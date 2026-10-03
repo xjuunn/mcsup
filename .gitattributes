@@ -1,0 +1,50 @@
+* text=auto eol=lf
+
+*.rs        text eol=lf
+*.toml      text eol=lf
+*.lock      text eol=lf
+*.md        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.json      text eol=lf
+*.ts        text eol=lf
+*.tsx       text eol=lf
+*.js        text eol=lf
+*.jsx       text eol=lf
+*.css       text eol=lf
+*.html      text eol=lf
+*.svg       text eol=lf
+*.sh        text eol=lf
+*.bash      text eol=lf
+.gitignore        text eol=lf
+.gitattributes    text eol=lf
+
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+*.ps1       text eol=crlf
+
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.ico       binary
+*.webp      binary
+*.pdf       binary
+*.zip       binary
+*.gz        binary
+*.xz        binary
+*.bz2       binary
+*.zst       binary
+*.jar       binary
+*.nbt       binary
+*.mca       binary
+*.dat       binary
+*.db        binary
+*.sqlite    binary
+*.sqlite3   binary
+*.so        binary
+*.dll       binary
+*.dylib     binary
+*.exe       binary
+*.pdb       binary
+*.wasm      binary

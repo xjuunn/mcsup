@@ -1,0 +1,44 @@
+# 发布前的许可证与 advisory 审计。
+#
+# mcsup 是要发布到 crates.io 的库，使用方会把它拉进自己的依赖树，因此
+# 许可证策略必须是机器可执行的，不能靠 review 记忆。
+#
+# 策略：
+#   - 只允许宽松许可，AGPL / GPL / SSPL 一律拒绝
+#   - 通配符依赖（foo = "*"）直接拒绝，避免上游作者擅自改版本
+#   - 同一 crate 多个版本只警告：tokio 这类生态里多个版本是常态，
+#     硬拒绝会逼出无意义的版本 pin
+#   - 允许的来源只有 crates.io
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

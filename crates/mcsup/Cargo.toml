@@ -1,0 +1,26 @@
+[package]
+name = "mcsup"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT"
+description = "Professional-grade Minecraft server infrastructure management platform"
+documentation = "https://docs.rs/mcsup"
+readme = "../../README.md"
+keywords = ["minecraft", "server", "management", "backup"]
+categories = ["command-line-utilities", "database", "network-programming"]
+
+[lints]
+workspace = true
+
+# feature 跟着模块走：模块没落地就不声明，拼错的名字会被静默接受。
+# domain / port 无条件编译；其余模块一律门控，依赖用 dep: 门控。
+[features]
+default = []
+
+# 无依赖。thiserror 等第一个 #[derive(Error)] 出现时再加。
+
+[package.metadata.docs.rs]
+# 不加这段，docs.rs 不传 --cfg docsrs，使用方看不到哪个模块需要哪个 feature。
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

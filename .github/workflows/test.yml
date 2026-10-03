@@ -1,0 +1,177 @@
+name: Test
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支的新 push 取消旧的运行，避免占用额度。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  architecture:
+    name: architecture
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      # 用 sh 调用，不依赖 git 的可执行位。
+      - name: check architecture rules
+        run: sh scripts/check-architecture.sh
+
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # 用 `-- -D warnings` 而非 RUSTFLAGS：后者会连依赖的警告一起提升为错误。
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test --workspace --all-features
+
+  # MSRV = [workspace.package] rust-version。clippy.toml 的 msrv 必须一致。
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.85
+      - uses: Swatinem/rust-cache@v2
+      # 必须覆盖 RUSTUP_TOOLCHAIN，否则根目录的 rust-toolchain.toml 会让本 job 静默跑 1.98.1。
+      - name: cargo check
+        env:
+          RUSTUP_TOOLCHAIN: 1.85
+        run: cargo check --workspace --all-targets --all-features
+
+  # 要发布的库，文档警告等同缺陷。
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo doc
+        run: cargo doc --workspace --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # --all-features 抓不到「单独开某个 feature 编译不过」，而那正是第三方安装的边界。
+  features:
+    name: feature powerset
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-hack
+        run: cargo install cargo-hack --locked
+      - name: cargo hack check
+        run: cargo hack check --workspace --feature-powerset --depth 1 --all-targets
+
+  # 许可证与 advisory 审计。见 deny.toml。
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: cargo deny check
+        run: cargo deny check
+
+  required:
+    name: required checks
+    if: always()
+    needs: [architecture, fmt, clippy, test, msrv, docs, features, deny]
+    runs-on: ubuntu-latest
+    steps:
+      # required 失败时必须指出是哪个 job：原来 jq 输出丢进 /dev/null，日志是空的。
+      - name: Report job results
+        run: |
+          needs='${{ toJSON(needs) }}'
+
+          {
+            echo '## required checks'
+            echo ''
+            echo '| job | result |'
+            echo '| --- | --- |'
+            echo "$needs" | jq -r 'to_entries | sort_by(.key)[] | "| \(.key) | \(.value.result) |"'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          failed=$(echo "$needs" | jq -r '
+            to_entries[]
+            | select(.value.result != "success")
+            | .key + " -> " + .value.result
+          ')
+
+          if [ -n "$failed" ]; then
+            {
+              echo ''
+              echo '未通过的 job，具体原因见各自日志末尾：'
+              echo ''
+              echo '```'
+              echo "$failed"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo '未通过的 job，具体原因见各自日志末尾：' >&2
+            echo "$failed" >&2
+          fi
+
+      - name: Verify all jobs passed
+        run: |
+          echo '${{ toJSON(needs) }}' | jq -e '
+            all(.[]; .result == "success")
+          ' > /dev/null

@@ -1,0 +1,42 @@
+#!/bin/sh
+# 首次使用需执行一次：
+#   git config core.hooksPath .githooks
+#
+# 先自动格式化本次提交涉及的 Rust 文件并重新暂存，再跑唯一门禁
+# scripts/check.sh。只重新暂存已暂存文件。
+
+set -e
+
+staged_rs=$(git diff --cached --name-only --diff-filter=ACMR -- '*.rs')
+
+if [ -n "$staged_rs" ]; then
+	echo "==> cargo fmt"
+	cargo fmt --all
+	printf '%s\n' "$staged_rs" | while IFS= read -r file; do
+		[ -f "$file" ] && git add -- "$file"
+	done
+fi
+
+echo "==> scripts/check.sh"
+
+# 门禁的输出先落盘再回显：失败时要从中取出失败步骤，否则只能报一句
+# 「未通过」，看不出是 clippy 还是 test 挂的。
+log=$(mktemp)
+status=0
+sh scripts/check.sh >"$log" 2>&1 || status=$?
+cat "$log"
+
+if [ "$status" -ne 0 ]; then
+	failed=$(grep -m1 '^失败于：' "$log" || true)
+	rm -f "$log"
+	echo ""
+	if [ -n "$failed" ]; then
+		echo "提交被拒绝：${failed#失败于：}"
+	else
+		echo "提交被拒绝：门禁未通过"
+	fi
+	echo ""
+	exit 1
+fi
+
+rm -f "$log"

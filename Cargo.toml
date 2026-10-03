@@ -1,0 +1,29 @@
+[workspace]
+resolver = "3"
+# crates/mcsup 是唯一发布单元。第一个 app 落地时在这里补上 "apps/*"：
+# glob 无匹配时 cargo 会当字面路径加载并报错，所以不能提前写。
+members = ["crates/mcsup"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+# CI 的 clippy 步骤以 `-D warnings` 运行，rustc 与 clippy 的 warn 都会让它失败。
+[workspace.lints.rust]
+unsafe_code = "forbid"
+rust_2018_idioms = { level = "warn", priority = -1 }
+nonstandard_style = { level = "warn", priority = -1 }
+unreachable_pub = "warn"
+missing_debug_implementations = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+
+print_stdout = "warn"
+print_stderr = "warn"

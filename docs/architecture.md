@@ -1,0 +1,344 @@
+# MCSUP 架构规范
+
+来自 `AGENTS.md`。
+
+包含项目范围、目录结构、每个架构层的职责与边界、领域模型、Domain Event、状态机与依赖模型。
+
+判断某段代码属于哪个层、某个类型该放在哪个模块时查阅。
+
+---
+
+# 项目范围
+
+MCSUP（Minecraft Server Utility Platform）是专业级 Minecraft Server 管理平台。
+
+MCSUP 使用 Rust 构建，采用 Cargo Workspace + Monorepo 架构。
+
+MCSUP 面向三个入口：CLI（含 TUI）、API（REST / WebSocket，由 `apps/server`
+承载）、MCP。支持本地与远程 Server、Remote Agent，以及 Java / Minecraft
+Runtime、Provider、File、World、Backup、Mod、Player、Scheduler、Monitoring、
+Auth、Audit、Automation 等能力。目标是在生产环境长期稳定运行，可跨平台、高
+性能、可扩展。Web 前端暂不在本仓库，后续作为独立项目通过 API 接入。
+
+所有入口经 Service 调用，禁止直接访问数据库、启动 Minecraft 或处理 Backup。
+
+# Workspace 架构
+
+> 本节描述**当前**的多 crate 布局。
+>
+> 目标形态是单 package（`mcsup`）+ feature 门控，理由、feature 矩阵和
+> crates.io 分发方式见 `docs/embedding.md`。迁移完成前，本节
+> （Workspace 架构）和下方的核心依赖方向一节仍以当前布局为准。
+
+项目使用 Rust Workspace。
+
+推荐结构：
+
+```
+mcsup/
+├── apps/
+│   ├── cli/                 # CLI / TUI 程序入口，bin 名为 mcsup
+│   ├── agent/               # Remote Agent 程序入口，bin 名为 mcsup-agent
+│   ├── server/              # API（HTTP / REST / WebSocket）入口，bin 名为 mcsup-server
+│   ├── mcp/                 # MCP Server 入口，bin 名为 mcsup-mcp
+│   ├── dev/                 # 开发辅助工具
+│   └── bench/               # 性能基准测试程序
+│
+├── crates/
+│   ├── domain/                   # 领域模型、领域规则和领域事件
+│   ├── port/                     # 能力 trait / Port 定义
+│   ├── service/                  # 统一业务服务层和业务编排
+│   ├── backend/                  # Local / Remote 执行位置抽象
+│   ├── runtime/                  # Minecraft / Java Runtime 运行管理
+│   ├── provider/                 # 外部资源和第三方 API Provider
+│   ├── storage/                  # 元数据和持久化
+│   ├── file/                     # 文件系统和文件传输
+│   ├── backup/                   # CAS / Snapshot / Restore / GC
+│   ├── modkit/                   # Mod / Modpack 管理
+│   ├── java/                     # Java 检测、安装和版本管理
+│   ├── protocol/                 # RPC 消息和协议定义
+│   ├── transport/                # RPC / gRPC 通信实现
+│   ├── api/                      # REST DTO / API Contract / OpenAPI
+│   └── auth/                     # Authentication / Authorization
+│
+├── tests/                        # 跨模块集成测试
+├── docs/                         # 项目文档
+├── scripts/                      # 构建、开发和发布脚本
+│
+├── .github/
+│   └── workflows/
+│       ├── ci.yml                # CI
+│       └── release.yml           # Release
+│
+├── Cargo.toml                    # Workspace 配置
+├── Cargo.lock                    # 依赖锁定
+├── README.md                     # 项目说明
+├── CONTRIBUTING.md               # 开发规范
+└── LICENSE                       # License
+```
+
+注意：
+
+`crates` 中的库名称一律使用单个单词，不使用 `mcsup-` 前缀，也没有例外
+（清单见上方目录树）。禁止使用以下名称：
+
+```
+core     // 内置 crate，会被遮蔽
+std      // 内置 crate，破坏 prelude，println! / Vec / Ok 全部不可用
+mod      // Rust 关键字；因此 Mod / Modpack 管理 crate 命名为 modkit
+crate    // Rust 关键字
+self     // Rust 关键字
+super    // Rust 关键字
+```
+
+依赖名为 `core` 的包会永久遮蔽内置 `core`，连 `::core::...` 也失败。该错误
+只在第一个下游 crate 编译时暴露，排查方向容易错，因此领域层必须是
+`domain`。`cargo metadata` 不校验这些名称，必须在 CI 中检查。
+
+`apps/` 下的包同样使用单词名：`cli agent server mcp dev bench`。它们不发布到
+crates.io，不受全局命名空间约束。TUI 属于 `apps/cli`，不单独建入口。
+
+可执行文件名必须带前缀，通过 `[[bin]]` 指定：
+
+```
+mcsup  mcsup-agent  mcsup-server  mcsup-mcp
+```
+
+因为 bin 名会进入用户 PATH。`cargo install` 装的是 bin 名，所以前缀不影响
+安装体验：`cargo install --path apps/cli` 装出的可执行文件名仍是 `mcsup`。
+
+# 核心依赖方向
+
+依赖必须保持单向。
+
+推荐：
+
+```
+apps
+  ↓
+service
+  ↓
+port / domain
+  ↑
+backend / runtime / provider / storage / file / backup / modkit
+```
+
+实现层实现 `port` 的 trait 并依赖 `domain`，`service` 不直接依赖任何
+具体实现模块。
+
+远程通信：
+
+```
+service
+  ↓
+backend
+  ↓
+transport
+  ↓
+protocol
+  ↓
+agent
+```
+
+API：
+
+```
+HTTP
+ ↓
+API DTO
+ ↓
+Service
+```
+
+禁止：
+
+```
+domain → CLI
+domain → HTTP
+domain → Agent
+domain → TUI
+domain → MCP
+```
+
+判定逻辑必须收敛到领域层（例如 `ServerStatus::transition`），入口只做错误
+映射。三个入口（CLI / API / MCP）一旦各写一份判定就会分叉。
+规则见 `AGENTS.md` 的判定逻辑收敛一节。
+
+禁止：
+
+```
+    apps/cli → apps/agent
+    apps/cli → apps/server
+    apps/agent → apps/cli
+```
+
+`apps` 是并行入口，不允许互相 Cargo 依赖。
+
+# Domain
+
+`domain` 是领域核心：Server / ServerId / ServerStatus / ServerConfig / World /
+Player、生命周期与状态转换、领域规则与领域事件、核心领域错误。状态用枚举
+显式表达（如 `Created → Starting → Running → Stopping → Stopped`）。
+
+Domain 不涉及 CLI、HTTP、REST、TUI、MCP、数据库、RPC / gRPC，必须尽可能
+稳定、纯粹、可测试。
+
+# Service
+
+`service` 是统一业务入口，CLI（含 TUI）、API、MCP 都经它调用。它负责
+业务流程、跨模块协调、权限检查入口、Domain Event，并统一 Local / Remote。
+
+Service 不负责 CLI 输出、HTTP Router、HTML、TUI 渲染、MCP 协议细节。
+
+# Backend
+
+Backend 回答「这个操作在哪里执行」，由 `port::Backend` 定义，抽象为
+`LocalBackend` 与 `RemoteBackend`。Local 本机执行，Remote 经 transport →
+RPC → agent。
+
+Service 里不应出现大量 `if remote { ... } else { ... }`；出现即说明抽象边界
+有问题。
+
+# Runtime
+
+Runtime 回答「Minecraft Server 应该如何运行」：Server Jar / Loader、启动命令、
+JVM 参数、环境、进程生命周期、stdout / stderr / stdin、PID、优雅与强制停止、
+重启、崩溃检测、日志流。
+
+下载文件不归 Runtime，归 Provider。
+
+# Provider
+
+Provider 回答「外部资源从哪里获得」，对接 Mojang、Fabric、Forge、NeoForge、
+Paper、Purpur、Modrinth 等：HTTP API、下载、版本 / Mod / Modpack 查询、
+Artifact 获取。Provider 不承担核心业务流程。
+
+# Storage
+
+Storage 持久化元数据：Server、配置、Backup / Snapshot 元数据、User / Role /
+Permission、Agent、Task、Audit 等，只存 metadata / index / relationship /
+configuration / state。大文件不进数据库。
+
+# File
+
+`file` 提供 list / read / write / copy / move / delete / mkdir / upload /
+download / sync / checksum，全部 Streaming First。必须处理大文件、内存占用、
+并发、断点续传、Chunk、Progress、Cancellation，禁止把整个 World 读进内存。
+
+# Backup
+
+Backup = File CAS + Snapshot：文件按内容哈希存入 CAS（`File → Hash → CAS
+Object`），相同内容只存一次；Snapshot 记录各文件到哈希的映射。支持 Snapshot、
+去重、Restore、Retention、GC、完整性校验、并发备份与失败恢复。
+
+运行中备份必须先 `save-all`、等待完成、`save-off`，再建 Snapshot，最后恢复
+save 状态。任何异常都必须在 finally / cleanup 中恢复 Server 状态，禁止让
+服务器永久停在 save-off。
+
+# Protocol / Transport
+
+Protocol 定义传输什么（`StartServerRequest` / `StartServerResponse` /
+`LogEvent` / `FileChunk` / `BackupProgress` 等消息类型）；Transport 定义怎么传
+（gRPC / tonic / prost / streaming）。禁止把具体 gRPC 实现污染到 Domain。
+
+# Agent
+
+Agent 是远程执行节点：`mcsup-server / CLI → RemoteBackend → RPC → Agent →
+Runtime / File / Backup / Domain`。
+
+Agent 是高权限程序，必须高性能、低资源占用、安全、可审计，支持 Streaming、
+Cancellation、版本协商与 Capability。禁止默认开放公网且无认证、无 TLS；必须
+实现 Authentication / Authorization / TLS / Pairing / Token / Permission /
+Audit / Capability Negotiation / Protocol Version。
+
+# REST API
+
+`apps/server` 负责 HTTP / REST / WebSocket；`api` 负责
+Request / Response / Error DTO、分页、过滤、排序、API Contract 与 OpenAPI。
+
+HTTP Handler 只做 `Parse → Validate → Auth → Service → Map Response`，禁止
+直接操作数据库或启动 Minecraft，禁止直接暴露 Domain Model 作为公共 API
+Contract。
+
+# Web（独立项目）
+
+Web 前端不在本仓库，后续作为独立项目通过 REST API 与 WebSocket 通信，禁止
+直接访问数据库、Domain、Runtime、Backup、Provider。
+
+WebSocket 用于 Server Status / Logs、Player Events、Backup 与 File Transfer
+Progress、Task Progress、Domain Events。
+
+# Auth
+
+`auth` 负责 Authentication / Authorization / Identity / Credential / Token /
+Session / Role / Permission，权限形如 `server:read`、`backup:restore`、
+`file:write`，角色可先有 Admin / Operator / Viewer。禁止一开始就构建复杂
+RBAC / ABAC，先满足真实需求。
+
+# CLI
+
+CLI 必须非常薄：`Parse → Validate → Call Service → Display → Exit Code`，例如
+`mcsup server start` 只是转调 Service，不实现 Server 启动逻辑。可以提供 JSON
+与人类可读输出、Progress、交互 / 非交互模式、Shell Completion、Exit Codes。
+
+# TUI
+
+TUI 是 CLI 入口的一部分（与 CLI 同一个 app），基于 ratatui / crossterm，只负责
+Input / Rendering / Interaction。业务统一进入 Service，禁止复制 CLI 的业务逻辑。
+
+# MCP
+
+MCP 是另一种用户入口，Tool 如 `server.start` / `backup.restore` /
+`file.upload`，必须调用 Service，禁止自己实现业务逻辑。
+
+# Domain Event
+
+跨模块通信尽量通过 Domain Event 解耦，例如 `ServerStarted` / `ServerStopped`
+/ `ServerCrashed` / `PlayerJoined` / `BackupCompleted` /
+`FileTransferCompleted`。消费者包括 CLI、API、MCP、Scheduler、Monitoring、
+Audit、Notification；Domain / Service 不直接依赖这些 UI。
+
+# 状态机
+
+生命周期状态必须用 enum 显式建模，禁止用多个 bool 拼接。例如用
+`ServerStatus`，而不是 `running: bool` + `starting: bool` + `stopping: bool`
++ `error: bool`——后者会出现 `running` 与 `starting` 同时为真的非法组合。
+Enum 让非法状态难以表达。
+
+# 新代码归属
+
+新代码属于哪个模块、禁止哪些架构捷径，见 `AGENTS.md` 的「代码归属与依赖方向」
+一节；各层的职责与边界见本文上面的分层章节。
+
+# 最终依赖模型
+
+必须尽量保持：
+
+入口是并列的，彼此不依赖，只向下依赖 Service：
+
+```
+   CLI(含 TUI)   API   MCP
+        \         |    /
+         \        |   /
+          v       v  v
+               Service
+                 |
+                 v
+              Backend
+             /       \
+            v         v
+         Local      Remote
+           |           |
+           |        transport
+           |           |
+           |        protocol
+           |           |
+           |         Agent
+           v           v
+   Runtime / File / Backup / Provider / ...
+                 |
+                 v
+              Storage
+```
+
+
