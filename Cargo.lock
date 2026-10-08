@@ -3,5 +3,25 @@
 version = 4
 
 [[package]]
+name = "cli"
+version = "0.1.0"
+
+[[package]]
+name = "domain"
+version = "0.1.0"
+
+[[package]]
 name = "mcsup"
+version = "0.1.0"
+
+[[package]]
+name = "port"
+version = "0.1.0"
+
+[[package]]
+name = "provider"
+version = "0.1.0"
+
+[[package]]
+name = "service"
 version = "0.1.0"

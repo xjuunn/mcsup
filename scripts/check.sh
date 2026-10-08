@@ -6,7 +6,6 @@ set -eu
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 
-# `|| status=$?` 而非直接调用：set -e 会立刻退出，来不及报出是哪一步。
 run() {
 	label=$1
 	shift
@@ -26,11 +25,10 @@ run 'clippy' cargo clippy --workspace --all-targets --all-features -- -D warning
 run 'test' cargo test --workspace --all-features
 run 'doc' env 'RUSTDOCFLAGS=-D warnings' cargo doc --workspace --all-features --no-deps
 
-# 硬要求：跳过去本地绿灯就不再等于 CI 绿灯。
 printf '\n==> feature powerset\n'
 if ! cargo hack --version >/dev/null 2>&1; then
 	printf '失败于：feature powerset\n' >&2
-	printf '未安装：cargo install cargo-hack --locked\n' >&2
+	printf '未安装：cargo-hack。安装：scripts/init.sh\n' >&2
 	exit 1
 fi
 status=0
@@ -41,7 +39,7 @@ if [ "$status" -ne 0 ]; then
 	exit "$status"
 fi
 
-# 审计类，不影响构建，缺工具就静默跳过。
+# 审计类，不影响构建，缺工具就跳过并提示——静默跳过会让本地绿灯 ≠ CI 绿灯。
 if cargo deny --version >/dev/null 2>&1; then
 	printf '\n==> deny\n'
 	status=0
@@ -51,6 +49,8 @@ if cargo deny --version >/dev/null 2>&1; then
 		printf '许可与 advisory 见 deny.toml。\n' >&2
 		exit "$status"
 	fi
+else
+	printf '\n提示：未安装 cargo-deny，已跳过 deny（CI 会执行）。安装：scripts/init.sh\n' >&2
 fi
 
 printf '\n门禁通过。\n'
