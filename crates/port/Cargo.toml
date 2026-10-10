@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+async-trait = "0.1.92"
+domain = { version = "0.1.0", path = "../domain" }
+thiserror = "2.0.21"
+url = "2.5.8"
 
 [lints]
 workspace = true

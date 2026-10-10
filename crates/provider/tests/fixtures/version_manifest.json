@@ -1,0 +1,29 @@
+{
+    "latest": {
+        "release": "1.21.1",
+        "snapshot": "24w33a"
+    },
+    "versions": [
+        {
+            "id": "1.21.1",
+            "type": "release",
+            "url": "https://example.invalid/1.21.1.json",
+            "time": "2024-08-08T00:00:00+00:00",
+            "releaseTime": "2024-08-08T00:00:00+00:00"
+        },
+        {
+            "id": "24w33a",
+            "type": "snapshot",
+            "url": "https://example.invalid/24w33a.json",
+            "time": "2024-08-15T00:00:00+00:00",
+            "releaseTime": "2024-08-15T00:00:00+00:00"
+        },
+        {
+            "id": "a1.2.6",
+            "type": "old_alpha",
+            "url": "https://example.invalid/a1.2.6.json",
+            "time": "2010-11-11T00:00:00+00:00",
+            "releaseTime": "2010-11-11T00:00:00+00:00"
+        }
+    ]
+}
