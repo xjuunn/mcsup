@@ -1,6 +1,8 @@
 use crate::server::error::InvalidTransition;
 
+/// 下载任务的生命周期
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DownloadStatus {
     Pending,
     Downloading,

@@ -13,8 +13,8 @@ pub(crate) struct VersionManifestItem {
     pub(crate) url: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum VersionKind {
     Release,
     Snapshot,
