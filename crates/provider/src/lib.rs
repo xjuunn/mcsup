@@ -1,1 +1,2 @@
-pub(crate) mod mojang;
+pub mod http;
+pub mod mojang;

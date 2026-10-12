@@ -1,3 +1,4 @@
+use crate::http::{build_client, map_transport};
 use async_trait::async_trait;
 use domain::server::{
     artifact::{Checksum, ChecksumAlgorithm, JarArtifact},
@@ -6,7 +7,6 @@ use domain::server::{
 use port::{ResolvedArtifact, ServerJarSource, SourceError};
 use reqwest::Client;
 use serde::de::DeserializeOwned;
-use std::time::Duration;
 use thiserror::Error;
 use url::Url;
 
@@ -14,32 +14,23 @@ use super::manifest::{VersionDetails, VersionKind, VersionManifest, VersionManif
 
 /// 版本清单地址
 const MANIFEST_URL: &str = "https://piston-meta.mojang.com/mc/game/version_manifest.json";
-/// 整个请求的总超时
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-/// 连接超时
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// 明确 User-Agent，便于上游识别与限流
-const USER_AGENT: &str = concat!("mcsup/", env!("CARGO_PKG_VERSION"));
 
 /// Mojang 官方服务端来源
-pub(crate) struct MojangSource {
+#[derive(Debug)]
+pub struct MojangSource {
     http: Client,
 }
 
 impl MojangSource {
     /// 用内置配置构建来源
     ///
-    /// # Error
+    /// # Errors
     ///
     /// HTTP 客户端构建失败时返回 [`SourceError::Init`]
-    pub(crate) fn new() -> Result<Self, SourceError> {
-        let http = Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
-            .user_agent(USER_AGENT)
-            .build()
-            .map_err(|e| SourceError::Init(Box::new(e)))?;
-        Ok(Self { http })
+    pub fn new() -> Result<Self, SourceError> {
+        Ok(Self {
+            http: build_client()?,
+        })
     }
 
     async fn manifest(&self) -> Result<VersionManifest, SourceError> {
@@ -80,7 +71,7 @@ impl ServerJarSource for MojangSource {
             .find(|item| item.id == version.as_str())
             .ok_or_else(|| SourceError::NotFound(version.clone()))?;
         let details_url = parse_https_url(&item.url)?;
-        let server = self.details(&details_url).await?.downloads;
+        let server = self.details(&details_url).await?.downloads.server;
         let location = parse_https_url(&server.url)?;
         let artifact = JarArtifact {
             version: version.clone(),
@@ -120,15 +111,11 @@ fn parse_https_url(raw: &str) -> Result<Url, SourceError> {
     Ok(url)
 }
 
-fn map_transport(err: reqwest::Error) -> SourceError {
-    SourceError::NetWork(Box::new(err))
-}
-
 fn map_decode(err: reqwest::Error) -> SourceError {
     if err.is_decode() {
         SourceError::Decode(Box::new(err))
     } else {
-        SourceError::NetWork(Box::new(err))
+        SourceError::Network(Box::new(err))
     }
 }
 

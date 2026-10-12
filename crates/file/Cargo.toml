@@ -1,0 +1,23 @@
+[package]
+name = "file"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+async-trait = "0.1.92"
+domain = { path = "../domain" }
+port = { path = "../port" }
+sha1 = "0.11.0"
+sha2 = "0.11.0"
+tokio = { version = "1.53.2", features = ["fs", "io-util", "time"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.53.2", features = ["macros", "rt"] }
+url = "2.5.8"

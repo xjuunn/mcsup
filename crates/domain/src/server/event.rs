@@ -1,5 +1,6 @@
 use crate::server::version::VersionId;
 
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DomainEvent {
     // 下载完成并校验通过

@@ -1,5 +1,6 @@
 use super::version::VersionId;
 
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChecksumAlgorithm {
     Sha1,
@@ -28,6 +29,11 @@ impl Checksum {
     #[must_use]
     pub fn matches(&self, computed_hex: &str) -> bool {
         self.hex == computed_hex.to_ascii_lowercase()
+    }
+
+    #[must_use]
+    pub fn hex(&self) -> &str {
+        &self.hex
     }
 }
 
