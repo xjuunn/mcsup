@@ -113,6 +113,14 @@ dependencies = [
 [[package]]
 name = "cli"
 version = "0.1.0"
+dependencies = [
+ "domain",
+ "file",
+ "port",
+ "provider",
+ "service",
+ "tokio",
+]
 
 [[package]]
 name = "cmake"

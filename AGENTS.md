@@ -219,6 +219,7 @@ package 内的 feature 门控模块。目标形态与迁移理由见 `docs/embed
 | `docs/code-design.md` | God Object、God Trait、依赖管理、跨平台 | 设计模块接口、引入依赖、处理平台差异时 |
 | `docs/engineering-discipline.md` | 创建模块的时机、无意义重构、发现架构问题时的处理、架构修改规则 | 新建模块、改动已有代码、遇到设计缺陷时 |
 | `docs/ai-collaboration.md` | AI 协助开发细则：方案类 / 代码类 / 审查类的对应流程 | 收到用户提问时 |
+| `docs/cli-commands.md` | CLI 子命令设计：`server` 及其 `backup` / `mod`；`modpack` / `java` / `remote` 用法表 | 设计或查询子命令时 |
 
 新增代码时的判断顺序：
 

@@ -12,6 +12,12 @@ path = "src/main.rs"
 doc = false
 
 [dependencies]
+domain = { version = "0.1.0", path = "../../crates/domain" }
+file = { version = "0.1.0", path = "../../crates/file" }
+port = { version = "0.1.0", path = "../../crates/port" }
+provider = { version = "0.1.0", path = "../../crates/provider" }
+service = { version = "0.1.0", path = "../../crates/service" }
+tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true
