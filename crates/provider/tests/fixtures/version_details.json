@@ -1,0 +1,15 @@
+{
+    "id": "1.21.1",
+    "downloads": {
+        "client": {
+            "sha1": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "size": 1000,
+            "url": "https://example.invalid/client.jar"
+        },
+        "server": {
+            "sha1": "2d89c95c030e635387448f332961074ce1adbb4b",
+            "size": 62458029,
+            "url": "https://example.invalid/server.jar"
+        }
+    }
+}

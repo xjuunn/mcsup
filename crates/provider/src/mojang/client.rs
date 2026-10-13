@@ -70,15 +70,8 @@ impl ServerJarSource for MojangSource {
             .into_iter()
             .find(|item| item.id == version.as_str())
             .ok_or_else(|| SourceError::NotFound(version.clone()))?;
-        let details_url = parse_https_url(&item.url)?;
-        let server = self.details(&details_url).await?.downloads.server;
-        let location = parse_https_url(&server.url)?;
-        let artifact = JarArtifact {
-            version: version.clone(),
-            size: server.size,
-            checksum: Checksum::new(ChecksumAlgorithm::Sha1, server.sha1),
-        };
-        Ok(ResolvedArtifact { artifact, location })
+        let details = self.details(&parse_https_url(&item.url)?).await?;
+        into_atrifact(version, details)
     }
 }
 
@@ -97,6 +90,20 @@ fn into_domain_kind(kind: VersionKind) -> domain::server::version::VersionKind {
         VersionKind::Snapshot => Domain::Snapshot,
         VersionKind::OldAlpha | VersionKind::OldBeta => Domain::Historical,
     }
+}
+
+fn into_atrifact(
+    version: &VersionId,
+    details: VersionDetails,
+) -> Result<ResolvedArtifact, SourceError> {
+    let server = details.downloads.server;
+    let location = parse_https_url(&server.url)?;
+    let artifact = JarArtifact {
+        version: version.clone(),
+        size: server.size,
+        checksum: Checksum::new(ChecksumAlgorithm::Sha1, server.sha1),
+    };
+    Ok(ResolvedArtifact { artifact, location })
 }
 
 fn parse_https_url(raw: &str) -> Result<Url, SourceError> {
@@ -152,5 +159,26 @@ mod tests {
         assert!(parse_https_url("http://example.com/file.jar").is_err());
         assert!(parse_https_url("not a url").is_err());
         assert!(parse_https_url("https://example.com/jar").is_ok());
+    }
+
+    #[test]
+    fn resolves_server_download_from_details() -> Result<(), Box<dyn std::error::Error>> {
+        let details: VersionDetails =
+            serde_json::from_str(include_str!("../../tests/fixtures/version_details.json"))?;
+        let resolved = into_atrifact(&VersionId::new("1.21.1"), details)?;
+
+        assert_eq!(resolved.artifact.size, 6245_8029);
+        assert_eq!(resolved.artifact.version, VersionId::new("1.21.1"));
+        assert!(
+            resolved
+                .artifact
+                .checksum
+                .matches("2d89c95c030e635387448f332961074ce1adbb4b")
+        );
+        assert_eq!(
+            resolved.location.as_str(),
+            "https://example.invalid/server.jar"
+        );
+        Ok(())
     }
 }
