@@ -2,7 +2,8 @@ use domain::server::download::DownloadStatus;
 use domain::server::error::InvalidTransition;
 use domain::server::version::VersionId;
 use port::{
-    ArtifactDownloader, CancellationToken, DownloadRequest, DownloadedArtifact, ServerJarSource,
+    ArtifactDownloader, CancellationToken, DownloadRequest, DownloadedArtifact, ProgressSink,
+    ServerJarSource,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -60,6 +61,7 @@ impl ServerInstaller {
         &self,
         version: &VersionId,
         destination: PathBuf,
+        progress: Option<&dyn ProgressSink>,
         cancel: &CancellationToken,
     ) -> Result<InstalledDownload, InstallError> {
         let mut status = DownloadStatus::Pending.transition(DownloadStatus::Downloading)?;
@@ -71,7 +73,7 @@ impl ServerInstaller {
             expected: Some(resolved.artifact.checksum),
             expected_size: Some(resolved.artifact.size),
         };
-        let artifact = self.downloader.download(&request, None, cancel).await?;
+        let artifact = self.downloader.download(&request, progress, cancel).await?;
         status = status.transition(DownloadStatus::Verifying)?;
         status = status.transition(DownloadStatus::Ready)?;
         Ok(InstalledDownload { status, artifact })
@@ -117,7 +119,7 @@ mod tests {
         async fn download(
             &self,
             _request: &DownloadRequest,
-            _progress: Option<&dyn port::ProgressSink>,
+            _progress: Option<&dyn ProgressSink>,
             _cancel: &CancellationToken,
         ) -> Result<DownloadedArtifact, DownloadError> {
             if self.cancelled {
@@ -159,6 +161,7 @@ mod tests {
             .install(
                 &VersionId::new("1.21.1"),
                 PathBuf::from("/tmp/server.jar"),
+                None,
                 &CancellationToken::new(),
             )
             .await?;
@@ -188,6 +191,7 @@ mod tests {
             .install(
                 &VersionId::new("1.21.1"),
                 PathBuf::from("/tmp/server.jar"),
+                None,
                 &CancellationToken::new(),
             )
             .await;
@@ -226,6 +230,7 @@ mod tests {
             .install(
                 &VersionId::new("1.21.1"),
                 PathBuf::from("/tmp/server.jar"),
+                None,
                 &CancellationToken::new(),
             )
             .await;

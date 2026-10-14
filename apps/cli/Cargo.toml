@@ -12,12 +12,29 @@ path = "src/main.rs"
 doc = false
 
 [dependencies]
-domain = { version = "0.1.0", path = "../../crates/domain" }
-file = { version = "0.1.0", path = "../../crates/file" }
-port = { version = "0.1.0", path = "../../crates/port" }
-provider = { version = "0.1.0", path = "../../crates/provider" }
-service = { version = "0.1.0", path = "../../crates/service" }
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive", "wrap_help"] }
+clap-verbosity-flag = { version = "3.0", default-features = false, features = ["tracing"] }
+clap_complete = "4.6.11"
+comfy-table = "8.0.0"
+console = "0.16.6"
+dirs = "7.0.0"
+domain = { path = "../../crates/domain" }
+file = { path = "../../crates/file" }
+indicatif = "0.18.6"
+inquire = "0.9.4"
+miette = { version = "7.6.0", features = ["fancy"] }
+owo-colors = {version = "4.4.0"}
+port = { path = "../../crates/port" }
+provider = { path = "../../crates/provider" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+service = { path = "../../crates/service" }
+shell-words = "1.1.1"
 tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread"] }
+toml = "1.1.8"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [lints]
 workspace = true
