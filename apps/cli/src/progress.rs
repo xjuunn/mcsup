@@ -40,10 +40,10 @@ impl ProgressSink for BarSink {
     fn on_progress(&self, transferred: u64, total: Option<u64>) {
         if let Some(total) = total {
             self.bar.set_length(total);
-            if !self.determinate.swap(true, Ordering::Relaxed) {
-                if let Ok(style) = ProgressStyle::with_template(BAR) {
-                    self.bar.set_style(style);
-                }
+            if !self.determinate.swap(true, Ordering::Relaxed)
+                && let Ok(style) = ProgressStyle::with_template(BAR)
+            {
+                self.bar.set_style(style);
             }
         }
         self.bar.set_position(transferred);

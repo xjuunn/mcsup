@@ -6,7 +6,7 @@ members = ["apps/cli","crates/domain", "crates/file","crates/mcsup", "crates/por
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT"
 
 # CI 的 clippy 步骤以 `-D warnings` 运行，rustc 与 clippy 的 warn 都会让它失败。

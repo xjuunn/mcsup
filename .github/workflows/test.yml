@@ -79,12 +79,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.85
+          toolchain: 1.88
       - uses: Swatinem/rust-cache@v2
       # 必须覆盖 RUSTUP_TOOLCHAIN，否则根目录的 rust-toolchain.toml 会让本 job 静默跑 1.98.1。
       - name: cargo check
         env:
-          RUSTUP_TOOLCHAIN: 1.85
+          RUSTUP_TOOLCHAIN: 1.88
         run: cargo check --workspace --all-targets --all-features
 
   # 要发布的库，文档警告等同缺陷。

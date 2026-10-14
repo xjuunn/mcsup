@@ -146,13 +146,13 @@ fn verify(
             });
         }
     }
-    if let Some(expected) = request.expected_size {
-        if expected != transferred {
-            return Err(DownloadError::SizeMismatch {
-                expected,
-                actual: transferred,
-            });
-        }
+    if let Some(expected) = request.expected_size
+        && expected != transferred
+    {
+        return Err(DownloadError::SizeMismatch {
+            expected,
+            actual: transferred,
+        });
     }
     Ok(())
 }
