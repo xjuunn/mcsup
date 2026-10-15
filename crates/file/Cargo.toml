@@ -12,7 +12,14 @@ domain = { path = "../domain" }
 port = { path = "../port" }
 sha1 = "0.11.0"
 sha2 = "0.11.0"
-tokio = { version = "1.53.2", features = ["fs", "io-util", "time"] }
+tokio = { version = "1.53.2", features = [
+    "fs",
+    "io-util",
+    "time",
+    "sync",
+    "rt",
+] }
+url = "2.5.8"
 
 [lints]
 workspace = true
@@ -20,4 +27,3 @@ workspace = true
 [dev-dependencies]
 tempfile = "3.27.0"
 tokio = { version = "1.53.2", features = ["macros", "rt"] }
-url = "2.5.8"

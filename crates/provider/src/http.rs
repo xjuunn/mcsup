@@ -1,6 +1,7 @@
 use async_trait::async_trait;
-use port::{ByteReader, ByteSource, SourceError};
+use port::{ByteReader, ByteSource, RangeSource, RemoteStat, SourceError};
 use reqwest::Client;
+use std::ops::RangeInclusive;
 use std::time::Duration;
 use url::Url;
 
@@ -28,6 +29,7 @@ pub(crate) fn build_stream_client() -> Result<Client, SourceError> {
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
         .user_agent(USER_AGENT)
+        .http1_only()
         .build()
         .map_err(|e| SourceError::Init(Box::new(e)))
 }
@@ -86,4 +88,78 @@ impl ByteReader for HttpBody {
 
 pub(crate) fn map_transport(err: reqwest::Error) -> SourceError {
     SourceError::Network(Box::new(err))
+}
+
+#[async_trait]
+impl RangeSource for HttpByteSource {
+    async fn stat(&self, location: &Url) -> Result<RemoteStat, SourceError> {
+        let response = self
+            .http
+            .head(location.clone())
+            .send()
+            .await
+            .map_err(map_transport)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(SourceError::Status {
+                status: status.as_u16(),
+            });
+        }
+        let supports_range = response
+            .headers()
+            .get(reqwest::header::ACCEPT_RANGES)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("bytes"));
+        let size = response
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| {
+                SourceError::Decode(Box::new(std::io::Error::other("missing content-length")))
+            })?;
+        Ok(RemoteStat {
+            size,
+            supports_range,
+        })
+    }
+
+    async fn open_range(
+        &self,
+        location: &Url,
+        range: RangeInclusive<u64>,
+    ) -> Result<Box<dyn ByteReader>, SourceError> {
+        let response = self
+            .http
+            .get(location.clone())
+            .header(
+                reqwest::header::RANGE,
+                format!("bytes={}-{}", range.start(), range.end()),
+            )
+            .send()
+            .await
+            .map_err(map_transport)?;
+        let status = response.status();
+        if status != reqwest::StatusCode::PARTIAL_CONTENT {
+            return Err(SourceError::Status {
+                status: status.as_u16(),
+            });
+        }
+        let expected_prefix = format!("bytes {}-{}/", range.start(), range.end());
+        let content_range = response
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| {
+                SourceError::Decode(Box::new(std::io::Error::other("missing content-range")))
+            })?;
+        if !content_range.starts_with(&expected_prefix) {
+            return Err(SourceError::Decode(Box::new(std::io::Error::other(
+                format!(
+                    "content-range mismatch: expected `{expected_prefix}*`, got `{content_range}`"
+                ),
+            ))));
+        }
+        Ok(Box::new(HttpBody { response }))
+    }
 }

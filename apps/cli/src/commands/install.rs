@@ -34,7 +34,8 @@ pub(crate) async fn run(
     let destination = dir.join("server.jar");
     let source = Arc::new(MojangSource::new().context("初始化 Mojang 源")?);
     let bytes = Arc::new(HttpByteSource::new().context("初始化 HTTP 传输")?);
-    let installer = ServerInstaller::new(source, Arc::new(FileDownloader::new(bytes)));
+    let downloader = FileDownloader::new(bytes.clone()).with_range_source(bytes);
+    let installer = ServerInstaller::new(source, Arc::new(downloader));
 
     let cancel = CancellationToken::new();
     let sink = BarSink::new(format!("解析并下载 {version_id}"), printer.is_human());

@@ -179,6 +179,39 @@ pub trait ByteReader: Send {
     async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, SourceError>;
 }
 
+/// 远端对象的元信息
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteStat {
+    /// 对象总字节数
+    pub size: u64,
+    /// 是否声明支持按字节范围读取
+    pub supports_range: bool,
+}
+
+/// 可按字节范围读取的来源
+#[async_trait::async_trait]
+pub trait RangeSource: Send + Sync {
+    /// 读取远端元信息
+    ///
+    /// # Errors
+    ///
+    /// 上游不可达、返回异常状态码或缺少必要的响应头时返回 [`SourceError`]
+    async fn stat(&self, location: &Url) -> Result<RemoteStat, SourceError>;
+
+    /// 打开闭区间 `start..=end` 的响应体
+    ///
+    /// 实现要求上游以部分响应返回该区间；上游忽略范围时按 [`SourceError::Status`] 报告，由调用方判定回退
+    ///
+    /// # Errors
+    ///
+    /// 上游不可达、未按范围返回或状态码异常时返回 [`SourceError`]
+    async fn open_range(
+        &self,
+        location: &Url,
+        range: std::ops::RangeInclusive<u64>,
+    ) -> Result<Box<dyn ByteReader>, SourceError>;
+}
+
 /// 下载器
 #[async_trait::async_trait]
 pub trait ArtifactDownloader: Send + Sync {

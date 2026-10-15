@@ -3,13 +3,15 @@ use port::ProgressSink;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-const SPINNER: &str = "{spinner:.cyan} {msg} ({bytes})";
+const SPINNER: &str = "{spinner:.cyan} {msg}";
+const SPINNER_BYTES: &str = "{spinner:.cyan} {msg} ({bytes})";
 const BAR: &str = "{msg}\n{spinner:.cyan} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, ETA {eta})";
 
 /// 把下载进度渲染到 stderr 的 indicatif 适配器
 pub(crate) struct BarSink {
     bar: ProgressBar,
     determinate: AtomicBool,
+    bytes_shown: AtomicBool,
 }
 
 impl BarSink {
@@ -28,6 +30,7 @@ impl BarSink {
         Self {
             bar,
             determinate: AtomicBool::new(false),
+            bytes_shown: AtomicBool::new(false),
         }
     }
 
@@ -45,6 +48,11 @@ impl ProgressSink for BarSink {
             {
                 self.bar.set_style(style);
             }
+        } else if !self.determinate.load(Ordering::Relaxed)
+            && !self.bytes_shown.swap(true, Ordering::Relaxed)
+            && let Ok(style) = ProgressStyle::with_template(SPINNER_BYTES)
+        {
+            self.bar.set_style(style);
         }
         self.bar.set_position(transferred);
     }
