@@ -136,10 +136,13 @@ $ mcsup-agent --listen ...    # 看到 server / agent 无法猜到和 Minecraft 
 
 完整目录结构见 `docs/architecture.md`。
 
-目标形态是单 package（`mcsup`）+ feature 门控，而不是多 crate。届时
-`crates/*` 变成同一 package 内的 feature 门控模块，只有 `mcsup` 发布到
-crates.io，因此不必为内部模块名申请全局唯一名。原因和 feature 定义见
-`docs/embedding.md` 的分发形态一节。迁移完成前，命名规则仍按本节执行。
+当前与目标都是多 crate + `mcsup` 门面：`mcsup` 按 feature 级联重导出内层
+crate，是第三方依赖的唯一入口与发布主体。内层 crate 现为 `publish = false`
+的 path 依赖，单词名不发布、不占 crates.io；一旦要发布 `mcsup`，它 feature
+拉入的每个内层 crate 必须先改名 `mcsup-*`（单词名已被占用，`mcsup-*` 已验证
+可用），按 `domain → port → service / file / provider → mcsup` 顺序发布，
+版本以 `workspace.version` 锁步。门面 feature、级联与发布条件见
+`docs/embedding.md` 的分发形态一节。
 
 # 代码归属与依赖方向
 
@@ -185,10 +188,10 @@ Cargo 依赖。`service` 不直接依赖任何具体实现模块，实现层之�
 Local / Remote 必须共享同一套业务逻辑，差异只体现在 Backend 实现里。
 Backend 只回答「在哪里执行」，不回答「能不能执行」——后者属于领域层判定。
 
-架构正在从多 crate 迁移到单 package（`mcsup`）+ feature 门控。上表的
-名称在迁移前后都是模块名，归属不变；变的是它们从独立 crate 变成同一
-package 内的 feature 门控模块。目标形态与迁移理由见 `docs/embedding.md`。
-迁移完成前以当前多 crate 布局为准。
+上表名称即 crate / 模块名，归属不随形态变化。多 crate 以 `mcsup` 为门面：
+门面按 feature 级联重导出内层（`file` / `provider` → `port` → `domain`），
+第三方经门面按 feature 选能力；`apps/cli` 目前直连内层 crate，后续改走门面。
+方案、代价与发布条件见 `docs/embedding.md`。
 
 以下行为禁止：
 

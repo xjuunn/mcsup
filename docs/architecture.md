@@ -24,11 +24,11 @@ Auth、Audit、Automation 等能力。目标是在生产环境长期稳定运行
 
 # Workspace 架构
 
-> 本节描述**当前**的多 crate 布局。
+> 本节描述的多 crate 布局**也是目标布局**：多 crate + `mcsup` 门面。
 >
-> 目标形态是单 package（`mcsup`）+ feature 门控，理由、feature 矩阵和
-> crates.io 分发方式见 `docs/embedding.md`。迁移完成前，本节
-> （Workspace 架构）和下方的核心依赖方向一节仍以当前布局为准。
+> `mcsup` 按 feature 级联重导出内层 crate，是第三方依赖的唯一入口与发布
+> 主体；`apps/*` 是并行 bin 入口。feature 矩阵、级联与 crates.io 发布条件
+> 见 `docs/embedding.md` 的分发形态一节。
 
 项目使用 Rust Workspace。
 
@@ -45,6 +45,7 @@ mcsup/
 │   └── bench/               # 性能基准测试程序
 │
 ├── crates/
+│   ├── mcsup/                   # 门面：feature 级联重导出内层，唯一发布单元
 │   ├── domain/                   # 领域模型、领域规则和领域事件
 │   ├── port/                     # 能力 trait / Port 定义
 │   ├── service/                  # 统一业务服务层和业务编排

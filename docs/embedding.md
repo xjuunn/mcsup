@@ -2,10 +2,10 @@
 
 第三方启动器集成方式，以及作为 Rust 库发布到 crates.io 的分发形态。
 
-本文记录**目标架构**，当前处于未实施状态：仓库只有 `crates/domain`。
-`docs/architecture.md` 的 Workspace 架构一节描述的是当前多 crate 布局，
-迁移时需同步更新；`scripts/check-architecture.sh` 的成员与命名校验届时改为
-模块 `use` 图检查。
+本文记录已实施的**门面架构**：多 crate 保留，`mcsup` 作为门面在
+`crates/mcsup` 内按 feature 重导出内层 crate。`docs/architecture.md` 的
+Workspace 架构一节与本方案一致；`scripts/check-architecture.sh` 校验成员、
+命名、apps 互依赖与门面 feature ↔ `pub use` 对应。
 
 ## 目标
 
@@ -29,25 +29,28 @@ CLI 模块内部因此分两层：命令语义和渲染分离。第三方 Rust �
 
 ## Layer 结构与依赖方向
 
-单 package，feature 门控。模块分层如下：
+多 crate + 门面：能力层保持独立 crate（`crates/<name>`），`mcsup` 按
+feature 重导出。分层如下：
 
 ```
-crates/mcsup/               package mcsup（库，唯一发布单元）
-├── domain/                 领域模型、值对象、状态机、领域错误
-├── port/                   能力 trait：Backend / ProcessSpawner /
-│                           JavaResolver / ServerRepository / ConsoleSink /
-│                           EventSink / Clock
-├── service/                用例编排：start / stop / status / backup
-├── protocol/               消息和结果类型（唯一契约来源）
-├── cli/                    CLI 命令语义和渲染（feature = "cli"）
-└── 实现层（feature 门控）：
+crates/mcsup/               门面 package mcsup（唯一入口与发布主体）
+│                           src/lib.rs：feature → pub use 重导出
+├── 已落地（内层 crate + 门面同名 feature）：
+│   ├── domain/             领域模型、值对象、状态机、领域错误（无依赖）
+│   ├── port/               能力 trait：Backend / ProcessSpawner /
+│   │                       JavaResolver / ServerRepository / ConsoleSink /
+│   │                       EventSink / Clock（依赖 domain）
+│   ├── service/            用例编排：start / stop / status / backup
+│   ├── file/               文件系统和文件传输
+│   └── provider/           外部资源和第三方 API
+└── 待建（同样建 crate 并在门面加 feature；cli 为门面内模块）：
+    ├── protocol/           消息和结果类型（唯一契约来源）
+    ├── cli/                CLI 命令语义和渲染（feature = "cli"，门面内模块）
     ├── backend/            Local / Remote 执行位置选择（实现 port::Backend）
     ├── runtime/            Minecraft / JVM 进程运行（实现 port）
     ├── java/               Java 检测与版本管理（实现 port）
     ├── storage/            元数据持久化（实现 port::ServerRepository）
-    ├── file/               文件系统和文件传输
     ├── backup/             CAS / Snapshot / Restore
-    ├── provider/           外部资源和第三方 API
     ├── modkit/             Mod / Modpack
     ├── transport/          RPC 通信（RemoteBackend 使用）
     ├── api/                REST DTO / OpenAPI（apps/server 使用）
@@ -76,9 +79,10 @@ crates/mcsup/               package mcsup（库，唯一发布单元）
   它只通过 `port` 的 trait 工作。
 - CLI 不得绕过 `service` 直接调用实现层。
 
-分层规则将纳入 `scripts/check-architecture.sh`。当前脚本只校验包命名、
-app 互依赖和 `domain` 不依赖其他 workspace 包；上表的分层和依赖方向
-校验要在迁移到单 package、模块边界固定后才能实施。
+分层在多 crate 形态下由 Cargo manifest 直接表达（实现层只声明 domain / port
+等依赖）。`scripts/check-architecture.sh` 校验包命名、app 互依赖、
+`domain` 不依赖其他 workspace 包与门面 feature ↔ `pub use` 对应；
+crate 级依赖方向断言（实现层之间不互相依赖）尚待补入该脚本。
 
 ## Port / Adapter
 
@@ -159,15 +163,17 @@ CLI 既是人类工具，也是第三方（非 Rust）的编程接口。两者�
 
 ### 发布单元
 
-只发布一个包：`mcsup`（lib）。
+门面 `mcsup` 是唯一入口与发布主体；它 feature 拉入的每个内层 crate 必须
+随之发布（crates.io 不接受 path-only / `publish = false` 依赖）：
 
 ```
 crates.io
-└── mcsup              lib，第三方嵌入，feature 选择能力
+├── mcsup                  门面 lib，feature 选择能力
+└── mcsup-domain 等         内层（发布时由单词名改名，见下）
 
 仓库，不发布
-├── crates/mcsup/      被上面那个包包含
-└── apps/cli/ ...      bin，装出 mcsup / mcsup-agent / mcsup-server
+├── crates/mcsup/           门面；内层现为 publish = false 的 path 依赖
+└── apps/cli/ ...           bin，装出 mcsup / mcsup-agent / mcsup-server
 ```
 
 `apps/` 不发布到 crates.io。它们通过 `--path` 或 `--git` 安装：
@@ -181,61 +187,57 @@ Cargo 禁止同一 workspace 内出现同名 package，所以发布库叫 `mcsup
 `apps/` 下的包不能用这个名字。但由于 apps 的 package 名本就是单词名
 （`cli` / `agent` / `server`），不构成冲突。
 
-不把库拆成 `mcsup-domain` / `mcsup-service` / … 的原因：
+### 为什么是多 crate + 门面
 
-- crates.io 上 `domain` / `service` / `port` / `sdk` 已被占用
-  （实测 2026-10），单词名无法发布。
-- 多包意味着发布顺序管理，且存在版本错配风险（宿主同时依赖旧版
-  `mcsup-domain` 与新版 `mcsup` 时类型不兼容）。
-- 多包会让内部 crate 泄漏成公共 API，防守成本高。
+保留多 crate 而不并成单 package 的原因：
+
+- 增量编译与构建并行：crate 边界即缓存边界，改 `file` 不重编 `domain`。
+- 内层可被独立依赖与演进（如只想用 `domain` 做校验的第三方）。
+- 门面把多包成本收口：第三方只面对 `mcsup`，feature 级联保证「开什么得
+  什么」且类型同源，不必手拼多个 crate 的版本组合。
+
+发布时接受的代价：
+
+- 单词名 `domain` / `port` / `service` / `file` / `provider` 在 crates.io
+  均被占用（实测 2026-10）；内层发布必须改名 `mcsup-*`（已验证可用）。
+- 发布顺序：`mcsup-domain → mcsup-port → mcsup-service / mcsup-file /
+  mcsup-provider → mcsup`。
+- 版本锁步：内层与门面共用 `workspace.version` 一起 bump，避免同名类型
+  跨版本不兼容。
+- 内层一经发布即成公共 API，跨层重构受 semver 约束。
+- 只开发不发布时无需改名：内层 `publish = false`，`apps/cli` 与测试方走
+  path 依赖；未改名前 `cargo publish -p mcsup` 必然失败。
 
 ### Feature 矩阵
 
 `default = []`，强制显式选择。不设默认是因为默认 feature 会让
-"只选部分能力"名存实亡：写了 `features = ["backup"]` 仍会带上默认的
-`core` + `service`，除非调用方记得写 `default-features = false`，
+"只选部分能力"名存实亡：写了 `features = ["file"]` 仍会带上默认的
+`service` + `provider`，除非调用方记得写 `default-features = false`，
 而大部分调用方不会记得。
 
-命名组合给不确定选哪些的调用方：
+已实施（`crates/mcsup/Cargo.toml`，feature 切可选依赖并按名重导出）：
 
 ```
-minimal = ["domain", "service"]
-full    = ["domain", "service", "protocol", "backend", "runtime", "backup",
-           "file", "modkit", "java", "provider", "storage", "transport"]
+domain   = ["dep:domain"]
+port     = ["dep:port", "domain"]
+service  = ["dep:service", "port"]
+file     = ["dep:file", "port"]
+provider = ["dep:provider", "port"]
 ```
 
-能力组（模块用 cfg 门控，外部依赖用 `dep:` 门控）：
+级联规则：feature 引用同级 feature，被引用者带出其可选依赖——只要
+`mcsup::port` 可命名，`mcsup::domain` 必可命名。每新增一个内层 crate，
+同步三处：可选依赖（`path + version`）、feature 级联、`lib.rs` 的
+`pub use`。
 
-```
-domain    = ["dep:thiserror"]
-port      = []
-service   = ["domain", "port"]
-protocol  = []
-backend   = ["domain", "port"]
-runtime   = ["domain", "port", "dep:tokio"]
-backup    = ["domain", "dep:sha2"]
-file      = ["dep:walkdir", "dep:fs2"]
-storage   = ["dep:rusqlite"]
-java      = ["dep:which"]
-provider  = ["dep:reqwest"]
-modkit    = ["dep:zip"]
-transport = ["protocol", "dep:tonic"]
-api       = ["protocol"]
-auth      = []
-cli       = ["service", "dep:clap"]
-```
+组合 feature（`minimal` / `full`）尚未声明：`check-architecture.sh` 的
+feature_bundles 目前只豁免 `default`，新增组合 feature 时同步豁免。
 
-`full` 面向库嵌入者，含远程管理与备份，但不含 `api` / `auth`——
-它们是 `apps/server` 专用的 HTTP 契约与鉴权，库嵌入者不需要。
+feature 语义必须机器校验。如果 `file` 硬依赖 `provider`，那
+`features = ["file"]` 会把 `reqwest` 拉进来，这个 feature 就是假的。
 
-`thiserror` 是 domain 错误类型的派生宏，只在构建期生成代码，不引入
-运行时依赖，因此 `domain` feature 必须带上它。
-
-feature 语义必须机器校验。如果 `backup` 硬依赖 `storage`，那
-`features = ["backup"]` 会把 `storage` 拉进来，这个 feature 就是假的。
-
-该检查尚未实现。迁移到单 package 后，`scripts/check-architecture.sh` 应
-对每个 feature 单独构建并断言实际拉入的依赖集合等于允许集合。
+该检查尚未实现。门面形态下的断言方式：`cargo tree -p mcsup
+--no-default-features --features <f>` 实际拉入的依赖集合等于允许集合。
 
 ### CLI 与库的解耦
 
@@ -280,18 +282,16 @@ mcsup = { version = "0.1", default-features = false, features = ["full"] }
 
 ## 落地顺序
 
-依赖拓扑序，每步结束都是可用状态：
+依赖拓扑序，每步结束都是可用状态。已落地：domain、port、service、
+file、provider（内层 crate + 门面 feature）、apps/cli（`server install`
+已接通，其余命令为桩）。后续按序：
 
 ```
-1  domain      状态机 + 值对象
-2  port        trait 签名冻结
-3  service     用例编排，测试用内存 fake
-4  protocol    命令 + 结果类型冻结
-5  cli         命令语义 + 渲染 + JSON
-6  apps/cli    CLI 入口，bin 名为 mcsup
-7  runtime     第一个真实 ProcessSpawner
-8  storage     第一个真实 Repository
-9  sidecar     protocol 的 HTTP 绑定
+1  protocol    命令 + 结果类型冻结
+2  cli         库侧命令语义 + 渲染 + JSON
+3  runtime     第一个真实 ProcessSpawner
+4  storage     第一个真实 Repository
+5  sidecar     protocol 的 HTTP 绑定
 ```
 
-第 1-6 步做完，CLI 已完整，同时非 Rust 第三方已有编程接口。
+第 1-2 步做完，CLI 库侧语义完整；第 5 步后非 Rust 第三方已有网络编程接口。
