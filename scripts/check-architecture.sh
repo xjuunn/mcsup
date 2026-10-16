@@ -215,10 +215,9 @@ if [ -f "$pkg_manifest" ] && [ -f "$pkg_lib" ]; then
 			continue
 		fi
 
-		# 属性可叠加（cfg + doc_cfg），往下看几行而非只看紧邻一行
 		if ! grep -A3 -E "cfg\(feature[[:space:]]*=[[:space:]]*\"$feature\"\)" "$pkg_lib" |
-			grep -qE "pub[[:space:]]+mod[[:space:]]+$feature;"; then
-			fail "$feature: 声明了 feature 但没有 #[cfg(feature = \"$feature\")] pub mod $feature"
+			grep -qE "pub[[:space:]]+(mod|use)[[:space:]]+$feature;"; then
+			fail "$feature: 声明了 feature 但没有 #[cfg(feature = \"$feature\")] pub mod/use $feature;"
 		fi
 	done
 

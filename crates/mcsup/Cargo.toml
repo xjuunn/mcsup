@@ -13,14 +13,21 @@ categories = ["command-line-utilities", "database", "network-programming"]
 [lints]
 workspace = true
 
-# feature 跟着模块走：模块没落地就不声明，拼错的名字会被静默接受。
-# domain / port 无条件编译；其余模块一律门控，依赖用 dep: 门控。
+[dependencies]
+domain = { path = "../domain", version = "0.1.0", optional = true }
+port = { path = "../port", version = "0.1.0", optional = true }
+service = { path = "../service", version = "0.1.0", optional = true }
+file = { path = "../file", version = "0.1.0", optional = true }
+provider = { path = "../provider", version = "0.1.0", optional = true }
+
 [features]
 default = []
-
-# 无依赖。thiserror 等第一个 #[derive(Error)] 出现时再加。
+domain = ["dep:domain"]
+port = ["dep:port", "domain"]
+service = ["dep:service", "port"]
+file = ["dep:file", "port"]
+provider = ["dep:provider", "port"]
 
 [package.metadata.docs.rs]
-# 不加这段，docs.rs 不传 --cfg docsrs，使用方看不到哪个模块需要哪个 feature。
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

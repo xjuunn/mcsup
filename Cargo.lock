@@ -1135,6 +1135,13 @@ dependencies = [
 [[package]]
 name = "mcsup"
 version = "0.1.0"
+dependencies = [
+ "domain",
+ "file",
+ "port",
+ "provider",
+ "service",
+]
 
 [[package]]
 name = "memchr"
