@@ -8,7 +8,7 @@ use port::CancellationToken;
 use provider::http::HttpByteSource;
 use provider::mojang::MojangSource;
 use service::ServerInstaller;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use tracing::info;
 
@@ -20,16 +20,13 @@ use tracing::info;
 pub(crate) async fn run(
     version: &str,
     dir: Option<&Path>,
-    cfg: &Config,
+    _cfg: &Config,
     printer: Printer,
 ) -> Result<()> {
     let version_id = VersionId::new(version);
     let dir = match dir {
         Some(dir) => dir.to_path_buf(),
-        None => cfg
-            .install_dir
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(".")),
+        None => std::env::current_dir().context("获取当前工作目录失败")?,
     };
     let destination = dir.join("server.jar");
     let source = Arc::new(MojangSource::new().context("初始化 Mojang 源")?);
