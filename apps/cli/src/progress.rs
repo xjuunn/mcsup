@@ -1,5 +1,5 @@
 use indicatif::{ProgressBar, ProgressStyle};
-use port::ProgressSink;
+use mcsup::port::ProgressSink;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 

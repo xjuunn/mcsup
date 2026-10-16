@@ -3,7 +3,8 @@
 #
 # cargo 不校验 crate 命名与依赖方向，AGENTS.md 的命名与依赖规则只能在这里断言。
 # 检查项：成员覆盖、禁用名、mcsup- 前缀（库禁止 / bin 必需）、apps 依赖、
-# [lints]、模块依赖方向、feature 与模块对应。
+# [lints]、模块依赖方向、feature 与模块对应、feature 语义（拉入内层集合
+# 等于允许集合）。
 #
 # 用法：sh scripts/check-architecture.sh
 
@@ -235,6 +236,66 @@ if [ -f "$pkg_manifest" ] && [ -f "$pkg_lib" ]; then
 		fi
 		if ! contains "$module" "$declared_features"; then
 			fail "mcsup::$module: 非常开模块必须声明同名 feature，否则它会无条件编译"
+		fi
+	done
+
+	# 9: feature 语义。feature 若硬依赖其他能力 crate（如 file 拉入 provider），
+	# 「只开 file」名存实亡。断言：每个 feature 拉入的内层 crate 集合等于其
+	# 级联闭包；空 feature 一个内层也不拉。允许集合 = facade_allow，新增
+	# crate / feature 时同步更新。
+
+	inner_names=''
+	for manifest in crates/*/Cargo.toml; do
+		name=$(pkg_name "$manifest")
+		if [ -n "$name" ] && [ "$name" != 'mcsup' ]; then
+			inner_names="$inner_names $name"
+		fi
+	done
+
+	facade_allow() {
+		case "$1" in
+		domain) printf '%s' 'domain' ;;
+		port) printf '%s' 'domain port' ;;
+		service) printf '%s' 'domain port service' ;;
+		file) printf '%s' 'domain port file' ;;
+		provider) printf '%s' 'domain port provider' ;;
+		*) printf '%s' '' ;;
+		esac
+	}
+
+	facade_inner_of() {
+		if [ -n "$1" ]; then
+			cargo tree -p mcsup --no-default-features --features "$1" \
+				--edges normal,build --prefix none 2>/dev/null
+		else
+			cargo tree -p mcsup --no-default-features \
+				--edges normal,build --prefix none 2>/dev/null
+		fi | awk '{print $1}' | sort -u
+	}
+
+	actual=$(facade_inner_of '')
+	for name in $inner_names; do
+		if printf '%s\n' "$actual" | grep -qx "$name"; then
+			fail "门面空 feature: 不应拉入内层 $name"
+		fi
+	done
+
+	for feature in $declared_features; do
+		if contains "$feature" "$feature_bundles"; then
+			continue
+		fi
+
+		actual=$(facade_inner_of "$feature")
+		picked=''
+		for name in $inner_names; do
+			if printf '%s\n' "$actual" | grep -qx "$name"; then
+				picked="$picked $name"
+			fi
+		done
+		picked=$(printf '%s\n' $picked | sort | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+		allowed=$(facade_allow "$feature" | tr ' ' '\n' | sed '/^$/d' | sort | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+		if [ "$picked" != "$allowed" ]; then
+			fail "feature $feature: 拉入内层 [$picked]，允许 [$allowed]；feature 级联或允许集合表不同步"
 		fi
 	done
 fi

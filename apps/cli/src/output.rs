@@ -1,8 +1,8 @@
 use crate::diagnostic::AppDiagnostic;
 use comfy_table::{Cell, Table};
-use domain::server::version::VersionId;
+use mcsup::domain::server::version::VersionId;
+use mcsup::port::DownloadedArtifact;
 use owo_colors::OwoColorize;
-use port::DownloadedArtifact;
 use serde::Serialize;
 use std::fmt::{self};
 use std::path::Path;
@@ -87,18 +87,18 @@ impl Printer {
             return diag.exit_code;
         }
         for cause in err.chain() {
-            if let Some(install) = cause.downcast_ref::<service::InstallError>() {
+            if let Some(install) = cause.downcast_ref::<mcsup::service::InstallError>() {
                 return match install {
-                    service::InstallError::Source(source) => source_exit_code(source),
-                    service::InstallError::Download(_) => 5,
-                    service::InstallError::Status(_) => 4,
+                    mcsup::service::InstallError::Source(source) => source_exit_code(source),
+                    mcsup::service::InstallError::Download(_) => 5,
+                    mcsup::service::InstallError::Status(_) => 4,
                     _ => 1,
                 };
             }
-            if let Some(source) = cause.downcast_ref::<port::SourceError>() {
+            if let Some(source) = cause.downcast_ref::<mcsup::port::SourceError>() {
                 return source_exit_code(source);
             }
-            if cause.downcast_ref::<port::DownloadError>().is_some() {
+            if cause.downcast_ref::<mcsup::port::DownloadError>().is_some() {
                 return 5;
             }
         }
@@ -119,12 +119,12 @@ impl Printer {
     }
 }
 
-fn source_exit_code(source: &port::SourceError) -> u8 {
+fn source_exit_code(source: &mcsup::port::SourceError) -> u8 {
     match source {
-        port::SourceError::NotFound(_) => 3,
-        port::SourceError::Network(_)
-        | port::SourceError::Status { .. }
-        | port::SourceError::Init(_) => 5,
+        mcsup::port::SourceError::NotFound(_) => 3,
+        mcsup::port::SourceError::Network(_)
+        | mcsup::port::SourceError::Status { .. }
+        | mcsup::port::SourceError::Init(_) => 5,
         _ => 1,
     }
 }
@@ -187,12 +187,12 @@ fn print_error_line(text: &str) {
 mod tests {
     use super::Printer;
     use anyhow::Context as _;
-    use domain::server::version::VersionId;
-    use port::SourceError;
+    use mcsup::domain::server::version::VersionId;
+    use mcsup::port::SourceError;
 
     #[test]
     fn backend_failure_maps_to_exit_code_5() {
-        let err = Err::<(), _>(service::InstallError::from(SourceError::Network(
+        let err = Err::<(), _>(mcsup::service::InstallError::from(SourceError::Network(
             "boom".into(),
         )))
         .context("安装服务端失败")
