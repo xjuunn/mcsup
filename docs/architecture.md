@@ -181,6 +181,9 @@ domain → MCP
 Player、生命周期与状态转换、领域规则与领域事件、核心领域错误。状态用枚举
 显式表达（如 `Created → Starting → Running → Stopping → Stopped`）。
 
+Workspace 也是领域对象：`Workspace` / `WorkspaceId` / `WorkspaceName`、
+命名与默认标记、身份与移动规则。目录布局与存储规范见 `docs/workspace.md`。
+
 Domain 不涉及 CLI、HTTP、REST、TUI、MCP、数据库、RPC / gRPC，必须尽可能
 稳定、纯粹、可测试。
 
@@ -216,9 +219,9 @@ Artifact 获取。Provider 不承担核心业务流程。
 
 # Storage
 
-Storage 持久化元数据：Server、配置、Backup / Snapshot 元数据、User / Role /
-Permission、Agent、Task、Audit 等，只存 metadata / index / relationship /
-configuration / state。大文件不进数据库。
+Storage 持久化元数据：Workspace、Server、配置、Backup / Snapshot 元数据、
+User / Role / Permission、Agent、Task、Audit 等，只存 metadata / index /
+relationship / configuration / state。大文件不进数据库。
 
 # File
 

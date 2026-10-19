@@ -9,25 +9,31 @@
 - **服务属性统一 `server set`**：JVM 绑定、内存、自启等一律
   `mcsup server set <name> <key> <value>`，不为一类属性单开子命令。
 - **机器级命令**：`java`（本机 JVM 运行时）、`remote`（远端执行位置）。
-- **平台级命令直接动作**：`init` / `doctor` / `config` / `update` 等。
+- **平台级命令直接动作**：`doctor` / `config` / `update` 等；工作目录经
+  `workspace` 子命令管理。
+- **服务器只能建在已注册工作目录下**：`--workspace <名>` 按名选择，
+  缺省用默认工作目录；目录规范与 init 行为见 `docs/workspace.md`。
 
 命令层级：
 
 ```
 mcsup
+├── workspace                 # 工作目录：创建 / 注册表 / 默认切换
+│   ├── init [--dir <path>] [--name <name>]
+│   ├── list / use <name> / remove <name> [--purge] / info
 ├── server                    # 单台服务：生命周期 + 属主内容
 │   ├── list / create / install / start / stop / restart
 │   ├── status / console / send / logs / props / set / remove / version
 │   ├── backup    create · list · restore · verify · prune
 │   └── mod       list · install · remove · update · outdated
 ├── modpack                   # 整合包：一键建整包服务器
-│   ├── install <pack> [--name <name>] [--dir <path>]
+│   ├── install <pack> [--name <name>] [--workspace <ws>]
 │   └── update <name>
 ├── java                      # 机器级 JVM 运行时
 │   └── list / install / uninstall / default
 ├── remote                    # 远端执行位置（Backend）
 │   └── list / deploy / ping / remove
-└── init / doctor / config / update / completions / version / help
+└── doctor / config / update / completions / version / help
 ```
 
 CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、JSON 等
@@ -38,7 +44,7 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | 子命令 | 用法 | 说明 |
 | --- | --- | --- |
 | `list` | `mcsup server list` | 列出所有服务与状态 |
-| `create` | `mcsup server create <name> --version <ver> [--variant <v>] [--dir <path>]` | 按指定版本/变体建站；`--variant` 取 `vanilla/paper/fabric/forge/neoforge` |
+| `create` | `mcsup server create <name> --version <ver> [--variant <v>] [--workspace <ws>]` | 按指定版本/变体建站，落在所选工作目录；`--variant` 取 `vanilla/paper/fabric/forge/neoforge` |
 | `install` | `mcsup server install <name> [--version <ver>]` | 给既有服务安装/更换服务端核心（JAR），校验后落盘 |
 | `start` | `mcsup server start <name>` | 按已配置的 JVM 与内存启动，返回 PID |
 | `stop` | `mcsup server stop <name> [--grace <sec>] [--force]` | 先优雅停机，宽限后 `--force` 强杀 |
@@ -82,11 +88,21 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | `update` | `mcsup server mod update <name> [<mod>]` | 更新指定或全部（先 dry-run 列出变更） |
 | `outdated` | `mcsup server mod outdated <name>` | 可更新清单 |
 
+## mcsup workspace（工作目录）
+
+| 子命令 | 用法 | 说明 |
+| --- | --- | --- |
+| `init` | `mcsup workspace init [--dir <path>] [--name <name>]` | 创建并注册工作目录；无 `--dir` 进入交互（默认当前目录），目录必须为空 |
+| `list` | `mcsup workspace list` | 已注册工作目录：名称、路径、服务器数、是否默认 |
+| `use` | `mcsup workspace use <name>` | 切换默认工作目录；只影响 `create` 落点，不隐藏其他目录的服务器 |
+| `remove` | `mcsup workspace remove <name> [--purge]` | 注销工作目录；`--purge` 才删磁盘数据 |
+| `info` | `mcsup workspace info` | 默认工作目录、平台数据目录与结构说明 |
+
 ## mcsup modpack（整合包：一键建整包服务器）
 
 | 子命令 | 用法 | 说明 |
 | --- | --- | --- |
-| `install` | `mcsup modpack install <pack> [--name <name>] [--dir <path>]` | 一键建整包服务器；缺省 `--name` 时用整包名 |
+| `install` | `mcsup modpack install <pack> [--name <name>] [--workspace <ws>]` | 一键建整包服务器；缺省 `--name` 时用整包名 |
 | `update` | `mcsup modpack update <name>` | 把已安装整包升级到新版本（先 dry-run 列出变更） |
 
 建好的整包服务与 `server create` 建的服务是同一种对象，后续运维都走
@@ -100,6 +116,8 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | `install` | `mcsup java install <version> [--vendor <name>]` | 下载并安装 JVM |
 | `uninstall` | `mcsup java uninstall <version>` | 移除运行时 |
 | `default` | `mcsup java default [<version>]` | 查询/设置默认运行时 |
+
+JVM 安装在平台数据目录 `{data_dir}/mcsup/java/`，不属于任何工作目录。
 
 ## mcsup remote（远端执行位置 = Backend）
 
@@ -116,7 +134,6 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 
 | 子命令 | 用法 | 说明 |
 | --- | --- | --- |
-| `init` | `mcsup init [--dir <path>]` | 建默认配置目录与第一个服务目录 |
 | `doctor` | `mcsup doctor` | 自检：路径权限、Java、provider 连通、远端 |
 | `config` | `mcsup config show \| set <key> <value> \| edit` | 查看/修改/编辑平台配置，`edit` 打开 `$EDITOR` |
 | `update` | `mcsup update [--version <v>]` | 升级 mcsup 自身 |
