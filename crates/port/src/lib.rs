@@ -1,7 +1,8 @@
 use domain::server::artifact::{Checksum, JarArtifact};
 use domain::server::meta::{InstalledJar, ServerMeta, ServerName};
 use domain::server::version::{ServerVersion, VersionId};
-use std::path::PathBuf;
+use domain::workspace::{Workspace, WorkspaceId, WorkspaceName};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
@@ -233,11 +234,11 @@ pub trait ArtifactDownloader: Send + Sync {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum RepositoryError {
-    /// 同名服务已存在
-    #[error("server already exists: {0}")]
+    /// 同名服务或工作目录已存在
+    #[error("already exists: {0}")]
     AlreadyExists(String),
-    /// 服务不存在
-    #[error("server not found: {0}")]
+    /// 服务或工作目录不存在
+    #[error("not found: {0}")]
     NotFound(String),
     /// 记录内容损坏，无法还原为领域对象
     #[error("corrupt repository record: {0}")]
@@ -253,7 +254,7 @@ pub trait ServerRepository: Send + Sync {
     ///
     /// # Errors
     ///
-    /// 名称或目录冲突返回 [`RepositoryError::AlreadyExists`]；
+    /// 名称冲突或同工作目录下 `rel_dir` 冲突返回 [`RepositoryError::AlreadyExists`]；
     /// 底层失败返回 [`RepositoryError::Storage`]
     fn create(&self, meta: &ServerMeta) -> Result<(), RepositoryError>;
 
@@ -282,6 +283,92 @@ pub trait ServerRepository: Send + Sync {
         jar: &InstalledJar,
         updated_at: i64,
     ) -> Result<ServerMeta, RepositoryError>;
+
+    /// 按工作目录删除全部服务器登记（注销工作目录时用）
+    ///
+    /// # Errors
+    ///
+    /// 底层失败返回 [`RepositoryError::Storage`]
+    fn remove_by_workspace(&self, workspace_id: &WorkspaceId) -> Result<(), RepositoryError>;
+
+    /// 按名称改挂到另一工作目录并更新 `rel_dir`（移动单服）
+    ///
+    /// # Errors
+    ///
+    /// 不存在返回 [`RepositoryError::NotFound`]，
+    /// 目标冲突返回 [`RepositoryError::AlreadyExists`]
+    fn relink(
+        &self,
+        name: &ServerName,
+        workspace_id: &WorkspaceId,
+        rel_dir: &Path,
+        updated_at: i64,
+    ) -> Result<ServerMeta, RepositoryError>;
+}
+
+/// 工作目录注册表存储
+pub trait WorkspaceRepository: Send + Sync {
+    /// 写入新工作目录
+    ///
+    /// # Errors
+    ///
+    /// 名称或路径冲突返回 [`RepositoryError::AlreadyExists`]；
+    /// 底层失败返回 [`RepositoryError::Storage`]
+    fn create(&self, ws: &Workspace) -> Result<(), RepositoryError>;
+
+    /// 按身份读取
+    ///
+    /// # Errors
+    ///
+    /// 不存在返回 [`RepositoryError::NotFound`]
+    fn get(&self, id: &WorkspaceId) -> Result<Workspace, RepositoryError>;
+
+    /// 按名称读取
+    ///
+    /// # Errors
+    ///
+    /// 不存在返回 [`RepositoryError::NotFound`]
+    fn get_by_name(&self, name: &WorkspaceName) -> Result<Workspace, RepositoryError>;
+
+    /// 全部工作目录，按名称升序
+    ///
+    /// # Errors
+    ///
+    /// 底层失败返回 [`RepositoryError::Storage`]
+    fn list(&self) -> Result<Vec<Workspace>, RepositoryError>;
+
+    /// 当前默认工作目录；尚无注册时为 `None`
+    ///
+    /// # Errors
+    ///
+    /// 底层失败返回 [`RepositoryError::Storage`]
+    fn default(&self) -> Result<Option<Workspace>, RepositoryError>;
+
+    /// 设为默认并清除其他默认标记（原子）
+    ///
+    /// # Errors
+    ///
+    /// 不存在返回 [`RepositoryError::NotFound`]
+    fn set_default(&self, id: &WorkspaceId) -> Result<(), RepositoryError>;
+
+    /// 注销（不删磁盘）
+    ///
+    /// # Errors
+    ///
+    /// 不存在返回 [`RepositoryError::NotFound`]
+    fn remove(&self, id: &WorkspaceId) -> Result<(), RepositoryError>;
+
+    /// 移动后改写路径并刷新 `updated_at`
+    ///
+    /// # Errors
+    ///
+    /// 不存在返回 [`RepositoryError::NotFound`]
+    fn relink_path(
+        &self,
+        id: &WorkspaceId,
+        path: &Path,
+        updated_at: i64,
+    ) -> Result<(), RepositoryError>;
 }
 
 #[cfg(test)]

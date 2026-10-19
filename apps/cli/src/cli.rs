@@ -27,6 +27,11 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
+    /// 工作目录：创建 / 注册表 / 默认切换
+    Workspace {
+        #[command(subcommand)]
+        action: WorkspaceAction,
+    },
     /// 服务端生命周期与运维
     Server {
         #[command(subcommand)]
@@ -47,11 +52,6 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: RemoteAction,
     },
-    /// 初始化默认配置与服务目录
-    Init {
-        #[arg(long, value_name = "PATH")]
-        dir: Option<PathBuf>,
-    },
     /// 环境自检
     Doctor,
     /// 查看 / 编辑平台配置
@@ -68,6 +68,29 @@ pub(crate) enum Command {
 }
 
 #[derive(Debug, Subcommand)]
+pub(crate) enum WorkspaceAction {
+    /// 创建并注册工作目录
+    Init {
+        #[arg(long, value_name = "PATH")]
+        dir: Option<PathBuf>,
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+    },
+    /// 已注册工作目录
+    List,
+    /// 切换默认工作目录
+    Use { name: String },
+    /// 注销工作目录
+    Remove {
+        name: String,
+        #[arg(long)]
+        purge: bool,
+    },
+    /// 默认工作目录与平台数据目录
+    Info,
+}
+
+#[derive(Debug, Subcommand)]
 pub(crate) enum ServerAction {
     /// 列出所有服务
     List,
@@ -78,15 +101,14 @@ pub(crate) enum ServerAction {
         version: String,
         #[arg(long, value_name = "VAR")]
         variant: Option<String>,
-        #[arg(long, value_name = "PATH")]
-        dir: Option<PathBuf>,
+        #[arg(long, value_name = "WS")]
+        workspace: Option<String>,
     },
     /// 安装 / 更换服务端核心
     Install {
-        #[arg(value_name = "VERSION")]
-        version: String,
-        #[arg(long, value_name = "PATH")]
-        dir: Option<PathBuf>,
+        name: String,
+        #[arg(long, value_name = "VER")]
+        version: Option<String>,
     },
     /// 启动服务
     Start { name: String },
@@ -183,8 +205,8 @@ pub(crate) enum ModpackAction {
         pack: String,
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
-        #[arg(long, value_name = "PATH")]
-        dir: Option<PathBuf>,
+        #[arg(long, value_name = "WS")]
+        workspace: Option<String>,
     },
 }
 

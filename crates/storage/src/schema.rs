@@ -1,9 +1,22 @@
 // @generated automatically by Diesel CLI.
 
 diesel::table! {
-    servers (name) {
+    workspaces (id) {
+        id -> Text,
         name -> Text,
-        dir -> Text,
+        path -> Text,
+        is_default -> Bool,
+        created_at -> BigInt,
+        updated_at -> BigInt,
+    }
+}
+
+diesel::table! {
+    servers (id) {
+        id -> Text,
+        name -> Text,
+        workspace_id -> Text,
+        rel_dir -> Text,
         version -> Text,
         variant -> Text,
         jar_path -> Nullable<Text>,

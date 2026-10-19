@@ -158,7 +158,7 @@ fn human_bytes(n: u64) -> String {
     }
 }
 #[allow(clippy::print_stdout)]
-fn print_table(table: &Table) {
+pub(crate) fn print_table(table: &Table) {
     println!("{table}");
 }
 

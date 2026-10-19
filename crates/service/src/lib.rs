@@ -1,3 +1,9 @@
+mod registry;
+mod workspace;
+
+pub use registry::{RegisteredServer, ServerRegistry, ServerRegistryError};
+pub use workspace::{InitOutcome, WorkspaceError, WorkspaceService};
+
 use domain::server::download::DownloadStatus;
 use domain::server::error::InvalidTransition;
 use domain::server::version::VersionId;

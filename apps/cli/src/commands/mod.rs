@@ -1,4 +1,6 @@
 mod install;
+mod server_ops;
+mod workspace;
 
 use crate::cli::{Cli, Command, ServerAction};
 use crate::config::Config;
@@ -9,11 +11,11 @@ use anyhow::{Ok, Result};
 pub(crate) async fn run(cli: Cli, cfg: &Config) -> Result<()> {
     let printer = Printer::new(cli.output);
     match cli.command {
+        Command::Workspace { action } => workspace::run(action, printer),
         Command::Server { action } => server(action, cfg, printer).await,
         Command::Modpack { .. } => err("modpack"),
         Command::Java { .. } => err("java"),
         Command::Remote { .. } => err("remote"),
-        Command::Init { .. } => err("init"),
         Command::Doctor => err("doctor"),
         Command::Config { .. } => {
             printer.print_section(&format!("配置: {}", cfg.path.display()));
@@ -30,10 +32,21 @@ pub(crate) async fn run(cli: Cli, cfg: &Config) -> Result<()> {
 
 async fn server(action: ServerAction, cfg: &Config, printer: Printer) -> Result<()> {
     match action {
-        ServerAction::List => err("list"),
-        ServerAction::Create { .. } => err("create"),
-        ServerAction::Install { version, dir } => {
-            install::run(&version, dir.as_deref(), cfg, printer).await
+        ServerAction::List => server_ops::list(printer),
+        ServerAction::Create {
+            name,
+            version,
+            variant,
+            workspace,
+        } => server_ops::create(
+            &name,
+            &version,
+            variant.as_deref(),
+            workspace.as_deref(),
+            printer,
+        ),
+        ServerAction::Install { name, version } => {
+            install::run(&name, version.as_deref(), cfg, printer).await
         }
         ServerAction::Start { .. } => err("start"),
         ServerAction::Stop { .. } => err("stop"),

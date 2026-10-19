@@ -19,6 +19,7 @@ port = { path = "../port", version = "0.1.0", optional = true }
 service = { path = "../service", version = "0.1.0", optional = true }
 file = { path = "../file", version = "0.1.0", optional = true }
 provider = { path = "../provider", version = "0.1.0", optional = true }
+storage = { path = "../storage", version = "0.1.0", optional = true }
 
 [features]
 default = []
@@ -27,6 +28,7 @@ port = ["dep:port", "domain"]
 service = ["dep:service", "port"]
 file = ["dep:file", "port"]
 provider = ["dep:provider", "port"]
+storage = ["dep:storage", "port"]
 
 [package.metadata.docs.rs]
 all-features = true

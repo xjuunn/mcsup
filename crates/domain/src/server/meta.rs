@@ -1,6 +1,7 @@
 use super::artifact::Checksum;
 use super::error::InvalidServerName;
 use super::version::ServerVariant;
+use crate::workspace::{InvalidId, WorkspaceId, uuid_is_valid};
 use std::fmt;
 use std::path::PathBuf;
 
@@ -41,9 +42,40 @@ impl fmt::Display for ServerName {
     }
 }
 
+/// 服务器稳定身份：`mcsup.json` 与数据库共用的 UUID 文本
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ServerId(String);
+
+impl ServerId {
+    /// 校验并构造身份
+    ///
+    /// # Errors
+    ///
+    /// 非 8-4-4-4-12 十六进制 UUID 文本时返回 [`InvalidId`]
+    pub fn parse(raw: &str) -> Result<Self, InvalidId> {
+        if uuid_is_valid(raw) {
+            Ok(Self(raw.to_owned()))
+        } else {
+            Err(InvalidId(raw.to_owned()))
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ServerId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// 已安装并校验通过的服务端核心
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledJar {
+    /// 相对服务器目录（固定 `server.jar`），不存绝对路径
     pub path: PathBuf,
     pub size: u64,
     pub checksum: Checksum,
@@ -52,8 +84,11 @@ pub struct InstalledJar {
 /// 服务元数据：`storage` 持久化的领域对象
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerMeta {
+    pub id: ServerId,
     pub name: ServerName,
-    pub dir: PathBuf,
+    pub workspace_id: WorkspaceId,
+    /// 相对工作目录 `servers/` 下的目录名
+    pub rel_dir: PathBuf,
     pub version: super::version::VersionId,
     pub variant: ServerVariant,
     /// 尚未执行 `server install` 时为 `None`
@@ -83,6 +118,13 @@ mod tests {
         assert!(ServerName::parse("a/b").is_err());
         assert!(ServerName::parse("a b").is_err());
         assert!(ServerName::parse(&"x".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn server_id_requires_uuid_shape() {
+        let ok = "550e8400-e29b-41d4-a716-446655440000";
+        assert!(ServerId::parse(ok).is_ok());
+        assert!(ServerId::parse("1").is_err());
     }
 
     #[test]

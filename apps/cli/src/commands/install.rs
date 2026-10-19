@@ -8,7 +8,6 @@ use mcsup::port::CancellationToken;
 use mcsup::provider::http::HttpByteSource;
 use mcsup::provider::mojang::MojangSource;
 use mcsup::service::ServerInstaller;
-use std::path::Path;
 use std::sync::Arc;
 use tracing::info;
 
@@ -18,16 +17,15 @@ use tracing::info;
 ///
 /// 版本不存在（3）、来源或传输/校验失败（5）、其他安装失败（1）时返回错误
 pub(crate) async fn run(
-    version: &str,
-    dir: Option<&Path>,
+    name: &str,
+    version: Option<&str>,
     _cfg: &Config,
     printer: Printer,
 ) -> Result<()> {
+    let version = version.unwrap_or("latest");
     let version_id = VersionId::new(version);
-    let dir = match dir {
-        Some(dir) => dir.to_path_buf(),
-        None => std::env::current_dir().context("获取当前工作目录失败")?,
-    };
+    let dir = std::env::current_dir().context("获取当前工作目录失败")?;
+    let _ = name;
     let destination = dir.join("server.jar");
     let source = Arc::new(MojangSource::new().context("初始化 Mojang 源")?);
     let bytes = Arc::new(HttpByteSource::new().context("初始化 HTTP 传输")?);

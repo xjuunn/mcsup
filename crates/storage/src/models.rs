@@ -1,18 +1,33 @@
 use diesel::prelude::*;
 use domain::server::artifact::{Checksum, ChecksumAlgorithm};
-use domain::server::meta::{InstalledJar, ServerMeta, ServerName};
+use domain::server::meta::{InstalledJar, ServerId, ServerMeta, ServerName};
 use domain::server::version::{ServerVariant, VersionId};
+use domain::workspace::{Workspace, WorkspaceId, WorkspaceName};
 use port::RepositoryError;
 use std::path::PathBuf;
 
-use crate::schema::servers::{self};
+use crate::schema::{servers, workspaces};
 
-/// `server` 表的一行
+/// `workspaces` 表的一行
+#[derive(Debug, Clone, Queryable, Selectable, Insertable)]
+#[diesel(table_name = workspaces)]
+pub(crate) struct WorkspaceRow {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) path: String,
+    pub(crate) is_default: bool,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
+}
+
+/// `servers` 表的一行
 #[derive(Debug, Clone, Queryable, Selectable, Insertable)]
 #[diesel(table_name = servers)]
 pub(crate) struct ServerRow {
+    pub(crate) id: String,
     pub(crate) name: String,
-    pub(crate) dir: String,
+    pub(crate) workspace_id: String,
+    pub(crate) rel_dir: String,
     pub(crate) version: String,
     pub(crate) variant: String,
     pub(crate) jar_path: Option<String>,
@@ -23,7 +38,7 @@ pub(crate) struct ServerRow {
     pub(crate) updated_at: i64,
 }
 
-/// 核心元数据变更集：只更新这几列，不动 `name` / `dir`/ `created_at`
+/// 核心元数据变更集：只更新这几列，不动身份 / 归属 / `created_at`
 #[derive(Debug, AsChangeset)]
 #[diesel(table_name = servers)]
 pub(crate) struct JarChangeset {
@@ -32,6 +47,48 @@ pub(crate) struct JarChangeset {
     pub(crate) checksum_algo: String,
     pub(crate) checksum: String,
     pub(crate) updated_at: i64,
+}
+
+/// 移动归属变更集
+#[derive(Debug, AsChangeset)]
+#[diesel(table_name = servers)]
+pub(crate) struct RelinkChangeset {
+    pub(crate) workspace_id: String,
+    pub(crate) rel_dir: String,
+    pub(crate) updated_at: i64,
+}
+
+impl From<&Workspace> for WorkspaceRow {
+    fn from(ws: &Workspace) -> Self {
+        Self {
+            id: ws.id.as_str().to_owned(),
+            name: ws.name.as_str().to_owned(),
+            path: ws.path.to_string_lossy().into_owned(),
+            is_default: ws.is_default,
+            created_at: ws.created_at,
+            updated_at: ws.updated_at,
+        }
+    }
+}
+
+impl TryFrom<WorkspaceRow> for Workspace {
+    type Error = RepositoryError;
+
+    fn try_from(row: WorkspaceRow) -> Result<Self, Self::Error> {
+        let id = WorkspaceId::parse(&row.id)
+            .map_err(|err| RepositoryError::Corrupt(format!("workspace id {}: {err}", row.id)))?;
+        let name = WorkspaceName::parse(&row.name).map_err(|err| {
+            RepositoryError::Corrupt(format!("workspace name {}: {err}", row.name))
+        })?;
+        Ok(Self {
+            id,
+            name,
+            path: PathBuf::from(row.path),
+            is_default: row.is_default,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        })
+    }
 }
 
 impl From<&ServerMeta> for ServerRow {
@@ -46,8 +103,10 @@ impl From<&ServerMeta> for ServerRow {
             None => (None, None, None, None),
         };
         Self {
+            id: meta.id.as_str().to_owned(),
             name: meta.name.as_str().to_owned(),
-            dir: meta.dir.to_string_lossy().into_owned(),
+            workspace_id: meta.workspace_id.as_str().to_owned(),
+            rel_dir: meta.rel_dir.to_string_lossy().into_owned(),
             version: meta.version.as_str().to_owned(),
             variant: meta.variant.as_str().to_owned(),
             jar_path,
@@ -64,8 +123,13 @@ impl TryFrom<ServerRow> for ServerMeta {
     type Error = RepositoryError;
 
     fn try_from(row: ServerRow) -> Result<Self, Self::Error> {
+        let id = ServerId::parse(&row.id)
+            .map_err(|err| RepositoryError::Corrupt(format!("server id {}: {err}", row.id)))?;
         let name = ServerName::parse(&row.name)
             .map_err(|err| RepositoryError::Corrupt(format!("name {}: {err}", row.name)))?;
+        let workspace_id = WorkspaceId::parse(&row.workspace_id).map_err(|err| {
+            RepositoryError::Corrupt(format!("workspace_id {}: {err}", row.workspace_id))
+        })?;
         let variant = ServerVariant::parse(&row.variant)
             .map_err(|err| RepositoryError::Corrupt(format!("variant {}: {err}", row.variant)))?;
         let jar = match (row.jar_path, row.jar_size, row.checksum_algo, row.checksum) {
@@ -89,8 +153,10 @@ impl TryFrom<ServerRow> for ServerMeta {
         };
 
         Ok(Self {
+            id,
             name,
-            dir: PathBuf::from(row.dir),
+            workspace_id,
+            rel_dir: PathBuf::from(row.rel_dir),
             version: VersionId::new(row.version),
             variant,
             jar,

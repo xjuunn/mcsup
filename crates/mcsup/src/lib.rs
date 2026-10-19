@@ -32,3 +32,7 @@ pub use file;
 #[cfg(feature = "provider")]
 #[cfg_attr(docsrs, doc(cfg(feature = "provider")))]
 pub use provider;
+
+#[cfg(feature = "storage")]
+#[cfg_attr(docsrs, doc(cfg(feature = "storage")))]
+pub use storage;
