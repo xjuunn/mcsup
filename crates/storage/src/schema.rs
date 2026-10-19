@@ -27,3 +27,23 @@ diesel::table! {
         updated_at -> BigInt,
     }
 }
+
+diesel::table! {
+    java_runtimes (id) {
+        id -> Text,
+        path -> Text,
+        major -> BigInt,
+        version -> Text,
+        vendor -> Text,
+        managed -> Bool,
+        created_at -> BigInt,
+        updated_at -> BigInt,
+    }
+}
+
+diesel::table! {
+    java_scan_state (key) {
+        key -> Text,
+        scanned_at -> BigInt,
+    }
+}

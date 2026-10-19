@@ -64,7 +64,7 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 
 | 键 | 值 | 说明 |
 | --- | --- | --- |
-| `java-version` | 运行时版本 | 绑定本服务的 JVM（来自 `mcsup java` 运行时集，默认跟随 `java default`） |
+| `java-version` | 运行时版本 | 绑定本服务的 JVM 大版本（从 `mcsup java` 已注册运行时中按 major 匹配） |
 | `ram` | 如 `2G` / `1024M` | 启动内存上限 |
 | `autostart` | `true` / `false` | 机器启动时自动拉起 |
 
@@ -112,12 +112,14 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 
 | 子命令 | 用法 | 说明 |
 | --- | --- | --- |
-| `list` | `mcsup java list` | 已安装运行时与位置 |
-| `install` | `mcsup java install <version> [--vendor <name>]` | 下载并安装 JVM |
-| `uninstall` | `mcsup java uninstall <version>` | 移除运行时 |
-| `default` | `mcsup java default [<version>]` | 查询/设置默认运行时 |
+| `list` | `mcsup java list` | 已注册运行时；未扫描过则自动扫描本机 |
+| `scan` | `mcsup java scan` | 重新扫描本机已安装的 Java |
+| `install` | `mcsup java install [<version>] [--jre] [--vendor <name>]` | 从远端下载安装 JDK（默认）或 JRE；缺省版本时交互选择 |
+| `uninstall` | `mcsup java uninstall <version或路径>` 或 `--dir <路径>` | 卸载；系统 Java 仅移除注册记录，文件保留。同一 major 多个运行时且在 TTY 下交互选择；非 TTY 须用 `--dir` 显式指定路径 |
 
 JVM 安装在平台数据目录 `{data_dir}/mcsup/java/`，不属于任何工作目录。
+不同服务器通过 `server set java-version <major>` 绑定各自的大版本，不设全局 default。
+下载源按启动时探测延迟排序（foojay / adoptium / azul），单源失败自动切换下一个。
 
 ## mcsup remote（远端执行位置 = Backend）
 

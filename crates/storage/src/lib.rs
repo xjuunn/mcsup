@@ -1,14 +1,15 @@
 mod models;
 mod schema;
 
-use crate::models::{JarChangeset, RelinkChangeset, ServerRow, WorkspaceRow};
-use crate::schema::{servers, workspaces};
+use crate::models::{JarChangeset, JavaRuntimeRow, RelinkChangeset, ServerRow, WorkspaceRow};
+use crate::schema::{java_runtimes, java_scan_state, servers, workspaces};
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
+use domain::java::JavaRuntime;
 use domain::server::meta::{ServerMeta, ServerName};
 use domain::workspace::{Workspace, WorkspaceId, WorkspaceName};
-use port::{RepositoryError, ServerRepository, WorkspaceRepository};
+use port::{JavaRuntimeRepository, RepositoryError, ServerRepository, WorkspaceRepository};
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 
@@ -288,6 +289,98 @@ impl ServerRepository for SqliteStore {
     }
 }
 
+impl JavaRuntimeRepository for SqliteStore {
+    fn upsert(&self, runtime: &JavaRuntime) -> Result<(), RepositoryError> {
+        self.with_conn(|conn| {
+            let row = JavaRuntimeRow::from(runtime);
+            diesel::insert_into(java_runtimes::table)
+                .values(&row)
+                .on_conflict(java_runtimes::path)
+                .do_update()
+                .set((
+                    java_runtimes::major.eq(row.major),
+                    java_runtimes::version.eq(&row.version),
+                    java_runtimes::vendor.eq(&row.vendor),
+                    java_runtimes::managed.eq(row.managed),
+                    java_runtimes::updated_at.eq(row.updated_at),
+                ))
+                .execute(conn)
+                .map_err(storage_err)?;
+            Ok(())
+        })
+    }
+
+    fn list(&self) -> Result<Vec<JavaRuntime>, RepositoryError> {
+        self.with_conn(|conn| {
+            let row = java_runtimes::table
+                .order((java_runtimes::major.desc(), java_runtimes::path))
+                .select(JavaRuntimeRow::as_select())
+                .load::<JavaRuntimeRow>(conn)
+                .map_err(storage_err)?;
+            row.into_iter().map(JavaRuntime::try_from).collect()
+        })
+    }
+
+    fn get_by_path(&self, path: &Path) -> Result<JavaRuntime, RepositoryError> {
+        self.with_conn(|conn| {
+            let row: Option<JavaRuntimeRow> = java_runtimes::table
+                .filter(java_runtimes::path.eq(path.to_string_lossy().into_owned()))
+                .select(JavaRuntimeRow::as_select())
+                .first(conn)
+                .optional()
+                .map_err(storage_err)?;
+            let row =
+                row.ok_or_else(|| RepositoryError::NotFound(path.to_string_lossy().into_owned()))?;
+            JavaRuntime::try_from(row)
+        })
+    }
+
+    fn remove(&self, path: &Path) -> Result<(), RepositoryError> {
+        self.with_conn(|conn| {
+            let affected = diesel::delete(
+                java_runtimes::table
+                    .filter(java_runtimes::path.eq(path.to_string_lossy().into_owned())),
+            )
+            .execute(conn)
+            .map_err(storage_err)?;
+            if affected == 0 {
+                return Err(RepositoryError::NotFound(
+                    path.to_string_lossy().into_owned(),
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    fn scan_state(&self) -> Result<Option<i64>, RepositoryError> {
+        self.with_conn(|conn| {
+            let at: Option<i64> = java_scan_state::table
+                .filter(java_scan_state::key.eq("scanner"))
+                .select(java_scan_state::scanned_at)
+                .first(conn)
+                .optional()
+                .map_err(storage_err)?;
+            Ok(at)
+        })
+    }
+
+    fn mark_scanned(&self, at: i64) -> Result<(), RepositoryError> {
+        self.with_conn(|conn| {
+            diesel::insert_into(java_scan_state::table)
+                .values((
+                    java_scan_state::key.eq("scanner"),
+                    java_scan_state::scanned_at.eq(at),
+                ))
+                .on_conflict(java_scan_state::key)
+                .do_update()
+                .set(java_scan_state::scanned_at.eq(at))
+                .execute(conn)
+                .map_err(storage_err)?;
+            Ok(())
+        })
+    }
+}
+
 fn select_meta(
     conn: &mut SqliteConnection,
     name: &ServerName,
@@ -494,5 +587,70 @@ mod tests {
         )
         .expect_err("missing");
         assert!(matches!(err, RepositoryError::NotFound(_)));
+    }
+
+    fn sample_java(path: &str, major: i64, managed: bool) -> JavaRuntime {
+        JavaRuntime {
+            id: format!("java-{path}"),
+            path: PathBuf::from(path),
+            major: domain::java::JavaMajor::parse(major).expect("major"),
+            version: format!("{major}.0.9+9"),
+            vendor: domain::java::JavaVendor::Temurin,
+            managed,
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+        }
+    }
+
+    #[test]
+    fn java_upsert_and_list_orders_by_major_desc() {
+        let store = SqliteStore::open_in_memory().expect("open");
+        JavaRuntimeRepository::upsert(&store, &sample_java("/opt/jdk17", 17, false)).expect("17");
+        JavaRuntimeRepository::upsert(&store, &sample_java("/opt/jdk21", 21, true)).expect("21");
+        let list = JavaRuntimeRepository::list(&store).expect("list");
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].major.as_i64(), 21);
+        assert_eq!(list[1].major.as_i64(), 17);
+    }
+
+    #[test]
+    fn java_upsert_same_path_updates_in_place() {
+        let store = SqliteStore::open_in_memory().expect("open");
+        JavaRuntimeRepository::upsert(&store, &sample_java("/opt/jdk17", 17, false))
+            .expect("first");
+        let mut updated = sample_java("/opt/jdk17", 17, true);
+        updated.version = "17.0.11+9".to_owned();
+        updated.updated_at = 1_700_000_100;
+        JavaRuntimeRepository::upsert(&store, &updated).expect("second");
+        let list = JavaRuntimeRepository::list(&store).expect("list");
+        assert_eq!(list.len(), 1);
+        assert!(list[0].managed);
+        assert_eq!(list[0].version, "17.0.11+9");
+    }
+
+    #[test]
+    fn java_remove_missing_is_not_found() {
+        let store = SqliteStore::open_in_memory().expect("open");
+        let err = JavaRuntimeRepository::remove(&store, Path::new("/ghost")).expect_err("missing");
+        assert!(matches!(err, RepositoryError::NotFound(_)));
+    }
+
+    #[test]
+    fn java_scan_state_roundtrip() {
+        let store = SqliteStore::open_in_memory().expect("open");
+        assert_eq!(
+            JavaRuntimeRepository::scan_state(&store).expect("state"),
+            None
+        );
+        JavaRuntimeRepository::mark_scanned(&store, 1_700_000_000).expect("mark");
+        assert_eq!(
+            JavaRuntimeRepository::scan_state(&store).expect("state"),
+            Some(1_700_000_000)
+        );
+        JavaRuntimeRepository::mark_scanned(&store, 1_700_000_200).expect("remark");
+        assert_eq!(
+            JavaRuntimeRepository::scan_state(&store).expect("state"),
+            Some(1_700_000_200)
+        );
     }
 }

@@ -258,6 +258,7 @@ if [ -f "$pkg_manifest" ] && [ -f "$pkg_lib" ]; then
 		port) printf '%s' 'domain port' ;;
 		service) printf '%s' 'domain port service' ;;
 		file) printf '%s' 'domain port file' ;;
+		java) printf '%s' 'domain port java' ;;
 		provider) printf '%s' 'domain port provider' ;;
 		storage) printf '%s' 'domain port storage' ;;
 		*) printf '%s' '' ;;

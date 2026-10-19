@@ -1,8 +1,9 @@
 mod install;
+mod java;
 mod server_ops;
 mod workspace;
 
-use crate::cli::{Cli, Command, ServerAction};
+use crate::cli::{Cli, Command, JavaAction, ServerAction};
 use crate::config::Config;
 use crate::diagnostic::AppDiagnostic;
 use crate::output::Printer;
@@ -14,7 +15,7 @@ pub(crate) async fn run(cli: Cli, cfg: &Config) -> Result<()> {
         Command::Workspace { action } => workspace::run(action, printer),
         Command::Server { action } => server(action, cfg, printer).await,
         Command::Modpack { .. } => err("modpack"),
-        Command::Java { .. } => err("java"),
+        Command::Java { action } => java(action, printer).await,
         Command::Remote { .. } => err("remote"),
         Command::Doctor => err("doctor"),
         Command::Config { .. } => {
@@ -26,6 +27,21 @@ pub(crate) async fn run(cli: Cli, cfg: &Config) -> Result<()> {
         Command::Version => {
             printer.print_section(&format!("mcsup {}", env!("CARGO_PKG_VERSION")));
             Ok(())
+        }
+    }
+}
+
+async fn java(action: JavaAction, printer: Printer) -> Result<()> {
+    match action {
+        JavaAction::List => java::list(printer),
+        JavaAction::Scan => java::scan(printer),
+        JavaAction::Install {
+            version,
+            jre,
+            vendor,
+        } => java::install(version.as_deref(), jre, vendor.as_deref(), printer).await,
+        JavaAction::Uninstall { target, dir } => {
+            java::uninstall(target.as_deref(), dir.as_deref(), printer)
         }
     }
 }

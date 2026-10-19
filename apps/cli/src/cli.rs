@@ -212,17 +212,29 @@ pub(crate) enum ModpackAction {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum JavaAction {
+    /// 列出已注册的 Java 运行时（未扫描过则自动扫描）
     List,
+    /// 重新扫描本机 Java
+    Scan,
+    /// 从远端下载安装 Java
     Install {
-        version: String,
-        #[arg(long, value_name = "NAME")]
+        /// 大版本号，如 17 / 21；缺省时交互选择
+        version: Option<String>,
+        /// 只装 JRE，不装完整 JDK
+        #[arg(long)]
+        jre: bool,
+        /// 发行版：temurin / zulu / liberica / corretto
+        #[arg(long, value_name = "VENDOR")]
         vendor: Option<String>,
     },
+    /// 卸载 Java（系统 Java 仅移除注册记录）
+    #[command(arg_required_else_help = true)]
     Uninstall {
-        version: String,
-    },
-    Default {
-        version: Option<String>,
+        /// 大版本号或运行时路径
+        target: Option<String>,
+        /// 运行时路径（路径含空格时推荐，如 "…/Application Support/…"）
+        #[arg(long, value_name = "PATH")]
+        dir: Option<PathBuf>,
     },
 }
 

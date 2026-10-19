@@ -1,4 +1,5 @@
 use diesel::prelude::*;
+use domain::java::{JavaMajor, JavaRuntime, JavaVendor};
 use domain::server::artifact::{Checksum, ChecksumAlgorithm};
 use domain::server::meta::{InstalledJar, ServerId, ServerMeta, ServerName};
 use domain::server::version::{ServerVariant, VersionId};
@@ -6,7 +7,7 @@ use domain::workspace::{Workspace, WorkspaceId, WorkspaceName};
 use port::RepositoryError;
 use std::path::PathBuf;
 
-use crate::schema::{servers, workspaces};
+use crate::schema::{java_runtimes, servers, workspaces};
 
 /// `workspaces` 表的一行
 #[derive(Debug, Clone, Queryable, Selectable, Insertable)]
@@ -55,6 +56,20 @@ pub(crate) struct JarChangeset {
 pub(crate) struct RelinkChangeset {
     pub(crate) workspace_id: String,
     pub(crate) rel_dir: String,
+    pub(crate) updated_at: i64,
+}
+
+/// `java_runtimes` 表的一行
+#[derive(Debug, Clone, Queryable, Selectable, Insertable)]
+#[diesel(table_name = java_runtimes)]
+pub(crate) struct JavaRuntimeRow {
+    pub(crate) id: String,
+    pub(crate) path: String,
+    pub(crate) major: i64,
+    pub(crate) version: String,
+    pub(crate) vendor: String,
+    pub(crate) managed: bool,
+    pub(crate) created_at: i64,
     pub(crate) updated_at: i64,
 }
 
@@ -160,6 +175,40 @@ impl TryFrom<ServerRow> for ServerMeta {
             version: VersionId::new(row.version),
             variant,
             jar,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        })
+    }
+}
+
+impl From<&JavaRuntime> for JavaRuntimeRow {
+    fn from(rt: &JavaRuntime) -> Self {
+        Self {
+            id: rt.id.clone(),
+            path: rt.path.to_string_lossy().into_owned(),
+            major: rt.major.as_i64(),
+            version: rt.version.clone(),
+            vendor: rt.vendor.as_str().to_owned(),
+            managed: rt.managed,
+            created_at: rt.created_at,
+            updated_at: rt.updated_at,
+        }
+    }
+}
+
+impl TryFrom<JavaRuntimeRow> for JavaRuntime {
+    type Error = RepositoryError;
+
+    fn try_from(row: JavaRuntimeRow) -> Result<Self, Self::Error> {
+        let major = JavaMajor::parse(row.major)
+            .map_err(|err| RepositoryError::Corrupt(format!("java major {}: {err}", row.major)))?;
+        Ok(Self {
+            id: row.id,
+            path: PathBuf::from(row.path),
+            major,
+            version: row.version,
+            vendor: JavaVendor::parse_fuzzy(&row.vendor),
+            managed: row.managed,
             created_at: row.created_at,
             updated_at: row.updated_at,
         })

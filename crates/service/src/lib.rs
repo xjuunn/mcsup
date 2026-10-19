@@ -1,6 +1,11 @@
+mod java;
 mod registry;
 mod workspace;
 
+pub use java::{
+    InstallOutcome, InstallStage, JavaError, JavaService, JavaSourceRegistryPort,
+    RemoteJavaPackage, ScanOutcome, StageSink, UninstallOutcome,
+};
 pub use registry::{RegisteredServer, ServerRegistry, ServerRegistryError};
 pub use workspace::{InitOutcome, WorkspaceError, WorkspaceService};
 

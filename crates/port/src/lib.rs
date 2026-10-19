@@ -1,3 +1,4 @@
+use domain::java::{JavaMajor, JavaPackageType, JavaRuntime, JavaVendor};
 use domain::server::artifact::{Checksum, JarArtifact};
 use domain::server::meta::{InstalledJar, ServerMeta, ServerName};
 use domain::server::version::{ServerVersion, VersionId};
@@ -369,6 +370,131 @@ pub trait WorkspaceRepository: Send + Sync {
         path: &Path,
         updated_at: i64,
     ) -> Result<(), RepositoryError>;
+}
+
+/// Java 发行包查询条件
+#[derive(Debug, Clone)]
+pub struct JavaPackageRequest {
+    /// 目标大版本
+    pub major: JavaMajor,
+    /// 包类型
+    pub package_type: JavaPackageType,
+    /// 目标操作系统标识（如 `mac`、`linux`、`windows`）
+    pub os: String,
+    /// 目标架构标识（如 `aarch64`、`x64`）
+    pub arch: String,
+}
+
+/// 远端一个可下载的 Java 发行包
+#[derive(Debug, Clone)]
+pub struct JavaPackage {
+    /// 源内唯一标识
+    pub id: String,
+    pub vendor: JavaVendor,
+    pub major: JavaMajor,
+    /// 完整版本串
+    pub version: String,
+    pub package_type: JavaPackageType,
+}
+
+/// 解析后的可下载二进制
+#[derive(Debug, Clone)]
+pub struct ResolvedJava {
+    pub package: JavaPackage,
+    pub location: Url,
+    /// 期望字节数；`None` 跳过校验
+    pub expected_size: Option<u64>,
+}
+
+/// Java 发行包来源
+#[async_trait::async_trait]
+pub trait JavaReleaseSource: Send + Sync {
+    /// 来源名（用于日志与错误聚合）
+    fn name(&self) -> &'static str;
+
+    /// 列出符合条件的发行包，按版本降序
+    ///
+    /// # Errors
+    ///
+    /// 上游不可达、状态码异常或响应无法解析时返回 [`SourceError`]
+    async fn list_packages(
+        &self,
+        request: &JavaPackageRequest,
+    ) -> Result<Vec<JavaPackage>, SourceError>;
+
+    /// 解析某包的下载地址
+    ///
+    /// # Errors
+    ///
+    /// 包不存在返回 [`SourceError::NotFound`]；其余同上
+    async fn resolve_binary(&self, package: &JavaPackage) -> Result<ResolvedJava, SourceError>;
+}
+
+/// 本机 Java 扫描结果
+#[derive(Debug, Clone)]
+pub struct ScannedJava {
+    pub path: PathBuf,
+    pub major: JavaMajor,
+    pub version: String,
+    pub vendor: JavaVendor,
+}
+
+/// 本机 Java 扫描器
+pub trait JavaScanner: Send + Sync {
+    /// 扫描本机已安装的 Java，每个候选项通过 `on_found` 回调逐个上报
+    ///
+    /// # Errors
+    ///
+    /// 平台专用命令执行失败时返回底层错误
+    fn scan(
+        &self,
+        on_found: &mut dyn FnMut(ScannedJava),
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// Java 运行时注册表
+pub trait JavaRuntimeRepository: Send + Sync {
+    /// 写入或覆盖一条运行时记录（按 path 去重）
+    ///
+    /// # Errors
+    ///
+    /// 底层失败返回 [`RepositoryError::Storage`]
+    fn upsert(&self, runtime: &JavaRuntime) -> Result<(), RepositoryError>;
+
+    /// 全部运行时，按 major 降序、path 升序
+    ///
+    /// # Errors
+    ///
+    /// 底层失败返回 [`RepositoryError::Storage`]
+    fn list(&self) -> Result<Vec<JavaRuntime>, RepositoryError>;
+
+    /// 按路径读取
+    ///
+    /// # Errors
+    ///
+    /// 不存在返回 [`RepositoryError::NotFound`]
+    fn get_by_path(&self, path: &Path) -> Result<JavaRuntime, RepositoryError>;
+
+    /// 删除一条记录
+    ///
+    /// # Errors
+    ///
+    /// 不存在返回 [`RepositoryError::NotFound`]
+    fn remove(&self, path: &Path) -> Result<(), RepositoryError>;
+
+    /// 扫描状态：已扫描过则返回 `Some(unix秒)`
+    ///
+    /// # Errors
+    ///
+    /// 底层失败返回 [`RepositoryError::Storage`]
+    fn scan_state(&self) -> Result<Option<i64>, RepositoryError>;
+
+    /// 标记已扫描（幂等覆盖时间戳）
+    ///
+    /// # Errors
+    ///
+    /// 底层失败返回 [`RepositoryError::Storage`]
+    fn mark_scanned(&self, at: i64) -> Result<(), RepositoryError>;
 }
 
 #[cfg(test)]

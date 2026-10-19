@@ -29,6 +29,10 @@ pub use service;
 #[cfg_attr(docsrs, doc(cfg(feature = "file")))]
 pub use file;
 
+#[cfg(feature = "java")]
+#[cfg_attr(docsrs, doc(cfg(feature = "java")))]
+pub use java;
+
 #[cfg(feature = "provider")]
 #[cfg_attr(docsrs, doc(cfg(feature = "provider")))]
 pub use provider;

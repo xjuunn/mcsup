@@ -83,6 +83,18 @@ apps/cli    apps/server    apps/agent    apps/mcp
 本项目由人写代码、AI 协助。收到用户提问时先读 `docs/ai-collaboration.md`，
 按其中的类型分派执行。规则只在该文件维护，此处不复制。
 
+## 8. CLI 耗时操作必须回显
+
+CLI 中任何可能超过数百毫秒的步骤（网络请求、扫描、下载、解压、数据库迁移）
+必须有实时进度回显，禁止静默等待。用户看不到输出会认为程序卡死。
+
+回显要求：
+
+- 风格统一：spinner 或进度条，单行刷新，不刷屏
+- 多阶段任务每阶段切换文案，让用户知道当前在做什么
+- JSON 输出模式（`--output json`）下隐藏进度，stdout 保持纯数据
+- 实现放在 `apps/cli/src/progress.rs`，复用 `TaskSpinner` / `BarSink`
+
 # 命名与目录结构
 
 `crates` 中的库名称一律使用单个单词，不使用 `mcsup-` 前缀：
