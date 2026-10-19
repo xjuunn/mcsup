@@ -40,7 +40,9 @@ pub enum WorkspaceError {
     #[error("no default workspace; run `mcsup workspace init` first")]
     NoDefault,
     /// 文件系统失败
-    #[error("io error on {path}: {source}")]
+    ///
+    /// 消息只带路径，原因走 source 链：`{:#}` 渲染时才不会把原因打两遍
+    #[error("io error on {path}")]
     Io {
         path: PathBuf,
         #[source]
@@ -168,7 +170,12 @@ impl WorkspaceService {
     ///
     /// 注册表失败时返回 [`WorkspaceError`]
     pub fn list(&self) -> Result<Vec<Workspace>, WorkspaceError> {
-        Ok(self.repo.list()?)
+        Ok(self
+            .repo
+            .list()?
+            .into_iter()
+            .map(normalize_workspace)
+            .collect())
     }
 
     /// 默认工作目录
@@ -177,7 +184,10 @@ impl WorkspaceService {
     ///
     /// 无默认或注册表失败时返回 [`WorkspaceError`]
     pub fn default_workspace(&self) -> Result<Workspace, WorkspaceError> {
-        self.repo.default()?.ok_or(WorkspaceError::NoDefault)
+        self.repo
+            .default()?
+            .map(normalize_workspace)
+            .ok_or(WorkspaceError::NoDefault)
     }
 
     /// 按名选择器解析：精确 → 唯一前缀 → 报错
@@ -186,7 +196,7 @@ impl WorkspaceService {
     ///
     /// 未找到 / 歧义 / 注册表失败时返回 [`WorkspaceError`]
     pub fn resolve(&self, selector: &str) -> Result<Workspace, WorkspaceError> {
-        let all = self.repo.list()?;
+        let all = self.list()?;
         if let Some(exact) = all.iter().find(|w| w.name.as_str() == selector) {
             return Ok(exact.clone());
         }
@@ -219,15 +229,19 @@ impl WorkspaceService {
 
     /// 注销工作目录；`purge` 时一并删除磁盘目录
     ///
+    /// 先删数据再注销：删除失败（常见于目录被占用）时注册记录还在，
+    /// 退出占用后重试即可；反过来会留下「记录已注销、目录只删了一半」的中间态。
+    ///
     /// # Errors
     ///
     /// 不存在、IO 或注册表失败时返回 [`WorkspaceError`]
     pub fn remove(&self, selector: &str, purge: bool) -> Result<Workspace, WorkspaceError> {
         let ws = self.resolve(selector)?;
-        self.repo.remove(&ws.id)?;
         if purge && ws.path.exists() {
-            std::fs::remove_dir_all(&ws.path).map_err(|err| WorkspaceError::io(&ws.path, err))?;
+            std::fs::remove_dir_all(&ws.path)
+                .map_err(|err| WorkspaceError::io(&ws.path, deletion_hint(err)))?;
         }
+        self.repo.remove(&ws.id)?;
         Ok(ws)
     }
 
@@ -248,7 +262,9 @@ impl WorkspaceService {
         })?;
 
         if let Ok(existing) = self.repo.get(&id) {
-            return Ok(InitOutcome::AlreadyRegistered(existing));
+            return Ok(InitOutcome::AlreadyRegistered(normalize_workspace(
+                existing,
+            )));
         }
 
         let ws = Workspace {
@@ -340,13 +356,48 @@ fn is_empty_dir(dir: &Path) -> Result<bool, WorkspaceError> {
 }
 
 fn absolute(dir: &Path) -> PathBuf {
-    if dir.is_absolute() {
+    let joined = if dir.is_absolute() {
         dir.to_path_buf()
     } else {
         std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(dir)
+    };
+    normalize_path(&joined)
+}
+
+/// 去掉 `.` 组件与多余分隔符
+///
+/// 不规范化就会把 `D:\ws\.` 之类路径入库：展示难看，同一目录也可能被当成两个身份
+fn normalize_path(path: &Path) -> PathBuf {
+    path.components().collect()
+}
+
+/// 读出注册表记录时规范化路径：库里可能存着历史写入的未规范化路径
+fn normalize_workspace(mut ws: Workspace) -> Workspace {
+    ws.path = normalize_path(&ws.path);
+    ws
+}
+
+/// Windows 上目录被占用时 `remove_dir_all` 报 `ERROR_SHARING_VIOLATION`（os error 32）
+///
+/// 常见于有终端把该目录当工作目录、资源管理器开着它。补一句可操作提示，
+/// 否则用户只看到一个 os error 32，不知道该干什么。
+#[cfg(windows)]
+fn deletion_hint(err: std::io::Error) -> std::io::Error {
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    if err.raw_os_error() == Some(ERROR_SHARING_VIOLATION) {
+        return std::io::Error::other(format!(
+            "{err}（目录正被占用：常见于终端的工作目录就在其中，或资源管理器/其他程序打开着；退出占用后重试）"
+        ));
     }
+    err
+}
+
+/// 非 Windows 没有这个错误码
+#[cfg(not(windows))]
+fn deletion_hint(err: std::io::Error) -> std::io::Error {
+    err
 }
 
 fn now_unix() -> i64 {
@@ -475,6 +526,39 @@ mod tests {
         assert!(dir.join("servers").is_dir());
         assert!(dir.join("backups/cas").is_dir());
         assert!(dir.join("workspace.toml").is_file());
+    }
+
+    /// 带 `.` 的路径入库前必须规范化，否则库里会留下 `D:\ws\.` 这种形态
+    #[test]
+    fn init_normalizes_dotted_path() {
+        let (svc, tmp) = svc();
+        let dir = tmp.path().join("ws").join(".");
+        let InitOutcome::Created(ws) = svc.init(&dir, Some("ws01")).expect("init") else {
+            unreachable!("expected Created")
+        };
+        assert_eq!(ws.path, tmp.path().join("ws"));
+        assert_eq!(svc.resolve("ws01").expect("resolve").path, ws.path);
+    }
+
+    /// 历史数据可能带 `.` 组件，读出时统一规范化，同一目录不能有两种身份
+    #[test]
+    fn list_normalizes_legacy_dotted_path() {
+        let repo = Arc::new(MemRepo::new());
+        let svc = WorkspaceService::new(repo.clone());
+        let tmp = tempfile::tempdir().expect("tmp");
+        let InitOutcome::Created(ws) = svc
+            .init(&tmp.path().join("ws"), Some("ws01"))
+            .expect("init")
+        else {
+            unreachable!("expected Created")
+        };
+        {
+            let mut items = repo.items.lock().expect("lock");
+            items[0].path = items[0].path.join(".");
+        }
+
+        assert_eq!(svc.list().expect("list")[0].path, ws.path);
+        assert_eq!(svc.resolve("ws01").expect("resolve").path, ws.path);
     }
 
     #[test]
@@ -606,5 +690,21 @@ mod tests {
         svc.init(&dir, Some("ws01")).expect("init");
         svc.remove("ws01", true).expect("remove");
         assert!(!dir.exists());
+    }
+
+    /// 删除失败时必须保留注册记录：否则「记录已注销、目录只删了一半」无从重试
+    #[test]
+    fn purge_failure_keeps_registration() {
+        let (svc, tmp) = svc();
+        let dir = tmp.path().join("ws");
+        svc.init(&dir, Some("ws01")).expect("init");
+        // 把目录换成同名文件：remove_dir_all 在各平台都会失败
+        std::fs::remove_dir_all(&dir).expect("rmdir");
+        std::fs::write(&dir, "occupied").expect("file");
+
+        let err = svc.remove("ws01", true).expect_err("must fail");
+        assert!(matches!(err, WorkspaceError::Io { .. }));
+        // 记录还在，占用解除后重试即可自愈
+        assert!(svc.resolve("ws01").is_ok());
     }
 }

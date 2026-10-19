@@ -27,7 +27,8 @@ pub enum JavaError {
     #[error(transparent)]
     Repo(#[from] RepositoryError),
     /// 本地 IO 失败
-    #[error("io error on {path}: {source}")]
+    /// 文件系统失败；原因走 source 链，避免 `{:#}` 渲染时重复
+    #[error("io error on {path}")]
     Io {
         path: PathBuf,
         #[source]

@@ -95,7 +95,7 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | `init` | `mcsup workspace init [--dir <path>] [--name <name>]` | 创建并注册工作目录；无 `--dir` 进入交互（默认当前目录），目录必须为空 |
 | `list` | `mcsup workspace list` | 已注册工作目录：名称、路径、服务器数、是否默认 |
 | `use` | `mcsup workspace use <name>` | 切换默认工作目录；只影响 `create` 落点，不隐藏其他目录的服务器 |
-| `remove` | `mcsup workspace remove <name> [--purge]` | 注销工作目录；`--purge` 才删磁盘数据 |
+| `remove` | `mcsup workspace remove <name> [--purge]` | 注销工作目录；交互下询问是否删除磁盘数据（默认不删），`--purge` 跳过询问直接删除；删除失败（目录被占用）保留注册，退出占用后重试即可 |
 | `info` | `mcsup workspace info` | 默认工作目录、平台数据目录与结构说明 |
 
 ## mcsup modpack（整合包：一键建整包服务器）
