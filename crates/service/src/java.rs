@@ -635,6 +635,9 @@ fn zip_extractors(archive: &Path, into: &Path) -> Vec<Extractor> {
 }
 
 /// `PowerShell` 解压脚本：路径经环境变量传入，不进命令行
+///
+/// 只有 Windows 的候选解压链用它，其他目标下不跟着引用方一起裁掉就是死代码
+#[cfg(target_os = "windows")]
 const POWERSHELL_EXPAND_ARCHIVE: &str =
     "Expand-Archive -LiteralPath $env:MCSUP_ZIP_SRC -DestinationPath $env:MCSUP_ZIP_DST -Force";
 
