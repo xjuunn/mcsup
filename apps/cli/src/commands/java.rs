@@ -45,16 +45,19 @@ impl JavaSourceRegistryPort for RegistryAdapter {
     }
 }
 
-/// 把 service 的 [`StageSink`] 转发到 spinner；进入下载阶段时收掉 spinner，让进度条独占
+/// 把 service 的 [`StageSink`] 转发到回显线：阶段文案给 spinner，
+/// 进入下载把同一条线交给 [`BarSink`]，解压时再交还 —— 全程一行、不留白
 struct StageAdapter<'a> {
     spinner: &'a TaskSpinner,
+    sink: &'a BarSink,
     downloading: std::sync::atomic::AtomicBool,
 }
 
-impl StageAdapter<'_> {
-    fn new(spinner: &TaskSpinner) -> StageAdapter<'_> {
+impl<'a> StageAdapter<'a> {
+    fn new(spinner: &'a TaskSpinner, sink: &'a BarSink) -> StageAdapter<'a> {
         StageAdapter {
             spinner,
+            sink,
             downloading: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -62,16 +65,21 @@ impl StageAdapter<'_> {
 
 impl StageSink for StageAdapter<'_> {
     fn on_stage(&self, stage: InstallStage) {
-        if matches!(stage, InstallStage::Downloading) {
-            // 下载阶段：清掉 spinner，BarSink 独占 stderr
-            self.downloading
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            self.spinner.finish();
-        } else if self.downloading.load(std::sync::atomic::Ordering::Relaxed) {
-            // 下载后的阶段（解压等）：spinner 已 finish，换文案会重新绘制
-            self.spinner.set_message(stage.message());
-        } else {
-            self.spinner.set_message(stage.message());
+        match stage {
+            // 下载：立即接管这条线，从发起请求到首字节之间也要有回显
+            InstallStage::Downloading => {
+                self.downloading
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                self.sink.start();
+            }
+            // 下载之后的阶段（解压等）：进度条交还 spinner，继续画同一条线
+            stage if self.downloading.load(std::sync::atomic::Ordering::Relaxed) => {
+                self.downloading
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                self.sink.finish();
+                self.spinner.set_message(stage.message());
+            }
+            stage => self.spinner.set_message(stage.message()),
         }
     }
 }
@@ -228,18 +236,22 @@ pub(crate) async fn install(
     let major = if let Some(raw) = version {
         parse_major(raw)?
     } else {
+        // 交互提示要独占这一行：finish 之后 bar 不再绘制，提示结束必须 restart，
+        // 否则后面所有阶段（查询版本 / 解析地址 / 下载）都没有回显
         spinner.finish();
-        prompt_major(enable)?
+        let selected = prompt_major(enable)?;
+        spinner.restart();
+        selected
     };
     let vendor_enum = vendor.map(JavaVendor::parse_fuzzy);
 
     info!(major = %major, jre, "java install start");
     let sink = BarSink::new(
+        spinner.handle(),
         format!("下载 Java {major} {}", package_type.as_str()),
-        enable,
     );
     let cancel = CancellationToken::new();
-    let stage = StageAdapter::new(&spinner);
+    let stage = StageAdapter::new(&spinner, &sink);
     let outcome = service
         .install(
             major,
@@ -251,7 +263,6 @@ pub(crate) async fn install(
         )
         .await
         .context("安装 Java 失败")?;
-    sink.finish();
     spinner.finish();
 
     printer.print_section(&format!(
@@ -375,4 +386,45 @@ fn prompt_runtime(major: JavaMajor, matches: &[JavaRuntime]) -> Result<PathBuf> 
         .find(|rt| selected.starts_with(&rt.path.display().to_string()))
         .map(|rt| rt.path.clone())
         .ok_or_else(|| anyhow!("未匹配到所选运行时"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mcsup::port::ProgressSink;
+
+    /// 安装全程只用一条回显线：阶段 spinner → 下载进度条 → 阶段 spinner。
+    ///
+    /// 交互提示 `finish` 之后必须 `restart`，否则 indicatif 的 bar 处于终态，
+    /// 后续阶段全部画不出来 —— 那几秒空白就是这么来的。
+    #[test]
+    fn stage_sequence_keeps_one_live_line() {
+        let spinner = TaskSpinner::new(InstallStage::Probing.message(), false);
+        let sink = BarSink::new(spinner.handle(), "下载 Java 25 jdk");
+        let adapter = StageAdapter::new(&spinner, &sink);
+        let line = spinner.handle();
+
+        adapter.on_stage(InstallStage::Listing);
+        assert_eq!(line.message(), InstallStage::Listing.message());
+
+        // 交互提示独占这一行，结束后必须恢复
+        spinner.finish();
+        assert!(line.is_finished());
+        spinner.restart();
+        assert!(!line.is_finished());
+
+        adapter.on_stage(InstallStage::Resolving);
+        assert_eq!(line.message(), InstallStage::Resolving.message());
+
+        // 进入下载：同一条线交给进度条，不等首字节
+        adapter.on_stage(InstallStage::Downloading);
+        assert_eq!(line.message(), "下载 Java 25 jdk");
+        sink.on_progress(1, Some(100));
+        assert_eq!(line.length(), Some(100));
+
+        // 解压：进度条交还 spinner，同一条线继续有回显
+        adapter.on_stage(InstallStage::Extracting);
+        assert_eq!(line.message(), InstallStage::Extracting.message());
+        assert!(!line.is_finished());
+    }
 }

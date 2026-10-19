@@ -3,7 +3,6 @@
 use crate::http::{build_client, map_transport};
 use async_trait::async_trait;
 use domain::java::{JavaMajor, JavaVendor};
-use domain::server::version::VersionId;
 use port::{JavaPackage, JavaPackageRequest, JavaReleaseSource, ResolvedJava, SourceError};
 use reqwest::Client;
 use serde::Deserialize;
@@ -32,7 +31,6 @@ impl AzulSource {
 
 #[derive(Debug, Deserialize)]
 struct PackageDto {
-    package_uuid: String,
     name: String,
     download_url: String,
     #[serde(default)]
@@ -88,7 +86,9 @@ impl JavaReleaseSource for AzulSource {
                     .collect::<Vec<_>>()
                     .join(".");
                 JavaPackage {
-                    id: pkg.package_uuid,
+                    // id 即下载地址：Azul 的列表响应已带 download_url，
+                    // 回查反而不可靠（见 resolve_binary）
+                    id: pkg.download_url,
                     vendor: JavaVendor::Zulu,
                     major: JavaMajor::parse(major).unwrap_or(request.major),
                     version,
@@ -98,16 +98,12 @@ impl JavaReleaseSource for AzulSource {
             .collect())
     }
 
+    /// id 即下载地址，直接解析，不再回查 API
+    ///
+    /// 回查用的 `package_uuid` 过滤会被 Azul 静默忽略，返回的是未过滤的默认列表，
+    /// 取其中第一项会拿到任意平台的包（实测第一项是 macOS aarch64 的 FX JRE）。
     async fn resolve_binary(&self, package: &JavaPackage) -> Result<ResolvedJava, SourceError> {
-        // 用 id 回查拿 download_url
-        let url = format!("{PACKAGES_URL}?package_uuid={}", package.id);
-        let packages: Vec<PackageDto> = self.get(&url).await?;
-        let pkg = packages
-            .into_iter()
-            .next()
-            .ok_or_else(|| SourceError::NotFound(VersionId::new(package.major.to_string())))?;
-        let location =
-            Url::parse(&pkg.download_url).map_err(|err| SourceError::Decode(Box::new(err)))?;
+        let location = Url::parse(&package.id).map_err(|err| SourceError::Decode(Box::new(err)))?;
         Ok(ResolvedJava {
             package: package.clone(),
             location,
@@ -132,5 +128,42 @@ impl AzulSource {
             .json()
             .await
             .map_err(|err| SourceError::Decode(Box::new(err)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use domain::java::JavaPackageType;
+
+    fn package(id: &str) -> JavaPackage {
+        JavaPackage {
+            id: id.to_owned(),
+            vendor: JavaVendor::Zulu,
+            major: JavaMajor::parse(27).expect("27"),
+            version: "27.0.0".into(),
+            package_type: JavaPackageType::Jre,
+        }
+    }
+
+    /// id 即下载地址：不再回查 API。Azul 会静默忽略 `package_uuid` 过滤，
+    /// 回查拿到的是未过滤的默认列表，取第一项会下载到任意平台的包
+    #[tokio::test]
+    async fn resolve_uses_package_id_as_url() {
+        let source = AzulSource::new().expect("source");
+        let id = "https://cdn.azul.com/zulu/bin/zulu27.28.103-ca-fx-jre27.0.0-win_x64.zip";
+        let resolved = source.resolve_binary(&package(id)).await.expect("resolve");
+        assert_eq!(resolved.location.as_str(), id);
+        assert_eq!(resolved.package.id, id);
+    }
+
+    #[tokio::test]
+    async fn resolve_rejects_non_url_id() {
+        let source = AzulSource::new().expect("source");
+        let err = source
+            .resolve_binary(&package("not-a-url"))
+            .await
+            .expect_err("must fail");
+        assert!(matches!(err, SourceError::Decode(_)));
     }
 }

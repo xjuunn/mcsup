@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::output::Printer;
-use crate::progress::BarSink;
+use crate::progress::{BarSink, TaskSpinner};
 use anyhow::{Context, Result};
 use mcsup::domain::server::version::VersionId;
 use mcsup::file::FileDownloader;
@@ -33,12 +33,16 @@ pub(crate) async fn run(
     let installer = ServerInstaller::new(source, Arc::new(downloader));
 
     let cancel = CancellationToken::new();
-    let sink = BarSink::new(format!("解析并下载 {version_id}"), printer.is_human());
+    // 解析版本到首字节之间没有任何进度回调，先挂 spinner 保证整段有回显；
+    // 首个进度到达后由 BarSink 接手同一条线，切换成进度显示
+    let message = format!("解析并下载 {version_id}");
+    let spinner = TaskSpinner::new(message.clone(), printer.is_human());
+    let sink = BarSink::new(spinner.handle(), message);
     info!(version = %version_id, dest = %&destination.display(), "开始安装");
     let outcome = installer
         .install(&version_id, destination.clone(), Some(&sink), &cancel)
         .await
         .context("安装服务端失败")?;
-    sink.finish();
+    spinner.finish();
     printer.print_installed(&version_id, &outcome.artifact, &destination)
 }

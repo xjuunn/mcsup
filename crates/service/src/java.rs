@@ -422,6 +422,27 @@ fn locate_java_home(root: &Path) -> Option<PathBuf> {
     None
 }
 
+/// 校验解压产物里有当前平台可用的 JVM home
+///
+/// 下错平台 / 架构的归档（例如在 Windows 上装到 macOS 包）解压不会报错，
+/// 但产物里没有 `bin/java.exe`，跑不起来。必须在这里失败，而不是注册成运行时。
+///
+/// # Errors
+///
+/// 找不到 JVM home 时返回 [`JavaError::Io`]，消息点明可能是平台不符
+fn require_jvm_home(archive: &Path, dir: &Path) -> Result<PathBuf, JavaError> {
+    match locate_java_home(dir) {
+        Some(home) => Ok(home),
+        None => Err(java_io_err(
+            archive,
+            format!(
+                "解压后未找到可用的 JVM home（期望 bin/{}），归档可能属于其他平台或架构",
+                domain::java::java_exe_name()
+            ),
+        )),
+    }
+}
+
 /// 解压归档到临时目录，成功后原子替换目标目录
 ///
 /// 避免重复安装时 `tar`/`unzip` 对已存在文件逐个询问覆盖。
@@ -444,6 +465,13 @@ fn extract_and_swap(archive: &Path, into: &Path) -> Result<PathBuf, JavaError> {
 
     let extract_result = extract_archive(archive, &tmp);
     if let Err(err) = extract_result {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(err);
+    }
+
+    // 解压成功但没有可用 home：多半是下错平台 / 架构的包（如 Windows 上装到 macOS 包），
+    // 这种产物跑不起来，必须在替换与注册前拦下
+    if let Err(err) = require_jvm_home(archive, &tmp) {
         let _ = std::fs::remove_dir_all(&tmp);
         return Err(err);
     }
@@ -936,6 +964,36 @@ mod tests {
         assert_eq!(candidates[0].program, OsString::from("tar"));
         #[cfg(not(target_os = "windows"))]
         assert_eq!(candidates[0].program, OsString::from("unzip"));
+    }
+
+    /// 下错平台的包：目录里只有与当前平台不符的 java 文件名，视为不可用
+    #[test]
+    fn require_jvm_home_rejects_foreign_platform_tree() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let bin = dir.path().join("jdk-27").join("bin");
+        std::fs::create_dir_all(&bin).expect("bin");
+        let foreign = if cfg!(target_os = "windows") {
+            "java"
+        } else {
+            "java.exe"
+        };
+        std::fs::write(bin.join(foreign), b"stub").expect("stub");
+
+        let archive = dir.path().join("foreign.zip");
+        let err = require_jvm_home(&archive, dir.path()).expect_err("must fail");
+        assert!(matches!(err, JavaError::Io { .. }));
+    }
+
+    #[test]
+    fn require_jvm_home_accepts_current_platform_tree() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let bin = dir.path().join("jdk-27").join("bin");
+        std::fs::create_dir_all(&bin).expect("bin");
+        std::fs::write(bin.join(domain::java::java_exe_name()), b"stub").expect("stub");
+
+        let archive = dir.path().join("ok.zip");
+        let home = require_jvm_home(&archive, dir.path()).expect("home");
+        assert_eq!(home, dir.path().join("jdk-27"));
     }
 
     #[test]
