@@ -28,7 +28,7 @@ pub enum VersionKind {
     Historical,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ServerVariant {
     Vanilla,
@@ -43,4 +43,35 @@ pub struct ServerVersion {
     pub id: VersionId,
     pub kind: VersionKind,
     pub variant: ServerVariant,
+}
+
+impl ServerVariant {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Vanilla => "vanilla",
+            Self::Fabric => "fabric",
+            Self::Forge => "forge",
+            Self::NeoForge => "neoforge",
+            Self::Paper => "paper",
+        }
+    }
+
+    /// 解析变体名
+    ///
+    /// # Errors
+    ///
+    /// 名称不在已知集合内时返回 [`super::error::UnknownVariant`]
+    pub fn parse(raw: &str) -> Result<Self, super::error::UnknownVariant> {
+        match raw {
+            "vanilla" => Ok(Self::Vanilla),
+            "fabric" => Ok(Self::Fabric),
+            "forge" => Ok(Self::Forge),
+            "neoforge" => Ok(Self::NeoForge),
+            "paper" => Ok(Self::Paper),
+            other => Err(super::error::UnknownVariant {
+                raw: other.to_owned(),
+            }),
+        }
+    }
 }

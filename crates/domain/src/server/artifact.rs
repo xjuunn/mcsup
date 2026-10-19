@@ -7,6 +7,29 @@ pub enum ChecksumAlgorithm {
     Sha256,
 }
 
+impl ChecksumAlgorithm {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sha1 => "sha1",
+            Self::Sha256 => "sha256",
+        }
+    }
+
+    /// 解析算法名
+    ///
+    /// # Errors
+    ///
+    /// 名称不是 `sha1` / `sha256` 时返回 [`super::error::UnknownChecksumAlgorithm`]
+    pub fn parse(raw: &str) -> Result<Self, super::error::UnknownChecksumAlgorithm> {
+        match raw {
+            "sha1" => Ok(Self::Sha1),
+            "sha256" => Ok(Self::Sha256),
+            other => Err(super::error::UnknownChecksumAlgorithm(other.to_owned())),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Checksum {
     algorithm: ChecksumAlgorithm,

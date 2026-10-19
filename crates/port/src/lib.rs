@@ -1,4 +1,5 @@
 use domain::server::artifact::{Checksum, JarArtifact};
+use domain::server::meta::{InstalledJar, ServerMeta, ServerName};
 use domain::server::version::{ServerVersion, VersionId};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -226,6 +227,61 @@ pub trait ArtifactDownloader: Send + Sync {
         progress: Option<&dyn ProgressSink>,
         cancel: &CancellationToken,
     ) -> Result<DownloadedArtifact, DownloadError>;
+}
+
+/// 元数据存储错误
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum RepositoryError {
+    /// 同名服务已存在
+    #[error("server already exists: {0}")]
+    AlreadyExists(String),
+    /// 服务不存在
+    #[error("server not found: {0}")]
+    NotFound(String),
+    /// 记录内容损坏，无法还原为领域对象
+    #[error("corrupt repository record: {0}")]
+    Corrupt(String),
+    /// 底层存储失败
+    #[error("storage error: {0}")]
+    Storage(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
+
+/// 服务元数据存储
+pub trait ServerRepository: Send + Sync {
+    /// 写入新服务
+    ///
+    /// # Errors
+    ///
+    /// 名称或目录冲突返回 [`RepositoryError::AlreadyExists`]；
+    /// 底层失败返回 [`RepositoryError::Storage`]
+    fn create(&self, meta: &ServerMeta) -> Result<(), RepositoryError>;
+
+    /// 按名称读取
+    ///
+    /// # Errors
+    ///
+    /// 不存在返回 [`RepositoryError::NotFound`]
+    fn get(&self, name: &ServerName) -> Result<ServerMeta, RepositoryError>;
+
+    /// 列出全部服务，按名称升序
+    ///
+    /// # Errors
+    ///
+    /// 底层失败返回 [`RepositoryError::Storage`]
+    fn list(&self) -> Result<Vec<ServerMeta>, RepositoryError>;
+
+    /// 回写核心元数据并刷新 `updated_at`，返回最新记录
+    ///
+    /// # Errors
+    ///
+    /// 不存在返回 [`RepositoryError::NotFound`]
+    fn update_jar(
+        &self,
+        name: &ServerName,
+        jar: &InstalledJar,
+        updated_at: i64,
+    ) -> Result<ServerMeta, RepositoryError>;
 }
 
 #[cfg(test)]
