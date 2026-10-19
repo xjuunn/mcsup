@@ -1,7 +1,8 @@
 use std::fmt;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-/// Java 大版本非法（须为 8–25 的整数）
+/// Java 大版本非法（须为 [`JavaMajor::MIN`]–[`JavaMajor::MAX`] 的整数）
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("invalid java major version: {0}")]
 pub struct InvalidJavaMajor(pub i64);
@@ -11,13 +12,18 @@ pub struct InvalidJavaMajor(pub i64);
 pub struct JavaMajor(i16);
 
 impl JavaMajor {
+    /// 可构造的最小大版本
+    pub const MIN: i64 = 8;
+    /// 可构造的最大大版本
+    pub const MAX: i64 = 99;
+
     /// 校验并构造大版本
     ///
     /// # Errors
     ///
-    /// 不在 8–25 闭区间时返回 [`InvalidJavaMajor`]
+    /// 不在 [`JavaMajor::MIN`]–[`JavaMajor::MAX`] 闭区间时返回 [`InvalidJavaMajor`]
     pub fn parse(raw: i64) -> Result<Self, InvalidJavaMajor> {
-        if (8..=25).contains(&raw) {
+        if (Self::MIN..=Self::MAX).contains(&raw) {
             #[allow(clippy::cast_possible_truncation)]
             Ok(Self(raw as i16))
         } else {
@@ -112,13 +118,35 @@ impl JavaPackageType {
     }
 }
 
+/// JVM home 内 `java` 可执行文件的文件名（Windows 为 `java.exe`）
+#[cfg(target_os = "windows")]
+#[must_use]
+pub const fn java_exe_name() -> &'static str {
+    "java.exe"
+}
+
+/// JVM home 内 `java` 可执行文件的文件名（Unix 为 `java`）
+#[cfg(not(target_os = "windows"))]
+#[must_use]
+pub const fn java_exe_name() -> &'static str {
+    "java"
+}
+
+/// 判断目录是否为 JVM home：存在可执行 `java`
+///
+/// 扫描与安装后定位 home 共用此判定，避免各处对 `.exe` 后缀分叉。
+#[must_use]
+pub fn is_jvm_home(path: &Path) -> bool {
+    path.join("bin").join(java_exe_name()).is_file()
+}
+
 /// 已注册的本机 Java 运行时
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JavaRuntime {
     /// 稳定身份（UUID 文本）
     pub id: String,
     /// `java` 可执行文件所在目录（或 JVM home）
-    pub path: std::path::PathBuf,
+    pub path: PathBuf,
     pub major: JavaMajor,
     /// 完整版本串，如 `17.0.9+9`
     pub version: String,
@@ -136,12 +164,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn major_accepts_minecraft_common_range() {
-        assert!(JavaMajor::parse(8).is_ok());
+    fn major_accepts_supported_range() {
+        assert!(JavaMajor::parse(JavaMajor::MIN).is_ok());
         assert!(JavaMajor::parse(17).is_ok());
         assert!(JavaMajor::parse(21).is_ok());
+        assert!(JavaMajor::parse(26).is_ok());
+        assert!(JavaMajor::parse(JavaMajor::MAX).is_ok());
         assert!(JavaMajor::parse(7).is_err());
-        assert!(JavaMajor::parse(26).is_err());
+        assert!(JavaMajor::parse(100).is_err());
     }
 
     #[test]
@@ -161,5 +191,13 @@ mod tests {
     fn package_type_default_is_jdk() {
         assert_eq!(JavaPackageType::default(), JavaPackageType::Jdk);
         assert_eq!(JavaPackageType::Jre.as_str(), "jre");
+    }
+
+    #[test]
+    fn java_exe_name_matches_platform() {
+        #[cfg(target_os = "windows")]
+        assert_eq!(java_exe_name(), "java.exe");
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(java_exe_name(), "java");
     }
 }

@@ -290,13 +290,18 @@ fn parse_major(raw: &str) -> Result<JavaMajor> {
 /// LTS 大版本集合，用于交互列表标注
 const LTS_MAJORS: &[i64] = &[8, 11, 17, 21, 25];
 
+/// 交互列表的最高大版本：只列已发布版本，避免出现还不存在的选择
+///
+/// 能力上界是 [`JavaMajor::MAX`]，更新的版本用 `mcsup java install <大版本>` 指定。
+const INSTALL_MENU_MAX: i64 = 27;
+
 fn prompt_major(enable: bool) -> Result<JavaMajor> {
     if !enable || !std::io::stdin().is_terminal() {
         return Err(anyhow!("非交互环境请指定版本，如 mcsup java install 21"));
     }
-    // 8..=25 全部大版本，倒序（新版本在前）；inquire Select 自带滚动
+    // 已发布大版本倒序（新版本在前）；inquire Select 自带滚动
     let mut choices = Vec::new();
-    for major in (8..=25).rev() {
+    for major in (JavaMajor::MIN..=INSTALL_MENU_MAX).rev() {
         let label = if LTS_MAJORS.contains(&major) {
             format!("{major} (LTS)")
         } else {
