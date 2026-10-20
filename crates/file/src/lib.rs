@@ -30,7 +30,37 @@ const MIN_SEGMENTED_SIZE: u64 = 8 * 1024 * 1024;
 const SEGMENT_MAX_ATTEMPTS: u32 = 3;
 /// 重发延迟
 const SEGMENT_RETRY_DELAY: Duration = Duration::from_millis(250);
+/// 取消标志的轮询粒度
+const CANCEL_POLL: Duration = Duration::from_millis(25);
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// 取消可打断的网络等待
+///
+/// [`CancellationToken`] 是原子标志、没有唤醒机制，只能轮询；而建连、跟随
+/// 重定向、首字节、重试退避这些等待可能持续数百毫秒到数秒，期间网络 future
+/// 不返回，循环里的取消检查就一直执行不到——Ctrl-C 后观感是「下载又继续了
+/// 一秒」。把网络 future 与 [`wait_cancelled`] 竞争，取消在轮询粒度内立即
+/// 生效，并丢弃进行中的请求（连接随之中止）。
+///
+/// `cancel` 是令牌列表：用户取消（Ctrl-C）与分段停止令牌都需要能打断等待，
+/// 任一置位即返回 [`DownloadError::Cancelled`]。
+async fn until_cancelled<T>(
+    future: impl Future<Output = T>,
+    cancel: &[&CancellationToken],
+) -> Result<T, DownloadError> {
+    tokio::select! {
+        biased;
+        () = wait_cancelled(cancel) => Err(DownloadError::Cancelled),
+        value = future => Ok(value),
+    }
+}
+
+/// 轮询到任一令牌被置位为止
+async fn wait_cancelled(cancel: &[&CancellationToken]) {
+    while !cancel.iter().any(|token| token.is_cancelled()) {
+        tokio::time::sleep(CANCEL_POLL).await;
+    }
+}
 
 /// 下载的传输算法
 ///
@@ -111,31 +141,38 @@ impl FileDownloader {
     ///
     /// 以下任一条件成立即回退单流：未注入范围能力、元信息探测失败、上游未声明范围支持、
     /// 对象小于 [`MIN_SEGMENTED_SIZE`]、声明大小与元信息不一致。回退只损失分段加速，
-    /// 不影响正确性，因此探测失败不额外记录日志
-    async fn plan(&self, request: &DownloadRequest) -> TransferPlan {
+    /// 不影响正确性，因此探测失败不额外记录日志。
+    ///
+    /// 探测等待可被打断：取消发生在探测期间时直接返回错误，不退化成单流
+    /// （退化会再发起一次注定被取消的建连）
+    async fn plan(
+        &self,
+        request: &DownloadRequest,
+        cancel: &CancellationToken,
+    ) -> Result<TransferPlan, DownloadError> {
         // 未注入范围能力或探测失败：总长退化为调用方声明的大小
         let Some(range) = self.range.clone() else {
-            return TransferPlan::Single {
+            return Ok(TransferPlan::Single {
                 total: request.expected_size,
-            };
+            });
         };
-        let Ok(stat) = range.stat(&request.location).await else {
-            return TransferPlan::Single {
+        let Ok(stat) = until_cancelled(range.stat(&request.location), &[cancel]).await? else {
+            return Ok(TransferPlan::Single {
                 total: request.expected_size,
-            };
+            });
         };
         // 探测到的总长比 expected_size 可靠（多数源不声明大小），进度总长优先用它
         let known = Some(stat.size);
         if !stat.supports_range || stat.size < MIN_SEGMENTED_SIZE {
-            return TransferPlan::Single { total: known };
+            return Ok(TransferPlan::Single { total: known });
         }
         if request
             .expected_size
             .is_some_and(|expected| expected != stat.size)
         {
-            return TransferPlan::Single { total: known };
+            return Ok(TransferPlan::Single { total: known });
         }
-        TransferPlan::Segmented { range, stat }
+        Ok(TransferPlan::Segmented { range, stat })
     }
 
     async fn transfer(
@@ -145,7 +182,7 @@ impl FileDownloader {
         progress: Option<&dyn ProgressSink>,
         cancel: &CancellationToken,
     ) -> Result<u64, DownloadError> {
-        match self.plan(request).await {
+        match self.plan(request, cancel).await? {
             TransferPlan::Single { total } => {
                 self.transfer_single(temp_path, request, total, progress, cancel)
                     .await
@@ -169,7 +206,8 @@ impl FileDownloader {
         progress: Option<&dyn ProgressSink>,
         cancel: &CancellationToken,
     ) -> Result<u64, DownloadError> {
-        let mut reader = self.source.open(&request.location).await?;
+        // 建连 / 跟随重定向 / 响应头都在这里等待，取消必须能打断它
+        let mut reader = until_cancelled(self.source.open(&request.location), &[cancel]).await??;
         let mut file = tokio::fs::File::create(temp_path)
             .await
             .map_err(DownloadError::Io)?;
@@ -179,10 +217,8 @@ impl FileDownloader {
         };
         let mut transferred: u64 = 0;
         loop {
-            if cancel.is_cancelled() {
-                return Err(DownloadError::Cancelled);
-            }
-            let Some(chunk) = reader.next_chunk().await? else {
+            // 等字节同样可打断：服务端停顿时 Ctrl-C 不能等到读超时才生效
+            let Some(chunk) = until_cancelled(reader.next_chunk(), &[cancel]).await?? else {
                 break;
             };
             if let Some(hasher) = hasher.as_mut() {
@@ -377,12 +413,18 @@ async fn run_segment(
                     stop.cancel();
                     return Err(err);
                 }
-                // 按段起点与尝试次数确定性错开，避免所有段同时重试
+                // 按段起点与尝试次数确定性错开，避免所有段同时重试；
+                // 退避也要可打断：Ctrl-C 不等退避结束
                 let jitter_ms = (task.bounds.start() % 200) + (u64::from(attempt) * 37 % 200);
-                tokio::time::sleep(
-                    SEGMENT_RETRY_DELAY * attempt + Duration::from_millis(jitter_ms),
-                )
-                .await;
+                let delay = SEGMENT_RETRY_DELAY * attempt + Duration::from_millis(jitter_ms);
+                if until_cancelled(tokio::time::sleep(delay), &[&cancel, &stop])
+                    .await
+                    .is_err()
+                {
+                    // 只有取消（用户 Ctrl-C 或兄弟段失败的 stop）能到这里，
+                    // 两个令牌都已置位，无需再通知
+                    return Err(DownloadError::Cancelled);
+                }
             }
         }
     }
@@ -399,10 +441,13 @@ async fn fetch_segment(
     if cancel.is_cancelled() || stop.is_cancelled() {
         return Err(DownloadError::Cancelled);
     }
-    let mut reader = task
-        .range_source
-        .open_range(&task.location, task.bounds.clone())
-        .await?;
+    // 段连接的建立也要可打断：取消发生在建连期间不等响应头
+    let mut reader = until_cancelled(
+        task.range_source
+            .open_range(&task.location, task.bounds.clone()),
+        &[cancel, stop],
+    )
+    .await??;
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
         .open(&task.temp_path)
@@ -415,10 +460,7 @@ async fn fetch_segment(
     let mut got: u64 = 0;
     let outcome: Result<(), DownloadError> = async {
         loop {
-            if cancel.is_cancelled() || stop.is_cancelled() {
-                return Err(DownloadError::Cancelled);
-            }
-            let Some(chunks) = reader.next_chunk().await? else {
+            let Some(chunks) = until_cancelled(reader.next_chunk(), &[cancel, stop]).await?? else {
                 break;
             };
             file.write_all(&chunks).await.map_err(DownloadError::Io)?;
@@ -794,6 +836,51 @@ mod tests {
 
         let result = downloader.download(&request, None, &cancel).await;
         assert!(matches!(result, Err(DownloadError::Cancelled)));
+        Ok(())
+    }
+
+    /// 建连 / 首字节等待期间按下 Ctrl-C：不等网络返回就中止
+    ///
+    /// 取消检查不能只放在分块循环顶部——网络 future 不返回，检查就执行不到，
+    /// 观感是 Ctrl-C 后下载又继续了一秒。这里 open 永不完成，取消必须仍能打断
+    /// （回归时表现为 5s 超时而非正常返回）。
+    #[tokio::test]
+    async fn cancel_during_hanging_open_returns_promptly() -> Result<(), Box<dyn Error>> {
+        struct HangingSource;
+
+        #[async_trait]
+        impl ByteSource for HangingSource {
+            async fn open(&self, _location: &Url) -> Result<Box<dyn ByteReader>, SourceError> {
+                std::future::pending().await
+            }
+        }
+
+        let dir = tempdir()?;
+        let destination = dir.path().join("server.jar");
+        let cancel = CancellationToken::new();
+        let downloader = FileDownloader::new(Arc::new(HangingSource));
+        let request = DownloadRequest {
+            location: "https://example.com/server.jar".parse()?,
+            destination: destination.clone(),
+            expected: None,
+            expected_size: None,
+        };
+
+        let token = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            token.cancel();
+        });
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            downloader.download(&request, None, &cancel),
+        )
+        .await;
+        let result = outcome.expect("cancel must abort the hanging connection, not wait on it");
+        assert!(matches!(result, Err(DownloadError::Cancelled)));
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read_dir(dir.path())?.count(), 0);
         Ok(())
     }
 

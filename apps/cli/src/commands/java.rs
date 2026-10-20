@@ -1,3 +1,4 @@
+use crate::diagnostic::AppDiagnostic;
 use crate::output::Printer;
 use crate::progress::{InstallSession, ScanProgress};
 use anyhow::{Context, Result, anyhow};
@@ -145,6 +146,11 @@ pub(crate) async fn install(
         .await
         .context("安装 Java 失败")?;
     session.finish();
+
+    // 取消落在解压尾段、重装场景已照常注册：安装其实已完成，仍按取消静默退出
+    if session.cancel().is_cancelled() {
+        return Err(AppDiagnostic::cancelled().into());
+    }
 
     printer.print_outcome(
         &format!(

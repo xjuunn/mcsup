@@ -7,9 +7,15 @@ use port::{
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::info;
+
+/// 硬中断（断电 / kill）遗留临时条目的判定年龄
+///
+/// 正常失败路径就地清理；超过该年龄的 `.tmp-*` / `.bak-*` / `*.tmp` 视为
+/// 上次进程没来得及清的残留。够老才删，避免误删并发安装的进行中产物。
+const STALE_TEMP_AGE: Duration = Duration::from_secs(3600);
 
 /// Java 操作失败
 #[derive(Debug, Error)]
@@ -255,11 +261,11 @@ impl JavaService {
 
         // 源探测与排序属于安装编排的一部分，换入口（CLI/API/MCP）共享同一阶段机
         notify(InstallStage::Probing);
-        let registry = self.registry.ranked().await;
+        let registry = until_cancelled(self.registry.ranked(), cancel).await?;
 
         notify(InstallStage::Listing);
         let request = JavaPackageRequest::for_current_platform(major, package_type);
-        let packages = registry.list_packages(&request).await?;
+        let packages = until_cancelled(registry.list_packages(&request), cancel).await??;
         let package = packages
             .into_iter()
             .find(|pkg| vendor.is_none_or(|v| pkg.vendor == v))
@@ -270,16 +276,28 @@ impl JavaService {
             })?;
 
         notify(InstallStage::Resolving);
-        let resolved = registry.resolve_binary(&package).await?;
+        let resolved = until_cancelled(registry.resolve_binary(&package), cancel).await??;
+
+        // 上次硬中断（断电 / kill -9）残留的临时文件在安装开始时统一回收
+        sweep_stale_temp(&self.java_root);
 
         // 目录名用「厂商-大版本」，短且稳定：重装同一大版本就地替换，
         // 不随归档文件名（版本号、平台后缀）膨胀路径
         let dir_name = install_dir_name(&package);
         let install_dir = self.java_root.join(&dir_name);
+        // 失败清理只删本次新建的目录：重装失败时旧运行时必须原样保留
+        let dir_preexisting = install_dir.exists();
         std::fs::create_dir_all(&install_dir)
             .map_err(|source| JavaError::io(&install_dir, source))?;
         let filename = download_filename(&resolved.location);
         let destination = install_dir.join(&filename);
+
+        // 取消落在解析完成与下载发起之间：下载器入口也会查，这里兜底让任何
+        // ArtifactDownloader 实现（含不查取消的）都受控，且目录尚未被使用
+        if cancel.is_cancelled() {
+            cleanup_partial_install(&install_dir, &destination, dir_preexisting);
+            return Err(JavaError::Download(port::DownloadError::Cancelled));
+        }
 
         notify(InstallStage::Downloading);
         let request = DownloadRequest {
@@ -288,10 +306,38 @@ impl JavaService {
             expected: None,
             expected_size: resolved.expected_size,
         };
-        let artifact = self.downloader.download(&request, progress, cancel).await?;
+        let artifact = match self.downloader.download(&request, progress, cancel).await {
+            Ok(artifact) => artifact,
+            Err(err) => {
+                // 下载器已清自己的 .tmp，这里回收目录本身；取消同走此路径
+                cleanup_partial_install(&install_dir, &destination, dir_preexisting);
+                return Err(err.into());
+            }
+        };
+
+        // Ctrl-C 落在下载完成与解压之间：不启动耗时的解压，直接回收
+        if cancel.is_cancelled() {
+            cleanup_partial_install(&install_dir, &destination, dir_preexisting);
+            return Err(JavaError::Download(port::DownloadError::Cancelled));
+        }
 
         notify(InstallStage::Extracting);
-        let home = extract_and_swap(&destination, &install_dir, self.extractor.as_ref())?;
+        // 解压失败时归档（可能数百 MB）与半成品都在 install_dir 里，必须回收
+        let home = match extract_and_swap(&destination, &install_dir, self.extractor.as_ref()) {
+            Ok(home) => home,
+            Err(err) => {
+                cleanup_partial_install(&install_dir, &destination, dir_preexisting);
+                return Err(err);
+            }
+        };
+
+        // 解压不可打断（同步解包）：取消落在解压期间时，全新安装连完整产物一并
+        // 回收，不留未注册的目录；重装场景旧目录已被替换，删除只会两头落空，
+        // 照常注册（入口层见取消后静默退出，不打印成功）
+        if cancel.is_cancelled() && !dir_preexisting {
+            let _ = std::fs::remove_dir_all(&install_dir);
+            return Err(JavaError::Download(port::DownloadError::Cancelled));
+        }
 
         let now = crate::util::unix_now();
         let runtime = JavaRuntime {
@@ -398,6 +444,82 @@ fn managed_install_dir(java_root: &Path, home: &Path) -> Option<PathBuf> {
     let relative = home.strip_prefix(java_root).ok()?;
     let first = relative.components().next()?;
     Some(java_root.join(first.as_os_str()))
+}
+
+/// 安装失败后的目录回收
+///
+/// 归档文件（可能数百 MB）总是删掉；`install_dir` 是本次新建的空壳时整个删除，
+/// 重装场景（目录本就存在）只删归档，旧运行时原样保留。
+fn cleanup_partial_install(install_dir: &Path, archive: &Path, dir_preexisting: bool) {
+    let _ = std::fs::remove_file(archive);
+    if !dir_preexisting {
+        let _ = std::fs::remove_dir_all(install_dir);
+    }
+}
+
+/// 取消可打断的阶段等待（轮询令牌，粒度 [`CANCEL_POLL`]）
+///
+/// [`CancellationToken`] 是原子标志、没有唤醒机制；探测排序 / 查询版本 / 解析
+/// 下载地址各自都要跑完一轮网络往返，期间取消标志无人检查——Ctrl-C 后观感是
+/// 「按了没反应，过了几秒才停」。把阶段 future 与取消轮询竞争，取消在轮询粒度
+/// 内立即生效；进行中的请求随 future 丢弃（子任务即使在后台跑完也无人消费）。
+async fn until_cancelled<T>(
+    future: impl Future<Output = T>,
+    cancel: &CancellationToken,
+) -> Result<T, JavaError> {
+    tokio::select! {
+        biased;
+        () = async {
+            while !cancel.is_cancelled() {
+                tokio::time::sleep(CANCEL_POLL).await;
+            }
+        } => Err(JavaError::Download(port::DownloadError::Cancelled)),
+        value = future => Ok(value),
+    }
+}
+
+/// 阶段取消的轮询粒度
+const CANCEL_POLL: Duration = Duration::from_millis(25);
+
+/// 回收硬中断（断电 / kill -9）残留的临时条目
+///
+/// 进程被强杀时析构与错误路径都来不及跑，`.tmp-*` 解压目录、`.bak-*` 备份
+/// 目录、`*.tmp` 下载半成品会永久留在 `java_root`。下次安装开始时按年龄
+/// 清理：够老（[`STALE_TEMP_AGE`]）才删，不碰并发安装的进行中产物。
+fn sweep_stale_temp(java_root: &Path) {
+    let Ok(entries) = std::fs::read_dir(java_root) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let is_temp = name.starts_with(".tmp-")
+            || name.starts_with(".bak-")
+            || (name.ends_with(".tmp") && name.starts_with('.'));
+        if !is_temp {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > STALE_TEMP_AGE);
+        if !stale {
+            continue;
+        }
+        let path = entry.path();
+        let removed = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match removed {
+            Ok(()) => info!(path = %path.display(), "removed stale temp from previous run"),
+            Err(err) => tracing::warn!(path = %path.display(), %err, "failed to remove stale temp"),
+        }
+    }
 }
 
 /// 安装目录名：`{vendor}-{major}`（如 `zulu-27`、`temurin-21-jre`）
@@ -691,6 +813,40 @@ mod tests {
         }
     }
 
+    /// 下载一开工就失败：错误、超时、Ctrl-C 取消都收敛到这条返回路径
+    struct FailingDownloader;
+
+    #[async_trait]
+    impl ArtifactDownloader for FailingDownloader {
+        async fn download(
+            &self,
+            _request: &DownloadRequest,
+            _progress: Option<&dyn ProgressSink>,
+            _cancel: &CancellationToken,
+        ) -> Result<DownloadedArtifact, port::DownloadError> {
+            Err(port::DownloadError::Cancelled)
+        }
+    }
+
+    /// 只落归档、不产出可运行的 bin/java：解压校验必然失败
+    struct ArchiveOnlyDownloader;
+
+    #[async_trait]
+    impl ArtifactDownloader for ArchiveOnlyDownloader {
+        async fn download(
+            &self,
+            request: &DownloadRequest,
+            _progress: Option<&dyn ProgressSink>,
+            _cancel: &CancellationToken,
+        ) -> Result<DownloadedArtifact, port::DownloadError> {
+            std::fs::write(&request.destination, b"stub").map_err(port::DownloadError::Io)?;
+            Ok(DownloadedArtifact {
+                path: request.destination.clone(),
+                size: 4,
+            })
+        }
+    }
+
     /// 归档格式判定与真实工具链一致；测试下载不产生真归档，extract 不会被触发
     struct FakeExtractor;
 
@@ -758,12 +914,27 @@ mod tests {
     }
 
     fn svc(tmp: &Path) -> (JavaService, Arc<MemRepo>) {
+        svc_with(tmp, Arc::new(NoopDownloader))
+    }
+
+    /// 用指定下载器装配服务：失败清理类用例需要下载器行为可控
+    fn svc_with(
+        tmp: &Path,
+        downloader: Arc<dyn ArtifactDownloader>,
+    ) -> (JavaService, Arc<MemRepo>) {
+        svc_parts(tmp, downloader, Arc::new(FakeRegistry))
+    }
+
+    /// 指定下载器与聚合注册表：取消类用例需要注册表挂起 / 在阶段中触发取消
+    fn svc_parts(
+        tmp: &Path,
+        downloader: Arc<dyn ArtifactDownloader>,
+        registry: Arc<dyn JavaSourceRegistryPort>,
+    ) -> (JavaService, Arc<MemRepo>) {
         let repo = Arc::new(MemRepo::new());
         let scanner = Arc::new(FakeScanner {
             homes: vec![tmp.join("jdk21")],
         });
-        let registry = Arc::new(FakeRegistry);
-        let downloader = Arc::new(NoopDownloader);
         let extractor = Arc::new(FakeExtractor);
         let java_root = tmp.join("java");
         std::fs::create_dir_all(&java_root).expect("mkdir");
@@ -924,6 +1095,325 @@ mod tests {
             .collect();
         assert_eq!(managed.len(), 1);
         assert_eq!(managed[0].id, "temurin-21");
+    }
+
+    /// `java_root` 下的全部残留名（失败清理类断言用）
+    fn java_root_entries(tmp: &Path) -> Vec<String> {
+        std::fs::read_dir(tmp.join("java"))
+            .expect("read java_root")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// 下载失败 / Ctrl-C 取消：本次新建的安装目录整体回收，不留空壳
+    #[tokio::test]
+    async fn install_download_failure_removes_new_dir() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (service, _repo) = svc_with(tmp.path(), Arc::new(FailingDownloader));
+        let cancel = CancellationToken::new();
+
+        let err = service
+            .install(
+                JavaMajor::parse(21).expect("21"),
+                JavaPackageType::Jdk,
+                None,
+                None,
+                None,
+                &cancel,
+            )
+            .await
+            .expect_err("must fail");
+
+        assert!(matches!(
+            err,
+            JavaError::Download(port::DownloadError::Cancelled)
+        ));
+        let leftovers = java_root_entries(tmp.path());
+        assert!(leftovers.is_empty(), "leftovers: {leftovers:?}");
+    }
+
+    /// 解压校验失败：已下载的归档（可能数百 MB）连同新建目录一起回收
+    #[tokio::test]
+    async fn install_extract_failure_removes_archive_and_new_dir() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (service, _repo) = svc_with(tmp.path(), Arc::new(ArchiveOnlyDownloader));
+        let cancel = CancellationToken::new();
+
+        let err = service
+            .install(
+                JavaMajor::parse(21).expect("21"),
+                JavaPackageType::Jdk,
+                None,
+                None,
+                None,
+                &cancel,
+            )
+            .await
+            .expect_err("must fail");
+
+        assert!(matches!(err, JavaError::Fs(FsError::Io { .. })));
+        let leftovers = java_root_entries(tmp.path());
+        assert!(leftovers.is_empty(), "leftovers: {leftovers:?}");
+    }
+
+    /// 重装失败：目录本就存在（旧运行时在里面），只回收本次归档，目录原样保留
+    #[tokio::test]
+    async fn install_extract_failure_keeps_preexisting_dir() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let java_root = tmp.path().join("java");
+        let install_dir = java_root.join("temurin-21");
+        let sentinel = install_dir.join("keep.txt");
+        std::fs::create_dir_all(&install_dir).expect("mkdir");
+        std::fs::write(&sentinel, b"old install").expect("sentinel");
+
+        let (service, _repo) = svc_with(tmp.path(), Arc::new(ArchiveOnlyDownloader));
+        let cancel = CancellationToken::new();
+        let err = service
+            .install(
+                JavaMajor::parse(21).expect("21"),
+                JavaPackageType::Jdk,
+                None,
+                None,
+                None,
+                &cancel,
+            )
+            .await
+            .expect_err("must fail");
+
+        assert!(matches!(err, JavaError::Fs(FsError::Io { .. })));
+        assert!(
+            sentinel.exists(),
+            "existing install must survive a failed reinstall"
+        );
+        assert!(
+            !install_dir.join("java-bin").exists(),
+            "partial archive must be cleaned"
+        );
+    }
+
+    /// 聚合注册表永远不返回（网络挂起）：取消必须在轮询粒度内生效，
+    /// 而不是等网络 future 返回——回归时表现为 5s 超时而非正常返回
+    #[tokio::test]
+    async fn install_aborts_promptly_while_registry_hangs() {
+        struct HangingRegistry;
+
+        #[async_trait]
+        impl JavaSourceRegistryPort for HangingRegistry {
+            fn source_names(&self) -> Vec<&'static str> {
+                vec!["hang"]
+            }
+
+            async fn ranked(&self) -> Arc<dyn JavaSourceRegistryPort> {
+                Arc::new(HangingRegistry)
+            }
+
+            async fn list_packages(
+                &self,
+                _request: &JavaPackageRequest,
+            ) -> Result<Vec<port::JavaPackage>, SourceError> {
+                std::future::pending().await
+            }
+
+            async fn resolve_binary(
+                &self,
+                _package: &port::JavaPackage,
+            ) -> Result<port::ResolvedJava, SourceError> {
+                std::future::pending().await
+            }
+        }
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (service, _repo) = svc_parts(
+            tmp.path(),
+            Arc::new(NoopDownloader),
+            Arc::new(HangingRegistry),
+        );
+        let cancel = CancellationToken::new();
+        let token = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            token.cancel();
+        });
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            service.install(
+                JavaMajor::parse(21).expect("21"),
+                JavaPackageType::Jdk,
+                None,
+                None,
+                None,
+                &cancel,
+            ),
+        )
+        .await;
+        let err = outcome
+            .expect("cancel must abort the hanging registry, not wait for it")
+            .expect_err("must be cancelled");
+        assert!(matches!(
+            err,
+            JavaError::Download(port::DownloadError::Cancelled)
+        ));
+    }
+
+    /// 在解析阶段触发取消：不发起下载，新建目录整体回收
+    #[tokio::test]
+    async fn install_cancels_between_resolve_and_download() {
+        struct CancelOnResolve {
+            cancel: CancellationToken,
+        }
+
+        #[async_trait]
+        impl JavaSourceRegistryPort for CancelOnResolve {
+            fn source_names(&self) -> Vec<&'static str> {
+                vec!["fake"]
+            }
+
+            async fn ranked(&self) -> Arc<dyn JavaSourceRegistryPort> {
+                Arc::new(CancelOnResolve {
+                    cancel: self.cancel.clone(),
+                })
+            }
+
+            async fn list_packages(
+                &self,
+                request: &JavaPackageRequest,
+            ) -> Result<Vec<port::JavaPackage>, SourceError> {
+                Ok(vec![port::JavaPackage {
+                    id: "pkg1".into(),
+                    vendor: JavaVendor::Temurin,
+                    major: request.major,
+                    version: format!("{}.0.5", request.major),
+                    package_type: request.package_type,
+                }])
+            }
+
+            async fn resolve_binary(
+                &self,
+                package: &port::JavaPackage,
+            ) -> Result<port::ResolvedJava, SourceError> {
+                self.cancel.cancel();
+                Ok(port::ResolvedJava {
+                    package: package.clone(),
+                    location: url::Url::parse("https://example.com/java-bin").expect("url"),
+                    expected_size: None,
+                })
+            }
+        }
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let cancel = CancellationToken::new();
+        let (service, _repo) = svc_parts(
+            tmp.path(),
+            Arc::new(NoopDownloader),
+            Arc::new(CancelOnResolve {
+                cancel: cancel.clone(),
+            }),
+        );
+
+        let err = service
+            .install(
+                JavaMajor::parse(21).expect("21"),
+                JavaPackageType::Jdk,
+                None,
+                None,
+                None,
+                &cancel,
+            )
+            .await
+            .expect_err("must be cancelled");
+        assert!(matches!(
+            err,
+            JavaError::Download(port::DownloadError::Cancelled)
+        ));
+        let leftovers = java_root_entries(tmp.path());
+        assert!(leftovers.is_empty(), "leftovers: {leftovers:?}");
+    }
+
+    /// 取消落在下载完成与解压之间：不启动解压，归档与新建目录一并回收
+    #[tokio::test]
+    async fn install_cancels_before_extract() {
+        struct CancelOnDownload {
+            cancel: CancellationToken,
+        }
+
+        #[async_trait]
+        impl ArtifactDownloader for CancelOnDownload {
+            async fn download(
+                &self,
+                request: &DownloadRequest,
+                _progress: Option<&dyn ProgressSink>,
+                _cancel: &CancellationToken,
+            ) -> Result<DownloadedArtifact, port::DownloadError> {
+                std::fs::write(&request.destination, b"stub").map_err(port::DownloadError::Io)?;
+                self.cancel.cancel();
+                Ok(DownloadedArtifact {
+                    path: request.destination.clone(),
+                    size: 4,
+                })
+            }
+        }
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let cancel = CancellationToken::new();
+        let (service, _repo) = svc_parts(
+            tmp.path(),
+            Arc::new(CancelOnDownload {
+                cancel: cancel.clone(),
+            }),
+            Arc::new(FakeRegistry),
+        );
+
+        let err = service
+            .install(
+                JavaMajor::parse(21).expect("21"),
+                JavaPackageType::Jdk,
+                None,
+                None,
+                None,
+                &cancel,
+            )
+            .await
+            .expect_err("must be cancelled");
+        assert!(matches!(
+            err,
+            JavaError::Download(port::DownloadError::Cancelled)
+        ));
+        let leftovers = java_root_entries(tmp.path());
+        assert!(leftovers.is_empty(), "leftovers: {leftovers:?}");
+    }
+
+    /// 强杀（断电 / kill -9）残留按年龄回收：够老才删，新鲜条目与正常安装不碰
+    #[test]
+    fn sweep_stale_temp_removes_only_stale() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let java_root = tmp.path().join("java");
+        std::fs::create_dir_all(&java_root).expect("mkdir");
+
+        let stale = java_root.join(".partial.zip.123.1.tmp");
+        std::fs::write(&stale, b"half").expect("stale file");
+        let handle = std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .expect("open");
+        handle
+            .set_modified(SystemTime::now() - STALE_TEMP_AGE - Duration::from_secs(60))
+            .expect("backdate");
+
+        let fresh = java_root.join(".fresh.zip.124.2.tmp");
+        std::fs::write(&fresh, b"half").expect("fresh file");
+        let live_tmp = java_root.join(".tmp-zulu-27-20260101");
+        std::fs::create_dir_all(&live_tmp).expect("tmp dir");
+        let install = java_root.join("zulu-27");
+        std::fs::create_dir_all(&install).expect("install dir");
+
+        sweep_stale_temp(&java_root);
+
+        assert!(!stale.exists(), "stale download temp must be removed");
+        assert!(fresh.exists(), "fresh temp must survive");
+        assert!(live_tmp.exists(), "fresh extraction temp must survive");
+        assert!(install.exists(), "managed install must survive");
     }
 
     /// 目录名用「厂商-大版本」：短、稳定，JRE 加后缀避免与 JDK 同址

@@ -273,10 +273,12 @@ impl InstallSession {
         let message = message.into();
         let spinner = TaskSpinner::new(message.clone(), enable);
         let sink = BarSink::new(spinner.handle(), message);
+        let cancel = CancellationToken::new();
+        install_ctrl_c_handler(cancel.clone(), spinner.handle());
         Self {
             spinner,
             sink,
-            cancel: CancellationToken::new(),
+            cancel,
             downloading: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -316,6 +318,10 @@ impl InstallSession {
 impl StageSink for InstallSession {
     fn on_stage(&self, stage: InstallStage) {
         use std::sync::atomic::Ordering;
+        // 取消后回显线已由 Ctrl-C 处理器收掉，任何迟到的阶段/进度都不再画
+        if self.cancel.is_cancelled() {
+            return;
+        }
         match stage {
             // 下载：立即接管这条线，从发起请求到首字节之间也要有回显
             InstallStage::Downloading => {
@@ -335,6 +341,10 @@ impl StageSink for InstallSession {
 
 impl ProgressSink for InstallSession {
     fn on_progress(&self, transferred: u64, total: Option<u64>) {
+        // 取消后不再回显（同 on_stage：线已收掉，迟到的进度画不上去）
+        if self.cancel.is_cancelled() {
+            return;
+        }
         self.sink.on_progress(transferred, total);
     }
 }
@@ -344,6 +354,31 @@ impl Drop for InstallSession {
         self.cancel.cancel();
         // TaskSpinner::drop 清除回显行
     }
+}
+
+/// Ctrl-C 转为协作取消：第一次按下取消令牌并立即收掉回显线（下载循环在下个
+/// 轮询粒度内退出、中间文件就地回收），第二次按下强制退出（此时清理可能被
+/// 占用卡住，交给用户决断）
+///
+/// 不装处理器时 Ctrl-C 走进程默认终止，析构与清理路径全都不跑，`.tmp`
+/// 半成品直接残留在磁盘上。非异步上下文（单测）下静默跳过。
+fn install_ctrl_c_handler(cancel: CancellationToken, bar: ProgressBar) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    handle.spawn(async move {
+        if tokio::signal::ctrl_c().await.is_err() {
+            return;
+        }
+        tracing::debug!("ctrl-c received, cancelling install");
+        cancel.cancel();
+        // 界面立刻停住：不等下载循环与清理走完
+        bar.finish_and_clear();
+        if tokio::signal::ctrl_c().await.is_ok() {
+            // 第二次：不再等清理，立即退出（130 = 128 + SIGINT）
+            std::process::exit(130);
+        }
+    });
 }
 
 #[cfg(test)]

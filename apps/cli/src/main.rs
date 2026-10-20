@@ -32,7 +32,11 @@ async fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             let code = output::Printer::exit_code(&err);
-            output::Printer::render_error(err);
+            // 130 只有「用户取消」一条来路（Ctrl-C 协作取消），中间文件已由
+            // 下层静默清理完：不打印错误，直接以取消码退出
+            if code != 130 {
+                output::Printer::render_error(err);
+            }
             ExitCode::from(code)
         }
     }

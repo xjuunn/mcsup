@@ -180,8 +180,8 @@ impl Printer {
             if let Some(source) = cause.downcast_ref::<mcsup::port::SourceError>() {
                 return source_exit_code(source);
             }
-            if cause.downcast_ref::<mcsup::port::DownloadError>().is_some() {
-                return 5;
+            if let Some(download) = cause.downcast_ref::<mcsup::port::DownloadError>() {
+                return download_exit_code(download);
             }
         }
         1
@@ -198,6 +198,15 @@ impl Printer {
     #[must_use]
     pub(crate) const fn is_human(self) -> bool {
         matches!(self.format, OutputFormat::Human)
+    }
+}
+
+/// 下载失败 → 5 后端失败；用户取消 → 130（128 + SIGINT），与 Ctrl-C 强制
+/// 退出码一致，调用方凭码区分「取消」与「失败」
+fn download_exit_code(err: &mcsup::port::DownloadError) -> u8 {
+    match err {
+        mcsup::port::DownloadError::Cancelled => 130,
+        _ => 5,
     }
 }
 
@@ -234,7 +243,7 @@ fn java_exit_code(err: &mcsup::service::JavaError) -> u8 {
     match err {
         mcsup::service::JavaError::NotFound(_) => 3,
         mcsup::service::JavaError::Source(source) => source_exit_code(source),
-        mcsup::service::JavaError::Download(_) => 5,
+        mcsup::service::JavaError::Download(download) => download_exit_code(download),
         mcsup::service::JavaError::Repo(repo) => repo_exit_code(repo),
         _ => 1,
     }
@@ -243,7 +252,7 @@ fn java_exit_code(err: &mcsup::service::JavaError) -> u8 {
 fn install_exit_code(err: &mcsup::service::InstallError) -> u8 {
     match err {
         mcsup::service::InstallError::Source(source) => source_exit_code(source),
-        mcsup::service::InstallError::Download(_) => 5,
+        mcsup::service::InstallError::Download(download) => download_exit_code(download),
         mcsup::service::InstallError::Status(_) => 4,
         _ => 1,
     }
@@ -396,5 +405,25 @@ mod tests {
         .context("安装 Java 失败")
         .unwrap_err();
         assert_eq!(Printer::exit_code(&err), 5);
+    }
+
+    /// 用户取消（Ctrl-C 协作取消）：130 = 128 + SIGINT，与后端失败 5 区分
+    #[test]
+    fn java_cancelled_maps_to_exit_code_130() {
+        let err = Err::<(), _>(mcsup::service::JavaError::from(
+            mcsup::port::DownloadError::Cancelled,
+        ))
+        .context("安装 Java 失败")
+        .unwrap_err();
+        assert_eq!(Printer::exit_code(&err), 130);
+    }
+
+    /// 裸下载取消（不经 `JavaError` 包装，如服务端核心下载）同样判 130
+    #[test]
+    fn download_cancelled_maps_to_exit_code_130() {
+        let err = Err::<(), _>(mcsup::port::DownloadError::Cancelled)
+            .context("下载服务端失败")
+            .unwrap_err();
+        assert_eq!(Printer::exit_code(&err), 130);
     }
 }
