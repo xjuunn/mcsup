@@ -5,6 +5,8 @@ use crate::output::Printer;
 use anyhow::{Context, Result};
 use comfy_table::Table;
 use inquire::Confirm;
+use inquire::validator::{ErrorMessage, Validation};
+use mcsup::domain::workspace::Workspace;
 use mcsup::service::{InitOutcome, ServerRegistry, WorkspaceService, absolute_path};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -30,7 +32,7 @@ struct InitRow<'a> {
 pub(crate) fn run(action: WorkspaceAction, printer: Printer) -> Result<()> {
     let store = bootstrap::open_store()?;
     let reg = Arc::new(ServerRegistry::new(store.clone(), store.clone()));
-    let svc = WorkspaceService::new(store);
+    let svc = WorkspaceService::new(store.clone(), store);
     match action {
         WorkspaceAction::Init { dir, name } => init(&svc, dir, name.as_deref(), printer),
         WorkspaceAction::List => list(&svc, &reg, printer),
@@ -180,14 +182,19 @@ fn remove(svc: &WorkspaceService, name: &str, purge: bool, printer: Printer) -> 
     let purge = if purge || !printer.is_interactive() {
         purge
     } else {
-        Confirm::new(&format!(
+        let confirmed = Confirm::new(&format!(
             "删除 {} ({}) 的磁盘数据?",
             ws.name.as_str(),
             ws.path.display()
         ))
         .with_default(false)
         .prompt()
-        .context("已取消注销")?
+        .context("已取消注销")?;
+        if confirmed {
+            // 同意删盘后再上一道闸：红色警示 + 手输工作区名称，防误删存档与备份
+            confirm_purge_by_name(&ws, printer)?;
+        }
+        confirmed
     };
     if purge {
         // 自身工作目录在目标里时我们自己也持有句柄，先退到目标之外；
@@ -207,6 +214,29 @@ fn remove(svc: &WorkspaceService, name: &str, purge: bool, printer: Printer) -> 
             "purged": purge,
         }),
     )
+}
+
+/// 删盘前的第二道确认：红色警示 + 输入工作区名称（交互下同意删盘后调用）
+fn confirm_purge_by_name(ws: &Workspace, printer: Printer) -> Result<()> {
+    printer.print_warning(&format!(
+        "警告: 将永久删除 {} ({}) 中的所有存档、备份等文件，此操作无法恢复",
+        ws.name.as_str(),
+        ws.path.display()
+    ));
+    let expected = ws.name.as_str();
+    let _: String = inquire::Text::new(&format!("输入工作区名称 {expected} 以确认删除"))
+        .with_validator(move |input: &str| {
+            Ok(if input.trim() == expected {
+                Validation::Valid
+            } else {
+                Validation::Invalid(ErrorMessage::Custom(
+                    "名称不匹配，请重新输入（Ctrl+C 取消）".to_owned(),
+                ))
+            })
+        })
+        .prompt()
+        .context("已取消删除")?;
+    Ok(())
 }
 
 /// 目标目录包含当前工作目录时，先退出来

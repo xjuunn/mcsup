@@ -43,6 +43,14 @@ impl Printer {
         }
     }
 
+    /// 一行红色警示，仅人类模式：不可恢复的危险操作前的最后提示
+    #[allow(clippy::print_stdout)]
+    pub(crate) fn print_warning(self, text: &str) {
+        if self.format == OutputFormat::Human {
+            println!("{}", text.red());
+        }
+    }
+
     /// 当前是否可提问：JSON 输出下交互会卡住脚本，管道输入下提问必然失败
     ///
     /// 所有 inquire 调用前统一问这一个口径，禁止在命令里各自判 TTY。

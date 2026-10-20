@@ -1,6 +1,6 @@
 use crate::fs_error::FsError;
 use domain::workspace::{InvalidWorkspaceName, Workspace, WorkspaceId, WorkspaceName};
-use port::{RepositoryError, WorkspaceRepository};
+use port::{RepositoryError, ServerRepository, WorkspaceRepository};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -83,6 +83,8 @@ pub enum InitOutcome {
 /// 工作目录编排：判空、目录结构、marker、注册表
 pub struct WorkspaceService {
     repo: Arc<dyn WorkspaceRepository>,
+    /// 服务器登记（外键引用工作目录）：注销前先清，见 [`WorkspaceService::remove`]
+    servers: Arc<dyn ServerRepository>,
 }
 
 impl std::fmt::Debug for WorkspaceService {
@@ -94,8 +96,8 @@ impl std::fmt::Debug for WorkspaceService {
 impl WorkspaceService {
     /// 组合注册表
     #[must_use]
-    pub fn new(repo: Arc<dyn WorkspaceRepository>) -> Self {
-        Self { repo }
+    pub fn new(repo: Arc<dyn WorkspaceRepository>, servers: Arc<dyn ServerRepository>) -> Self {
+        Self { repo, servers }
     }
 
     /// 创建并注册工作目录
@@ -203,8 +205,11 @@ impl WorkspaceService {
 
     /// 注销工作目录；`purge` 时一并删除磁盘目录
     ///
-    /// 先删数据再注销：删除失败（常见于目录被占用）时注册记录还在，
-    /// 退出占用后重试即可；反过来会留下「记录已注销、目录只删了一半」的中间态。
+    /// 顺序：先删数据再注销，再清服务器登记。服务器外键引用工作目录行，
+    /// 必须先 [`ServerRepository::remove_by_workspace`] 清掉服务器登记、
+    /// 再注销工作目录，否则注册表删除报 `FOREIGN KEY constraint failed`。
+    /// 删除失败（常见于目录被占用）时注册记录还在，退出占用后重试即可；
+    /// 反过来会留下「记录已注销、目录只删了一半」的中间态。
     ///
     /// # Errors
     ///
@@ -215,6 +220,8 @@ impl WorkspaceService {
             std::fs::remove_dir_all(&ws.path)
                 .map_err(|err| WorkspaceError::io(&ws.path, deletion_hint(err)))?;
         }
+        // 服务器登记引用工作目录（外键）：先清服务器，再注销工作目录
+        self.servers.remove_by_workspace(&ws.id)?;
         self.repo.remove(&ws.id)?;
         Ok(ws)
     }
@@ -502,10 +509,78 @@ mod tests {
         }
     }
 
+    /// 服务器登记假件：记录注销工作目录时是否被清（外键协作的回归点）
+    struct MemServers {
+        cleared: std::sync::atomic::AtomicBool,
+    }
+
+    impl MemServers {
+        fn new() -> Self {
+            Self {
+                cleared: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl ServerRepository for MemServers {
+        fn create(&self, _meta: &domain::server::meta::ServerMeta) -> Result<(), RepositoryError> {
+            unreachable!("not used in tests")
+        }
+        fn get(
+            &self,
+            _name: &domain::server::meta::ServerName,
+        ) -> Result<domain::server::meta::ServerMeta, RepositoryError> {
+            unreachable!("not used in tests")
+        }
+        fn list(&self) -> Result<Vec<domain::server::meta::ServerMeta>, RepositoryError> {
+            Ok(Vec::new())
+        }
+        fn update_jar(
+            &self,
+            _name: &domain::server::meta::ServerName,
+            _jar: &domain::server::meta::InstalledJar,
+            _updated_at: i64,
+        ) -> Result<domain::server::meta::ServerMeta, RepositoryError> {
+            unreachable!("not used in tests")
+        }
+        fn remove_by_workspace(&self, _workspace_id: &WorkspaceId) -> Result<(), RepositoryError> {
+            self.cleared
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn relink(
+            &self,
+            _name: &domain::server::meta::ServerName,
+            _workspace_id: &WorkspaceId,
+            _rel_dir: &Path,
+            _updated_at: i64,
+        ) -> Result<domain::server::meta::ServerMeta, RepositoryError> {
+            unreachable!("not used in tests")
+        }
+    }
+
     fn svc() -> (WorkspaceService, tempfile::TempDir) {
         let tmp = tempfile::tempdir().expect("tmp");
         let repo = Arc::new(MemRepo::new());
-        (WorkspaceService::new(repo), tmp)
+        let servers = Arc::new(MemServers::new());
+        (WorkspaceService::new(repo, servers), tmp)
+    }
+
+    /// 服务器登记以工作目录为外键：注销前必须先清，否则注册表删除报
+    /// `FOREIGN KEY constraint failed`（真实外键见 storage 集成测试）
+    #[test]
+    fn remove_clears_server_registrations_first() {
+        let repo = Arc::new(MemRepo::new());
+        let servers = Arc::new(MemServers::new());
+        let svc = WorkspaceService::new(repo.clone(), servers.clone());
+        let tmp = tempfile::tempdir().expect("tmp");
+        svc.init(&tmp.path().join("ws"), Some("ws01"))
+            .expect("init");
+
+        svc.remove("ws01", false).expect("remove");
+
+        assert!(servers.cleared.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(svc.resolve("ws01").is_err());
     }
 
     #[test]
@@ -538,7 +613,8 @@ mod tests {
     #[test]
     fn list_normalizes_legacy_dotted_path() {
         let repo = Arc::new(MemRepo::new());
-        let svc = WorkspaceService::new(repo.clone());
+        let servers = Arc::new(MemServers::new());
+        let svc = WorkspaceService::new(repo.clone(), servers);
         let tmp = tempfile::tempdir().expect("tmp");
         let InitOutcome::Created(ws) = svc
             .init(&tmp.path().join("ws"), Some("ws01"))
