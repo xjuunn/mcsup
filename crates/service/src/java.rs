@@ -308,7 +308,12 @@ impl JavaService {
         Ok(InstallOutcome { runtime, artifact })
     }
 
-    /// 卸载：managed 删文件+记录，系统只删记录
+    /// 卸载：managed 删整个安装目录+记录，系统只删记录
+    ///
+    /// managed 的 JVM home 常嵌套在归档顶层目录里（`{java_root}/{dir}/{dir}/.../Home`），
+    /// 只删 home 会留下 `Contents` 空壳——删除目标是 home 在 `java_root` 下的
+    /// 直接子目录（`managed_install_dir`）。先删文件再注销：删除失败时
+    /// 记录还在，退出占用后重试即可。
     ///
     /// # Errors
     ///
@@ -318,14 +323,18 @@ impl JavaService {
             RepositoryError::NotFound(key) => JavaError::NotFound(key),
             other => JavaError::Repo(other),
         })?;
-        self.repo.remove(path)?;
         if runtime.managed {
-            if runtime.path.starts_with(&self.java_root) {
-                let _ = std::fs::remove_dir_all(&runtime.path);
+            if let Some(install_dir) = managed_install_dir(&self.java_root, &runtime.path)
+                && install_dir.exists()
+            {
+                std::fs::remove_dir_all(&install_dir)
+                    .map_err(|source| JavaError::io(&install_dir, source))?;
             }
+            self.repo.remove(path)?;
             info!(path = %runtime.path.display(), "managed java removed");
             Ok(UninstallOutcome::RemovedManaged { path: runtime.path })
         } else {
+            self.repo.remove(path)?;
             info!(path = %runtime.path.display(), "system java unregistered");
             Ok(UninstallOutcome::UnregisteredSystem { path: runtime.path })
         }
@@ -358,6 +367,17 @@ fn download_filename(location: &url::Url) -> String {
         .and_then(|mut segments| segments.next_back())
         .filter(|s| !s.is_empty())
         .map_or_else(|| "java-archive".into(), str::to_owned)
+}
+
+/// managed 运行时的安装根：`{java_root}/{dir}`（install 落盘的那一层）
+///
+/// JVM home 可能嵌套在归档顶层目录里（`{dir}/{dir}/Contents/Home`），卸载必须
+/// 删到 `java_root` 的直接子目录，只删 home 会留下 `Contents` 空壳。
+/// home 不在 `java_root` 下、或就是 `java_root` 本身时返回 `None`（不删盘）。
+fn managed_install_dir(java_root: &Path, home: &Path) -> Option<PathBuf> {
+    let relative = home.strip_prefix(java_root).ok()?;
+    let first = relative.components().next()?;
+    Some(java_root.join(first.as_os_str()))
 }
 
 /// 把 package id 净化为安全目录名；URL 只取末段文件名，剥掉归档扩展名
@@ -752,6 +772,69 @@ mod tests {
         let (service, _repo) = svc(tmp.path());
         let err = service.uninstall(Path::new("/ghost")).expect_err("missing");
         assert!(matches!(err, JavaError::NotFound(_)));
+    }
+
+    /// managed 的 home 嵌套在归档顶层目录里：必须删到 `java_root` 的直接子目录，
+    /// 只删 home 会留下 `Contents` 空壳（`Info.plist` / `_CodeSignature` 等）
+    #[test]
+    fn uninstall_managed_removes_whole_install_dir() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (service, repo) = svc(tmp.path());
+        let java_root = tmp.path().join("java");
+        let install_dir = java_root.join("zulu27");
+        let home = install_dir.join("zulu27").join("Contents").join("Home");
+        std::fs::create_dir_all(home.join("bin")).expect("mkdir");
+        std::fs::write(
+            home.join("bin").join(domain::java::java_exe_name()),
+            b"stub",
+        )
+        .expect("stub");
+        repo.upsert(&JavaRuntime {
+            id: "zulu27".into(),
+            path: home.clone(),
+            major: JavaMajor::parse(27).expect("27"),
+            version: "27.0.0".into(),
+            vendor: JavaVendor::Zulu,
+            managed: true,
+            created_at: 1,
+            updated_at: 1,
+        })
+        .expect("upsert");
+
+        let outcome = service.uninstall(&home).expect("uninstall");
+
+        assert_eq!(outcome, UninstallOutcome::RemovedManaged { path: home });
+        assert!(!install_dir.exists(), "whole install dir must be gone");
+        assert!(repo.list().expect("list").is_empty(), "record removed");
+    }
+
+    /// 先删文件再注销：安装目录删除失败时记录必须保留，退出占用后重试即可
+    #[test]
+    fn uninstall_managed_failure_keeps_record() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (service, repo) = svc(tmp.path());
+        let java_root = tmp.path().join("java");
+        std::fs::create_dir_all(&java_root).expect("mkdir");
+        // 安装目录换成同名文件：remove_dir_all 必失败
+        let install_dir = java_root.join("zulu27");
+        std::fs::write(&install_dir, "occupied").expect("file");
+        let home = install_dir.join("zulu27").join("Contents").join("Home");
+        repo.upsert(&JavaRuntime {
+            id: "zulu27".into(),
+            path: home.clone(),
+            major: JavaMajor::parse(27).expect("27"),
+            version: "27.0.0".into(),
+            vendor: JavaVendor::Zulu,
+            managed: true,
+            created_at: 1,
+            updated_at: 1,
+        })
+        .expect("upsert");
+
+        let err = service.uninstall(&home).expect_err("must fail");
+        assert!(matches!(err, JavaError::Fs(FsError::Io { .. })));
+        // 记录还在，解除占用后重试即可自愈
+        assert!(repo.get_by_path(&home).is_ok(), "record kept for retry");
     }
 
     #[tokio::test]
