@@ -36,8 +36,8 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 ///
 /// 选择规则集在 [`FileDownloader::plan`]; 将来新增算法，只需要扩展本枚举
 enum TransferPlan {
-    /// 单流顺序写入
-    Single,
+    /// 单流顺序写入；`total` 是探测到的总字节数，仅用于进度总长
+    Single { total: Option<u64> },
     /// 分段并发写入
     Segmented {
         range: Arc<dyn RangeSource>,
@@ -113,20 +113,27 @@ impl FileDownloader {
     /// 对象小于 [`MIN_SEGMENTED_SIZE`]、声明大小与元信息不一致。回退只损失分段加速，
     /// 不影响正确性，因此探测失败不额外记录日志
     async fn plan(&self, request: &DownloadRequest) -> TransferPlan {
+        // 未注入范围能力或探测失败：总长退化为调用方声明的大小
         let Some(range) = self.range.clone() else {
-            return TransferPlan::Single;
+            return TransferPlan::Single {
+                total: request.expected_size,
+            };
         };
         let Ok(stat) = range.stat(&request.location).await else {
-            return TransferPlan::Single;
+            return TransferPlan::Single {
+                total: request.expected_size,
+            };
         };
+        // 探测到的总长比 expected_size 可靠（多数源不声明大小），进度总长优先用它
+        let known = Some(stat.size);
         if !stat.supports_range || stat.size < MIN_SEGMENTED_SIZE {
-            return TransferPlan::Single;
+            return TransferPlan::Single { total: known };
         }
         if request
             .expected_size
             .is_some_and(|expected| expected != stat.size)
         {
-            return TransferPlan::Single;
+            return TransferPlan::Single { total: known };
         }
         TransferPlan::Segmented { range, stat }
     }
@@ -139,8 +146,8 @@ impl FileDownloader {
         cancel: &CancellationToken,
     ) -> Result<u64, DownloadError> {
         match self.plan(request).await {
-            TransferPlan::Single => {
-                self.transfer_single(temp_path, request, progress, cancel)
+            TransferPlan::Single { total } => {
+                self.transfer_single(temp_path, request, total, progress, cancel)
                     .await
             }
             TransferPlan::Segmented { range, stat } => {
@@ -151,10 +158,14 @@ impl FileDownloader {
     }
 
     /// 单流顺序写入
+    ///
+    /// `total` 是调用方（[`Self::plan`]）探测到的总字节数，用于进度条总长；
+    /// 未知时进度回显退化为 spinner + 已传字节
     async fn transfer_single(
         &self,
         temp_path: &Path,
         request: &DownloadRequest,
+        total: Option<u64>,
         progress: Option<&dyn ProgressSink>,
         cancel: &CancellationToken,
     ) -> Result<u64, DownloadError> {
@@ -180,7 +191,7 @@ impl FileDownloader {
             file.write_all(&chunk).await.map_err(DownloadError::Io)?;
             transferred += chunk.len() as u64;
             if let Some(sink) = progress {
-                sink.on_progress(transferred, request.expected_size);
+                sink.on_progress(transferred, total);
             }
         }
         file.flush().await.map_err(DownloadError::Io)?;
@@ -265,7 +276,7 @@ impl FileDownloader {
                 DownloadError::Source(SourceError::Status { status: 200 | 416 })
             ) {
                 return self
-                    .transfer_single(temp_path, request, progress, cancel)
+                    .transfer_single(temp_path, request, Some(stat.size), progress, cancel)
                     .await;
             }
             return Err(err);

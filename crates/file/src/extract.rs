@@ -22,23 +22,60 @@ impl CommandExtractor {
 
 impl ArchiveExtractor for CommandExtractor {
     fn is_extractable(&self, archive: &Path) -> bool {
-        is_gzip(archive) || has_ext(archive, "zip")
+        detect_format(archive).is_some()
     }
 
     fn extract(&self, archive: &Path, dest: &Path) -> Result<(), ExtractError> {
-        if is_gzip(archive) {
-            untar_gz(archive, dest)
-        } else if has_ext(archive, "zip") {
-            unzip(archive, dest)
-        } else {
+        match detect_format(archive) {
+            Some(ArchiveFormat::Gzip) => untar_gz(archive, dest),
+            Some(ArchiveFormat::Zip) => unzip(archive, dest),
             // is_extractable 挡住的格式（dmg / msi 等）由调用方按目录内容处理，
             // 静默 no-op 会把「没解压」误当「解压完成」，按误用上报
-            Err(ExtractError(format!(
+            None => Err(ExtractError(format!(
                 "unsupported archive format: {}",
                 archive.display()
-            )))
+            ))),
         }
     }
+}
+
+/// 归档格式
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveFormat {
+    /// gzip 容器（`.tar.gz` / `.tgz`）
+    Gzip,
+    /// zip
+    Zip,
+}
+
+/// 识别归档格式：先按扩展名，识别不出再按文件头魔数
+///
+/// 下载文件名来自 URL 末段，可能没有扩展名（如 foojay 的重定向地址
+/// `…/packages/{id}/redirect` 落盘为 `redirect`），只按后缀判定会把真正的
+/// 归档当安装包跳过解压。魔数与内容一致，不受命名影响。
+fn detect_format(archive: &Path) -> Option<ArchiveFormat> {
+    if is_gzip(archive) {
+        return Some(ArchiveFormat::Gzip);
+    }
+    if has_ext(archive, "zip") {
+        return Some(ArchiveFormat::Zip);
+    }
+    sniff_magic(archive)
+}
+
+/// 读文件头魔数判定格式；文件不存在或读失败时返回 `None`
+fn sniff_magic(archive: &Path) -> Option<ArchiveFormat> {
+    use std::io::Read;
+    let mut header = [0u8; 4];
+    let mut file = std::fs::File::open(archive).ok()?;
+    let read = file.read(&mut header).ok()?;
+    if read >= 2 && header.starts_with(b"PK") {
+        return Some(ArchiveFormat::Zip);
+    }
+    if read >= 2 && header[..2] == [0x1f, 0x8b] {
+        return Some(ArchiveFormat::Gzip);
+    }
+    None
 }
 
 fn has_ext(path: &Path, expected: &str) -> bool {
@@ -249,6 +286,56 @@ mod tests {
         assert!(extractor.is_extractable(Path::new("/x/A.ZIP")));
         assert!(!extractor.is_extractable(Path::new("/x/a.dmg")));
         assert!(!extractor.is_extractable(Path::new("/x/java-bin")));
+    }
+
+    /// 下载文件名来自 URL 末段（如 foojay 重定向地址落盘为 `redirect`），
+    /// 无扩展名时必须按文件头魔数识别，否则真正的归档被当安装包跳过解压
+    #[test]
+    fn detects_format_by_magic_when_extension_missing() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let no_ext = tmp.path().join("redirect");
+
+        std::fs::write(&no_ext, b"PK\x03\x04rest of zip").expect("zip magic");
+        assert_eq!(detect_format(&no_ext), Some(ArchiveFormat::Zip));
+
+        std::fs::write(&no_ext, [0x1f, 0x8b, 0x08, 0x00]).expect("gzip magic");
+        assert_eq!(detect_format(&no_ext), Some(ArchiveFormat::Gzip));
+
+        std::fs::write(&no_ext, b"MZ\x90\x00").expect("exe magic");
+        assert_eq!(detect_format(&no_ext), None);
+    }
+
+    /// 无扩展名的真 zip：魔数识别后能真正解压出内容
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn extracts_extensionless_zip_roundtrip() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join("bin")).expect("mkdir");
+        std::fs::write(src.join("bin").join("java.exe"), b"stub").expect("write");
+        // Windows 10 1803+ 自带 bsdtar，用它造 zip（与解压候选同源）
+        let archive = tmp.path().join("payload.zip");
+        let status = std::process::Command::new("tar")
+            .arg("-a")
+            .arg("-cf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&src)
+            .arg("bin")
+            .status()
+            .expect("tar create");
+        assert!(status.success());
+        // 去掉扩展名，模拟 URL 末段落盘的文件名
+        let extensionless = tmp.path().join("redirect");
+        std::fs::rename(&archive, &extensionless).expect("rename");
+
+        let dest = tmp.path().join("out");
+        std::fs::create_dir_all(&dest).expect("out");
+        CommandExtractor::new()
+            .extract(&extensionless, &dest)
+            .expect("extract");
+        let got = std::fs::read(dest.join("bin").join("java.exe")).expect("read back");
+        assert_eq!(got, b"stub");
     }
 
     #[cfg(unix)]

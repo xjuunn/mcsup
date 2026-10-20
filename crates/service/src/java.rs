@@ -272,8 +272,9 @@ impl JavaService {
         notify(InstallStage::Resolving);
         let resolved = registry.resolve_binary(&package).await?;
 
-        // id 可能是 URL（adoptium），净化为安全目录名
-        let dir_name = sanitize_dir_name(&package.id, &package);
+        // 目录名用「厂商-大版本」，短且稳定：重装同一大版本就地替换，
+        // 不随归档文件名（版本号、平台后缀）膨胀路径
+        let dir_name = install_dir_name(&package);
         let install_dir = self.java_root.join(&dir_name);
         std::fs::create_dir_all(&install_dir)
             .map_err(|source| JavaError::io(&install_dir, source))?;
@@ -310,10 +311,11 @@ impl JavaService {
 
     /// 卸载：managed 删整个安装目录+记录，系统只删记录
     ///
-    /// managed 的 JVM home 常嵌套在归档顶层目录里（`{java_root}/{dir}/{dir}/.../Home`），
-    /// 只删 home 会留下 `Contents` 空壳——删除目标是 home 在 `java_root` 下的
-    /// 直接子目录（`managed_install_dir`）。先删文件再注销：删除失败时
-    /// 记录还在，退出占用后重试即可。
+    /// managed 的删除目标是 home 在 `java_root` 下的直接子目录
+    /// （`managed_install_dir`）——只删 home 会把外层包装目录留成空壳。
+    /// 删完再自底向上清掉 `java_root` 下的空目录链，旧版嵌套布局
+    /// （`{java_root}/{dir}/{dir}`）残留的空壳一并扫净。
+    /// 先删文件再注销：删除失败时记录还在，退出占用后重试即可。
     ///
     /// # Errors
     ///
@@ -329,6 +331,7 @@ impl JavaService {
             {
                 std::fs::remove_dir_all(&install_dir)
                     .map_err(|source| JavaError::io(&install_dir, source))?;
+                prune_empty_parents(&install_dir, &self.java_root);
             }
             self.repo.remove(path)?;
             info!(path = %runtime.path.display(), "managed java removed");
@@ -369,6 +372,23 @@ fn download_filename(location: &url::Url) -> String {
         .map_or_else(|| "java-archive".into(), str::to_owned)
 }
 
+/// 自底向上删掉 `root` 以下的空目录链（不含 `root` 本身）
+///
+/// 卸载残留的空壳目录（如旧版嵌套布局的外层）逐层清掉；任一层非空或
+/// 删除失败即停——那层属于别的运行时或被占用，不能动。
+fn prune_empty_parents(start: &Path, root: &Path) {
+    let mut cursor = start.parent().map(Path::to_path_buf);
+    while let Some(dir) = cursor {
+        if dir == root || !dir.starts_with(root) {
+            break;
+        }
+        if std::fs::remove_dir(&dir).is_err() {
+            break;
+        }
+        cursor = dir.parent().map(Path::to_path_buf);
+    }
+}
+
 /// managed 运行时的安装根：`{java_root}/{dir}`（install 落盘的那一层）
 ///
 /// JVM home 可能嵌套在归档顶层目录里（`{dir}/{dir}/Contents/Home`），卸载必须
@@ -380,42 +400,16 @@ fn managed_install_dir(java_root: &Path, home: &Path) -> Option<PathBuf> {
     Some(java_root.join(first.as_os_str()))
 }
 
-/// 把 package id 净化为安全目录名；URL 只取末段文件名，剥掉归档扩展名
-fn sanitize_dir_name(raw: &str, package: &port::JavaPackage) -> String {
-    let base = raw
-        .rsplit(['/', '\\'])
-        .next()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("java");
-    // 去掉 query / fragment 残留
-    let base = base.split(['?', '#']).next().unwrap_or(base);
-    let cleaned: String = base
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let stem = strip_archive_ext(&cleaned);
-    if stem.is_empty() || stem == "." || stem == ".." {
-        format!("{}-{}", package.vendor.as_str(), package.major)
-    } else {
-        stem
+/// 安装目录名：`{vendor}-{major}`（如 `zulu-27`、`temurin-21-jre`）
+///
+/// 短且稳定：重装同一大版本就地替换，路径不随归档文件名（版本号、平台后缀）
+/// 膨胀，卸载时 `managed_install_dir` 直接删到这一层，不留包装目录空壳。
+fn install_dir_name(package: &port::JavaPackage) -> String {
+    let base = format!("{}-{}", package.vendor.as_str(), package.major);
+    match package.package_type {
+        JavaPackageType::Jdk => base,
+        JavaPackageType::Jre => format!("{base}-jre"),
     }
-}
-
-/// 剥掉常见归档扩展名，得到干净的目录名
-fn strip_archive_ext(name: &str) -> String {
-    let lower = name.to_ascii_lowercase();
-    for suffix in [".tar.gz", ".tgz", ".zip", ".dmg", ".msi", ".pkg", ".exe"] {
-        if lower.ends_with(suffix) {
-            return name[..name.len() - suffix.len()].to_owned();
-        }
-    }
-    name.to_owned()
 }
 
 /// 在解压目录中定位 JVM home：根目录一对候选（本身 / bundle）优先，
@@ -455,11 +449,14 @@ fn require_jvm_home(archive: &Path, dir: &Path) -> Result<PathBuf, JavaError> {
     }
 }
 
-/// 解压归档到临时目录，成功后原子替换目标目录
+/// 解压归档到临时目录，成功后把 JVM home 提升到目标目录根并原子替换
 ///
-/// 避免重复安装时 `tar`/`unzip` 对已存在文件逐个询问覆盖。
-/// 流程：解压到唯一临时目录 → 校验 JVM home → 旧目录改名为备份 → 临时目录改名入位；
-/// 任一步失败都回滚备份，原目录不丢。
+/// 归档通常自带一层顶层目录（`zulu27…/bin/java.exe`），直接整树入位会得到
+/// `{java_root}/{dir}/{dir}/…` 的双层嵌套。因此解压到临时目录后先定位 JVM
+/// home，再把 home 本身改名到目标目录——安装路径只有一层，无包装目录空壳。
+///
+/// 流程：解压到唯一临时目录 → 校验并定位 JVM home → 旧目录改名为备份 →
+/// home 改名入位（清理临时目录与备份）；任一步失败都回滚备份，原目录不丢。
 /// 非压缩格式（dmg/msi）不解压，但仍须在其中找到 JVM home 才放行。
 ///
 /// # Errors
@@ -495,10 +492,13 @@ fn extract_and_swap(
 
     // 解压成功但没有可用 home：多半是下错平台 / 架构的包（如 Windows 上装到 macOS 包），
     // 这种产物跑不起来，必须在替换与注册前拦下
-    if let Err(err) = require_jvm_home(archive, &tmp) {
-        let _ = std::fs::remove_dir_all(&tmp);
-        return Err(err);
-    }
+    let home = match require_jvm_home(archive, &tmp) {
+        Ok(home) => home,
+        Err(err) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(err);
+        }
+    };
 
     // 归档已在 tmp 中解压完毕：旧目录先改名备份，改名失败可原样回滚
     let bak = parent.join(format!(".bak-{name}-{stamp}"));
@@ -507,7 +507,21 @@ fn extract_and_swap(
         let _ = std::fs::remove_dir_all(&tmp);
         return Err(JavaError::io(into, source));
     }
-    if let Err(source) = std::fs::rename(&tmp, into) {
+
+    // home 提升到目标目录根；home 就是 tmp 根时整树直接入位
+    let promote = if home == tmp {
+        std::fs::rename(&tmp, into)
+    } else {
+        match std::fs::rename(&home, into) {
+            Ok(()) => {
+                // 包装目录残渣（归档顶层目录的其余内容）一并清掉
+                let _ = std::fs::remove_dir_all(&tmp);
+                Ok(())
+            }
+            Err(source) => Err(source),
+        }
+    };
+    if let Err(source) = promote {
         // 回滚：新目录没入位，把旧目录放回去
         if had_old {
             let _ = std::fs::rename(&bak, into);
@@ -518,7 +532,7 @@ fn extract_and_swap(
     if had_old {
         let _ = std::fs::remove_dir_all(&bak);
     }
-    Ok(locate_java_home(into).unwrap_or_else(|| into.to_path_buf()))
+    Ok(into.to_path_buf())
 }
 
 /// 构造以归档路径为上下文的 IO 错误
@@ -697,6 +711,52 @@ mod tests {
         }
     }
 
+    /// 模拟真实归档：解压出的顶层目录里套着 JVM home（`zulu27/bin/java.exe`）
+    struct NestedExtractor;
+
+    impl ArchiveExtractor for NestedExtractor {
+        fn is_extractable(&self, _archive: &Path) -> bool {
+            true
+        }
+
+        fn extract(&self, _archive: &Path, dest: &Path) -> Result<(), port::ExtractError> {
+            let home = dest.join("zulu27.28.101").join("bin");
+            std::fs::create_dir_all(&home).map_err(|err| port::ExtractError(err.to_string()))?;
+            std::fs::write(home.join(domain::java::java_exe_name()), b"stub")
+                .map_err(|err| port::ExtractError(err.to_string()))?;
+            Ok(())
+        }
+    }
+
+    /// 归档自带顶层目录时，home 必须提升到安装目录根：最终路径是
+    /// `{java_root}/{dir}/bin/java.exe`，不留 `{dir}/{dir}` 嵌套与包装目录空壳
+    #[test]
+    fn extract_and_swap_promotes_nested_home() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let into = tmp.path().join("zulu-27");
+        std::fs::create_dir_all(&into).expect("mkdir into");
+        let archive = into.join("zulu.zip");
+        std::fs::write(&archive, b"stub").expect("archive");
+
+        let home = extract_and_swap(&archive, &into, &NestedExtractor).expect("swap");
+
+        assert_eq!(home, into);
+        assert!(
+            into.join("bin")
+                .join(domain::java::java_exe_name())
+                .is_file(),
+            "home must sit at install root"
+        );
+        // 包装目录与临时目录都不残留
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .expect("read_dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".tmp-") || name == "zulu27.28.101")
+            .collect();
+        assert!(leftovers.is_empty(), "leftovers: {leftovers:?}");
+    }
+
     fn svc(tmp: &Path) -> (JavaService, Arc<MemRepo>) {
         let repo = Arc::new(MemRepo::new());
         let scanner = Arc::new(FakeScanner {
@@ -863,7 +923,25 @@ mod tests {
             .filter(|rt| rt.managed)
             .collect();
         assert_eq!(managed.len(), 1);
-        assert_eq!(managed[0].id, "pkg1");
+        assert_eq!(managed[0].id, "temurin-21");
+    }
+
+    /// 目录名用「厂商-大版本」：短、稳定，JRE 加后缀避免与 JDK 同址
+    #[test]
+    fn install_dir_name_is_short_and_stable() {
+        let jdk = port::JavaPackage {
+            id: "https://example.com/zulu27.28.101-ca-jdk27.0.0-win_x64.zip".into(),
+            vendor: JavaVendor::Zulu,
+            major: JavaMajor::parse(27).expect("27"),
+            version: "27.0.0".into(),
+            package_type: JavaPackageType::Jdk,
+        };
+        assert_eq!(install_dir_name(&jdk), "zulu-27");
+        let jre = port::JavaPackage {
+            package_type: JavaPackageType::Jre,
+            ..jdk
+        };
+        assert_eq!(install_dir_name(&jre), "zulu-27-jre");
     }
 
     #[test]
