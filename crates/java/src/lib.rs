@@ -31,8 +31,12 @@ impl JavaScanner for HostJavaScanner {
         &self,
         on_found: &mut dyn FnMut(ScannedJava),
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // 实现方负责去重（见 port::JavaScanner 契约）：unix 上候选 home 先归一到
+        // 真实路径——JAVA_HOME、sdkman `current` 等常是软链，不归一同一 JVM
+        // 会被当成两个 home 重复注册
         let mut seen = std::collections::HashSet::new();
         for home in collect_homes() {
+            let home = canonical_home(home);
             if !seen.insert(home.clone()) {
                 continue;
             }
@@ -44,6 +48,19 @@ impl JavaScanner for HostJavaScanner {
     }
 }
 
+/// unix 上把候选 home 归一到真实路径；路径不存在时保留原样
+#[cfg(unix)]
+fn canonical_home(home: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&home).unwrap_or(home)
+}
+
+/// Windows 不跟随链接，保留原路径形态（`canonicalize` 会加 `\\?\` 前缀，
+/// 与注册表登记的路径不同形，去重与注册会重复）
+#[cfg(not(unix))]
+fn canonical_home(home: PathBuf) -> PathBuf {
+    home
+}
+
 /// 收集候选 JVM home 目录
 fn collect_homes() -> Vec<PathBuf> {
     let mut homes = Vec::new();
@@ -51,6 +68,31 @@ fn collect_homes() -> Vec<PathBuf> {
     collect_path_homes(&mut homes);
     collect_platform_homes(&mut homes);
     homes
+}
+
+/// 运行命令并捕获输出
+///
+/// spawn 失败返回 `None` 并记 warn；`require_success` 为 `true` 且退出码非零时
+/// 同样返回 `None`——失败命令的 stdout 往往是半截或误导性文本，
+/// 拿它解析会把坏路径登记成 JVM home。
+fn run_capture(
+    cmd: &mut Command,
+    label: &str,
+    require_success: bool,
+) -> Option<std::process::Output> {
+    match cmd.output() {
+        Ok(output) => {
+            if require_success && !output.status.success() {
+                tracing::warn!("{label} exited with {}; discarding output", output.status);
+                return None;
+            }
+            Some(output)
+        }
+        Err(err) => {
+            tracing::warn!(?err, "failed to run {label}");
+            None
+        }
+    }
 }
 
 fn collect_env_home(homes: &mut Vec<PathBuf>) {
@@ -115,7 +157,11 @@ fn collect_platform_homes(homes: &mut Vec<PathBuf>) {
 /// 不同 macOS 版本输出位置不一致。
 #[cfg(target_os = "macos")]
 fn collect_java_home_tool(homes: &mut Vec<PathBuf>) {
-    let Ok(output) = Command::new("/usr/libexec/java_home").arg("-V").output() else {
+    let Some(output) = run_capture(
+        Command::new("/usr/libexec/java_home").arg("-V"),
+        "java_home -V",
+        false,
+    ) else {
         return;
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -165,10 +211,11 @@ fn collect_platform_homes(homes: &mut Vec<PathBuf>) {
 /// Debian 系 `update-alternatives` 登记的 java 链接
 #[cfg(target_os = "linux")]
 fn collect_update_alternatives(homes: &mut Vec<PathBuf>) {
-    let Ok(output) = Command::new("update-alternatives")
-        .args(["--list", "java"])
-        .output()
-    else {
+    let Some(output) = run_capture(
+        Command::new("update-alternatives").args(["--list", "java"]),
+        "update-alternatives --list java",
+        false,
+    ) else {
         return;
     };
     let text = String::from_utf8_lossy(&output.stdout);
@@ -205,10 +252,11 @@ fn collect_platform_homes(homes: &mut Vec<PathBuf>) {
 #[cfg(target_os = "windows")]
 fn collect_registry_homes(homes: &mut Vec<PathBuf>) {
     for &key in JAVA_SOFT_KEYS {
-        let Ok(output) = Command::new("reg")
-            .args(["query", key, "/s", "/v", "JavaHome"])
-            .output()
-        else {
+        let Some(output) = run_capture(
+            Command::new("reg").args(["query", key, "/s", "/v", "JavaHome"]),
+            "reg query JavaHome",
+            false,
+        ) else {
             continue;
         };
         let text = String::from_utf8_lossy(&output.stdout);
@@ -226,7 +274,7 @@ fn collect_registry_homes(homes: &mut Vec<PathBuf>) {
 /// `where java` 解析 PATH + PATHEXT，能补出裸目录扫描漏掉的入口
 #[cfg(target_os = "windows")]
 fn collect_where_homes(homes: &mut Vec<PathBuf>) {
-    let Ok(output) = Command::new("where").arg("java").output() else {
+    let Some(output) = run_capture(Command::new("where").arg("java"), "where java", false) else {
         return;
     };
     let text = String::from_utf8_lossy(&output.stdout);
@@ -321,7 +369,8 @@ fn collect_from_roots(roots: &[(PathBuf, usize)], homes: &mut Vec<PathBuf>) {
 fn collect_homes_under(root: &Path, max_depth: usize, homes: &mut Vec<PathBuf>) {
     let mut queue = VecDeque::from([(root.to_path_buf(), 0usize)]);
     while let Some((dir, depth)) = queue.pop_front() {
-        if let Some(home) = jvm_home_at(&dir) {
+        // 目录本身 / macOS bundle 的候选与顺序统一在 domain，扫描与安装不走两份
+        if let Some(home) = domain::java::find_jvm_home(&dir, Path::is_file) {
             homes.push(home);
             continue;
         }
@@ -340,29 +389,20 @@ fn collect_homes_under(root: &Path, max_depth: usize, homes: &mut Vec<PathBuf>) 
     }
 }
 
-/// 目录本身是 JVM home 则返回它；macOS 的 `.jdk` 包则返回 `Contents/Home`
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-fn jvm_home_at(dir: &Path) -> Option<PathBuf> {
-    if domain::java::is_jvm_home(dir) {
-        return Some(dir.to_path_buf());
-    }
-    let contents_home = dir.join("Contents").join("Home");
-    if domain::java::is_jvm_home(&contents_home) {
-        return Some(contents_home);
-    }
-    None
-}
-
 /// 对单个 home 执行 `java -version` 并解析
 ///
 /// 大版本不在服务端支持区间（见 [`JavaMajor::parse`]）时返回 `None`，
 /// 该 home 不登记。
 fn probe_home(home: &Path) -> Option<ScannedJava> {
-    let java_bin = home.join("bin").join(java_exe_name());
+    let java_bin = domain::java::java_bin_under(home);
     if !java_bin.is_file() {
         return None;
     }
-    let output = Command::new(&java_bin).arg("-version").output().ok()?;
+    let output = run_capture(
+        Command::new(&java_bin).arg("-version"),
+        "java -version",
+        true,
+    )?;
     // `java -version` 写 stderr
     let text = String::from_utf8_lossy(&output.stderr);
     let first = text.lines().next()?;
@@ -390,11 +430,9 @@ fn extract_major(version: &str) -> Option<JavaMajor> {
     if head == "1" {
         // 1.8.x → 8
         let minor = version.split('.').nth(1)?;
-        let minor: i64 = minor.parse().ok()?;
-        return JavaMajor::parse(minor).ok();
+        return JavaMajor::parse_str(minor).ok();
     }
-    let major: i64 = head.parse().ok()?;
-    JavaMajor::parse(major).ok()
+    JavaMajor::parse_str(head).ok()
 }
 
 #[cfg(test)]

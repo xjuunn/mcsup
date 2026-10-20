@@ -172,10 +172,7 @@ impl WorkspaceRepository for SqliteStore {
             let affected = diesel::delete(workspaces::table.filter(workspaces::id.eq(id.as_str())))
                 .execute(conn)
                 .map_err(storage_err)?;
-            if affected == 0 {
-                return Err(RepositoryError::NotFound(id.as_str().to_owned()));
-            }
-            Ok(())
+            require_found(affected, id.as_str())
         })
     }
 
@@ -193,10 +190,7 @@ impl WorkspaceRepository for SqliteStore {
                 ))
                 .execute(conn)
                 .map_err(storage_err)?;
-            if affected == 0 {
-                return Err(RepositoryError::NotFound(id.as_str().to_owned()));
-            }
-            Ok(())
+            require_found(affected, id.as_str())
         })
     }
 }
@@ -246,9 +240,7 @@ impl ServerRepository for SqliteStore {
                 .set(&changeset)
                 .execute(conn)
                 .map_err(storage_err)?;
-            if affected == 0 {
-                return Err(RepositoryError::NotFound(name.as_str().to_owned()));
-            }
+            require_found(affected, name.as_str())?;
 
             select_meta(conn, name)
         })
@@ -280,9 +272,7 @@ impl ServerRepository for SqliteStore {
                 .set(&changeset)
                 .execute(conn)
                 .map_err(|err| map_insert_error(err, name.as_str(), "servers"))?;
-            if affected == 0 {
-                return Err(RepositoryError::NotFound(name.as_str().to_owned()));
-            }
+            require_found(affected, name.as_str())?;
 
             select_meta(conn, name)
         })
@@ -343,12 +333,7 @@ impl JavaRuntimeRepository for SqliteStore {
             )
             .execute(conn)
             .map_err(storage_err)?;
-            if affected == 0 {
-                return Err(RepositoryError::NotFound(
-                    path.to_string_lossy().into_owned(),
-                ));
-            }
-            Ok(())
+            require_found(affected, path.to_string_lossy().into_owned())
         })
     }
 
@@ -405,6 +390,17 @@ fn map_insert_error(err: diesel::result::Error, key: &str, table: &str) -> Repos
         }
     }
     storage_err(err)
+}
+
+/// UPDATE/DELETE 影响行数转结果：0 行即目标不存在
+///
+/// 静默成功会让调用方把「没改到」当「已改」，统一收敛到 [`RepositoryError::NotFound`]。
+fn require_found(affected: usize, key: impl Into<String>) -> Result<(), RepositoryError> {
+    if affected == 0 {
+        Err(RepositoryError::NotFound(key.into()))
+    } else {
+        Ok(())
+    }
 }
 
 fn storage_err(err: impl std::error::Error + Send + Sync + 'static) -> RepositoryError {

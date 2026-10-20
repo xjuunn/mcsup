@@ -2,7 +2,10 @@
 
 use super::{adoptium::AdoptiumSource, azul::AzulSource, foojay::FoojaySource};
 use domain::java::{JavaMajor, JavaPackageType};
-use port::{JavaPackage, JavaPackageRequest, JavaReleaseSource, ResolvedJava, SourceError};
+use port::{
+    JavaPackage, JavaPackageRequest, JavaReleaseSource, JavaSourceRegistryPort, ResolvedJava,
+    SourceError,
+};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -28,6 +31,22 @@ impl JavaSourceRegistry {
     #[must_use]
     pub fn new(sources: Vec<Arc<dyn JavaReleaseSource>>) -> Self {
         Self { sources }
+    }
+
+    /// 全部内置源（未探测排序；[`JavaSourceRegistryPort::ranked`] 时才打网络）
+    #[must_use]
+    pub fn all_sources() -> Self {
+        let mut candidates: Vec<Arc<dyn JavaReleaseSource>> = Vec::new();
+        if let Ok(source) = FoojaySource::new() {
+            candidates.push(Arc::new(source));
+        }
+        if let Ok(source) = AdoptiumSource::new() {
+            candidates.push(Arc::new(source));
+        }
+        if let Ok(source) = AzulSource::new() {
+            candidates.push(Arc::new(source));
+        }
+        Self::new(candidates)
     }
 
     /// 当前启用的源名列表（按优先级）
@@ -95,41 +114,30 @@ impl JavaSourceRegistry {
     }
 }
 
-/// 构建默认请求（当前 OS / 架构）
-#[must_use]
-pub fn default_request(major: JavaMajor, package_type: JavaPackageType) -> JavaPackageRequest {
-    JavaPackageRequest {
-        major,
-        package_type,
-        os: super::current_os().to_owned(),
-        arch: super::current_arch().to_owned(),
+#[async_trait::async_trait]
+impl JavaSourceRegistryPort for JavaSourceRegistry {
+    fn source_names(&self) -> Vec<&'static str> {
+        JavaSourceRegistry::source_names(self)
     }
-}
 
-/// 并发探测各源元数据端点，按响应延迟升序排列
-///
-/// 探测失败的源不进入返回列表。
-pub async fn rank_sources() -> JavaSourceRegistry {
-    let mut candidates: Vec<Arc<dyn JavaReleaseSource>> = Vec::new();
-    if let Ok(source) = FoojaySource::new() {
-        candidates.push(Arc::new(source));
+    async fn ranked(&self) -> Arc<dyn JavaSourceRegistryPort> {
+        let mut probed = probe_all(self.sources.clone()).await;
+        probed.sort_by_key(|(latency, _)| *latency);
+        Arc::new(JavaSourceRegistry::new(
+            probed.into_iter().map(|(_, s)| s).collect(),
+        ))
     }
-    if let Ok(source) = AdoptiumSource::new() {
-        candidates.push(Arc::new(source));
-    }
-    if let Ok(source) = AzulSource::new() {
-        candidates.push(Arc::new(source));
-    }
-    rank_sources_from(candidates).await
-}
 
-/// 对给定候选源做延迟排序（测试可注入 mock）
-pub(crate) async fn rank_sources_from(
-    candidates: Vec<Arc<dyn JavaReleaseSource>>,
-) -> JavaSourceRegistry {
-    let mut probed = probe_all(candidates).await;
-    probed.sort_by_key(|(latency, _)| *latency);
-    JavaSourceRegistry::new(probed.into_iter().map(|(_, s)| s).collect())
+    async fn list_packages(
+        &self,
+        request: &JavaPackageRequest,
+    ) -> Result<Vec<JavaPackage>, SourceError> {
+        JavaSourceRegistry::list_packages(self, request).await
+    }
+
+    async fn resolve_binary(&self, package: &JavaPackage) -> Result<ResolvedJava, SourceError> {
+        JavaSourceRegistry::resolve_binary(self, package).await
+    }
 }
 
 /// 并发探测全部候选源；失败的被丢弃
@@ -164,12 +172,8 @@ async fn probe_all(
 
 /// 对单个源发一次轻量请求量延迟；失败返回 `None`
 async fn probe_latency(source: &Arc<dyn JavaReleaseSource>) -> Option<Duration> {
-    let request = JavaPackageRequest {
-        major: JavaMajor::parse(21).ok()?,
-        package_type: JavaPackageType::Jdk,
-        os: super::current_os().to_owned(),
-        arch: super::current_arch().to_owned(),
-    };
+    let request =
+        JavaPackageRequest::for_current_platform(JavaMajor::parse(21).ok()?, JavaPackageType::Jdk);
     let start = Instant::now();
     let result = tokio::time::timeout(PROBE_TIMEOUT, source.list_packages(&request)).await;
     match result {
@@ -236,7 +240,10 @@ mod tests {
             }),
         ];
         let registry = JavaSourceRegistry::new(sources);
-        let request = default_request(JavaMajor::parse(21).expect("21"), JavaPackageType::Jdk);
+        let request = JavaPackageRequest::for_current_platform(
+            JavaMajor::parse(21).expect("21"),
+            JavaPackageType::Jdk,
+        );
         let packages = registry.list_packages(&request).await.expect("packages");
         assert_eq!(packages.len(), 1);
         assert_eq!(packages[0].version, "21.0.5");
@@ -249,7 +256,10 @@ mod tests {
             fail: true,
         })];
         let registry = JavaSourceRegistry::new(sources);
-        let request = default_request(JavaMajor::parse(21).expect("21"), JavaPackageType::Jdk);
+        let request = JavaPackageRequest::for_current_platform(
+            JavaMajor::parse(21).expect("21"),
+            JavaPackageType::Jdk,
+        );
         let err = registry
             .list_packages(&request)
             .await
@@ -269,7 +279,7 @@ mod tests {
                 fail: false,
             }),
         ];
-        let registry = rank_sources_from(candidates).await;
+        let registry = JavaSourceRegistry::new(candidates).ranked().await;
         assert_eq!(registry.source_names(), vec!["good"]);
     }
 }

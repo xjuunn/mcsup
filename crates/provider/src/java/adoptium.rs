@@ -1,13 +1,12 @@
 //! Eclipse Temurin（Adoptium）直连源
 
-use crate::http::{build_client, map_transport};
+use crate::http::{build_client, get_json};
 use async_trait::async_trait;
-use domain::java::{JavaMajor, JavaVendor};
+use domain::java::JavaVendor;
 use domain::server::version::VersionId;
 use port::{JavaPackage, JavaPackageRequest, JavaReleaseSource, ResolvedJava, SourceError};
 use reqwest::Client;
 use serde::Deserialize;
-use url::Url;
 
 const ASSETS_URL: &str = "https://api.adoptium.net/v3/assets/latest";
 
@@ -67,19 +66,28 @@ impl JavaReleaseSource for AdoptiumSource {
         request: &JavaPackageRequest,
     ) -> Result<Vec<JavaPackage>, SourceError> {
         let image_type = request.package_type.as_str();
+        let archive_type = if request.os == "windows" {
+            "zip"
+        } else {
+            "tar.gz"
+        };
         let url = format!(
-            "{ASSETS_URL}/{}/{}/?architecture={}&image_type={}&os={}&vendor=eclipse&heap_size=normal&project=jdk&sort_method=DEFAULT&sort_order=DESC",
+            "{ASSETS_URL}/{}/{}/?architecture={}&image_type={}&os={}&archive_type={}&vendor=eclipse&heap_size=normal&project=jdk&sort_method=DEFAULT&sort_order=DESC",
             request.major.as_i64(),
             "hotspot",
             request.arch,
             image_type,
             request.os,
+            archive_type,
         );
         let assets: Vec<Asset> = self.get(&url).await?;
         Ok(assets
             .into_iter()
             .filter_map(|asset| {
                 let package = asset.binary.package?;
+                if !super::is_deployable_archive(&package.link) {
+                    return None;
+                }
                 let major = asset
                     .version
                     .as_ref()
@@ -93,7 +101,7 @@ impl JavaReleaseSource for AdoptiumSource {
                 Some(JavaPackage {
                     id: package.link.clone(),
                     vendor: JavaVendor::Temurin,
-                    major: JavaMajor::parse(major).ok()?,
+                    major: super::parse_major_or_drop(major, "adoptium", &package.link)?,
                     version,
                     package_type: request.package_type,
                 })
@@ -101,13 +109,9 @@ impl JavaReleaseSource for AdoptiumSource {
             .collect())
     }
 
+    /// id 即下载地址，共用解析见 [`super::resolved_from_id`]
     async fn resolve_binary(&self, package: &JavaPackage) -> Result<ResolvedJava, SourceError> {
-        let location = Url::parse(&package.id).map_err(|err| SourceError::Decode(Box::new(err)))?;
-        Ok(ResolvedJava {
-            package: package.clone(),
-            location,
-            expected_size: None,
-        })
+        super::resolved_from_id(package)
     }
 }
 
@@ -116,20 +120,6 @@ impl AdoptiumSource {
     where
         T: serde::de::DeserializeOwned,
     {
-        let response = self.http.get(url).send().await.map_err(map_transport)?;
-        let status = response.status();
-        if !status.is_success() {
-            let status_code = status.as_u16();
-            if status_code == 404 {
-                return Err(SourceError::NotFound(VersionId::new("adoptium")));
-            }
-            return Err(SourceError::Status {
-                status: status_code,
-            });
-        }
-        response
-            .json()
-            .await
-            .map_err(|err| SourceError::Decode(Box::new(err)))
+        get_json(&self.http, url, Some(VersionId::new("adoptium"))).await
     }
 }

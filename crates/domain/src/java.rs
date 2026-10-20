@@ -3,9 +3,11 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 /// Java 大版本非法（须为 [`JavaMajor::MIN`]–[`JavaMajor::MAX`] 的整数）
+///
+/// 载荷保留原始输入文本，非数字输入也能原样带回给调用方提示用户
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("invalid java major version: {0}")]
-pub struct InvalidJavaMajor(pub i64);
+pub struct InvalidJavaMajor(pub String);
 
 /// Java 大版本：Minecraft 服务端绑定的粒度（8、11、17、21…）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -14,8 +16,17 @@ pub struct JavaMajor(i16);
 impl JavaMajor {
     /// 可构造的最小大版本
     pub const MIN: i64 = 8;
-    /// 可构造的最大大版本
+    /// 可构造的最大大版本（能力上界，允许为尚未发布的版本预留）
     pub const MAX: i64 = 99;
+
+    /// 当前已发布的最大大版本（发布事实上界）
+    ///
+    /// 列可选项时用本常量而非 [`JavaMajor::MAX`]，避免出现还不存在的版本；
+    /// 新大版本发布时更新此值。
+    pub const RELEASED_MAX: i64 = 27;
+
+    /// LTS（长期支持）大版本集合，用于标注与推荐
+    pub const LTS_MAJORS: &'static [i64] = &[8, 11, 17, 21, 25];
 
     /// 校验并构造大版本
     ///
@@ -27,7 +38,23 @@ impl JavaMajor {
             #[allow(clippy::cast_possible_truncation)]
             Ok(Self(raw as i16))
         } else {
-            Err(InvalidJavaMajor(raw))
+            Err(InvalidJavaMajor(raw.to_string()))
+        }
+    }
+
+    /// 从十进制字符串校验并构造大版本（首尾空白自动裁剪）
+    ///
+    /// `parse` 与 `parse_str` 是同一条规则的两个入口，判定只在本类型里存在一份。
+    ///
+    /// # Errors
+    ///
+    /// 非十进制整数、或不在 [`JavaMajor::MIN`]–[`JavaMajor::MAX`] 闭区间时
+    /// 返回 [`InvalidJavaMajor`]（载荷为原始输入文本）
+    pub fn parse_str(raw: &str) -> Result<Self, InvalidJavaMajor> {
+        let trimmed = raw.trim();
+        match trimmed.parse::<i64>() {
+            Ok(n) => Self::parse(n),
+            Err(_) => Err(InvalidJavaMajor(trimmed.to_owned())),
         }
     }
 
@@ -132,12 +159,26 @@ pub const fn java_exe_name() -> &'static str {
     "java"
 }
 
-/// 判断目录是否为 JVM home：存在可执行 `java`
+/// JVM home 内 `java` 可执行文件的路径（`<home>/bin/java`，Windows 为 `java.exe`）
 ///
-/// 扫描与安装后定位 home 共用此判定，避免各处对 `.exe` 后缀分叉。
+/// `bin` 布局与平台后缀是领域规则：扫描与安装后定位共用此形状，
+/// 避免各处对 `.exe` 后缀分叉。
 #[must_use]
-pub fn is_jvm_home(path: &Path) -> bool {
-    path.join("bin").join(java_exe_name()).is_file()
+pub fn java_bin_under(home: &Path) -> PathBuf {
+    home.join("bin").join(java_exe_name())
+}
+
+/// 依序探测目录内的 JVM home：目录本身优先，macOS bundle（`Contents/Home`）次之
+///
+/// 顺序即解析优先级：扫描与安装后定位必须走同一份，否则同一目录可能被
+/// 两处登记成不同身份。`exists` 判定 [`java_bin_under`] 出的路径是否存在；
+/// IO 由调用方提供，domain 自身不做文件系统访问。
+#[must_use]
+pub fn find_jvm_home(dir: &Path, exists: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+    let candidates = [dir.to_path_buf(), dir.join("Contents").join("Home")];
+    candidates
+        .into_iter()
+        .find(|candidate| exists(&java_bin_under(candidate)))
 }
 
 /// 已注册的本机 Java 运行时
@@ -175,6 +216,19 @@ mod tests {
     }
 
     #[test]
+    fn released_max_and_lts_stay_within_capability_range() {
+        const {
+            assert!(JavaMajor::RELEASED_MAX >= JavaMajor::MIN);
+            assert!(JavaMajor::RELEASED_MAX < JavaMajor::MAX);
+        }
+        assert!(
+            JavaMajor::LTS_MAJORS
+                .iter()
+                .all(|m| JavaMajor::parse(*m).is_ok())
+        );
+    }
+
+    #[test]
     fn vendor_fuzzy_roundtrip() {
         assert_eq!(
             JavaVendor::parse_fuzzy("Eclipse Adoptium"),
@@ -199,5 +253,25 @@ mod tests {
         assert_eq!(java_exe_name(), "java.exe");
         #[cfg(not(target_os = "windows"))]
         assert_eq!(java_exe_name(), "java");
+    }
+
+    #[test]
+    fn java_bin_under_joins_platform_bin() {
+        let bin = java_bin_under(Path::new("/jdk"));
+        assert_eq!(bin, Path::new("/jdk").join("bin").join(java_exe_name()));
+    }
+
+    #[test]
+    fn find_jvm_home_prefers_root_then_bundle() {
+        let dir = Path::new("/jdk");
+        let bundle = dir.join("Contents").join("Home");
+        // 两处都满足时目录本身优先：顺序即解析优先级
+        assert_eq!(find_jvm_home(dir, |_| true), Some(PathBuf::from("/jdk")));
+        // 只有 bundle 的 bin 满足时返回 Contents/Home
+        assert_eq!(
+            find_jvm_home(dir, |bin| bin == java_bin_under(&bundle)),
+            Some(bundle)
+        );
+        assert_eq!(find_jvm_home(dir, |_| false), None);
     }
 }

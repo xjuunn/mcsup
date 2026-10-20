@@ -1,212 +1,77 @@
-use crate::config;
 use crate::output::Printer;
-use crate::progress::{BarSink, TaskSpinner};
+use crate::progress::{InstallSession, ScanProgress};
 use anyhow::{Context, Result, anyhow};
 use comfy_table::{ContentArrangement, Table};
 use inquire::Select;
 use mcsup::domain::java::{JavaMajor, JavaPackageType, JavaRuntime, JavaVendor};
-use mcsup::file::FileDownloader;
-use mcsup::java::HostJavaScanner;
-use mcsup::port::CancellationToken;
-use mcsup::provider::http::HttpByteSource;
-use mcsup::provider::java::{JavaSourceRegistry, default_request, rank_sources};
-use mcsup::service::{
-    InstallStage, JavaService, JavaSourceRegistryPort, StageSink, UninstallOutcome,
-};
-use mcsup::storage::SqliteStore;
-use std::io::{IsTerminal, Write};
+use mcsup::service::{InstallStage, JavaService, UninstallOutcome};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use tracing::info;
 
-/// 把 provider 的 [`JavaSourceRegistry`] 适配为 service 端口
-struct RegistryAdapter(JavaSourceRegistry);
+use crate::bootstrap;
 
-#[async_trait::async_trait]
-impl JavaSourceRegistryPort for RegistryAdapter {
-    fn source_names(&self) -> Vec<&'static str> {
-        self.0.source_names()
-    }
-
-    async fn list_packages(
-        &self,
-        major: JavaMajor,
-        package_type: JavaPackageType,
-    ) -> Result<Vec<mcsup::port::JavaPackage>, mcsup::port::SourceError> {
-        let request = default_request(major, package_type);
-        self.0.list_packages(&request).await
-    }
-
-    async fn resolve_binary(
-        &self,
-        package: &mcsup::port::JavaPackage,
-    ) -> Result<mcsup::port::ResolvedJava, mcsup::port::SourceError> {
-        self.0.resolve_binary(package).await
-    }
-}
-
-/// 把 service 的 [`StageSink`] 转发到回显线：阶段文案给 spinner，
-/// 进入下载把同一条线交给 [`BarSink`]，解压时再交还 —— 全程一行、不留白
-struct StageAdapter<'a> {
-    spinner: &'a TaskSpinner,
-    sink: &'a BarSink,
-    downloading: std::sync::atomic::AtomicBool,
-}
-
-impl<'a> StageAdapter<'a> {
-    fn new(spinner: &'a TaskSpinner, sink: &'a BarSink) -> StageAdapter<'a> {
-        StageAdapter {
-            spinner,
-            sink,
-            downloading: std::sync::atomic::AtomicBool::new(false),
-        }
-    }
-}
-
-impl StageSink for StageAdapter<'_> {
-    fn on_stage(&self, stage: InstallStage) {
-        match stage {
-            // 下载：立即接管这条线，从发起请求到首字节之间也要有回显
-            InstallStage::Downloading => {
-                self.downloading
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                self.sink.start();
-            }
-            // 下载之后的阶段（解压等）：进度条交还 spinner，继续画同一条线
-            stage if self.downloading.load(std::sync::atomic::Ordering::Relaxed) => {
-                self.downloading
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
-                self.sink.finish();
-                self.spinner.set_message(stage.message());
-            }
-            stage => self.spinner.set_message(stage.message()),
-        }
-    }
-}
-
-/// 本地命令（list / scan / uninstall）：不需要源探测，避免每次启动打网络
-fn open_local_service() -> Result<JavaService> {
-    let path = config::database_path()?;
-    let store = Arc::new(
-        SqliteStore::open(&path).with_context(|| format!("打开元数据库 {}", path.display()))?,
-    );
-    let scanner = Arc::new(HostJavaScanner::new());
-    let registry = Arc::new(RegistryAdapter(JavaSourceRegistry::new(Vec::new())));
-    let bytes = Arc::new(HttpByteSource::new().context("初始化 HTTP 传输")?);
-    let downloader = Arc::new(FileDownloader::new(bytes.clone()).with_range_source(bytes));
-    let java_root = config::platform_data_dir()?.join("java");
-    std::fs::create_dir_all(&java_root)
-        .with_context(|| format!("创建 Java 目录 {}", java_root.display()))?;
-    Ok(JavaService::new(
-        store.clone(),
-        scanner,
-        registry,
-        downloader,
-        java_root,
-    ))
-}
-
-/// install：并发探测源延迟并排序；`spinner` 负责探测阶段回显
-async fn open_install_service(spinner: &TaskSpinner) -> Result<JavaService> {
-    spinner.set_message(InstallStage::Probing.message());
-    let path = config::database_path()?;
-    let store = Arc::new(
-        SqliteStore::open(&path).with_context(|| format!("打开元数据库 {}", path.display()))?,
-    );
-    let scanner = Arc::new(HostJavaScanner::new());
-    let registry = Arc::new(RegistryAdapter(rank_sources().await));
-    let bytes = Arc::new(HttpByteSource::new().context("初始化 HTTP 传输")?);
-    let downloader = Arc::new(FileDownloader::new(bytes.clone()).with_range_source(bytes));
-    let java_root = config::platform_data_dir()?.join("java");
-    std::fs::create_dir_all(&java_root)
-        .with_context(|| format!("创建 Java 目录 {}", java_root.display()))?;
-    Ok(JavaService::new(
-        store.clone(),
-        scanner,
-        registry,
-        downloader,
-        java_root,
-    ))
-}
-
-/// 单行刷新扫描进度：`\r` 覆盖当前行，非 TTY 时退化为逐行
-struct ScanProgress {
-    interactive: bool,
-    last_len: usize,
-}
-
-impl ScanProgress {
-    fn new(enable: bool) -> Self {
-        Self {
-            interactive: enable && std::io::stderr().is_terminal(),
-            last_len: 0,
-        }
-    }
-
-    fn on_found(&mut self, path: &Path, version: &str) {
-        #[allow(clippy::print_stderr)]
-        {
-            if self.interactive {
-                let line = format!("  扫描到: {} ({})", path.display(), version);
-                // 清掉上一行残留（路径长短不一时用空格补齐）
-                let pad = self.last_len.saturating_sub(line.len());
-                eprint!("\r{line}{}", " ".repeat(pad));
-                let _ = std::io::stderr().flush();
-                self.last_len = line.len();
-            } else {
-                eprintln!("  扫描到: {} ({})", path.display(), version);
-            }
-        }
-    }
-
-    fn finish(&mut self) {
-        if self.interactive && self.last_len > 0 {
-            #[allow(clippy::print_stderr)]
-            {
-                eprintln!();
-            }
-            self.last_len = 0;
-        }
-    }
+/// `java list` 单行（JSON 模式序列化用）
+#[derive(serde::Serialize)]
+struct JavaRow<'a> {
+    major: i64,
+    version: &'a str,
+    vendor: &'a str,
+    managed: bool,
+    path: String,
 }
 
 pub(crate) fn list(printer: Printer) -> Result<()> {
-    let service = open_local_service()?;
-    // 未扫描过时带进度回调触发一次
-    if !service.has_scanned().context("读取扫描状态")? {
-        printer.print_section("首次使用，正在扫描本机 Java…");
-        let mut progress = ScanProgress::new(printer.is_human());
-        service
-            .scan(false, &mut |found| {
+    let service = bootstrap::open_java_service()?;
+    let mut progress = ScanProgress::new(printer.is_human());
+    let mut first_scan = false;
+    let runtimes = service
+        .list_or_scan(
+            &mut || {
+                first_scan = true;
+                printer.print_section("正在扫描本机 Java…");
+            },
+            &mut |found| {
                 progress.on_found(&found.path, &found.version);
-            })
-            .context("扫描失败")?;
-        progress.finish();
+            },
+        )
+        .context("列出 Java 失败")?;
+    progress.finish();
+    if first_scan {
         printer.print_section("扫描完成");
     }
-    let runtimes = service.list().context("列出 Java 失败")?;
-    if runtimes.is_empty() {
-        printer.print_section("未发现本机 Java，可运行 mcsup java install 安装");
-        return Ok(());
-    }
-    let mut table = Table::new();
-    table.set_content_arrangement(ContentArrangement::Dynamic);
-    table.set_header(["大版本", "完整版本", "厂商", "管理", "路径"]);
-    for rt in &runtimes {
-        table.add_row([
-            rt.major.to_string(),
-            rt.version.clone(),
-            rt.vendor.as_str().to_owned(),
-            if rt.managed { "mcsup" } else { "系统" }.to_owned(),
-            rt.path.display().to_string(),
-        ]);
-    }
-    crate::output::print_table(&table);
-    Ok(())
+    let rows: Vec<JavaRow<'_>> = runtimes
+        .iter()
+        .map(|rt| JavaRow {
+            major: rt.major.as_i64(),
+            version: rt.version.as_str(),
+            vendor: rt.vendor.as_str(),
+            managed: rt.managed,
+            path: rt.path.display().to_string(),
+        })
+        .collect();
+    printer.print_rows(
+        &rows,
+        "未发现本机 Java，可运行 mcsup java install 安装",
+        || {
+            let mut table = Table::new();
+            table.set_content_arrangement(ContentArrangement::Dynamic);
+            table.set_header(["大版本", "完整版本", "厂商", "管理", "路径"]);
+            for rt in &runtimes {
+                table.add_row([
+                    rt.major.to_string(),
+                    rt.version.clone(),
+                    rt.vendor.as_str().to_owned(),
+                    if rt.managed { "mcsup" } else { "系统" }.to_owned(),
+                    rt.path.display().to_string(),
+                ]);
+            }
+            table
+        },
+    )
 }
 
 pub(crate) fn scan(printer: Printer) -> Result<()> {
-    let service = open_local_service()?;
+    let service = bootstrap::open_java_service()?;
     printer.print_section("正在扫描本机 Java…");
     let mut progress = ScanProgress::new(printer.is_human());
     let outcome = service
@@ -215,8 +80,29 @@ pub(crate) fn scan(printer: Printer) -> Result<()> {
         })
         .context("扫描失败")?;
     progress.finish();
-    printer.print_section(&format!("扫描完成：新注册 {} 个", outcome.registered));
-    Ok(())
+    printer.print_outcome(
+        &format!("扫描完成：新注册 {} 个", outcome.registered),
+        &ScanRow {
+            registered: outcome.registered,
+            skipped: outcome.skipped,
+        },
+    )
+}
+
+/// `java scan` 结果（JSON 模式序列化用）
+#[derive(serde::Serialize)]
+struct ScanRow {
+    registered: usize,
+    skipped: usize,
+}
+
+/// `java install` 结果（JSON 模式序列化用）
+#[derive(serde::Serialize)]
+struct InstallJavaRow<'a> {
+    major: i64,
+    version: &'a str,
+    vendor: &'a str,
+    path: String,
 }
 
 pub(crate) async fn install(
@@ -226,8 +112,8 @@ pub(crate) async fn install(
     printer: Printer,
 ) -> Result<()> {
     let enable = printer.is_human();
-    let spinner = TaskSpinner::new(InstallStage::Probing.message(), enable);
-    let service = open_install_service(&spinner).await?;
+    let session = InstallSession::new(InstallStage::Probing.message(), enable);
+    let service = bootstrap::open_java_service()?;
     let package_type = if jre {
         JavaPackageType::Jre
     } else {
@@ -236,84 +122,92 @@ pub(crate) async fn install(
     let major = if let Some(raw) = version {
         parse_major(raw)?
     } else {
-        // 交互提示要独占这一行：finish 之后 bar 不再绘制，提示结束必须 restart，
-        // 否则后面所有阶段（查询版本 / 解析地址 / 下载）都没有回显
-        spinner.finish();
-        let selected = prompt_major(enable)?;
-        spinner.restart();
+        // 交互提示要独占这一行：让出后必须恢复，否则后面所有阶段
+        // （探测 / 查询版本 / 解析地址 / 下载）都没有回显
+        session.pause_for_prompt();
+        let selected = prompt_major(printer)?;
+        session.resume_after_prompt();
         selected
     };
     let vendor_enum = vendor.map(JavaVendor::parse_fuzzy);
 
     info!(major = %major, jre, "java install start");
-    let sink = BarSink::new(
-        spinner.handle(),
-        format!("下载 Java {major} {}", package_type.as_str()),
-    );
-    let cancel = CancellationToken::new();
-    let stage = StageAdapter::new(&spinner, &sink);
+    session.set_download_message(format!("下载 Java {major} {}", package_type.as_str()));
     let outcome = service
         .install(
             major,
             package_type,
             vendor_enum,
-            Some(&stage),
-            Some(&sink),
-            &cancel,
+            Some(&session),
+            Some(&session),
+            session.cancel(),
         )
         .await
         .context("安装 Java 失败")?;
-    spinner.finish();
+    session.finish();
 
-    printer.print_section(&format!(
-        "已安装: Java {} ({}) → {}",
-        outcome.runtime.version,
-        outcome.runtime.vendor,
-        outcome.runtime.path.display()
-    ));
-    Ok(())
+    printer.print_outcome(
+        &format!(
+            "已安装: Java {} ({}) → {}",
+            outcome.runtime.version,
+            outcome.runtime.vendor,
+            outcome.runtime.path.display()
+        ),
+        &InstallJavaRow {
+            major: outcome.runtime.major.as_i64(),
+            version: outcome.runtime.version.as_str(),
+            vendor: outcome.runtime.vendor.as_str(),
+            path: outcome.runtime.path.display().to_string(),
+        },
+    )
+}
+
+/// `java uninstall` 结果（JSON 模式序列化用）
+#[derive(serde::Serialize)]
+struct UninstallJavaRow {
+    path: String,
+    kind: &'static str,
 }
 
 pub(crate) fn uninstall(target: Option<&str>, dir: Option<&Path>, printer: Printer) -> Result<()> {
-    let service = open_local_service()?;
-    let path = resolve_target(&service, target, dir)?;
+    let service = bootstrap::open_java_service()?;
+    let path = resolve_target(&service, target, dir, printer)?;
     let outcome = service.uninstall(&path).context("卸载失败")?;
-    match outcome {
-        UninstallOutcome::RemovedManaged { path } => {
-            printer.print_section(&format!("已删除 mcsup 管理的 Java: {}", path.display()));
-        }
-        UninstallOutcome::UnregisteredSystem { path } => {
-            printer.print_section(&format!("已从注册表移除（文件保留）: {}", path.display()));
-        }
-    }
-    Ok(())
+    let (message, row) = match outcome {
+        UninstallOutcome::RemovedManaged { path } => (
+            format!("已删除 mcsup 管理的 Java: {}", path.display()),
+            UninstallJavaRow {
+                path: path.display().to_string(),
+                kind: "managed",
+            },
+        ),
+        UninstallOutcome::UnregisteredSystem { path } => (
+            format!("已从注册表移除（文件保留）: {}", path.display()),
+            UninstallJavaRow {
+                path: path.display().to_string(),
+                kind: "system",
+            },
+        ),
+    };
+    printer.print_outcome(&message, &row)
 }
 
 fn parse_major(raw: &str) -> Result<JavaMajor> {
     let trimmed = raw.trim().trim_start_matches("java-");
-    trimmed
-        .parse::<i64>()
-        .ok()
-        .and_then(|n| JavaMajor::parse(n).ok())
-        .ok_or_else(|| anyhow!("无法识别的 Java 大版本: {raw}（示例: 17 / 21）"))
+    JavaMajor::parse_str(trimmed)
+        .map_err(|_| anyhow!("无法识别的 Java 大版本: {raw}（示例: 17 / 21）"))
 }
 
-/// LTS 大版本集合，用于交互列表标注
-const LTS_MAJORS: &[i64] = &[8, 11, 17, 21, 25];
-
-/// 交互列表的最高大版本：只列已发布版本，避免出现还不存在的选择
-///
-/// 能力上界是 [`JavaMajor::MAX`]，更新的版本用 `mcsup java install <大版本>` 指定。
-const INSTALL_MENU_MAX: i64 = 27;
-
-fn prompt_major(enable: bool) -> Result<JavaMajor> {
-    if !enable || !std::io::stdin().is_terminal() {
+fn prompt_major(printer: Printer) -> Result<JavaMajor> {
+    // JSON 输出或管道下提问会卡死脚本，统一走 Printer 口径
+    if !printer.is_interactive() {
         return Err(anyhow!("非交互环境请指定版本，如 mcsup java install 21"));
     }
-    // 已发布大版本倒序（新版本在前）；inquire Select 自带滚动
+    // 已发布大版本倒序（新版本在前）；inquire Select 自带滚动。
+    // 可选项上界与 LTS 标注是领域知识，判定在 domain::java，不在此分叉
     let mut choices = Vec::new();
-    for major in (JavaMajor::MIN..=INSTALL_MENU_MAX).rev() {
-        let label = if LTS_MAJORS.contains(&major) {
+    for major in (JavaMajor::MIN..=JavaMajor::RELEASED_MAX).rev() {
+        let label = if JavaMajor::LTS_MAJORS.contains(&major) {
             format!("{major} (LTS)")
         } else {
             major.to_string()
@@ -332,6 +226,7 @@ fn resolve_target(
     service: &JavaService,
     target: Option<&str>,
     dir: Option<&Path>,
+    printer: Printer,
 ) -> Result<PathBuf> {
     // --dir 优先：路径含空格时避免 shell 拆分问题
     if let Some(dir) = dir {
@@ -347,7 +242,7 @@ fn resolve_target(
         return match matches.len() {
             0 => Err(anyhow!("未注册的大版本 Java: {major}")),
             1 => Ok(matches[0].path.clone()),
-            _ if std::io::stdin().is_terminal() => prompt_runtime(major, &matches),
+            _ if printer.is_interactive() => prompt_runtime(major, &matches),
             _ => Err(anyhow!(
                 "大版本 {major} 有多个运行时，请用 --dir 指定路径，如:\n  mcsup java uninstall --dir \"{}\"",
                 matches[0].path.display()
@@ -386,45 +281,4 @@ fn prompt_runtime(major: JavaMajor, matches: &[JavaRuntime]) -> Result<PathBuf> 
         .find(|rt| selected.starts_with(&rt.path.display().to_string()))
         .map(|rt| rt.path.clone())
         .ok_or_else(|| anyhow!("未匹配到所选运行时"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use mcsup::port::ProgressSink;
-
-    /// 安装全程只用一条回显线：阶段 spinner → 下载进度条 → 阶段 spinner。
-    ///
-    /// 交互提示 `finish` 之后必须 `restart`，否则 indicatif 的 bar 处于终态，
-    /// 后续阶段全部画不出来 —— 那几秒空白就是这么来的。
-    #[test]
-    fn stage_sequence_keeps_one_live_line() {
-        let spinner = TaskSpinner::new(InstallStage::Probing.message(), false);
-        let sink = BarSink::new(spinner.handle(), "下载 Java 25 jdk");
-        let adapter = StageAdapter::new(&spinner, &sink);
-        let line = spinner.handle();
-
-        adapter.on_stage(InstallStage::Listing);
-        assert_eq!(line.message(), InstallStage::Listing.message());
-
-        // 交互提示独占这一行，结束后必须恢复
-        spinner.finish();
-        assert!(line.is_finished());
-        spinner.restart();
-        assert!(!line.is_finished());
-
-        adapter.on_stage(InstallStage::Resolving);
-        assert_eq!(line.message(), InstallStage::Resolving.message());
-
-        // 进入下载：同一条线交给进度条，不等首字节
-        adapter.on_stage(InstallStage::Downloading);
-        assert_eq!(line.message(), "下载 Java 25 jdk");
-        sink.on_progress(1, Some(100));
-        assert_eq!(line.length(), Some(100));
-
-        // 解压：进度条交还 spinner，同一条线继续有回显
-        adapter.on_stage(InstallStage::Extracting);
-        assert_eq!(line.message(), InstallStage::Extracting.message());
-        assert!(!line.is_finished());
-    }
 }

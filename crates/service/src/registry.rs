@@ -1,17 +1,22 @@
 use domain::server::meta::{InstalledJar, ServerId, ServerMeta, ServerName};
 use domain::server::version::{ServerVariant, VersionId};
-use domain::workspace::Workspace;
-use port::{RepositoryError, ServerRepository, WorkspaceRepository};
+use domain::workspace::{Workspace, WorkspaceId};
+use port::{
+    CancellationToken, ProgressSink, RepositoryError, ServerRepository, WorkspaceRepository,
+};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+use crate::fs_error::FsError;
 use crate::workspace::WorkspaceError;
+use crate::{InstallError, InstalledDownload, ServerInstaller};
 
 const SERVER_MARKER: &str = "mcsup.json";
 const SERVER_MARKER_SCHEMA: u32 = 1;
+/// 核心固定文件名（[`InstalledJar::path`] 的相对路径口径）
+const SERVER_JAR: &str = "server.jar";
 
 /// 服务器注册操作失败
 #[derive(Debug, Error)]
@@ -26,17 +31,9 @@ pub enum ServerRegistryError {
     /// 服务器不存在
     #[error("server not found: {0}")]
     NotFound(String),
-    /// 文件系统失败
-    /// 文件系统失败；原因走 source 链，避免 `{:#}` 渲染时重复
-    #[error("io error on {path}")]
-    Io {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    /// marker 解析 / 序列化失败
-    #[error("server marker {path}: {message}")]
-    Marker { path: PathBuf, message: String },
+    /// 文件系统 / marker 失败（共用载荷见 [`FsError`]）
+    #[error(transparent)]
+    Fs(#[from] FsError),
     /// 注册表失败
     #[error(transparent)]
     Repo(#[from] RepositoryError),
@@ -45,12 +42,25 @@ pub enum ServerRegistryError {
     InvalidName(#[from] domain::server::error::InvalidServerName),
 }
 
+/// 服务端核心安装失败（注册表定位 + 下载编排）
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum InstallJarError {
+    /// 注册表失败（含服务器不存在）
+    #[error(transparent)]
+    Registry(#[from] ServerRegistryError),
+    /// 来源、下载或校验失败
+    #[error(transparent)]
+    Install(#[from] InstallError),
+}
+
 impl ServerRegistryError {
     fn io(path: &Path, source: std::io::Error) -> Self {
-        Self::Io {
-            path: path.to_path_buf(),
-            source,
-        }
+        FsError::io(path, source).into()
+    }
+
+    fn marker(path: impl Into<PathBuf>, message: impl Into<String>) -> Self {
+        FsError::marker(path, message).into()
     }
 }
 
@@ -67,6 +77,17 @@ struct ServerMarkerJson {
 pub struct RegisteredServer {
     pub meta: ServerMeta,
     pub dir: PathBuf,
+}
+
+/// 核心安装成功的结果
+#[derive(Debug, Clone)]
+pub struct InstalledServerJar {
+    /// 回写核心元数据后的服务器
+    pub server: RegisteredServer,
+    /// 写入的元数据
+    pub jar: InstalledJar,
+    /// 核心绝对路径
+    pub destination: PathBuf,
 }
 
 /// 服务器注册表编排：归属工作目录、目录创建、marker、注册
@@ -107,7 +128,7 @@ impl ServerRegistry {
         version: &VersionId,
         variant: ServerVariant,
     ) -> Result<RegisteredServer, ServerRegistryError> {
-        let now = now_unix();
+        let now = crate::util::unix_now();
         let name = ServerName::parse(name)?;
         let ws = self.resolve_workspace(workspace_selector)?;
 
@@ -121,12 +142,8 @@ impl ServerRegistry {
         }
         std::fs::create_dir_all(&dir).map_err(|err| ServerRegistryError::io(&dir, err))?;
 
-        let id = ServerId::parse(&uuid::Uuid::new_v4().to_string()).map_err(|err| {
-            ServerRegistryError::Marker {
-                path: dir.join(SERVER_MARKER),
-                message: err.to_string(),
-            }
-        })?;
+        let id = ServerId::parse(&uuid::Uuid::new_v4().to_string())
+            .map_err(|err| ServerRegistryError::marker(dir.join(SERVER_MARKER), err.to_string()))?;
         write_server_marker(
             &dir,
             &ServerMarkerJson {
@@ -200,27 +217,63 @@ impl ServerRegistry {
         Ok(RegisteredServer { meta, dir })
     }
 
+    /// 给既有服务器安装核心：定位目录 → 下载到 `{dir}/server.jar` → 回写元数据
+    ///
+    /// 目标目录由注册表回答，入口不再拿当前工作目录当目标。
+    ///
+    /// # Errors
+    ///
+    /// 服务器不存在返回 [`InstallJarError::Registry`]；来源、下载或校验失败返回
+    /// [`InstallJarError::Install`]
+    pub async fn install_jar(
+        &self,
+        name: &str,
+        version: &VersionId,
+        installer: &ServerInstaller,
+        progress: Option<&dyn ProgressSink>,
+        cancel: &CancellationToken,
+    ) -> Result<InstalledServerJar, InstallJarError> {
+        let srv = self.get(name)?;
+        let destination = srv.dir.join(SERVER_JAR);
+        let out: InstalledDownload = installer
+            .install(version, destination.clone(), progress, cancel)
+            .await?;
+        let jar = InstalledJar {
+            path: PathBuf::from(SERVER_JAR),
+            size: out.artifact.size,
+            checksum: out.checksum,
+        };
+        let srv = self.update_jar(name, &jar, crate::util::unix_now())?;
+        Ok(InstalledServerJar {
+            server: srv,
+            jar,
+            destination,
+        })
+    }
+
+    /// 某工作目录下的服务器数量（注册表口径，与 `server list` 同源）
+    ///
+    /// `workspace list` 的「服务器数」用这个，不要在入口数磁盘目录——
+    /// 残留目录与漏入库会让两边数字分叉。
+    ///
+    /// # Errors
+    ///
+    /// 注册表失败时返回 [`ServerRegistryError`]
+    pub fn count_in(&self, workspace_id: &WorkspaceId) -> Result<usize, ServerRegistryError> {
+        Ok(self
+            .servers
+            .list()?
+            .iter()
+            .filter(|meta| &meta.workspace_id == workspace_id)
+            .count())
+    }
+
     fn resolve_workspace(&self, selector: Option<&str>) -> Result<Workspace, ServerRegistryError> {
         match selector {
             Some(sel) => {
                 let all = self.workspaces.list()?;
-                if let Some(exact) = all.iter().find(|w| w.name.as_str() == sel) {
-                    return Ok(exact.clone());
-                }
-                let matched: Vec<&Workspace> = all
-                    .iter()
-                    .filter(|w| w.name.as_str().starts_with(sel))
-                    .collect();
-                match matched.as_slice() {
-                    [one] => Ok((*one).clone()),
-                    [] => Err(ServerRegistryError::Workspace(WorkspaceError::NotFound(
-                        sel.to_owned(),
-                    ))),
-                    many => Err(ServerRegistryError::Workspace(WorkspaceError::Ambiguous {
-                        selector: sel.to_owned(),
-                        candidates: many.iter().map(|w| w.name.as_str().to_owned()).collect(),
-                    })),
-                }
+                super::workspace::resolve_selector(&all, sel)
+                    .map_err(ServerRegistryError::Workspace)
             }
             None => self
                 .workspaces
@@ -240,17 +293,9 @@ impl ServerRegistry {
 
 fn write_server_marker(dir: &Path, marker: &ServerMarkerJson) -> Result<(), ServerRegistryError> {
     let path = dir.join(SERVER_MARKER);
-    let text = serde_json::to_string_pretty(marker).map_err(|err| ServerRegistryError::Marker {
-        path: path.clone(),
-        message: err.to_string(),
-    })?;
+    let text = serde_json::to_string_pretty(marker)
+        .map_err(|err| ServerRegistryError::marker(path.clone(), err.to_string()))?;
     std::fs::write(&path, text).map_err(|err| ServerRegistryError::io(&path, err))
-}
-
-fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs().cast_signed())
 }
 
 #[cfg(test)]

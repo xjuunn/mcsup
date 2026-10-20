@@ -1,3 +1,7 @@
+mod extract;
+
+pub use extract::CommandExtractor;
+
 use async_trait::async_trait;
 use domain::server::artifact::ChecksumAlgorithm;
 use port::{

@@ -1,9 +1,9 @@
+use crate::fs_error::FsError;
 use domain::workspace::{InvalidWorkspaceName, Workspace, WorkspaceId, WorkspaceName};
 use port::{RepositoryError, WorkspaceRepository};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 const MARKER_FILE: &str = "workspace.toml";
@@ -39,18 +39,9 @@ pub enum WorkspaceError {
     /// 尚无默认工作目录
     #[error("no default workspace; run `mcsup workspace init` first")]
     NoDefault,
-    /// 文件系统失败
-    ///
-    /// 消息只带路径，原因走 source 链：`{:#}` 渲染时才不会把原因打两遍
-    #[error("io error on {path}")]
-    Io {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    /// marker 解析 / 序列化失败
-    #[error("marker file {path}: {message}")]
-    Marker { path: PathBuf, message: String },
+    /// 文件系统 / marker 失败（共用载荷见 [`FsError`]）
+    #[error(transparent)]
+    Fs(#[from] FsError),
     /// 注册表失败
     #[error(transparent)]
     Repo(#[from] RepositoryError),
@@ -61,10 +52,11 @@ pub enum WorkspaceError {
 
 impl WorkspaceError {
     fn io(path: &Path, source: std::io::Error) -> Self {
-        Self::Io {
-            path: path.to_path_buf(),
-            source,
-        }
+        FsError::io(path, source).into()
+    }
+
+    fn marker(path: impl Into<PathBuf>, message: impl Into<String>) -> Self {
+        FsError::marker(path, message).into()
     }
 }
 
@@ -115,8 +107,8 @@ impl WorkspaceService {
     ///
     /// 目录非空、名称冲突、IO / marker / 注册表失败时返回 [`WorkspaceError`]
     pub fn init(&self, dir: &Path, name: Option<&str>) -> Result<InitOutcome, WorkspaceError> {
-        let now = now_unix();
-        let dir = absolute(dir);
+        let now = crate::util::unix_now();
+        let dir = absolute_path(dir);
 
         if let Some(marker) = read_marker(&dir)? {
             return self.recover(dir, &marker, now);
@@ -135,12 +127,8 @@ impl WorkspaceService {
         }
 
         create_layout(&dir)?;
-        let id = WorkspaceId::parse(&uuid::Uuid::new_v4().to_string()).map_err(|err| {
-            WorkspaceError::Marker {
-                path: dir.join(MARKER_FILE),
-                message: err.to_string(),
-            }
-        })?;
+        let id = WorkspaceId::parse(&uuid::Uuid::new_v4().to_string())
+            .map_err(|err| WorkspaceError::marker(dir.join(MARKER_FILE), err.to_string()))?;
         write_marker(
             &dir,
             &MarkerToml {
@@ -197,21 +185,7 @@ impl WorkspaceService {
     /// 未找到 / 歧义 / 注册表失败时返回 [`WorkspaceError`]
     pub fn resolve(&self, selector: &str) -> Result<Workspace, WorkspaceError> {
         let all = self.list()?;
-        if let Some(exact) = all.iter().find(|w| w.name.as_str() == selector) {
-            return Ok(exact.clone());
-        }
-        let matched: Vec<&Workspace> = all
-            .iter()
-            .filter(|w| w.name.as_str().starts_with(selector))
-            .collect();
-        match matched.as_slice() {
-            [one] => Ok((*one).clone()),
-            [] => Err(WorkspaceError::NotFound(selector.to_owned())),
-            many => Err(WorkspaceError::Ambiguous {
-                selector: selector.to_owned(),
-                candidates: many.iter().map(|w| w.name.as_str().to_owned()).collect(),
-            }),
-        }
+        resolve_selector(&all, selector)
     }
 
     /// 切换默认工作目录
@@ -252,14 +226,10 @@ impl WorkspaceService {
         now: i64,
     ) -> Result<InitOutcome, WorkspaceError> {
         let marker_path = dir.join(MARKER_FILE);
-        let id = WorkspaceId::parse(&marker.id).map_err(|err| WorkspaceError::Marker {
-            path: marker_path.clone(),
-            message: err.to_string(),
-        })?;
-        let name = WorkspaceName::parse(&marker.name).map_err(|err| WorkspaceError::Marker {
-            path: marker_path,
-            message: err.to_string(),
-        })?;
+        let id = WorkspaceId::parse(&marker.id)
+            .map_err(|err| WorkspaceError::marker(marker_path.clone(), err.to_string()))?;
+        let name = WorkspaceName::parse(&marker.name)
+            .map_err(|err| WorkspaceError::marker(marker_path, err.to_string()))?;
 
         if let Ok(existing) = self.repo.get(&id) {
             return Ok(InitOutcome::AlreadyRegistered(normalize_workspace(
@@ -306,6 +276,35 @@ impl WorkspaceService {
     }
 }
 
+/// 按名选择器从候选表里解析工作区：精确 → 唯一前缀 → 报错
+///
+/// `WorkspaceService::resolve` 与 `ServerRegistry::resolve_workspace` 共用，
+/// 选择器语义只允许有一份实现。
+///
+/// # Errors
+///
+/// 未找到 / 歧义时返回 [`WorkspaceError`]
+pub(crate) fn resolve_selector(
+    all: &[Workspace],
+    selector: &str,
+) -> Result<Workspace, WorkspaceError> {
+    if let Some(exact) = all.iter().find(|w| w.name.as_str() == selector) {
+        return Ok(exact.clone());
+    }
+    let matched: Vec<&Workspace> = all
+        .iter()
+        .filter(|w| w.name.as_str().starts_with(selector))
+        .collect();
+    match matched.as_slice() {
+        [one] => Ok((*one).clone()),
+        [] => Err(WorkspaceError::NotFound(selector.to_owned())),
+        many => Err(WorkspaceError::Ambiguous {
+            selector: selector.to_owned(),
+            candidates: many.iter().map(|w| w.name.as_str().to_owned()).collect(),
+        }),
+    }
+}
+
 fn create_layout(dir: &Path) -> Result<(), WorkspaceError> {
     for sub in ["servers", "backups/cas", "backups/snapshots", "cache"] {
         let path = dir.join(sub);
@@ -320,25 +319,21 @@ fn read_marker(dir: &Path) -> Result<Option<MarkerToml>, WorkspaceError> {
         return Ok(None);
     }
     let text = std::fs::read_to_string(&path).map_err(|err| WorkspaceError::io(&path, err))?;
-    let marker: MarkerToml = toml::from_str(&text).map_err(|err| WorkspaceError::Marker {
-        path: path.clone(),
-        message: err.to_string(),
-    })?;
+    let marker: MarkerToml = toml::from_str(&text)
+        .map_err(|err| WorkspaceError::marker(path.clone(), err.to_string()))?;
     if marker.schema != MARKER_SCHEMA {
-        return Err(WorkspaceError::Marker {
+        return Err(WorkspaceError::marker(
             path,
-            message: format!("unsupported schema {}", marker.schema),
-        });
+            format!("unsupported schema {}", marker.schema),
+        ));
     }
     Ok(Some(marker))
 }
 
 fn write_marker(dir: &Path, marker: &MarkerToml) -> Result<(), WorkspaceError> {
     let path = dir.join(MARKER_FILE);
-    let text = toml::to_string_pretty(marker).map_err(|err| WorkspaceError::Marker {
-        path: path.clone(),
-        message: err.to_string(),
-    })?;
+    let text = toml::to_string_pretty(marker)
+        .map_err(|err| WorkspaceError::marker(path.clone(), err.to_string()))?;
     std::fs::write(&path, text).map_err(|err| WorkspaceError::io(&path, err))
 }
 
@@ -355,7 +350,12 @@ fn is_empty_dir(dir: &Path) -> Result<bool, WorkspaceError> {
     Ok(true)
 }
 
-fn absolute(dir: &Path) -> PathBuf {
+/// 把用户给的目录解析为入库口径的绝对路径
+///
+/// 相对路径按当前工作目录展开，再去掉 `.` 组件与多余分隔符。展示与入库
+/// 必须走同一口径：入口侧确认页预览也调用本函数，不复制这份解析。
+#[must_use]
+pub fn absolute_path(dir: &Path) -> PathBuf {
     let joined = if dir.is_absolute() {
         dir.to_path_buf()
     } else {
@@ -398,12 +398,6 @@ fn deletion_hint(err: std::io::Error) -> std::io::Error {
 #[cfg(not(windows))]
 fn deletion_hint(err: std::io::Error) -> std::io::Error {
     err
-}
-
-fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs().cast_signed())
 }
 
 #[cfg(test)]
@@ -703,7 +697,7 @@ mod tests {
         std::fs::write(&dir, "occupied").expect("file");
 
         let err = svc.remove("ws01", true).expect_err("must fail");
-        assert!(matches!(err, WorkspaceError::Io { .. }));
+        assert!(matches!(err, WorkspaceError::Fs(FsError::Io { .. })));
         // 记录还在，占用解除后重试即可自愈
         assert!(svc.resolve("ws01").is_ok());
     }

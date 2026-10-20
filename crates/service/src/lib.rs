@@ -1,13 +1,20 @@
+mod fs_error;
 mod java;
 mod registry;
+mod util;
 mod workspace;
 
+pub use fs_error::FsError;
 pub use java::{
-    InstallOutcome, InstallStage, JavaError, JavaService, JavaSourceRegistryPort,
-    RemoteJavaPackage, ScanOutcome, StageSink, UninstallOutcome,
+    InstallOutcome, InstallStage, JavaError, JavaService, RemoteJavaPackage, ScanOutcome,
+    StageSink, UninstallOutcome,
 };
-pub use registry::{RegisteredServer, ServerRegistry, ServerRegistryError};
-pub use workspace::{InitOutcome, WorkspaceError, WorkspaceService};
+/// Java 源聚合端口（定义在 `port`，此处转出便于既有调用方）
+pub use port::JavaSourceRegistryPort;
+pub use registry::{
+    InstallJarError, InstalledServerJar, RegisteredServer, ServerRegistry, ServerRegistryError,
+};
+pub use workspace::{InitOutcome, WorkspaceError, WorkspaceService, absolute_path};
 
 use domain::server::download::DownloadStatus;
 use domain::server::error::InvalidTransition;
@@ -42,6 +49,8 @@ pub struct InstalledDownload {
     pub status: DownloadStatus,
     /// 最终信息
     pub artifact: DownloadedArtifact,
+    /// 来源声明的校验和（下载时已按它校验）
+    pub checksum: domain::server::artifact::Checksum,
 }
 
 /// 服务端安装编排
@@ -77,6 +86,7 @@ impl ServerInstaller {
     ) -> Result<InstalledDownload, InstallError> {
         let mut status = DownloadStatus::Pending.transition(DownloadStatus::Downloading)?;
         let resolved = self.source.artifact(version).await?;
+        let checksum = resolved.artifact.checksum.clone();
 
         let request = DownloadRequest {
             location: resolved.location,
@@ -87,7 +97,11 @@ impl ServerInstaller {
         let artifact = self.downloader.download(&request, progress, cancel).await?;
         status = status.transition(DownloadStatus::Verifying)?;
         status = status.transition(DownloadStatus::Ready)?;
-        Ok(InstalledDownload { status, artifact })
+        Ok(InstalledDownload {
+            status,
+            artifact,
+            checksum,
+        })
     }
 }
 

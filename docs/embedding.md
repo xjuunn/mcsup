@@ -42,14 +42,14 @@ crates/mcsup/               门面 package mcsup（唯一入口与发布主体�
 │   │                       EventSink / Clock（依赖 domain）
 │   ├── service/            用例编排：start / stop / status / backup
 │   ├── file/               文件系统和文件传输
-│   └── provider/           外部资源和第三方 API
+│   ├── java/               Java 检测与版本管理（实现 port）
+│   ├── provider/           外部资源和第三方 API
+│   └── storage/            元数据持久化（实现 port::ServerRepository）
 └── 待建（同样建 crate 并在门面加 feature；cli 为门面内模块）：
     ├── protocol/           消息和结果类型（唯一契约来源）
     ├── cli/                CLI 命令语义和渲染（feature = "cli"，门面内模块）
     ├── backend/            Local / Remote 执行位置选择（实现 port::Backend）
     ├── runtime/            Minecraft / JVM 进程运行（实现 port）
-    ├── java/               Java 检测与版本管理（实现 port）
-    ├── storage/            元数据持久化（实现 port::ServerRepository）
     ├── backup/             CAS / Snapshot / Restore
     ├── modkit/             Mod / Modpack
     ├── transport/          RPC 通信（RemoteBackend 使用）
@@ -222,7 +222,9 @@ domain   = ["dep:domain"]
 port     = ["dep:port", "domain"]
 service  = ["dep:service", "port"]
 file     = ["dep:file", "port"]
+java     = ["dep:java", "port"]
 provider = ["dep:provider", "port"]
+storage  = ["dep:storage", "port"]
 ```
 
 级联规则：feature 引用同级 feature，被引用者带出其可选依赖——只要

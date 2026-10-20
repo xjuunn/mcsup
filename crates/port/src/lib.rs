@@ -231,6 +231,29 @@ pub trait ArtifactDownloader: Send + Sync {
     ) -> Result<DownloadedArtifact, DownloadError>;
 }
 
+/// 归档解压失败（工具缺失 / 执行失败），消息自带工具与路径上下文
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("{0}")]
+pub struct ExtractError(pub String);
+
+/// 归档解压能力
+///
+/// 解压是重活（外部工具链，将来的远端执行同样在此之后），不在 service 内
+/// 做；service 只保留编排：临时目录 → 解压 → 校验 → 原子换入。
+pub trait ArchiveExtractor: Send + Sync {
+    /// 归档是否属于可解压格式
+    ///
+    /// dmg / msi 等安装包不解压，调用方按目录内容继续处理。
+    fn is_extractable(&self, archive: &Path) -> bool;
+
+    /// 把归档内容解到 `dest`；调用方负责临时目录与原子换入
+    ///
+    /// # Errors
+    ///
+    /// 工具缺失或解压失败时返回 [`ExtractError`]
+    fn extract(&self, archive: &Path, dest: &Path) -> Result<(), ExtractError>;
+}
+
 /// 元数据存储错误
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -385,6 +408,39 @@ pub struct JavaPackageRequest {
     pub arch: String,
 }
 
+impl JavaPackageRequest {
+    /// 当前平台（OS / 架构）的查询条件
+    #[must_use]
+    pub fn for_current_platform(major: JavaMajor, package_type: JavaPackageType) -> Self {
+        Self {
+            major,
+            package_type,
+            os: current_os().to_owned(),
+            arch: current_arch().to_owned(),
+        }
+    }
+}
+
+/// 当前平台的 API 操作系统标识
+const fn current_os() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "mac"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        "linux"
+    }
+}
+
+/// 当前平台的 API 架构标识
+const fn current_arch() -> &'static str {
+    if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "x64"
+    }
+}
+
 /// 远端一个可下载的 Java 发行包
 #[derive(Debug, Clone)]
 pub struct JavaPackage {
@@ -430,6 +486,35 @@ pub trait JavaReleaseSource: Send + Sync {
     async fn resolve_binary(&self, package: &JavaPackage) -> Result<ResolvedJava, SourceError>;
 }
 
+/// Java 发行包聚合注册表：多源按优先级故障切换（service 只依赖这个聚合端口）
+#[async_trait::async_trait]
+pub trait JavaSourceRegistryPort: Send + Sync {
+    /// 源名列表（当前优先级）
+    fn source_names(&self) -> Vec<&'static str>;
+
+    /// 并发探测各源元数据端点，返回按延迟升序重排后的注册表
+    ///
+    /// 探测失败的源被剔除；幂等，未探测到任何源时返回空注册表
+    async fn ranked(&self) -> Arc<dyn JavaSourceRegistryPort>;
+
+    /// 按优先级列出可用包；单源失败切换下一个，全部失败聚合错误
+    ///
+    /// # Errors
+    ///
+    /// 所有源均失败时返回最后一个 [`SourceError`]
+    async fn list_packages(
+        &self,
+        request: &JavaPackageRequest,
+    ) -> Result<Vec<JavaPackage>, SourceError>;
+
+    /// 解析下载地址；单源失败切换下一个
+    ///
+    /// # Errors
+    ///
+    /// 所有源均失败时返回最后一个 [`SourceError`]
+    async fn resolve_binary(&self, package: &JavaPackage) -> Result<ResolvedJava, SourceError>;
+}
+
 /// 本机 Java 扫描结果
 #[derive(Debug, Clone)]
 pub struct ScannedJava {
@@ -443,9 +528,15 @@ pub struct ScannedJava {
 pub trait JavaScanner: Send + Sync {
     /// 扫描本机已安装的 Java，每个候选项通过 `on_found` 回调逐个上报
     ///
+    /// 契约：同一 JVM home 只上报一次（unix 上实现须先把候选路径归一到真实
+    /// 路径再去重）；service 侧不再重复去重。
+    ///
+    /// 语义是 best-effort：单项候选探测失败只跳过该候选（`java -version`
+    /// 退出非零的损坏安装不登记），不中断整体扫描，因此正常情况下总是 `Ok(())`。
+    ///
     /// # Errors
     ///
-    /// 平台专用命令执行失败时返回底层错误
+    /// 实现自身的致命错误（平台命令整体不可用等）
     fn scan(
         &self,
         on_found: &mut dyn FnMut(ScannedJava),

@@ -1,9 +1,10 @@
+use crate::fs_error::FsError;
 use domain::java::{JavaMajor, JavaPackageType, JavaRuntime, JavaVendor};
 use port::{
-    ArtifactDownloader, CancellationToken, DownloadRequest, DownloadedArtifact,
-    JavaRuntimeRepository, JavaScanner, ProgressSink, RepositoryError, ScannedJava, SourceError,
+    ArchiveExtractor, ArtifactDownloader, CancellationToken, DownloadRequest, DownloadedArtifact,
+    JavaPackageRequest, JavaRuntimeRepository, JavaScanner, JavaSourceRegistryPort, ProgressSink,
+    RepositoryError, ScannedJava, SourceError,
 };
-use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -26,17 +27,18 @@ pub enum JavaError {
     /// 注册表失败
     #[error(transparent)]
     Repo(#[from] RepositoryError),
-    /// 本地 IO 失败
-    /// 文件系统失败；原因走 source 链，避免 `{:#}` 渲染时重复
-    #[error("io error on {path}")]
-    Io {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
+    /// 文件系统失败（共用载荷见 [`FsError`]）
+    #[error(transparent)]
+    Fs(#[from] FsError),
     /// 扫描失败
     #[error("scan failed: {0}")]
     Scan(String),
+}
+
+impl JavaError {
+    fn io(path: &Path, source: std::io::Error) -> Self {
+        FsError::io(path, source).into()
+    }
 }
 
 /// 扫描结果汇总
@@ -105,26 +107,10 @@ pub struct JavaService {
     scanner: Arc<dyn JavaScanner>,
     registry: Arc<dyn JavaSourceRegistryPort>,
     downloader: Arc<dyn ArtifactDownloader>,
+    /// 归档解压：重活经 port 能力注入，本层只做编排（见 [`extract_and_swap`]）
+    extractor: Arc<dyn ArchiveExtractor>,
     /// mcsup 管理的 JVM 安装根目录 `{data_dir}/mcsup/java`
     java_root: PathBuf,
-}
-
-/// 对 [`port::JavaReleaseSource`] 集合的封装（service 只依赖聚合接口）
-#[async_trait::async_trait]
-pub trait JavaSourceRegistryPort: Send + Sync {
-    /// 源名列表（优先级）
-    fn source_names(&self) -> Vec<&'static str>;
-    /// 列出可用包
-    async fn list_packages(
-        &self,
-        major: JavaMajor,
-        package_type: JavaPackageType,
-    ) -> Result<Vec<port::JavaPackage>, SourceError>;
-    /// 解析下载地址
-    async fn resolve_binary(
-        &self,
-        package: &port::JavaPackage,
-    ) -> Result<port::ResolvedJava, SourceError>;
 }
 
 impl std::fmt::Debug for JavaService {
@@ -141,6 +127,7 @@ impl JavaService {
         scanner: Arc<dyn JavaScanner>,
         registry: Arc<dyn JavaSourceRegistryPort>,
         downloader: Arc<dyn ArtifactDownloader>,
+        extractor: Arc<dyn ArchiveExtractor>,
         java_root: PathBuf,
     ) -> Self {
         Self {
@@ -148,6 +135,7 @@ impl JavaService {
             scanner,
             registry,
             downloader,
+            extractor,
             java_root,
         }
     }
@@ -178,15 +166,13 @@ impl JavaService {
                 skipped: 0,
             });
         }
-        let now = unix_now();
+        let now = crate::util::unix_now();
         let mut registered = 0usize;
         let mut skipped = 0usize;
-        let mut seen = std::collections::HashSet::new();
+        // 去重是扫描器的契约（见 port::JavaScanner）：service 不再维护 seen，
+        // 只管注册与回调
         self.scanner
             .scan(&mut |found| {
-                if !seen.insert(found.path.clone()) {
-                    return;
-                }
                 on_found(&found);
                 let runtime = JavaRuntime {
                     id: uuid::Uuid::new_v4().to_string(),
@@ -221,8 +207,26 @@ impl JavaService {
     ///
     /// 扫描或注册表失败时返回 [`JavaError`]
     pub fn list(&self) -> Result<Vec<JavaRuntime>, JavaError> {
+        self.list_or_scan(&mut || {}, &mut |_| {})
+    }
+
+    /// 列出全部已注册运行时；未扫描过则先扫描并逐个回调
+    ///
+    /// 「先扫描再列出」的判定收敛在 service，入口不再各自重写分支：
+    /// `on_first_scan` 仅在首次扫描将要开始时调用一次（入口用于打印阶段文案），
+    /// `on_found` 逐个上报扫描到的运行时。
+    ///
+    /// # Errors
+    ///
+    /// 扫描或注册表失败时返回 [`JavaError`]
+    pub fn list_or_scan(
+        &self,
+        on_first_scan: &mut dyn FnMut(),
+        on_found: &mut dyn FnMut(&ScannedJava),
+    ) -> Result<Vec<JavaRuntime>, JavaError> {
         if !self.has_scanned()? {
-            self.scan(false, &mut |_| {})?;
+            on_first_scan();
+            self.scan(false, on_found)?;
         }
         Ok(self.repo.list()?)
     }
@@ -249,8 +253,13 @@ impl JavaService {
             }
         };
 
+        // 源探测与排序属于安装编排的一部分，换入口（CLI/API/MCP）共享同一阶段机
+        notify(InstallStage::Probing);
+        let registry = self.registry.ranked().await;
+
         notify(InstallStage::Listing);
-        let packages = self.registry.list_packages(major, package_type).await?;
+        let request = JavaPackageRequest::for_current_platform(major, package_type);
+        let packages = registry.list_packages(&request).await?;
         let package = packages
             .into_iter()
             .find(|pkg| vendor.is_none_or(|v| pkg.vendor == v))
@@ -261,15 +270,13 @@ impl JavaService {
             })?;
 
         notify(InstallStage::Resolving);
-        let resolved = self.registry.resolve_binary(&package).await?;
+        let resolved = registry.resolve_binary(&package).await?;
 
         // id 可能是 URL（adoptium），净化为安全目录名
         let dir_name = sanitize_dir_name(&package.id, &package);
         let install_dir = self.java_root.join(&dir_name);
-        std::fs::create_dir_all(&install_dir).map_err(|source| JavaError::Io {
-            path: install_dir.clone(),
-            source,
-        })?;
+        std::fs::create_dir_all(&install_dir)
+            .map_err(|source| JavaError::io(&install_dir, source))?;
         let filename = download_filename(&resolved.location);
         let destination = install_dir.join(&filename);
 
@@ -283,9 +290,9 @@ impl JavaService {
         let artifact = self.downloader.download(&request, progress, cancel).await?;
 
         notify(InstallStage::Extracting);
-        let home = extract_and_swap(&destination, &install_dir)?;
+        let home = extract_and_swap(&destination, &install_dir, self.extractor.as_ref())?;
 
-        let now = unix_now();
+        let now = crate::util::unix_now();
         let runtime = JavaRuntime {
             id: dir_name,
             path: home,
@@ -345,12 +352,6 @@ impl JavaService {
     }
 }
 
-fn unix_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0))
-}
-
 fn download_filename(location: &url::Url) -> String {
     location
         .path_segments()
@@ -397,30 +398,20 @@ fn strip_archive_ext(name: &str) -> String {
     name.to_owned()
 }
 
-/// 在解压目录中定位 JVM home：优先 Contents/Home，否则找含 bin/java 的一层子目录
+/// 在解压目录中定位 JVM home：根目录一对候选（本身 / bundle）优先，
+/// 再对一层子目录依次做同样的探测
 ///
-/// 判定走 [`domain::java::is_jvm_home`]：Windows 上要找 `bin\java.exe`，
-/// 只认 `bin/java` 会把安装目录根当成 home。
+/// 候选与顺序统一在 [`domain::java::find_jvm_home`]：必须与扫描走同一份，
+/// 否则同一目录会被两处登记成不同身份。判定形状（`bin/java(.exe)`）见
+/// [`domain::java::java_bin_under`]。
 fn locate_java_home(root: &Path) -> Option<PathBuf> {
-    let contents_home = root.join("Contents").join("Home");
-    if domain::java::is_jvm_home(&contents_home) {
-        return Some(contents_home);
-    }
-    if domain::java::is_jvm_home(root) {
-        return Some(root.to_path_buf());
+    if let Some(home) = domain::java::find_jvm_home(root, Path::is_file) {
+        return Some(home);
     }
     let entries = std::fs::read_dir(root).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if domain::java::is_jvm_home(&path) {
-            return Some(path);
-        }
-        let nested_home = path.join("Contents").join("Home");
-        if domain::java::is_jvm_home(&nested_home) {
-            return Some(nested_home);
-        }
-    }
-    None
+    entries
+        .flatten()
+        .find_map(|entry| domain::java::find_jvm_home(&entry.path(), Path::is_file))
 }
 
 /// 校验解压产物里有当前平台可用的 JVM home
@@ -430,7 +421,7 @@ fn locate_java_home(root: &Path) -> Option<PathBuf> {
 ///
 /// # Errors
 ///
-/// 找不到 JVM home 时返回 [`JavaError::Io`]，消息点明可能是平台不符
+/// 找不到 JVM home 时返回 [`JavaError::Fs`]，消息点明可能是平台不符
 fn require_jvm_home(archive: &Path, dir: &Path) -> Result<PathBuf, JavaError> {
     match locate_java_home(dir) {
         Some(home) => Ok(home),
@@ -447,24 +438,36 @@ fn require_jvm_home(archive: &Path, dir: &Path) -> Result<PathBuf, JavaError> {
 /// 解压归档到临时目录，成功后原子替换目标目录
 ///
 /// 避免重复安装时 `tar`/`unzip` 对已存在文件逐个询问覆盖。
-/// 解压失败时保留原目录，清理临时目录。
-/// 非压缩格式（dmg/msi）不解压，直接返回目标目录（归档已在其中）。
-fn extract_and_swap(archive: &Path, into: &Path) -> Result<PathBuf, JavaError> {
-    // 非 tar.gz / zip：不走临时目录（归档文件本身在 into 里，不能删）
-    if !is_gzip(archive) && !has_ext(archive, "zip") {
-        return Ok(into.to_path_buf());
+/// 流程：解压到唯一临时目录 → 校验 JVM home → 旧目录改名为备份 → 临时目录改名入位；
+/// 任一步失败都回滚备份，原目录不丢。
+/// 非压缩格式（dmg/msi）不解压，但仍须在其中找到 JVM home 才放行。
+///
+/// # Errors
+///
+/// 解压失败、产物无 JVM home、改名失败时返回 [`JavaError::Fs`]（或解压器错误）
+fn extract_and_swap(
+    archive: &Path,
+    into: &Path,
+    extractor: &dyn ArchiveExtractor,
+) -> Result<PathBuf, JavaError> {
+    // 非压缩归档（dmg / msi 等安装包）：不走临时目录（归档文件本身在 into 里，
+    // 不能删），但同样必须验出 JVM home——安装包目录注册成运行时是跑不起来的
+    if !extractor.is_extractable(archive) {
+        return require_jvm_home(archive, into);
     }
 
     let parent = into.parent().unwrap_or(into);
     let name = into.file_name().unwrap_or_default().to_string_lossy();
-    let tmp = parent.join(format!(".tmp-{name}"));
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).map_err(|source| JavaError::Io {
-        path: tmp.clone(),
-        source,
-    })?;
+    // 后缀带纳秒时间戳：并发安装同一包时两个临时目录不会互删
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let tmp = parent.join(format!(".tmp-{name}-{stamp}"));
+    std::fs::create_dir_all(&tmp).map_err(|source| JavaError::io(&tmp, source))?;
 
-    let extract_result = extract_archive(archive, &tmp);
+    let extract_result = extractor
+        .extract(archive, &tmp)
+        .map_err(|err| java_io_err(archive, err.to_string()));
     if let Err(err) = extract_result {
         let _ = std::fs::remove_dir_all(&tmp);
         return Err(err);
@@ -477,226 +480,30 @@ fn extract_and_swap(archive: &Path, into: &Path) -> Result<PathBuf, JavaError> {
         return Err(err);
     }
 
-    // 归档已在 tmp 中解压完毕，可安全删除旧目录并替换
-    if into.exists() {
-        std::fs::remove_dir_all(into).map_err(|source| JavaError::Io {
-            path: into.to_path_buf(),
-            source,
-        })?;
+    // 归档已在 tmp 中解压完毕：旧目录先改名备份，改名失败可原样回滚
+    let bak = parent.join(format!(".bak-{name}-{stamp}"));
+    let had_old = into.exists();
+    if had_old && let Err(source) = std::fs::rename(into, &bak) {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(JavaError::io(into, source));
     }
-    std::fs::rename(&tmp, into).map_err(|source| JavaError::Io {
-        path: into.to_path_buf(),
-        source,
-    })?;
+    if let Err(source) = std::fs::rename(&tmp, into) {
+        // 回滚：新目录没入位，把旧目录放回去
+        if had_old {
+            let _ = std::fs::rename(&bak, into);
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(JavaError::io(into, source));
+    }
+    if had_old {
+        let _ = std::fs::remove_dir_all(&bak);
+    }
     Ok(locate_java_home(into).unwrap_or_else(|| into.to_path_buf()))
-}
-
-/// 解压归档到目录；不支持的格式原样保留并返回归档所在目录
-fn extract_archive(archive: &Path, into: &Path) -> Result<PathBuf, JavaError> {
-    if is_gzip(archive) {
-        untar_gz(archive, into)?;
-    } else if has_ext(archive, "zip") {
-        unzip(archive, into)?;
-    } else {
-        // dmg / msi 等安装包：不自动解压，路径指向归档目录
-        return Ok(into.to_path_buf());
-    }
-    Ok(into.to_path_buf())
-}
-
-fn has_ext(path: &Path, expected: &str) -> bool {
-    path.extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case(expected))
-}
-
-#[allow(clippy::case_sensitive_file_extension_comparisons)]
-fn is_gzip(path: &Path) -> bool {
-    let Some(name) = path.file_name() else {
-        return false;
-    };
-    let name = name.to_string_lossy().to_ascii_lowercase();
-    name.ends_with(".tar.gz") || name.ends_with(".tgz")
-}
-
-/// `.tar.gz` 解压：系统自带 `tar`（macOS / Linux 常驻，Windows 10 1803+ 内置）
-fn untar_gz(archive: &Path, into: &Path) -> Result<(), JavaError> {
-    let extractor = Extractor::new(
-        OsStr::new("tar"),
-        &[
-            OsStr::new("-xzf"),
-            archive.as_os_str(),
-            OsStr::new("-C"),
-            into.as_os_str(),
-        ],
-    );
-    match run_extractor(&extractor) {
-        Ok(()) => Ok(()),
-        Err(ExtractAttempt::Missing) => Err(java_io_err(
-            archive,
-            "tar not found; install tar to extract .tar.gz".to_owned(),
-        )),
-        Err(ExtractAttempt::Failed(message)) => Err(java_io_err(archive, message)),
-    }
-}
-
-/// `.zip` 解压：按平台给出候选工具依次尝试
-///
-/// 各平台自带的解压工具不同（Windows 无 `unzip`，Linux 无 `ditto`），
-/// 只调用其中一个必然在某个平台报 `program not found`。
-fn unzip(archive: &Path, into: &Path) -> Result<(), JavaError> {
-    let candidates = zip_extractors(archive, into);
-    let mut failure: Option<String> = None;
-    for extractor in &candidates {
-        match run_extractor(extractor) {
-            Ok(()) => return Ok(()),
-            // 本机没有这个程序：换下一个候选
-            Err(ExtractAttempt::Missing) => {}
-            Err(ExtractAttempt::Failed(message)) => {
-                if failure.is_none() {
-                    // 保留首选工具的失败原因，后续候选只用于覆盖「工具缺失」
-                    failure = Some(message);
-                }
-            }
-        }
-    }
-    let source = failure.unwrap_or_else(|| {
-        let tried = candidates
-            .iter()
-            .map(|extractor| extractor.program.to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("no zip extractor available (tried: {tried})")
-    });
-    Err(java_io_err(archive, source))
-}
-
-/// zip 的候选解压命令，按平台排列本机最可能可用的工具
-fn zip_extractors(archive: &Path, into: &Path) -> Vec<Extractor> {
-    let archive = archive.as_os_str();
-    let into = into.as_os_str();
-
-    #[cfg(target_os = "windows")]
-    {
-        vec![
-            // Windows 10 1803+ 自带 bsdtar，直接解 zip
-            Extractor::new(
-                OsStr::new("tar"),
-                &[OsStr::new("-xf"), archive, OsStr::new("-C"), into],
-            ),
-            // 老系统回退 PowerShell 的 Expand-Archive；路径走环境变量，避开引号转义
-            Extractor {
-                program: OsString::from("powershell"),
-                args: vec![
-                    OsString::from("-NoProfile"),
-                    OsString::from("-NonInteractive"),
-                    OsString::from("-Command"),
-                    OsString::from(POWERSHELL_EXPAND_ARCHIVE),
-                ],
-                envs: vec![
-                    (OsString::from("MCSUP_ZIP_SRC"), archive.to_os_string()),
-                    (OsString::from("MCSUP_ZIP_DST"), into.to_os_string()),
-                ],
-            },
-        ]
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        vec![
-            Extractor::new(
-                OsStr::new("unzip"),
-                &[OsStr::new("-q"), archive, OsStr::new("-d"), into],
-            ),
-            // macOS 系统自带，能处理带资源分叉的 zip
-            Extractor::new(
-                OsStr::new("ditto"),
-                &[OsStr::new("-x"), OsStr::new("-k"), archive, into],
-            ),
-            Extractor::new(
-                OsStr::new("tar"),
-                &[OsStr::new("-xf"), archive, OsStr::new("-C"), into],
-            ),
-        ]
-    }
-
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        vec![
-            Extractor::new(
-                OsStr::new("unzip"),
-                &[OsStr::new("-q"), archive, OsStr::new("-d"), into],
-            ),
-            Extractor::new(
-                OsStr::new("tar"),
-                &[OsStr::new("-xf"), archive, OsStr::new("-C"), into],
-            ),
-        ]
-    }
-}
-
-/// `PowerShell` 解压脚本：路径经环境变量传入，不进命令行
-///
-/// 只有 Windows 的候选解压链用它，其他目标下不跟着引用方一起裁掉就是死代码
-#[cfg(target_os = "windows")]
-const POWERSHELL_EXPAND_ARCHIVE: &str =
-    "Expand-Archive -LiteralPath $env:MCSUP_ZIP_SRC -DestinationPath $env:MCSUP_ZIP_DST -Force";
-
-/// 外部解压命令
-struct Extractor {
-    /// 程序名
-    program: OsString,
-    /// 参数
-    args: Vec<OsString>,
-    /// 环境变量
-    envs: Vec<(OsString, OsString)>,
-}
-
-impl Extractor {
-    /// 组装无环境变量的命令
-    fn new(program: &OsStr, args: &[&OsStr]) -> Self {
-        Self {
-            program: program.to_os_string(),
-            args: args.iter().map(|arg| (*arg).to_os_string()).collect(),
-            envs: Vec::new(),
-        }
-    }
-}
-
-/// [`run_extractor`] 的一次尝试结果
-#[derive(Debug)]
-enum ExtractAttempt {
-    /// 本机没有该程序，可换下一个候选
-    Missing,
-    /// 程序存在但执行失败
-    Failed(String),
-}
-
-/// 执行解压命令；程序不存在与执行失败分开上报，前者驱动候选回退
-fn run_extractor(extractor: &Extractor) -> Result<(), ExtractAttempt> {
-    let mut command = std::process::Command::new(&extractor.program);
-    command.args(&extractor.args);
-    for (key, value) in &extractor.envs {
-        command.env(key, value);
-    }
-    let status = command.status().map_err(|source| match source.kind() {
-        std::io::ErrorKind::NotFound => ExtractAttempt::Missing,
-        _ => ExtractAttempt::Failed(format!("{}: {source}", extractor.program.to_string_lossy())),
-    })?;
-    if !status.success() {
-        return Err(ExtractAttempt::Failed(format!(
-            "{} exited with {status}",
-            extractor.program.to_string_lossy()
-        )));
-    }
-    Ok(())
 }
 
 /// 构造以归档路径为上下文的 IO 错误
 fn java_io_err(path: &Path, source: String) -> JavaError {
-    JavaError::Io {
-        path: path.to_path_buf(),
-        source: std::io::Error::other(source),
-    }
+    JavaError::io(path, std::io::Error::other(source))
 }
 
 /// 对外重导出，便于 CLI 构造聚合注册表
@@ -793,17 +600,21 @@ mod tests {
             vec!["fake"]
         }
 
+        async fn ranked(&self) -> Arc<dyn JavaSourceRegistryPort> {
+            Arc::new(FakeRegistry)
+        }
+
         async fn list_packages(
             &self,
-            major: JavaMajor,
-            package_type: JavaPackageType,
+            request: &JavaPackageRequest,
         ) -> Result<Vec<port::JavaPackage>, SourceError> {
+            let major = request.major;
             Ok(vec![port::JavaPackage {
                 id: "pkg1".into(),
                 vendor: JavaVendor::Temurin,
                 major,
                 version: format!("{major}.0.5"),
-                package_type,
+                package_type: request.package_type,
             }])
         }
 
@@ -829,11 +640,40 @@ mod tests {
             _progress: Option<&dyn ProgressSink>,
             _cancel: &CancellationToken,
         ) -> Result<DownloadedArtifact, port::DownloadError> {
+            // 模拟已展开的安装目录：归档本身 + 可运行的 bin/java
+            let dir = request
+                .destination
+                .parent()
+                .ok_or_else(|| port::DownloadError::Io(std::io::Error::other("no parent")))?;
+            let bin = dir.join("bin");
+            std::fs::create_dir_all(&bin).map_err(port::DownloadError::Io)?;
+            std::fs::write(bin.join(domain::java::java_exe_name()), b"stub")
+                .map_err(port::DownloadError::Io)?;
             std::fs::write(&request.destination, b"stub").map_err(port::DownloadError::Io)?;
             Ok(DownloadedArtifact {
                 path: request.destination.clone(),
                 size: 4,
             })
+        }
+    }
+
+    /// 归档格式判定与真实工具链一致；测试下载不产生真归档，extract 不会被触发
+    struct FakeExtractor;
+
+    impl ArchiveExtractor for FakeExtractor {
+        #[allow(clippy::case_sensitive_file_extension_comparisons)]
+        fn is_extractable(&self, archive: &Path) -> bool {
+            let Some(name) = archive.file_name() else {
+                return false;
+            };
+            // 与 file::extract::is_gzip 同规则：先小写再比后缀
+            let name = name.to_string_lossy().to_ascii_lowercase();
+            name.ends_with(".zip") || name.ends_with(".tar.gz") || name.ends_with(".tgz")
+        }
+
+        fn extract(&self, _archive: &Path, dest: &Path) -> Result<(), port::ExtractError> {
+            std::fs::create_dir_all(dest).map_err(|err| port::ExtractError(err.to_string()))?;
+            Ok(())
         }
     }
 
@@ -844,10 +684,18 @@ mod tests {
         });
         let registry = Arc::new(FakeRegistry);
         let downloader = Arc::new(NoopDownloader);
+        let extractor = Arc::new(FakeExtractor);
         let java_root = tmp.join("java");
         std::fs::create_dir_all(&java_root).expect("mkdir");
         (
-            JavaService::new(repo.clone(), scanner, registry, downloader, java_root),
+            JavaService::new(
+                repo.clone(),
+                scanner,
+                registry,
+                downloader,
+                extractor,
+                java_root,
+            ),
             repo,
         )
     }
@@ -960,16 +808,6 @@ mod tests {
         assert_eq!(locate_java_home(tmp.path()), Some(tmp.path().to_path_buf()));
     }
 
-    #[test]
-    fn zip_extractors_start_with_platform_tool() {
-        let candidates = zip_extractors(Path::new("a.zip"), Path::new("out"));
-        assert!(!candidates.is_empty());
-        #[cfg(target_os = "windows")]
-        assert_eq!(candidates[0].program, OsString::from("tar"));
-        #[cfg(not(target_os = "windows"))]
-        assert_eq!(candidates[0].program, OsString::from("unzip"));
-    }
-
     /// 下错平台的包：目录里只有与当前平台不符的 java 文件名，视为不可用
     #[test]
     fn require_jvm_home_rejects_foreign_platform_tree() {
@@ -985,7 +823,7 @@ mod tests {
 
         let archive = dir.path().join("foreign.zip");
         let err = require_jvm_home(&archive, dir.path()).expect_err("must fail");
-        assert!(matches!(err, JavaError::Io { .. }));
+        assert!(matches!(err, JavaError::Fs(FsError::Io { .. })));
     }
 
     #[test]
@@ -998,35 +836,5 @@ mod tests {
         let archive = dir.path().join("ok.zip");
         let home = require_jvm_home(&archive, dir.path()).expect("home");
         assert_eq!(home, dir.path().join("jdk-27"));
-    }
-
-    #[test]
-    fn missing_program_is_reported_for_fallback() {
-        let extractor = Extractor::new(OsStr::new("mcsup-no-such-extractor"), &[]);
-        assert!(matches!(
-            run_extractor(&extractor),
-            Err(ExtractAttempt::Missing)
-        ));
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn failing_program_is_reported_as_failure() {
-        let extractor =
-            Extractor::new(OsStr::new("cmd"), &[OsStr::new("/C"), OsStr::new("exit 3")]);
-        assert!(matches!(
-            run_extractor(&extractor),
-            Err(ExtractAttempt::Failed(_))
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn failing_program_is_reported_as_failure() {
-        let extractor = Extractor::new(OsStr::new("sh"), &[OsStr::new("-c"), OsStr::new("exit 3")]);
-        assert!(matches!(
-            run_extractor(&extractor),
-            Err(ExtractAttempt::Failed(_))
-        ));
     }
 }

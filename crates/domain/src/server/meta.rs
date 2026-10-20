@@ -1,7 +1,7 @@
 use super::artifact::Checksum;
 use super::error::InvalidServerName;
 use super::version::ServerVariant;
-use crate::workspace::{InvalidId, WorkspaceId, uuid_is_valid};
+use crate::workspace::{InvalidId, WorkspaceId, name_is_valid, uuid_is_valid};
 use std::fmt;
 use std::path::PathBuf;
 
@@ -16,12 +16,7 @@ impl ServerName {
     ///
     /// 名称为空、长度超过 64 或含 [A-Za-z0-9_-] 以外字符时返回 [`InvalidServerName`]
     pub fn parse(raw: &str) -> Result<Self, InvalidServerName> {
-        let valid = !raw.is_empty()
-            && raw.len() <= 64
-            && raw
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-        if valid {
+        if name_is_valid(raw) {
             Ok(Self(raw.to_owned()))
         } else {
             Err(InvalidServerName {

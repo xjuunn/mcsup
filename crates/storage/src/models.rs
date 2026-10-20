@@ -9,6 +9,17 @@ use std::path::PathBuf;
 
 use crate::schema::{java_runtimes, servers, workspaces};
 
+/// 行字段解析失败 → [`RepositoryError::Corrupt`]，统一 `{字段} {值}: {err}` 形状
+///
+/// Corrupt 消息是给排查者看的，形状散在各处容易漏掉值或字段名。
+fn corrupt(
+    label: &str,
+    value: impl std::fmt::Display,
+    err: impl std::fmt::Display,
+) -> RepositoryError {
+    RepositoryError::Corrupt(format!("{label} {value}: {err}"))
+}
+
 /// `workspaces` 表的一行
 #[derive(Debug, Clone, Queryable, Selectable, Insertable)]
 #[diesel(table_name = workspaces)]
@@ -90,11 +101,10 @@ impl TryFrom<WorkspaceRow> for Workspace {
     type Error = RepositoryError;
 
     fn try_from(row: WorkspaceRow) -> Result<Self, Self::Error> {
-        let id = WorkspaceId::parse(&row.id)
-            .map_err(|err| RepositoryError::Corrupt(format!("workspace id {}: {err}", row.id)))?;
-        let name = WorkspaceName::parse(&row.name).map_err(|err| {
-            RepositoryError::Corrupt(format!("workspace name {}: {err}", row.name))
-        })?;
+        let id =
+            WorkspaceId::parse(&row.id).map_err(|err| corrupt("workspace id", &row.id, err))?;
+        let name = WorkspaceName::parse(&row.name)
+            .map_err(|err| corrupt("workspace name", &row.name, err))?;
         Ok(Self {
             id,
             name,
@@ -138,20 +148,16 @@ impl TryFrom<ServerRow> for ServerMeta {
     type Error = RepositoryError;
 
     fn try_from(row: ServerRow) -> Result<Self, Self::Error> {
-        let id = ServerId::parse(&row.id)
-            .map_err(|err| RepositoryError::Corrupt(format!("server id {}: {err}", row.id)))?;
-        let name = ServerName::parse(&row.name)
-            .map_err(|err| RepositoryError::Corrupt(format!("name {}: {err}", row.name)))?;
-        let workspace_id = WorkspaceId::parse(&row.workspace_id).map_err(|err| {
-            RepositoryError::Corrupt(format!("workspace_id {}: {err}", row.workspace_id))
-        })?;
+        let id = ServerId::parse(&row.id).map_err(|err| corrupt("server id", &row.id, err))?;
+        let name = ServerName::parse(&row.name).map_err(|err| corrupt("name", &row.name, err))?;
+        let workspace_id = WorkspaceId::parse(&row.workspace_id)
+            .map_err(|err| corrupt("workspace_id", &row.workspace_id, err))?;
         let variant = ServerVariant::parse(&row.variant)
-            .map_err(|err| RepositoryError::Corrupt(format!("variant {}: {err}", row.variant)))?;
+            .map_err(|err| corrupt("variant", &row.variant, err))?;
         let jar = match (row.jar_path, row.jar_size, row.checksum_algo, row.checksum) {
             (Some(path), Some(size), Some(algo), Some(hex)) => {
-                let algorithm = ChecksumAlgorithm::parse(&algo).map_err(|err| {
-                    RepositoryError::Corrupt(format!("checksum algo {algo}: {err}"))
-                })?;
+                let algorithm = ChecksumAlgorithm::parse(&algo)
+                    .map_err(|err| corrupt("checksum algo", &algo, err))?;
                 Some(InstalledJar {
                     path: PathBuf::from(path),
                     size: u64::try_from(size).unwrap_or(u64::MAX),
@@ -200,8 +206,8 @@ impl TryFrom<JavaRuntimeRow> for JavaRuntime {
     type Error = RepositoryError;
 
     fn try_from(row: JavaRuntimeRow) -> Result<Self, Self::Error> {
-        let major = JavaMajor::parse(row.major)
-            .map_err(|err| RepositoryError::Corrupt(format!("java major {}: {err}", row.major)))?;
+        let major =
+            JavaMajor::parse(row.major).map_err(|err| corrupt("java major", row.major, err))?;
         Ok(Self {
             id: row.id,
             path: PathBuf::from(row.path),

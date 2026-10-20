@@ -10,6 +10,10 @@ rust-version = "1.88"
 license = "MIT"
 
 # CI 的 clippy 步骤以 `-D warnings` 运行，rustc 与 clippy 的 warn 都会让它失败。
+[workspace.dependencies]
+tracing = "0.1.44"
+serde_json = "1.0.154"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 rust_2018_idioms = { level = "warn", priority = -1 }

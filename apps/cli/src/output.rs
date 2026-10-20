@@ -1,10 +1,10 @@
 use crate::diagnostic::AppDiagnostic;
 use comfy_table::{Cell, Table};
 use mcsup::domain::server::version::VersionId;
-use mcsup::port::DownloadedArtifact;
 use owo_colors::OwoColorize;
 use serde::Serialize;
 use std::fmt::{self};
+use std::io::IsTerminal;
 use std::path::Path;
 
 /// 输出格式，方便人类阅读
@@ -43,6 +43,65 @@ impl Printer {
         }
     }
 
+    /// 当前是否可提问：JSON 输出下交互会卡住脚本，管道输入下提问必然失败
+    ///
+    /// 所有 inquire 调用前统一问这一个口径，禁止在命令里各自判 TTY。
+    #[must_use]
+    pub(crate) fn is_interactive(self) -> bool {
+        self.is_human() && std::io::stdin().is_terminal()
+    }
+
+    /// 列表输出：人类打表格，JSON 打对象数组（空列表输出 `[]`）
+    ///
+    /// # Errors
+    ///
+    /// 序列化结果失败时返回底层错误
+    pub(crate) fn print_rows<T: Serialize>(
+        self,
+        rows: &[T],
+        empty_human: &str,
+        build_table: impl FnOnce() -> Table,
+    ) -> anyhow::Result<()> {
+        match self.format {
+            OutputFormat::Human => {
+                if rows.is_empty() {
+                    print_styled(empty_human);
+                } else {
+                    print_table(&build_table());
+                }
+                Ok(())
+            }
+            OutputFormat::Json => {
+                let line = serde_json::to_string(rows)?;
+                print_json_line(&line);
+                Ok(())
+            }
+        }
+    }
+
+    /// 单条结果：人类打标题行，JSON 打一个对象
+    ///
+    /// # Errors
+    ///
+    /// 序列化结果失败时返回底层错误
+    pub(crate) fn print_outcome<T: Serialize>(
+        self,
+        human: &str,
+        payload: &T,
+    ) -> anyhow::Result<()> {
+        match self.format {
+            OutputFormat::Human => {
+                print_styled(human);
+                Ok(())
+            }
+            OutputFormat::Json => {
+                let line = serde_json::to_string(payload)?;
+                print_json_line(&line);
+                Ok(())
+            }
+        }
+    }
+
     /// 安装成功结果： JSON 模式输出单行数据对象
     ///
     /// # Errors
@@ -51,7 +110,7 @@ impl Printer {
     pub(crate) fn print_installed(
         self,
         version: &VersionId,
-        artifact: &DownloadedArtifact,
+        size: u64,
         destination: &Path,
     ) -> anyhow::Result<()> {
         match self.format {
@@ -63,7 +122,7 @@ impl Printer {
                     Cell::new("文件"),
                     Cell::new(destination.display().to_string()),
                 ]);
-                table.add_row([Cell::new("大小"), Cell::new(human_bytes(artifact.size))]);
+                table.add_row([Cell::new("大小"), Cell::new(human_bytes(size))]);
                 print_table(&table);
                 print_success(&format!("安装完成: {}", destination.display()));
                 Ok(())
@@ -72,7 +131,7 @@ impl Printer {
                 let payload = InstalledJson {
                     version: version.to_string(),
                     path: destination.display().to_string(),
-                    size: artifact.size,
+                    size,
                 };
                 let line = serde_json::to_string(&payload)?;
                 print_json_line(&line);
@@ -82,18 +141,33 @@ impl Printer {
     }
 
     /// 错误退出码 0成功 / 1通用 / 2用法 / 3未找到 / 4冲突 / 5后端失败
+    ///
+    /// `#[error(transparent)]` 包装（[`mcsup::service::InstallJarError`] 等）会把
+    /// 内层错误从 `chain()` 里跳过——内层类型 downcast 不到，必须对包装类型
+    /// match 其内层字段判级。
     pub(crate) fn exit_code(err: &anyhow::Error) -> u8 {
         if let Some(diag) = err.downcast_ref::<AppDiagnostic>() {
             return diag.exit_code;
         }
         for cause in err.chain() {
-            if let Some(install) = cause.downcast_ref::<mcsup::service::InstallError>() {
-                return match install {
-                    mcsup::service::InstallError::Source(source) => source_exit_code(source),
-                    mcsup::service::InstallError::Download(_) => 5,
-                    mcsup::service::InstallError::Status(_) => 4,
+            if let Some(jar) = cause.downcast_ref::<mcsup::service::InstallJarError>() {
+                return match jar {
+                    mcsup::service::InstallJarError::Registry(reg) => registry_exit_code(reg),
+                    mcsup::service::InstallJarError::Install(install) => install_exit_code(install),
                     _ => 1,
                 };
+            }
+            if let Some(reg) = cause.downcast_ref::<mcsup::service::ServerRegistryError>() {
+                return registry_exit_code(reg);
+            }
+            if let Some(ws) = cause.downcast_ref::<mcsup::service::WorkspaceError>() {
+                return workspace_exit_code(ws);
+            }
+            if let Some(java) = cause.downcast_ref::<mcsup::service::JavaError>() {
+                return java_exit_code(java);
+            }
+            if let Some(install) = cause.downcast_ref::<mcsup::service::InstallError>() {
+                return install_exit_code(install);
             }
             if let Some(source) = cause.downcast_ref::<mcsup::port::SourceError>() {
                 return source_exit_code(source);
@@ -125,6 +199,52 @@ fn source_exit_code(source: &mcsup::port::SourceError) -> u8 {
         mcsup::port::SourceError::Network(_)
         | mcsup::port::SourceError::Status { .. }
         | mcsup::port::SourceError::Init(_) => 5,
+        _ => 1,
+    }
+}
+
+fn registry_exit_code(err: &mcsup::service::ServerRegistryError) -> u8 {
+    match err {
+        mcsup::service::ServerRegistryError::NotFound(_) => 3,
+        mcsup::service::ServerRegistryError::AlreadyExists(_) => 4,
+        mcsup::service::ServerRegistryError::Workspace(ws) => workspace_exit_code(ws),
+        mcsup::service::ServerRegistryError::Repo(repo) => repo_exit_code(repo),
+        _ => 1,
+    }
+}
+
+fn workspace_exit_code(err: &mcsup::service::WorkspaceError) -> u8 {
+    match err {
+        mcsup::service::WorkspaceError::NotFound(_) => 3,
+        mcsup::service::WorkspaceError::AlreadyExists(_) => 4,
+        mcsup::service::WorkspaceError::Repo(repo) => repo_exit_code(repo),
+        _ => 1,
+    }
+}
+
+fn java_exit_code(err: &mcsup::service::JavaError) -> u8 {
+    match err {
+        mcsup::service::JavaError::NotFound(_) => 3,
+        mcsup::service::JavaError::Source(source) => source_exit_code(source),
+        mcsup::service::JavaError::Download(_) => 5,
+        mcsup::service::JavaError::Repo(repo) => repo_exit_code(repo),
+        _ => 1,
+    }
+}
+
+fn install_exit_code(err: &mcsup::service::InstallError) -> u8 {
+    match err {
+        mcsup::service::InstallError::Source(source) => source_exit_code(source),
+        mcsup::service::InstallError::Download(_) => 5,
+        mcsup::service::InstallError::Status(_) => 4,
+        _ => 1,
+    }
+}
+
+fn repo_exit_code(err: &mcsup::port::RepositoryError) -> u8 {
+    match err {
+        mcsup::port::RepositoryError::NotFound(_) => 3,
+        mcsup::port::RepositoryError::AlreadyExists(_) => 4,
         _ => 1,
     }
 }
@@ -206,5 +326,67 @@ mod tests {
             .context("安装服务端失败")
             .unwrap_err();
         assert_eq!(Printer::exit_code(&err), 3);
+    }
+
+    /// 服务器不存在：`InstallJarError` 是 transparent 包装，内层
+    /// `ServerRegistryError` 不在 `chain()` 里，判级必须落在包装类型上
+    #[test]
+    fn install_jar_missing_server_maps_to_exit_code_3() {
+        use mcsup::service::{InstallJarError, ServerRegistryError};
+        let err = Err::<(), _>(InstallJarError::from(ServerRegistryError::NotFound(
+            "nope".to_owned(),
+        )))
+        .context("安装服务端 nope 失败")
+        .unwrap_err();
+        assert_eq!(Printer::exit_code(&err), 3);
+    }
+
+    /// 版本不存在：同上，经 `InstallJarError::Install` 包装也要还原成 3 / 5
+    #[test]
+    fn install_jar_missing_version_maps_to_exit_code_3() {
+        use mcsup::service::{InstallError, InstallJarError};
+        let err = Err::<(), _>(InstallJarError::from(InstallError::from(
+            SourceError::NotFound(VersionId::new("0.0.1")),
+        )))
+        .context("安装服务端 x 失败")
+        .unwrap_err();
+        assert_eq!(Printer::exit_code(&err), 3);
+    }
+
+    #[test]
+    fn install_jar_backend_failure_maps_to_exit_code_5() {
+        use mcsup::service::{InstallError, InstallJarError};
+        let err = Err::<(), _>(InstallJarError::from(InstallError::from(
+            SourceError::Network("boom".into()),
+        )))
+        .context("安装服务端 x 失败")
+        .unwrap_err();
+        assert_eq!(Printer::exit_code(&err), 5);
+    }
+
+    #[test]
+    fn workspace_not_found_maps_to_exit_code_3() {
+        let err = Err::<(), _>(mcsup::service::WorkspaceError::NotFound("nope".to_owned()))
+            .context("切换失败")
+            .unwrap_err();
+        assert_eq!(Printer::exit_code(&err), 3);
+    }
+
+    #[test]
+    fn java_not_found_maps_to_exit_code_3() {
+        let err = Err::<(), _>(mcsup::service::JavaError::NotFound("/nope".to_owned()))
+            .context("卸载失败")
+            .unwrap_err();
+        assert_eq!(Printer::exit_code(&err), 3);
+    }
+
+    #[test]
+    fn java_backend_failure_maps_to_exit_code_5() {
+        let err = Err::<(), _>(mcsup::service::JavaError::from(SourceError::Network(
+            "boom".into(),
+        )))
+        .context("安装 Java 失败")
+        .unwrap_err();
+        assert_eq!(Printer::exit_code(&err), 5);
     }
 }

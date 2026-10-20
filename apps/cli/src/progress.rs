@@ -1,5 +1,6 @@
 use indicatif::{ProgressBar, ProgressStyle};
-use mcsup::port::ProgressSink;
+use mcsup::port::{CancellationToken, ProgressSink};
+use mcsup::service::{InstallStage, StageSink};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -113,7 +114,6 @@ impl Drop for TaskSpinner {
 ///
 /// JSON 模式下 spinner本身就是 hidden bar，复用它自然不产生输出。
 pub(crate) struct BarSink {
-    message: String,
     bar: ProgressBar,
     /// 回显状态
     state: Mutex<SinkState>,
@@ -121,6 +121,8 @@ pub(crate) struct BarSink {
 
 #[derive(Default)]
 struct SinkState {
+    /// 下载阶段文案（可在下载开始前更新）
+    message: String,
     /// 是否已在这条线上回显下载
     started: bool,
     /// 是否已知总长并切成定长进度条
@@ -131,10 +133,20 @@ impl BarSink {
     /// `bar` 来自 [`TaskSpinner::handle`]：与阶段 spinner 同一条线
     pub(crate) fn new(bar: ProgressBar, message: impl Into<String>) -> Self {
         Self {
-            message: message.into(),
             bar,
-            state: Mutex::new(SinkState::default()),
+            state: Mutex::new(SinkState {
+                message: message.into(),
+                ..SinkState::default()
+            }),
         }
+    }
+
+    /// 下载开始前换文案（如从 spinner 初始文案换成「下载 Java 21 jdk」）
+    pub(crate) fn set_message(&self, message: impl Into<String>) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.message = message.into();
     }
 
     /// 进入下载阶段：立刻在这条线上显示「下载中」，不等首字节
@@ -146,7 +158,7 @@ impl BarSink {
         state.determinate = false;
         resume(&self.bar);
         apply_unknown_length_style(&self.bar);
-        self.bar.set_message(self.message.clone());
+        self.bar.set_message(state.message.clone());
     }
 
     /// 下载阶段结束：把这条线交还阶段 spinner（不清屏，避免出现空白）
@@ -171,7 +183,7 @@ impl ProgressSink for BarSink {
             state.started = true;
             resume(&self.bar);
             apply_unknown_length_style(&self.bar);
-            self.bar.set_message(self.message.clone());
+            self.bar.set_message(state.message.clone());
         }
         match total {
             Some(total) if !state.determinate => {
@@ -185,6 +197,152 @@ impl ProgressSink for BarSink {
             // 已是定长进度条，或总长未知（保持 spinner + 已传字节）
             _ => self.bar.set_position(transferred),
         }
+    }
+}
+
+/// 单行刷新扫描进度：`\r` 覆盖当前行，非 TTY 时退化为逐行
+///
+/// 扫描回调逐个到达，行文案由调用方给；本类型只管一行刷新与收尾换行
+pub(crate) struct ScanProgress {
+    /// human 模式才回显；JSON 模式全程静默，stdout 保持纯数据
+    enabled: bool,
+    interactive: bool,
+    last_len: usize,
+}
+
+impl ScanProgress {
+    /// `enable` 通常传 `Printer::is_human`；单行刷新还额外要求 stderr 是 TTY
+    pub(crate) fn new(enable: bool) -> Self {
+        use std::io::IsTerminal;
+        Self {
+            enabled: enable,
+            interactive: enable && std::io::stderr().is_terminal(),
+            last_len: 0,
+        }
+    }
+
+    /// 上报一条扫描到的运行时
+    pub(crate) fn on_found(&mut self, path: &std::path::Path, version: &str) {
+        use std::io::Write;
+        if !self.enabled {
+            return;
+        }
+        #[allow(clippy::print_stderr)]
+        {
+            if self.interactive {
+                let line = format!("  扫描到: {} ({})", path.display(), version);
+                // 清掉上一行残留（路径长短不一时用空格补齐）
+                let pad = self.last_len.saturating_sub(line.len());
+                eprint!("\r{line}{}", " ".repeat(pad));
+                let _ = std::io::stderr().flush();
+                self.last_len = line.len();
+            } else {
+                eprintln!("  扫描到: {} ({})", path.display(), version);
+            }
+        }
+    }
+
+    /// 结束：交互行补一个换行，避免后续输出接在进度行末尾
+    pub(crate) fn finish(&mut self) {
+        if self.enabled && self.interactive && self.last_len > 0 {
+            #[allow(clippy::print_stderr)]
+            {
+                eprintln!();
+            }
+            self.last_len = 0;
+        }
+    }
+}
+
+/// 一次安装的回显与取消装配：spinner + 下载进度条 + 取消令牌
+///
+/// 三者同生同灭，装错一次就整段安装只有半截回显或转不停的 spinner：
+/// - 与阶段机共用同一条回显线（见 [`StageSink`] 实现）
+/// - `Drop` 兜底：`?` 提前返回、Ctrl-C 中断时收线并请求取消，
+///   不留转不停的 spinner 挡住错误输出
+pub(crate) struct InstallSession {
+    spinner: TaskSpinner,
+    sink: BarSink,
+    cancel: CancellationToken,
+    downloading: std::sync::atomic::AtomicBool,
+}
+
+impl InstallSession {
+    /// `message` 是初始阶段文案（探测中…），`enable` 传 [`crate::output::Printer::is_human`]
+    pub(crate) fn new(message: impl Into<String>, enable: bool) -> Self {
+        let message = message.into();
+        let spinner = TaskSpinner::new(message.clone(), enable);
+        let sink = BarSink::new(spinner.handle(), message);
+        Self {
+            spinner,
+            sink,
+            cancel: CancellationToken::new(),
+            downloading: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// 下载阶段文案：须在进入下载前设置（下载开始后会被进度条占用）
+    pub(crate) fn set_download_message(&self, message: impl Into<String>) {
+        self.sink.set_message(message);
+    }
+
+    /// 交互提示独占这一行前调用：让出回显行
+    pub(crate) fn pause_for_prompt(&self) {
+        self.spinner.finish();
+    }
+
+    /// 提示结束、回到阶段回显时调用：恢复这条线
+    pub(crate) fn resume_after_prompt(&self) {
+        self.spinner.restart();
+    }
+
+    /// 正常收尾：清除回显行（Drop 会再兜底一次，重复调用无害）
+    pub(crate) fn finish(&self) {
+        self.spinner.finish();
+    }
+
+    /// 取消令牌：传给 service 的安装调用
+    pub(crate) fn cancel(&self) -> &CancellationToken {
+        &self.cancel
+    }
+
+    /// 回显线句柄（测试用：断言阶段/进度都画在同一条线上）
+    #[cfg(test)]
+    fn handle_for_test(&self) -> ProgressBar {
+        self.spinner.handle()
+    }
+}
+
+impl StageSink for InstallSession {
+    fn on_stage(&self, stage: InstallStage) {
+        use std::sync::atomic::Ordering;
+        match stage {
+            // 下载：立即接管这条线，从发起请求到首字节之间也要有回显
+            InstallStage::Downloading => {
+                self.downloading.store(true, Ordering::Relaxed);
+                self.sink.start();
+            }
+            // 下载之后的阶段（解压等）：进度条交还 spinner，继续画同一条线
+            stage if self.downloading.load(Ordering::Relaxed) => {
+                self.downloading.store(false, Ordering::Relaxed);
+                self.sink.finish();
+                self.spinner.set_message(stage.message());
+            }
+            stage => self.spinner.set_message(stage.message()),
+        }
+    }
+}
+
+impl ProgressSink for InstallSession {
+    fn on_progress(&self, transferred: u64, total: Option<u64>) {
+        self.sink.on_progress(transferred, total);
+    }
+}
+
+impl Drop for InstallSession {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        // TaskSpinner::drop 清除回显行
     }
 }
 
@@ -203,6 +361,51 @@ mod tests {
         assert!(handle.is_finished());
         spinner.restart();
         assert!(!handle.is_finished());
+    }
+
+    /// 安装全程只用一条回显线：阶段 spinner → 下载进度条 → 阶段 spinner。
+    ///
+    /// 交互提示 `finish` 之后必须 `restart`，否则 indicatif 的 bar 处于终态，
+    /// 后续阶段全部画不出来 —— 那几秒空白就是这么来的。
+    #[test]
+    fn install_session_keeps_one_live_line() {
+        let session = InstallSession::new(InstallStage::Probing.message(), false);
+        session.set_download_message("下载 Java 25 jdk");
+        let line = session.handle_for_test();
+
+        session.on_stage(InstallStage::Listing);
+        assert_eq!(line.message(), InstallStage::Listing.message());
+
+        // 交互提示独占这一行，结束后必须恢复
+        session.pause_for_prompt();
+        assert!(line.is_finished());
+        session.resume_after_prompt();
+        assert!(!line.is_finished());
+
+        session.on_stage(InstallStage::Resolving);
+        assert_eq!(line.message(), InstallStage::Resolving.message());
+
+        // 进入下载：同一条线交给进度条，不等首字节
+        session.on_stage(InstallStage::Downloading);
+        assert_eq!(line.message(), "下载 Java 25 jdk");
+        session.on_progress(1, Some(100));
+        assert_eq!(line.length(), Some(100));
+
+        // 解压：进度条交还 spinner，同一条线继续有回显
+        session.on_stage(InstallStage::Extracting);
+        assert_eq!(line.message(), InstallStage::Extracting.message());
+        assert!(!line.is_finished());
+    }
+
+    /// 中途 drop（错误提前返回 / Ctrl-C）也要收线并请求取消
+    #[test]
+    fn install_session_drop_cancels() {
+        let session = InstallSession::new("step", false);
+        let handle = session.handle_for_test();
+        let cancel = session.cancel().clone();
+        drop(session);
+        assert!(cancel.is_cancelled());
+        assert!(handle.is_finished());
     }
 
     /// 下载进度与阶段 spinner共用同一条线，且 finish 之后仍能接手

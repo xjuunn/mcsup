@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 domain = { path = "../domain" }
 port = { path = "../port" }
+tracing.workspace = true
 
 [lints]
 workspace = true

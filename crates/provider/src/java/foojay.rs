@@ -1,8 +1,8 @@
 //! Foojay Disco 聚合源：一个 API 覆盖 Temurin / Zulu / Liberica / Corretto 等
 
-use crate::http::{build_client, map_transport};
+use crate::http::{build_client, get_json};
 use async_trait::async_trait;
-use domain::java::{JavaMajor, JavaVendor};
+use domain::java::JavaVendor;
 use domain::server::version::VersionId;
 use port::{JavaPackage, JavaPackageRequest, JavaReleaseSource, ResolvedJava, SourceError};
 use reqwest::Client;
@@ -84,13 +84,19 @@ impl JavaReleaseSource for FoojaySource {
         Ok(response
             .result
             .into_iter()
-            .filter(|pkg| pkg.directly_downloadable && !pkg.filename.is_empty())
-            .map(|pkg| JavaPackage {
-                id: pkg.id,
-                vendor: JavaVendor::parse_fuzzy(&pkg.distribution),
-                major: JavaMajor::parse(pkg.major_version).unwrap_or(request.major),
-                version: pkg.java_version,
-                package_type: request.package_type,
+            .filter(|pkg| {
+                pkg.directly_downloadable
+                    && !pkg.filename.is_empty()
+                    && super::is_deployable_archive(&pkg.filename)
+            })
+            .filter_map(|pkg| {
+                Some(JavaPackage {
+                    major: super::parse_major_or_drop(pkg.major_version, "foojay", &pkg.id)?,
+                    id: pkg.id,
+                    vendor: JavaVendor::parse_fuzzy(&pkg.distribution),
+                    version: pkg.java_version,
+                    package_type: request.package_type,
+                })
             })
             .collect())
     }
@@ -120,16 +126,6 @@ impl FoojaySource {
     where
         T: serde::de::DeserializeOwned,
     {
-        let response = self.http.get(url).send().await.map_err(map_transport)?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(SourceError::Status {
-                status: status.as_u16(),
-            });
-        }
-        response
-            .json()
-            .await
-            .map_err(|err| SourceError::Decode(Box::new(err)))
+        get_json(&self.http, url, None).await
     }
 }

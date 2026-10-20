@@ -14,7 +14,11 @@ pub struct InvalidWorkspaceName {
 #[error("invalid id: {0}")]
 pub struct InvalidId(pub String);
 
-fn name_is_valid(raw: &str) -> bool {
+/// 名称字符集：非空、≤64 字节、仅 `[A-Za-z0-9_-]`
+///
+/// `WorkspaceName` 与 `ServerName` 共用——两者都会落到文件系统目录名，
+/// 判定分叉会让一边过得了、另一边过不了。
+pub(crate) fn name_is_valid(raw: &str) -> bool {
     !raw.is_empty()
         && raw.len() <= 64
         && raw

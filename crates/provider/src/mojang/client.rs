@@ -1,4 +1,4 @@
-use crate::http::{build_client, map_transport};
+use crate::http::{build_client, get_json};
 use async_trait::async_trait;
 use domain::server::{
     artifact::{Checksum, ChecksumAlgorithm, JarArtifact},
@@ -45,14 +45,7 @@ impl MojangSource {
     where
         T: DeserializeOwned,
     {
-        let response = self.http.get(url).send().await.map_err(map_transport)?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(SourceError::Status {
-                status: status.as_u16(),
-            });
-        }
-        response.json().await.map_err(map_decode)
+        get_json(&self.http, url, None).await
     }
 }
 
@@ -116,14 +109,6 @@ fn parse_https_url(raw: &str) -> Result<Url, SourceError> {
         ))));
     }
     Ok(url)
-}
-
-fn map_decode(err: reqwest::Error) -> SourceError {
-    if err.is_decode() {
-        SourceError::Decode(Box::new(err))
-    } else {
-        SourceError::Network(Box::new(err))
-    }
 }
 
 #[derive(Debug, Error)]

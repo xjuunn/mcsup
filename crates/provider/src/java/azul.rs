@@ -1,8 +1,8 @@
 //! Azul Zulu 直连源
 
-use crate::http::{build_client, map_transport};
+use crate::http::{build_client, get_json};
 use async_trait::async_trait;
-use domain::java::{JavaMajor, JavaVendor};
+use domain::java::JavaVendor;
 use port::{JavaPackage, JavaPackageRequest, JavaReleaseSource, ResolvedJava, SourceError};
 use reqwest::Client;
 use serde::Deserialize;
@@ -72,8 +72,10 @@ impl JavaReleaseSource for AzulSource {
         let packages: Vec<PackageDto> = self.get(url.as_str()).await?;
         Ok(packages
             .into_iter()
-            .filter(|pkg| !pkg.name.contains("-crac-"))
-            .map(|pkg| {
+            .filter(|pkg| {
+                !pkg.name.contains("-crac-") && super::is_deployable_archive(&pkg.download_url)
+            })
+            .filter_map(|pkg| {
                 let major = pkg
                     .java_version
                     .first()
@@ -85,15 +87,16 @@ impl JavaReleaseSource for AzulSource {
                     .map(i64::to_string)
                     .collect::<Vec<_>>()
                     .join(".");
-                JavaPackage {
-                    // id 即下载地址：Azul 的列表响应已带 download_url，
-                    // 回查反而不可靠（见 resolve_binary）
-                    id: pkg.download_url,
+                // id 即下载地址：Azul 的列表响应已带 download_url，
+                // 回查反而不可靠（见 resolve_binary）
+                let id = pkg.download_url;
+                Some(JavaPackage {
+                    major: super::parse_major_or_drop(major, "azul", &id)?,
+                    id,
                     vendor: JavaVendor::Zulu,
-                    major: JavaMajor::parse(major).unwrap_or(request.major),
                     version,
                     package_type: request.package_type,
-                }
+                })
             })
             .collect())
     }
@@ -103,12 +106,7 @@ impl JavaReleaseSource for AzulSource {
     /// 回查用的 `package_uuid` 过滤会被 Azul 静默忽略，返回的是未过滤的默认列表，
     /// 取其中第一项会拿到任意平台的包（实测第一项是 macOS aarch64 的 FX JRE）。
     async fn resolve_binary(&self, package: &JavaPackage) -> Result<ResolvedJava, SourceError> {
-        let location = Url::parse(&package.id).map_err(|err| SourceError::Decode(Box::new(err)))?;
-        Ok(ResolvedJava {
-            package: package.clone(),
-            location,
-            expected_size: None,
-        })
+        super::resolved_from_id(package)
     }
 }
 
@@ -117,24 +115,14 @@ impl AzulSource {
     where
         T: serde::de::DeserializeOwned,
     {
-        let response = self.http.get(url).send().await.map_err(map_transport)?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(SourceError::Status {
-                status: status.as_u16(),
-            });
-        }
-        response
-            .json()
-            .await
-            .map_err(|err| SourceError::Decode(Box::new(err)))
+        get_json(&self.http, url, None).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use domain::java::JavaPackageType;
+    use domain::java::{JavaMajor, JavaPackageType};
 
     fn package(id: &str) -> JavaPackage {
         JavaPackage {

@@ -1,32 +1,43 @@
+use crate::bootstrap;
 use crate::cli::WorkspaceAction;
 use crate::config;
 use crate::output::Printer;
 use anyhow::{Context, Result};
 use comfy_table::Table;
 use inquire::Confirm;
-use mcsup::service::{InitOutcome, WorkspaceService};
-use mcsup::storage::SqliteStore;
-use std::io::IsTerminal;
+use mcsup::service::{InitOutcome, ServerRegistry, WorkspaceService, absolute_path};
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// `workspace list` 单行（JSON 模式序列化用）
+#[derive(Serialize)]
+struct WorkspaceRow<'a> {
+    name: &'a str,
+    path: String,
+    servers: usize,
+    default: bool,
+}
+
+/// `workspace init` 结果（JSON 模式序列化用）
+#[derive(Serialize)]
+struct InitRow<'a> {
+    name: &'a str,
+    path: String,
+    status: &'a str,
+}
+
 pub(crate) fn run(action: WorkspaceAction, printer: Printer) -> Result<()> {
-    let store = open_store()?;
+    let store = bootstrap::open_store()?;
+    let reg = Arc::new(ServerRegistry::new(store.clone(), store.clone()));
     let svc = WorkspaceService::new(store);
     match action {
         WorkspaceAction::Init { dir, name } => init(&svc, dir, name.as_deref(), printer),
-        WorkspaceAction::List => list(&svc, printer),
+        WorkspaceAction::List => list(&svc, &reg, printer),
         WorkspaceAction::Use { name } => use_ws(&svc, &name, printer),
         WorkspaceAction::Remove { name, purge } => remove(&svc, &name, purge, printer),
         WorkspaceAction::Info => info(&svc, printer),
     }
-}
-
-fn open_store() -> Result<Arc<SqliteStore>> {
-    let path = config::database_path()?;
-    let store =
-        SqliteStore::open(&path).with_context(|| format!("打开元数据库 {}", path.display()))?;
-    Ok(Arc::new(store))
 }
 
 fn init(
@@ -35,7 +46,7 @@ fn init(
     name: Option<&str>,
     printer: Printer,
 ) -> Result<()> {
-    let interactive = interactive(printer);
+    let interactive = printer.is_interactive();
 
     let dir = match dir {
         Some(dir) => dir,
@@ -70,12 +81,15 @@ fn init(
     let name = name.as_deref();
 
     if interactive {
-        let abs = absolute_display(&dir);
+        let abs = absolute_path(&dir);
         let name_display = name.unwrap_or("(自动序号)");
-        let confirmed = Confirm::new(&format!("在 {abs} 创建并注册工作区 {name_display}?"))
-            .with_default(true)
-            .prompt()
-            .context("确认创建")?;
+        let confirmed = Confirm::new(&format!(
+            "在 {} 创建并注册工作区 {name_display}?",
+            abs.display()
+        ))
+        .with_default(true)
+        .prompt()
+        .context("确认创建")?;
         if !confirmed {
             printer.print_section("已取消");
             return Ok(());
@@ -83,74 +97,87 @@ fn init(
     }
 
     match svc.init(&dir, name)? {
-        InitOutcome::Created(ws) => {
-            printer.print_section(&format!(
-                "已创建并注册: {} ({})",
-                ws.name,
-                ws.path.display()
-            ));
-        }
-        InitOutcome::Recovered(ws) => {
-            printer.print_section(&format!(
-                "已补注册（上次中断）: {} ({})",
-                ws.name,
-                ws.path.display()
-            ));
-        }
-        InitOutcome::AlreadyRegistered(ws) => {
-            printer.print_section(&format!(
+        InitOutcome::Created(ws) => printer.print_outcome(
+            &format!("已创建并注册: {} ({})", ws.name, ws.path.display()),
+            &InitRow {
+                name: ws.name.as_str(),
+                path: ws.path.display().to_string(),
+                status: "created",
+            },
+        )?,
+        InitOutcome::Recovered(ws) => printer.print_outcome(
+            &format!("已补注册（上次中断）: {} ({})", ws.name, ws.path.display()),
+            &InitRow {
+                name: ws.name.as_str(),
+                path: ws.path.display().to_string(),
+                status: "recovered",
+            },
+        )?,
+        InitOutcome::AlreadyRegistered(ws) => printer.print_outcome(
+            &format!(
                 "已注册过: {} ({})，可用 mcsup workspace use {}",
                 ws.name,
                 ws.path.display(),
                 ws.name
-            ));
-        }
+            ),
+            &InitRow {
+                name: ws.name.as_str(),
+                path: ws.path.display().to_string(),
+                status: "already",
+            },
+        )?,
     }
     Ok(())
 }
 
-fn list(svc: &WorkspaceService, printer: Printer) -> Result<()> {
+fn list(svc: &WorkspaceService, reg: &ServerRegistry, printer: Printer) -> Result<()> {
     let all = svc.list()?;
-    if all.is_empty() {
-        printer.print_section("尚无工作目录，先运行 mcsup workspace init");
-        return Ok(());
-    }
-    let mut table = Table::new();
-    table.set_header(["名称", "路径", "服务器数", "默认"]);
-    for ws in &all {
-        table.add_row([
-            ws.name.as_str().to_owned(),
-            ws.path.display().to_string(),
-            count_servers(&ws.path).to_string(),
-            if ws.is_default { "*" } else { "" }.to_owned(),
-        ]);
-    }
-    crate::output::print_table(&table);
-    Ok(())
-}
-
-fn count_servers(path: &Path) -> usize {
-    std::fs::read_dir(path.join("servers")).map_or(0, |it| {
-        it.filter(|e| e.as_ref().is_ok_and(|e| e.path().is_dir()))
-            .count()
-    })
+    let rows: Vec<WorkspaceRow<'_>> = all
+        .iter()
+        .map(|ws| {
+            Ok(WorkspaceRow {
+                name: ws.name.as_str(),
+                path: ws.path.display().to_string(),
+                servers: reg.count_in(&ws.id)?,
+                default: ws.is_default,
+            })
+        })
+        .collect::<Result<_>>()?;
+    printer.print_rows(
+        &rows,
+        "尚无工作目录，先运行 mcsup workspace init",
+        || {
+            let mut table = Table::new();
+            table.set_header(["名称", "路径", "服务器数", "默认"]);
+            for (ws, row) in all.iter().zip(&rows) {
+                table.add_row([
+                    ws.name.as_str().to_owned(),
+                    row.path.clone(),
+                    row.servers.to_string(),
+                    if row.default { "*" } else { "" }.to_owned(),
+                ]);
+            }
+            table
+        },
+    )
 }
 
 fn use_ws(svc: &WorkspaceService, name: &str, printer: Printer) -> Result<()> {
     let ws = svc.set_default(name)?;
-    printer.print_section(&format!(
-        "默认工作目录已切换为 {} ({})",
-        ws.name,
-        ws.path.display()
-    ));
-    Ok(())
+    printer.print_outcome(
+        &format!("默认工作目录已切换为 {} ({})", ws.name, ws.path.display()),
+        &serde_json::json!({
+            "name": ws.name.as_str(),
+            "path": ws.path.display().to_string(),
+        }),
+    )
 }
 
 fn remove(svc: &WorkspaceService, name: &str, purge: bool, printer: Printer) -> Result<()> {
     // 先解析：名字不对时不必问，顺带把路径给用户看（删除不可恢复）
     let ws = svc.resolve(name)?;
     // 删了不可恢复：可交互时问一句，默认不删；`--purge` 是显式指令，不再问
-    let purge = if purge || !interactive(printer) {
+    let purge = if purge || !printer.is_interactive() {
         purge
     } else {
         Confirm::new(&format!(
@@ -168,17 +195,18 @@ fn remove(svc: &WorkspaceService, name: &str, purge: bool, printer: Printer) -> 
         chdir_out_of(&ws.path);
     }
     let ws = svc.remove(name, purge)?;
-    if purge {
-        printer.print_section(&format!("已注销并删除磁盘数据: {}", ws.name));
-    } else {
-        printer.print_section(&format!("已注销（磁盘数据保留）: {}", ws.name));
-    }
-    Ok(())
-}
-
-/// 当前是否可交互提问：JSON 输出或管道输入下提问只会失败
-fn interactive(printer: Printer) -> bool {
-    printer.is_human() && std::io::stdin().is_terminal()
+    printer.print_outcome(
+        &if purge {
+            format!("已注销并删除磁盘数据: {}", ws.name)
+        } else {
+            format!("已注销（磁盘数据保留）: {}", ws.name)
+        },
+        &serde_json::json!({
+            "name": ws.name.as_str(),
+            "path": ws.path.display().to_string(),
+            "purged": purge,
+        }),
+    )
 }
 
 /// 目标目录包含当前工作目录时，先退出来
@@ -198,26 +226,18 @@ fn chdir_out_of(target: &Path) {
 
 fn info(svc: &WorkspaceService, printer: Printer) -> Result<()> {
     let data = config::platform_data_dir()?;
-    printer.print_section(&format!("平台数据目录: {}", data.display()));
-    match svc.default_workspace() {
-        Ok(ws) => printer.print_section(&format!(
-            "默认工作目录: {} ({})",
-            ws.name,
-            ws.path.display()
-        )),
-        Err(_) => printer.print_section("默认工作目录: 尚无，先运行 mcsup workspace init"),
-    }
-    Ok(())
-}
-
-fn absolute_display(dir: &Path) -> String {
-    let abs = if dir.is_absolute() {
-        dir.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(dir)
+    let default = svc.default_workspace().ok();
+    let payload = serde_json::json!({
+        "data_dir": data.display().to_string(),
+        "default": default.as_ref().map(|ws| serde_json::json!({
+            "name": ws.name.as_str(),
+            "path": ws.path.display().to_string(),
+        })),
+    });
+    let text = match &default {
+        Some(ws) => format!("默认工作目录: {} ({})", ws.name, ws.path.display()),
+        None => "默认工作目录: 尚无，先运行 mcsup workspace init".to_owned(),
     };
-    // 规范化：`.` 组件与重复分隔符不进展示，否则确认页会出现 D:\ws\.
-    abs.components().collect::<PathBuf>().display().to_string()
+    printer.print_section(&format!("平台数据目录: {}", data.display()));
+    printer.print_outcome(&text, &payload)
 }

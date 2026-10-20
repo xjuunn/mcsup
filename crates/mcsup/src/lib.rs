@@ -6,7 +6,8 @@
 //!
 //! 门面结构：每个能力都是 feature 门控的可选依赖，`default = []` 强制显式
 //! 选择；选中的 crate 在下方按名重导出。`port` 级联带出 `domain`，
-//! `service` / `file` / `provider` 级联带出 `port` 与 `domain`。
+//! `service` / `file` / `java` / `provider` / `storage` 级联带出 `port` 与
+//! `domain`。
 //!
 //! 新增能力 crate 时同步三处：可选依赖、feature 级联、下方重导出。
 

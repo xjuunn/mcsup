@@ -1,6 +1,8 @@
 use async_trait::async_trait;
+use domain::server::version::VersionId;
 use port::{ByteReader, ByteSource, RangeSource, RemoteStat, SourceError};
 use reqwest::Client;
+use serde::de::DeserializeOwned;
 use std::ops::RangeInclusive;
 use std::time::Duration;
 use url::Url;
@@ -88,6 +90,44 @@ impl ByteReader for HttpBody {
 
 pub(crate) fn map_transport(err: reqwest::Error) -> SourceError {
     SourceError::Network(Box::new(err))
+}
+
+/// GET 并反序列化 JSON，各元数据源共用的唯一入口
+///
+/// - 非 2xx：`not_found_id` 非空且状态码为 404 时归为 [`SourceError::NotFound`]，
+///   其余一律 [`SourceError::Status`]
+/// - body 传输 / 解析错误：解析失败归 [`SourceError::Decode`]，其余归
+///   [`SourceError::Network`]（与 `ByteSource` 侧分类保持一致）
+///
+/// # Errors
+///
+/// 网络失败、非成功状态码或 body 非法时返回 [`SourceError`]
+pub(crate) async fn get_json<T>(
+    client: &Client,
+    url: &str,
+    not_found_id: Option<VersionId>,
+) -> Result<T, SourceError>
+where
+    T: DeserializeOwned,
+{
+    let response = client.get(url).send().await.map_err(map_transport)?;
+    let status = response.status();
+    if !status.is_success() {
+        let code = status.as_u16();
+        if code == 404
+            && let Some(id) = not_found_id
+        {
+            return Err(SourceError::NotFound(id));
+        }
+        return Err(SourceError::Status { status: code });
+    }
+    response.json().await.map_err(|err| {
+        if err.is_decode() {
+            SourceError::Decode(Box::new(err))
+        } else {
+            SourceError::Network(Box::new(err))
+        }
+    })
 }
 
 #[async_trait]
