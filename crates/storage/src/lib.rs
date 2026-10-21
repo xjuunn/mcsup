@@ -1,7 +1,9 @@
 mod models;
 mod schema;
 
-use crate::models::{JarChangeset, JavaRuntimeRow, RelinkChangeset, ServerRow, WorkspaceRow};
+use crate::models::{
+    JarChangeset, JavaRuntimeRow, RelinkChangeset, ServerRow, SettingsChangeset, WorkspaceRow,
+};
 use crate::schema::{java_runtimes, java_scan_state, servers, workspaces};
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
@@ -246,6 +248,29 @@ impl ServerRepository for SqliteStore {
         })
     }
 
+    fn update_settings(
+        &self,
+        name: &ServerName,
+        settings: &domain::server::settings::ServerSettings,
+        updated_at: i64,
+    ) -> Result<ServerMeta, RepositoryError> {
+        self.with_conn(|conn| {
+            let changeset = SettingsChangeset {
+                java_major: settings.java_major.map(domain::java::JavaMajor::as_i64),
+                ram_mib: settings.ram_mib.and_then(|mib| i32::try_from(mib).ok()),
+                autostart: settings.autostart,
+                updated_at,
+            };
+            let affected = diesel::update(servers::table.filter(servers::name.eq(name.as_str())))
+                .set(&changeset)
+                .execute(conn)
+                .map_err(storage_err)?;
+            require_found(affected, name.as_str())?;
+
+            select_meta(conn, name)
+        })
+    }
+
     fn remove(&self, name: &ServerName) -> Result<(), RepositoryError> {
         self.with_conn(|conn| {
             let affected = diesel::delete(servers::table.filter(servers::name.eq(name.as_str())))
@@ -419,6 +444,7 @@ fn storage_err(err: impl std::error::Error + Send + Sync + 'static) -> Repositor
 #[cfg(test)]
 mod tests {
     use super::*;
+    use domain::java::JavaMajor;
     use domain::server::artifact::{Checksum, ChecksumAlgorithm};
     use domain::server::meta::{InstalledJar, ServerId};
     use domain::server::version::{ServerVariant, VersionId};
@@ -452,6 +478,7 @@ mod tests {
             version: VersionId::new("1.21.1"),
             variant: ServerVariant::Vanilla,
             jar: None,
+            settings: domain::server::settings::ServerSettings::default(),
             created_at: 1_700_000_000,
             updated_at: 1_700_000_000,
         }
@@ -509,6 +536,44 @@ mod tests {
         .expect("update");
         assert_eq!(updated.jar, Some(jar));
         assert_eq!(updated.updated_at, 1_700_000_100);
+    }
+
+    /// `server set` 落库往返：三列写入、回读一致、时间戳刷新
+    #[test]
+    fn update_settings_persists_and_bumps_timestamp() {
+        let store = store_with_ws();
+        add_server(&store, &sample_meta("alpha"));
+        let settings = domain::server::settings::ServerSettings {
+            java_major: Some(JavaMajor::parse(21).expect("21")),
+            ram_mib: Some(2048),
+            autostart: true,
+        };
+        let updated = ServerRepository::update_settings(
+            &store,
+            &ServerName::parse("alpha").expect("valid"),
+            &settings,
+            1_700_000_200,
+        )
+        .expect("update");
+        assert_eq!(updated.settings, settings);
+        assert_eq!(updated.updated_at, 1_700_000_200);
+
+        let got = ServerRepository::get(&store, &ServerName::parse("alpha").expect("valid"))
+            .expect("get");
+        assert_eq!(got.settings, settings);
+    }
+
+    /// 未设置的服务属性回读为默认值（NULL → None，autostart → false）
+    #[test]
+    fn default_settings_roundtrip_as_empty() {
+        let store = store_with_ws();
+        add_server(&store, &sample_meta("alpha"));
+        let got = ServerRepository::get(&store, &ServerName::parse("alpha").expect("valid"))
+            .expect("get");
+        assert_eq!(
+            got.settings,
+            domain::server::settings::ServerSettings::default()
+        );
     }
 
     #[test]
@@ -616,7 +681,7 @@ mod tests {
         JavaRuntime {
             id: format!("java-{path}"),
             path: PathBuf::from(path),
-            major: domain::java::JavaMajor::parse(major).expect("major"),
+            major: JavaMajor::parse(major).expect("major"),
             version: format!("{major}.0.9+9"),
             vendor: domain::java::JavaVendor::Temurin,
             managed,

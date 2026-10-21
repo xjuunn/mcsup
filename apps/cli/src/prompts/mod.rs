@@ -224,6 +224,50 @@ pub(crate) fn validate_name(input: &str) -> Validation {
     }
 }
 
+/// 通用文本输入：回车取默认值（默认值常为该项当前值）
+///
+/// # Errors
+///
+/// 读取终端输入失败时返回底层错误
+pub(crate) fn input_text(label: &str, default: &str, help: &str) -> Result<String> {
+    let input: String = Text::new(label)
+        .with_default(default)
+        .with_help_message(help)
+        .prompt()
+        .context("读取输入")?;
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        Ok(default.to_owned())
+    } else {
+        Ok(trimmed.to_owned())
+    }
+}
+
+/// 布尔选择（`server set autostart` 等）：默认项置顶，回车即取默认
+///
+/// # Errors
+///
+/// 读取终端输入失败时返回底层错误
+pub(crate) fn select_bool(label: &str, default: bool) -> Result<bool> {
+    let choices = vec!["true", "false"];
+    let picked = Select::new(label, choices)
+        .with_starting_cursor(usize::from(!default))
+        .prompt()
+        .context("读取选择")?;
+    Ok(picked == "true")
+}
+
+/// 提示是否被 Esc / Ctrl+C 取消：交互循环据此静默退出而非报错
+#[must_use]
+pub(crate) fn is_cancelled(err: &anyhow::Error) -> bool {
+    matches!(
+        err.root_cause().downcast_ref::<inquire::InquireError>(),
+        Some(
+            inquire::InquireError::OperationCanceled | inquire::InquireError::OperationInterrupted
+        )
+    )
+}
+
 /// 目录名可作默认工作区名时返回它；不合法由调用方退回序号
 #[must_use]
 pub(crate) fn default_name_for_dir(dir: &Path) -> Option<String> {

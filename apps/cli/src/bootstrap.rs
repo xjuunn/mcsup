@@ -147,6 +147,10 @@ mod tests {
             self.variant
         }
 
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
         async fn versions(&self) -> Result<Vec<ServerVersion>, SourceError> {
             Ok(Vec::new())
         }

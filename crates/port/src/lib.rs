@@ -1,6 +1,7 @@
 use domain::java::{JavaMajor, JavaPackageType, JavaRuntime, JavaVendor};
 use domain::server::artifact::{Checksum, JarArtifact};
 use domain::server::meta::{InstalledJar, ServerMeta, ServerName};
+use domain::server::settings::ServerSettings;
 pub use domain::server::status::ServerStatus;
 use domain::server::version::{ServerVariant, ServerVersion, VersionId};
 use domain::workspace::{Workspace, WorkspaceId, WorkspaceName};
@@ -73,6 +74,8 @@ pub trait ServerJarSource: Send + Sync {
     ///
     /// 版本不存在返回 [`SourceError::NotFound`]; 其余同上
     async fn artifact(&self, version: &VersionId) -> Result<ResolvedArtifact, SourceError>;
+    /// 来源标识（如 `mojang`）；`server version` 的「来源」展示口径
+    fn name(&self) -> &'static str;
 }
 
 /// 一次下载请求
@@ -315,6 +318,18 @@ pub trait ServerRepository: Send + Sync {
         &self,
         name: &ServerName,
         jar: &InstalledJar,
+        updated_at: i64,
+    ) -> Result<ServerMeta, RepositoryError>;
+
+    /// 回写服务属性并刷新 `updated_at`，返回最新记录
+    ///
+    /// # Errors
+    ///
+    /// 不存在返回 [`RepositoryError::NotFound`]
+    fn update_settings(
+        &self,
+        name: &ServerName,
+        settings: &ServerSettings,
         updated_at: i64,
     ) -> Result<ServerMeta, RepositoryError>;
 

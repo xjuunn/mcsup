@@ -572,6 +572,14 @@ mod tests {
         ) -> Result<domain::server::meta::ServerMeta, RepositoryError> {
             unreachable!("not used in tests")
         }
+        fn update_settings(
+            &self,
+            _name: &domain::server::meta::ServerName,
+            _settings: &domain::server::settings::ServerSettings,
+            _updated_at: i64,
+        ) -> Result<domain::server::meta::ServerMeta, RepositoryError> {
+            unreachable!("not used in tests")
+        }
         fn remove(&self, _name: &domain::server::meta::ServerName) -> Result<(), RepositoryError> {
             unreachable!("not used in tests")
         }

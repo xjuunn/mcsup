@@ -8,7 +8,8 @@
   全部来自整包）。
 - **凡属某个服务器的内容，挂在 `server` 下**：备份（`backup`）、Mod（`mod`）。
 - **服务属性统一 `server set`**：JVM 绑定、内存、自启等一律
-  `mcsup server set <name> <key> <value>`，不为一类属性单开子命令。
+  `mcsup server set <name> <key> <value>`，不为一类属性单开子命令；
+  TTY 下缺 key / value 交互补齐。
 - **机器级命令**：`java`（本机 JVM 运行时）、`remote`（远端执行位置）。
 - **平台级命令直接动作**：`doctor` / `config` / `update` 等；工作目录经
   `workspace` 子命令管理。
@@ -74,11 +75,11 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | `console` | `mcsup server console <name>` | 交互附加控制台；`Ctrl+D` 只分离不断开进程；Windows 无 EOF 键，`Ctrl+D` / `Ctrl+Z` 随行到达、回车生效，Unix 行首 `Ctrl+D` 立即生效；非 TTY → 退出码 2 |
 | `send` | `mcsup server send <name> "<命令>"` | 单条命令注入服务端 stdin；未在运行 → 退出码 4 |
 | `logs` | `mcsup server logs <name> [--tail <n>] [--follow]` | 查看日志（`--tail` 默认 100），`--follow` 持续跟踪（JSON 模式 JSONL，一行一个对象） |
-| `props` | `mcsup server props <name> [key=value ...]` | 无参列出 `server.properties`；带参写入，改完提醒重启生效 |
-| `set` | `mcsup server set <name> <key> <value>` | 设置服务属性，见下表 |
+| `props` | `mcsup server props <name> [key=value ...]` | 无参列出 `server.properties`（TTY 下随后进入交互：选键改值、逐项写入、Esc 退出）；`key=value` 直接写入并提醒重启生效；单独 `key` 缺值时 TTY 交互输入、非 TTY → 退出码 2；键 / 值非法 → 2 |
+| `set` | `mcsup server set <name> [<key>] [<value>]` | 设置服务属性，见下表；TTY 下缺 key 从键列表选、缺 value 按类型补齐（java-version 从已注册大版本选、ram 输入、autostart 二选一）；非 TTY 缺参 → 退出码 2；`java-version` 绑定无运行时的大版本 → 3 |
 | `link` | `mcsup server link <path> [--name <name>] [--workspace <ws>]` | 把外部服务器目录链接进工作区并注册；目标不能在任一工作区 `servers/` 内；带 `mcsup.json` 时复用其身份 |
 | `remove` | `mcsup server remove <name> [--purge]` | 默认注销保留磁盘；`--purge` 连目录一起删（链接服务器拒绝 `--purge`，仅移除链接） |
-| `version` | `mcsup server version <name>` | 当前安装的版本、校验和、来源 |
+| `version` | `mcsup server version <name>` | 当前安装的版本、变体、来源（provider 名）、核心大小与校验和；未安装核心提示 `server install` |
 
 ### 内部入口（隐藏）
 
@@ -88,7 +89,7 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 
 ### server set（服务属性）
 
-属性键统一 kebab-case，随领域扩展追加；设置会校验并持久化，非法值报用法错误。
+属性键统一 kebab-case，随领域扩展追加；设置会校验并持久化，非法值报用法错误（2），`java-version` 绑定无已注册运行时的大版本报缺资源（3）。`ram` 规范化后展示（如 `2G` → `2048M`）；`start` 时优先级为显式选项 > 服务属性 > 平台默认。
 
 | 键 | 值 | 说明 |
 | --- | --- | --- |

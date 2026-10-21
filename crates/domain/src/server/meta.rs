@@ -88,6 +88,8 @@ pub struct ServerMeta {
     pub variant: ServerVariant,
     /// 尚未执行 `server install` 时为 `None`
     pub jar: Option<InstalledJar>,
+    /// 服务属性（`server set` 持久化）
+    pub settings: super::settings::ServerSettings,
     /// Unix 秒
     pub created_at: i64,
     /// Unix 秒

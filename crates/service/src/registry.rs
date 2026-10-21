@@ -1,4 +1,5 @@
 use domain::server::meta::{InstalledJar, ServerId, ServerMeta, ServerName};
+use domain::server::settings::ServerSettings;
 use domain::server::version::{ServerVariant, VersionId};
 use domain::workspace::{Workspace, WorkspaceId};
 use port::{
@@ -178,6 +179,7 @@ impl ServerRegistry {
             version: version.clone(),
             variant,
             jar: None,
+            settings: ServerSettings::default(),
             created_at: now,
             updated_at: now,
         };
@@ -291,6 +293,7 @@ impl ServerRegistry {
             version: VersionId::new("unknown"),
             variant: ServerVariant::Unknown,
             jar: None,
+            settings: ServerSettings::default(),
             created_at: now,
             updated_at: now,
         };
@@ -467,6 +470,28 @@ impl ServerRegistry {
         let name =
             ServerName::parse(name).map_err(|_| ServerRegistryError::NotFound(name.to_owned()))?;
         let meta = self.servers.update_jar(&name, jar, updated_at)?;
+        let dir = self.absolute_dir(&meta)?;
+        let linked = dir
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink());
+        Ok(RegisteredServer { meta, dir, linked })
+    }
+
+    /// 回写服务属性（`server set` 调用）
+    ///
+    /// # Errors
+    ///
+    /// 不存在或注册表失败时返回 [`ServerRegistryError`]
+    pub fn update_settings(
+        &self,
+        name: &str,
+        settings: &ServerSettings,
+    ) -> Result<RegisteredServer, ServerRegistryError> {
+        let name =
+            ServerName::parse(name).map_err(|_| ServerRegistryError::NotFound(name.to_owned()))?;
+        let meta = self
+            .servers
+            .update_settings(&name, settings, crate::util::unix_now())?;
         let dir = self.absolute_dir(&meta)?;
         let linked = dir
             .symlink_metadata()
@@ -708,6 +733,21 @@ mod tests {
                 .find(|m| &m.name == name)
                 .ok_or_else(|| RepositoryError::NotFound(name.as_str().to_owned()))?;
             meta.jar = Some(jar.clone());
+            meta.updated_at = updated_at;
+            Ok(meta.clone())
+        }
+        fn update_settings(
+            &self,
+            name: &ServerName,
+            settings: &ServerSettings,
+            updated_at: i64,
+        ) -> Result<ServerMeta, RepositoryError> {
+            let mut items = self.items.lock().expect("lock");
+            let meta = items
+                .iter_mut()
+                .find(|m| &m.name == name)
+                .ok_or_else(|| RepositoryError::NotFound(name.as_str().to_owned()))?;
+            meta.settings = *settings;
             meta.updated_at = updated_at;
             Ok(meta.clone())
         }

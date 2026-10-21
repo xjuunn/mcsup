@@ -175,13 +175,19 @@ pub(crate) enum ServerAction {
         #[arg(long)]
         follow: bool,
     },
-    /// 读写 server.properties
+    /// 读写 server.properties：无参列出（TTY 下可交互修改），
+    /// 带 `key=value` 直接写入，带 `key` 缺值时交互输入
     Props { name: String, kv: Vec<String> },
-    /// 设置服务属性
+    /// 设置服务属性（java-version / ram / autostart）；
+    /// 缺 key / value 且可交互时选择与输入
     Set {
         name: String,
-        key: String,
-        value: String,
+        /// 属性键；缺省且可交互时从键列表选择
+        #[arg(value_name = "KEY")]
+        key: Option<String>,
+        /// 属性值；缺省且可交互时按键类型输入或选择
+        #[arg(value_name = "VALUE")]
+        value: Option<String>,
     },
     /// 删除服务（链接服务器仅移除链接与登记）
     Remove {
