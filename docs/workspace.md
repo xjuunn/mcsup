@@ -83,7 +83,11 @@ JVM 属机器级命令，禁止放进工作目录：切换工作目录不换 JVM
 mcsup workspace init [--dir <path>] [--name <name>]
 ```
 
-- `--dir` 缺省时进入交互，输入默认 `.`；确认页显示规范化绝对路径。
+- `--dir` 缺省且可交互时进入向导：目录三选项（数据目录
+  `{data_dir}/mcsup/workspaces/<名称>` / 当前目录 / 自定义目录，输入即校验、
+  非法重输而不是终止）→ 名称（默认 = 目录名，不合法退回序号 `workspaceNN`）→
+  确认页显示规范化绝对路径。非交互无 `--dir` 保持用当前目录、名称交
+  service 序号的机器行为；交互组件见 `apps/cli/src/prompts/`。
 - 目标不存在：创建（含父目录）。目标存在：必须为空。
 - 判空先忽略噪声文件：`.DS_Store`、`Thumbs.db`、`desktop.ini`、
   `.localized`；其余任何条目（含隐藏文件）一律中止。判空收敛在 service，

@@ -6,8 +6,8 @@
 //!
 //! 门面结构：每个能力都是 feature 门控的可选依赖，`default = []` 强制显式
 //! 选择；选中的 crate 在下方按名重导出。`port` 级联带出 `domain`，
-//! `service` / `file` / `java` / `provider` / `storage` 级联带出 `port` 与
-//! `domain`。
+//! `service` / `file` / `java` / `provider` / `storage` / `runtime` 级联
+//! 带出 `port` 与 `domain`。
 //!
 //! 新增能力 crate 时同步三处：可选依赖、feature 级联、下方重导出。
 
@@ -21,6 +21,10 @@ pub use domain;
 #[cfg(feature = "port")]
 #[cfg_attr(docsrs, doc(cfg(feature = "port")))]
 pub use port;
+
+#[cfg(feature = "protocol")]
+#[cfg_attr(docsrs, doc(cfg(feature = "protocol")))]
+pub use protocol;
 
 #[cfg(feature = "service")]
 #[cfg_attr(docsrs, doc(cfg(feature = "service")))]
@@ -41,3 +45,7 @@ pub use provider;
 #[cfg(feature = "storage")]
 #[cfg_attr(docsrs, doc(cfg(feature = "storage")))]
 pub use storage;
+
+#[cfg(feature = "runtime")]
+#[cfg_attr(docsrs, doc(cfg(feature = "runtime")))]
+pub use runtime;

@@ -1,4 +1,5 @@
 use super::download::DownloadStatus;
+use super::status::ServerStatus;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -6,6 +7,13 @@ use thiserror::Error;
 pub struct InvalidTransition {
     pub from: DownloadStatus,
     pub to: DownloadStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("invalid server status transition: {from} -> {to}")]
+pub struct InvalidStatusTransition {
+    pub from: ServerStatus,
+    pub to: ServerStatus,
 }
 
 /// 服务器名称非法

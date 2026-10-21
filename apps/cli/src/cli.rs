@@ -65,6 +65,22 @@ pub(crate) enum Command {
     Completions { shell: clap_complete::Shell },
     /// 版本信息
     Version,
+    /// supervisor 进程入口（server start 自动拉起，不面向用户）
+    #[command(name = "__supervise", hide = true)]
+    Supervise {
+        /// 服务器目录
+        #[arg(long, value_name = "PATH")]
+        dir: PathBuf,
+        /// java 可执行文件
+        #[arg(long, value_name = "PATH")]
+        java: PathBuf,
+        /// 服务端核心 JAR
+        #[arg(long, value_name = "PATH")]
+        jar: PathBuf,
+        /// 堆上限（MiB）
+        #[arg(long, value_name = "MIB")]
+        ram: Option<u32>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -94,11 +110,14 @@ pub(crate) enum WorkspaceAction {
 pub(crate) enum ServerAction {
     /// 列出所有服务
     List,
-    /// 按指定版本 / 变体创建服务
+    /// 创建服务；缺名称 / 版本时交互补齐（非交互必填，见全局交互约定）
     Create {
-        name: String,
+        /// 服务器名；缺省且可交互时提示输入
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+        /// 服务端版本；缺省且可交互时从版本列表选择
         #[arg(long, value_name = "VER")]
-        version: String,
+        version: Option<String>,
         #[arg(long, value_name = "VAR")]
         variant: Option<String>,
         #[arg(long, value_name = "WS")]
@@ -111,11 +130,35 @@ pub(crate) enum ServerAction {
         version: Option<String>,
     },
     /// 启动服务
-    Start { name: String },
+    Start {
+        name: String,
+        /// 同意 Mojang EULA（写 eula=true）
+        #[arg(long)]
+        accept_eula: bool,
+    },
     /// 停止服务
-    Stop { name: String },
-    /// 重启服务
-    Restart { name: String },
+    Stop {
+        name: String,
+        /// 优雅停机宽限秒数
+        #[arg(long, value_name = "SEC", default_value_t = 30)]
+        grace: u64,
+        /// 宽限到期后强杀
+        #[arg(long)]
+        force: bool,
+    },
+    /// 重启服务（先停后启）
+    Restart {
+        name: String,
+        /// 同意 Mojang EULA（写 eula=true）
+        #[arg(long)]
+        accept_eula: bool,
+        /// 优雅停机宽限秒数
+        #[arg(long, value_name = "SEC", default_value_t = 30)]
+        grace: u64,
+        /// 宽限到期后强杀
+        #[arg(long)]
+        force: bool,
+    },
     /// 服务状态
     Status { name: String },
     /// 附加交互控制台
@@ -125,8 +168,10 @@ pub(crate) enum ServerAction {
     /// 查看日志
     Logs {
         name: String,
-        #[arg(long)]
-        tail: Option<usize>,
+        /// 显示末尾行数
+        #[arg(long, value_name = "N", default_value_t = 100)]
+        tail: usize,
+        /// 持续跟踪新增（JSON 模式输出 JSONL）
         #[arg(long)]
         follow: bool,
     },

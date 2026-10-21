@@ -3,3 +3,5 @@ msrv = "1.88"
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-print-in-tests = true
+# 测试里 panic!/expect 的白名单与 unwrap 同口径
+allow-panic-in-tests = true

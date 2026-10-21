@@ -2,7 +2,15 @@ use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct VersionManifest {
+    /// 最新稳定版 / 最新快照（`latest` 别名的解析依据）
+    pub(crate) latest: LatestVersions,
     pub(crate) versions: Vec<VersionManifestItem>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct LatestVersions {
+    pub(crate) release: String,
+    pub(crate) snapshot: String,
 }
 
 #[derive(Debug, Deserialize)]

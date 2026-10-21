@@ -256,11 +256,13 @@ if [ -f "$pkg_manifest" ] && [ -f "$pkg_lib" ]; then
 		case "$1" in
 		domain) printf '%s' 'domain' ;;
 		port) printf '%s' 'domain port' ;;
+		protocol) printf '%s' 'domain protocol' ;;
 		service) printf '%s' 'domain port service' ;;
 		file) printf '%s' 'domain port file' ;;
 		java) printf '%s' 'domain port java' ;;
 		provider) printf '%s' 'domain port provider' ;;
 		storage) printf '%s' 'domain port storage' ;;
+		runtime) printf '%s' 'domain port protocol runtime' ;;
 		*) printf '%s' '' ;;
 		esac
 	}

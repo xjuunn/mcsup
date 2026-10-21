@@ -158,6 +158,9 @@ impl Printer {
             return diag.exit_code;
         }
         for cause in err.chain() {
+            if let Some(life) = cause.downcast_ref::<mcsup::service::LifecycleError>() {
+                return lifecycle_exit_code(life);
+            }
             if let Some(jar) = cause.downcast_ref::<mcsup::service::InstallJarError>() {
                 return match jar {
                     mcsup::service::InstallJarError::Registry(reg) => registry_exit_code(reg),
@@ -190,7 +193,17 @@ impl Printer {
     /// 用 miette 渲染错误到 stderr
     pub(crate) fn render_error(err: anyhow::Error) {
         match err.downcast::<AppDiagnostic>() {
-            Ok(diag) => print_error_line(&format!("{}", miette::Report::new(diag))),
+            Ok(diag) => {
+                use miette::Diagnostic as _;
+                // miette 的 Display 不携带 help，用法错误必须把「怎么改」打出来
+                let help = diag.help().map(|h| h.to_string());
+                let mut text = format!("{}", miette::Report::new(diag));
+                if let Some(help) = help {
+                    text.push('\n');
+                    text.push_str(&help);
+                }
+                print_error_line(&text);
+            }
             Err(err) => print_error_line(&format!("mcsup: {err:#}")),
         }
     }
@@ -203,6 +216,21 @@ impl Printer {
 
 /// 下载失败 → 5 后端失败；用户取消 → 130（128 + SIGINT），与 Ctrl-C 强制
 /// 退出码一致，调用方凭码区分「取消」与「失败」
+/// 生命周期错误判级：状态冲突 4、缺资源 3、EULA 用法 2、后端 5、其余 1
+fn lifecycle_exit_code(err: &mcsup::service::LifecycleError) -> u8 {
+    use mcsup::service::LifecycleError as Life;
+    match err {
+        Life::Registry(reg) => registry_exit_code(reg),
+        Life::Java(java) => java_exit_code(java),
+        Life::Supervisor(_) => 5,
+        Life::NoJar { .. } | Life::NoJava => 3,
+        Life::EulaRequired => 2,
+        Life::AlreadyRunning | Life::NotRunning => 4,
+        // StopTimedOut / Io 与未来新增变体：通用 1
+        _ => 1,
+    }
+}
+
 fn download_exit_code(err: &mcsup::port::DownloadError) -> u8 {
     match err {
         mcsup::port::DownloadError::Cancelled => 130,
@@ -232,7 +260,10 @@ fn registry_exit_code(err: &mcsup::service::ServerRegistryError) -> u8 {
 
 fn workspace_exit_code(err: &mcsup::service::WorkspaceError) -> u8 {
     match err {
-        mcsup::service::WorkspaceError::NotFound(_) => 3,
+        // 未找到 / 无当前工作区都是「缺省资源不存在」（契约：3 未找到）
+        mcsup::service::WorkspaceError::NotFound(_) | mcsup::service::WorkspaceError::NoCurrent => {
+            3
+        }
         mcsup::service::WorkspaceError::AlreadyExists(_) => 4,
         mcsup::service::WorkspaceError::Repo(repo) => repo_exit_code(repo),
         _ => 1,
@@ -311,7 +342,7 @@ fn print_success(text: &str) {
 }
 
 #[allow(clippy::print_stdout)]
-fn print_json_line(line: &str) {
+pub(crate) fn print_json_line(line: &str) {
     println!("{line}");
 }
 
@@ -389,6 +420,25 @@ mod tests {
         assert_eq!(Printer::exit_code(&err), 3);
     }
 
+    /// 无当前工作区：缺省落点资源不存在，同「未找到」判 3
+    #[test]
+    fn no_current_workspace_maps_to_exit_code_3() {
+        let err = Err::<(), _>(mcsup::service::WorkspaceError::NoCurrent)
+            .context("创建服务器失败")
+            .unwrap_err();
+        assert_eq!(Printer::exit_code(&err), 3);
+    }
+
+    /// 用法错误（非交互缺必选参数 / 取值不合法）：退出码 2
+    #[test]
+    fn usage_error_maps_to_exit_code_2() {
+        let err = anyhow::Error::from(crate::diagnostic::AppDiagnostic::usage(
+            "server create 缺少 --version",
+            Some("交互终端下可省略".to_owned()),
+        ));
+        assert_eq!(Printer::exit_code(&err), 2);
+    }
+
     #[test]
     fn java_not_found_maps_to_exit_code_3() {
         let err = Err::<(), _>(mcsup::service::JavaError::NotFound("/nope".to_owned()))
@@ -405,6 +455,76 @@ mod tests {
         .context("安装 Java 失败")
         .unwrap_err();
         assert_eq!(Printer::exit_code(&err), 5);
+    }
+
+    // ---- 生命周期判级 ----
+
+    /// 已在运行 / 未在运行：状态冲突 → 4
+    #[test]
+    fn lifecycle_state_conflict_maps_to_exit_code_4() {
+        use mcsup::service::LifecycleError;
+        for err in [LifecycleError::AlreadyRunning, LifecycleError::NotRunning] {
+            let err = Err::<(), _>(err).context("启动失败").unwrap_err();
+            assert_eq!(Printer::exit_code(&err), 4);
+        }
+    }
+
+    /// EULA 未同意（非交互）：用法类 → 2
+    #[test]
+    fn lifecycle_eula_required_maps_to_exit_code_2() {
+        let err = Err::<(), _>(mcsup::service::LifecycleError::EulaRequired)
+            .context("启动失败")
+            .unwrap_err();
+        assert_eq!(Printer::exit_code(&err), 2);
+    }
+
+    /// 缺核心 / 缺 Java：资源不存在 → 3
+    #[test]
+    fn lifecycle_missing_resources_map_to_exit_code_3() {
+        use mcsup::service::LifecycleError;
+        for err in [
+            LifecycleError::NoJar {
+                name: "alpha".to_owned(),
+            },
+            LifecycleError::NoJava,
+        ] {
+            let err = Err::<(), _>(err).context("启动失败").unwrap_err();
+            assert_eq!(Printer::exit_code(&err), 3);
+        }
+    }
+
+    /// supervisor 交互失败（spawn / IPC）：后端失败 → 5
+    #[test]
+    fn lifecycle_supervisor_error_maps_to_exit_code_5() {
+        let err = Err::<(), _>(mcsup::service::LifecycleError::Supervisor(
+            mcsup::port::SupervisorError::Unreachable("gone".to_owned()),
+        ))
+        .context("停止失败")
+        .unwrap_err();
+        assert_eq!(Printer::exit_code(&err), 5);
+    }
+
+    /// 包装在 Registry 内层的未找到同样还原为 3
+    #[test]
+    fn lifecycle_registry_not_found_maps_to_exit_code_3() {
+        use mcsup::service::{LifecycleError, ServerRegistryError};
+        let err = Err::<(), _>(LifecycleError::Registry(ServerRegistryError::NotFound(
+            "nope".to_owned(),
+        )))
+        .context("状态查询失败")
+        .unwrap_err();
+        assert_eq!(Printer::exit_code(&err), 3);
+    }
+
+    /// 停机超时：通用失败 → 1（提示由错误文案携带）
+    #[test]
+    fn lifecycle_stop_timeout_maps_to_exit_code_1() {
+        let err = Err::<(), _>(mcsup::service::LifecycleError::StopTimedOut {
+            waited: std::time::Duration::from_secs(30),
+        })
+        .context("停止失败")
+        .unwrap_err();
+        assert_eq!(Printer::exit_code(&err), 1);
     }
 
     /// 用户取消（Ctrl-C 协作取消）：130 = 128 + SIGINT，与后端失败 5 区分

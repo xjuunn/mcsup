@@ -40,16 +40,16 @@ crates/mcsup/               门面 package mcsup（唯一入口与发布主体�
 │   ├── port/               能力 trait：Backend / ProcessSpawner /
 │   │                       JavaResolver / ServerRepository / ConsoleSink /
 │   │                       EventSink / Clock（依赖 domain）
+│   ├── protocol/           消息和结果类型（唯一契约来源，依赖 domain）
 │   ├── service/            用例编排：start / stop / status / backup
 │   ├── file/               文件系统和文件传输
 │   ├── java/               Java 检测与版本管理（实现 port）
 │   ├── provider/           外部资源和第三方 API
-│   └── storage/            元数据持久化（实现 port::ServerRepository）
+│   ├── storage/            元数据持久化（实现 port::ServerRepository）
+│   └── runtime/            Minecraft / JVM 进程运行（实现 port，依赖 protocol）
 └── 待建（同样建 crate 并在门面加 feature；cli 为门面内模块）：
-    ├── protocol/           消息和结果类型（唯一契约来源）
     ├── cli/                CLI 命令语义和渲染（feature = "cli"，门面内模块）
     ├── backend/            Local / Remote 执行位置选择（实现 port::Backend）
-    ├── runtime/            Minecraft / JVM 进程运行（实现 port）
     ├── backup/             CAS / Snapshot / Restore
     ├── modkit/             Mod / Modpack
     ├── transport/          RPC 通信（RemoteBackend 使用）
@@ -155,6 +155,10 @@ CLI 既是人类工具，也是第三方（非 Rust）的编程接口。两者�
 - `--follow` 输出 JSONL（一行一个事件对象），用于实时日志和状态推送。
 - `server send <id> <command>` 支持把宿主输入接到服务器 stdin。
 - 无交互：不依赖 TTY 输入，不等待确认，需要确认的走显式 `--yes`。
+- 交互兜底：参数优先级 `flag > MCSUP_WORKSPACE 环境变量 > 交互提示 / 默认值`；
+  必选参数缺失只在 human 输出 + TTY 下进交互补齐，`--output json` 或非 TTY
+  下不等待输入，stderr 提示用法并以退出码 2 结束；专用确认开关（如
+  `--accept-eula`）与 `--yes` 同此规则。
 - 幂等：同样命令重复执行结果可预期。
 
 这些必须在实现前定死。事后从"人类可用"改成"机器可用"要重写输出层。
@@ -201,7 +205,7 @@ Cargo 禁止同一 workspace 内出现同名 package，所以发布库叫 `mcsup
 - 单词名 `domain` / `port` / `service` / `file` / `provider` 在 crates.io
   均被占用（实测 2026-10）；内层发布必须改名 `mcsup-*`（已验证可用）。
 - 发布顺序：`mcsup-domain → mcsup-port → mcsup-service / mcsup-file /
-  mcsup-provider → mcsup`。
+  mcsup-java / mcsup-provider / mcsup-storage / mcsup-runtime → mcsup`。
 - 版本锁步：内层与门面共用 `workspace.version` 一起 bump，避免同名类型
   跨版本不兼容。
 - 内层一经发布即成公共 API，跨层重构受 semver 约束。
@@ -220,11 +224,13 @@ Cargo 禁止同一 workspace 内出现同名 package，所以发布库叫 `mcsup
 ```
 domain   = ["dep:domain"]
 port     = ["dep:port", "domain"]
+protocol = ["dep:protocol", "domain"]
 service  = ["dep:service", "port"]
 file     = ["dep:file", "port"]
 java     = ["dep:java", "port"]
 provider = ["dep:provider", "port"]
 storage  = ["dep:storage", "port"]
+runtime  = ["dep:runtime", "port", "protocol"]
 ```
 
 级联规则：feature 引用同级 feature，被引用者带出其可选依赖——只要
@@ -238,8 +244,9 @@ feature_bundles 目前只豁免 `default`，新增组合 feature 时同步豁免
 feature 语义必须机器校验。如果 `file` 硬依赖 `provider`，那
 `features = ["file"]` 会把 `reqwest` 拉进来，这个 feature 就是假的。
 
-该检查尚未实现。门面形态下的断言方式：`cargo tree -p mcsup
---no-default-features --features <f>` 实际拉入的依赖集合等于允许集合。
+该检查已由 `scripts/check-architecture.sh` 第 9 节实现：`cargo tree -p
+mcsup --no-default-features --features <f>` 实际拉入的内层 crate 集合等于
+`facade_allow` 允许集合；新增内层 crate 或 feature 时同步该表。
 
 ### CLI 与库的解耦
 
@@ -284,16 +291,15 @@ mcsup = { version = "0.1", default-features = false, features = ["full"] }
 
 ## 落地顺序
 
-依赖拓扑序，每步结束都是可用状态。已落地：domain、port、service、
-file、provider（内层 crate + 门面 feature）、apps/cli（`server install`
-已接通，其余命令为桩）。后续按序：
+依赖拓扑序，每步结束都是可用状态。已落地：domain、port、protocol、
+service、file、java、provider、storage、runtime（内层 crate + 门面 feature
+同步）、apps/cli（workspace / java / server create·install·link·remove 与生命周期
+start·stop·restart·status·console·send·logs 已接通，其余命令为桩）。
+后续按序：
 
 ```
-1  protocol    命令 + 结果类型冻结
-2  cli         库侧命令语义 + 渲染 + JSON
-3  runtime     第一个真实 ProcessSpawner
-4  storage     第一个真实 Repository
-5  sidecar     protocol 的 HTTP 绑定
+1  cli         库侧命令语义 + 渲染 + JSON
+2  sidecar     protocol 的 HTTP 绑定
 ```
 
-第 1-2 步做完，CLI 库侧语义完整；第 5 步后非 Rust 第三方已有网络编程接口。
+第 1 步做完，CLI 库侧语义完整；第 2 步后非 Rust 第三方已有网络编程接口。

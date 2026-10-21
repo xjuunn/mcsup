@@ -6,10 +6,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
 
-const MARKER_FILE: &str = "workspace.toml";
+/// `workspace.toml` marker 文件名；入口侧判空预检与本层判空必须同口径
+pub const MARKER_FILE: &str = "workspace.toml";
 const MARKER_SCHEMA: u32 = 1;
-/// 噪声文件：判空时忽略（macOS / Windows 产物）
-const NOISE_ENTRIES: &[&str] = &[".DS_Store", "Thumbs.db", "desktop.ini", ".localized"];
+/// 噪声文件：判空时忽略（macOS / Windows 产物）；入口侧预检复用
+pub const NOISE_ENTRIES: &[&str] = &[".DS_Store", "Thumbs.db", "desktop.ini", ".localized"];
 
 /// 工作目录操作失败
 #[derive(Debug, Error)]

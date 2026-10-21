@@ -1,5 +1,6 @@
 mod fs_error;
 mod java;
+mod lifecycle;
 mod registry;
 mod util;
 mod workspace;
@@ -9,13 +10,17 @@ pub use java::{
     InstallOutcome, InstallStage, JavaError, JavaService, RemoteJavaPackage, ScanOutcome,
     StageSink, UninstallOutcome,
 };
+pub use lifecycle::{
+    DEFAULT_RAM_MIB, LifecycleError, LogWatch, ServerLifecycleService, StartOptions, StatusReport,
+};
 /// Java 源聚合端口（定义在 `port`，此处转出便于既有调用方）
 pub use port::JavaSourceRegistryPort;
 pub use registry::{
     InstallJarError, InstalledServerJar, RegisteredServer, ServerRegistry, ServerRegistryError,
 };
 pub use workspace::{
-    DoctorFinding, DoctorLevel, InitOutcome, WorkspaceError, WorkspaceService, absolute_path,
+    DoctorFinding, DoctorLevel, InitOutcome, MARKER_FILE, NOISE_ENTRIES, WorkspaceError,
+    WorkspaceService, absolute_path,
 };
 
 use domain::server::download::DownloadStatus;
@@ -126,6 +131,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ServerJarSource for FakeSource {
+        fn variant(&self) -> domain::server::version::ServerVariant {
+            domain::server::version::ServerVariant::Vanilla
+        }
+
         async fn versions(
             &self,
         ) -> Result<Vec<domain::server::version::ServerVersion>, SourceError> {

@@ -1,7 +1,8 @@
 use domain::java::{JavaMajor, JavaPackageType, JavaRuntime, JavaVendor};
 use domain::server::artifact::{Checksum, JarArtifact};
 use domain::server::meta::{InstalledJar, ServerMeta, ServerName};
-use domain::server::version::{ServerVersion, VersionId};
+pub use domain::server::status::ServerStatus;
+use domain::server::version::{ServerVariant, ServerVersion, VersionId};
 use domain::workspace::{Workspace, WorkspaceId, WorkspaceName};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -51,6 +52,12 @@ pub struct ResolvedArtifact {
 /// 服务端 JAR 来源
 #[async_trait::async_trait]
 pub trait ServerJarSource: Send + Sync {
+    /// 该来源服务的变体
+    ///
+    /// 能力查询的唯一口径：可创建 / 可安装的变体集合 = 已注册来源
+    /// `variant()` 的去重结果。未注册的变体入口必须隐藏，显式指定时报错
+    /// 并列出可用项，禁止各入口写死变体清单。
+    fn variant(&self) -> ServerVariant;
     /// 列出可用版本
     ///
     /// #Errors
@@ -58,6 +65,9 @@ pub trait ServerJarSource: Send + Sync {
     /// 上游不可达、返回异常状态码或响应无法解析时返回 [`SourceError`]
     async fn versions(&self) -> Result<Vec<ServerVersion>, SourceError>;
     /// 解析某版本的服务器 JAR 下载信息
+    ///
+    /// 字面量 `latest` / `latest-snapshot` 是保留别名，由来源解析为其声明的
+    /// 最新稳定版 / 最新快照。
     ///
     /// # Errors
     ///
@@ -593,6 +603,148 @@ pub trait JavaRuntimeRepository: Send + Sync {
     ///
     /// 底层失败返回 [`RepositoryError::Storage`]
     fn mark_scanned(&self, at: i64) -> Result<(), RepositoryError>;
+}
+
+/// supervisor 启动请求（全部路径已由调用方解析）
+#[derive(Debug, Clone)]
+pub struct SupervisorStartRequest {
+    /// 服务器目录：运行期文件（`run/` / `console.log`）都落在其下
+    pub server_dir: PathBuf,
+    /// `java` 可执行文件
+    pub java_bin: PathBuf,
+    /// 服务端核心 JAR 绝对路径
+    pub jar_path: PathBuf,
+    /// 堆内存上限；`None` 用 JVM 默认
+    pub ram_mib: Option<u32>,
+    /// 用于再拉起 supervisor 的可执行文件（`mcsup` 本体）
+    pub supervisor_exe: PathBuf,
+}
+
+/// 一次运行的实时视图
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupervisorStatus {
+    /// 领域状态机口径
+    pub status: ServerStatus,
+    /// 服务端进程 PID（`Starting` 起即存在）
+    pub pid: Option<u32>,
+    /// 从拉起到现在的运行时长
+    pub uptime: Option<std::time::Duration>,
+    /// 退出码（进程已退出时）
+    pub exit_code: Option<i32>,
+}
+
+/// supervisor 拉起结果
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupervisorStartOutcome {
+    /// supervisor 进程 PID
+    pub supervisor_pid: u32,
+}
+
+/// 停机规格
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StopSpec {
+    /// 优雅停机宽限时长
+    pub grace: std::time::Duration,
+    /// 宽限到期后是否强杀
+    pub force: bool,
+}
+
+impl StopSpec {
+    /// 默认宽限 30 秒，不强杀
+    #[must_use]
+    pub fn default_grace() -> Self {
+        Self {
+            grace: std::time::Duration::from_secs(30),
+            force: false,
+        }
+    }
+}
+
+/// 停机结果
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopOutcome {
+    /// 宽限内正常退出
+    Stopped {
+        /// 请求停机到退出的耗时
+        elapsed: std::time::Duration,
+    },
+    /// 本来就没在跑（幂等）
+    AlreadyStopped,
+    /// 宽限到期仍在运行（未加 `force` 时不会强杀）
+    TimedOut {
+        /// 已等待的时长
+        waited: std::time::Duration,
+    },
+}
+
+/// supervisor 交互失败
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum SupervisorError {
+    /// 服务器已在运行（状态冲突）
+    #[error("server is already running")]
+    AlreadyRunning,
+    /// 拉起 supervisor 进程失败
+    #[error("failed to spawn supervisor: {0}")]
+    Spawn(#[source] std::io::Error),
+    /// 连接 / 读写失败（调用方预期 supervisor 存在的场景）
+    #[error("supervisor unreachable: {0}")]
+    Unreachable(String),
+    /// 协议帧错误或版本不匹配
+    #[error("supervisor protocol error: {0}")]
+    Protocol(String),
+    /// 远端（supervisor 侧）返回的业务错误
+    #[error("{kind}: {message}")]
+    Remote { kind: String, message: String },
+    /// 本地 IO 失败
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
+/// 服务器 supervisor：拉起 / 停机 / 查询 / 控制台注入
+///
+/// 回答「这个服务器现在跑没跑、怎么让它停下来」。Local 由 `runtime` 实现
+/// （本地进程 + IPC），Remote 将来经 transport 代理同一 trait——业务判定
+/// 仍在 `domain` / `service`，实现层只回答「在哪里执行」。
+pub trait SupervisorPort: Send + Sync {
+    /// 拉起 supervisor（已运行时拒绝重复启动）
+    ///
+    /// # Errors
+    ///
+    /// 已在运行返回 [`SupervisorError::AlreadyRunning`]；拉起或握手失败返回
+    /// 其余错误
+    fn start(
+        &self,
+        request: SupervisorStartRequest,
+    ) -> Result<SupervisorStartOutcome, SupervisorError>;
+
+    /// 请求停机：先优雅停机，宽限到期且 `force` 时强杀
+    ///
+    /// # Errors
+    ///
+    /// supervisor 无响应或协议失败时返回错误
+    fn stop(&self, server_dir: &Path, spec: StopSpec) -> Result<StopOutcome, SupervisorError>;
+
+    /// 实时状态；`Ok(None)` 表示没有 supervisor（未运行）
+    ///
+    /// # Errors
+    ///
+    /// 协议失败时返回错误（连接失败按「不在」处理）
+    fn status(&self, server_dir: &Path) -> Result<Option<SupervisorStatus>, SupervisorError>;
+
+    /// 向服务端 stdin 注入一行
+    ///
+    /// # Errors
+    ///
+    /// 未运行返回 [`SupervisorError::Unreachable`]；其余同上
+    fn send_line(&self, server_dir: &Path, line: &str) -> Result<(), SupervisorError>;
+
+    /// 通知空载（进程已退出）的 supervisor 尽快退出
+    ///
+    /// # Errors
+    ///
+    /// 协议失败时返回错误
+    fn shutdown(&self, server_dir: &Path) -> Result<(), SupervisorError>;
 }
 
 #[cfg(test)]

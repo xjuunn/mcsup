@@ -1,6 +1,9 @@
 pub mod artifact;
 pub mod download;
 pub mod error;
+pub mod eula;
 pub mod event;
+pub mod layout;
 pub mod meta;
+pub mod status;
 pub mod version;

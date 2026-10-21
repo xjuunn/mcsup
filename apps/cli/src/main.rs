@@ -6,6 +6,7 @@ mod config;
 mod diagnostic;
 mod output;
 mod progress;
+mod prompts;
 mod verbosity;
 
 use clap::Parser;

@@ -39,6 +39,17 @@ impl AppDiagnostic {
         }
     }
 
+    /// 用法错误（退出码 2，与 clap 的参数解析错误同级）：
+    /// 非交互 / JSON 模式下缺必选参数、取值不合法时走这里，不进入交互兜底
+    #[must_use]
+    pub(crate) fn usage(message: impl Into<String>, help: Option<String>) -> Self {
+        Self {
+            exit_code: 2,
+            message: message.into(),
+            help,
+        }
+    }
+
     /// 用户取消（Ctrl-C 协作取消后走完清理路径）：130 = 128 + SIGINT，
     /// 与强制退出码一致，调用方凭退出码即可区分「取消」与「失败」；
     /// 入口层对 130 不渲染消息（静默退出）

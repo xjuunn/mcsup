@@ -3,8 +3,9 @@
 `mcsup` 命令采用统一的 `<对象> <动作> <名字> ...` 结构，关键约定：
 
 - **动作总在名字前**：`mcsup server start <name>`、`mcsup server backup create <name>`。
-- **建站只有两个入口**：`server create <name>`（指定 version/variant，自配 Mod）；
-  `modpack install <pack>`（整包一键建站，version/variant/loader/Mod 全部来自整包）。
+- **建站只有两个入口**：`server create`（向导或全参数直通建站并下载核心，
+  自配 Mod）；`modpack install <pack>`（整包一键建站，version/variant/loader/Mod
+  全部来自整包）。
 - **凡属某个服务器的内容，挂在 `server` 下**：备份（`backup`）、Mod（`mod`）。
 - **服务属性统一 `server set`**：JVM 绑定、内存、自启等一律
   `mcsup server set <name> <key> <value>`，不为一类属性单开子命令。
@@ -14,6 +15,25 @@
 - **服务器只能建在已注册工作目录下**：`--workspace <名>` 按名选择，
   缺省用当前工作区（`--workspace` > 环境变量 `MCSUP_WORKSPACE` > 当前工作区）；
   目录规范与 init 行为见 `docs/workspace.md`。
+
+## 全局交互约定
+
+所有子命令一致，机器契约以 `docs/embedding.md` 的 CLI 契约一节为准：
+
+- 参数优先级：`flag > 环境变量（MCSUP_WORKSPACE） > 交互提示 / 默认值`。
+- 必选参数缺失只在 human 输出 + TTY 下进交互补齐；`--output json` 或非 TTY
+  下不等待输入，stderr 提示用法并以退出码 2 结束。
+- 危险确认走 `--yes`，eula 另有 `--accept-eula`；非交互下缺对应开关 → 退出码 2。
+- 耗时步骤（网络列表获取、下载、扫描）走 `apps/cli/src/progress.rs` 的
+  单行回显，JSON 模式隐藏进度。
+- 交互组件集中在 `apps/cli/src/prompts/`：步骤回显、目录三选项、名称输入、
+  可过滤选择、输入名称确认；`workspace init` / `server create` /
+  `modpack install` / `server remove` / `server set` 共用。组件只做 UI，
+  业务判定仍在 service / domain。
+- `workspace init` 无 `--dir` 且可交互时：目录三选项（数据目录 =
+  `{data_dir}/mcsup/workspaces/<名称>`；当前目录；自定义目录，输入时校验、
+  非法重输）→ 名称（默认=目录名，不合法退回序号 `workspaceNN`）→ 确认。
+  非交互无 `--dir` 保持用当前目录 + service 序号的既有机器行为。
 
 命令层级：
 
@@ -45,20 +65,26 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | 子命令 | 用法 | 说明 |
 | --- | --- | --- |
 | `list` | `mcsup server list` | 列出所有服务与状态 |
-| `create` | `mcsup server create <name> --version <ver> [--variant <v>] [--workspace <ws>]` | 按指定版本/变体建站，落在所选工作目录；`--variant` 取 `vanilla/paper/fabric/forge/neoforge` |
-| `install` | `mcsup server install <name> [--version <ver>]` | 给既有服务安装/更换服务端核心（JAR），校验后落盘 |
-| `start` | `mcsup server start <name>` | 按已配置的 JVM 与内存启动，返回 PID |
-| `stop` | `mcsup server stop <name> [--grace <sec>] [--force]` | 先优雅停机，宽限后 `--force` 强杀 |
-| `restart` | `mcsup server restart <name>` | 组合 stop/start |
-| `status` | `mcsup server status <name>` | 状态、进程、版本、占用 |
-| `console` | `mcsup server console <name>` | 交互附加控制台；`Ctrl+D` 只分离不断开进程 |
-| `send` | `mcsup server send <name> "<命令>"` | 单条命令注入（RCON/控制台） |
-| `logs` | `mcsup server logs <name> [--tail <n>] [--follow]` | 查看日志，`--follow` 持续跟踪 |
+| `create` | `mcsup server create [<name>] [--version <ver>] [--variant <v>] [--workspace <ws>]` | 建站并下载核心 JAR（变体从可用能力列选，缺省 vanilla；版本交互从列表选，也接受 `latest` / `latest-snapshot` 别名）。TTY 缺名/缺版本进向导（名称重输直到唯一，步骤回显 `[n/3]`，参数给定则跳过对应步）；无工作区且可交互时先复用 `workspace init` 向导再继续；非 TTY 缺 `--version` 或缺名 → 退出码 2；显式变体未知/未支持 → 2 并列出可用变体；下载失败保留已注册结果，提示 `mcsup server install <name>` 重试 |
+| `install` | `mcsup server install <name> [--version <ver>]` | 给既有服务安装/更换服务端核心（JAR），校验后落盘；交互无 `--version` 从版本列表选择（Release/Snapshot/旧版标注），非 TTY 缺省 `latest` 解析为 manifest 当前稳定版；服务器不存在 → 退出码 3 |
+| `start` | `mcsup server start <name> [--accept-eula]` | 经后台 supervisor 拉起 JVM（已注册 Java 取最高大版本，核心 JAR 取已安装项，默认堆 2048 MiB），返回 supervisor PID；EULA 未同意时 TTY 询问，非交互缺 `--accept-eula` → 退出码 2；已在运行 → 4；无核心 / 无 Java → 3；spawn / IPC 失败 → 5 |
+| `stop` | `mcsup server stop <name> [--grace <sec>] [--force]` | 先优雅停机（默认宽限 30s），宽限后 `--force` 强杀；未在运行幂等成功（exit 0）；超时未 `--force` → 退出码 1 并提示 `--force` |
+| `restart` | `mcsup server restart <name> [--accept-eula] [--grace <sec>] [--force]` | 先停后启：停机规格与 EULA 同 start / stop，停机超时中止不拉起 |
+| `status` | `mcsup server status <name>` | 注册版本 / 变体 + 实时状态、进程、运行时长、退出码；未在运行显示 `stopped`（exit 0） |
+| `console` | `mcsup server console <name>` | 交互附加控制台；`Ctrl+D` 只分离不断开进程；非 TTY → 退出码 2 |
+| `send` | `mcsup server send <name> "<命令>"` | 单条命令注入服务端 stdin；未在运行 → 退出码 4 |
+| `logs` | `mcsup server logs <name> [--tail <n>] [--follow]` | 查看日志（`--tail` 默认 100），`--follow` 持续跟踪（JSON 模式 JSONL，一行一个对象） |
 | `props` | `mcsup server props <name> [key=value ...]` | 无参列出 `server.properties`；带参写入，改完提醒重启生效 |
 | `set` | `mcsup server set <name> <key> <value>` | 设置服务属性，见下表 |
 | `link` | `mcsup server link <path> [--name <name>] [--workspace <ws>]` | 把外部服务器目录链接进工作区并注册；目标不能在任一工作区 `servers/` 内；带 `mcsup.json` 时复用其身份 |
 | `remove` | `mcsup server remove <name> [--purge]` | 默认注销保留磁盘；`--purge` 连目录一起删（链接服务器拒绝 `--purge`，仅移除链接） |
 | `version` | `mcsup server version <name>` | 当前安装的版本、校验和、来源 |
+
+### 内部入口（隐藏）
+
+| 子命令 | 用法 | 说明 |
+| --- | --- | --- |
+| `__supervise` | `mcsup __supervise --dir <path> --java <path> --jar <path> [--ram <mib>]` | `server start` 拉起的 supervisor 进程本体：托管 JVM、写 `console.log`、经本地 socket 提供状态 / 停机 / 注入 IPC；不在 `--help` 出现，退出码 0 正常停机 / 1 异常 |
 
 ### server set（服务属性）
 

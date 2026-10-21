@@ -51,6 +51,10 @@ impl MojangSource {
 
 #[async_trait]
 impl ServerJarSource for MojangSource {
+    fn variant(&self) -> ServerVariant {
+        ServerVariant::Vanilla
+    }
+
     async fn versions(&self) -> Result<Vec<ServerVersion>, SourceError> {
         let manifest = self.manifest().await?;
         Ok(manifest.versions.into_iter().map(into_version).collect())
@@ -58,13 +62,23 @@ impl ServerJarSource for MojangSource {
 
     async fn artifact(&self, version: &VersionId) -> Result<ResolvedArtifact, SourceError> {
         let manifest = self.manifest().await?;
+        let target = resolve_item_id(&manifest, version).to_owned();
         let item = manifest
             .versions
             .into_iter()
-            .find(|item| item.id == version.as_str())
+            .find(|item| item.id == target)
             .ok_or_else(|| SourceError::NotFound(version.clone()))?;
         let details = self.details(&parse_https_url(&item.url)?).await?;
-        into_atrifact(version, details)
+        into_atrifact(&VersionId::new(target.as_str()), details)
+    }
+}
+
+/// `latest` / `latest-snapshot` 保留别名 → 最新稳定版 / 最新快照；其余按字面匹配
+fn resolve_item_id<'a>(manifest: &'a VersionManifest, version: &'a VersionId) -> &'a str {
+    match version.as_str() {
+        "latest" => &manifest.latest.release,
+        "latest-snapshot" => &manifest.latest.snapshot,
+        other => other,
     }
 }
 
@@ -137,6 +151,36 @@ mod tests {
         assert_eq!(versions[3].kind, Domain::Historical);
         assert_eq!(versions[0].variant, ServerVariant::Vanilla);
         Ok(())
+    }
+
+    /// `latest` 别名解析到最新稳定版；字面版本原样返回
+    #[test]
+    fn latest_alias_resolves_to_stable_release() -> Result<(), Box<dyn std::error::Error>> {
+        let manifest: VersionManifest = serde_json::from_str(SAMPLE)?;
+        assert_eq!(
+            resolve_item_id(&manifest, &VersionId::new("latest")),
+            manifest.latest.release
+        );
+        assert_eq!(
+            resolve_item_id(&manifest, &VersionId::new("latest")),
+            "1.21.1"
+        );
+        assert_eq!(
+            resolve_item_id(&manifest, &VersionId::new("latest-snapshot")),
+            "24w33a"
+        );
+        assert_eq!(
+            resolve_item_id(&manifest, &VersionId::new("24w33a")),
+            "24w33a"
+        );
+        Ok(())
+    }
+
+    /// 能力查询：Mojang 来源声明 vanilla
+    #[test]
+    fn mojang_source_declares_vanilla_variant() {
+        let source = MojangSource::new().expect("Mojang 源初始化");
+        assert_eq!(source.variant(), ServerVariant::Vanilla);
     }
 
     #[test]

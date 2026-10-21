@@ -152,7 +152,7 @@ $ mcsup-agent --listen ...    # 看到 server / agent 无法猜到和 Minecraft 
 crate，是第三方依赖的唯一入口与发布主体。内层 crate 现为 `publish = false`
 的 path 依赖，单词名不发布、不占 crates.io；一旦要发布 `mcsup`，它 feature
 拉入的每个内层 crate 必须先改名 `mcsup-*`（单词名已被占用，`mcsup-*` 已验证
-可用），按 `domain → port → service / file / provider → mcsup` 顺序发布，
+可用），按 `domain → port → protocol → service / file / java / provider / storage / runtime → mcsup` 顺序发布，
 版本以 `workspace.version` 锁步。门面 feature、级联与发布条件见
 `docs/embedding.md` 的分发形态一节。
 
