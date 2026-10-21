@@ -82,7 +82,10 @@ pub(crate) fn scan(printer: Printer) -> Result<()> {
         .context("扫描失败")?;
     progress.finish();
     printer.print_outcome(
-        &format!("扫描完成：新注册 {} 个", outcome.registered),
+        &format!(
+            "扫描完成：新注册 {} 个，跳过 {} 个",
+            outcome.registered, outcome.skipped
+        ),
         &ScanRow {
             registered: outcome.registered,
             skipped: outcome.skipped,

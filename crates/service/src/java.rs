@@ -50,9 +50,9 @@ impl JavaError {
 /// 扫描结果汇总
 #[derive(Debug, Clone)]
 pub struct ScanOutcome {
-    /// 新注册条数
+    /// 新注册条数（注册表中此前不存在的路径）
     pub registered: usize,
-    /// 跳过（已存在且未变）条数
+    /// 跳过条数（已存在，仅刷新元数据；写入失败也计入并 warn）
     pub skipped: usize,
 }
 
@@ -180,6 +180,15 @@ impl JavaService {
         self.scanner
             .scan(&mut |found| {
                 on_found(&found);
+                let existed = match self.repo.get_by_path(&found.path) {
+                    Ok(_) => true,
+                    Err(RepositoryError::NotFound(_)) => false,
+                    Err(err) => {
+                        tracing::warn!(path = %found.path.display(), error = %err, "get_by_path failed");
+                        skipped += 1;
+                        return;
+                    }
+                };
                 let runtime = JavaRuntime {
                     id: uuid::Uuid::new_v4().to_string(),
                     path: found.path.clone(),
@@ -191,7 +200,14 @@ impl JavaService {
                     updated_at: now,
                 };
                 match self.repo.upsert(&runtime) {
-                    Ok(()) => registered += 1,
+                    // 已存在的路径只是刷新元数据，不算新注册
+                    Ok(()) => {
+                        if existed {
+                            skipped += 1;
+                        } else {
+                            registered += 1;
+                        }
+                    }
                     Err(err) => {
                         tracing::warn!(path = %found.path.display(), error = %err, "upsert failed");
                         skipped += 1;
@@ -969,7 +985,32 @@ mod tests {
         let (service, _repo) = svc(tmp.path());
         service.scan(false, &mut |_| {}).expect("first");
         let forced = service.scan(true, &mut |_| {}).expect("force");
-        assert_eq!(forced.registered, 1);
+        // 已注册路径再次扫描只刷新元数据，不再计为新注册
+        assert_eq!(forced.registered, 0);
+        assert_eq!(forced.skipped, 1);
+    }
+
+    #[test]
+    fn scan_counts_new_vs_existing() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let repo = Arc::new(MemRepo::new());
+        let scanner = Arc::new(FakeScanner {
+            homes: vec![tmp.path().join("jdk21"), tmp.path().join("jdk17")],
+        });
+        let service = JavaService::new(
+            repo,
+            scanner,
+            Arc::new(FakeRegistry),
+            Arc::new(NoopDownloader),
+            Arc::new(FakeExtractor),
+            tmp.path().join("java"),
+        );
+        let first = service.scan(true, &mut |_| {}).expect("first");
+        assert_eq!(first.registered, 2);
+        assert_eq!(first.skipped, 0);
+        let second = service.scan(true, &mut |_| {}).expect("second");
+        assert_eq!(second.registered, 0);
+        assert_eq!(second.skipped, 2);
     }
 
     #[test]
