@@ -4,6 +4,8 @@ mod commands;
 mod completions;
 mod config;
 mod diagnostic;
+mod input;
+mod keymap;
 mod output;
 mod progress;
 mod prompts;
