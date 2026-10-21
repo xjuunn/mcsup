@@ -8,7 +8,8 @@
   全部来自整包）。
 - **凡属某个服务器的内容，挂在 `server` 下**：备份（`backup`）、Mod（`mod`）。
 - **服务属性统一 `server set`**：JVM 绑定、内存、自启等一律
-  `mcsup server set <name> <key> <value>`，不为一类属性单开子命令。
+  `mcsup server set <name> <key> <value>`，不为一类属性单开子命令；
+  TTY 下缺 key / value 交互补齐。
 - **机器级命令**：`java`（本机 JVM 运行时）、`remote`（远端执行位置）。
 - **平台级命令直接动作**：`doctor` / `config` / `update` 等；工作目录经
   `workspace` 子命令管理。
@@ -67,18 +68,18 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | `list` | `mcsup server list` | 列出所有服务与状态 |
 | `create` | `mcsup server create [<name>] [--version <ver>] [--variant <v>] [--workspace <ws>]` | 建站并下载核心 JAR（变体从可用能力列选，缺省 vanilla；版本交互从列表选，也接受 `latest` / `latest-snapshot` 别名）。TTY 缺名/缺版本进向导（名称重输直到唯一，步骤回显 `[n/3]`，参数给定则跳过对应步）；无工作区且可交互时先复用 `workspace init` 向导再继续；非 TTY 缺 `--version` 或缺名 → 退出码 2；显式变体未知/未支持 → 2 并列出可用变体；下载失败保留已注册结果，提示 `mcsup server install <name>` 重试 |
 | `install` | `mcsup server install <name> [--version <ver>]` | 给既有服务安装/更换服务端核心（JAR），校验后落盘；交互无 `--version` 从版本列表选择（Release/Snapshot/旧版标注），非 TTY 缺省 `latest` 解析为 manifest 当前稳定版；服务器不存在 → 退出码 3 |
-| `start` | `mcsup server start <name> [--accept-eula]` | 经后台 supervisor 拉起 JVM（已注册 Java 取最高大版本，核心 JAR 取已安装项，默认堆 2048 MiB），返回 supervisor PID；EULA 未同意时 TTY 询问，非交互缺 `--accept-eula` → 退出码 2；已在运行 → 4；无核心 / 无 Java → 3；spawn / IPC 失败 → 5 |
+| `start` | `mcsup server start <name> [--accept-eula]` | 经后台 supervisor 拉起 JVM（`server set java-version` 绑定了大版本则用该版本，否则取已注册 Java 最高大版本；核心 JAR 取已安装项；堆上限 `server set ram` 优先、缺省 2048 MiB），返回 supervisor PID；EULA 未同意时 TTY 询问，非交互缺 `--accept-eula` → 退出码 2；已在运行 → 4；无核心 / 无 Java / 绑定大版本无运行时 → 3；spawn / IPC 失败 → 5 |
 | `stop` | `mcsup server stop <name> [--grace <sec>] [--force]` | 先优雅停机（默认宽限 30s），宽限后 `--force` 强杀；未在运行幂等成功（exit 0）；超时未 `--force` → 退出码 1 并提示 `--force` |
 | `restart` | `mcsup server restart <name> [--accept-eula] [--grace <sec>] [--force]` | 先停后启：停机规格与 EULA 同 start / stop，停机超时中止不拉起 |
 | `status` | `mcsup server status <name>` | 注册版本 / 变体 + 实时状态、进程、运行时长、退出码；未在运行显示 `stopped`（exit 0） |
 | `console` | `mcsup server console <name>` | 交互附加控制台；`Ctrl+D` 只分离不断开进程；Windows 无 EOF 键，`Ctrl+D` / `Ctrl+Z` 随行到达、回车生效，Unix 行首 `Ctrl+D` 立即生效；键位表统一在 `keymap`，未绑定的控制字符按文本注入；非 TTY → 退出码 2 |
 | `send` | `mcsup server send <name> "<命令>"` | 单条命令注入服务端 stdin；未在运行 → 退出码 4 |
 | `logs` | `mcsup server logs <name> [--tail <n>] [--follow]` | 查看日志（`--tail` 默认 100），`--follow` 持续跟踪（JSON 模式 JSONL，一行一个对象） |
-| `props` | `mcsup server props <name> [key=value ...]` | 无参列出 `server.properties`；带参写入，改完提醒重启生效 |
-| `set` | `mcsup server set <name> <key> <value>` | 设置服务属性，见下表 |
+| `props` | `mcsup server props <name> [key=value ...]` | 无参列出 `server.properties`（TTY 下随后进入交互：选键改值、逐项写入、Esc 退出）；`key=value` 直接写入并提醒重启生效；单独 `key` 缺值时 TTY 交互输入、非 TTY → 退出码 2；键 / 值非法 → 2 |
+| `set` | `mcsup server set <name> [<key>] [<value>]` | 设置服务属性，见下表；TTY 下缺 key 从键列表选、缺 value 按类型补齐（java-version 从已注册大版本选、ram 输入、autostart 二选一）；非 TTY 缺参 → 退出码 2；`java-version` 绑定无运行时的大版本 → 3 |
 | `link` | `mcsup server link <path> [--name <name>] [--workspace <ws>]` | 注册服务器目录：外部目录建符号链接进工作区（目标不能在任一工作区 `servers/` 内）；目标是某工作区 `servers/` 的直接子目录时不建链接、就地注册（恢复注册丢失的服务器，名称必须与目录名一致，`--workspace` 必须与目录归属一致）；带 `mcsup.json` 时复用其身份 |
 | `remove` | `mcsup server remove <name> [--purge]` | 默认注销保留磁盘；交互下询问是否删除磁盘数据（默认不删），同意后红色警示并要求输入服务器名称确认；`--purge` 跳过询问直接删目录（链接服务器拒绝 `--purge`，仅移除链接）；非交互不询问 |
-| `version` | `mcsup server version <name>` | 当前安装的版本、校验和、来源 |
+| `version` | `mcsup server version <name>` | 当前安装的版本、变体、来源（provider 名）、核心大小与校验和；未安装核心提示 `server install` |
 
 ### 内部入口（隐藏）
 
@@ -88,7 +89,7 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 
 ### server set（服务属性）
 
-属性键统一 kebab-case，随领域扩展追加；设置会校验并持久化，非法值报用法错误。
+属性键统一 kebab-case，随领域扩展追加；设置会校验并持久化，非法值报用法错误（2），`java-version` 绑定无已注册运行时的大版本报缺资源（3）。`ram` 规范化后展示（如 `2G` → `2048M`）；`start` 时优先级为显式选项 > 服务属性 > 平台默认。
 
 | 键 | 值 | 说明 |
 | --- | --- | --- |

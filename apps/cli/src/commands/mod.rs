@@ -1,7 +1,9 @@
 mod install;
 mod java;
 mod lifecycle;
+mod props;
 mod server_ops;
+mod settings;
 mod workspace;
 
 use crate::cli::{Cli, Command, JavaAction, ServerAction};
@@ -103,15 +105,17 @@ async fn server(action: ServerAction, cfg: &Config, printer: Printer) -> Result<
         ServerAction::Console { name } => lifecycle::console(&name, printer),
         ServerAction::Send { name, command } => lifecycle::send(&name, &command, printer),
         ServerAction::Logs { name, tail, follow } => lifecycle::logs(&name, tail, follow, printer),
-        ServerAction::Props { .. } => err("props"),
-        ServerAction::Set { .. } => err("set"),
+        ServerAction::Props { name, kv } => props::run(&name, &kv, printer),
+        ServerAction::Set { name, key, value } => {
+            settings::set(&name, key.as_deref(), value.as_deref(), printer)
+        }
         ServerAction::Remove { name, purge } => server_ops::remove(&name, purge, printer),
         ServerAction::Link {
             ref path,
             ref name,
             ref workspace,
         } => server_ops::link(path, name.as_deref(), workspace.as_deref(), printer),
-        ServerAction::Version { .. } => err("version"),
+        ServerAction::Version { name } => settings::version(&name, printer),
         ServerAction::Backup { .. } => err("backup"),
         ServerAction::Mod { .. } => err("mod"),
     }

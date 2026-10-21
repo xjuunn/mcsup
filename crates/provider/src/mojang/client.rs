@@ -55,6 +55,10 @@ impl ServerJarSource for MojangSource {
         ServerVariant::Vanilla
     }
 
+    fn name(&self) -> &'static str {
+        "mojang"
+    }
+
     async fn versions(&self) -> Result<Vec<ServerVersion>, SourceError> {
         let manifest = self.manifest().await?;
         Ok(manifest.versions.into_iter().map(into_version).collect())

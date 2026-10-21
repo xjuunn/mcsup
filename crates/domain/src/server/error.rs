@@ -34,3 +34,29 @@ pub struct UnknownVariant {
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("unknow checksum algorithm: {0}")]
 pub struct UnknownChecksumAlgorithm(pub String);
+
+/// 属性键非法（空 / 含 `=` 或换行）
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("invalid property key: {raw:?}")]
+pub struct InvalidPropertyKey {
+    pub raw: String,
+}
+
+/// 属性值非法（含换行）
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("invalid property value of {key}: {value:?}")]
+pub struct InvalidPropertyValue {
+    pub key: String,
+    pub value: String,
+}
+
+/// `server.properties` 写入失败：键或值不满足写入规则
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum PropertySetError {
+    /// 键非法
+    #[error(transparent)]
+    Key(#[from] InvalidPropertyKey),
+    /// 值非法
+    #[error(transparent)]
+    Value(#[from] InvalidPropertyValue),
+}

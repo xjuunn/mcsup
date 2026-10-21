@@ -1,7 +1,9 @@
 mod fs_error;
 mod java;
 mod lifecycle;
+mod props;
 mod registry;
+mod settings;
 mod util;
 mod workspace;
 
@@ -15,9 +17,11 @@ pub use lifecycle::{
 };
 /// Java 源聚合端口（定义在 `port`，此处转出便于既有调用方）
 pub use port::JavaSourceRegistryPort;
+pub use props::{PropsError, PropsReport, ServerPropsService};
 pub use registry::{
     InstallJarError, InstalledServerJar, RegisteredServer, ServerRegistry, ServerRegistryError,
 };
+pub use settings::{ServerSettingsService, SettingChange, SettingsError};
 pub use workspace::{
     DoctorFinding, DoctorLevel, InitOutcome, MARKER_FILE, NOISE_ENTRIES, WorkspaceError,
     WorkspaceService, absolute_path,
@@ -133,6 +137,10 @@ mod tests {
     impl ServerJarSource for FakeSource {
         fn variant(&self) -> domain::server::version::ServerVariant {
             domain::server::version::ServerVariant::Vanilla
+        }
+
+        fn name(&self) -> &'static str {
+            "fake"
         }
 
         async fn versions(

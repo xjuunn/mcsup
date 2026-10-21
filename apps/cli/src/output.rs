@@ -161,6 +161,12 @@ impl Printer {
             if let Some(life) = cause.downcast_ref::<mcsup::service::LifecycleError>() {
                 return lifecycle_exit_code(life);
             }
+            if let Some(props) = cause.downcast_ref::<mcsup::service::PropsError>() {
+                return props_exit_code(props);
+            }
+            if let Some(settings) = cause.downcast_ref::<mcsup::service::SettingsError>() {
+                return settings_exit_code(settings);
+            }
             if let Some(jar) = cause.downcast_ref::<mcsup::service::InstallJarError>() {
                 return match jar {
                     mcsup::service::InstallJarError::Registry(reg) => registry_exit_code(reg),
@@ -223,10 +229,32 @@ fn lifecycle_exit_code(err: &mcsup::service::LifecycleError) -> u8 {
         Life::Registry(reg) => registry_exit_code(reg),
         Life::Java(java) => java_exit_code(java),
         Life::Supervisor(_) => 5,
-        Life::NoJar { .. } | Life::NoJava => 3,
+        Life::NoJar { .. } | Life::NoJava | Life::UnknownJavaMajor { .. } => 3,
         Life::EulaRequired => 2,
         Life::AlreadyRunning | Life::NotRunning => 4,
         // StopTimedOut / Io 与未来新增变体：通用 1
+        _ => 1,
+    }
+}
+
+/// 属性文件判级：键 / 值非法 2（用法）、缺服务器 3、IO 失败 1
+fn props_exit_code(err: &mcsup::service::PropsError) -> u8 {
+    use mcsup::service::PropsError as Props;
+    match err {
+        Props::Registry(reg) => registry_exit_code(reg),
+        Props::InvalidSet(_) => 2,
+        _ => 1,
+    }
+}
+
+/// 服务属性判级：值非法 2（用法）、大版本未注册 / 缺服务器 3、其余 1
+fn settings_exit_code(err: &mcsup::service::SettingsError) -> u8 {
+    use mcsup::service::SettingsError as Set;
+    match err {
+        Set::Registry(reg) => registry_exit_code(reg),
+        Set::Java(java) => java_exit_code(java),
+        Set::InvalidValue(_) => 2,
+        Set::UnknownJavaMajor { .. } => 3,
         _ => 1,
     }
 }
@@ -311,7 +339,7 @@ struct InstalledJson {
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn human_bytes(n: u64) -> String {
+pub(crate) fn human_bytes(n: u64) -> String {
     const KIB: u64 = 1 << 10;
     const MIB: u64 = 1 << 20;
     const GIB: u64 = 1 << 30;

@@ -5,5 +5,7 @@ pub mod eula;
 pub mod event;
 pub mod layout;
 pub mod meta;
+pub mod props;
+pub mod settings;
 pub mod status;
 pub mod version;

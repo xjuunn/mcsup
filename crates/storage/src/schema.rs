@@ -25,6 +25,9 @@ diesel::table! {
         checksum -> Nullable<Text>,
         created_at -> BigInt,
         updated_at -> BigInt,
+        java_major -> Nullable<BigInt>,
+        ram_mib -> Nullable<Integer>,
+        autostart -> Bool,
     }
 }
 

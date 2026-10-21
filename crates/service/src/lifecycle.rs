@@ -74,6 +74,16 @@ pub enum LifecycleError {
     /// 本机没有可用 Java 运行时
     #[error("未发现可用 Java 运行时，可执行 mcsup java install 安装")]
     NoJava,
+    /// 绑定的大版本没有任何已注册运行时
+    #[error(
+        "服务器 {name} 绑定的 Java 大版本 {major} 无已注册运行时，可执行 mcsup java install {major} 安装"
+    )]
+    UnknownJavaMajor {
+        /// 服务器名
+        name: String,
+        /// 未注册的大版本
+        major: domain::java::JavaMajor,
+    },
     /// 服务器已在运行
     #[error("服务器已在运行")]
     AlreadyRunning,
@@ -163,17 +173,16 @@ impl ServerLifecycleService {
 
         ensure_eula(&server.dir, opts.accept_eula)?;
 
+        let settings = server.meta.settings;
         let runtimes = self.java.list_or_scan(on_first_scan, on_found)?;
-        let runtime = runtimes
-            .into_iter()
-            .max_by_key(|rt| rt.major.as_i16())
-            .ok_or(LifecycleError::NoJava)?;
+        let runtime = pick_runtime(&runtimes, settings.java_major, name)?;
 
         let request = SupervisorStartRequest {
             server_dir: server.dir.clone(),
             java_bin: java_bin_under(&runtime.path),
             jar_path,
-            ram_mib: Some(opts.ram_mib.unwrap_or(DEFAULT_RAM_MIB)),
+            // 优先级：显式选项 > 服务属性（server set ram）> 平台默认
+            ram_mib: Some(opts.ram_mib.or(settings.ram_mib).unwrap_or(DEFAULT_RAM_MIB)),
             supervisor_exe: opts.supervisor_exe.clone(),
         };
         self.supervisor.start(request).map_err(|err| match err {
@@ -277,6 +286,27 @@ impl ServerLifecycleService {
             variant: server.meta.variant.as_str().to_owned(),
             status: self.supervisor.status(&server.dir)?,
         })
+    }
+}
+
+/// Java 选择：`server set java-version` 绑定大版本时取该版本的运行时，
+/// 未绑定取已注册运行时中的最高大版本
+fn pick_runtime<'a>(
+    runtimes: &'a [domain::java::JavaRuntime],
+    bound: Option<domain::java::JavaMajor>,
+    name: &str,
+) -> Result<&'a domain::java::JavaRuntime, LifecycleError> {
+    match bound {
+        Some(major) => runtimes.iter().find(|rt| rt.major == major).ok_or_else(|| {
+            LifecycleError::UnknownJavaMajor {
+                name: name.to_owned(),
+                major,
+            }
+        }),
+        None => runtimes
+            .iter()
+            .max_by_key(|rt| rt.major.as_i16())
+            .ok_or(LifecycleError::NoJava),
     }
 }
 
@@ -464,6 +494,21 @@ mod tests {
                 .find(|m| m.name == *name)
                 .ok_or_else(|| RepositoryError::NotFound(name.as_str().to_owned()))?;
             meta.jar = Some(jar.clone());
+            meta.updated_at = updated_at;
+            Ok(meta.clone())
+        }
+        fn update_settings(
+            &self,
+            name: &domain::server::meta::ServerName,
+            settings: &domain::server::settings::ServerSettings,
+            updated_at: i64,
+        ) -> Result<domain::server::meta::ServerMeta, RepositoryError> {
+            let mut items = self.items.lock().expect("lock");
+            let meta = items
+                .iter_mut()
+                .find(|m| m.name == *name)
+                .ok_or_else(|| RepositoryError::NotFound(name.as_str().to_owned()))?;
+            meta.settings = *settings;
             meta.updated_at = updated_at;
             Ok(meta.clone())
         }
@@ -968,6 +1013,124 @@ mod tests {
             request.supervisor_exe,
             PathBuf::from("/usr/local/bin/mcsup")
         );
+    }
+
+    /// `server set java-version`：绑定大版本时只在该版本内选运行时
+    #[test]
+    fn start_honors_bound_java_major() {
+        let fixture = Fixture::new(true);
+        let runtimes = vec![
+            runtime(Path::new("/opt/java17"), 17),
+            runtime(Path::new("/opt/java21"), 21),
+        ];
+        fixture
+            .registry
+            .update_settings(
+                &fixture.name,
+                &domain::server::settings::ServerSettings {
+                    java_major: Some(JavaMajor::parse(17).expect("17")),
+                    ram_mib: None,
+                    autostart: false,
+                },
+            )
+            .expect("settings");
+        let supervisor = Arc::new(FakeSupervisor::default());
+        let svc = service(
+            &fixture,
+            java_service(MemJavaRepo::new(runtimes, true), vec![]),
+            Arc::clone(&supervisor),
+        );
+
+        start(&svc, &fixture.name, true).expect("start");
+
+        let requests = supervisor.starts();
+        assert_eq!(
+            requests[0].java_bin,
+            java_bin_under(Path::new("/opt/java17"))
+        );
+    }
+
+    /// 绑定的大版本没有运行时：start 报 UnknownJavaMajor（而不是静默降级）
+    #[test]
+    fn start_reports_unknown_java_major_when_bound_runtime_missing() {
+        let fixture = Fixture::new(true);
+        fixture
+            .registry
+            .update_settings(
+                &fixture.name,
+                &domain::server::settings::ServerSettings {
+                    java_major: Some(JavaMajor::parse(17).expect("17")),
+                    ram_mib: None,
+                    autostart: false,
+                },
+            )
+            .expect("settings");
+        let supervisor = Arc::new(FakeSupervisor::default());
+        let svc = service(
+            &fixture,
+            java_service(
+                MemJavaRepo::new(vec![runtime(Path::new("/opt/java21"), 21)], true),
+                vec![],
+            ),
+            Arc::clone(&supervisor),
+        );
+
+        let err = start(&svc, &fixture.name, true).expect_err("must fail");
+        assert!(
+            matches!(err, LifecycleError::UnknownJavaMajor { .. }),
+            "{err:?}"
+        );
+        assert!(supervisor.starts().is_empty());
+    }
+
+    /// `server set ram`：服务属性定堆上限；显式选项优先于属性
+    #[test]
+    fn start_honors_ram_setting_and_opts_override_it() {
+        let fixture = Fixture::new(true);
+        fixture
+            .registry
+            .update_settings(
+                &fixture.name,
+                &domain::server::settings::ServerSettings {
+                    java_major: None,
+                    ram_mib: Some(4096),
+                    autostart: false,
+                },
+            )
+            .expect("settings");
+        let supervisor = Arc::new(FakeSupervisor::default());
+        let svc = service(
+            &fixture,
+            java_service(
+                MemJavaRepo::new(vec![runtime(Path::new("/opt/java21"), 21)], true),
+                vec![],
+            ),
+            Arc::clone(&supervisor),
+        );
+
+        start(&svc, &fixture.name, true).expect("start");
+        assert_eq!(supervisor.starts()[0].ram_mib, Some(4096));
+
+        // 显式 StartOptions 覆盖属性（首个 start 已把假监督器置为运行中，
+        // 换一套监督器验证覆盖关系）
+        let explicit = StartOptions {
+            accept_eula: true,
+            ram_mib: Some(512),
+            supervisor_exe: PathBuf::from("/usr/local/bin/mcsup"),
+        };
+        let explicit_supervisor = Arc::new(FakeSupervisor::default());
+        let explicit_svc = service(
+            &fixture,
+            java_service(
+                MemJavaRepo::new(vec![runtime(Path::new("/opt/java21"), 21)], true),
+                vec![],
+            ),
+            Arc::clone(&explicit_supervisor),
+        );
+        explicit_svc
+            .start(&fixture.name, &explicit, &mut || {}, &mut |_| {})
+            .expect("start");
+        assert_eq!(explicit_supervisor.starts()[0].ram_mib, Some(512));
     }
 
     #[test]

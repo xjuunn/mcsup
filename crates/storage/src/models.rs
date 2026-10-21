@@ -2,6 +2,7 @@ use diesel::prelude::*;
 use domain::java::{JavaMajor, JavaRuntime, JavaVendor};
 use domain::server::artifact::{Checksum, ChecksumAlgorithm};
 use domain::server::meta::{InstalledJar, ServerId, ServerMeta, ServerName};
+use domain::server::settings::ServerSettings;
 use domain::server::version::{ServerVariant, VersionId};
 use domain::workspace::{Workspace, WorkspaceId, WorkspaceName};
 use port::RepositoryError;
@@ -48,6 +49,9 @@ pub(crate) struct ServerRow {
     pub(crate) checksum: Option<String>,
     pub(crate) created_at: i64,
     pub(crate) updated_at: i64,
+    pub(crate) java_major: Option<i64>,
+    pub(crate) ram_mib: Option<i32>,
+    pub(crate) autostart: bool,
 }
 
 /// 核心元数据变更集：只更新这几列，不动身份 / 归属 / `created_at`
@@ -58,6 +62,16 @@ pub(crate) struct JarChangeset {
     pub(crate) jar_size: i64,
     pub(crate) checksum_algo: String,
     pub(crate) checksum: String,
+    pub(crate) updated_at: i64,
+}
+
+/// 服务属性变更集：只更新属性列，不动身份 / 归属 / 核心 / `created_at`
+#[derive(Debug, AsChangeset)]
+#[diesel(table_name = servers)]
+pub(crate) struct SettingsChangeset {
+    pub(crate) java_major: Option<i64>,
+    pub(crate) ram_mib: Option<i32>,
+    pub(crate) autostart: bool,
     pub(crate) updated_at: i64,
 }
 
@@ -140,6 +154,12 @@ impl From<&ServerMeta> for ServerRow {
             checksum,
             created_at: meta.created_at,
             updated_at: meta.updated_at,
+            java_major: meta.settings.java_major.map(JavaMajor::as_i64),
+            ram_mib: meta
+                .settings
+                .ram_mib
+                .and_then(|mib| i32::try_from(mib).ok()),
+            autostart: meta.settings.autostart,
         }
     }
 }
@@ -173,6 +193,22 @@ impl TryFrom<ServerRow> for ServerMeta {
             }
         };
 
+        let java_major = match row.java_major {
+            Some(raw) => {
+                Some(JavaMajor::parse(raw).map_err(|err| corrupt("java major", raw, err))?)
+            }
+            None => None,
+        };
+        let ram_mib = match row.ram_mib {
+            Some(raw) => Some(u32::try_from(raw).map_err(|err| corrupt("ram_mib", raw, err))?),
+            None => None,
+        };
+        let settings = ServerSettings {
+            java_major,
+            ram_mib,
+            autostart: row.autostart,
+        };
+
         Ok(Self {
             id,
             name,
@@ -181,6 +217,7 @@ impl TryFrom<ServerRow> for ServerMeta {
             version: VersionId::new(row.version),
             variant,
             jar,
+            settings,
             created_at: row.created_at,
             updated_at: row.updated_at,
         })
