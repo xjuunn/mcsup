@@ -8,7 +8,8 @@ use crate::cli::{Cli, Command, JavaAction, ServerAction};
 use crate::config::Config;
 use crate::diagnostic::AppDiagnostic;
 use crate::output::Printer;
-use anyhow::{Context, Ok, Result};
+use anyhow::{Context, Result};
+use std::path::Path;
 
 pub(crate) async fn run(cli: Cli, cfg: &Config) -> Result<()> {
     let printer = Printer::new(cli.output);
@@ -118,4 +119,19 @@ async fn server(action: ServerAction, cfg: &Config, printer: Printer) -> Result<
 
 fn err(what: &str) -> Result<()> {
     Err(AppDiagnostic::not_implemented(what).into())
+}
+
+/// 目标目录包含当前工作目录时，先退出来
+///
+/// Windows 上进程的工作目录本身持有句柄，不退出来 `remove_dir_all` 必然失败
+/// （终端自己的工作目录无法由我们释放，只能让用户 cd 出去）。
+fn chdir_out_of(target: &Path) {
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    if !cwd.starts_with(target) {
+        return;
+    }
+    let outside = target.parent().filter(|p| !p.as_os_str().is_empty());
+    let _ = std::env::set_current_dir(outside.unwrap_or(Path::new(".")));
 }

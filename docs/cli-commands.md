@@ -77,7 +77,7 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | `props` | `mcsup server props <name> [key=value ...]` | 无参列出 `server.properties`；带参写入，改完提醒重启生效 |
 | `set` | `mcsup server set <name> <key> <value>` | 设置服务属性，见下表 |
 | `link` | `mcsup server link <path> [--name <name>] [--workspace <ws>]` | 注册服务器目录：外部目录建符号链接进工作区（目标不能在任一工作区 `servers/` 内）；目标是某工作区 `servers/` 的直接子目录时不建链接、就地注册（恢复注册丢失的服务器，名称必须与目录名一致，`--workspace` 必须与目录归属一致）；带 `mcsup.json` 时复用其身份 |
-| `remove` | `mcsup server remove <name> [--purge]` | 默认注销保留磁盘；`--purge` 连目录一起删（链接服务器拒绝 `--purge`，仅移除链接） |
+| `remove` | `mcsup server remove <name> [--purge]` | 默认注销保留磁盘；交互下询问是否删除磁盘数据（默认不删），同意后红色警示并要求输入服务器名称确认；`--purge` 跳过询问直接删目录（链接服务器拒绝 `--purge`，仅移除链接）；非交互不询问 |
 | `version` | `mcsup server version <name>` | 当前安装的版本、校验和、来源 |
 
 ### 内部入口（隐藏）

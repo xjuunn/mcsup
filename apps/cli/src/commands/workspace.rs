@@ -295,7 +295,7 @@ fn remove(svc: &WorkspaceService, name: &str, purge: bool, printer: Printer) -> 
     if purge {
         // 自身工作目录在目标里时我们自己也持有句柄，先退到目标之外；
         // 终端的工作目录不由我们释放，那种情况只能提示用户 cd 出去
-        chdir_out_of(&ws.path);
+        super::chdir_out_of(&ws.path);
     }
     let ws = svc.remove(name, purge)?;
     printer.print_outcome(
@@ -317,21 +317,6 @@ fn remove(svc: &WorkspaceService, name: &str, purge: bool, printer: Printer) -> 
         printer.print_section(&format!("当前工作区已移交给 {}", cur.name));
     }
     Ok(())
-}
-
-/// 目标目录包含当前工作目录时，先退出来
-///
-/// Windows 上进程的工作目录本身持有句柄，不退出来 `remove_dir_all` 必然失败
-/// （终端自己的工作目录无法由我们释放，只能让用户 cd 出去）。
-fn chdir_out_of(target: &Path) {
-    let Ok(cwd) = std::env::current_dir() else {
-        return;
-    };
-    if !cwd.starts_with(target) {
-        return;
-    }
-    let outside = target.parent().filter(|p| !p.as_os_str().is_empty());
-    let _ = std::env::set_current_dir(outside.unwrap_or(Path::new(".")));
 }
 
 fn doctor(reg: &ServerRegistry, printer: Printer) -> Result<()> {

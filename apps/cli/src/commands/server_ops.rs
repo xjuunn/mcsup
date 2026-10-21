@@ -336,23 +336,35 @@ pub(crate) fn remove(name: &str, purge: bool, printer: Printer) -> Result<()> {
     let srv = reg
         .get(name)
         .with_context(|| format!("服务器 {name} 不存在"))?;
-    let purge = if purge && srv.linked {
+    if purge && srv.linked {
         printer.print_warning(&format!(
             "{name} 是链接服务器，--purge 会拒绝执行（目标在工作区外，无法安全删除）"
         ));
-        true // 仍传给 service，由其拒绝并给出统一错误
-    } else if purge && !printer.is_interactive() {
-        true
-    } else if purge {
-        printer.print_warning(&format!(
-            "警告: 将永久删除 {} ({}) 目录及其中所有文件，此操作无法恢复",
-            name,
-            srv.dir.display()
-        ));
-        prompts::confirm_yes(&format!("删除 {name} 的磁盘数据?"), false).context("已取消删除")?
+        // 仍传给 service，由其拒绝并给出统一错误
+    }
+    // 删了不可恢复：可交互时问一句，默认不删；`--purge` 是显式指令，不再问
+    let purge = if purge || !printer.is_interactive() {
+        purge
     } else {
-        false
+        let confirmed = prompts::confirm_yes(
+            &format!("删除 {name} ({}) 的磁盘数据?", srv.dir.display()),
+            false,
+        )
+        .context("已取消注销")?;
+        if confirmed {
+            // 同意删盘后再上一道闸：红色警示 + 手输服务器名称，防误删存档与备份
+            printer.print_warning(&format!(
+                "警告: 将永久删除 {name} ({}) 中的所有存档、备份等文件，此操作无法恢复",
+                srv.dir.display()
+            ));
+            prompts::confirm_by_name(&format!("输入服务器名称 {name} 以确认删除"), name)?;
+        }
+        confirmed
     };
+    // 链接服务器不会真删目录，不必退出来
+    if purge && !srv.linked {
+        super::chdir_out_of(&srv.dir);
+    }
     let out = reg.remove(name, purge)?;
     printer.print_outcome(
         &if purge {
