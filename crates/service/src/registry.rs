@@ -43,6 +43,9 @@ pub enum ServerRegistryError {
     /// 目标位于某个工作区的 servers/ 子树内，禁止 link
     #[error("target is inside a workspace servers directory: {0}")]
     TargetInsideWorkspace(PathBuf),
+    /// 就地注册时 `--workspace` 指向了别的工作区（目录物理归属不可改）
+    #[error("target belongs to workspace `{owner}` but --workspace resolved to `{selected}`")]
+    WorkspaceMismatch { owner: String, selected: String },
 }
 
 /// 服务端核心安装失败（注册表定位 + 下载编排）
@@ -189,16 +192,20 @@ impl ServerRegistry {
         })
     }
 
-    /// 把外部服务器目录链接进工作目录并注册
+    /// 把服务器目录注册进工作区：外部目录建符号链接，工作区内目录就地注册
     ///
-    /// 在 `<ws>/servers/<name>` 建指向 `target` 的符号链接。`target` 不能位于
-    /// 任何工作区的 `servers/` 子树内（防环）。目标目录带合法 `mcsup.json`
-    /// 时复用其 id，否则写入新 id。注册表写失败时回滚符号链接。
+    /// 外部目标在 `<ws>/servers/<name>` 建指向 `target` 的符号链接，
+    /// `target` 不能位于任何工作区的 `servers/` 子树内（防环）。目标是某工作区
+    /// `servers/` 的直接子目录时不建链接、直接就地注册——恢复「目录还在、
+    /// 注册已删」的服务器；名称一律以目录名为准，与 `--name` 或 marker 名
+    /// 不一致时直接拒绝，不做猜测。更深的子树仍拒绝（`rel_dir` 只有单层）。
+    /// 目标目录带合法 `mcsup.json` 时复用其 id，否则写入新 id。符号链接
+    /// 路径上注册表写失败时回滚链接。
     ///
     /// # Errors
     ///
-    /// 名称冲突、目标在工作区内、marker 损坏 / id 已注册、IO / 注册表失败时
-    /// 返回 [`ServerRegistryError`]
+    /// 名称冲突、目标在工作区内、`--workspace` 与目录归属不一致、marker 损坏 /
+    /// id 已注册、IO / 注册表失败时返回 [`ServerRegistryError`]
     pub fn link(
         &self,
         target: &Path,
@@ -213,6 +220,10 @@ impl ServerRegistry {
                 target.clone(),
                 "target is not a directory",
             )));
+        }
+        // 工作区内 servers/ 的直接子目录：就地注册（不建符号链接）
+        if let Some(owner) = self.in_place_owner(&target)? {
+            return self.register_in_place(target, name, workspace_selector, &owner, now);
         }
         self.reject_target_inside_workspace_servers(&target)?;
 
@@ -392,7 +403,9 @@ impl ServerRegistry {
                             level: DoctorLevel::Warning,
                             workspace: Some(ws_name.clone()),
                             message: format!(
-                                "on disk but not registered: {} (run `server create` or remove it)",
+                                "on disk but not registered: {} \
+                                 (run `server link {}` to re-register it, or remove it)",
+                                path.display(),
                                 path.display()
                             ),
                         });
@@ -566,6 +579,126 @@ impl ServerRegistry {
         }
         Ok(())
     }
+
+    /// 目标是某个工作区 `servers/` 的直接子目录时返回该工作区
+    ///
+    /// 只认直接子目录：更深的子树无法用单层 `rel_dir` 表达，仍交给防环拒绝。
+    fn in_place_owner(&self, target: &Path) -> Result<Option<Workspace>, ServerRegistryError> {
+        for ws in self.workspaces.list()? {
+            let servers_dir = ws.path.join("servers");
+            // target 已 canonicalize；servers_dir 同口径比较，避免前缀 / 大小写误判
+            let servers_dir = std::fs::canonicalize(&servers_dir).unwrap_or(servers_dir);
+            if target.parent() == Some(servers_dir.as_path()) {
+                return Ok(Some(ws));
+            }
+        }
+        Ok(None)
+    }
+
+    /// 就地注册工作区内目录：目录存在但注册缺失时经 `server link` 恢复
+    ///
+    /// 不建符号链接、不搬动目录，只补一条注册行。名称一律以目录名为准——
+    /// `rel_dir` 必须与磁盘目录名一致，否则 doctor 盘点与目录推导都会错位；
+    /// `--name` 与目录名不一致、marker 名与目录名不一致时拒绝，不猜测意图。
+    /// marker 的 id 已被占用时同样拒绝，防止一个 id 两个目录。
+    fn register_in_place(
+        &self,
+        target: PathBuf,
+        name: Option<&str>,
+        workspace_selector: Option<&str>,
+        owner: &Workspace,
+        now: i64,
+    ) -> Result<LinkedServer, ServerRegistryError> {
+        // 目录物理归属不可改：--workspace 只能与归属一致
+        if let Some(sel) = workspace_selector {
+            let selected = self.resolve_workspace(Some(sel))?;
+            if selected.id != owner.id {
+                return Err(ServerRegistryError::WorkspaceMismatch {
+                    owner: owner.name.as_str().to_owned(),
+                    selected: selected.name.as_str().to_owned(),
+                });
+            }
+        }
+        let dir_name = in_place_dir_name(&target, name)?;
+        if self.servers.get(&dir_name).is_ok() {
+            return Err(ServerRegistryError::AlreadyExists(
+                dir_name.as_str().to_owned(),
+            ));
+        }
+        let marker = read_server_marker(&target)?;
+        let id = self.in_place_id(&target, &dir_name, marker.as_ref())?;
+        let meta = ServerMeta {
+            id,
+            name: dir_name.clone(),
+            workspace_id: owner.id.clone(),
+            rel_dir: PathBuf::from(dir_name.as_str()),
+            version: VersionId::new("unknown"),
+            variant: ServerVariant::Unknown,
+            jar: None,
+            created_at: now,
+            updated_at: now,
+        };
+        self.servers.create(&meta)?;
+        Ok(LinkedServer {
+            server: RegisteredServer {
+                meta,
+                dir: target.clone(),
+                linked: false,
+            },
+            target,
+        })
+    }
+
+    /// marker 的 id 复用与冲突检查：无 marker 写入新 id；marker 名与目录名
+    /// 不一致、id 已被占用时拒绝，防止一个 id 两个目录
+    fn in_place_id(
+        &self,
+        target: &Path,
+        dir_name: &ServerName,
+        marker: Option<&ServerMarkerJson>,
+    ) -> Result<ServerId, ServerRegistryError> {
+        let Some(m) = marker else {
+            let id = ServerId::parse(&uuid::Uuid::new_v4().to_string()).map_err(|err| {
+                ServerRegistryError::marker(target.join(SERVER_MARKER), err.to_string())
+            })?;
+            write_server_marker(
+                target,
+                &ServerMarkerJson {
+                    schema: SERVER_MARKER_SCHEMA,
+                    id: id.as_str().to_owned(),
+                    name: dir_name.as_str().to_owned(),
+                },
+            )?;
+            return Ok(id);
+        };
+        let id = ServerId::parse(&m.id).map_err(|err| {
+            ServerRegistryError::marker(target.join(SERVER_MARKER), err.to_string())
+        })?;
+        if self
+            .servers
+            .list()?
+            .iter()
+            .any(|existing| existing.id == id)
+        {
+            return Err(ServerRegistryError::AlreadyExists(
+                dir_name.as_str().to_owned(),
+            ));
+        }
+        let marker_name = ServerName::parse(&m.name)?;
+        if marker_name != *dir_name {
+            return Err(ServerRegistryError::marker(
+                target.join(SERVER_MARKER),
+                format!(
+                    "marker name `{}` does not match directory name `{}`; \
+                     fix {} or rename the directory first",
+                    marker_name.as_str(),
+                    dir_name.as_str(),
+                    SERVER_MARKER
+                ),
+            ));
+        }
+        Ok(id)
+    }
 }
 
 fn write_server_marker(dir: &Path, marker: &ServerMarkerJson) -> Result<(), ServerRegistryError> {
@@ -573,6 +706,37 @@ fn write_server_marker(dir: &Path, marker: &ServerMarkerJson) -> Result<(), Serv
     let text = serde_json::to_string_pretty(marker)
         .map_err(|err| ServerRegistryError::marker(path.clone(), err.to_string()))?;
     std::fs::write(&path, text).map_err(|err| ServerRegistryError::io(&path, err))
+}
+
+/// 就地注册的名称口径：以目录名为准，`--name` 不一致时拒绝
+///
+/// `rel_dir` 必须与磁盘目录名一致，否则 doctor 盘点与目录推导都会错位。
+fn in_place_dir_name(target: &Path, name: Option<&str>) -> Result<ServerName, ServerRegistryError> {
+    let dir_name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or_else(|| {
+            ServerRegistryError::Fs(FsError::marker(
+                target.to_path_buf(),
+                "cannot derive server name from path",
+            ))
+        })?;
+    let dir_name = ServerName::parse(&dir_name)?;
+    if let Some(raw) = name {
+        let requested = ServerName::parse(raw)?;
+        if requested != dir_name {
+            return Err(ServerRegistryError::Fs(FsError::marker(
+                target.to_path_buf(),
+                format!(
+                    "--name `{}` does not match directory name `{}`; \
+                     in-place registration must use the directory name",
+                    requested.as_str(),
+                    dir_name.as_str()
+                ),
+            )));
+        }
+    }
+    Ok(dir_name)
 }
 
 /// 读取 `mcsup.json`；不存在返回 `Ok(None)`，损坏返回错误
@@ -901,13 +1065,26 @@ mod tests {
         assert_eq!(names, ["alpha", "beta"]);
     }
 
-    /// 仅供 link 系测试（软链在 Unix 上才有意义）
-    #[cfg(unix)]
+    /// 工作区注册表 fixture：当前工作区 `ws01`，路径 `<root>/ws`
     fn registry_with_ws(root: &Path) -> ServerRegistry {
         ServerRegistry::new(
             Arc::new(MemServers::new()),
             Arc::new(MemWorkspaces::new(ws_fixture(root))),
         )
+    }
+
+    /// 第二个工作区 fixture：非当前，路径 `<root>/ws2`
+    fn ws2_fixture(root: &Path) -> Workspace {
+        let path = root.join("ws2");
+        std::fs::create_dir_all(path.join("servers")).expect("mkdir");
+        Workspace {
+            id: WorkspaceId::parse("550e8400-e29b-41d4-a716-446655440002").expect("uuid"),
+            name: WorkspaceName::parse("ws02").expect("valid"),
+            path,
+            is_current: false,
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+        }
     }
 
     #[cfg(unix)]
@@ -934,16 +1111,151 @@ mod tests {
         assert!(out.server.dir.join("mcsup.json").is_file());
     }
 
-    #[cfg(unix)]
+    /// 直接子目录：就地注册，不建符号链接
     #[test]
-    fn link_rejects_target_inside_servers_dir() {
+    fn link_registers_in_place_for_direct_child() {
         let tmp = tempfile::tempdir().expect("tmp");
         let reg = registry_with_ws(tmp.path());
-        let inside = tmp.path().join("ws/servers/nested");
-        std::fs::create_dir_all(&inside).expect("mkdir");
+        let dir = tmp.path().join("ws/servers/nested");
+        std::fs::create_dir_all(&dir).expect("mkdir");
 
-        let err = reg.link(&inside, Some("nested"), None).expect_err("reject");
+        let out = reg.link(&dir, None, None).expect("in-place");
+
+        assert_eq!(out.server.meta.name.as_str(), "nested");
+        assert_eq!(out.server.meta.rel_dir, Path::new("nested"));
+        assert!(!out.server.linked);
+        assert_eq!(out.target, std::fs::canonicalize(&dir).expect("canonical"));
+        assert!(dir.join("mcsup.json").is_file());
+        assert!(
+            !dir.symlink_metadata()
+                .expect("meta")
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    /// 恢复场景：create → 注销（磁盘保留）→ link 补回注册并复用 marker 身份
+    #[test]
+    fn link_in_place_reuses_id_after_unregister() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let reg = registry_with_ws(tmp.path());
+        let created = reg
+            .create(
+                None,
+                "test",
+                &VersionId::new("1.21.1"),
+                ServerVariant::Vanilla,
+            )
+            .expect("create");
+        reg.remove("test", false).expect("unregister");
+
+        let out = reg.link(&created.dir, None, None).expect("recover");
+
+        assert_eq!(out.server.meta.id, created.meta.id);
+        assert_eq!(out.server.meta.rel_dir, Path::new("test"));
+        assert_eq!(out.server.meta.version.as_str(), "unknown");
+        assert!(!out.server.linked);
+        assert!(created.dir.is_dir());
+    }
+
+    /// 重复就地注册：名称已入库即冲突
+    #[test]
+    fn link_in_place_twice_is_already_exists() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let reg = registry_with_ws(tmp.path());
+        let dir = tmp.path().join("ws/servers/nested");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        reg.link(&dir, None, None).expect("first");
+
+        let err = reg.link(&dir, None, None).expect_err("reject");
+        assert!(matches!(err, ServerRegistryError::AlreadyExists(_)));
+    }
+
+    /// 目录归属不可改：--workspace 指向别的工作区时拒绝
+    #[test]
+    fn link_in_place_rejects_foreign_workspace_selector() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let ws01 = ws_fixture(tmp.path());
+        let dir = ws01.path.join("servers").join("nested");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let store = Arc::new(MemWorkspaces::new(ws01));
+        store.create(&ws2_fixture(tmp.path())).expect("second ws");
+        let reg = ServerRegistry::new(Arc::new(MemServers::new()), store);
+
+        let err = reg.link(&dir, None, Some("ws02")).expect_err("reject");
+        assert!(matches!(err, ServerRegistryError::WorkspaceMismatch { .. }));
+    }
+
+    /// `--name` 与目录名不一致时拒绝：`rel_dir` 必须与磁盘一致
+    #[test]
+    fn link_in_place_rejects_name_not_matching_dir() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let reg = registry_with_ws(tmp.path());
+        let dir = tmp.path().join("ws/servers/nested");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let err = reg.link(&dir, Some("other"), None).expect_err("reject");
+        assert!(matches!(err, ServerRegistryError::Fs(_)));
+        assert!(reg.list().expect("list").is_empty());
+    }
+
+    /// marker 名与目录名不一致时拒绝：不猜哪个是真实身份
+    #[test]
+    fn link_in_place_rejects_marker_name_mismatch() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let reg = registry_with_ws(tmp.path());
+        let dir = tmp.path().join("ws/servers/nested");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("mcsup.json"),
+            r#"{"schema":1,"id":"550e8400-e29b-41d4-a716-446655440009","name":"oldname"}"#,
+        )
+        .expect("marker");
+
+        let err = reg.link(&dir, None, None).expect_err("reject");
+        assert!(matches!(err, ServerRegistryError::Fs(_)));
+        assert!(reg.list().expect("list").is_empty());
+    }
+
+    /// marker id 已被别的服务器占用时拒绝：一个 id 不能对应两个目录
+    #[test]
+    fn link_in_place_rejects_registered_id() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let reg = registry_with_ws(tmp.path());
+        let taken = reg
+            .create(
+                None,
+                "taken",
+                &VersionId::new("1.21.1"),
+                ServerVariant::Vanilla,
+            )
+            .expect("create");
+        let dir = tmp.path().join("ws/servers/nested");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("mcsup.json"),
+            format!(
+                r#"{{"schema":1,"id":"{}","name":"nested"}}"#,
+                taken.meta.id.as_str()
+            ),
+        )
+        .expect("marker");
+
+        let err = reg.link(&dir, None, None).expect_err("reject");
+        assert!(matches!(err, ServerRegistryError::AlreadyExists(_)));
+    }
+
+    /// `servers/` 更深的子树仍拒绝：单层 `rel_dir` 表达不了，链接回去会成环
+    #[test]
+    fn link_rejects_target_below_servers_child() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let reg = registry_with_ws(tmp.path());
+        let deep = tmp.path().join("ws/servers/nested/deep");
+        std::fs::create_dir_all(&deep).expect("mkdir");
+
+        let err = reg.link(&deep, None, None).expect_err("reject");
         assert!(matches!(err, ServerRegistryError::TargetInsideWorkspace(_)));
+        assert!(reg.list().expect("list").is_empty());
     }
 
     #[cfg(unix)]

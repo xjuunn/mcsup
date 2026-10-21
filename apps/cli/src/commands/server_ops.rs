@@ -303,20 +303,29 @@ pub(crate) fn link(
     let selector = workspace_selector(workspace);
     let out = reg
         .link(path, name, selector.as_deref())
-        .with_context(|| format!("链接服务器目录 {} 失败", path.display()))?;
+        .with_context(|| format!("注册服务器目录 {} 失败", path.display()))?;
+    // 工作区内目录走就地注册（linked=false），外部目录才建符号链接
     printer.print_outcome(
-        &format!(
-            "已链接: {} → {}（目标 {}）",
-            out.server.meta.name,
-            out.server.dir.display(),
-            out.target.display()
-        ),
+        &if out.server.linked {
+            format!(
+                "已链接: {} → {}（目标 {}）",
+                out.server.meta.name,
+                out.server.dir.display(),
+                out.target.display()
+            )
+        } else {
+            format!(
+                "已注册工作区内目录: {} → {}（未建符号链接）",
+                out.server.meta.name,
+                out.server.dir.display()
+            )
+        },
         &CreateRow {
             name: out.server.meta.name.as_str(),
             version: out.server.meta.version.as_str(),
             variant: out.server.meta.variant.as_str(),
             path: out.server.dir.display().to_string(),
-            linked: Some(true),
+            linked: Some(out.server.linked),
         },
     )
 }
