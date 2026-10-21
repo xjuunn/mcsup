@@ -404,7 +404,7 @@ impl LogWatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use domain::java::{JavaMajor, JavaRuntime, JavaVendor};
+    use domain::java::{JavaMajor, JavaRuntime, JavaVendor, java_bin_under};
     use domain::server::artifact::{Checksum, ChecksumAlgorithm};
     use domain::server::meta::InstalledJar;
     use domain::server::version::{ServerVariant, VersionId};
@@ -962,7 +962,7 @@ mod tests {
         let request = &requests[0];
         assert_eq!(request.server_dir, fixture.server_dir);
         assert_eq!(request.jar_path, fixture.server_dir.join("server.jar"));
-        assert_eq!(request.java_bin, PathBuf::from("/opt/java21/bin/java"));
+        assert_eq!(request.java_bin, java_bin_under(Path::new("/opt/java21")));
         assert_eq!(request.ram_mib, Some(DEFAULT_RAM_MIB));
         assert_eq!(
             request.supervisor_exe,

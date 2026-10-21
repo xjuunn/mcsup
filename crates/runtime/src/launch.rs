@@ -37,15 +37,20 @@ pub(crate) fn build_command(launch: &MinecraftLaunch) -> Command {
 
 /// 拉起服务端进程：stdin 管控制台，stdout / stderr 管道交给 supervisor 收集
 ///
+/// 进程脱离终端运行（[`crate::process::detach`]）：服务端完全后台，Windows 上
+/// 不为 JVM 新建控制台窗口，终端关闭也不带走服务端。
+///
 /// # Errors
 ///
 /// 进程创建失败（java 不存在、权限不足等）时返回底层错误
 pub(crate) fn spawn_minecraft(launch: &MinecraftLaunch) -> std::io::Result<Child> {
-    build_command(launch)
+    let mut command = build_command(launch);
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    crate::process::detach(&mut command);
+    command.spawn()
 }
 
 #[cfg(test)]

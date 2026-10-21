@@ -279,6 +279,19 @@ pub(crate) fn status(name: &str, printer: Printer) -> Result<()> {
     }
 }
 
+/// 行内分离符：`Ctrl+D`(`U+0004`) / `Ctrl+Z`(`U+001A`)
+///
+/// Unix 的 EOF 由终端行规直接给出 `read_line` 的 0，行里不会出现这两个字符；
+/// Windows 没有 EOF 键，conhost 把它们当普通字符放进整行（回显 `^D`），
+/// 只能在数据里识别：否则永远等不到 EOF，控制字符还会被注入服务端 stdin。
+fn split_detach(line: &str) -> (&str, bool) {
+    let index = line.find(['\u{4}', '\u{1a}']);
+    match index {
+        Some(index) => (&line[..index], true),
+        None => (line, false),
+    }
+}
+
 /// `server console`：stdin 注入 + 实时输出，Ctrl+D 分离（服务器继续运行）
 ///
 /// 注入失败回显走 stderr：stdout 只留服务器输出。
@@ -297,8 +310,14 @@ pub(crate) fn console(name: &str, printer: Printer) -> Result<()> {
         return Err(LifecycleError::NotRunning.into());
     }
 
+    // Windows 无 EOF 键：Ctrl+D 随整行到达，必须回车才生效
+    let detach_hint = if cfg!(windows) {
+        "Ctrl+D 后回车分离"
+    } else {
+        "Ctrl+D 分离"
+    };
     printer.print_section(&format!(
-        "已附加 {name} 控制台（Ctrl+D 分离，服务器继续运行）"
+        "已附加 {name} 控制台（{detach_hint}，服务器继续运行）"
     ));
     let mut watch = service.log_watch(name)?;
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -312,17 +331,22 @@ pub(crate) fn console(name: &str, printer: Printer) -> Result<()> {
             loop {
                 line.clear();
                 match stdin.read_line(&mut line) {
-                    Ok(0) | Err(_) => break, // Ctrl+D 或读失败：只分离，不带走进程
+                    // EOF（Unix 行首 Ctrl+D、Windows Ctrl+Z 回车）或读失败：只分离，不带走进程
+                    Ok(0) | Err(_) => break,
                     Ok(_) => {
-                        let trimmed = line.trim_end();
-                        if trimmed.is_empty() {
-                            continue;
-                        }
-                        if let Err(err) = service.send_line(&name, trimmed) {
+                        let (text, detach) = split_detach(&line);
+                        let trimmed = text.trim_end();
+                        if !trimmed.is_empty()
+                            && let Err(err) = service.send_line(&name, trimmed)
+                        {
                             eprintln!("注入失败: {err}");
                             if matches!(err, LifecycleError::NotRunning) {
                                 break;
                             }
+                        }
+                        // Windows 的 Ctrl+D / Ctrl+Z 以字面字符随行到达，按分离处理
+                        if detach {
+                            break;
                         }
                     }
                 }
@@ -410,7 +434,7 @@ fn fmt_uptime(secs: Option<u64>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::fmt_uptime;
+    use super::{fmt_uptime, split_detach};
 
     #[test]
     fn uptime_formats_by_scale() {
@@ -421,5 +445,16 @@ mod tests {
         assert_eq!(fmt_uptime(Some(200)), "3m20s");
         assert_eq!(fmt_uptime(Some(3600)), "1h0m");
         assert_eq!(fmt_uptime(Some(3725)), "1h2m");
+    }
+
+    /// Windows 无 EOF 键：Ctrl+D / Ctrl+Z 以字面字符随整行到达，按分离处理
+    #[test]
+    fn split_detach_marks_control_key_and_keeps_prefix() {
+        assert_eq!(split_detach("\u{4}\r\n"), ("", true));
+        assert_eq!(split_detach("stop\r\n\u{4}"), ("stop\r\n", true));
+        assert_eq!(split_detach("stop\u{4}more\n"), ("stop", true));
+        assert_eq!(split_detach("\u{1a}\r\n"), ("", true));
+        assert_eq!(split_detach("stop\r\n"), ("stop\r\n", false));
+        assert_eq!(split_detach("stop"), ("stop", false));
     }
 }

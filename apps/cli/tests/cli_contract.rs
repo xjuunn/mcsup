@@ -10,6 +10,20 @@ use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use tempfile::TempDir;
 
+/// 隔离用临时 HOME
+///
+/// Windows 上 `dirs::data_dir()` 走 Known Folder API，按 `%USERPROFILE%` 展开
+/// `User Shell Folders` 模板得到 `AppData\Roaming`，目录不存在时解析失败，
+/// CLI 会以「无法确定系统数据目录」退出 1，因此先把该目录建出来。
+fn temp_home() -> TempDir {
+    let home = TempDir::new().expect("tempdir");
+    if cfg!(windows) {
+        std::fs::create_dir_all(home.path().join("AppData").join("Roaming"))
+            .expect("创建 AppData\\Roaming");
+    }
+    home
+}
+
 fn run(home: &Path, args: &[&str]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_mcsup"));
     cmd.args(args)
@@ -32,7 +46,7 @@ fn stderr(out: &Output) -> String {
 /// 非交互缺名称 → 用法错误 2；不落库、不联网，stdout 无输出
 #[test]
 fn create_without_name_exits_2() {
-    let home = TempDir::new().expect("tempdir");
+    let home = temp_home();
     let out = run(home.path(), &["server", "create", "--output", "json"]);
     assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
     assert!(out.stdout.is_empty(), "用法错误不得输出数据");
@@ -42,7 +56,7 @@ fn create_without_name_exits_2() {
 /// 非交互缺 --version → 用法错误 2（交互下才进版本选择）
 #[test]
 fn create_without_version_exits_2() {
-    let home = TempDir::new().expect("tempdir");
+    let home = temp_home();
     let out = run(
         home.path(),
         &["server", "create", "srv1", "--output", "json"],
@@ -55,7 +69,7 @@ fn create_without_version_exits_2() {
 /// 显式未支持的变体 → 用法错误 2，文案列出当前可用变体（能力查询口径）
 #[test]
 fn create_unsupported_variant_exits_2_and_lists_available() {
-    let home = TempDir::new().expect("tempdir");
+    let home = temp_home();
     let out = run(
         home.path(),
         &[
@@ -80,7 +94,7 @@ fn create_unsupported_variant_exits_2_and_lists_available() {
 /// 未知变体拼写同样判用法错误 2 并列出可用项
 #[test]
 fn create_unknown_variant_exits_2() {
-    let home = TempDir::new().expect("tempdir");
+    let home = temp_home();
     let out = run(
         home.path(),
         &[
@@ -103,7 +117,7 @@ fn create_unknown_variant_exits_2() {
 /// 无参 `workspace use` 非交互 → 用法错误 2（不提问）
 #[test]
 fn workspace_use_without_name_exits_2() {
-    let home = TempDir::new().expect("tempdir");
+    let home = temp_home();
     let out = run(home.path(), &["workspace", "use", "--output", "json"]);
     assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
     assert!(out.stdout.is_empty());
@@ -113,7 +127,7 @@ fn workspace_use_without_name_exits_2() {
 /// 服务器不存在 → 未找到 3（能力解析之前先查注册表）
 #[test]
 fn install_missing_server_exits_3() {
-    let home = TempDir::new().expect("tempdir");
+    let home = temp_home();
     let out = run(
         home.path(),
         &["server", "install", "nope", "--output", "json"],
@@ -126,7 +140,7 @@ fn install_missing_server_exits_3() {
 /// 非交互 init：stdout 单行 JSON 对象（机器契约），随后 list 可见且为当前
 #[test]
 fn workspace_init_then_list_stdout_single_json() {
-    let home = TempDir::new().expect("tempdir");
+    let home = temp_home();
     let ws = home.path().join("wsdir");
     let init = run(
         home.path(),

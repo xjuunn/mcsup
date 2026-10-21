@@ -901,6 +901,8 @@ mod tests {
         assert_eq!(names, ["alpha", "beta"]);
     }
 
+    /// 仅供 link 系测试（软链在 Unix 上才有意义）
+    #[cfg(unix)]
     fn registry_with_ws(root: &Path) -> ServerRegistry {
         ServerRegistry::new(
             Arc::new(MemServers::new()),

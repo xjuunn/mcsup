@@ -71,7 +71,7 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | `stop` | `mcsup server stop <name> [--grace <sec>] [--force]` | 先优雅停机（默认宽限 30s），宽限后 `--force` 强杀；未在运行幂等成功（exit 0）；超时未 `--force` → 退出码 1 并提示 `--force` |
 | `restart` | `mcsup server restart <name> [--accept-eula] [--grace <sec>] [--force]` | 先停后启：停机规格与 EULA 同 start / stop，停机超时中止不拉起 |
 | `status` | `mcsup server status <name>` | 注册版本 / 变体 + 实时状态、进程、运行时长、退出码；未在运行显示 `stopped`（exit 0） |
-| `console` | `mcsup server console <name>` | 交互附加控制台；`Ctrl+D` 只分离不断开进程；非 TTY → 退出码 2 |
+| `console` | `mcsup server console <name>` | 交互附加控制台；`Ctrl+D` 只分离不断开进程；Windows 无 EOF 键，`Ctrl+D` / `Ctrl+Z` 随行到达、回车生效，Unix 行首 `Ctrl+D` 立即生效；非 TTY → 退出码 2 |
 | `send` | `mcsup server send <name> "<命令>"` | 单条命令注入服务端 stdin；未在运行 → 退出码 4 |
 | `logs` | `mcsup server logs <name> [--tail <n>] [--follow]` | 查看日志（`--tail` 默认 100），`--follow` 持续跟踪（JSON 模式 JSONL，一行一个对象） |
 | `props` | `mcsup server props <name> [key=value ...]` | 无参列出 `server.properties`；带参写入，改完提醒重启生效 |

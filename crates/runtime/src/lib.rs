@@ -15,6 +15,7 @@ mod e2e_tests;
 mod endpoint;
 mod launch;
 mod local;
+mod process;
 mod supervisor;
 
 pub use launch::MinecraftLaunch;

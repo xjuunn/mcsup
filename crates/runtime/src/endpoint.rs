@@ -5,13 +5,15 @@ use domain::server::layout::run_dir;
 use std::path::{Path, PathBuf};
 
 /// Unix socket 文件名（Windows 走命名管道，不用此文件）
+#[cfg(any(unix, test))]
 const SOCKET_FILE: &str = "supervisor.sock";
 /// supervisor 自身的 PID 文件名
 const PID_FILE: &str = "supervisor.pid";
 /// supervisor 启动失败时的 stderr 落点
 pub(crate) const SUPERVISOR_LOG: &str = "supervisor.log";
 
-/// `{server_dir}/run/supervisor.sock`
+/// `{server_dir}/run/supervisor.sock`（Windows 无 socket 文件，见 [`pipe_name`]）
+#[cfg(any(unix, test))]
 #[must_use]
 pub(crate) fn socket_path(server_dir: &Path) -> PathBuf {
     run_dir(server_dir).join(SOCKET_FILE)

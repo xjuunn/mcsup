@@ -37,26 +37,6 @@ impl LocalSupervisor {
     }
 }
 
-/// 脱离终端：Unix 新进程组，Windows 分离进程 + 新进程组
-///
-/// 保证 CLI 退出 / 终端关闭不带走 supervisor；子进程随之脱离前台信号组。
-#[cfg(unix)]
-fn detach(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    command.process_group(0);
-}
-
-#[cfg(windows)]
-fn detach(command: &mut Command) {
-    use std::os::windows::process::CommandExt;
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-}
-
-#[cfg(not(any(unix, windows)))]
-fn detach(_command: &mut Command) {}
-
 impl SupervisorPort for LocalSupervisor {
     fn start(
         &self,
@@ -84,7 +64,7 @@ impl SupervisorPort for LocalSupervisor {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(log));
-        detach(&mut command);
+        crate::process::detach(&mut command);
 
         let child = command.spawn().map_err(SupervisorError::Spawn)?;
         let supervisor_pid = child.id();
