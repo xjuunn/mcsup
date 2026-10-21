@@ -1,6 +1,5 @@
 use crate::bootstrap;
 use crate::cli::WorkspaceAction;
-use crate::config;
 use crate::output::Printer;
 use anyhow::{Context, Result};
 use comfy_table::Table;
@@ -18,7 +17,7 @@ struct WorkspaceRow<'a> {
     name: &'a str,
     path: String,
     servers: usize,
-    default: bool,
+    current: bool,
 }
 
 /// `workspace init` 结果（JSON 模式序列化用）
@@ -36,9 +35,9 @@ pub(crate) fn run(action: WorkspaceAction, printer: Printer) -> Result<()> {
     match action {
         WorkspaceAction::Init { dir, name } => init(&svc, dir, name.as_deref(), printer),
         WorkspaceAction::List => list(&svc, &reg, printer),
-        WorkspaceAction::Use { name } => use_ws(&svc, &name, printer),
+        WorkspaceAction::Use { name } => use_ws(&svc, name.as_deref(), printer),
         WorkspaceAction::Remove { name, purge } => remove(&svc, &name, purge, printer),
-        WorkspaceAction::Info => info(&svc, printer),
+        WorkspaceAction::Doctor => doctor(&reg, printer),
     }
 }
 
@@ -141,7 +140,7 @@ fn list(svc: &WorkspaceService, reg: &ServerRegistry, printer: Printer) -> Resul
                 name: ws.name.as_str(),
                 path: ws.path.display().to_string(),
                 servers: reg.count_in(&ws.id)?,
-                default: ws.is_default,
+                current: ws.is_current,
             })
         })
         .collect::<Result<_>>()?;
@@ -150,13 +149,13 @@ fn list(svc: &WorkspaceService, reg: &ServerRegistry, printer: Printer) -> Resul
         "尚无工作目录，先运行 mcsup workspace init",
         || {
             let mut table = Table::new();
-            table.set_header(["名称", "路径", "服务器数", "默认"]);
+            table.set_header(["名称", "路径", "服务器数", "当前"]);
             for (ws, row) in all.iter().zip(&rows) {
                 table.add_row([
                     ws.name.as_str().to_owned(),
                     row.path.clone(),
                     row.servers.to_string(),
-                    if row.default { "*" } else { "" }.to_owned(),
+                    if row.current { "*" } else { "" }.to_owned(),
                 ]);
             }
             table
@@ -164,15 +163,51 @@ fn list(svc: &WorkspaceService, reg: &ServerRegistry, printer: Printer) -> Resul
     )
 }
 
-fn use_ws(svc: &WorkspaceService, name: &str, printer: Printer) -> Result<()> {
-    let ws = svc.set_default(name)?;
+fn use_ws(svc: &WorkspaceService, name: Option<&str>, printer: Printer) -> Result<()> {
+    let selector = match name {
+        Some(name) => name.to_owned(),
+        None => pick_workspace(svc, printer)?,
+    };
+    let ws = svc.set_current(&selector)?;
     printer.print_outcome(
-        &format!("默认工作目录已切换为 {} ({})", ws.name, ws.path.display()),
+        &format!("当前工作区已切换为 {} ({})", ws.name, ws.path.display()),
         &serde_json::json!({
             "name": ws.name.as_str(),
             "path": ws.path.display().to_string(),
         }),
     )
+}
+
+/// 无参 `workspace use`：交互选择器
+fn pick_workspace(svc: &WorkspaceService, printer: Printer) -> Result<String> {
+    let all = svc.list()?;
+    if all.is_empty() {
+        anyhow::bail!("尚无工作目录，先运行 mcsup workspace init");
+    }
+    if !printer.is_interactive() {
+        let names: Vec<&str> = all.iter().map(|w| w.name.as_str()).collect();
+        anyhow::bail!(
+            "非交互模式必须指定工作区名称（如 `mcsup workspace use {}`）",
+            names[0]
+        );
+    }
+    let current = svc.current_workspace().ok();
+    let options: Vec<String> = all
+        .iter()
+        .map(|w| {
+            let mark = if current.as_ref().is_some_and(|c| c.id == w.id) {
+                " (当前)"
+            } else {
+                ""
+            };
+            format!("{}{mark}", w.name.as_str())
+        })
+        .collect();
+    let choice = inquire::Select::new("选择工作区", options)
+        .prompt()
+        .context("读取工作区选择")?;
+    let name = choice.split(" (当前)").next().unwrap_or(&choice);
+    Ok(name.to_owned())
 }
 
 fn remove(svc: &WorkspaceService, name: &str, purge: bool, printer: Printer) -> Result<()> {
@@ -213,7 +248,14 @@ fn remove(svc: &WorkspaceService, name: &str, purge: bool, printer: Printer) -> 
             "path": ws.path.display().to_string(),
             "purged": purge,
         }),
-    )
+    )?;
+    // 删除的是当前工作区时告知移交结果，避免用户找不到「当前」去哪了
+    if ws.is_current
+        && let Ok(cur) = svc.current_workspace()
+    {
+        printer.print_section(&format!("当前工作区已移交给 {}", cur.name));
+    }
+    Ok(())
 }
 
 /// 删盘前的第二道确认：红色警示 + 输入工作区名称（交互下同意删盘后调用）
@@ -254,20 +296,46 @@ fn chdir_out_of(target: &Path) {
     let _ = std::env::set_current_dir(outside.unwrap_or(Path::new(".")));
 }
 
-fn info(svc: &WorkspaceService, printer: Printer) -> Result<()> {
-    let data = config::platform_data_dir()?;
-    let default = svc.default_workspace().ok();
-    let payload = serde_json::json!({
-        "data_dir": data.display().to_string(),
-        "default": default.as_ref().map(|ws| serde_json::json!({
-            "name": ws.name.as_str(),
-            "path": ws.path.display().to_string(),
-        })),
-    });
-    let text = match &default {
-        Some(ws) => format!("默认工作目录: {} ({})", ws.name, ws.path.display()),
-        None => "默认工作目录: 尚无，先运行 mcsup workspace init".to_owned(),
-    };
-    printer.print_section(&format!("平台数据目录: {}", data.display()));
-    printer.print_outcome(&text, &payload)
+fn doctor(reg: &ServerRegistry, printer: Printer) -> Result<()> {
+    use mcsup::service::DoctorLevel;
+
+    let findings = reg.doctor()?;
+    if findings.is_empty() {
+        printer.print_outcome(
+            "检查通过：工作区与注册表一致",
+            &serde_json::json!({ "findings": [] }),
+        )?;
+        return Ok(());
+    }
+    if printer.is_human() {
+        for f in &findings {
+            let scope = f.workspace.as_deref().unwrap_or("(全局)");
+            let level = match f.level {
+                DoctorLevel::Error => "ERROR",
+                DoctorLevel::Warning => "WARN",
+            };
+            let line = format!("[{level}] {scope}: {}", f.message);
+            match f.level {
+                DoctorLevel::Error => printer.print_warning(&line),
+                DoctorLevel::Warning => printer.print_section(&line),
+            }
+        }
+    }
+    printer.print_outcome(
+        &format!("发现 {} 个问题", findings.len()),
+        &serde_json::json!({
+            "findings": findings.iter().map(|f| serde_json::json!({
+                "level": match f.level {
+                    DoctorLevel::Error => "error",
+                    DoctorLevel::Warning => "warning",
+                },
+                "workspace": f.workspace,
+                "message": f.message,
+            })).collect::<Vec<_>>(),
+        }),
+    )?;
+    if findings.iter().any(|f| f.level == DoctorLevel::Error) {
+        anyhow::bail!("发现错误级问题，请按提示处理");
+    }
+    Ok(())
 }

@@ -308,6 +308,13 @@ pub trait ServerRepository: Send + Sync {
         updated_at: i64,
     ) -> Result<ServerMeta, RepositoryError>;
 
+    /// 按名称注销单个服务器登记（不删磁盘）
+    ///
+    /// # Errors
+    ///
+    /// 不存在返回 [`RepositoryError::NotFound`]
+    fn remove(&self, name: &ServerName) -> Result<(), RepositoryError>;
+
     /// 按工作目录删除全部服务器登记（注销工作目录时用）
     ///
     /// # Errors
@@ -361,19 +368,19 @@ pub trait WorkspaceRepository: Send + Sync {
     /// 底层失败返回 [`RepositoryError::Storage`]
     fn list(&self) -> Result<Vec<Workspace>, RepositoryError>;
 
-    /// 当前默认工作目录；尚无注册时为 `None`
+    /// 当前工作区；尚无注册时为 `None`
     ///
     /// # Errors
     ///
     /// 底层失败返回 [`RepositoryError::Storage`]
-    fn default(&self) -> Result<Option<Workspace>, RepositoryError>;
+    fn current(&self) -> Result<Option<Workspace>, RepositoryError>;
 
-    /// 设为默认并清除其他默认标记（原子）
+    /// 设为当前并清除其他当前标记（原子）
     ///
     /// # Errors
     ///
     /// 不存在返回 [`RepositoryError::NotFound`]
-    fn set_default(&self, id: &WorkspaceId) -> Result<(), RepositoryError>;
+    fn set_current(&self, id: &WorkspaceId) -> Result<(), RepositoryError>;
 
     /// 注销（不删磁盘）
     ///

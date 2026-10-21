@@ -36,9 +36,9 @@ pub enum WorkspaceError {
         selector: String,
         candidates: Vec<String>,
     },
-    /// 尚无默认工作目录
-    #[error("no default workspace; run `mcsup workspace init` first")]
-    NoDefault,
+    /// 尚无当前工作区
+    #[error("no current workspace; run `mcsup workspace init` or `mcsup workspace use` first")]
+    NoCurrent,
     /// 文件系统 / marker 失败（共用载荷见 [`FsError`]）
     #[error(transparent)]
     Fs(#[from] FsError),
@@ -146,7 +146,7 @@ impl WorkspaceService {
             id,
             name,
             path: dir,
-            is_default: is_first,
+            is_current: is_first,
             created_at: now,
             updated_at: now,
         };
@@ -168,16 +168,16 @@ impl WorkspaceService {
             .collect())
     }
 
-    /// 默认工作目录
+    /// 当前工作区：`create` / `link` 等缺省操作的落点
     ///
     /// # Errors
     ///
-    /// 无默认或注册表失败时返回 [`WorkspaceError`]
-    pub fn default_workspace(&self) -> Result<Workspace, WorkspaceError> {
+    /// 无当前或注册表失败时返回 [`WorkspaceError`]
+    pub fn current_workspace(&self) -> Result<Workspace, WorkspaceError> {
         self.repo
-            .default()?
+            .current()?
             .map(normalize_workspace)
-            .ok_or(WorkspaceError::NoDefault)
+            .ok_or(WorkspaceError::NoCurrent)
     }
 
     /// 按名选择器解析：精确 → 唯一前缀 → 报错
@@ -190,16 +190,16 @@ impl WorkspaceService {
         resolve_selector(&all, selector)
     }
 
-    /// 切换默认工作目录
+    /// 切换当前工作区
     ///
     /// # Errors
     ///
     /// 不存在或注册表失败时返回 [`WorkspaceError`]
-    pub fn set_default(&self, selector: &str) -> Result<Workspace, WorkspaceError> {
+    pub fn set_current(&self, selector: &str) -> Result<Workspace, WorkspaceError> {
         let ws = self.resolve(selector)?;
-        self.repo.set_default(&ws.id)?;
+        self.repo.set_current(&ws.id)?;
         let mut ws = ws;
-        ws.is_default = true;
+        ws.is_current = true;
         Ok(ws)
     }
 
@@ -210,6 +210,9 @@ impl WorkspaceService {
     /// 再注销工作目录，否则注册表删除报 `FOREIGN KEY constraint failed`。
     /// 删除失败（常见于目录被占用）时注册记录还在，退出占用后重试即可；
     /// 反过来会留下「记录已注销、目录只删了一半」的中间态。
+    ///
+    /// 被删的是当前工作区时，当前标记移交给剩余中按名称排序的第一个；
+    /// 无剩余则当前为空，后续缺省落点操作报 [`WorkspaceError::NoCurrent`]。
     ///
     /// # Errors
     ///
@@ -223,6 +226,11 @@ impl WorkspaceService {
         // 服务器登记引用工作目录（外键）：先清服务器，再注销工作目录
         self.servers.remove_by_workspace(&ws.id)?;
         self.repo.remove(&ws.id)?;
+        if ws.is_current
+            && let Some(next) = self.repo.list()?.first()
+        {
+            self.repo.set_current(&next.id)?;
+        }
         Ok(ws)
     }
 
@@ -248,7 +256,7 @@ impl WorkspaceService {
             id,
             name,
             path: dir,
-            is_default: self.repo.list()?.is_empty(),
+            is_current: self.repo.list()?.is_empty(),
             created_at: marker.created_at,
             updated_at: now,
         };
@@ -281,6 +289,26 @@ impl WorkspaceService {
     fn name_taken(&self, name: &WorkspaceName) -> bool {
         self.repo.get_by_name(name).is_ok()
     }
+}
+
+/// `workspace doctor` 单项检查结果
+#[derive(Debug, Clone)]
+pub struct DoctorFinding {
+    /// 严重程度：error 非零退出，warning 仅提示
+    pub level: DoctorLevel,
+    /// 所属工作区（全局检查可为空）
+    pub workspace: Option<String>,
+    /// 人类可读的问题描述
+    pub message: String,
+}
+
+/// doctor 检查级别
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoctorLevel {
+    /// 需要处理的问题，退出码非零
+    Error,
+    /// 提示性问题，退出码零
+    Warning,
 }
 
 /// 按名选择器从候选表里解析工作区：精确 → 唯一前缀 → 报错
@@ -434,9 +462,9 @@ mod tests {
             {
                 return Err(RepositoryError::AlreadyExists(ws.name.as_str().to_owned()));
             }
-            if ws.is_default {
+            if ws.is_current {
                 for w in items.iter_mut() {
-                    w.is_default = false;
+                    w.is_current = false;
                 }
             }
             items.push(ws.clone());
@@ -465,22 +493,22 @@ mod tests {
             items.sort_by(|a, b| a.name.cmp(&b.name));
             Ok(items)
         }
-        fn default(&self) -> Result<Option<Workspace>, RepositoryError> {
+        fn current(&self) -> Result<Option<Workspace>, RepositoryError> {
             Ok(self
                 .items
                 .lock()
                 .expect("lock")
                 .iter()
-                .find(|w| w.is_default)
+                .find(|w| w.is_current)
                 .cloned())
         }
-        fn set_default(&self, id: &WorkspaceId) -> Result<(), RepositoryError> {
+        fn set_current(&self, id: &WorkspaceId) -> Result<(), RepositoryError> {
             let mut items = self.items.lock().expect("lock");
             if !items.iter().any(|w| &w.id == id) {
                 return Err(RepositoryError::NotFound(id.as_str().to_owned()));
             }
             for w in items.iter_mut() {
-                w.is_default = &w.id == id;
+                w.is_current = &w.id == id;
             }
             Ok(())
         }
@@ -543,6 +571,9 @@ mod tests {
         ) -> Result<domain::server::meta::ServerMeta, RepositoryError> {
             unreachable!("not used in tests")
         }
+        fn remove(&self, _name: &domain::server::meta::ServerName) -> Result<(), RepositoryError> {
+            unreachable!("not used in tests")
+        }
         fn remove_by_workspace(&self, _workspace_id: &WorkspaceId) -> Result<(), RepositoryError> {
             self.cleared
                 .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -584,13 +615,13 @@ mod tests {
     }
 
     #[test]
-    fn init_creates_layout_marker_and_first_default() {
+    fn init_creates_layout_marker_and_first_current() {
         let (svc, tmp) = svc();
         let dir = tmp.path().join("ws");
         let InitOutcome::Created(ws) = svc.init(&dir, None).expect("init") else {
             unreachable!("expected Created")
         };
-        assert!(ws.is_default);
+        assert!(ws.is_current);
         assert_eq!(ws.name.as_str(), "workspace01");
         assert!(dir.join("servers").is_dir());
         assert!(dir.join("backups/cas").is_dir());
@@ -652,16 +683,16 @@ mod tests {
     }
 
     #[test]
-    fn second_workspace_is_not_default() {
+    fn second_workspace_is_not_current() {
         let (svc, tmp) = svc();
         svc.init(&tmp.path().join("a"), None).expect("a");
         let InitOutcome::Created(b) = svc.init(&tmp.path().join("b"), Some("ws02")).expect("b")
         else {
             unreachable!("expected Created")
         };
-        assert!(!b.is_default);
-        let def = svc.default_workspace().expect("default");
-        assert_eq!(def.name.as_str(), "workspace01");
+        assert!(!b.is_current);
+        let cur = svc.current_workspace().expect("current");
+        assert_eq!(cur.name.as_str(), "workspace01");
     }
 
     #[test]
@@ -692,7 +723,7 @@ mod tests {
             unreachable!("expected Recovered, got {outcome:?}")
         };
         assert_eq!(ws.name.as_str(), "half");
-        assert!(ws.is_default);
+        assert!(ws.is_current);
     }
 
     #[test]
@@ -735,13 +766,13 @@ mod tests {
     }
 
     #[test]
-    fn set_default_switches() {
+    fn set_current_switches() {
         let (svc, tmp) = svc();
         svc.init(&tmp.path().join("a"), Some("ws01")).expect("a");
         svc.init(&tmp.path().join("b"), Some("ws02")).expect("b");
-        let ws = svc.set_default("ws02").expect("use");
-        assert!(ws.is_default);
-        assert_eq!(svc.default_workspace().expect("def").name.as_str(), "ws02");
+        let ws = svc.set_current("ws02").expect("use");
+        assert!(ws.is_current);
+        assert_eq!(svc.current_workspace().expect("cur").name.as_str(), "ws02");
     }
 
     #[test]
@@ -751,6 +782,32 @@ mod tests {
         svc.init(&dir, Some("ws01")).expect("init");
         svc.remove("ws01", false).expect("remove");
         assert!(dir.join("workspace.toml").is_file());
+    }
+
+    /// 删除当前工作区时，当前标记必须移交给剩余中按名称排序的第一个
+    #[test]
+    fn remove_current_hands_over_to_next() {
+        let (svc, tmp) = svc();
+        svc.init(&tmp.path().join("a"), Some("ws01")).expect("a");
+        svc.init(&tmp.path().join("b"), Some("ws02")).expect("b");
+        svc.init(&tmp.path().join("c"), Some("ws03")).expect("c");
+        assert_eq!(svc.current_workspace().expect("cur").name.as_str(), "ws01");
+
+        svc.remove("ws01", false).expect("remove");
+
+        assert_eq!(svc.current_workspace().expect("cur").name.as_str(), "ws02");
+    }
+
+    /// 最后一个工作区被删后无当前：缺省落点操作报 `NoCurrent`
+    #[test]
+    fn remove_last_workspace_clears_current() {
+        let (svc, tmp) = svc();
+        svc.init(&tmp.path().join("a"), Some("ws01")).expect("a");
+        svc.remove("ws01", false).expect("remove");
+        assert!(matches!(
+            svc.current_workspace().expect_err("none"),
+            WorkspaceError::NoCurrent
+        ));
     }
 
     #[test]

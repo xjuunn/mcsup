@@ -78,16 +78,16 @@ pub(crate) enum WorkspaceAction {
     },
     /// 已注册工作目录
     List,
-    /// 切换默认工作目录
-    Use { name: String },
+    /// 切换当前工作区；不带名字时交互选择
+    Use { name: Option<String> },
     /// 注销工作目录
     Remove {
         name: String,
         #[arg(long)]
         purge: bool,
     },
-    /// 默认工作目录与平台数据目录
-    Info,
+    /// 检查工作区与注册表一致性
+    Doctor,
 }
 
 #[derive(Debug, Subcommand)]
@@ -138,11 +138,22 @@ pub(crate) enum ServerAction {
         key: String,
         value: String,
     },
-    /// 删除服务
+    /// 删除服务（链接服务器仅移除链接与登记）
     Remove {
         name: String,
         #[arg(long)]
         purge: bool,
+    },
+    /// 链接外部服务器目录到工作区
+    Link {
+        /// 外部服务器目录
+        path: PathBuf,
+        /// 注册名，缺省取目录名或 marker 名
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// 目标工作区，缺省当前工作区
+        #[arg(long, value_name = "WS")]
+        workspace: Option<String>,
     },
     /// 服务版本信息
     Version { name: String },

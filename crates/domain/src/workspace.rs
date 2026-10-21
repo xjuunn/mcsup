@@ -103,7 +103,8 @@ pub struct Workspace {
     pub name: WorkspaceName,
     /// 目录绝对路径；移动后由注册表更新
     pub path: PathBuf,
-    pub is_default: bool,
+    /// 当前工作区标记：`create` / `link` 等缺省操作的落点，全库至多一个
+    pub is_current: bool,
     /// Unix 秒
     pub created_at: i64,
     /// Unix 秒

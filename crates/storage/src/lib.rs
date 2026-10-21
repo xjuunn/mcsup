@@ -131,10 +131,10 @@ impl WorkspaceRepository for SqliteStore {
         })
     }
 
-    fn default(&self) -> Result<Option<Workspace>, RepositoryError> {
+    fn current(&self) -> Result<Option<Workspace>, RepositoryError> {
         self.with_conn(|conn| {
             let row: Option<WorkspaceRow> = workspaces::table
-                .filter(workspaces::is_default.eq(true))
+                .filter(workspaces::is_current.eq(true))
                 .select(WorkspaceRow::as_select())
                 .first(conn)
                 .optional()
@@ -143,15 +143,15 @@ impl WorkspaceRepository for SqliteStore {
         })
     }
 
-    fn set_default(&self, id: &WorkspaceId) -> Result<(), RepositoryError> {
+    fn set_current(&self, id: &WorkspaceId) -> Result<(), RepositoryError> {
         self.with_conn(|conn| {
             conn.transaction(|conn| {
-                diesel::update(workspaces::table.filter(workspaces::is_default.eq(true)))
-                    .set(workspaces::is_default.eq(false))
+                diesel::update(workspaces::table.filter(workspaces::is_current.eq(true)))
+                    .set(workspaces::is_current.eq(false))
                     .execute(conn)?;
                 let affected =
                     diesel::update(workspaces::table.filter(workspaces::id.eq(id.as_str())))
-                        .set(workspaces::is_default.eq(true))
+                        .set(workspaces::is_current.eq(true))
                         .execute(conn)?;
                 if affected == 0 {
                     return Err(diesel::result::Error::NotFound);
@@ -243,6 +243,15 @@ impl ServerRepository for SqliteStore {
             require_found(affected, name.as_str())?;
 
             select_meta(conn, name)
+        })
+    }
+
+    fn remove(&self, name: &ServerName) -> Result<(), RepositoryError> {
+        self.with_conn(|conn| {
+            let affected = diesel::delete(servers::table.filter(servers::name.eq(name.as_str())))
+                .execute(conn)
+                .map_err(storage_err)?;
+            require_found(affected, name.as_str())
         })
     }
 
@@ -420,7 +429,7 @@ mod tests {
             id: WorkspaceId::parse(id).expect("uuid"),
             name: WorkspaceName::parse(name).expect("valid"),
             path: PathBuf::from(path),
-            is_default: false,
+            is_current: false,
             created_at: 1_700_000_000,
             updated_at: 1_700_000_000,
         }
@@ -524,21 +533,39 @@ mod tests {
     }
 
     #[test]
-    fn workspace_default_is_single() {
+    fn workspace_current_is_single() {
         let store = SqliteStore::open_in_memory().expect("open");
         add_ws(&store, &sample_ws("ws01", "/tmp/ws01", WS01));
         add_ws(&store, &sample_ws("ws02", "/tmp/ws02", WS02));
         let id01 = WorkspaceId::parse(WS01).expect("uuid");
         let id02 = WorkspaceId::parse(WS02).expect("uuid");
-        WorkspaceRepository::set_default(&store, &id01).expect("default 1");
-        WorkspaceRepository::set_default(&store, &id02).expect("default 2");
-        let defaults: Vec<_> = WorkspaceRepository::list(&store)
+        WorkspaceRepository::set_current(&store, &id01).expect("current 1");
+        WorkspaceRepository::set_current(&store, &id02).expect("current 2");
+        let currents: Vec<_> = WorkspaceRepository::list(&store)
             .expect("list")
             .into_iter()
-            .filter(|w| w.is_default)
+            .filter(|w| w.is_current)
             .collect();
-        assert_eq!(defaults.len(), 1);
-        assert_eq!(defaults[0].name.as_str(), "ws02");
+        assert_eq!(currents.len(), 1);
+        assert_eq!(currents[0].name.as_str(), "ws02");
+    }
+
+    #[test]
+    fn remove_single_server_clears_row() {
+        let store = store_with_ws();
+        add_server(&store, &sample_meta("alpha"));
+        add_server(&store, &sample_meta("beta"));
+        ServerRepository::remove(&store, &ServerName::parse("alpha").expect("valid"))
+            .expect("remove");
+        let rest: Vec<_> = ServerRepository::list(&store)
+            .expect("list")
+            .into_iter()
+            .map(|m| m.name.as_str().to_owned())
+            .collect();
+        assert_eq!(rest, ["beta"]);
+        let err = ServerRepository::remove(&store, &ServerName::parse("alpha").expect("valid"))
+            .expect_err("gone");
+        assert!(matches!(err, RepositoryError::NotFound(_)));
     }
 
     #[test]

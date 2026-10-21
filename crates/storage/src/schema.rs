@@ -5,7 +5,7 @@ diesel::table! {
         id -> Text,
         name -> Text,
         path -> Text,
-        is_default -> Bool,
+        is_current -> Bool,
         created_at -> BigInt,
         updated_at -> BigInt,
     }

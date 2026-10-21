@@ -73,7 +73,12 @@ async fn server(action: ServerAction, cfg: &Config, printer: Printer) -> Result<
         ServerAction::Logs { .. } => err("logs"),
         ServerAction::Props { .. } => err("props"),
         ServerAction::Set { .. } => err("set"),
-        ServerAction::Remove { .. } => err("remove"),
+        ServerAction::Remove { name, purge } => server_ops::remove(&name, purge, printer),
+        ServerAction::Link {
+            ref path,
+            ref name,
+            ref workspace,
+        } => server_ops::link(path, name.as_deref(), workspace.as_deref(), printer),
         ServerAction::Version { .. } => err("version"),
         ServerAction::Backup { .. } => err("backup"),
         ServerAction::Mod { .. } => err("mod"),

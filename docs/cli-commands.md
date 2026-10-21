@@ -12,17 +12,18 @@
 - **平台级命令直接动作**：`doctor` / `config` / `update` 等；工作目录经
   `workspace` 子命令管理。
 - **服务器只能建在已注册工作目录下**：`--workspace <名>` 按名选择，
-  缺省用默认工作目录；目录规范与 init 行为见 `docs/workspace.md`。
+  缺省用当前工作区（`--workspace` > 环境变量 `MCSUP_WORKSPACE` > 当前工作区）；
+  目录规范与 init 行为见 `docs/workspace.md`。
 
 命令层级：
 
 ```
 mcsup
-├── workspace                 # 工作目录：创建 / 注册表 / 默认切换
+├── workspace                 # 工作区：创建 / 注册表 / 当前切换
 │   ├── init [--dir <path>] [--name <name>]
-│   ├── list / use <name> / remove <name> [--purge] / info
+│   ├── list / use [<name>] / remove <name> [--purge] / doctor
 ├── server                    # 单台服务：生命周期 + 属主内容
-│   ├── list / create / install / start / stop / restart
+│   ├── list / create / link / install / start / stop / restart
 │   ├── status / console / send / logs / props / set / remove / version
 │   ├── backup    create · list · restore · verify · prune
 │   └── mod       list · install · remove · update · outdated
@@ -55,7 +56,8 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | `logs` | `mcsup server logs <name> [--tail <n>] [--follow]` | 查看日志，`--follow` 持续跟踪 |
 | `props` | `mcsup server props <name> [key=value ...]` | 无参列出 `server.properties`；带参写入，改完提醒重启生效 |
 | `set` | `mcsup server set <name> <key> <value>` | 设置服务属性，见下表 |
-| `remove` | `mcsup server remove <name> [--purge]` | 停止并删除；`--purge` 连数据目录一起删 |
+| `link` | `mcsup server link <path> [--name <name>] [--workspace <ws>]` | 把外部服务器目录链接进工作区并注册；目标不能在任一工作区 `servers/` 内；带 `mcsup.json` 时复用其身份 |
+| `remove` | `mcsup server remove <name> [--purge]` | 默认注销保留磁盘；`--purge` 连目录一起删（链接服务器拒绝 `--purge`，仅移除链接） |
 | `version` | `mcsup server version <name>` | 当前安装的版本、校验和、来源 |
 
 ### server set（服务属性）
@@ -93,10 +95,10 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | 子命令 | 用法 | 说明 |
 | --- | --- | --- |
 | `init` | `mcsup workspace init [--dir <path>] [--name <name>]` | 创建并注册工作目录；无 `--dir` 进入交互（默认当前目录），目录必须为空 |
-| `list` | `mcsup workspace list` | 已注册工作目录：名称、路径、服务器数、是否默认 |
-| `use` | `mcsup workspace use <name>` | 切换默认工作目录；只影响 `create` 落点，不隐藏其他目录的服务器 |
-| `remove` | `mcsup workspace remove <name> [--purge]` | 注销工作目录，同时清除该工作目录下的服务器登记；交互下询问是否删除磁盘数据（默认不删），同意后红色警示并要求输入工作区名称确认，`--purge` 跳过询问直接删除；删除失败（目录被占用）保留注册，退出占用后重试即可 |
-| `info` | `mcsup workspace info` | 默认工作目录、平台数据目录与结构说明 |
+| `list` | `mcsup workspace list` | 已注册工作目录：名称、路径、服务器数、是否当前 |
+| `use` | `mcsup workspace use [<name>]` | 切换当前工作区；不带名字在 TTY 下交互选择；只影响 `create` / `link` 缺省落点，不隐藏其他目录的服务器 |
+| `remove` | `mcsup workspace remove <name> [--purge]` | 注销工作目录，同时清除该工作目录下的服务器登记；交互下询问是否删除磁盘数据（默认不删），同意后红色警示并要求输入工作区名称确认，`--purge` 跳过询问直接删除；删除失败（目录被占用）保留注册，退出占用后重试即可；删除当前工作区时当前标记移交给剩余中按名称排序的第一个 |
+| `doctor` | `mcsup workspace doctor` | 检查工作区与注册表一致性：工作目录缺失、悬空链接、磁盘/登记漂移、无当前工作区；发现错误级问题非零退出 |
 
 ## mcsup modpack（整合包：一键建整包服务器）
 

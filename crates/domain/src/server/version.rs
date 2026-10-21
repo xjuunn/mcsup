@@ -36,6 +36,8 @@ pub enum ServerVariant {
     Forge,
     NeoForge,
     Paper,
+    /// 外部目录链接（`server link`）进来的服务器，变体未知
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +56,7 @@ impl ServerVariant {
             Self::Forge => "forge",
             Self::NeoForge => "neoforge",
             Self::Paper => "paper",
+            Self::Unknown => "unknown",
         }
     }
 
@@ -69,6 +72,7 @@ impl ServerVariant {
             "forge" => Ok(Self::Forge),
             "neoforge" => Ok(Self::NeoForge),
             "paper" => Ok(Self::Paper),
+            "unknown" => Ok(Self::Unknown),
             other => Err(super::error::UnknownVariant {
                 raw: other.to_owned(),
             }),

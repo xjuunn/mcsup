@@ -14,7 +14,9 @@ pub use port::JavaSourceRegistryPort;
 pub use registry::{
     InstallJarError, InstalledServerJar, RegisteredServer, ServerRegistry, ServerRegistryError,
 };
-pub use workspace::{InitOutcome, WorkspaceError, WorkspaceService, absolute_path};
+pub use workspace::{
+    DoctorFinding, DoctorLevel, InitOutcome, WorkspaceError, WorkspaceService, absolute_path,
+};
 
 use domain::server::download::DownloadStatus;
 use domain::server::error::InvalidTransition;

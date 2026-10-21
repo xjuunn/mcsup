@@ -104,18 +104,29 @@ mcsup workspace init [--dir <path>] [--name <name>]
 
 - 所有工作目录的服务器在同一个数据库中，`server list` / `start` 等按
   名字全局解析，与「当前在哪个目录」无关。
-- 首个 workspace 自动成为 default；后续 init 不修改 default；切换必须
-  显式 `mcsup workspace use`。
-- default 只决定 `server create` 缺省落点，不隐藏、不过滤任何服务器。
-  禁止「工作区上下文」式的可见性切换。
+- 首个 workspace 自动成为 current；后续 init 不修改 current；切换必须
+  显式 `mcsup workspace use`（不带名字时 TTY 下交互选择）。
+- current 只决定 `server create` / `server link` 缺省落点，不隐藏、不过滤
+  任何服务器。禁止「工作区上下文」式的可见性切换。
+- 删除 current 时当前标记移交给剩余中按名称排序的第一个；无剩余则无当前，
+  缺省落点操作报 `NoCurrent`。
 - `--workspace` 按名匹配：精确 → 唯一前缀 → 未找到或歧义时列候选报错。
+  选择器优先级：flag > 环境变量 `MCSUP_WORKSPACE` > 当前工作区。
 - `server create` 不提供自由路径参数；服务器只能落在已注册工作目录的
-  `servers/` 下。
+  `servers/` 下。外部已有目录用 `server link` 引入（符号链接）。
+- `server link` 约束：目标不能位于任一工作区 `servers/` 子树内；目标目录
+  带合法 `mcsup.json` 时复用其 id，损坏则拒绝，id 已注册也拒绝；注册失败
+  回滚符号链接。链接服务器 `server remove --purge` 直接拒绝（目标在工作区
+  外，删除不可恢复），普通 `remove` 仅移除链接与登记。
+- `workspace doctor` 检查：无当前（warning）、工作目录缺失、`servers/` 下
+  悬空符号链接、磁盘有目录但未登记、已登记但磁盘缺失；错误级问题使退出码
+  非零。
+- `server move` 暂不实现（v1 之后再评估，与 `link` 一起做语义会交叉）。
 
 # 数据库概要
 
 ```
-workspaces(id PK, name UNIQUE, path UNIQUE, is_default,
+workspaces(id PK, name UNIQUE, path UNIQUE, is_current,
            created_at, updated_at)
 servers(id PK, name UNIQUE, workspace_id FK, rel_dir, version, variant,
         jar_path, jar_size, checksum_algo, checksum,

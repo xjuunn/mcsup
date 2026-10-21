@@ -27,7 +27,7 @@ pub(crate) struct WorkspaceRow {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) path: String,
-    pub(crate) is_default: bool,
+    pub(crate) is_current: bool,
     pub(crate) created_at: i64,
     pub(crate) updated_at: i64,
 }
@@ -90,7 +90,7 @@ impl From<&Workspace> for WorkspaceRow {
             id: ws.id.as_str().to_owned(),
             name: ws.name.as_str().to_owned(),
             path: ws.path.to_string_lossy().into_owned(),
-            is_default: ws.is_default,
+            is_current: ws.is_current,
             created_at: ws.created_at,
             updated_at: ws.updated_at,
         }
@@ -109,7 +109,7 @@ impl TryFrom<WorkspaceRow> for Workspace {
             id,
             name,
             path: PathBuf::from(row.path),
-            is_default: row.is_default,
+            is_current: row.is_current,
             created_at: row.created_at,
             updated_at: row.updated_at,
         })
