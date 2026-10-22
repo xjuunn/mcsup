@@ -3,6 +3,9 @@ use clap::{Parser, Subcommand};
 use clap_verbosity_flag::Verbosity;
 use std::path::PathBuf;
 
+/// 日志默认回看行数：`logs --tail` 缺省值，`console` 附加时回放的历史行数
+pub(crate) const LOG_TAIL_DEFAULT: usize = 30;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "mcsup",
@@ -169,7 +172,7 @@ pub(crate) enum ServerAction {
     Logs {
         name: String,
         /// 显示末尾行数
-        #[arg(long, value_name = "N", default_value_t = 100)]
+        #[arg(long, value_name = "N", default_value_t = LOG_TAIL_DEFAULT)]
         tail: usize,
         /// 持续跟踪新增（JSON 模式输出 JSONL）
         #[arg(long)]
@@ -325,4 +328,24 @@ pub(crate) enum ConfigAction {
     Set { key: String, value: String },
     /// 打开编辑器
     Edit,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// `logs` 缺省回看 30 行，与 `console` 附加回放行数一致
+    #[test]
+    fn logs_tail_defaults_to_console_history_lines() {
+        let cli = Cli::try_parse_from(["mcsup", "server", "logs", "alpha"]).expect("parse");
+        let tail = match cli.command {
+            Command::Server {
+                action: ServerAction::Logs { tail, .. },
+            } => tail,
+            other => panic!("expected server logs, got {other:?}"),
+        };
+        assert_eq!(tail, 30);
+        assert_eq!(tail, LOG_TAIL_DEFAULT);
+    }
 }

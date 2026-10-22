@@ -293,6 +293,24 @@ impl ServerLifecycleService {
         Ok(LogWatch::open(console_log_path(&server.dir)))
     }
 
+    /// 打开 `console.log` 的增量读取器，同时返回末尾若干行历史（`server console` 附加时用）
+    ///
+    /// 历史与增量以同一文件长度快照为界：快照之前的内容进历史，
+    /// 快照之后的追加由 [`LogWatch::read_new`] 返回，不重不漏。
+    ///
+    /// # Errors
+    ///
+    /// 注册表失败或日志读取失败
+    pub fn log_watch_tail(
+        &self,
+        name: &str,
+        lines: usize,
+    ) -> Result<(Vec<String>, LogWatch), LifecycleError> {
+        let server = self.registry.get(name)?;
+        let (watch, history) = LogWatch::open_tail(console_log_path(&server.dir), lines)?;
+        Ok((history, watch))
+    }
+
     /// 注册元数据 + 实时状态的合并报告（`server status` 用）
     ///
     /// # Errors
@@ -348,14 +366,15 @@ fn ensure_eula(server_dir: &Path, accept_eula: bool) -> Result<(), LifecycleErro
     Ok(())
 }
 
-/// 反向读取文件末尾 `max_lines` 行；文件不存在返回空
+/// 反向读取文件末尾 `max_lines` 行，并返回读取时的文件长度快照；文件不存在返回空 + 0
 ///
 /// 从尾部按块回退收集，够 `max_lines + 1` 行（首行可能是半截）或到文件头
-/// 为止。控制台日志可能非 UTF-8，按 lossy 解码。
-fn tail_lines(path: &Path, max_lines: usize) -> std::io::Result<Vec<String>> {
+/// 为止。控制台日志可能非 UTF-8，按 lossy 解码。快照长度用于增量读取的
+/// 起始偏移：只读 `[0, len)`，追加写入不受影响。
+fn tail_lines_upto(path: &Path, max_lines: usize) -> std::io::Result<(Vec<String>, u64)> {
     let mut file = match std::fs::File::open(path) {
         Ok(file) => file,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok((Vec::new(), 0)),
         Err(err) => return Err(err),
     };
     let len = file.metadata()?.len();
@@ -379,10 +398,18 @@ fn tail_lines(path: &Path, max_lines: usize) -> std::io::Result<Vec<String>> {
     if lines.len() > max_lines {
         lines.drain(..lines.len() - max_lines);
     }
-    Ok(lines
+    let lines = lines
         .into_iter()
         .map(|line| line.trim_end_matches('\r').to_owned())
-        .collect())
+        .collect();
+    Ok((lines, len))
+}
+
+/// 反向读取文件末尾 `max_lines` 行；文件不存在返回空
+///
+/// 见 [`tail_lines_upto`]。
+fn tail_lines(path: &Path, max_lines: usize) -> std::io::Result<Vec<String>> {
+    tail_lines_upto(path, max_lines).map(|(lines, _)| lines)
 }
 
 /// 增量读取日志文件（`server logs --follow` 用）：按路径 + 偏移轮询
@@ -405,6 +432,26 @@ impl LogWatch {
             offset,
             partial: Vec::new(),
         }
+    }
+
+    /// 打开并返回末尾 `max_lines` 行历史，同时定位到读取时的文件长度快照
+    ///
+    /// 快照之前的内容进历史，之后的追加由 [`Self::read_new`] 返回，不重不漏。
+    /// 文件不存在按空历史 + 从文件头跟踪处理。
+    ///
+    /// # Errors
+    ///
+    /// 读取失败（「不存在」不报错）
+    pub fn open_tail(path: PathBuf, max_lines: usize) -> std::io::Result<(Self, Vec<String>)> {
+        let (history, offset) = tail_lines_upto(&path, max_lines)?;
+        Ok((
+            Self {
+                path,
+                offset,
+                partial: Vec::new(),
+            },
+            history,
+        ))
     }
 
     /// 读取新增的完整行；尾部半行暂存到下次调用
@@ -1498,6 +1545,72 @@ mod tests {
             watch.read_new().expect("completed"),
             vec!["half-line".to_owned()]
         );
+    }
+
+    #[test]
+    fn log_watch_tail_replays_history_then_only_new_lines() {
+        let fixture = Fixture::new(true);
+        let log = console_log_path(&fixture.server_dir);
+        std::fs::write(&log, "l1\nl2\nl3\nl4\n").expect("write");
+        let supervisor = Arc::new(FakeSupervisor::default());
+        let svc = service(
+            &fixture,
+            java_service(MemJavaRepo::new(vec![], true), vec![]),
+            Arc::clone(&supervisor),
+        );
+        let (history, mut watch) = svc.log_watch_tail(&fixture.name, 2).expect("watch tail");
+        assert_eq!(history, vec!["l3".to_owned(), "l4".to_owned()]);
+        // 历史与增量不重：快照之后才追加
+        assert!(watch.read_new().expect("no dup").is_empty());
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .expect("open");
+        writeln!(file, "l5").expect("append");
+        assert_eq!(watch.read_new().expect("new"), vec!["l5".to_owned()]);
+    }
+
+    #[test]
+    fn log_watch_tail_missing_file_starts_empty_then_reads_from_start() {
+        let fixture = Fixture::new(true);
+        let supervisor = Arc::new(FakeSupervisor::default());
+        let svc = service(
+            &fixture,
+            java_service(MemJavaRepo::new(vec![], true), vec![]),
+            Arc::clone(&supervisor),
+        );
+        let (history, mut watch) = svc.log_watch_tail(&fixture.name, 30).expect("watch tail");
+        assert!(history.is_empty());
+        // 文件此时尚未创建：快照长度为 0，创建后从头跟踪
+        let log = console_log_path(&fixture.server_dir);
+        std::fs::write(&log, "boot\nready\n").expect("write");
+        assert_eq!(
+            watch.read_new().expect("from start"),
+            vec!["boot".to_owned(), "ready".to_owned()]
+        );
+    }
+
+    #[test]
+    fn log_watch_open_tail_caps_history_at_max_lines() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join("console.log");
+        let content = (1..=100)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, format!("{content}\n")).expect("write");
+        let (mut watch, history) = LogWatch::open_tail(path.clone(), 5).expect("open tail");
+        assert_eq!(
+            history,
+            vec!["line96", "line97", "line98", "line99", "line100"]
+        );
+        assert!(watch.read_new().expect("no dup").is_empty());
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open");
+        writeln!(file, "line101").expect("append");
+        assert_eq!(watch.read_new().expect("new"), vec!["line101".to_owned()]);
     }
 
     #[test]

@@ -299,6 +299,8 @@ pub(crate) fn console(name: &str, printer: Printer) -> Result<()> {
     if !report.status.as_ref().is_some_and(|s| s.status.is_alive()) {
         return Err(LifecycleError::NotRunning.into());
     }
+    // 先取历史 + 增量读取器（同一快照为界，不重不漏），再回放，避免附加瞬间丢行
+    let (history, mut watch) = service.log_watch_tail(name, crate::cli::LOG_TAIL_DEFAULT)?;
 
     // Windows 无 EOF 键：Ctrl+D 随整行到达，必须回车才生效
     let detach_hint = if cfg!(windows) {
@@ -309,7 +311,9 @@ pub(crate) fn console(name: &str, printer: Printer) -> Result<()> {
     printer.print_section(&format!(
         "已附加 {name} 控制台（{detach_hint}，服务器继续运行）"
     ));
-    let mut watch = service.log_watch(name)?;
+    for line in &history {
+        print_raw_line(line);
+    }
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
         let done = Arc::clone(&done);
