@@ -15,8 +15,9 @@ use tracing::info;
 /// 目标目录 = 注册表里该服务器的目录（`{workspace}/servers/{name}/server.jar`），
 /// 来源按服务端变体做能力匹配；当前工作目录不参与定位；安装完成回写 `meta.jar`。
 ///
-/// 版本：`--version` 直用；缺省时交互下从版本列表选择，非交互保留
-/// `latest`（由来源解析为最新稳定版）。
+/// 版本：`--version` 直用；核心尚未装成时沿用注册表里已记录的版本（下载失败后
+/// 重试不再重选）；其余交互下从版本列表选择，非交互保留 `latest`
+/// （由来源解析为最新稳定版）。
 ///
 /// # Errors
 ///
@@ -34,13 +35,38 @@ pub(crate) async fn run(
     let source = bootstrap::source_for(srv.meta.variant)?;
     let version_id = match version {
         Some(raw) => VersionId::new(raw),
-        None if printer.is_interactive() => {
-            pick_version(source.as_ref(), srv.meta.variant, printer).await?
-        }
-        None => VersionId::new("latest"),
+        None => match default_version_source(srv.meta.jar.is_some(), printer.is_interactive()) {
+            VersionSource::Recorded => srv.meta.version.clone(),
+            VersionSource::Prompt => {
+                pick_version(source.as_ref(), srv.meta.variant, printer).await?
+            }
+            VersionSource::Latest => VersionId::new("latest"),
+        },
     };
     let (size, destination) = download_jar(&registry, name, &version_id, source, printer).await?;
     printer.print_installed(&version_id, size, &destination)
+}
+
+/// 未显式传 `--version` 时版本的来源
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VersionSource {
+    /// 沿用注册表记录的版本：核心还没装成（下载失败 / 被清理）时重试不重选
+    Recorded,
+    /// 交互选择
+    Prompt,
+    /// 非交互缺省 `latest`
+    Latest,
+}
+
+/// 缺省版本的来源判定：核心未装成 > 交互 > 非交互 `latest`
+fn default_version_source(has_jar: bool, interactive: bool) -> VersionSource {
+    if !has_jar {
+        VersionSource::Recorded
+    } else if interactive {
+        VersionSource::Prompt
+    } else {
+        VersionSource::Latest
+    }
 }
 
 /// 下载并登记服务端核心；不打印结果行（由调用方输出，保证 JSON 单行契约）
@@ -96,14 +122,32 @@ pub(crate) async fn pick_version(
     if versions.is_empty() {
         anyhow::bail!("{} 暂无可用版本", variant.as_str());
     }
-    let labels: Vec<String> = versions.iter().map(version_label).collect();
-    let picked = prompts::select_filter("选择版本", &labels)?;
+    let choices = version_choices(&versions);
+    let picked = prompts::select_filter_scoped(
+        "选择版本",
+        &choices,
+        prompts::ScopeHint {
+            show_all: "显示所有版本",
+            show_default: "只显示正式版",
+        },
+    )?;
     versions
         .into_iter()
-        .zip(labels)
-        .find(|(_, label)| *label == picked)
+        .zip(choices)
+        .find(|(_, choice)| choice.label == picked)
         .map(|(v, _)| v.id)
         .ok_or_else(|| anyhow::anyhow!("无效选择: {picked}"))
+}
+
+/// 版本候选：默认只列正式版，快照 / 旧版标为扩展候选（由 Ctrl+A 切换显示）
+fn version_choices(versions: &[ServerVersion]) -> Vec<prompts::ScopedChoice> {
+    versions
+        .iter()
+        .map(|version| {
+            let extra = !matches!(version.kind, VersionKind::Release);
+            prompts::ScopedChoice::new(version_label(version), extra)
+        })
+        .collect()
 }
 
 /// 版本候选的展示标签（含版本 id，映射回 id 时按标签全名匹配）
@@ -143,5 +187,37 @@ mod tests {
             version_label(&version(VersionKind::Historical, "1.0")),
             "1.0（旧版）"
         );
+    }
+
+    /// 正式版为默认候选，快照 / 旧版标为扩展候选（由 Ctrl+A 切换显示）
+    #[test]
+    fn version_choices_marks_non_release_as_extra() {
+        let versions = vec![
+            version(VersionKind::Release, "1.21.1"),
+            version(VersionKind::Snapshot, "24w33a"),
+            version(VersionKind::Historical, "1.0"),
+        ];
+        let choices = version_choices(&versions);
+        assert_eq!(choices.len(), 3);
+        assert_eq!(choices[0].label, "1.21.1");
+        assert!(!choices[0].extra, "正式版是默认候选");
+        assert_eq!(choices[1].label, "24w33a（快照）");
+        assert!(choices[1].extra);
+        assert_eq!(choices[2].label, "1.0（旧版）");
+        assert!(choices[2].extra);
+    }
+
+    /// 缺省版本来源：核心未装成时沿用记录版本（重试不重选），否则按交互性
+    #[test]
+    fn default_version_source_prefers_recorded_when_core_missing() {
+        // 下载失败 / 已被清理：无论是否交互都沿用记录版本
+        assert_eq!(default_version_source(false, true), VersionSource::Recorded);
+        assert_eq!(
+            default_version_source(false, false),
+            VersionSource::Recorded
+        );
+        // 已装成核心：交互重选，非交互沿用 latest 口径
+        assert_eq!(default_version_source(true, true), VersionSource::Prompt);
+        assert_eq!(default_version_source(true, false), VersionSource::Latest);
     }
 }

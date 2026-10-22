@@ -285,6 +285,7 @@ dependencies = [
  "clap_complete",
  "comfy-table",
  "console",
+ "crossterm",
  "dirs",
  "indicatif",
  "inquire",

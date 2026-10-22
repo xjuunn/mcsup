@@ -14,6 +14,16 @@ use mcsup::domain::workspace::WorkspaceName;
 use mcsup::service::{MARKER_FILE, NOISE_ENTRIES, absolute_path};
 use std::path::{Path, PathBuf};
 
+mod scoped;
+
+pub(crate) use scoped::{ScopeHint, ScopedChoice, select_filter_scoped};
+
+/// 空输入的校验文案（可过滤选择的两个组件共用）
+pub(crate) const ERR_EMPTY_INPUT: &str = "请输入关键字或从建议中选择";
+
+/// 非候选全名的校验文案（同上）
+pub(crate) const ERR_NOT_A_CHOICE: &str = "请从建议中选择一个选项";
+
 /// 步骤标题：`[n/N] 标题`（多阶段任务的统一回显风格）
 pub(crate) fn step(printer: Printer, step: usize, total: usize, title: &str) {
     printer.print_section(&format!("[{step}/{total}] {title}"));
@@ -324,14 +334,12 @@ pub(crate) fn canonical_choice<'a>(input: &str, choices: &'a [String]) -> Option
 pub(crate) fn validate_choice(input: &str, choices: &[String]) -> Validation {
     let input = input.trim();
     if input.is_empty() {
-        return Validation::Invalid(ErrorMessage::Custom(
-            "请输入关键字或从建议中选择".to_owned(),
-        ));
+        return Validation::Invalid(ErrorMessage::Custom(ERR_EMPTY_INPUT.to_owned()));
     }
     if canonical_choice(input, choices).is_some() {
         Validation::Valid
     } else {
-        Validation::Invalid(ErrorMessage::Custom("请从建议中选择一个选项".to_owned()))
+        Validation::Invalid(ErrorMessage::Custom(ERR_NOT_A_CHOICE.to_owned()))
     }
 }
 
