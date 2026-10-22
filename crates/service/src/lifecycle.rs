@@ -13,6 +13,7 @@ use port::{
     ScannedJava, StopOutcome, StopSpec, SupervisorError, SupervisorPort, SupervisorStartOutcome,
     SupervisorStartRequest, SupervisorStatus,
 };
+use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -232,6 +233,25 @@ impl ServerLifecycleService {
     pub fn status(&self, name: &str) -> Result<Option<SupervisorStatus>, LifecycleError> {
         let server = self.registry.get(name)?;
         Ok(self.supervisor.status(&server.dir)?)
+    }
+
+    /// 全量服务器的实时状态（`server list` 状态列用）
+    ///
+    /// 逐台探测；连不上 = `None`（未在运行）。按键取值，顺序不保证。
+    ///
+    /// # Errors
+    ///
+    /// 注册表失败，或任一 supervisor 协议失败
+    pub fn statuses(&self) -> Result<HashMap<String, Option<SupervisorStatus>>, LifecycleError> {
+        let servers = self.registry.list()?;
+        let mut out = HashMap::with_capacity(servers.len());
+        for srv in servers {
+            out.insert(
+                srv.meta.name.as_str().to_owned(),
+                self.supervisor.status(&srv.dir)?,
+            );
+        }
+        Ok(out)
     }
 
     /// 向服务端 stdin 注入一行
@@ -1388,6 +1408,28 @@ mod tests {
         let report = idle.describe(&fixture.name).expect("describe");
         assert!(report.status.is_none());
         assert_eq!(report.version, "1.21.1");
+    }
+
+    #[test]
+    fn statuses_probes_all_registered_servers() {
+        let fixture = Fixture::new(true);
+        let running = service(
+            &fixture,
+            java_service(MemJavaRepo::new(vec![], true), vec![]),
+            Arc::new(FakeSupervisor::running()),
+        );
+        let map = running.statuses().expect("statuses");
+        assert_eq!(map.len(), 1);
+        let view = map.get("alpha").expect("alpha").as_ref().expect("view");
+        assert!(view.status.is_alive());
+
+        let idle = service(
+            &fixture,
+            java_service(MemJavaRepo::new(vec![], true), vec![]),
+            Arc::new(FakeSupervisor::default()),
+        );
+        let map = idle.statuses().expect("statuses");
+        assert!(map.get("alpha").expect("alpha").is_none());
     }
 
     #[test]

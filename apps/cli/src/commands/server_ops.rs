@@ -3,7 +3,8 @@ use crate::diagnostic::AppDiagnostic;
 use crate::output::Printer;
 use crate::prompts;
 use anyhow::{Context, Result};
-use comfy_table::Table;
+use comfy_table::{Cell, Color, Table};
+use mcsup::domain::server::status::ServerStatus;
 use mcsup::domain::server::version::{ServerVariant, VersionId};
 use mcsup::domain::workspace::WorkspaceId;
 use mcsup::service::{ServerRegistry, ServerRegistryError, WorkspaceError, WorkspaceService};
@@ -23,6 +24,11 @@ struct ServerRow<'a> {
     path: String,
     jar: Option<String>,
     linked: bool,
+    /// 领域状态口径；无 supervisor 时为 `stopped`
+    status: String,
+    /// 是否进程尚存（表格状态列着色用，不进 JSON）
+    #[serde(skip)]
+    running: bool,
 }
 
 /// `server create` / `server link` 结果（JSON 模式序列化用）
@@ -66,19 +72,30 @@ pub(crate) fn list(printer: Printer) -> Result<()> {
     let reg = open_registry()?;
     let all = reg.list().context("列出服务器失败")?;
     let ws_names = workspace_names()?;
+    let statuses = super::lifecycle::lifecycle_service()?.statuses()?;
     let rows: Vec<ServerRow<'_>> = all
         .iter()
-        .map(|srv| ServerRow {
-            name: srv.meta.name.as_str(),
-            workspace: ws_names
-                .get(&srv.meta.workspace_id)
-                .cloned()
-                .unwrap_or_else(|| srv.meta.workspace_id.as_str().to_owned()),
-            version: srv.meta.version.as_str(),
-            variant: srv.meta.variant.as_str(),
-            path: srv.dir.display().to_string(),
-            jar: srv.meta.jar.as_ref().map(|j| j.path.display().to_string()),
-            linked: srv.linked,
+        .map(|srv| {
+            let view = statuses
+                .get(srv.meta.name.as_str())
+                .and_then(Option::as_ref);
+            ServerRow {
+                name: srv.meta.name.as_str(),
+                workspace: ws_names
+                    .get(&srv.meta.workspace_id)
+                    .cloned()
+                    .unwrap_or_else(|| srv.meta.workspace_id.as_str().to_owned()),
+                version: srv.meta.version.as_str(),
+                variant: srv.meta.variant.as_str(),
+                path: srv.dir.display().to_string(),
+                jar: srv.meta.jar.as_ref().map(|j| j.path.display().to_string()),
+                linked: srv.linked,
+                status: view.map_or_else(
+                    || ServerStatus::Stopped.as_str().to_owned(),
+                    |s| s.status.as_str().to_owned(),
+                ),
+                running: view.is_some_and(|s| s.status.is_alive()),
+            }
         })
         .collect();
     printer.print_rows(
@@ -86,18 +103,20 @@ pub(crate) fn list(printer: Printer) -> Result<()> {
         "尚无服务器，先运行 mcsup server create",
         || {
             let mut table = Table::new();
-            table.set_header(["名称", "工作区", "版本", "变体", "路径"]);
-            for srv in &all {
-                let ws = ws_names
-                    .get(&srv.meta.workspace_id)
-                    .cloned()
-                    .unwrap_or_else(|| srv.meta.workspace_id.as_str().to_owned());
+            table.set_header(["名称", "工作区", "版本", "变体", "状态", "路径"]);
+            for row in &rows {
+                let status = if row.running {
+                    Cell::new("运行中").fg(Color::Green)
+                } else {
+                    Cell::new("")
+                };
                 table.add_row([
-                    srv.meta.name.as_str().to_owned(),
-                    ws,
-                    srv.meta.version.as_str().to_owned(),
-                    srv.meta.variant.as_str().to_owned(),
-                    srv.dir.display().to_string(),
+                    Cell::new(row.name),
+                    Cell::new(&row.workspace),
+                    Cell::new(row.version),
+                    Cell::new(row.variant),
+                    status,
+                    Cell::new(&row.path),
                 ]);
             }
             table

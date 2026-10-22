@@ -62,7 +62,7 @@ struct LogsTailJson<'a> {
 }
 
 /// 装配生命周期服务：注册表 + Java + 本机 supervisor
-fn lifecycle_service() -> Result<Arc<ServerLifecycleService>> {
+pub(crate) fn lifecycle_service() -> Result<Arc<ServerLifecycleService>> {
     let registry = bootstrap::open_registry()?;
     let java = bootstrap::open_java_service()?;
     Ok(Arc::new(ServerLifecycleService::new(
