@@ -10,6 +10,7 @@ use diesel::prelude::*;
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use domain::java::JavaRuntime;
 use domain::server::meta::{ServerMeta, ServerName};
+use domain::server::version::VersionId;
 use domain::workspace::{Workspace, WorkspaceId, WorkspaceName};
 use port::{JavaRuntimeRepository, RepositoryError, ServerRepository, WorkspaceRepository};
 use std::path::Path;
@@ -73,7 +74,7 @@ impl SqliteStore {
 
     /// 取锁后在连接上执行一段操作
     ///
-    /// 内部组合（如 `update_jar` 之后回读）必须走同一个闭包共享连接，
+    /// 内部组合（如 `update_core` 之后回读）必须走同一个闭包共享连接，
     /// 禁止方法间重入 `self`——`std::sync::Mutex` 不可重入，会死锁
     fn with_conn<T>(
         &self,
@@ -224,14 +225,16 @@ impl ServerRepository for SqliteStore {
         })
     }
 
-    fn update_jar(
+    fn update_core(
         &self,
         name: &ServerName,
+        version: &VersionId,
         jar: &domain::server::meta::InstalledJar,
         updated_at: i64,
     ) -> Result<ServerMeta, RepositoryError> {
         self.with_conn(|conn| {
             let changeset = JarChangeset {
+                version: version.to_string(),
                 jar_path: jar.path.to_string_lossy().into_owned(),
                 jar_size: i64::try_from(jar.size).unwrap_or(i64::MAX),
                 checksum_algo: jar.checksum.algorithm().as_str().to_owned(),
@@ -519,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn update_jar_persists_and_bumps_timestamp() {
+    fn update_core_persists_version_and_jar() {
         let store = store_with_ws();
         add_server(&store, &sample_meta("alpha"));
         let jar = InstalledJar {
@@ -527,13 +530,16 @@ mod tests {
             size: 42,
             checksum: Checksum::new(ChecksumAlgorithm::Sha1, "a".repeat(40)),
         };
-        let updated = ServerRepository::update_jar(
+        let version = VersionId::new("1.21.2");
+        let updated = ServerRepository::update_core(
             &store,
             &ServerName::parse("alpha").expect("valid"),
+            &version,
             &jar,
             1_700_000_100,
         )
         .expect("update");
+        assert_eq!(updated.version, version, "安装换版本要同步回写");
         assert_eq!(updated.jar, Some(jar));
         assert_eq!(updated.updated_at, 1_700_000_100);
     }

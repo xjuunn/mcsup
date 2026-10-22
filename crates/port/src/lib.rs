@@ -4,6 +4,7 @@ use domain::server::meta::{InstalledJar, ServerMeta, ServerName};
 use domain::server::settings::ServerSettings;
 pub use domain::server::status::ServerStatus;
 use domain::server::version::{ServerVariant, ServerVersion, VersionId};
+use domain::server::world::{DataVersion, WorldInfo};
 use domain::workspace::{Workspace, WorkspaceId, WorkspaceName};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -267,6 +268,69 @@ pub trait ArchiveExtractor: Send + Sync {
     fn extract(&self, archive: &Path, dest: &Path) -> Result<(), ExtractError>;
 }
 
+/// 读取世界 / 核心元数据失败
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum InspectError {
+    /// 文件无法读取
+    #[error("failed to read {path}")]
+    Io {
+        /// 出错路径
+        path: PathBuf,
+        /// 底层 IO 错误
+        #[source]
+        source: std::io::Error,
+    },
+    /// 文件内容无法解析
+    #[error("failed to parse {path}: {message}")]
+    Parse {
+        /// 出错路径
+        path: PathBuf,
+        /// 解析失败原因
+        message: String,
+    },
+}
+
+impl InspectError {
+    /// 构造 IO 失败
+    #[must_use]
+    pub fn io(path: &Path, source: std::io::Error) -> Self {
+        Self::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    }
+
+    /// 构造解析失败
+    #[must_use]
+    pub fn parse(path: &Path, message: impl Into<String>) -> Self {
+        Self::Parse {
+            path: path.to_path_buf(),
+            message: message.into(),
+        }
+    }
+}
+
+/// 读取世界数据版本与核心数据版本
+///
+/// 安装核心前用它确认目标版本不会把既有世界降级；读取失败由调用方决定
+/// 是否中止，本 trait 只报告「有没有 / 是多少」。
+pub trait CoreInspector: Send + Sync {
+    /// 读取服务器目录下既有世界的信息；没有世界时返回 `None`
+    ///
+    /// # Errors
+    ///
+    /// 世界存在但 `level.dat` 无法读取 / 解析时返回 [`InspectError`]
+    fn world_info(&self, server_dir: &Path) -> Result<Option<WorldInfo>, InspectError>;
+
+    /// 读取核心 `version.json` 的 `world_version`；核心没有该字段时返回 `None`
+    ///
+    /// # Errors
+    ///
+    /// 文件无法读取或归档 / JSON 无法解析时返回 [`InspectError`]
+    fn jar_data_version(&self, jar: &Path) -> Result<Option<DataVersion>, InspectError>;
+}
+
 /// 元数据存储错误
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -309,14 +373,18 @@ pub trait ServerRepository: Send + Sync {
     /// 底层失败返回 [`RepositoryError::Storage`]
     fn list(&self) -> Result<Vec<ServerMeta>, RepositoryError>;
 
-    /// 回写核心元数据并刷新 `updated_at`，返回最新记录
+    /// 回写核心元数据（版本 + jar）并刷新 `updated_at`，返回最新记录
+    ///
+    /// 安装核心可能换版本，版本与 jar 必须在同一次写入里落库，
+    /// 否则会出现「jar 已是新版本、记录仍是旧版本」的不一致。
     ///
     /// # Errors
     ///
     /// 不存在返回 [`RepositoryError::NotFound`]
-    fn update_jar(
+    fn update_core(
         &self,
         name: &ServerName,
+        version: &VersionId,
         jar: &InstalledJar,
         updated_at: i64,
     ) -> Result<ServerMeta, RepositoryError>;

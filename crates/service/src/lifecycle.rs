@@ -549,9 +549,10 @@ mod tests {
         fn list(&self) -> Result<Vec<domain::server::meta::ServerMeta>, RepositoryError> {
             Ok(self.items.lock().expect("lock").clone())
         }
-        fn update_jar(
+        fn update_core(
             &self,
             name: &domain::server::meta::ServerName,
+            version: &VersionId,
             jar: &InstalledJar,
             updated_at: i64,
         ) -> Result<domain::server::meta::ServerMeta, RepositoryError> {
@@ -560,6 +561,7 @@ mod tests {
                 .iter_mut()
                 .find(|m| m.name == *name)
                 .ok_or_else(|| RepositoryError::NotFound(name.as_str().to_owned()))?;
+            meta.version = version.clone();
             meta.jar = Some(jar.clone());
             meta.updated_at = updated_at;
             Ok(meta.clone())
@@ -933,8 +935,9 @@ mod tests {
             if with_jar {
                 std::fs::write(server.dir.join("server.jar"), b"jar").expect("jar");
                 registry
-                    .update_jar(
+                    .update_core(
                         "alpha",
+                        &VersionId::new("1.21.1"),
                         &InstalledJar {
                             path: PathBuf::from("server.jar"),
                             size: 3,

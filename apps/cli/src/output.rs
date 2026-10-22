@@ -171,6 +171,8 @@ impl Printer {
                 return match jar {
                     mcsup::service::InstallJarError::Registry(reg) => registry_exit_code(reg),
                     mcsup::service::InstallJarError::Install(install) => install_exit_code(install),
+                    // 世界与目标版本冲突：状态冲突，不重试同一版本
+                    mcsup::service::InstallJarError::Downgrade { .. } => 4,
                     _ => 1,
                 };
             }
@@ -438,6 +440,22 @@ mod tests {
         .context("安装服务端 x 失败")
         .unwrap_err();
         assert_eq!(Printer::exit_code(&err), 5);
+    }
+
+    /// 世界降级：状态冲突，重试同一版本无意义
+    #[test]
+    fn install_jar_downgrade_maps_to_exit_code_4() {
+        use mcsup::domain::server::world::DataVersion;
+        use mcsup::service::InstallJarError;
+        let err = Err::<(), _>(InstallJarError::Downgrade {
+            world: DataVersion::new(4786),
+            target: DataVersion::new(4554),
+            world_version: "26.1".to_owned(),
+            target_version: "1.21.9".to_owned(),
+        })
+        .context("安装服务端 x 失败")
+        .unwrap_err();
+        assert_eq!(Printer::exit_code(&err), 4);
     }
 
     #[test]

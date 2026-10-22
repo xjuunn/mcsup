@@ -142,9 +142,10 @@ mod tests {
         fn list(&self) -> Result<Vec<domain::server::meta::ServerMeta>, RepositoryError> {
             Ok(self.items.lock().expect("lock").clone())
         }
-        fn update_jar(
+        fn update_core(
             &self,
             _name: &domain::server::meta::ServerName,
+            _version: &VersionId,
             _jar: &domain::server::meta::InstalledJar,
             _updated_at: i64,
         ) -> Result<domain::server::meta::ServerMeta, RepositoryError> {

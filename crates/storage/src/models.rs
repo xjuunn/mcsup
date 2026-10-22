@@ -54,10 +54,11 @@ pub(crate) struct ServerRow {
     pub(crate) autostart: bool,
 }
 
-/// 核心元数据变更集：只更新这几列，不动身份 / 归属 / `created_at`
+/// 核心元数据变更集：版本 + jar 列 + `updated_at`，不动身份 / 归属 / `created_at`
 #[derive(Debug, AsChangeset)]
 #[diesel(table_name = servers)]
 pub(crate) struct JarChangeset {
+    pub(crate) version: String,
     pub(crate) jar_path: String,
     pub(crate) jar_size: i64,
     pub(crate) checksum_algo: String,

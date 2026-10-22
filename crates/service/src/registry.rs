@@ -1,9 +1,11 @@
 use domain::server::meta::{InstalledJar, ServerId, ServerMeta, ServerName};
 use domain::server::settings::ServerSettings;
 use domain::server::version::{ServerVariant, VersionId};
+use domain::server::world::{DataVersion, ensure_world_readable};
 use domain::workspace::{Workspace, WorkspaceId};
 use port::{
-    CancellationToken, ProgressSink, RepositoryError, ServerRepository, WorkspaceRepository,
+    CancellationToken, CoreInspector, ProgressSink, RepositoryError, ServerRepository,
+    WorkspaceRepository,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -18,6 +20,8 @@ const SERVER_MARKER: &str = "mcsup.json";
 const SERVER_MARKER_SCHEMA: u32 = 1;
 /// 核心固定文件名（[`InstalledJar::path`] 的相对路径口径）
 const SERVER_JAR: &str = "server.jar";
+/// 安装暂存文件：先下载到这里，校验通过后再原子替换 `server.jar`
+const STAGING_JAR: &str = ".server.jar.installing";
 
 /// 服务器注册操作失败
 #[derive(Debug, Error)]
@@ -59,6 +63,23 @@ pub enum InstallJarError {
     /// 来源、下载或校验失败
     #[error(transparent)]
     Install(#[from] InstallError),
+    /// 世界或目标核心的元数据无法读取
+    #[error("无法检查世界或目标核心的兼容性")]
+    Inspect(#[from] port::InspectError),
+    /// 目标核心低于世界数据版本：Minecraft 不支持降级世界
+    #[error(
+        "世界由 {world_version}（DataVersion {world}）创建，目标版本 {target_version}（DataVersion {target}）更低；Minecraft 不支持降级世界。请改用 {world_version} 或更高版本，或备份并移走世界目录后重试"
+    )]
+    Downgrade {
+        /// 世界数据版本
+        world: DataVersion,
+        /// 目标核心数据版本
+        target: DataVersion,
+        /// 世界对应的版本名（缺失时为 `DataVersion N`）
+        world_version: String,
+        /// 用户选择的目标版本
+        target_version: String,
+    },
 }
 
 impl ServerRegistryError {
@@ -469,20 +490,21 @@ impl ServerRegistry {
         Ok(RegisteredServer { meta, dir, linked })
     }
 
-    /// 回写核心元数据（安装完成后调用）
+    /// 回写核心元数据（版本 + jar，安装完成后调用）
     ///
     /// # Errors
     ///
     /// 不存在或注册表失败时返回 [`ServerRegistryError`]
-    pub fn update_jar(
+    pub fn update_core(
         &self,
         name: &str,
+        version: &VersionId,
         jar: &InstalledJar,
         updated_at: i64,
     ) -> Result<RegisteredServer, ServerRegistryError> {
         let name =
             ServerName::parse(name).map_err(|_| ServerRegistryError::NotFound(name.to_owned()))?;
-        let meta = self.servers.update_jar(&name, jar, updated_at)?;
+        let meta = self.servers.update_core(&name, version, jar, updated_at)?;
         let dir = self.absolute_dir(&meta)?;
         let linked = dir
             .symlink_metadata()
@@ -512,33 +534,69 @@ impl ServerRegistry {
         Ok(RegisteredServer { meta, dir, linked })
     }
 
-    /// 给既有服务器安装核心：定位目录 → 下载到 `{dir}/server.jar` → 回写元数据
+    /// 给既有服务器安装核心：定位目录 → 下载到暂存文件 → 校验数据版本 →
+    /// 原子替换 `server.jar` → 回写元数据
     ///
-    /// 目标目录由注册表回答，入口不再拿当前工作目录当目标。
+    /// 目标目录由注册表回答，入口不再拿当前工作目录当目标。先下到暂存文件是
+    /// 为了在覆盖旧核心前完成降级检查：校验不过时旧核心原样保留。
     ///
     /// # Errors
     ///
     /// 服务器不存在返回 [`InstallJarError::Registry`]；来源、下载或校验失败返回
-    /// [`InstallJarError::Install`]
+    /// [`InstallJarError::Install`]；元数据读取失败返回 [`InstallJarError::Inspect`]；
+    /// 目标版本低于世界数据版本返回 [`InstallJarError::Downgrade`]
     pub async fn install_jar(
         &self,
         name: &str,
         version: &VersionId,
         installer: &ServerInstaller,
+        inspector: &dyn CoreInspector,
         progress: Option<&dyn ProgressSink>,
         cancel: &CancellationToken,
     ) -> Result<InstalledServerJar, InstallJarError> {
         let srv = self.get(name)?;
         let destination = srv.dir.join(SERVER_JAR);
+        let staging = srv.dir.join(STAGING_JAR);
+        let _ = std::fs::remove_file(&staging);
+
+        let world = inspector.world_info(&srv.dir)?;
         let out: InstalledDownload = installer
-            .install(version, destination.clone(), progress, cancel)
+            .install(version, staging.clone(), progress, cancel)
             .await?;
+        let target = match inspector.jar_data_version(&staging) {
+            Ok(target) => target,
+            Err(err) => {
+                let _ = std::fs::remove_file(&staging);
+                return Err(err.into());
+            }
+        };
+        if let Some(target) = target
+            && let Some(world) = world.as_ref()
+            && let Some(world_version) = world.data_version
+            && let Err(downgrade) = ensure_world_readable(world_version, target)
+        {
+            let _ = std::fs::remove_file(&staging);
+            return Err(InstallJarError::Downgrade {
+                world: downgrade.world,
+                target: downgrade.target,
+                world_version: world
+                    .version_name
+                    .clone()
+                    .unwrap_or_else(|| format!("DataVersion {}", downgrade.world)),
+                target_version: version.to_string(),
+            });
+        }
+        if let Err(err) = std::fs::rename(&staging, &destination) {
+            let _ = std::fs::remove_file(&staging);
+            return Err(ServerRegistryError::io(&destination, err).into());
+        }
+
         let jar = InstalledJar {
             path: PathBuf::from(SERVER_JAR),
             size: out.artifact.size,
             checksum: out.checksum,
         };
-        let srv = self.update_jar(name, &jar, crate::util::unix_now())?;
+        let srv = self.update_core(name, version, &jar, crate::util::unix_now())?;
         Ok(InstalledServerJar {
             server: srv,
             jar,
@@ -886,9 +944,10 @@ mod tests {
             items.sort_by(|a, b| a.name.cmp(&b.name));
             Ok(items)
         }
-        fn update_jar(
+        fn update_core(
             &self,
             name: &ServerName,
+            version: &VersionId,
             jar: &InstalledJar,
             updated_at: i64,
         ) -> Result<ServerMeta, RepositoryError> {
@@ -897,6 +956,7 @@ mod tests {
                 .iter_mut()
                 .find(|m| &m.name == name)
                 .ok_or_else(|| RepositoryError::NotFound(name.as_str().to_owned()))?;
+            meta.version = version.clone();
             meta.jar = Some(jar.clone());
             meta.updated_at = updated_at;
             Ok(meta.clone())
@@ -1384,5 +1444,162 @@ mod tests {
         assert!(msgs.iter().any(|m| m.contains("dangling symlink")));
         assert!(msgs.iter().any(|m| m.contains("not registered")));
         assert!(msgs.iter().any(|m| m.contains("missing on disk")));
+    }
+
+    struct FakeSource;
+
+    #[async_trait::async_trait]
+    impl port::ServerJarSource for FakeSource {
+        fn variant(&self) -> ServerVariant {
+            ServerVariant::Vanilla
+        }
+
+        async fn versions(
+            &self,
+        ) -> Result<Vec<domain::server::version::ServerVersion>, port::SourceError> {
+            Ok(Vec::new())
+        }
+
+        async fn artifact(
+            &self,
+            version: &VersionId,
+        ) -> Result<port::ResolvedArtifact, port::SourceError> {
+            Ok(port::ResolvedArtifact {
+                artifact: domain::server::artifact::JarArtifact {
+                    version: version.clone(),
+                    size: 3,
+                    checksum: domain::server::artifact::Checksum::new(
+                        domain::server::artifact::ChecksumAlgorithm::Sha1,
+                        "0".repeat(40),
+                    ),
+                },
+                location: url::Url::parse("https://example.invalid/server.jar").expect("url"),
+            })
+        }
+
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+    }
+
+    struct FakeDownloader;
+
+    #[async_trait::async_trait]
+    impl port::ArtifactDownloader for FakeDownloader {
+        async fn download(
+            &self,
+            request: &port::DownloadRequest,
+            _progress: Option<&dyn ProgressSink>,
+            _cancel: &CancellationToken,
+        ) -> Result<port::DownloadedArtifact, port::DownloadError> {
+            std::fs::write(&request.destination, b"new").expect("write");
+            Ok(port::DownloadedArtifact {
+                path: request.destination.clone(),
+                size: 3,
+            })
+        }
+    }
+
+    struct FakeInspector {
+        world: Option<domain::server::world::WorldInfo>,
+        target: Option<DataVersion>,
+    }
+
+    impl CoreInspector for FakeInspector {
+        fn world_info(
+            &self,
+            _server_dir: &Path,
+        ) -> Result<Option<domain::server::world::WorldInfo>, port::InspectError> {
+            Ok(self.world.clone())
+        }
+
+        fn jar_data_version(&self, _jar: &Path) -> Result<Option<DataVersion>, port::InspectError> {
+            Ok(self.target)
+        }
+    }
+
+    fn world_info(data_version: i32, name: &str) -> domain::server::world::WorldInfo {
+        domain::server::world::WorldInfo {
+            data_version: Some(DataVersion::new(data_version)),
+            version_name: Some(name.to_owned()),
+        }
+    }
+
+    /// 世界比目标新：拒绝替换，旧 `server.jar` 原样保留，暂存文件清理
+    #[tokio::test]
+    async fn downgrade_is_rejected_and_old_jar_kept() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let reg = registry_with_ws(tmp.path());
+        let created = reg
+            .create(
+                None,
+                "alpha",
+                &VersionId::new("26.1"),
+                ServerVariant::Vanilla,
+            )
+            .expect("create");
+        std::fs::write(created.dir.join(SERVER_JAR), b"old").expect("old jar");
+
+        let installer = ServerInstaller::new(Arc::new(FakeSource), Arc::new(FakeDownloader));
+        let inspector = FakeInspector {
+            world: Some(world_info(4786, "26.1")),
+            target: Some(DataVersion::new(4554)),
+        };
+        let err = reg
+            .install_jar(
+                "alpha",
+                &VersionId::new("1.21.9"),
+                &installer,
+                &inspector,
+                None,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("downgrade must fail");
+        assert!(matches!(err, InstallJarError::Downgrade { .. }));
+        assert_eq!(
+            std::fs::read(created.dir.join(SERVER_JAR)).expect("read"),
+            b"old"
+        );
+        assert!(!created.dir.join(STAGING_JAR).exists(), "暂存文件要清理");
+    }
+
+    /// 目标不低：替换成功并回写版本
+    #[tokio::test]
+    async fn compatible_core_replaces_jar_and_version() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let reg = registry_with_ws(tmp.path());
+        let created = reg
+            .create(
+                None,
+                "alpha",
+                &VersionId::new("26.1"),
+                ServerVariant::Vanilla,
+            )
+            .expect("create");
+        std::fs::write(created.dir.join(SERVER_JAR), b"old").expect("old jar");
+
+        let installer = ServerInstaller::new(Arc::new(FakeSource), Arc::new(FakeDownloader));
+        let inspector = FakeInspector {
+            world: Some(world_info(4786, "26.1")),
+            target: Some(DataVersion::new(4786)),
+        };
+        let out = reg
+            .install_jar(
+                "alpha",
+                &VersionId::new("26.1"),
+                &installer,
+                &inspector,
+                None,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("install");
+        assert_eq!(out.server.meta.version.as_str(), "26.1");
+        assert_eq!(
+            std::fs::read(created.dir.join(SERVER_JAR)).expect("read"),
+            b"new"
+        );
+        assert!(!created.dir.join(STAGING_JAR).exists());
     }
 }

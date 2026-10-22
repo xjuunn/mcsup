@@ -1,6 +1,9 @@
 mod extract;
+mod inspect;
+mod nbt;
 
 pub use extract::CommandExtractor;
+pub use inspect::FileCoreInspector;
 
 use async_trait::async_trait;
 use domain::server::artifact::ChecksumAlgorithm;

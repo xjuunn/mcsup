@@ -9,7 +9,9 @@ publish = false
 [dependencies]
 async-trait = "0.1.92"
 domain = { path = "../domain" }
+flate2 = "1.1.10"
 port = { path = "../port" }
+serde_json.workspace = true
 sha1 = "0.11.0"
 sha2 = "0.11.0"
 tokio = { version = "1.53.2", features = [
@@ -21,6 +23,7 @@ tokio = { version = "1.53.2", features = [
     "macros",
 ] }
 url = "2.5.8"
+zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2"] }
 
 [lints]
 workspace = true

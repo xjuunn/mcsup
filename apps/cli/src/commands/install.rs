@@ -4,6 +4,7 @@ use crate::progress::{InstallSession, TaskSpinner};
 use crate::prompts;
 use anyhow::{Context, Result};
 use mcsup::domain::server::version::{ServerVariant, ServerVersion, VersionId, VersionKind};
+use mcsup::file::FileCoreInspector;
 use mcsup::port::ServerJarSource;
 use mcsup::service::{ServerInstaller, ServerRegistry};
 use std::path::PathBuf;
@@ -83,6 +84,7 @@ pub(crate) async fn download_jar(
 ) -> Result<(u64, PathBuf)> {
     let downloader = Arc::new(bootstrap::build_downloader()?);
     let installer = ServerInstaller::new(source, downloader);
+    let inspector = FileCoreInspector::new();
 
     // 解析版本到首字节之间没有任何进度回调，先挂 spinner 保证整段有回显；
     // 首个进度到达后由 session 内的 BarSink 接手同一条线，切换成进度显示
@@ -94,6 +96,7 @@ pub(crate) async fn download_jar(
             name,
             version_id,
             &installer,
+            &inspector,
             Some(&session),
             session.cancel(),
         )
