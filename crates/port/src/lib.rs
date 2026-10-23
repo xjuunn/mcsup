@@ -49,6 +49,8 @@ impl SourceError {
 pub struct ResolvedArtifact {
     pub artifact: JarArtifact,
     pub location: Url,
+    /// 版本要求的 Java 大版本（来源自版本详情）
+    pub java_major: Option<JavaMajor>,
 }
 
 /// 服务端 JAR 来源
@@ -373,10 +375,11 @@ pub trait ServerRepository: Send + Sync {
     /// 底层失败返回 [`RepositoryError::Storage`]
     fn list(&self) -> Result<Vec<ServerMeta>, RepositoryError>;
 
-    /// 回写核心元数据（版本 + jar）并刷新 `updated_at`，返回最新记录
+    /// 回写核心元数据（版本 + jar + 该版本要求的 Java 大版本）并刷新
+    /// `updated_at`，返回最新记录
     ///
-    /// 安装核心可能换版本，版本与 jar 必须在同一次写入里落库，
-    /// 否则会出现「jar 已是新版本、记录仍是旧版本」的不一致。
+    /// 安装核心可能换版本，版本、jar 与版本的 Java 要求必须在同一次写入里
+    /// 落库，否则会出现「jar 已是新版本、记录仍是旧版本」的不一致。
     ///
     /// # Errors
     ///
@@ -386,6 +389,7 @@ pub trait ServerRepository: Send + Sync {
         name: &ServerName,
         version: &VersionId,
         jar: &InstalledJar,
+        required_java_major: Option<JavaMajor>,
         updated_at: i64,
     ) -> Result<ServerMeta, RepositoryError>;
 

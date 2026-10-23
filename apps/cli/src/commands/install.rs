@@ -172,6 +172,7 @@ mod tests {
             id: VersionId::new(id),
             kind,
             variant: ServerVariant::Vanilla,
+            java_major: None,
         }
     }
 

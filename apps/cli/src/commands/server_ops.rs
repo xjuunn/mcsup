@@ -194,8 +194,10 @@ pub(crate) async fn create(
         pick_version(source.as_ref(), variant, printer).await?
     };
 
+    // Java 版本要求不在此预取：下载核心时 `install_jar` 会随元数据一并回写，
+    // 预取会重复打一遍 manifest/details 网络请求
     let srv = reg
-        .create(selector.as_deref(), &name, &version_id, variant)
+        .create(selector.as_deref(), &name, &version_id, variant, None)
         .with_context(|| format!("创建服务器 {name} 失败"))?;
 
     // 7. 下载核心：失败保留已注册结果，提示用 install 重试

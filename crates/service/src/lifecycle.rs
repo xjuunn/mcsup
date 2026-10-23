@@ -176,7 +176,7 @@ impl ServerLifecycleService {
 
         let settings = server.meta.settings;
         let runtimes = self.java.list_or_scan(on_first_scan, on_found)?;
-        let runtime = pick_runtime(&runtimes, settings.java_major, name)?;
+        let runtime = pick_runtime(&runtimes, settings.java_major, server.meta.java_major, name)?;
 
         let request = SupervisorStartRequest {
             server_dir: server.dir.clone(),
@@ -328,19 +328,24 @@ impl ServerLifecycleService {
 }
 
 /// Java 选择：`server set java-version` 绑定大版本时取该版本的运行时，
-/// 未绑定取已注册运行时中的最高大版本
+/// 未绑定且服务器元数据记录了版本要求时按该要求取运行时，
+/// 否则取已注册运行时中的最高大版本
 fn pick_runtime<'a>(
     runtimes: &'a [domain::java::JavaRuntime],
     bound: Option<domain::java::JavaMajor>,
+    meta_java_major: Option<domain::java::JavaMajor>,
     name: &str,
 ) -> Result<&'a domain::java::JavaRuntime, LifecycleError> {
-    match bound {
+    // 优先级：显式绑定 > 服务器元数据记录的 java_major > 最高已注册版本
+    let target_major = bound.or(meta_java_major);
+    match target_major {
         Some(major) => runtimes.iter().find(|rt| rt.major == major).ok_or_else(|| {
             LifecycleError::UnknownJavaMajor {
                 name: name.to_owned(),
                 major,
             }
         }),
+        // 无任何依据时不猜具体版本：用户装什么由交互入口决定
         None => runtimes
             .iter()
             .max_by_key(|rt| rt.major.as_i16())
@@ -554,6 +559,7 @@ mod tests {
             name: &domain::server::meta::ServerName,
             version: &VersionId,
             jar: &InstalledJar,
+            required_java_major: Option<JavaMajor>,
             updated_at: i64,
         ) -> Result<domain::server::meta::ServerMeta, RepositoryError> {
             let mut items = self.items.lock().expect("lock");
@@ -563,6 +569,7 @@ mod tests {
                 .ok_or_else(|| RepositoryError::NotFound(name.as_str().to_owned()))?;
             meta.version = version.clone();
             meta.jar = Some(jar.clone());
+            meta.java_major = required_java_major;
             meta.updated_at = updated_at;
             Ok(meta.clone())
         }
@@ -930,6 +937,7 @@ mod tests {
                     "alpha",
                     &VersionId::new("1.21.1"),
                     ServerVariant::Vanilla,
+                    None,
                 )
                 .expect("create");
             if with_jar {
@@ -943,6 +951,7 @@ mod tests {
                             size: 3,
                             checksum: Checksum::new(ChecksumAlgorithm::Sha1, "0".repeat(40)),
                         },
+                        None,
                         1_700_000_000,
                     )
                     .expect("jar");
@@ -1118,6 +1127,84 @@ mod tests {
             requests[0].java_bin,
             java_bin_under(Path::new("/opt/java17"))
         );
+    }
+
+    /// 版本自带 Java 要求（`required_java_major`）：未绑定时按版本要求选运行时，
+    /// 而不是盲目取最高大版本——class file 69.0 需要新版 JDK，选低了会
+    /// `UnsupportedClassVersionError`
+    #[test]
+    fn start_honors_version_required_java_major() {
+        let fixture = Fixture::new(true);
+        let runtimes = vec![
+            runtime(Path::new("/opt/java17"), 17),
+            runtime(Path::new("/opt/java21"), 21),
+        ];
+        fixture
+            .registry
+            .update_core(
+                &fixture.name,
+                &VersionId::new("1.21.1"),
+                &InstalledJar {
+                    path: PathBuf::from("server.jar"),
+                    size: 3,
+                    checksum: Checksum::new(ChecksumAlgorithm::Sha1, "0".repeat(40)),
+                },
+                Some(JavaMajor::parse(21).expect("21")),
+                1_700_000_000,
+            )
+            .expect("core");
+        let supervisor = Arc::new(FakeSupervisor::default());
+        let svc = service(
+            &fixture,
+            java_service(MemJavaRepo::new(runtimes, true), vec![]),
+            Arc::clone(&supervisor),
+        );
+
+        start(&svc, &fixture.name, true).expect("start");
+
+        let requests = supervisor.starts();
+        assert_eq!(
+            requests[0].java_bin,
+            java_bin_under(Path::new("/opt/java21")),
+            "版本要求的 Java 大版本必须被采纳"
+        );
+    }
+
+    /// 版本要求的 Java 大版本缺失运行时：报 UnknownJavaMajor，交互入口可据此
+    /// 提示安装（class file 69.0 即 Java 25 编译产物，JDK 17 跑不起来）
+    #[test]
+    fn start_reports_unknown_when_version_required_major_missing() {
+        let fixture = Fixture::new(true);
+        fixture
+            .registry
+            .update_core(
+                &fixture.name,
+                &VersionId::new("26.1"),
+                &InstalledJar {
+                    path: PathBuf::from("server.jar"),
+                    size: 3,
+                    checksum: Checksum::new(ChecksumAlgorithm::Sha1, "0".repeat(40)),
+                },
+                Some(JavaMajor::parse(25).expect("25")),
+                1_700_000_000,
+            )
+            .expect("core");
+        let supervisor = Arc::new(FakeSupervisor::default());
+        let svc = service(
+            &fixture,
+            java_service(
+                MemJavaRepo::new(vec![runtime(Path::new("/opt/java17"), 17)], true),
+                vec![],
+            ),
+            Arc::clone(&supervisor),
+        );
+
+        let err = start(&svc, &fixture.name, true).expect_err("must fail");
+        assert!(
+            matches!(err, LifecycleError::UnknownJavaMajor { major, .. } if major.as_i64() == 25),
+            "{err:?}"
+        );
+        assert!(supervisor.starts().is_empty());
     }
 
     /// 绑定的大版本没有运行时：start 报 UnknownJavaMajor（而不是静默降级）

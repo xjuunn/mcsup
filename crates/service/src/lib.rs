@@ -62,6 +62,8 @@ pub struct InstalledDownload {
     pub artifact: DownloadedArtifact,
     /// 来源声明的校验和（下载时已按它校验）
     pub checksum: domain::server::artifact::Checksum,
+    /// 该版本要求的 Java 大版本（版本详情 `javaVersion.majorVersion`）
+    pub java_major: Option<domain::java::JavaMajor>,
 }
 
 /// 服务端安装编排
@@ -98,6 +100,7 @@ impl ServerInstaller {
         let mut status = DownloadStatus::Pending.transition(DownloadStatus::Downloading)?;
         let resolved = self.source.artifact(version).await?;
         let checksum = resolved.artifact.checksum.clone();
+        let java_major = resolved.java_major;
 
         let request = DownloadRequest {
             location: resolved.location,
@@ -112,6 +115,7 @@ impl ServerInstaller {
             status,
             artifact,
             checksum,
+            java_major,
         })
     }
 }
@@ -182,6 +186,7 @@ mod tests {
                 checksum: Checksum::new(ChecksumAlgorithm::Sha1, "0".repeat(40)),
             },
             location: "https://example.invalid/server.jar".parse()?,
+            java_major: None,
         })
     }
 
@@ -259,6 +264,7 @@ mod tests {
                         checksum: Checksum::new(ChecksumAlgorithm::Sha1, "0".repeat(40)),
                     },
                     location: "https://example.invalid/placeholder.jar".parse()?,
+                    java_major: None,
                 },
             }),
             Arc::new(FakeDownloader {

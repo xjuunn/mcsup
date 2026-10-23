@@ -166,6 +166,7 @@ impl ServerRegistry {
         name: &str,
         version: &VersionId,
         variant: ServerVariant,
+        java_major: Option<domain::java::JavaMajor>,
     ) -> Result<RegisteredServer, ServerRegistryError> {
         let now = crate::util::unix_now();
         let name = ServerName::parse(name)?;
@@ -204,6 +205,7 @@ impl ServerRegistry {
             variant,
             jar: None,
             settings: ServerSettings::default(),
+            java_major,
             created_at: now,
             updated_at: now,
         };
@@ -229,6 +231,7 @@ impl ServerRegistry {
     ///
     /// 名称冲突、目标在工作区内、`--workspace` 与目录归属不一致、marker 损坏 /
     /// id 已注册、IO / 注册表失败时返回 [`ServerRegistryError`]
+    #[allow(clippy::too_many_lines)]
     pub fn link(
         &self,
         target: &Path,
@@ -326,6 +329,7 @@ impl ServerRegistry {
             variant: ServerVariant::Unknown,
             jar: None,
             settings: ServerSettings::default(),
+            java_major: None,
             created_at: now,
             updated_at: now,
         };
@@ -490,7 +494,7 @@ impl ServerRegistry {
         Ok(RegisteredServer { meta, dir, linked })
     }
 
-    /// 回写核心元数据（版本 + jar，安装完成后调用）
+    /// 回写核心元数据（版本 + jar + 该版本要求的 Java 大版本），安装完成后调用
     ///
     /// # Errors
     ///
@@ -500,11 +504,14 @@ impl ServerRegistry {
         name: &str,
         version: &VersionId,
         jar: &InstalledJar,
+        required_java_major: Option<domain::java::JavaMajor>,
         updated_at: i64,
     ) -> Result<RegisteredServer, ServerRegistryError> {
         let name =
             ServerName::parse(name).map_err(|_| ServerRegistryError::NotFound(name.to_owned()))?;
-        let meta = self.servers.update_core(&name, version, jar, updated_at)?;
+        let meta =
+            self.servers
+                .update_core(&name, version, jar, required_java_major, updated_at)?;
         let dir = self.absolute_dir(&meta)?;
         let linked = dir
             .symlink_metadata()
@@ -596,7 +603,7 @@ impl ServerRegistry {
             size: out.artifact.size,
             checksum: out.checksum,
         };
-        let srv = self.update_core(name, version, &jar, crate::util::unix_now())?;
+        let srv = self.update_core(name, version, &jar, out.java_major, crate::util::unix_now())?;
         Ok(InstalledServerJar {
             server: srv,
             jar,
@@ -719,6 +726,7 @@ impl ServerRegistry {
             variant: ServerVariant::Unknown,
             jar: None,
             settings: ServerSettings::default(),
+            java_major: None,
             created_at: now,
             updated_at: now,
         };
@@ -949,6 +957,7 @@ mod tests {
             name: &ServerName,
             version: &VersionId,
             jar: &InstalledJar,
+            required_java_major: Option<domain::java::JavaMajor>,
             updated_at: i64,
         ) -> Result<ServerMeta, RepositoryError> {
             let mut items = self.items.lock().expect("lock");
@@ -958,6 +967,7 @@ mod tests {
                 .ok_or_else(|| RepositoryError::NotFound(name.as_str().to_owned()))?;
             meta.version = version.clone();
             meta.jar = Some(jar.clone());
+            meta.java_major = required_java_major;
             meta.updated_at = updated_at;
             Ok(meta.clone())
         }
@@ -1089,6 +1099,7 @@ mod tests {
                 "alpha",
                 &VersionId::new("1.21.1"),
                 ServerVariant::Vanilla,
+                None,
             )
             .expect("create");
         assert_eq!(out.meta.name.as_str(), "alpha");
@@ -1110,6 +1121,7 @@ mod tests {
             "alpha",
             &VersionId::new("1.21.1"),
             ServerVariant::Vanilla,
+            None,
         )
         .expect("first");
         let err = reg
@@ -1118,6 +1130,7 @@ mod tests {
                 "alpha",
                 &VersionId::new("1.21.1"),
                 ServerVariant::Vanilla,
+                None,
             )
             .expect_err("dup");
         assert!(matches!(err, ServerRegistryError::AlreadyExists(_)));
@@ -1148,6 +1161,7 @@ mod tests {
             "beta",
             &VersionId::new("1.21.1"),
             ServerVariant::Vanilla,
+            None,
         )
         .expect("b");
         reg.create(
@@ -1155,6 +1169,7 @@ mod tests {
             "alpha",
             &VersionId::new("1.21.1"),
             ServerVariant::Vanilla,
+            None,
         )
         .expect("a");
         let names: Vec<_> = reg
@@ -1246,6 +1261,7 @@ mod tests {
                 "test",
                 &VersionId::new("1.21.1"),
                 ServerVariant::Vanilla,
+                None,
             )
             .expect("create");
         reg.remove("test", false).expect("unregister");
@@ -1329,6 +1345,7 @@ mod tests {
                 "taken",
                 &VersionId::new("1.21.1"),
                 ServerVariant::Vanilla,
+                None,
             )
             .expect("create");
         let dir = tmp.path().join("ws/servers/nested");
@@ -1411,6 +1428,7 @@ mod tests {
                 "stale",
                 &VersionId::new("1.21.1"),
                 ServerVariant::Vanilla,
+                None,
             )
             .expect_err("refuse");
         assert!(matches!(err, ServerRegistryError::AlreadyExists(_)));
@@ -1426,6 +1444,7 @@ mod tests {
             "alpha",
             &VersionId::new("1.21.1"),
             ServerVariant::Vanilla,
+            None,
         )
         .expect("create");
         // 磁盘有目录但未入库
@@ -1474,6 +1493,7 @@ mod tests {
                     ),
                 },
                 location: url::Url::parse("https://example.invalid/server.jar").expect("url"),
+                java_major: None,
             })
         }
 
@@ -1536,6 +1556,7 @@ mod tests {
                 "alpha",
                 &VersionId::new("26.1"),
                 ServerVariant::Vanilla,
+                None,
             )
             .expect("create");
         std::fs::write(created.dir.join(SERVER_JAR), b"old").expect("old jar");
@@ -1575,6 +1596,7 @@ mod tests {
                 "alpha",
                 &VersionId::new("26.1"),
                 ServerVariant::Vanilla,
+                None,
             )
             .expect("create");
         std::fs::write(created.dir.join(SERVER_JAR), b"old").expect("old jar");

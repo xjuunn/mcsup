@@ -93,14 +93,16 @@ async fn server(action: ServerAction, cfg: &Config, printer: Printer) -> Result<
         ServerAction::Install { name, version } => {
             install::run(&name, version.as_deref(), cfg, printer).await
         }
-        ServerAction::Start { name, accept_eula } => lifecycle::start(&name, accept_eula, printer),
+        ServerAction::Start { name, accept_eula } => {
+            lifecycle::start(&name, accept_eula, printer).await
+        }
         ServerAction::Stop { name, grace, force } => lifecycle::stop(&name, grace, force, printer),
         ServerAction::Restart {
             name,
             accept_eula,
             grace,
             force,
-        } => lifecycle::restart(&name, accept_eula, grace, force, printer),
+        } => lifecycle::restart(&name, accept_eula, grace, force, printer).await,
         ServerAction::Status { name } => lifecycle::status(&name, printer),
         ServerAction::Console { name } => lifecycle::console(&name, printer),
         ServerAction::Send { name, command } => lifecycle::send(&name, &command, printer),

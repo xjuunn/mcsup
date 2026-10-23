@@ -91,6 +91,7 @@ fn into_version(item: VersionManifestItem) -> ServerVersion {
         id: VersionId::new(item.id),
         kind: into_domain_kind(item.kind),
         variant: ServerVariant::Vanilla,
+        java_major: None, // 版本列表不包含 Java 版本，详情接口才有
     }
 }
 
@@ -114,7 +115,14 @@ fn into_atrifact(
         size: server.size,
         checksum: Checksum::new(ChecksumAlgorithm::Sha1, server.sha1),
     };
-    Ok(ResolvedArtifact { artifact, location })
+    let java_major = details
+        .java_version
+        .and_then(|jv| domain::java::JavaMajor::parse(jv.major_version).ok());
+    Ok(ResolvedArtifact {
+        artifact,
+        location,
+        java_major,
+    })
 }
 
 fn parse_https_url(raw: &str) -> Result<Url, SourceError> {
@@ -212,6 +220,30 @@ mod tests {
             resolved.location.as_str(),
             "https://example.invalid/server.jar"
         );
+        // 版本详情的 javaVersion.majorVersion 必须随 artifact 带出：
+        // 启动时按它选运行时，缺失会装错 Java（class file 69.0 报错的根因）
+        assert_eq!(
+            resolved.java_major.map(domain::java::JavaMajor::as_i64),
+            Some(21)
+        );
+        Ok(())
+    }
+
+    /// 老版本详情无 `javaVersion` 字段：不报错，按 `None` 带出
+    #[test]
+    fn missing_java_version_is_none_not_error() -> Result<(), Box<dyn std::error::Error>> {
+        let legacy = r#"{
+            "downloads": {
+                "server": {
+                    "sha1": "2d89c95c030e635387448f332961074ce1adbb4b",
+                    "size": 62458029,
+                    "url": "https://example.invalid/server.jar"
+                }
+            }
+        }"#;
+        let details: VersionDetails = serde_json::from_str(legacy)?;
+        let resolved = into_atrifact(&VersionId::new("1.7.10"), details)?;
+        assert_eq!(resolved.java_major, None);
         Ok(())
     }
 }

@@ -26,6 +26,7 @@ diesel::table! {
         created_at -> BigInt,
         updated_at -> BigInt,
         java_major -> Nullable<BigInt>,
+        required_java_major -> Nullable<BigInt>,
         ram_mib -> Nullable<Integer>,
         autostart -> Bool,
     }

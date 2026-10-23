@@ -165,6 +165,7 @@ mod tests {
             _name: &ServerName,
             _version: &VersionId,
             _jar: &InstalledJar,
+            _required_java_major: Option<JavaMajor>,
             _updated_at: i64,
         ) -> Result<domain::server::meta::ServerMeta, RepositoryError> {
             unreachable!("not used in tests")
@@ -392,6 +393,7 @@ mod tests {
                 "alpha",
                 &VersionId::new("1.21.1"),
                 ServerVariant::Vanilla,
+                None,
             )
             .expect("create");
         let java = JavaService::new(

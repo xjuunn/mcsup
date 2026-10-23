@@ -45,6 +45,9 @@ pub struct ServerVersion {
     pub id: VersionId,
     pub kind: VersionKind,
     pub variant: ServerVariant,
+    /// Minecraft 版本要求的 Java 大版本（如 1.21.1 需要 Java 21）
+    /// 来源：版本清单中的 `javaVersion.majorVersion`
+    pub java_major: Option<crate::java::JavaMajor>,
 }
 
 impl ServerVariant {

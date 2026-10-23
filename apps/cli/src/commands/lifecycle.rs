@@ -85,10 +85,11 @@ fn with_spinner<T>(
 }
 
 /// 共享的启动流程（start 与 restart 后半段）：EULA 非交互报错，交互下询问后重试
-fn run_start(
+/// Java 缺失时交互提示安装，安装后重试
+async fn run_start(
     service: &ServerLifecycleService,
     name: &str,
-    accept_eula: bool,
+    mut accept_eula: bool,
     supervisor_exe: &std::path::Path,
     printer: Printer,
 ) -> Result<SupervisorStartOutcome> {
@@ -110,29 +111,67 @@ fn run_start(
         })
     };
 
-    match attempt(accept_eula) {
-        Ok(outcome) => Ok(outcome),
-        Err(err) => {
-            let needs_eula = err
-                .downcast_ref::<LifecycleError>()
-                .is_some_and(|e| matches!(e, LifecycleError::EulaRequired));
-            if !needs_eula || !printer.is_interactive() {
+    loop {
+        match attempt(accept_eula) {
+            Ok(outcome) => return Ok(outcome),
+            Err(err) => {
+                let needs_eula = err
+                    .downcast_ref::<LifecycleError>()
+                    .is_some_and(|e| matches!(e, LifecycleError::EulaRequired));
+                if needs_eula && printer.is_interactive() {
+                    if !prompts::confirm_yes("需要同意 Mojang EULA（eula=true），是否同意？", true)?
+                    {
+                        return Err(anyhow::anyhow!("未同意 EULA，已中止"));
+                    }
+                    accept_eula = true;
+                    continue;
+                }
+
+                // 交互式修复循环：缺哪个 Java 装哪个，装完重试
+                // NoJava：本机一个运行时都没有（清单为空，说不出缺哪个版本）→
+                // 引导用户从已发布大版本中选一个装；
+                // UnknownJavaMajor：服务器绑定 / 版本要求的 Java 大版本缺失 →
+                // 明确点名该版本（class file 69.0 这类报错的根因是选低了）
+                let missing = err.downcast_ref::<LifecycleError>().and_then(|e| match e {
+                    LifecycleError::NoJava => Some(None),
+                    LifecycleError::UnknownJavaMajor { major, .. } => Some(Some(*major)),
+                    _ => None,
+                });
+
+                if let Some(missing_major) = missing {
+                    if !printer.is_interactive() {
+                        return Err(err);
+                    }
+                    let prompt_text = match missing_major {
+                        Some(major) => format!("本机缺少 Java {major}，是否现在安装？"),
+                        None => "本机未发现任何 Java 运行时，是否现在安装？".to_owned(),
+                    };
+                    if !prompts::confirm_yes(&prompt_text, true)? {
+                        return Err(anyhow::anyhow!("缺少所需 Java 版本，已中止启动"));
+                    }
+                    // 安装缺的版本；NoJava 无从点名，装当前 LTS 21 作为起步
+                    let major_str = missing_major.map_or("21".to_string(), |m| m.to_string());
+                    crate::commands::java::install_with_outcome(
+                        Some(&major_str),
+                        false,
+                        None,
+                        printer,
+                    )
+                    .await?;
+                    continue;
+                }
+
                 return Err(err);
             }
-            if !prompts::confirm_yes("需要同意 Mojang EULA（eula=true），是否同意？", true)?
-            {
-                return Err(anyhow::anyhow!("未同意 EULA，已中止"));
-            }
-            attempt(true)
         }
     }
 }
 
 /// `server start`：启动并报告 supervisor PID
-pub(crate) fn start(name: &str, accept_eula: bool, printer: Printer) -> Result<()> {
+pub(crate) async fn start(name: &str, accept_eula: bool, printer: Printer) -> Result<()> {
     let service = lifecycle_service()?;
     let supervisor_exe = std::env::current_exe().context("定位 mcsup 可执行文件")?;
-    let outcome = run_start(&service, name, accept_eula, &supervisor_exe, printer)?;
+    let outcome = run_start(&service, name, accept_eula, &supervisor_exe, printer).await?;
     let payload = StartJson {
         name,
         supervisor_pid: outcome.supervisor_pid,
@@ -187,7 +226,7 @@ pub(crate) fn stop(name: &str, grace: u64, force: bool, printer: Printer) -> Res
 }
 
 /// `server restart`：先停（超时中止），再走与 start 相同的启动路径
-pub(crate) fn restart(
+pub(crate) async fn restart(
     name: &str,
     accept_eula: bool,
     grace: u64,
@@ -216,7 +255,7 @@ pub(crate) fn restart(
         }
     }
 
-    let outcome = run_start(&service, name, accept_eula, &supervisor_exe, printer)?;
+    let outcome = run_start(&service, name, accept_eula, &supervisor_exe, printer).await?;
     let payload = StartJson {
         name,
         supervisor_pid: outcome.supervisor_pid,

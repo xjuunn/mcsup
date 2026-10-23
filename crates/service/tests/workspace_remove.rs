@@ -34,6 +34,7 @@ fn add_server(store: &SqliteStore, workspace_id: &WorkspaceId) {
         variant: ServerVariant::Vanilla,
         jar: None,
         settings: domain::server::settings::ServerSettings::default(),
+        java_major: None,
         created_at: 1_700_000_000,
         updated_at: 1_700_000_000,
     };

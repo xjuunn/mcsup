@@ -230,6 +230,7 @@ impl ServerRepository for SqliteStore {
         name: &ServerName,
         version: &VersionId,
         jar: &domain::server::meta::InstalledJar,
+        required_java_major: Option<domain::java::JavaMajor>,
         updated_at: i64,
     ) -> Result<ServerMeta, RepositoryError> {
         self.with_conn(|conn| {
@@ -239,6 +240,7 @@ impl ServerRepository for SqliteStore {
                 jar_size: i64::try_from(jar.size).unwrap_or(i64::MAX),
                 checksum_algo: jar.checksum.algorithm().as_str().to_owned(),
                 checksum: jar.checksum.hex().to_owned(),
+                required_java_major: required_java_major.map(domain::java::JavaMajor::as_i64),
                 updated_at,
             };
             let affected = diesel::update(servers::table.filter(servers::name.eq(name.as_str())))
@@ -482,6 +484,7 @@ mod tests {
             variant: ServerVariant::Vanilla,
             jar: None,
             settings: domain::server::settings::ServerSettings::default(),
+            java_major: None,
             created_at: 1_700_000_000,
             updated_at: 1_700_000_000,
         }
@@ -531,16 +534,23 @@ mod tests {
             checksum: Checksum::new(ChecksumAlgorithm::Sha1, "a".repeat(40)),
         };
         let version = VersionId::new("1.21.2");
+        let required = JavaMajor::parse(21).expect("21");
         let updated = ServerRepository::update_core(
             &store,
             &ServerName::parse("alpha").expect("valid"),
             &version,
             &jar,
+            Some(required),
             1_700_000_100,
         )
         .expect("update");
         assert_eq!(updated.version, version, "安装换版本要同步回写");
         assert_eq!(updated.jar, Some(jar));
+        assert_eq!(
+            updated.java_major,
+            Some(required),
+            "版本的 Java 要求要同步回写"
+        );
         assert_eq!(updated.updated_at, 1_700_000_100);
     }
 

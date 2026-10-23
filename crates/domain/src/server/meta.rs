@@ -1,6 +1,7 @@
 use super::artifact::Checksum;
 use super::error::InvalidServerName;
 use super::version::ServerVariant;
+use crate::java::JavaMajor;
 use crate::workspace::{InvalidId, WorkspaceId, name_is_valid, uuid_is_valid};
 use std::fmt;
 use std::path::PathBuf;
@@ -90,6 +91,9 @@ pub struct ServerMeta {
     pub jar: Option<InstalledJar>,
     /// 服务属性（`server set` 持久化）
     pub settings: super::settings::ServerSettings,
+    /// 该服务端版本要求的 Java 大版本（来自版本详情的 javaVersion.majorVersion）
+    /// 用于启动时自动选择正确的 Java 运行时
+    pub java_major: Option<JavaMajor>,
     /// Unix 秒
     pub created_at: i64,
     /// Unix 秒

@@ -1,5 +1,9 @@
 {
     "id": "1.21.1",
+    "javaVersion": {
+        "component": "java-runtime-delta",
+        "majorVersion": 21
+    },
     "downloads": {
         "client": {
             "sha1": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",

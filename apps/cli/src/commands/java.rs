@@ -109,12 +109,13 @@ struct InstallJavaRow<'a> {
     path: String,
 }
 
-pub(crate) async fn install(
+/// 安装 Java 并返回结果（供 server start 调用）
+pub(crate) async fn install_with_outcome(
     version: Option<&str>,
     jre: bool,
     vendor: Option<&str>,
     printer: Printer,
-) -> Result<()> {
+) -> Result<mcsup::service::InstallOutcome> {
     let enable = printer.is_human();
     let session = InstallSession::new(InstallStage::Probing.message(), enable);
     let service = bootstrap::open_java_service()?;
@@ -168,7 +169,19 @@ pub(crate) async fn install(
             vendor: outcome.runtime.vendor.as_str(),
             path: outcome.runtime.path.display().to_string(),
         },
-    )
+    )?;
+
+    Ok(outcome)
+}
+
+pub(crate) async fn install(
+    version: Option<&str>,
+    jre: bool,
+    vendor: Option<&str>,
+    printer: Printer,
+) -> Result<()> {
+    install_with_outcome(version, jre, vendor, printer).await?;
+    Ok(())
 }
 
 /// `java uninstall` 结果（JSON 模式序列化用）

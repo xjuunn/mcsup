@@ -33,6 +33,15 @@ pub(crate) enum VersionKind {
 #[derive(Debug, Deserialize)]
 pub(crate) struct VersionDetails {
     pub(crate) downloads: Downloads,
+    /// Java 版本要求（如 `"javaVersion": {"component": "java-runtime-delta", "majorVersion": 21}`）
+    #[serde(rename = "javaVersion")]
+    pub(crate) java_version: Option<JavaVersion>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct JavaVersion {
+    #[serde(rename = "majorVersion")]
+    pub(crate) major_version: i64,
 }
 
 #[derive(Debug, Deserialize)]

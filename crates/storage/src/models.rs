@@ -50,11 +50,13 @@ pub(crate) struct ServerRow {
     pub(crate) created_at: i64,
     pub(crate) updated_at: i64,
     pub(crate) java_major: Option<i64>,
+    pub(crate) required_java_major: Option<i64>,
     pub(crate) ram_mib: Option<i32>,
     pub(crate) autostart: bool,
 }
 
-/// 核心元数据变更集：版本 + jar 列 + `updated_at`，不动身份 / 归属 / `created_at`
+/// 核心元数据变更集：版本 + jar 列 + 版本要求的 Java 大版本 + `updated_at`，
+/// 不动身份 / 归属 / `created_at`
 #[derive(Debug, AsChangeset)]
 #[diesel(table_name = servers)]
 pub(crate) struct JarChangeset {
@@ -63,6 +65,7 @@ pub(crate) struct JarChangeset {
     pub(crate) jar_size: i64,
     pub(crate) checksum_algo: String,
     pub(crate) checksum: String,
+    pub(crate) required_java_major: Option<i64>,
     pub(crate) updated_at: i64,
 }
 
@@ -156,6 +159,7 @@ impl From<&ServerMeta> for ServerRow {
             created_at: meta.created_at,
             updated_at: meta.updated_at,
             java_major: meta.settings.java_major.map(JavaMajor::as_i64),
+            required_java_major: meta.java_major.map(JavaMajor::as_i64),
             ram_mib: meta
                 .settings
                 .ram_mib
@@ -200,6 +204,12 @@ impl TryFrom<ServerRow> for ServerMeta {
             }
             None => None,
         };
+        let required_java_major = match row.required_java_major {
+            Some(raw) => Some(
+                JavaMajor::parse(raw).map_err(|err| corrupt("required java major", raw, err))?,
+            ),
+            None => None,
+        };
         let ram_mib = match row.ram_mib {
             Some(raw) => Some(u32::try_from(raw).map_err(|err| corrupt("ram_mib", raw, err))?),
             None => None,
@@ -219,6 +229,7 @@ impl TryFrom<ServerRow> for ServerMeta {
             variant,
             jar,
             settings,
+            java_major: required_java_major,
             created_at: row.created_at,
             updated_at: row.updated_at,
         })
