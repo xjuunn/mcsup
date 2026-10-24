@@ -119,7 +119,7 @@ impl McsupBuilder {
     pub fn scanner(self, s: Arc<dyn JavaScanner>) -> Self;
     pub fn extractor(self, e: Arc<dyn ArchiveExtractor>) -> Self;
     pub fn java_registry(self, r: Arc<dyn JavaSourceRegistryPort>) -> Self;
-    pub fn store(self, s: Arc<SqliteStore>) -> Self;
+    pub fn store(self, s: Arc<JsonStore>) -> Self;
     pub fn server_repository(self, r: Arc<dyn ServerRepository>) -> Self;
     pub fn workspace_repository(self, r: Arc<dyn WorkspaceRepository>) -> Self;
     pub fn jar_sources(self, s: Vec<Arc<dyn ServerJarSource>>) -> Self;

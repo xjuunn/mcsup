@@ -1,6 +1,6 @@
-//! 默认组合根：把「开箱即用」的装配从 `apps/cli` 下沉到库侧
+﻿//! 默认组合根：把「开箱即用」的装配从 `apps/cli` 下沉到库侧
 //!
-//! 第三方 Rust 宿主不必自己拼 `SqliteStore` + 各实现——这里给出与 CLI
+//! 第三方 Rust 宿主不必自己拼 `JsonStore` + 各实现——这里给出与 CLI
 //! 完全相同的一套默认装配；要接管某项能力时，用 `McsupBuilder` 注入
 //! 自己的实现覆盖对应字段（port trait 全部公开、不 sealed）。
 //!
@@ -18,17 +18,17 @@ use provider::mojang::MojangSource;
 use service::{JavaService, ServerLifecycleService, ServerRegistry, WorkspaceService};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use storage::SqliteStore;
+use storage::JsonStore;
 use thiserror::Error;
 
 /// 组合根装配失败
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum BootstrapError {
-    /// 元数据库打开 / 迁移失败
+    /// 元数据仓库打开失败
     #[error("open store at {path}: {source}")]
     Store {
-        /// 数据库路径
+        /// 仓库根目录
         path: PathBuf,
         /// 底层错误
         #[source]
@@ -71,11 +71,11 @@ pub struct Mcsup {
     pub lifecycle: ServerLifecycleService,
     /// 已注册的服务端 JAR 来源（能力查询数据源）
     pub jar_sources: Vec<Arc<dyn ServerJarSource>>,
-    /// 元数据库句柄（Workspace / Server / Java 三个仓库共用）
+    /// 元数据仓库句柄（Workspace / Server / Java 三个仓库共用）
     ///
     /// 具体存储类型是实现细节，对外只经 [`McsupBuilder::server_repository`]
     /// / [`McsupBuilder::workspace_repository`] 的 trait 注入口替换。
-    store: Arc<SqliteStore>,
+    store: Arc<JsonStore>,
 }
 
 impl std::fmt::Debug for Mcsup {
@@ -85,20 +85,20 @@ impl std::fmt::Debug for Mcsup {
 }
 
 impl Mcsup {
-    /// 按平台数据目录装配：数据库在 `<data_dir>/db/mcsup.db`
+    /// 按平台数据目录装配：仓库根目录在 `<data_dir>/db`，其中 `workspaces/`、`servers/`、`java/` 各自一条记录一个文件
     ///
     /// `data_dir` 由调用方决定（库不读环境变量）。
     ///
     /// # Errors
     ///
-    /// 数据库打开 / 迁移、目录创建或来源初始化失败时返回 [`BootstrapError`]
+    /// 仓库打开、目录创建或来源初始化失败时返回 [`BootstrapError`]
     pub fn open(data_dir: &Path) -> Result<Self, BootstrapError> {
         McsupBuilder::new().build(data_dir)
     }
 
-    /// 元数据库句柄（仅测试与诊断用；业务访问经各 service）
+    /// 元数据仓库句柄（仅测试与诊断用；业务访问经各 service）
     #[must_use]
-    pub fn store(&self) -> &Arc<SqliteStore> {
+    pub fn store(&self) -> &Arc<JsonStore> {
         &self.store
     }
 
@@ -130,7 +130,7 @@ impl Mcsup {
 /// ```
 #[derive(Default)]
 pub struct McsupBuilder {
-    store: Option<Arc<SqliteStore>>,
+    store: Option<Arc<JsonStore>>,
     servers_repo: Option<Arc<dyn port::ServerRepository>>,
     workspaces_repo: Option<Arc<dyn port::WorkspaceRepository>>,
     java_repo: Option<Arc<dyn port::JavaRuntimeRepository>>,
@@ -169,18 +169,18 @@ impl McsupBuilder {
         Self::default()
     }
 
-    /// 注入自定义元数据库（如内存库、未来网络库）
+    /// 注入自定义仓库（如内存实现、未来网络实现）
     ///
     /// 只换连接实现；Workspace / Server 两个仓库仍由该库派生。要换掉
     /// 仓库实现本身（自定义持久化），用 [`Self::server_repository`] /
     /// [`Self::workspace_repository`]。
     #[must_use]
-    pub fn store(mut self, store: Arc<SqliteStore>) -> Self {
+    pub fn store(mut self, store: Arc<JsonStore>) -> Self {
         self.store = Some(store);
         self
     }
 
-    /// 注入自定义服务器仓库（按 trait，覆盖默认 SQLite 实现）
+    /// 注入自定义服务器仓库（按 trait，覆盖默认 JSON 实现）
     ///
     /// 传入后 [`Mcsup::registry`] 的工作区关联检查仍用默认实现，
     /// 因此通常与 [`Self::workspace_repository`] 成对注入。
@@ -190,14 +190,14 @@ impl McsupBuilder {
         self
     }
 
-    /// 注入自定义工作区仓库（按 trait，覆盖默认 SQLite 实现）
+    /// 注入自定义工作区仓库（按 trait，覆盖默认 JSON 实现）
     #[must_use]
     pub fn workspace_repository(mut self, repo: Arc<dyn port::WorkspaceRepository>) -> Self {
         self.workspaces_repo = Some(repo);
         self
     }
 
-    /// 注入自定义 Java 运行时仓库（按 trait，覆盖默认 SQLite 实现）
+    /// 注入自定义 Java 运行时仓库（按 trait，覆盖默认 JSON 实现）
     #[must_use]
     pub fn java_repository(mut self, repo: Arc<dyn port::JavaRuntimeRepository>) -> Self {
         self.java_repo = Some(repo);
@@ -252,17 +252,18 @@ impl McsupBuilder {
     ///
     /// 见 [`BootstrapError`]
     pub fn build(self, data_dir: &Path) -> Result<Mcsup, BootstrapError> {
-        let db_path = data_dir.join("db").join("mcsup.db");
-        let store =
-            match self.store {
-                Some(store) => store,
-                None => Arc::new(SqliteStore::open(&db_path).map_err(|source| {
-                    BootstrapError::Store {
-                        path: db_path.clone(),
+        let db_root = data_dir.join("db");
+        let store = match self.store {
+            Some(store) => store,
+            None => {
+                Arc::new(
+                    JsonStore::open(&db_root).map_err(|source| BootstrapError::Store {
+                        path: db_root.clone(),
                         source,
-                    }
-                })?),
-            };
+                    })?,
+                )
+            }
+        };
 
         let bytes = Arc::new(
             HttpByteSource::new().map_err(|err| BootstrapError::Transport(Box::new(err)))?,
@@ -327,7 +328,7 @@ mod tests {
     /// 内存库 + 全默认装配必须能跑通：第三方「零拼装」的验收线
     #[test]
     fn builds_with_in_memory_store() {
-        let store = Arc::new(SqliteStore::open_in_memory().expect("memory store"));
+        let store = Arc::new(JsonStore::open_in_memory().expect("memory store"));
         let dir = std::env::temp_dir().join(format!("mcsup-bootstrap-{}", std::process::id()));
         let mcsup = McsupBuilder::new()
             .store(store)
@@ -342,7 +343,7 @@ mod tests {
     /// 变体能力来自注入的 `jar_sources`，默认只有 vanilla
     #[test]
     fn default_jar_sources_cover_vanilla() {
-        let store = Arc::new(SqliteStore::open_in_memory().expect("memory store"));
+        let store = Arc::new(JsonStore::open_in_memory().expect("memory store"));
         let dir = std::env::temp_dir().join(format!("mcsup-bootstrap-cap-{}", std::process::id()));
         let mcsup = McsupBuilder::new()
             .store(store)

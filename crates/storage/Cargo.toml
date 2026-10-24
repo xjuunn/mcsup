@@ -7,14 +7,11 @@ license.workspace = true
 publish = false
 
 [dependencies]
-diesel = { version = "2.3.14", features = ["sqlite"] }
-diesel_migrations = { version = "2.3.2", features = ["sqlite"] }
 domain = { version = "0.1.0", path = "../domain" }
-libsqlite3-sys = { version = "0.38.2", features = ["bundled"] }
 port = { version = "0.1.0", path = "../port" }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true

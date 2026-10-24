@@ -1,19 +1,17 @@
-use diesel::prelude::*;
 use domain::java::{JavaMajor, JavaRuntime, JavaVendor};
 use domain::server::artifact::{Checksum, ChecksumAlgorithm};
 use domain::server::meta::{InstalledJar, ServerId, ServerMeta, ServerName};
 use domain::server::settings::ServerSettings;
 use domain::server::version::{ServerVariant, VersionId};
-use domain::workspace::{Workspace, WorkspaceId, WorkspaceName};
+use domain::workspace::{Workspace, WorkspaceId};
 use port::RepositoryError;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::schema::{java_runtimes, servers, workspaces};
-
-/// 行字段解析失败 → [`RepositoryError::Corrupt`]，统一 `{字段} {值}: {err}` 形状
+/// 字段解析失败 → [`RepositoryError::Corrupt`]，统一 `{字段} {值}: {err}` 形状
 ///
 /// Corrupt 消息是给排查者看的，形状散在各处容易漏掉值或字段名。
-fn corrupt(
+pub(crate) fn corrupt(
     label: &str,
     value: impl std::fmt::Display,
     err: impl std::fmt::Display,
@@ -21,120 +19,94 @@ fn corrupt(
     RepositoryError::Corrupt(format!("{label} {value}: {err}"))
 }
 
-/// `workspaces` 表的一行
-#[derive(Debug, Clone, Queryable, Selectable, Insertable)]
-#[diesel(table_name = workspaces)]
-pub(crate) struct WorkspaceRow {
+/// 每条记录的格式版本
+///
+/// 一条记录一个文件，版本随记录存放：将来可以逐条升级，不必重写全部数据。
+pub(crate) const RECORD_VERSION: u32 = 1;
+
+/// 记录文件的一项：工作目录
+///
+/// 「当前工作区」不在这里：它是全局唯一指针，存 `state.json`。记录内
+/// 保存该布尔值会让单值语义分散到 n 个文件，写入必须改两个文件才一致。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct WorkspaceEntry {
+    pub(crate) version: u32,
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) path: String,
-    pub(crate) is_current: bool,
     pub(crate) created_at: i64,
     pub(crate) updated_at: i64,
 }
 
-/// `servers` 表的一行
-#[derive(Debug, Clone, Queryable, Selectable, Insertable)]
-#[diesel(table_name = servers)]
-pub(crate) struct ServerRow {
+/// 注册表的一项：服务器
+///
+/// `jar_*` 四列同生同灭：要么全是 `None`，要么全部有值，与旧库的
+/// 「partial jar columns」判据保持一致。`java_major` 是版本要求，
+/// `settings.java_major` 是用户绑定，两者不可混用。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ServerEntry {
+    pub(crate) schema: u32,
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) workspace_id: String,
     pub(crate) rel_dir: String,
     pub(crate) version: String,
     pub(crate) variant: String,
+    #[serde(default)]
     pub(crate) jar_path: Option<String>,
+    #[serde(default)]
     pub(crate) jar_size: Option<i64>,
+    #[serde(default)]
     pub(crate) checksum_algo: Option<String>,
+    #[serde(default)]
     pub(crate) checksum: Option<String>,
     pub(crate) created_at: i64,
     pub(crate) updated_at: i64,
+    #[serde(default)]
     pub(crate) java_major: Option<i64>,
+    #[serde(default)]
     pub(crate) required_java_major: Option<i64>,
+    #[serde(default)]
     pub(crate) ram_mib: Option<i32>,
+    #[serde(default)]
     pub(crate) autostart: bool,
 }
 
-/// 核心元数据变更集：版本 + jar 列 + 版本要求的 Java 大版本 + `updated_at`，
-/// 不动身份 / 归属 / `created_at`
-#[derive(Debug, AsChangeset)]
-#[diesel(table_name = servers)]
-pub(crate) struct JarChangeset {
-    pub(crate) version: String,
-    pub(crate) jar_path: String,
-    pub(crate) jar_size: i64,
-    pub(crate) checksum_algo: String,
-    pub(crate) checksum: String,
-    pub(crate) required_java_major: Option<i64>,
-    pub(crate) updated_at: i64,
-}
-
-/// 服务属性变更集：只更新属性列，不动身份 / 归属 / 核心 / `created_at`
-#[derive(Debug, AsChangeset)]
-#[diesel(table_name = servers)]
-pub(crate) struct SettingsChangeset {
-    pub(crate) java_major: Option<i64>,
-    pub(crate) ram_mib: Option<i32>,
-    pub(crate) autostart: bool,
-    pub(crate) updated_at: i64,
-}
-
-/// 移动归属变更集
-#[derive(Debug, AsChangeset)]
-#[diesel(table_name = servers)]
-pub(crate) struct RelinkChangeset {
-    pub(crate) workspace_id: String,
-    pub(crate) rel_dir: String,
-    pub(crate) updated_at: i64,
-}
-
-/// `java_runtimes` 表的一行
-#[derive(Debug, Clone, Queryable, Selectable, Insertable)]
-#[diesel(table_name = java_runtimes)]
-pub(crate) struct JavaRuntimeRow {
+/// 记录文件的一项：Java 运行时
+///
+/// 字段 `version` 是 JDK 版本号，格式版本因此用 `schema`，避免同名冲突。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct JavaRuntimeEntry {
+    pub(crate) schema: u32,
     pub(crate) id: String,
     pub(crate) path: String,
     pub(crate) major: i64,
     pub(crate) version: String,
     pub(crate) vendor: String,
+    #[serde(default)]
     pub(crate) managed: bool,
     pub(crate) created_at: i64,
     pub(crate) updated_at: i64,
 }
 
-impl From<&Workspace> for WorkspaceRow {
+impl From<&Workspace> for WorkspaceEntry {
     fn from(ws: &Workspace) -> Self {
         Self {
+            version: RECORD_VERSION,
             id: ws.id.as_str().to_owned(),
             name: ws.name.as_str().to_owned(),
             path: ws.path.to_string_lossy().into_owned(),
-            is_current: ws.is_current,
             created_at: ws.created_at,
             updated_at: ws.updated_at,
         }
     }
 }
 
-impl TryFrom<WorkspaceRow> for Workspace {
-    type Error = RepositoryError;
+// 记录 → 领域对象的转换在 `lib.rs` 的 `into_workspace` 里做：
+// 记录文件不含当前标记，`is_current` 必须由 `state.json` 决定，
+// 因此这里不提供会产出语义不完整中间态的 `TryFrom`。
 
-    fn try_from(row: WorkspaceRow) -> Result<Self, Self::Error> {
-        let id =
-            WorkspaceId::parse(&row.id).map_err(|err| corrupt("workspace id", &row.id, err))?;
-        let name = WorkspaceName::parse(&row.name)
-            .map_err(|err| corrupt("workspace name", &row.name, err))?;
-        Ok(Self {
-            id,
-            name,
-            path: PathBuf::from(row.path),
-            is_current: row.is_current,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-        })
-    }
-}
-
-impl From<&ServerMeta> for ServerRow {
+impl From<&ServerMeta> for ServerEntry {
     fn from(meta: &ServerMeta) -> Self {
         let (jar_path, jar_size, checksum_algo, checksum) = match &meta.jar {
             Some(jar) => (
@@ -146,6 +118,7 @@ impl From<&ServerMeta> for ServerRow {
             None => (None, None, None, None),
         };
         Self {
+            schema: RECORD_VERSION,
             id: meta.id.as_str().to_owned(),
             name: meta.name.as_str().to_owned(),
             workspace_id: meta.workspace_id.as_str().to_owned(),
@@ -169,17 +142,23 @@ impl From<&ServerMeta> for ServerRow {
     }
 }
 
-impl TryFrom<ServerRow> for ServerMeta {
+impl TryFrom<ServerEntry> for ServerMeta {
     type Error = RepositoryError;
 
-    fn try_from(row: ServerRow) -> Result<Self, Self::Error> {
-        let id = ServerId::parse(&row.id).map_err(|err| corrupt("server id", &row.id, err))?;
-        let name = ServerName::parse(&row.name).map_err(|err| corrupt("name", &row.name, err))?;
-        let workspace_id = WorkspaceId::parse(&row.workspace_id)
-            .map_err(|err| corrupt("workspace_id", &row.workspace_id, err))?;
-        let variant = ServerVariant::parse(&row.variant)
-            .map_err(|err| corrupt("variant", &row.variant, err))?;
-        let jar = match (row.jar_path, row.jar_size, row.checksum_algo, row.checksum) {
+    fn try_from(entry: ServerEntry) -> Result<Self, Self::Error> {
+        let id = ServerId::parse(&entry.id).map_err(|err| corrupt("server id", &entry.id, err))?;
+        let name =
+            ServerName::parse(&entry.name).map_err(|err| corrupt("name", &entry.name, err))?;
+        let workspace_id = WorkspaceId::parse(&entry.workspace_id)
+            .map_err(|err| corrupt("workspace_id", &entry.workspace_id, err))?;
+        let variant = ServerVariant::parse(&entry.variant)
+            .map_err(|err| corrupt("variant", &entry.variant, err))?;
+        let jar = match (
+            entry.jar_path,
+            entry.jar_size,
+            entry.checksum_algo,
+            entry.checksum,
+        ) {
             (Some(path), Some(size), Some(algo), Some(hex)) => {
                 let algorithm = ChecksumAlgorithm::parse(&algo)
                     .map_err(|err| corrupt("checksum algo", &algo, err))?;
@@ -193,52 +172,53 @@ impl TryFrom<ServerRow> for ServerMeta {
             _ => {
                 return Err(RepositoryError::Corrupt(format!(
                     "partial jar columns of {}",
-                    row.name
+                    entry.name
                 )));
             }
         };
 
-        let java_major = match row.java_major {
+        let java_major = match entry.java_major {
             Some(raw) => {
                 Some(JavaMajor::parse(raw).map_err(|err| corrupt("java major", raw, err))?)
             }
             None => None,
         };
-        let required_java_major = match row.required_java_major {
+        let required_java_major = match entry.required_java_major {
             Some(raw) => Some(
                 JavaMajor::parse(raw).map_err(|err| corrupt("required java major", raw, err))?,
             ),
             None => None,
         };
-        let ram_mib = match row.ram_mib {
+        let ram_mib = match entry.ram_mib {
             Some(raw) => Some(u32::try_from(raw).map_err(|err| corrupt("ram_mib", raw, err))?),
             None => None,
         };
         let settings = ServerSettings {
             java_major,
             ram_mib,
-            autostart: row.autostart,
+            autostart: entry.autostart,
         };
 
         Ok(Self {
             id,
             name,
             workspace_id,
-            rel_dir: PathBuf::from(row.rel_dir),
-            version: VersionId::new(row.version),
+            rel_dir: PathBuf::from(entry.rel_dir),
+            version: VersionId::new(entry.version),
             variant,
             jar,
             settings,
             java_major: required_java_major,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
+            created_at: entry.created_at,
+            updated_at: entry.updated_at,
         })
     }
 }
 
-impl From<&JavaRuntime> for JavaRuntimeRow {
+impl From<&JavaRuntime> for JavaRuntimeEntry {
     fn from(rt: &JavaRuntime) -> Self {
         Self {
+            schema: RECORD_VERSION,
             id: rt.id.clone(),
             path: rt.path.to_string_lossy().into_owned(),
             major: rt.major.as_i64(),
@@ -251,21 +231,21 @@ impl From<&JavaRuntime> for JavaRuntimeRow {
     }
 }
 
-impl TryFrom<JavaRuntimeRow> for JavaRuntime {
+impl TryFrom<JavaRuntimeEntry> for JavaRuntime {
     type Error = RepositoryError;
 
-    fn try_from(row: JavaRuntimeRow) -> Result<Self, Self::Error> {
+    fn try_from(entry: JavaRuntimeEntry) -> Result<Self, Self::Error> {
         let major =
-            JavaMajor::parse(row.major).map_err(|err| corrupt("java major", row.major, err))?;
+            JavaMajor::parse(entry.major).map_err(|err| corrupt("java major", entry.major, err))?;
         Ok(Self {
-            id: row.id,
-            path: PathBuf::from(row.path),
+            id: entry.id,
+            path: PathBuf::from(entry.path),
             major,
-            version: row.version,
-            vendor: JavaVendor::parse_fuzzy(&row.vendor),
-            managed: row.managed,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
+            version: entry.version,
+            vendor: JavaVendor::parse_fuzzy(&entry.vendor),
+            managed: entry.managed,
+            created_at: entry.created_at,
+            updated_at: entry.updated_at,
         })
     }
 }

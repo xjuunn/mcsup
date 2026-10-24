@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow};
+﻿use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -44,7 +44,7 @@ pub(crate) fn platform_data_dir() -> Result<PathBuf> {
     Ok(base.join("mcsup"))
 }
 
-/// 元数据库路径 `{data_dir}/mcsup/db/mcsup.db`
+/// 元数据仓库根目录 `{data_dir}/mcsup/db`
 pub(crate) fn database_path() -> Result<PathBuf> {
-    Ok(platform_data_dir()?.join("db").join("mcsup.db"))
+    Ok(platform_data_dir()?.join("db"))
 }

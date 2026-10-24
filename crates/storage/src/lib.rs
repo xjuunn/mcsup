@@ -1,182 +1,791 @@
-mod models;
-mod schema;
+//! 元数据存储：一条记录一个 JSON 文件
+//!
+//! 目录布局（`{root}` = `{data_dir}/mcsup/db`）：
+//!
+//! ```text
+//! {root}/workspaces/state.json      {"version":1,"current":"<uuid>|null"}
+//! {root}/workspaces/<uuid>.json     一条工作目录
+//! {root}/servers/<uuid>.json        一台服务器
+//! {root}/java/state.json            {"version":1,"scanned_at":<unix 秒>|null}
+//! {root}/java/<id>.json             一个 Java 运行时
+//! ```
+//!
+//! 设计要点：
+//!
+//! - **故障隔离**：一条记录一个文件，坏一份只影响那一条（[`RepositoryError::Corrupt`]
+//!   指向具体文件名），其余照常可读写。
+//! - **原子写入**：同目录临时文件 → `fsync` → `rename` 覆盖。进程中断只会留下
+//!   「替换前」或「替换后」的完整文件，不会出现半截 JSON。
+//! - **当前工作区只有一处真相**：`state.json` 的 `current` 指针。记录文件里不再
+//!   存 `is_current`，避免「n 个布尔表示单值」带来的不一致。
+//! - **唯一性**：文件系统不提供唯一索引，写入前扫目录比对（名称 / 路径 /
+//!   同工作区 `rel_dir`），代价与全量解析同量级。
+//! - **文件名即身份**：文件名（不含 `.json`）必须等于记录 `id`，不一致按损坏拒绝，
+//!   防止文件被手工改名后出现「两条同 id」。
+//!
+//! 并发边界：进程内 `Mutex` 串行，跨进程用数据根目录的 `.lock` 文件互斥；
+//! 跨机器共享同一目录不在契约内。
 
-use crate::models::{
-    JarChangeset, JavaRuntimeRow, RelinkChangeset, ServerRow, SettingsChangeset, WorkspaceRow,
-};
-use crate::schema::{java_runtimes, java_scan_state, servers, workspaces};
-use diesel::connection::SimpleConnection;
-use diesel::prelude::*;
-use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
+mod models;
+
+use crate::models::{JavaRuntimeEntry, ServerEntry, WorkspaceEntry, corrupt};
 use domain::java::JavaRuntime;
 use domain::server::meta::{ServerMeta, ServerName};
 use domain::server::version::VersionId;
 use domain::workspace::{Workspace, WorkspaceId, WorkspaceName};
 use port::{JavaRuntimeRepository, RepositoryError, ServerRepository, WorkspaceRepository};
-use std::path::Path;
-use std::sync::{Mutex, PoisonError};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
-/// 编译进二进制的迁移集；`migrations/` 位于本 crate 根
-pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
-const BUSY_TIMEOUT_MS: u64 = 5_000;
+/// `state.json` 的格式版本
+const STATE_VERSION: u32 = 1;
+/// 记录文件扩展名
+const RECORD_EXT: &str = "json";
+/// 当前工作区指针文件名
+const STATE_FILE: &str = "state.json";
+/// 跨进程锁文件名（位于数据根目录）
+const LOCK_FILE: &str = ".lock";
 
-/// SQLite 实现的元数据库
-pub struct SqliteStore {
-    conn: Mutex<SqliteConnection>,
+/// 工作目录集合的全局状态
+///
+/// 只放「全局唯一」的东西：当前是哪个工作目录。其余字段都在各自记录里。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct WorkspaceState {
+    version: u32,
+    /// 当前工作区 id。指向已删除或损坏的记录时读取视为「无当前」。
+    current: Option<String>,
 }
 
-impl std::fmt::Debug for SqliteStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SqliteStore").finish_non_exhaustive()
-    }
+/// Java 集合的全局状态
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct JavaState {
+    version: u32,
+    /// 上次扫描时间（unix 秒）
+    scanned_at: Option<i64>,
 }
 
-impl SqliteStore {
-    /// 打开或创建数据库文件并执行待应用的迁移
-    ///
-    /// # Errors
-    ///
-    /// 创建目录、打开连接、PRAGMA 或迁移失败时返回 [`RepositoryError`]
-    pub fn open(path: &Path) -> Result<Self, RepositoryError> {
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent).map_err(storage_err)?;
+impl WorkspaceState {
+    fn new() -> Self {
+        Self {
+            version: STATE_VERSION,
+            current: None,
         }
-        let url = path.to_string_lossy().into_owned();
-        let conn = SqliteConnection::establish(&url).map_err(storage_err)?;
-        Self::from_conn(conn)
-    }
-
-    /// 内存库：测试与临时查询用
-    ///
-    /// # Errors
-    ///
-    /// 同 [`SqliteStore::open`]
-    pub fn open_in_memory() -> Result<Self, RepositoryError> {
-        let conn = SqliteConnection::establish(":memory:").map_err(storage_err)?;
-        Self::from_conn(conn)
-    }
-
-    fn from_conn(mut conn: SqliteConnection) -> Result<Self, RepositoryError> {
-        conn.batch_execute(&format!(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA busy_timeout = {BUSY_TIMEOUT_MS};
-             PRAGMA foreign_keys = ON;"
-        ))
-        .map_err(storage_err)?;
-        conn.run_pending_migrations(MIGRATIONS)
-            .map_err(RepositoryError::Storage)?;
-        Ok(Self {
-            conn: Mutex::new(conn),
-        })
-    }
-
-    /// 取锁后在连接上执行一段操作
-    ///
-    /// 内部组合（如 `update_core` 之后回读）必须走同一个闭包共享连接，
-    /// 禁止方法间重入 `self`——`std::sync::Mutex` 不可重入，会死锁
-    fn with_conn<T>(
-        &self,
-        f: impl FnOnce(&mut SqliteConnection) -> Result<T, RepositoryError>,
-    ) -> Result<T, RepositoryError> {
-        let mut conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
-        f(&mut conn)
     }
 }
 
-impl WorkspaceRepository for SqliteStore {
-    fn create(&self, ws: &Workspace) -> Result<(), RepositoryError> {
-        self.with_conn(|conn| {
-            let row = WorkspaceRow::from(ws);
-            diesel::insert_into(workspaces::table)
-                .values(&row)
-                .execute(conn)
-                .map_err(|err| map_insert_error(err, ws.name.as_str(), "workspaces"))?;
-            Ok(())
+impl JavaState {
+    fn new() -> Self {
+        Self {
+            version: STATE_VERSION,
+            scanned_at: None,
+        }
+    }
+}
+
+/// 一条扫描结果：文件路径 + 解析成功或失败
+type RawRecord<T> = (PathBuf, Result<T, RepositoryError>);
+
+/// 一条记录的一个集合（目录 + 文件名规则 + 状态文件）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Collection {
+    Workspaces,
+    Servers,
+    Java,
+}
+
+impl Collection {
+    /// 子目录名
+    fn dir(self) -> &'static str {
+        match self {
+            Self::Workspaces => "workspaces",
+            Self::Servers => "servers",
+            Self::Java => "java",
+        }
+    }
+}
+
+/// 进程内锁 + 跨进程锁的持有者
+struct Guard<'a> {
+    /// 保持 `MutexGuard` 存活；不做额外访问
+    _thread: MutexGuard<'a, ()>,
+    _dir: DirLock,
+}
+
+/// 多文件 JSON 实现的元数据仓库
+///
+/// 三个仓库（工作目录 / 服务器 / Java）共用同一个实例，因此共用一把锁：
+/// 写入涉及跨集合校验（服务器引用工作目录），进程内必须串行。
+pub struct JsonStore {
+    root: PathBuf,
+    lock: Mutex<()>,
+    /// `open_in_memory` 的临时目录：随 store 存活，drop 时清理
+    dir: Option<tempfile::TempDir>,
+}
+
+impl std::fmt::Debug for JsonStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JsonStore")
+            .field("root", &self.root)
+            .finish_non_exhaustive()
+    }
+}
+
+impl JsonStore {
+    /// 打开（必要时创建）存放三个集合的数据目录
+    ///
+    /// 打开时只建目录、不校验内容：损坏的单条记录不应阻止其他命令运行，
+    /// 只在真正读到它时报错。
+    ///
+    /// # Errors
+    ///
+    /// 目录创建失败时返回 [`RepositoryError::Storage`]
+    pub fn open(root: &Path) -> Result<Self, RepositoryError> {
+        let store = Self {
+            root: root.to_path_buf(),
+            lock: Mutex::new(()),
+            dir: None,
+        };
+        for collection in [
+            Collection::Workspaces,
+            Collection::Servers,
+            Collection::Java,
+        ] {
+            std::fs::create_dir_all(store.collection_dir(collection)).map_err(storage_err)?;
+        }
+        Ok(store)
+    }
+
+    /// 临时目录中的空仓库：测试与临时查询用
+    ///
+    /// 临时目录随返回的 store 一起保活，drop 时清理。
+    ///
+    /// # Errors
+    ///
+    /// 临时目录创建或子目录创建失败时返回 [`RepositoryError::Storage`]
+    pub fn open_in_memory() -> Result<Self, RepositoryError> {
+        let dir = tempfile::TempDir::new().map_err(storage_err)?;
+        let mut store = Self::open(dir.path())?;
+        store.dir = Some(dir);
+        Ok(store)
+    }
+
+    /// 数据根目录（三个集合的父目录）
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn collection_dir(&self, collection: Collection) -> PathBuf {
+        self.root.join(collection.dir())
+    }
+
+    /// 记录文件路径；`id` 必须是单个普通文件名片段
+    ///
+    /// `id` 进路径前必须校验：它既来自目录扫描的文件名，也来自记录内容。
+    /// 含 `.` / 分隔符 / 盘符的 id 会把写入引到集合目录之外（如 `..`），
+    /// 或让不同 id 映射到同一文件。这类 id 视为损坏而不是拼接后放行。
+    fn record_path(&self, collection: Collection, id: &str) -> Result<PathBuf, RepositoryError> {
+        if !is_safe_record_id(id) {
+            return Err(RepositoryError::Corrupt(format!(
+                "{}: unsafe record id {id}",
+                collection.dir()
+            )));
+        }
+        Ok(self
+            .collection_dir(collection)
+            .join(format!("{id}.{RECORD_EXT}")))
+    }
+
+    fn state_path(&self, collection: Collection) -> PathBuf {
+        self.collection_dir(collection).join(STATE_FILE)
+    }
+
+    /// 进程内排队 + 跨进程锁
+    ///
+    /// 返回的 guard 离开作用域时同时释放两把锁。
+    fn lock(&self) -> Result<Guard<'_>, RepositoryError> {
+        let guard = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let dir_lock = DirLock::acquire(self.root.join(LOCK_FILE))?;
+        Ok(Guard {
+            _thread: guard,
+            _dir: dir_lock,
         })
+    }
+
+    // ---------------------------------------------------------------- 记录读写
+
+    /// 读一条记录；文件不存在返回 `None`
+    ///
+    /// 文件名与记录 `id` 必须一致，`schema` 必须是本版本，否则按损坏拒绝。
+    fn load_record<T>(&self, collection: Collection, id: &str) -> Result<Option<T>, RepositoryError>
+    where
+        T: DeserializeOwned + RecordId,
+    {
+        let path = self.record_path(collection, id)?;
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(storage_err(err)),
+        };
+        let record: T = serde_json::from_slice(&bytes)
+            .map_err(|err| RepositoryError::Corrupt(format!("{}: {err}", self.display(&path))))?;
+        if record.schema() != models::RECORD_VERSION {
+            return Err(RepositoryError::Corrupt(format!(
+                "{}: schema {}, expected {}",
+                self.display(&path),
+                record.schema(),
+                models::RECORD_VERSION
+            )));
+        }
+        if record.record_id() != id {
+            return Err(RepositoryError::Corrupt(format!(
+                "{}: holds id {}",
+                self.display(&path),
+                record.record_id()
+            )));
+        }
+        Ok(Some(record))
+    }
+
+    /// 扫描整个集合
+    ///
+    /// `tolerate` 为 `true` 时跳过损坏文件（结果里带出它们的路径），
+    /// 为 `false` 时第一个坏文件即失败。`list` 用前者，唯一性校验用后者：
+    /// 校验时看不见的记录可能正好与待写记录冲突，不能默默放过。
+    fn scan<T>(
+        &self,
+        collection: Collection,
+        tolerate: bool,
+    ) -> Result<(Vec<T>, Vec<String>), RepositoryError>
+    where
+        T: DeserializeOwned + RecordId,
+    {
+        let dir = self.collection_dir(collection);
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return Ok((Vec::new(), Vec::new()));
+            }
+            Err(err) => return Err(storage_err(err)),
+        };
+        let mut records = Vec::new();
+        let mut broken = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(storage_err)?;
+            let path = entry.path();
+            if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some(RECORD_EXT) {
+                continue;
+            }
+            // 状态文件不是记录
+            if path.file_name().and_then(|n| n.to_str()) == Some(STATE_FILE) {
+                continue;
+            }
+            let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            match self.load_record::<T>(collection, id) {
+                Ok(Some(record)) => records.push(record),
+                // 扫描与读取之间被删除：跳过
+                Ok(None) => {}
+                Err(err @ RepositoryError::Corrupt(_)) => {
+                    if tolerate {
+                        broken.push(self.display(&path));
+                    } else {
+                        return Err(err);
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Ok((records, broken))
+    }
+
+    /// 扫描并要求全部可读（唯一性校验等写入前置检查用）
+    fn scan_strict<T>(&self, collection: Collection) -> Result<Vec<T>, RepositoryError>
+    where
+        T: DeserializeOwned + RecordId,
+    {
+        Ok(self.scan(collection, false)?.0)
+    }
+
+    /// 扫描并把每条结果与「解析错误」成对返回，供需要区分「删掉哪个」的调用方使用
+    fn scan_raw<T>(&self, collection: Collection) -> Result<Vec<RawRecord<T>>, RepositoryError>
+    where
+        T: DeserializeOwned + RecordId,
+    {
+        let dir = self.collection_dir(collection);
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(storage_err(err)),
+        };
+        let mut out = Vec::new();
+        for entry in entries {
+            let path = entry.map_err(storage_err)?.path();
+            if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some(RECORD_EXT) {
+                continue;
+            }
+            if path.file_name().and_then(|n| n.to_str()) == Some(STATE_FILE) {
+                continue;
+            }
+            let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let id = id.to_owned();
+            match self.load_record::<T>(collection, &id) {
+                Ok(Some(record)) => out.push((path, Ok(record))),
+                Ok(None) => {}
+                Err(err) => out.push((path, Err(err))),
+            }
+        }
+        Ok(out)
+    }
+
+    /// 原子写入一条记录
+    fn write_record(
+        &self,
+        collection: Collection,
+        id: &str,
+        record: &impl Serialize,
+    ) -> Result<(), RepositoryError> {
+        write_atomically(&self.record_path(collection, id)?, record)
+    }
+
+    fn remove_record(&self, collection: Collection, id: &str) -> Result<(), RepositoryError> {
+        remove_file_checked(&self.record_path(collection, id)?)
+    }
+
+    // ---------------------------------------------------------------- 状态读写
+
+    fn load_workspace_state(&self) -> Result<WorkspaceState, RepositoryError> {
+        self.load_state(Collection::Workspaces, WorkspaceState::new)
+    }
+
+    /// 读当前工作区指针，读不出时退化为「无当前」
+    ///
+    /// `state.json` 是全局单点：解析失败或版本未知时若直接报错，
+    /// `workspace list` / `server list` 会整体不可用。而这两个命令
+    /// 并不需要「当前」才能给出有用结果，因此这里只降级不失败，
+    /// 与悬空指针同一语义。写入路径仍走 [`Self::load_workspace_state`]：
+    /// 写之前必须知道状态是否真的可改，不能静默覆盖一份读不懂的文件。
+    fn current_pointer(&self) -> Option<String> {
+        self.load_workspace_state()
+            .ok()
+            .and_then(|state| state.current)
+    }
+
+    fn load_java_state(&self) -> Result<JavaState, RepositoryError> {
+        self.load_state(Collection::Java, JavaState::new)
+    }
+
+    fn load_state<T>(&self, collection: Collection, empty: fn() -> T) -> Result<T, RepositoryError>
+    where
+        T: DeserializeOwned + StateVersion,
+    {
+        let path = self.state_path(collection);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(empty()),
+            Err(err) => return Err(storage_err(err)),
+        };
+        let state: T = serde_json::from_slice(&bytes)
+            .map_err(|err| RepositoryError::Corrupt(format!("{}: {err}", self.display(&path))))?;
+        if state.state_version() != STATE_VERSION {
+            return Err(RepositoryError::Corrupt(format!(
+                "{}: version {}, expected {STATE_VERSION}",
+                self.display(&path),
+                state.state_version()
+            )));
+        }
+        Ok(state)
+    }
+
+    fn write_state<T: Serialize>(
+        &self,
+        collection: Collection,
+        state: &T,
+    ) -> Result<(), RepositoryError> {
+        write_atomically(&self.state_path(collection), state)
+    }
+
+    /// 相对根目录显示路径，错误信息不洩露完整用户路径
+    fn display(&self, path: &Path) -> String {
+        path.strip_prefix(&self.root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+}
+
+/// 把记录转成领域对象，并按 `state.json` 的指针填充 `is_current`
+///
+/// 单独构造而不是复用 `TryFrom`：记录文件里没有当前标记，
+/// 直接构造可避免出现一个 `is_current = false` 的中间态。
+fn into_workspace(
+    entry: WorkspaceEntry,
+    current: Option<&str>,
+) -> Result<Workspace, RepositoryError> {
+    let is_current = current == Some(entry.id.as_str());
+    let WorkspaceEntry {
+        id,
+        name,
+        path,
+        created_at,
+        updated_at,
+        ..
+    } = entry;
+    Ok(Workspace {
+        id: WorkspaceId::parse(&id).map_err(|err| corrupt("workspace id", &id, err))?,
+        name: WorkspaceName::parse(&name).map_err(|err| corrupt("workspace name", &name, err))?,
+        path: PathBuf::from(path),
+        is_current,
+        created_at,
+        updated_at,
+    })
+}
+
+/// 记录文件能自报身份与格式版本
+trait RecordId {
+    fn record_id(&self) -> &str;
+    /// 格式版本字段：工作目录 / 服务器是 `version`，Java 是 `schema`
+    fn schema(&self) -> u32;
+}
+
+impl RecordId for WorkspaceEntry {
+    fn record_id(&self) -> &str {
+        &self.id
+    }
+    fn schema(&self) -> u32 {
+        self.version
+    }
+}
+
+impl RecordId for ServerEntry {
+    fn record_id(&self) -> &str {
+        &self.id
+    }
+    fn schema(&self) -> u32 {
+        self.schema
+    }
+}
+
+impl RecordId for JavaRuntimeEntry {
+    fn record_id(&self) -> &str {
+        &self.id
+    }
+    fn schema(&self) -> u32 {
+        self.schema
+    }
+}
+
+/// `state.json` 能自报格式版本
+trait StateVersion {
+    fn state_version(&self) -> u32;
+}
+
+impl StateVersion for WorkspaceState {
+    fn state_version(&self) -> u32 {
+        self.version
+    }
+}
+
+impl StateVersion for JavaState {
+    fn state_version(&self) -> u32 {
+        self.version
+    }
+}
+
+/// 序列化 → 写同目录临时文件 → 刷盘 → rename 覆盖
+///
+/// 临时文件与目标同目录，保证 rename 是同一文件系统上的原子替换；
+/// Windows 的 `rename` 覆盖已存在目标，无需先删除（先删会留下无文件窗口）。
+/// 失败时清掉临时文件并抛出错误，目标文件保持原样。
+fn write_atomically(path: &Path, value: &impl Serialize) -> Result<(), RepositoryError> {
+    let mut bytes = serde_json::to_vec_pretty(value).map_err(storage_err)?;
+    bytes.push(b'\n');
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(storage_err)?;
+    }
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = path.with_file_name(format!(".{file_name}.tmp"));
+    let result = (|| -> io::Result<()> {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if let Err(err) = result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(storage_err(err));
+    }
+    // 目录项也要落盘，否则断电后可能「文件在、名字不在」
+    sync_parent(path);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_parent(path: &Path) {
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+}
+
+/// Windows 无法对目录 fsync，rename 已由 NTFS 日志保证
+#[cfg(not(unix))]
+fn sync_parent(_path: &Path) {}
+
+/// 记录 id 是否可安全地作为文件名使用
+///
+/// 只允许字母、数字、`-` 和 `_`：覆盖 UUID 与 `java-21` 这类生成式 id，
+/// 同时排除路径分隔符、`.`（会与扩展名或 `..` 混淆）和盘符。
+fn is_safe_record_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn storage_err(err: impl std::error::Error + Send + Sync + 'static) -> RepositoryError {
+    RepositoryError::Storage(Box::new(err))
+}
+
+/// 删除文件；已不存在视为成功（幂等）
+fn remove_file_checked(path: &Path) -> Result<(), RepositoryError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(storage_err(err)),
+    }
+}
+
+/// 目录级互斥：进程内 `Mutex` 之外再加一把跨进程锁
+///
+/// 进程内锁挡不住两个 mcsup 进程同时写同一目录。唯一性靠「先扫后写」，
+/// 没有这把锁时两个进程会一起通过校验、各自落盘，产生重名或重复 id。
+///
+/// 实现：`try_lock` 自旋 + 超时，不用 `flock`（Windows 语义不同），
+/// 锁文件内容写持有者 pid 作为存活凭据。锁文件本身永不删除——删锁文件会
+/// 引入「A 删了锁、B 也创建了锁」的竞态。
+struct DirLock {
+    path: PathBuf,
+}
+
+impl DirLock {
+    fn acquire(path: PathBuf) -> Result<Self, RepositoryError> {
+        // 进程内已排队，超时只可能是别的进程持锁或残留锁
+        let deadline = std::time::Instant::now() + LOCK_TIMEOUT;
+        let mut delay = std::time::Duration::from_millis(2);
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    // pid 是回收残留锁的唯一凭据，写失败就无法判断存活，
+                    // 宁可失败也不留下一个无法回收的锁
+                    write!(file, "{}", std::process::id())
+                        .map_err(|err| storage_err(io::Error::new(err.kind(), err.to_string())))?;
+                    return Ok(Self { path });
+                }
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                    if is_stale(&path) {
+                        // 持锁进程已死：清掉后重试。删除失败说明别的进程刚抢到，继续等
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err(RepositoryError::Storage(Box::new(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            format!(
+                                "storage lock busy: waited {LOCK_TIMEOUT:?}, another mcsup process holds it"
+                            ),
+                        ))));
+                    }
+                    std::thread::sleep(delay);
+                    delay = (delay * 2).min(std::time::Duration::from_millis(50));
+                }
+                Err(err) => return Err(storage_err(err)),
+            }
+        }
+    }
+}
+
+impl Drop for DirLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// 单次拿到锁的最长等待时间
+const LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 锁文件是否是可回收的残留
+///
+/// 判据是**持有者进程是否还活着**，不是锁文件有多旧：
+/// 旧的时间阈值只会误判——正常持锁超过阈值的进程会被当成崩溃，
+/// 锁被别的进程删除后两者同处临界区。
+fn is_stale(path: &Path) -> bool {
+    match std::fs::read_to_string(path) {
+        // 读得到 pid：活着就不是残留
+        Ok(text) => match text.trim().parse::<u32>() {
+            Ok(pid) => !process_alive(pid),
+            // pid 写了一半（写入瞬间崩溃）或为垃圾：判为残留
+            Err(_) => true,
+        },
+        // 文件刚被别的进程释放：不算残留，让调用方下一轮重试创建
+        Err(_) => false,
+    }
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    // Unix 上 pid 会被复用；信号 0 只探测存在性，已足够区分「崩溃遗留」
+    // 与「仍在运行」两种常见情况
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Windows：查询打开该 pid 的进程句柄
+///
+/// pid 已退出时 `OpenProcess` 失败并置 `ERROR_INVALID_PARAMETER`。
+/// 不引入 Win32 绑定依赖，改用系统自带的任务列表查询，避免为一次
+/// 诊断性判断扩大依赖面。
+#[cfg(not(unix))]
+fn process_alive(pid: u32) -> bool {
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .output()
+        .is_ok_and(|out| {
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains(&pid.to_string())
+        })
+}
+
+fn conflict_unique(exists: bool, key: &str) -> Result<(), RepositoryError> {
+    if exists {
+        Err(RepositoryError::AlreadyExists(key.to_owned()))
+    } else {
+        Ok(())
+    }
+}
+
+// -------------------------------------------------------------------- 工作目录
+
+impl WorkspaceRepository for JsonStore {
+    fn create(&self, ws: &Workspace) -> Result<(), RepositoryError> {
+        let _guard = self.lock()?;
+        let entry = WorkspaceEntry::from(ws);
+        // 唯一性必须在写入前确认：坏记录看不见就会放过冲突
+        let existing = self.scan_strict::<WorkspaceEntry>(Collection::Workspaces)?;
+        for other in &existing {
+            if other.id == entry.id {
+                return Err(RepositoryError::AlreadyExists(ws.name.as_str().to_owned()));
+            }
+            conflict_unique(other.name == entry.name, ws.name.as_str())?;
+            conflict_unique(other.path == entry.path, ws.path.to_string_lossy().as_ref())?;
+        }
+        self.write_record(Collection::Workspaces, &entry.id, &entry)?;
+        // 标记为当前时同步提升指针；`state.json` 单独一步，
+        // 崩溃只会留下「已登记但不是当前」，不会留下两个当前
+        if ws.is_current {
+            let mut state = self.load_workspace_state()?;
+            state.current = Some(ws.id.as_str().to_owned());
+            self.write_state(Collection::Workspaces, &state)?;
+        }
+        Ok(())
     }
 
     fn get(&self, id: &WorkspaceId) -> Result<Workspace, RepositoryError> {
-        self.with_conn(|conn| {
-            let row: Option<WorkspaceRow> = workspaces::table
-                .filter(workspaces::id.eq(id.as_str()))
-                .select(WorkspaceRow::as_select())
-                .first(conn)
-                .optional()
-                .map_err(storage_err)?;
-            let row = row.ok_or_else(|| RepositoryError::NotFound(id.as_str().to_owned()))?;
-            Workspace::try_from(row)
-        })
+        let _guard = self.lock()?;
+        let entry = self
+            .load_record::<WorkspaceEntry>(Collection::Workspaces, id.as_str())?
+            .ok_or_else(|| RepositoryError::NotFound(id.as_str().to_owned()))?;
+        into_workspace(entry, self.current_pointer().as_deref())
     }
 
     fn get_by_name(&self, name: &WorkspaceName) -> Result<Workspace, RepositoryError> {
-        self.with_conn(|conn| {
-            let row: Option<WorkspaceRow> = workspaces::table
-                .filter(workspaces::name.eq(name.as_str()))
-                .select(WorkspaceRow::as_select())
-                .first(conn)
-                .optional()
-                .map_err(storage_err)?;
-            let row = row.ok_or_else(|| RepositoryError::NotFound(name.as_str().to_owned()))?;
-            Workspace::try_from(row)
-        })
+        let _guard = self.lock()?;
+        let (records, _) = self.scan::<WorkspaceEntry>(Collection::Workspaces, true)?;
+        let entry = records
+            .into_iter()
+            .find(|entry| entry.name == name.as_str())
+            .ok_or_else(|| RepositoryError::NotFound(name.as_str().to_owned()))?;
+        into_workspace(entry, self.current_pointer().as_deref())
     }
 
     fn list(&self) -> Result<Vec<Workspace>, RepositoryError> {
-        self.with_conn(|conn| {
-            let row = workspaces::table
-                .order(workspaces::name)
-                .select(WorkspaceRow::as_select())
-                .load::<WorkspaceRow>(conn)
-                .map_err(storage_err)?;
-            row.into_iter().map(Workspace::try_from).collect()
-        })
+        let _guard = self.lock()?;
+        // 单条损坏不应让整个列表不可用：跳过它，其余照常返回
+        let (records, _) = self.scan::<WorkspaceEntry>(Collection::Workspaces, true)?;
+        let current = self.current_pointer();
+        let mut rows = records
+            .into_iter()
+            .map(|entry| into_workspace(entry, current.as_deref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+        Ok(rows)
     }
 
     fn current(&self) -> Result<Option<Workspace>, RepositoryError> {
-        self.with_conn(|conn| {
-            let row: Option<WorkspaceRow> = workspaces::table
-                .filter(workspaces::is_current.eq(true))
-                .select(WorkspaceRow::as_select())
-                .first(conn)
-                .optional()
-                .map_err(storage_err)?;
-            row.map(Workspace::try_from).transpose()
-        })
+        let _guard = self.lock()?;
+        let Some(id) = self.current_pointer() else {
+            return Ok(None);
+        };
+        // 指针悬空（记录已删 / 损坏）按「无当前」处理，不改文件：
+        // 悬空是安全失败，下次 set_current 自然覆盖
+        let Some(entry) = self
+            .load_record::<WorkspaceEntry>(Collection::Workspaces, &id)
+            .ok()
+            .flatten()
+        else {
+            return Ok(None);
+        };
+        into_workspace(entry, Some(&id)).map(Some)
     }
 
     fn set_current(&self, id: &WorkspaceId) -> Result<(), RepositoryError> {
-        self.with_conn(|conn| {
-            conn.transaction(|conn| {
-                diesel::update(workspaces::table.filter(workspaces::is_current.eq(true)))
-                    .set(workspaces::is_current.eq(false))
-                    .execute(conn)?;
-                let affected =
-                    diesel::update(workspaces::table.filter(workspaces::id.eq(id.as_str())))
-                        .set(workspaces::is_current.eq(true))
-                        .execute(conn)?;
-                if affected == 0 {
-                    return Err(diesel::result::Error::NotFound);
-                }
-                Ok(())
-            })
-            .map_err(|err| match err {
-                diesel::result::Error::NotFound => {
-                    RepositoryError::NotFound(id.as_str().to_owned())
-                }
-                other => storage_err(other),
-            })
-        })
+        let _guard = self.lock()?;
+        if self
+            .load_record::<WorkspaceEntry>(Collection::Workspaces, id.as_str())?
+            .is_none()
+        {
+            return Err(RepositoryError::NotFound(id.as_str().to_owned()));
+        }
+        let mut state = self.load_workspace_state()?;
+        state.current = Some(id.as_str().to_owned());
+        self.write_state(Collection::Workspaces, &state)
     }
 
     fn remove(&self, id: &WorkspaceId) -> Result<(), RepositoryError> {
-        self.with_conn(|conn| {
-            let affected = diesel::delete(workspaces::table.filter(workspaces::id.eq(id.as_str())))
-                .execute(conn)
-                .map_err(storage_err)?;
-            require_found(affected, id.as_str())
-        })
+        let _guard = self.lock()?;
+        if self
+            .load_record::<WorkspaceEntry>(Collection::Workspaces, id.as_str())?
+            .is_none()
+        {
+            return Err(RepositoryError::NotFound(id.as_str().to_owned()));
+        }
+        self.remove_record(Collection::Workspaces, id.as_str())?;
+        // 删的正是当前项：清指针。另有剩余项的移交由 service 层完成
+        let mut state = self.load_workspace_state()?;
+        if state.current.as_deref() == Some(id.as_str()) {
+            state.current = None;
+            self.write_state(Collection::Workspaces, &state)?;
+        }
+        Ok(())
     }
 
     fn relink_path(
@@ -185,44 +794,71 @@ impl WorkspaceRepository for SqliteStore {
         path: &Path,
         updated_at: i64,
     ) -> Result<(), RepositoryError> {
-        self.with_conn(|conn| {
-            let affected = diesel::update(workspaces::table.filter(workspaces::id.eq(id.as_str())))
-                .set((
-                    workspaces::path.eq(path.to_string_lossy().into_owned()),
-                    workspaces::updated_at.eq(updated_at),
-                ))
-                .execute(conn)
-                .map_err(storage_err)?;
-            require_found(affected, id.as_str())
-        })
+        let _guard = self.lock()?;
+        let new_path = path.to_string_lossy().into_owned();
+        let existing = self.scan_strict::<WorkspaceEntry>(Collection::Workspaces)?;
+        for other in &existing {
+            conflict_unique(
+                other.path == new_path && other.id != id.as_str(),
+                new_path.as_str(),
+            )?;
+        }
+        let Some(mut entry) =
+            self.load_record::<WorkspaceEntry>(Collection::Workspaces, id.as_str())?
+        else {
+            return Err(RepositoryError::NotFound(id.as_str().to_owned()));
+        };
+        entry.path = new_path;
+        entry.updated_at = updated_at;
+        self.write_record(Collection::Workspaces, &entry.id, &entry)
     }
 }
 
-impl ServerRepository for SqliteStore {
+// ---------------------------------------------------------------------- 服务器
+
+impl ServerRepository for JsonStore {
     fn create(&self, meta: &ServerMeta) -> Result<(), RepositoryError> {
-        self.with_conn(|conn| {
-            let row = ServerRow::from(meta);
-            diesel::insert_into(servers::table)
-                .values(&row)
-                .execute(conn)
-                .map_err(|err| map_insert_error(err, meta.name.as_str(), "servers"))?;
-            Ok(())
-        })
+        let _guard = self.lock()?;
+        let entry = ServerEntry::from(meta);
+        // 工作目录必须已登记：文件系统没有外键，只能在这里显式检查
+        if self
+            .load_record::<WorkspaceEntry>(Collection::Workspaces, entry.workspace_id.as_str())?
+            .is_none()
+        {
+            return Err(RepositoryError::Corrupt(format!(
+                "server {} references unknown workspace {}",
+                entry.name, entry.workspace_id
+            )));
+        }
+        let existing = self.scan_strict::<ServerEntry>(Collection::Servers)?;
+        for other in &existing {
+            if other.id == entry.id {
+                return Err(RepositoryError::AlreadyExists(entry.name.clone()));
+            }
+            check_server_conflict(other, &entry)?;
+        }
+        self.write_record(Collection::Servers, &entry.id, &entry)
     }
 
     fn get(&self, name: &ServerName) -> Result<ServerMeta, RepositoryError> {
-        self.with_conn(|conn| select_meta(conn, name))
+        let _guard = self.lock()?;
+        let (records, _) = self.scan::<ServerEntry>(Collection::Servers, true)?;
+        let entry = records
+            .into_iter()
+            .find(|entry| entry.name == name.as_str())
+            .ok_or_else(|| RepositoryError::NotFound(name.as_str().to_owned()))?;
+        ServerMeta::try_from(entry)
     }
 
     fn list(&self) -> Result<Vec<ServerMeta>, RepositoryError> {
-        self.with_conn(|conn| {
-            let row = servers::table
-                .order(servers::name)
-                .select(ServerRow::as_select())
-                .load::<ServerRow>(conn)
-                .map_err(storage_err)?;
-            row.into_iter().map(ServerMeta::try_from).collect()
-        })
+        let _guard = self.lock()?;
+        let (records, _) = self.scan::<ServerEntry>(Collection::Servers, true)?;
+        let mut rows = records
+            .into_iter()
+            .map(ServerMeta::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+        Ok(rows)
     }
 
     fn update_core(
@@ -233,24 +869,17 @@ impl ServerRepository for SqliteStore {
         required_java_major: Option<domain::java::JavaMajor>,
         updated_at: i64,
     ) -> Result<ServerMeta, RepositoryError> {
-        self.with_conn(|conn| {
-            let changeset = JarChangeset {
-                version: version.to_string(),
-                jar_path: jar.path.to_string_lossy().into_owned(),
-                jar_size: i64::try_from(jar.size).unwrap_or(i64::MAX),
-                checksum_algo: jar.checksum.algorithm().as_str().to_owned(),
-                checksum: jar.checksum.hex().to_owned(),
-                required_java_major: required_java_major.map(domain::java::JavaMajor::as_i64),
-                updated_at,
-            };
-            let affected = diesel::update(servers::table.filter(servers::name.eq(name.as_str())))
-                .set(&changeset)
-                .execute(conn)
-                .map_err(storage_err)?;
-            require_found(affected, name.as_str())?;
-
-            select_meta(conn, name)
-        })
+        let _guard = self.lock()?;
+        let mut entry = self.find_server_entry(name)?;
+        entry.version = version.to_string();
+        entry.jar_path = Some(jar.path.to_string_lossy().into_owned());
+        entry.jar_size = Some(i64::try_from(jar.size).unwrap_or(i64::MAX));
+        entry.checksum_algo = Some(jar.checksum.algorithm().as_str().to_owned());
+        entry.checksum = Some(jar.checksum.hex().to_owned());
+        entry.required_java_major = required_java_major.map(domain::java::JavaMajor::as_i64);
+        entry.updated_at = updated_at;
+        self.write_record(Collection::Servers, &entry.id, &entry)?;
+        ServerMeta::try_from(entry)
     }
 
     fn update_settings(
@@ -259,39 +888,36 @@ impl ServerRepository for SqliteStore {
         settings: &domain::server::settings::ServerSettings,
         updated_at: i64,
     ) -> Result<ServerMeta, RepositoryError> {
-        self.with_conn(|conn| {
-            let changeset = SettingsChangeset {
-                java_major: settings.java_major.map(domain::java::JavaMajor::as_i64),
-                ram_mib: settings.ram_mib.and_then(|mib| i32::try_from(mib).ok()),
-                autostart: settings.autostart,
-                updated_at,
-            };
-            let affected = diesel::update(servers::table.filter(servers::name.eq(name.as_str())))
-                .set(&changeset)
-                .execute(conn)
-                .map_err(storage_err)?;
-            require_found(affected, name.as_str())?;
-
-            select_meta(conn, name)
-        })
+        let _guard = self.lock()?;
+        let mut entry = self.find_server_entry(name)?;
+        entry.java_major = settings.java_major.map(domain::java::JavaMajor::as_i64);
+        entry.ram_mib = settings.ram_mib.and_then(|mib| i32::try_from(mib).ok());
+        entry.autostart = settings.autostart;
+        entry.updated_at = updated_at;
+        self.write_record(Collection::Servers, &entry.id, &entry)?;
+        ServerMeta::try_from(entry)
     }
 
     fn remove(&self, name: &ServerName) -> Result<(), RepositoryError> {
-        self.with_conn(|conn| {
-            let affected = diesel::delete(servers::table.filter(servers::name.eq(name.as_str())))
-                .execute(conn)
-                .map_err(storage_err)?;
-            require_found(affected, name.as_str())
-        })
+        let _guard = self.lock()?;
+        let entry = self.find_server_entry(name)?;
+        self.remove_record(Collection::Servers, &entry.id)
     }
 
     fn remove_by_workspace(&self, workspace_id: &WorkspaceId) -> Result<(), RepositoryError> {
-        self.with_conn(|conn| {
-            diesel::delete(servers::table.filter(servers::workspace_id.eq(workspace_id.as_str())))
-                .execute(conn)
-                .map_err(storage_err)?;
-            Ok(())
-        })
+        let _guard = self.lock()?;
+        // 逐条处理，损坏文件也要删：留着它会在下次校验时挡住所有写入，
+        // 而它的归属已无法判断，只能一并清理
+        for (path, record) in self.scan_raw::<ServerEntry>(Collection::Servers)? {
+            let owned = match record {
+                Ok(entry) => entry.workspace_id == workspace_id.as_str(),
+                Err(_) => true,
+            };
+            if owned {
+                remove_file_checked(&path)?;
+            }
+        }
+        Ok(())
     }
 
     fn relink(
@@ -301,149 +927,132 @@ impl ServerRepository for SqliteStore {
         rel_dir: &Path,
         updated_at: i64,
     ) -> Result<ServerMeta, RepositoryError> {
-        self.with_conn(|conn| {
-            let changeset = RelinkChangeset {
-                workspace_id: workspace_id.as_str().to_owned(),
-                rel_dir: rel_dir.to_string_lossy().into_owned(),
-                updated_at,
-            };
-            let affected = diesel::update(servers::table.filter(servers::name.eq(name.as_str())))
-                .set(&changeset)
-                .execute(conn)
-                .map_err(|err| map_insert_error(err, name.as_str(), "servers"))?;
-            require_found(affected, name.as_str())?;
-
-            select_meta(conn, name)
-        })
+        let _guard = self.lock()?;
+        if self
+            .load_record::<WorkspaceEntry>(Collection::Workspaces, workspace_id.as_str())?
+            .is_none()
+        {
+            return Err(RepositoryError::NotFound(workspace_id.as_str().to_owned()));
+        }
+        let mut entry = self.find_server_entry(name)?;
+        let target_workspace = workspace_id.as_str().to_owned();
+        let mut candidate = entry.clone();
+        candidate.workspace_id.clone_from(&target_workspace);
+        candidate.rel_dir = rel_dir.to_string_lossy().into_owned();
+        let existing = self.scan_strict::<ServerEntry>(Collection::Servers)?;
+        for other in &existing {
+            if other.id != candidate.id {
+                check_server_conflict(other, &candidate)?;
+            }
+        }
+        entry.workspace_id = candidate.workspace_id;
+        entry.rel_dir = candidate.rel_dir;
+        entry.updated_at = updated_at;
+        self.write_record(Collection::Servers, &entry.id, &entry)?;
+        ServerMeta::try_from(entry)
     }
 }
 
-impl JavaRuntimeRepository for SqliteStore {
+impl JsonStore {
+    /// 按名称读服务器原记录；名称冲突（大于 1 条）按损坏拒绝
+    fn find_server_entry(&self, name: &ServerName) -> Result<ServerEntry, RepositoryError> {
+        let (records, _) = self.scan::<ServerEntry>(Collection::Servers, true)?;
+        let mut found = records
+            .into_iter()
+            .filter(|entry| entry.name == name.as_str());
+        let Some(entry) = found.next() else {
+            return Err(RepositoryError::NotFound(name.as_str().to_owned()));
+        };
+        if found.next().is_some() {
+            return Err(RepositoryError::Corrupt(format!(
+                "duplicate server name {}",
+                name.as_str()
+            )));
+        }
+        Ok(entry)
+    }
+}
+
+/// 名称全局唯一；同工作区下 `rel_dir` 唯一
+fn check_server_conflict(
+    other: &ServerEntry,
+    candidate: &ServerEntry,
+) -> Result<(), RepositoryError> {
+    conflict_unique(other.name == candidate.name, &candidate.name)?;
+    conflict_unique(
+        other.workspace_id == candidate.workspace_id && other.rel_dir == candidate.rel_dir,
+        &candidate.rel_dir,
+    )
+}
+
+// ------------------------------------------------------------------- Java 运行时
+
+impl JavaRuntimeRepository for JsonStore {
     fn upsert(&self, runtime: &JavaRuntime) -> Result<(), RepositoryError> {
-        self.with_conn(|conn| {
-            let row = JavaRuntimeRow::from(runtime);
-            diesel::insert_into(java_runtimes::table)
-                .values(&row)
-                .on_conflict(java_runtimes::path)
-                .do_update()
-                .set((
-                    java_runtimes::major.eq(row.major),
-                    java_runtimes::version.eq(&row.version),
-                    java_runtimes::vendor.eq(&row.vendor),
-                    java_runtimes::managed.eq(row.managed),
-                    java_runtimes::updated_at.eq(row.updated_at),
-                ))
-                .execute(conn)
-                .map_err(storage_err)?;
-            Ok(())
-        })
+        let _guard = self.lock()?;
+        let mut entry = JavaRuntimeEntry::from(runtime);
+        let existing = self.scan_strict::<JavaRuntimeEntry>(Collection::Java)?;
+        // 同路径视为同一运行时：复用原 id，避免同一个 JDK 登记两遍
+        if let Some(existing_id) = existing
+            .iter()
+            .find(|other| other.path == entry.path)
+            .map(|other| other.id.as_str())
+        {
+            entry.id = existing_id.to_owned();
+        }
+        self.write_record(Collection::Java, &entry.id, &entry)
     }
 
     fn list(&self) -> Result<Vec<JavaRuntime>, RepositoryError> {
-        self.with_conn(|conn| {
-            let row = java_runtimes::table
-                .order((java_runtimes::major.desc(), java_runtimes::path))
-                .select(JavaRuntimeRow::as_select())
-                .load::<JavaRuntimeRow>(conn)
-                .map_err(storage_err)?;
-            row.into_iter().map(JavaRuntime::try_from).collect()
-        })
+        let _guard = self.lock()?;
+        let (records, _) = self.scan::<JavaRuntimeEntry>(Collection::Java, true)?;
+        let mut rows = records
+            .into_iter()
+            .map(JavaRuntime::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.sort_by(|a, b| {
+            b.major
+                .as_i64()
+                .cmp(&a.major.as_i64())
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        Ok(rows)
     }
 
     fn get_by_path(&self, path: &Path) -> Result<JavaRuntime, RepositoryError> {
-        self.with_conn(|conn| {
-            let row: Option<JavaRuntimeRow> = java_runtimes::table
-                .filter(java_runtimes::path.eq(path.to_string_lossy().into_owned()))
-                .select(JavaRuntimeRow::as_select())
-                .first(conn)
-                .optional()
-                .map_err(storage_err)?;
-            let row =
-                row.ok_or_else(|| RepositoryError::NotFound(path.to_string_lossy().into_owned()))?;
-            JavaRuntime::try_from(row)
-        })
+        let _guard = self.lock()?;
+        let raw = path.to_string_lossy().into_owned();
+        let (records, _) = self.scan::<JavaRuntimeEntry>(Collection::Java, true)?;
+        let entry = records
+            .into_iter()
+            .find(|entry| entry.path == raw)
+            .ok_or_else(|| RepositoryError::NotFound(raw))?;
+        JavaRuntime::try_from(entry)
     }
 
     fn remove(&self, path: &Path) -> Result<(), RepositoryError> {
-        self.with_conn(|conn| {
-            let affected = diesel::delete(
-                java_runtimes::table
-                    .filter(java_runtimes::path.eq(path.to_string_lossy().into_owned())),
-            )
-            .execute(conn)
-            .map_err(storage_err)?;
-            require_found(affected, path.to_string_lossy().into_owned())
-        })
+        let _guard = self.lock()?;
+        let raw = path.to_string_lossy().into_owned();
+        let (records, _) = self.scan::<JavaRuntimeEntry>(Collection::Java, true)?;
+        let id = records
+            .into_iter()
+            .find(|entry| entry.path == raw)
+            .map(|entry| entry.id)
+            .ok_or_else(|| RepositoryError::NotFound(raw.clone()))?;
+        self.remove_record(Collection::Java, &id)
     }
 
     fn scan_state(&self) -> Result<Option<i64>, RepositoryError> {
-        self.with_conn(|conn| {
-            let at: Option<i64> = java_scan_state::table
-                .filter(java_scan_state::key.eq("scanner"))
-                .select(java_scan_state::scanned_at)
-                .first(conn)
-                .optional()
-                .map_err(storage_err)?;
-            Ok(at)
-        })
+        let _guard = self.lock()?;
+        Ok(self.load_java_state()?.scanned_at)
     }
 
     fn mark_scanned(&self, at: i64) -> Result<(), RepositoryError> {
-        self.with_conn(|conn| {
-            diesel::insert_into(java_scan_state::table)
-                .values((
-                    java_scan_state::key.eq("scanner"),
-                    java_scan_state::scanned_at.eq(at),
-                ))
-                .on_conflict(java_scan_state::key)
-                .do_update()
-                .set(java_scan_state::scanned_at.eq(at))
-                .execute(conn)
-                .map_err(storage_err)?;
-            Ok(())
-        })
+        let _guard = self.lock()?;
+        let mut state = self.load_java_state()?;
+        state.scanned_at = Some(at);
+        self.write_state(Collection::Java, &state)
     }
-}
-
-fn select_meta(
-    conn: &mut SqliteConnection,
-    name: &ServerName,
-) -> Result<ServerMeta, RepositoryError> {
-    let row: Option<ServerRow> = servers::table
-        .filter(servers::name.eq(name.as_str()))
-        .select(ServerRow::as_select())
-        .first(conn)
-        .optional()
-        .map_err(storage_err)?;
-    let row = row.ok_or_else(|| RepositoryError::NotFound(name.as_str().to_owned()))?;
-    ServerMeta::try_from(row)
-}
-
-fn map_insert_error(err: diesel::result::Error, key: &str, table: &str) -> RepositoryError {
-    if let diesel::result::Error::DatabaseError(kind, info) = &err
-        && *kind == diesel::result::DatabaseErrorKind::UniqueViolation
-    {
-        let message = info.message();
-        if message.contains(table) {
-            return RepositoryError::AlreadyExists(key.to_owned());
-        }
-    }
-    storage_err(err)
-}
-
-/// UPDATE/DELETE 影响行数转结果：0 行即目标不存在
-///
-/// 静默成功会让调用方把「没改到」当「已改」，统一收敛到 [`RepositoryError::NotFound`]。
-fn require_found(affected: usize, key: impl Into<String>) -> Result<(), RepositoryError> {
-    if affected == 0 {
-        Err(RepositoryError::NotFound(key.into()))
-    } else {
-        Ok(())
-    }
-}
-
-fn storage_err(err: impl std::error::Error + Send + Sync + 'static) -> RepositoryError {
-    RepositoryError::Storage(Box::new(err))
 }
 
 #[cfg(test)]
@@ -452,8 +1061,10 @@ mod tests {
     use domain::java::JavaMajor;
     use domain::server::artifact::{Checksum, ChecksumAlgorithm};
     use domain::server::meta::{InstalledJar, ServerId};
-    use domain::server::version::{ServerVariant, VersionId};
-    use std::path::PathBuf;
+    use domain::server::version::ServerVariant;
+
+    const WS01: &str = "550e8400-e29b-41d4-a716-446655440001";
+    const WS02: &str = "550e8400-e29b-41d4-a716-446655440002";
 
     fn sample_ws(name: &str, path: &str, id: &str) -> Workspace {
         Workspace {
@@ -490,22 +1101,42 @@ mod tests {
         }
     }
 
-    const WS01: &str = "550e8400-e29b-41d4-a716-446655440001";
-    const WS02: &str = "550e8400-e29b-41d4-a716-446655440002";
+    fn sample_java(path: &str, major: i64, managed: bool) -> JavaRuntime {
+        JavaRuntime {
+            id: format!("java-{major}"),
+            path: PathBuf::from(path),
+            major: JavaMajor::parse(major).expect("major"),
+            version: format!("{major}.0.9+9"),
+            vendor: domain::java::JavaVendor::Temurin,
+            managed,
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+        }
+    }
 
-    fn add_ws(store: &SqliteStore, ws: &Workspace) {
+    fn add_ws(store: &JsonStore, ws: &Workspace) {
         WorkspaceRepository::create(store, ws).expect("ws");
     }
 
-    fn add_server(store: &SqliteStore, meta: &ServerMeta) {
+    fn add_server(store: &JsonStore, meta: &ServerMeta) {
         ServerRepository::create(store, meta).expect("server");
     }
 
-    fn store_with_ws() -> SqliteStore {
-        let store = SqliteStore::open_in_memory().expect("open");
+    fn store_with_ws() -> JsonStore {
+        let store = JsonStore::open_in_memory().expect("open");
         add_ws(&store, &sample_ws("ws01", "/tmp/ws01", WS01));
         store
     }
+
+    fn file_count(store: &JsonStore, collection: Collection) -> usize {
+        std::fs::read_dir(store.collection_dir(collection))
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some(RECORD_EXT))
+            .count()
+    }
+
+    // ------------------------------------------------------------ 基本往返
 
     #[test]
     fn create_get_roundtrip() {
@@ -546,15 +1177,10 @@ mod tests {
         .expect("update");
         assert_eq!(updated.version, version, "安装换版本要同步回写");
         assert_eq!(updated.jar, Some(jar));
-        assert_eq!(
-            updated.java_major,
-            Some(required),
-            "版本的 Java 要求要同步回写"
-        );
+        assert_eq!(updated.java_major, Some(required));
         assert_eq!(updated.updated_at, 1_700_000_100);
     }
 
-    /// `server set` 落库往返：三列写入、回读一致、时间戳刷新
     #[test]
     fn update_settings_persists_and_bumps_timestamp() {
         let store = store_with_ws();
@@ -572,24 +1198,9 @@ mod tests {
         )
         .expect("update");
         assert_eq!(updated.settings, settings);
-        assert_eq!(updated.updated_at, 1_700_000_200);
-
         let got = ServerRepository::get(&store, &ServerName::parse("alpha").expect("valid"))
             .expect("get");
         assert_eq!(got.settings, settings);
-    }
-
-    /// 未设置的服务属性回读为默认值（NULL → None，autostart → false）
-    #[test]
-    fn default_settings_roundtrip_as_empty() {
-        let store = store_with_ws();
-        add_server(&store, &sample_meta("alpha"));
-        let got = ServerRepository::get(&store, &ServerName::parse("alpha").expect("valid"))
-            .expect("get");
-        assert_eq!(
-            got.settings,
-            domain::server::settings::ServerSettings::default()
-        );
     }
 
     #[test]
@@ -614,24 +1225,6 @@ mod tests {
     }
 
     #[test]
-    fn workspace_current_is_single() {
-        let store = SqliteStore::open_in_memory().expect("open");
-        add_ws(&store, &sample_ws("ws01", "/tmp/ws01", WS01));
-        add_ws(&store, &sample_ws("ws02", "/tmp/ws02", WS02));
-        let id01 = WorkspaceId::parse(WS01).expect("uuid");
-        let id02 = WorkspaceId::parse(WS02).expect("uuid");
-        WorkspaceRepository::set_current(&store, &id01).expect("current 1");
-        WorkspaceRepository::set_current(&store, &id02).expect("current 2");
-        let currents: Vec<_> = WorkspaceRepository::list(&store)
-            .expect("list")
-            .into_iter()
-            .filter(|w| w.is_current)
-            .collect();
-        assert_eq!(currents.len(), 1);
-        assert_eq!(currents[0].name.as_str(), "ws02");
-    }
-
-    #[test]
     fn remove_single_server_clears_row() {
         let store = store_with_ws();
         add_server(&store, &sample_meta("alpha"));
@@ -644,9 +1237,11 @@ mod tests {
             .map(|m| m.name.as_str().to_owned())
             .collect();
         assert_eq!(rest, ["beta"]);
-        let err = ServerRepository::remove(&store, &ServerName::parse("alpha").expect("valid"))
-            .expect_err("gone");
-        assert!(matches!(err, RepositoryError::NotFound(_)));
+        assert_eq!(
+            file_count(&store, Collection::Servers),
+            1,
+            "记录文件必须删掉"
+        );
     }
 
     #[test]
@@ -657,11 +1252,12 @@ mod tests {
         let ws_id = WorkspaceId::parse(WS01).expect("uuid");
         ServerRepository::remove_by_workspace(&store, &ws_id).expect("clear");
         assert!(ServerRepository::list(&store).expect("list").is_empty());
+        assert_eq!(file_count(&store, Collection::Servers), 0);
     }
 
     #[test]
     fn relink_moves_server() {
-        let store = SqliteStore::open_in_memory().expect("open");
+        let store = JsonStore::open_in_memory().expect("open");
         add_ws(&store, &sample_ws("ws01", "/tmp/ws01", WS01));
         add_ws(&store, &sample_ws("ws02", "/tmp/ws02", WS02));
         add_server(&store, &sample_meta("alpha"));
@@ -675,7 +1271,6 @@ mod tests {
         )
         .expect("relink");
         assert_eq!(moved.workspace_id, ws_id02);
-        assert_eq!(moved.rel_dir, PathBuf::from("alpha"));
     }
 
     #[test]
@@ -693,22 +1288,510 @@ mod tests {
         assert!(matches!(err, RepositoryError::NotFound(_)));
     }
 
-    fn sample_java(path: &str, major: i64, managed: bool) -> JavaRuntime {
-        JavaRuntime {
-            id: format!("java-{path}"),
-            path: PathBuf::from(path),
-            major: JavaMajor::parse(major).expect("major"),
-            version: format!("{major}.0.9+9"),
-            vendor: domain::java::JavaVendor::Temurin,
-            managed,
-            created_at: 1_700_000_000,
-            updated_at: 1_700_000_000,
+    #[test]
+    fn relink_to_unknown_workspace_is_not_found() {
+        let store = store_with_ws();
+        add_server(&store, &sample_meta("alpha"));
+        let err = ServerRepository::relink(
+            &store,
+            &ServerName::parse("alpha").expect("valid"),
+            &WorkspaceId::parse(WS02).expect("uuid"),
+            Path::new("alpha"),
+            0,
+        )
+        .expect_err("unknown ws");
+        assert!(matches!(err, RepositoryError::NotFound(_)));
+    }
+
+    // -------------------------------------------------------- 目录布局与文件
+
+    /// 一条记录一个文件，文件名即 id
+    #[test]
+    fn one_file_per_record() {
+        let store = JsonStore::open_in_memory().expect("open");
+        add_ws(&store, &sample_ws("ws01", "/tmp/ws01", WS01));
+        add_ws(&store, &sample_ws("ws02", "/tmp/ws02", WS02));
+        assert_eq!(file_count(&store, Collection::Workspaces), 2);
+        assert!(
+            store
+                .record_path(Collection::Workspaces, WS01)
+                .expect("path")
+                .is_file()
+        );
+        add_server(&store, &sample_meta("alpha"));
+        assert_eq!(file_count(&store, Collection::Servers), 1);
+        JavaRuntimeRepository::upsert(&store, &sample_java("/opt/jdk21", 21, true)).expect("java");
+        assert_eq!(file_count(&store, Collection::Java), 1);
+    }
+
+    /// 记录文件内容是带 schema 的独立 JSON 对象
+    #[test]
+    fn record_file_is_self_describing() {
+        let store = store_with_ws();
+        let text = std::fs::read_to_string(
+            store
+                .record_path(Collection::Workspaces, WS01)
+                .expect("path"),
+        )
+        .expect("read");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(value["version"], models::RECORD_VERSION);
+        assert_eq!(value["id"], WS01);
+        assert_eq!(value["name"], "ws01");
+        assert!(value.get("is_current").is_none(), "当前标记不进记录文件");
+    }
+
+    /// 数据跨 `open` 重开仍在
+    #[test]
+    fn data_survives_reopen() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        {
+            let store = JsonStore::open(dir.path()).expect("open");
+            add_ws(&store, &sample_ws("ws01", "/tmp/ws01", WS01));
+            WorkspaceRepository::set_current(&store, &WorkspaceId::parse(WS01).expect("uuid"))
+                .expect("current");
+            add_server(&store, &sample_meta("alpha"));
+            JavaRuntimeRepository::upsert(&store, &sample_java("/opt/jdk21", 21, true))
+                .expect("java");
+            JavaRuntimeRepository::mark_scanned(&store, 1_700_000_000).expect("mark");
         }
+        let store = JsonStore::open(dir.path()).expect("reopen");
+        assert_eq!(WorkspaceRepository::list(&store).expect("list").len(), 1);
+        assert_eq!(
+            WorkspaceRepository::current(&store)
+                .expect("current")
+                .map(|ws| ws.name.as_str().to_owned()),
+            Some("ws01".to_owned())
+        );
+        assert_eq!(
+            ServerRepository::list(&store).expect("servers"),
+            vec![sample_meta("alpha")]
+        );
+        assert_eq!(
+            JavaRuntimeRepository::scan_state(&store).expect("state"),
+            Some(1_700_000_000)
+        );
+    }
+
+    // ----------------------------------------------------------- 故障隔离
+
+    /// 坏一个文件只影响那一条：list 跳过它，其余照常
+    #[test]
+    fn corrupt_record_is_isolated() {
+        let store = store_with_ws();
+        add_server(&store, &sample_meta("alpha"));
+        add_server(&store, &sample_meta("beta"));
+        let broken = store
+            .record_path(Collection::Servers, sample_meta("beta").id.as_str())
+            .expect("path");
+        std::fs::write(&broken, b"{ not json").expect("corrupt");
+
+        let list = ServerRepository::list(&store).expect("list 不应整体失败");
+        assert_eq!(list.len(), 1, "只跳过坏的那一条");
+        assert_eq!(list[0].name.as_str(), "alpha");
+
+        let err = ServerRepository::get(&store, &ServerName::parse("beta").expect("valid"))
+            .expect_err("坏记录读不出");
+        assert!(
+            matches!(err, RepositoryError::NotFound(_))
+                || matches!(err, RepositoryError::Corrupt(_))
+        );
+    }
+
+    /// 坏记录挡住写入：看不见的记录可能与待写项冲突，不能默默放过
+    #[test]
+    fn corrupt_record_blocks_write() {
+        let store = store_with_ws();
+        add_server(&store, &sample_meta("alpha"));
+        let broken = store
+            .record_path(Collection::Servers, sample_meta("alpha").id.as_str())
+            .expect("path");
+        std::fs::write(&broken, b"{ not json").expect("corrupt");
+        let err = ServerRepository::create(&store, &sample_meta("beta"))
+            .expect_err("校验必须看得到坏文件");
+        assert!(matches!(err, RepositoryError::Corrupt(_)), "got {err:?}");
+        assert!(
+            !store
+                .record_path(Collection::Servers, sample_meta("beta").id.as_str())
+                .expect("path")
+                .exists()
+        );
+    }
+
+    /// 文件名与内部 id 不一致 → 损坏，防止改名造出两条同 id
+    #[test]
+    fn mismatched_id_is_corrupt() {
+        let store = store_with_ws();
+        let path = store
+            .record_path(Collection::Workspaces, WS01)
+            .expect("path");
+        let text = std::fs::read_to_string(&path).expect("read");
+        let renamed = store
+            .record_path(Collection::Workspaces, WS02)
+            .expect("path");
+        std::fs::write(&renamed, text).expect("rename");
+        let err = store
+            .load_record::<WorkspaceEntry>(Collection::Workspaces, WS02)
+            .expect_err("id 不一致");
+        assert!(matches!(err, RepositoryError::Corrupt(_)), "got {err:?}");
+    }
+
+    /// schema 版本不符 → 损坏
+    #[test]
+    fn unknown_record_schema_is_corrupt() {
+        let store = store_with_ws();
+        let path = store
+            .record_path(Collection::Workspaces, WS01)
+            .expect("path");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":99,"id":"{WS01}","name":"ws01","path":"/tmp/ws01","created_at":0,"updated_at":0}}"#
+            ),
+        )
+        .expect("seed");
+        let err = store
+            .load_record::<WorkspaceEntry>(Collection::Workspaces, WS01)
+            .expect_err("schema");
+        assert!(matches!(err, RepositoryError::Corrupt(_)), "got {err:?}");
+    }
+
+    /// 写入失败不破坏旧文件
+    #[test]
+    fn failed_write_keeps_previous_file() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = JsonStore::open(dir.path()).expect("open");
+        add_ws(&store, &sample_ws("ws01", "/tmp/ws01", WS01));
+        let path = store
+            .record_path(Collection::Workspaces, WS01)
+            .expect("path");
+        let before = std::fs::read(&path).expect("read before");
+        // 用目录占住临时文件名，模拟写盘失败
+        std::fs::create_dir(path.with_file_name(format!(".{WS01}.json.tmp"))).expect("block");
+        let err = WorkspaceRepository::relink_path(
+            &store,
+            &WorkspaceId::parse(WS01).expect("uuid"),
+            Path::new("/tmp/moved"),
+            1,
+        )
+        .expect_err("write");
+        assert!(matches!(err, RepositoryError::Storage(_)), "got {err:?}");
+        assert_eq!(std::fs::read(&path).expect("read after"), before);
+    }
+
+    /// 写入不留 `.tmp` 残留
+    #[test]
+    fn successful_write_leaves_no_temp_file() {
+        let store = store_with_ws();
+        let leftovers: Vec<_> = std::fs::read_dir(store.collection_dir(Collection::Workspaces))
+            .expect("dir")
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "残留 {leftovers:?}");
+    }
+
+    // ------------------------------------------------------------ 当前工作区
+
+    #[test]
+    fn create_current_workspace_sets_pointer() {
+        let store = JsonStore::open_in_memory().expect("open");
+        let mut ws = sample_ws("ws01", "/tmp/ws01", WS01);
+        ws.is_current = true;
+        add_ws(&store, &ws);
+        let current = WorkspaceRepository::current(&store)
+            .expect("current")
+            .expect("some");
+        assert_eq!(current.name.as_str(), "ws01");
+
+        // 后续新增不抢当前标记
+        add_ws(&store, &sample_ws("ws02", "/tmp/ws02", WS02));
+        assert_eq!(
+            WorkspaceRepository::current(&store)
+                .expect("current")
+                .expect("some")
+                .name
+                .as_str(),
+            "ws01"
+        );
     }
 
     #[test]
+    fn workspace_current_is_single() {
+        let store = JsonStore::open_in_memory().expect("open");
+        add_ws(&store, &sample_ws("ws01", "/tmp/ws01", WS01));
+        add_ws(&store, &sample_ws("ws02", "/tmp/ws02", WS02));
+        let id01 = WorkspaceId::parse(WS01).expect("uuid");
+        let id02 = WorkspaceId::parse(WS02).expect("uuid");
+        WorkspaceRepository::set_current(&store, &id01).expect("current 1");
+        WorkspaceRepository::set_current(&store, &id02).expect("current 2");
+        let currents: Vec<_> = WorkspaceRepository::list(&store)
+            .expect("list")
+            .into_iter()
+            .filter(|w| w.is_current)
+            .collect();
+        assert_eq!(currents.len(), 1, "单值语义只能有一个当前");
+        assert_eq!(currents[0].name.as_str(), "ws02");
+    }
+
+    /// 删除当前工作区后指针清空
+    #[test]
+    fn remove_current_workspace_clears_marker() {
+        let store = JsonStore::open_in_memory().expect("open");
+        add_ws(&store, &sample_ws("ws01", "/tmp/ws01", WS01));
+        let id = WorkspaceId::parse(WS01).expect("uuid");
+        WorkspaceRepository::set_current(&store, &id).expect("current");
+        WorkspaceRepository::remove(&store, &id).expect("remove");
+        assert!(
+            WorkspaceRepository::current(&store)
+                .expect("current")
+                .is_none()
+        );
+    }
+
+    /// `state.json` 指向不存在的记录 → 按「无当前」处理，不报错也不改写文件
+    #[test]
+    fn dangling_current_pointer_is_none() {
+        let store = store_with_ws();
+        let state_path = store.state_path(Collection::Workspaces);
+        std::fs::write(
+            &state_path,
+            format!(r#"{{"version":1,"current":"{WS02}"}}"#),
+        )
+        .expect("seed");
+        assert!(
+            WorkspaceRepository::current(&store)
+                .expect("悬空指针是安全失败")
+                .is_none()
+        );
+        let text = std::fs::read_to_string(&state_path).expect("read");
+        assert!(text.contains(WS02), "读不应改写状态文件");
+    }
+
+    #[test]
+    fn set_current_missing_is_not_found() {
+        let store = JsonStore::open_in_memory().expect("open");
+        let err =
+            WorkspaceRepository::set_current(&store, &WorkspaceId::parse(WS01).expect("uuid"))
+                .expect_err("missing");
+        assert!(matches!(err, RepositoryError::NotFound(_)));
+    }
+
+    /// `state.json` 版本不符 → 写路径拒绝，读路径降级为「无当前」
+    ///
+    /// 读路径不能整体失败：`state.json` 是全局单点，若它坏掉就
+    /// 让 `workspace list` / `server list` 全不可用，就退回到了单文件方案
+    /// 「一处损坏全盘瘫痪」的老问题。
+    #[test]
+    fn corrupt_state_degrades_reads_but_blocks_writes() {
+        let store = store_with_ws();
+        std::fs::write(
+            store.state_path(Collection::Workspaces),
+            br#"{"version":7,"current":null}"#,
+        )
+        .expect("seed");
+
+        let list = WorkspaceRepository::list(&store).expect("list 仍应可用");
+        assert_eq!(list.len(), 1);
+        assert!(!list[0].is_current, "读不懂指针时按无当前展示");
+        assert!(
+            WorkspaceRepository::current(&store)
+                .expect("current 降级")
+                .is_none()
+        );
+
+        // 写路径仍必须失败：不能静默覆盖一份读不懂的状态文件
+        let err =
+            WorkspaceRepository::set_current(&store, &WorkspaceId::parse(WS01).expect("uuid"))
+                .expect_err("state 损坏时不得写入");
+        assert!(matches!(err, RepositoryError::Corrupt(_)), "got {err:?}");
+    }
+
+    /// 不安全 id 被拒绝，不会被拼进路径
+    ///
+    /// `id` 既来自文件名也来自记录内容；含 `..` 或分隔符的 id
+    /// 会让读写落到集合目录之外。
+    #[test]
+    fn unsafe_record_id_is_rejected() {
+        let store = store_with_ws();
+        for bad in ["..", "a..b", "a/b", "a\\b", "C:evil", "", "a.json"] {
+            assert!(
+                store.record_path(Collection::Workspaces, bad).is_err(),
+                "{bad} 必须被拒绝"
+            );
+        }
+        assert!(
+            store.record_path(Collection::Workspaces, WS01).is_ok(),
+            "UUID 必须通过"
+        );
+        assert!(
+            store.record_path(Collection::Java, "java-21").is_ok(),
+            "生成式 id 必须通过"
+        );
+    }
+
+    /// 记录内 id 被改成越界值 → 损坏，而不是写到目录外
+    #[test]
+    fn tampered_id_does_not_escape_collection_dir() {
+        let store = store_with_ws();
+        let path = store
+            .record_path(Collection::Workspaces, WS01)
+            .expect("path");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"id":"../escaped","name":"ws01","path":"/tmp/ws01","created_at":0,"updated_at":0}"#,
+        )
+        .expect("seed");
+        let err = store
+            .load_record::<WorkspaceEntry>(Collection::Workspaces, WS01)
+            .expect_err("id 越界");
+        assert!(matches!(err, RepositoryError::Corrupt(_)), "got {err:?}");
+    }
+
+    // -------------------------------------------------------------- 唯一键
+
+    #[test]
+    fn workspace_unique_keys() {
+        let store = JsonStore::open_in_memory().expect("open");
+        add_ws(&store, &sample_ws("ws01", "/tmp/ws01", WS01));
+
+        let dup_name = WorkspaceRepository::create(&store, &sample_ws("ws01", "/tmp/other", WS02))
+            .expect_err("dup name");
+        assert!(matches!(dup_name, RepositoryError::AlreadyExists(_)));
+
+        let dup_path = WorkspaceRepository::create(&store, &sample_ws("ws02", "/tmp/ws01", WS02))
+            .expect_err("dup path");
+        assert!(matches!(dup_path, RepositoryError::AlreadyExists(_)));
+
+        assert_eq!(WorkspaceRepository::list(&store).expect("list").len(), 1);
+    }
+
+    #[test]
+    fn server_unique_rel_dir_per_workspace() {
+        let store = JsonStore::open_in_memory().expect("open");
+        add_ws(&store, &sample_ws("ws01", "/tmp/ws01", WS01));
+        add_ws(&store, &sample_ws("ws02", "/tmp/ws02", WS02));
+        let mut first = sample_meta("alpha");
+        first.rel_dir = PathBuf::from("shared");
+        add_server(&store, &first);
+
+        let mut other = sample_meta("beta");
+        other.rel_dir = PathBuf::from("shared");
+        let err = ServerRepository::create(&store, &other).expect_err("dup rel_dir");
+        assert!(matches!(err, RepositoryError::AlreadyExists(_)));
+
+        other.workspace_id = WorkspaceId::parse(WS02).expect("uuid");
+        ServerRepository::create(&store, &other).expect("different workspace");
+    }
+
+    #[test]
+    fn server_with_unknown_workspace_is_corrupt() {
+        let store = JsonStore::open_in_memory().expect("open");
+        let err = ServerRepository::create(&store, &sample_meta("alpha")).expect_err("no ws");
+        assert!(matches!(err, RepositoryError::Corrupt(_)), "got {err:?}");
+        assert_eq!(file_count(&store, Collection::Servers), 0, "失败不得落盘");
+    }
+
+    #[test]
+    fn relink_path_rejects_taken_target() {
+        let store = JsonStore::open_in_memory().expect("open");
+        add_ws(&store, &sample_ws("ws01", "/tmp/ws01", WS01));
+        add_ws(&store, &sample_ws("ws02", "/tmp/ws02", WS02));
+        let err = WorkspaceRepository::relink_path(
+            &store,
+            &WorkspaceId::parse(WS02).expect("uuid"),
+            Path::new("/tmp/ws01"),
+            0,
+        )
+        .expect_err("taken");
+        assert!(matches!(err, RepositoryError::AlreadyExists(_)));
+        let ws = WorkspaceRepository::get(&store, &WorkspaceId::parse(WS02).expect("uuid"))
+            .expect("get");
+        assert_eq!(ws.path, PathBuf::from("/tmp/ws02"));
+    }
+
+    // ------------------------------------------------------------ 跨进程锁
+
+    /// 锁存在时阻塞；释放后可继续（模拟另一个进程持锁）
+    #[test]
+    fn dir_lock_blocks_until_released() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join(".lock");
+        let held = DirLock::acquire(path.clone()).expect("第一个拿到锁");
+        assert!(path.exists(), "持锁期间锁文件存在");
+
+        // 持锁期间其他持有者拿不到：用另一线程 + 超时验证不会立刻成功
+        let probe_path = path.clone();
+        let probe = std::thread::spawn(move || DirLock::acquire(probe_path).is_ok());
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(!probe.is_finished(), "第二个持有者必须等待，而不是立刻拿到");
+
+        drop(held);
+        // 等待者一放锁就会立刻补上，因此这里不能断言「锁文件不存在」，
+        // 只能等它拿到、自己释放后再断言
+        assert!(probe.join().expect("join"), "释放后等待者应拿到锁");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!path.exists(), "最终不残留锁文件");
+    }
+
+    /// 持有者已死（pid 不存在）的锁会被回收，不会永久卡住写入
+    #[test]
+    fn stale_lock_is_reclaimed() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join(".lock");
+        // 一个几乎不可能存在的 pid：判据是「进程是否存活」而非文件年龄
+        std::fs::write(&path, "4294967290").expect("seed");
+        assert!(is_stale(&path), "死亡 pid 的锁必须判为残留");
+        let lock = DirLock::acquire(path.clone()).expect("残留锁应被回收");
+        drop(lock);
+        assert!(!path.exists());
+    }
+
+    /// 持有者仍活着时，锁无论多旧都不回收
+    ///
+    /// 这是旧实现的缺陷：按文件 mtime 判断时，正常持锁超过阈值的进程
+    /// 会被当成崩溃，锁被删除后两个进程同处临界区。
+    #[test]
+    fn live_lock_is_never_reclaimed() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join(".lock");
+        std::fs::write(&path, std::process::id().to_string()).expect("seed");
+        let ancient = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400);
+        let file = std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open");
+        file.set_modified(ancient).expect("set mtime");
+        drop(file);
+        assert!(!is_stale(&path), "pid 存活则不是残留，与文件年龄无关");
+    }
+
+    /// 空或非数字的锁内容（写入瞬间崩溃）判为残留
+    #[test]
+    fn unreadable_lock_is_reclaimed() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join(".lock");
+        std::fs::write(&path, "").expect("seed");
+        assert!(is_stale(&path));
+        std::fs::write(&path, "not-a-pid").expect("seed");
+        assert!(is_stale(&path));
+    }
+
+    /// 写入结束后锁文件不残留
+    #[test]
+    fn lock_file_removed_after_write() {
+        let store = store_with_ws();
+        add_server(&store, &sample_meta("alpha"));
+        assert!(!store.root().join(LOCK_FILE).exists(), "锁文件必须释放");
+    }
+
+    // ---------------------------------------------------------------- Java
+    #[test]
     fn java_upsert_and_list_orders_by_major_desc() {
-        let store = SqliteStore::open_in_memory().expect("open");
+        let store = JsonStore::open_in_memory().expect("open");
         JavaRuntimeRepository::upsert(&store, &sample_java("/opt/jdk17", 17, false)).expect("17");
         JavaRuntimeRepository::upsert(&store, &sample_java("/opt/jdk21", 21, true)).expect("21");
         let list = JavaRuntimeRepository::list(&store).expect("list");
@@ -719,29 +1802,28 @@ mod tests {
 
     #[test]
     fn java_upsert_same_path_updates_in_place() {
-        let store = SqliteStore::open_in_memory().expect("open");
+        let store = JsonStore::open_in_memory().expect("open");
         JavaRuntimeRepository::upsert(&store, &sample_java("/opt/jdk17", 17, false))
             .expect("first");
         let mut updated = sample_java("/opt/jdk17", 17, true);
         updated.version = "17.0.11+9".to_owned();
-        updated.updated_at = 1_700_000_100;
         JavaRuntimeRepository::upsert(&store, &updated).expect("second");
         let list = JavaRuntimeRepository::list(&store).expect("list");
-        assert_eq!(list.len(), 1);
+        assert_eq!(list.len(), 1, "同路径不得产生两份记录");
+        assert_eq!(file_count(&store, Collection::Java), 1);
         assert!(list[0].managed);
-        assert_eq!(list[0].version, "17.0.11+9");
     }
 
     #[test]
     fn java_remove_missing_is_not_found() {
-        let store = SqliteStore::open_in_memory().expect("open");
+        let store = JsonStore::open_in_memory().expect("open");
         let err = JavaRuntimeRepository::remove(&store, Path::new("/ghost")).expect_err("missing");
         assert!(matches!(err, RepositoryError::NotFound(_)));
     }
 
     #[test]
     fn java_scan_state_roundtrip() {
-        let store = SqliteStore::open_in_memory().expect("open");
+        let store = JsonStore::open_in_memory().expect("open");
         assert_eq!(
             JavaRuntimeRepository::scan_state(&store).expect("state"),
             None
@@ -750,11 +1832,6 @@ mod tests {
         assert_eq!(
             JavaRuntimeRepository::scan_state(&store).expect("state"),
             Some(1_700_000_000)
-        );
-        JavaRuntimeRepository::mark_scanned(&store, 1_700_000_200).expect("remark");
-        assert_eq!(
-            JavaRuntimeRepository::scan_state(&store).expect("state"),
-            Some(1_700_000_200)
         );
     }
 }

@@ -72,6 +72,11 @@ apps/cli    apps/server    apps/agent    apps/mcp
 
 任务完成不等于可以提交。发现暂存内容有问题时指出问题，不要修正。
 
+开发任务（新功能 / bugfix）默认在新建 worktree 中完成，除非用户明确要求。
+完成后运行 `scripts/check.sh`，测试必须完全通过；经用户明确同意后，才提交并
+合入 master。合入前如有冲突，先解决冲突。提交信息规范见
+`docs/development-workflow.md` 的「提交信息规范」。
+
 ## 6. AI 写作规范
 
 简洁、直接、必要。不要前言后语，不加表情符号。保留原有条文和术语，不擅自改写。
@@ -226,7 +231,7 @@ Backend 只回答「在哪里执行」，不回答「能不能执行」——后
 | --- | --- | --- |
 | `docs/architecture.md` | 项目范围；目录结构；各架构层职责、边界和领域模型；Domain Event、状态机；依赖模型 | 判断某段代码属于哪个层、某个类型该放在哪个模块时 |
 | `docs/embedding.md` | 第三方启动器集成方式；Port/Adapter 能力注入；公开 API 约束；CLI 机器契约；crates.io 分发形态和 Feature 矩阵 | 设计库对外接口、实现能力注入、处理发布与打包时 |
-| `docs/development-workflow.md` | 开发流程、代码质量门禁、完成标准 | 规划一次开发任务、判断任务是否完成时 |
+| `docs/development-workflow.md` | 开发流程、代码质量门禁、完成标准、任务交付流程、提交信息规范 | 规划一次开发任务、判断任务是否完成、规范提交信息时 |
 | `docs/principles.md` | 最终开发原则、Agent 最终行为准则 | 判断某个设计取舍是否合理时 |
 | `docs/rust-standards.md` | 设计模式、Rust 开发规范、错误处理、日志、代码风格 | 写实现代码、定义错误类型、打日志时 |
 | `docs/testing.md` | 测试分层、测试矩阵、测试优先级、性能测试 | 设计测试、评估测试覆盖时 |

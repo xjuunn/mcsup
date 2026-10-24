@@ -70,7 +70,7 @@ if [ "$left" -ne 0 ]; then
 fi
 
 # 终验 1：内层 manifest 里 9 个内层名不允许携带版本字面量（继承形态下
-# 出现即违规）；外部依赖（zip/diesel 等）的 version 声明是合法的，不在此列
+# 出现即违规）；外部依赖（zip/serde 等）的 version 声明是合法的，不在此列
 inner='domain|port|protocol|service|file|java|provider|storage|runtime'
 stray=$(grep -lE "^(($inner)) = \{ version = \"[0-9]" crates/*/Cargo.toml apps/*/Cargo.toml 2>/dev/null || true)
 if [ -n "$stray" ]; then

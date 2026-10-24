@@ -1,4 +1,4 @@
-use crate::config;
+﻿use crate::config;
 use anyhow::{Context, Result, anyhow};
 use mcsup::bootstrap::Mcsup;
 use mcsup::domain::server::version::ServerVariant;
@@ -7,13 +7,13 @@ use mcsup::service::JavaService;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// 打开元数据库（配置目录下的 `mcsup/db`）
+/// 打开元数据仓库（配置目录下的 `mcsup/db`，一条记录一个 JSON 文件）
 ///
 /// 所有命令从这里取库，禁止各自拼 `config::database_path()` + `open`。
-pub(crate) fn open_store() -> Result<Arc<mcsup::storage::SqliteStore>> {
+pub(crate) fn open_store() -> Result<Arc<mcsup::storage::JsonStore>> {
     let path = config::database_path()?;
-    let store = mcsup::storage::SqliteStore::open(&path)
-        .with_context(|| format!("打开元数据库 {}", path.display()))?;
+    let store = mcsup::storage::JsonStore::open(&path)
+        .with_context(|| format!("打开元数据仓库 {}", path.display()))?;
     Ok(Arc::new(store))
 }
 
@@ -132,7 +132,7 @@ pub(crate) fn join_variants(available: &[ServerVariant]) -> String {
 /// 库侧默认组合根（`mcsup::bootstrap`）：CLI 全部命令的统一装配口径。
 ///
 /// 单一入口：路径来自 `config`，网络能力与默认实现全部来自库侧组合根，
-/// CLI 不再自己拼 `SqliteStore` / 下载器 / Java 服务。第三方宿主用同一个
+/// CLI 不再自己拼 `JsonStore` / 下载器 / Java 服务。第三方宿主用同一个
 /// 组合根即可获得与 CLI 完全一致的默认行为。
 pub(crate) fn open_mcsup() -> Result<Mcsup> {
     let data_dir = config::platform_data_dir()?;

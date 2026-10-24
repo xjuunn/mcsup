@@ -16,21 +16,24 @@ MCSUP 分两级存放数据：平台数据目录（机器级，自动创建）�
 ## 平台数据目录
 
 `{data_dir}/mcsup/`，`data_dir` 取系统数据目录（macOS 为
-`~/Library/Application Support`）。惰性创建：任一需要数据库的命令首次
+`~/Library/Application Support`）。惰性创建：任一需要元数据的命令首次
 运行时创建。
 
 ```
 {data_dir}/mcsup/
 ├── config.toml                   # 平台级偏好，不含 workspace 列表
-├── db/
-│   └── mcsup.db                  # 唯一元数据库
+├── db/                           # 元数据：一条记录一个 JSON 文件
+│   ├── workspaces/
+│   ├── servers/
+│   └── java/
 └── java/                         # 机器级 JVM（mcsup java）
     ├── 21/
     └── 17/
 ```
 
 JVM 属机器级命令，禁止放进工作目录：切换工作目录不换 JVM，多工作目录
-不重复占盘。workspace 列表存数据库，不进 `config.toml`，避免双真相源。
+不重复占盘。workspace 列表存 `db/workspaces/`，不进 `config.toml`，
+避免双真相源。
 
 ## 工作目录
 
@@ -127,14 +130,104 @@ mcsup workspace init [--dir <path>] [--name <name>]
   非零。
 - `server move` 暂不实现（v1 之后再评估，与 `link` 一起做语义会交叉）。
 
-# 数据库概要
+# 元数据存储布局
+
+`{data_dir}/mcsup/db/` 下按集合分目录，**一条记录一个 JSON 文件**：
 
 ```
-workspaces(id PK, name UNIQUE, path UNIQUE, is_current,
-           created_at, updated_at)
-servers(id PK, name UNIQUE, workspace_id FK, rel_dir, version, variant,
-        jar_path, jar_size, checksum_algo, checksum,
-        created_at, updated_at, UNIQUE(workspace_id, rel_dir))
+{data_dir}/mcsup/db/
+├── .lock                          # 跨进程写锁（仅在写入瞬间存在）
+├── workspaces/
+│   ├── state.json                 # 唯一的当前工作区指针
+│   ├── 495493ae-....-36d7c9.json  # 一条工作目录
+│   └── b76d0a24-....-166fd31.json
+├── servers/
+│   └── 60e3cfde-....-a524ecf.json # 一台服务器
+└── java/
+    ├── state.json                 # 上次扫描时间
+    └── 43c75465-....-66922266e8.json
 ```
 
-表结构与迁移细节以 `crates/storage/migrations` 为准。
+## 为什么这样切
+
+- **故障隔离**：一条记录一个文件。某个文件损坏只让那一条读不出，
+  `workspace list` / `server list` / `java list` 跳过它照常返回其余项；
+  删除损坏文件即可恢复，不需要修整份数据。
+- **写入量恒定**：改一台服务器只重写它自己的文件，与记录总数无关。
+- **当前工作区只有一处真相**：`workspaces/state.json` 的 `current` 指针。
+  记录文件里不存 `is_current`——单值语义若拆成 n 个布尔，切换当前必须改
+  两个文件，中途崩溃就会出现两个或零个当前。
+- **指针悬空是安全失败**：`current` 指向已删除或损坏的记录时，读取按
+  「无当前」处理（下次 `workspace use` 自然覆盖），不改写文件。
+
+## 记录文件格式
+
+每条记录自描述，文件名（去掉 `.json`）必须等于记录 `id`：
+
+```json
+// workspaces/<id>.json
+{
+  "version": 1,
+  "id": "<uuid>",
+  "name": "alpha",
+  "path": "C:\\Users\\me\\servers",
+  "created_at": 1700000000,
+  "updated_at": 1700000000
+}
+```
+
+```json
+// workspaces/state.json
+{ "version": 1, "current": "<uuid>|null" }
+```
+
+```json
+// java/state.json
+{ "version": 1, "scanned_at": 1700000000 }
+```
+
+`servers/<id>.json` 字段：`version`（记录格式）、`id`、`name`、`workspace_id`、
+`rel_dir`、`version`（Minecraft 版本号，与记录格式版本同名但值不同）、
+`variant`、`jar_path`、`jar_size`、`checksum_algo`、`checksum`、
+`created_at`、`updated_at`、`java_major`、`required_java_major`、
+`ram_mib`、`autostart`。
+
+`java/<id>.json` 字段：`schema`（记录格式，因 `version` 已被 JDK 版本占用）、
+`id`、`path`、`major`、`version`（JDK 版本）、`vendor`、`managed`、
+`created_at`、`updated_at`。
+
+## 约束
+
+- `workspaces.name`、`workspaces.path` 各自全局唯一
+- `servers.name` 全局唯一，`(workspace_id, rel_dir)` 组内唯一
+- `servers.workspace_id` 必须指向存在的 workspace 记录
+- 当前工作区至多一个（由 `state.json` 保证，不再是分散的布尔）
+- 记录 `id` 只含字母、数字、`-`、`_`
+- `jar_*` 四项同生同灭
+
+文件系统没有唯一索引和外键，这些约束在**写入前扫目录核对**。校验时
+遇到损坏文件直接失败而不是跳过：看不见的记录可能正好与待写项冲突。
+
+`remove_by_workspace` 是例外：损坏的 server 记录无法判断属于哪个工作区，
+删工作区时一并清理。留着它会在之后每次写入时挡住校验，且已无从归属。
+
+`id` 进文件名前必须校验。它既来自目录扫描也来自记录内容，含 `..` 或
+分隔符的 id 会把读写引到集合目录之外，这类 id 按损坏拒绝。
+
+## 一致性保证
+
+- **原子写入**：同目录 `.xxx.json.tmp` → `fsync` → `rename` 覆盖。中断只会
+  留下替换前或替换后的完整文件；失败时清理临时文件，旧文件不动。
+- **跨进程锁**：进程内 `Mutex` + 数据根目录的 `.lock` 文件
+  （`create_new` 独占创建），内容记录持有者 pid。两个 mcsup 进程同时写入时
+  串行化，避免「都通过唯一性校验、各自落盘」产生重名。残留锁按
+  **持有者进程是否存活**回收，与锁文件的新旧无关：按文件年龄判断会误删
+  仍在正常持锁的进程的锁，使两个进程同处临界区。等锁上限 30 秒。
+- **身份自校验**：文件名与内部 `id` 不一致、`version` / `schema` 不符、
+  JSON 非法、`id` 越界，均报 `corrupt repository record` 并带上相对路径。
+- **读路径不因 `state.json` 瘫痪**：`state.json` 是全局单点。它损坏时
+  `workspace list` / `server list` 按「无当前」降级照常返回，与悬空指针
+  同一语义；写入仍直接报错，不静默覆盖一份读不懂的状态文件。
+
+实现见 `crates/storage/src/lib.rs`，字段映射见同目录 `models.rs`。
+旧版 `mcsup.db` / `registry.json` 不做迁移。

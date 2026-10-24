@@ -1,7 +1,7 @@
-//! 注销工作目录与服务器登记的外键协作
+﻿//! 注销工作目录与服务器登记的协作
 //!
-//! 真实 SQLite（`PRAGMA foreign_keys = ON`）：服务器行以工作目录为外键，
-//! 注册表里有服务器时 `workspace remove` 曾报 `FOREIGN KEY constraint failed`。
+//! 真实 JSON 注册表：服务器项以工作目录 id 引用，工作目录被注销后
+//! 其下的服务器必须一并清理，否则注册表里会留下悬空引用。
 
 // clippy.toml 的 allow-expect-in-tests 只认 `#[test]` 及 cfg(test) 内的函数，
 // 集成测试的 setup 辅助函数不在其中，这里按同一意图放行
@@ -14,17 +14,17 @@ use port::ServerRepository;
 use service::WorkspaceService;
 use std::path::PathBuf;
 use std::sync::Arc;
-use storage::SqliteStore;
+use storage::JsonStore;
 
-fn setup(name: &str) -> (Arc<SqliteStore>, WorkspaceService, tempfile::TempDir) {
-    let store = Arc::new(SqliteStore::open_in_memory().expect("open in-memory store"));
+fn setup(name: &str) -> (Arc<JsonStore>, WorkspaceService, tempfile::TempDir) {
+    let store = Arc::new(JsonStore::open_in_memory().expect("open in-memory store"));
     let svc = WorkspaceService::new(store.clone(), store.clone());
     let tmp = tempfile::tempdir().expect("tmp");
     svc.init(&tmp.path().join("ws"), Some(name)).expect("init");
     (store, svc, tmp)
 }
 
-fn add_server(store: &SqliteStore, workspace_id: &WorkspaceId) {
+fn add_server(store: &JsonStore, workspace_id: &WorkspaceId) {
     let meta = ServerMeta {
         id: ServerId::parse("550e8400-e29b-41d4-a716-4466554400b1").expect("uuid"),
         name: ServerName::parse("test").expect("valid"),
