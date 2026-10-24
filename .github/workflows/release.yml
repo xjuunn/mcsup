@@ -49,12 +49,31 @@ jobs:
             target: x86_64-unknown-linux-gnu
             archive: tar
           - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive: tar
+            musl: true
+          - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             archive: tar
             cross: true
-          - os: windows-latest
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            archive: tar
+            musl: true
+            cross: true
+          # windows-2022 而非 windows-latest：windows-latest 已切 VS2026 镜像，
+          # 缺 v143 ARM64 MSVC 工具链（runner-images #14215）；2022 镜像带
+          # VC.Tools.ARM64 + LLVM 20.1.8（ring 在 Windows AArch64 强制用
+          # clang 编 C 代码，clang 必须在 PATH）。
+          - os: windows-2022
             target: x86_64-pc-windows-msvc
             archive: zip
+          - os: windows-2022
+            target: aarch64-pc-windows-msvc
+            archive: zip
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive: tar
           - os: macos-latest
             target: aarch64-apple-darwin
             archive: tar
@@ -67,17 +86,41 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      # 交叉编译 aarch64：ring（rustls → reqwest）带 C/汇编，cc-rs 找不到
-      # aarch64 交叉 gcc 就失败。私有仓库用不了免费 ARM 原生 runner（仅公开
-      # 仓库免费），所以在 x86_64 runner 上装交叉工具链。
-      - name: install cross toolchain
-        if: matrix.cross
+      # 交叉编译 Linux ARM64 / musl ARM64：ring（rustls → reqwest）带 C/汇编，
+      # cc-rs 找不到目标交叉 gcc 就失败。
+      # - aarch64-gnu：Ubuntu 仓库有现成交叉 gcc，直接 apt 装。
+      # - aarch64-musl：Ubuntu 仓库没有 musl ARM64 交叉包（musl-tools 只有
+      #   x86_64），改用 cross（Docker 镜像内置 musl 交叉工具链），runner
+      #   自带 Docker，零额外系统依赖。
+      - name: install cross toolchain (aarch64-gnu)
+        if: matrix.cross && !matrix.musl
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: install cross (aarch64-musl)
+        if: matrix.cross && matrix.musl
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL https://github.com/cross-rs/cross/releases/download/v0.2.5/cross-x86_64-unknown-linux-gnu.tar.gz -o /tmp/cross.tgz
+          tar -xzf /tmp/cross.tgz -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      # musl x86_64：musl-tools 提供 musl-gcc，产物静态链接、无 glibc 依赖，
+      # 老系统 / 容器 / Alpine 直接运行。
+      - name: install musl tools (x86_64)
+        if: matrix.musl && !matrix.cross
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # Intel Mac 从 ARM runner 交叉编译：macos runner 自带 Apple clang + macOS
+      # SDK，rustc 官方支持 clang 交叉编译 Apple 目标（SDK 自动探测），零配置；
+      # ring 的 C 代码由 clang -target x86_64-apple-darwin 编译，同样零配置。
       - name: build mcsup
+        if: matrix.target != 'aarch64-unknown-linux-musl'
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: cargo build --release --target ${{ matrix.target }} -p cli
+      - name: build mcsup (cross)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: cross build --release --target ${{ matrix.target }} -p cli
       - name: package (unix)
         if: matrix.archive == 'tar'
         run: |
