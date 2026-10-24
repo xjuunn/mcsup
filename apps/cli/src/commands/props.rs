@@ -11,15 +11,8 @@ use crate::output::Printer;
 use crate::prompts;
 use anyhow::{Context, Result};
 use comfy_table::Table;
+use mcsup::protocol::cli::{PropRow, PropsWriteJson};
 use mcsup::service::{PropsReport, ServerPropsService};
-use serde::Serialize;
-
-/// `server props` 列表行（JSON 模式序列化用）
-#[derive(Serialize)]
-struct PropRow<'a> {
-    key: &'a str,
-    value: &'a str,
-}
 
 /// 位置参数的三种形态
 #[derive(Debug, PartialEq, Eq)]
@@ -147,15 +140,15 @@ fn write(
         .map(|(key, value)| format!("{key}={value}"))
         .collect::<Vec<_>>()
         .join("、");
-    let mut changed = serde_json::Map::new();
+    let mut updated_map = std::collections::BTreeMap::new();
     for (key, value) in updates {
-        changed.insert(key.clone(), serde_json::Value::String(value.clone()));
+        updated_map.insert(key.clone(), value.clone());
     }
-    let payload = serde_json::json!({
-        "name": name,
-        "path": report.path.display().to_string(),
-        "updated": changed,
-    });
+    let payload = PropsWriteJson {
+        name: name.to_owned(),
+        path: report.path.display().to_string(),
+        updated: updated_map,
+    };
     printer.print_outcome(&format!("已写入 {summary}（重启生效）"), &payload)?;
     Ok(())
 }

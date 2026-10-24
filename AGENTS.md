@@ -202,7 +202,8 @@ Backend 只回答「在哪里执行」，不回答「能不能执行」——后
 
 上表名称即 crate / 模块名，归属不随形态变化。多 crate 以 `mcsup` 为门面：
 门面按 feature 级联重导出内层（`file` / `provider` → `port` → `domain`），
-第三方经门面按 feature 选能力；`apps/cli` 目前直连内层 crate，后续改走门面。
+第三方经门面按 feature 选能力；`apps/cli` 已改走门面，装配统一经门面
+`bootstrap` 组合根（`McsupBuilder`），CLI 不再手工拼装服务。
 方案、代价与发布条件见 `docs/embedding.md`。
 
 以下行为禁止：

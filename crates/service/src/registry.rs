@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
 
-use crate::fs_error::FsError;
+use crate::fs_error::{FsError, deletion_hint};
 use crate::workspace::{DoctorFinding, DoctorLevel, WorkspaceError};
 use crate::{InstallError, InstalledDownload, ServerInstaller};
 
@@ -893,20 +893,8 @@ fn remove_link_or_dir(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Windows 上目录被占用时 `remove_dir_all` 报 `ERROR_SHARING_VIOLATION`（os error 32）
-#[cfg(windows)]
-fn deletion_hint(err: std::io::Error) -> std::io::Error {
-    const ERROR_SHARING_VIOLATION: i32 = 32;
-    if err.raw_os_error() == Some(ERROR_SHARING_VIOLATION) {
-        return std::io::Error::other(format!("{err}（目录正被占用：退出占用后重试）"));
-    }
-    err
-}
-
-#[cfg(not(windows))]
-fn deletion_hint(err: std::io::Error) -> std::io::Error {
-    err
-}
+// Windows 上目录被占用时 `remove_dir_all` 报 `ERROR_SHARING_VIOLATION`（os error 32）。
+// 提示统一在 `fs_error::deletion_hint`。
 
 #[cfg(test)]
 mod tests {

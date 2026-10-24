@@ -7,9 +7,9 @@ license.workspace = true
 publish = false
 
 [dependencies]
-domain = { path = "../domain" }
-port = { path = "../port" }
-protocol = { path = "../protocol" }
+domain = { version = "0.1.0", path = "../domain" }
+port = { version = "0.1.0", path = "../port" }
+protocol = { version = "0.1.0", path = "../protocol" }
 interprocess = "2.4.6"
 serde_json.workspace = true
 tracing.workspace = true
@@ -18,7 +18,7 @@ tracing.workspace = true
 signal-hook = "0.4.5"
 
 [dev-dependencies]
-tempfile = "3.27.0"
+tempfile.workspace = true
 
 [lints]
 workspace = true

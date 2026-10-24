@@ -23,6 +23,7 @@ java = { path = "../java", version = "0.1.0", optional = true }
 provider = { path = "../provider", version = "0.1.0", optional = true }
 storage = { path = "../storage", version = "0.1.0", optional = true }
 runtime = { path = "../runtime", version = "0.1.0", optional = true }
+thiserror = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -35,6 +36,18 @@ java = ["dep:java", "port"]
 provider = ["dep:provider", "port"]
 storage = ["dep:storage", "port"]
 runtime = ["dep:runtime", "port", "protocol"]
+# 默认组合根：一次装配全部默认实现（storage/service/file/java/provider/runtime）
+bootstrap = [
+    "dep:storage",
+    "dep:service",
+    "dep:file",
+    "dep:java",
+    "dep:provider",
+    "dep:runtime",
+    "port",
+    "protocol",
+    "dep:thiserror",
+]
 
 [package.metadata.docs.rs]
 all-features = true

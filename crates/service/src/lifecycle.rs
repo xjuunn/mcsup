@@ -5,13 +5,15 @@
 //! `port` / `domain`，本层只做组装与前置检查。
 
 use crate::java::JavaService;
-use crate::{ServerRegistry, ServerRegistryError};
+use crate::{InstallJarError, ServerRegistry, ServerRegistryError};
 use domain::java::java_bin_under;
 use domain::server::eula::{EULA_FILE, eula_accepted, render_eula};
 use domain::server::layout::console_log_path;
+use domain::server::version::VersionId;
 use port::{
-    ScannedJava, StopOutcome, StopSpec, SupervisorError, SupervisorPort, SupervisorStartOutcome,
-    SupervisorStartRequest, SupervisorStatus,
+    CancellationToken, CoreInspector, ProgressSink, ScannedJava, StopOutcome, StopSpec,
+    SupervisorError, SupervisorPort, SupervisorStartOutcome, SupervisorStartRequest,
+    SupervisorStatus,
 };
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
@@ -91,6 +93,17 @@ pub enum LifecycleError {
     /// 服务器未在运行
     #[error("服务器未在运行")]
     NotRunning,
+    /// 目标操作与运行状态冲突：删除 / 换核心不允许在运行中进行
+    #[error("服务器 {name} 正在运行（{phase}），请先 mcsup server stop {name}")]
+    Busy {
+        /// 服务器名
+        name: String,
+        /// 被拒绝的操作（如「删除」「更换核心」）
+        phase: &'static str,
+    },
+    /// 安装 / 更换核心失败（来源、下载、校验、世界降级）
+    #[error(transparent)]
+    InstallJar(#[from] InstallJarError),
     /// 宽限到期仍未退出（未加 `--force`）
     #[error("停机超时（已等待 {waited:?}），可加 --force 强杀")]
     StopTimedOut {
@@ -103,6 +116,10 @@ pub enum LifecycleError {
 }
 
 /// 服务器生命周期编排
+///
+/// 各组件均为 `Arc` / 可共享句柄，克隆即共享同一套装配（组合根把同一
+/// 实例交给 CLI 命令与库侧调用方）。
+#[derive(Clone)]
 pub struct ServerLifecycleService {
     registry: Arc<ServerRegistry>,
     java: JavaService,
@@ -225,6 +242,99 @@ impl ServerLifecycleService {
         self.start(name, start_opts, on_first_scan, on_found)
     }
 
+    /// 删除服务器的统一入口：运行中拒绝，再转 [`ServerRegistry::remove`]
+    ///
+    /// 运行中删除在 Linux 上会让 JVM 拿着已删目录的句柄继续写盘（存档
+    /// 「蒸发」、进程变幽灵），Windows 上因占用中途失败——平台行为分叉，
+    /// 必须在 service 层统一拦下，禁止入口各自补检查。
+    ///
+    /// # Errors
+    ///
+    /// 运行中返回 [`LifecycleError::Busy`]；其余见
+    /// [`ServerRegistry::remove`]（经 [`LifecycleError::Registry`]）
+    pub fn remove_server(
+        &self,
+        name: &str,
+        purge: bool,
+    ) -> Result<crate::RegisteredServer, LifecycleError> {
+        self.ensure_stopped(name, "删除")?;
+        Ok(self.registry.remove(name, purge)?)
+    }
+
+    /// 安装 / 更换服务端核心的统一入口：运行中拒绝，再转
+    /// [`ServerRegistry::install_jar`]
+    ///
+    /// 运行中换核心在 Linux 上 rename 成功但 JVM 继续用旧 inode（用户以为
+    /// 升级了、实际没有，重启后行为不一致），Windows 上 rename 因占用直接
+    /// 失败——与删除同理必须在 service 层统一拦截。
+    ///
+    /// # Errors
+    ///
+    /// 运行中返回 [`LifecycleError::Busy`]；其余见
+    /// [`crate::InstallJarError`]（经 [`LifecycleError::Registry`]
+    /// 的扩展转换，见 `From` 实现）
+    pub async fn install_jar_checked(
+        &self,
+        name: &str,
+        version: &VersionId,
+        installer: &crate::ServerInstaller,
+        inspector: &dyn CoreInspector,
+        progress: Option<&dyn ProgressSink>,
+        cancel: &CancellationToken,
+    ) -> Result<crate::InstalledServerJar, LifecycleError> {
+        self.ensure_stopped(name, "更换核心")?;
+        Ok(self
+            .registry
+            .install_jar(name, version, installer, inspector, progress, cancel)
+            .await?)
+    }
+
+    /// 运行状态闸：任一服务器存活则拒绝（Busy），供生命周期敏感操作共用
+    fn ensure_stopped(&self, name: &str, phase: &'static str) -> Result<(), LifecycleError> {
+        let server = self.registry.get(name)?;
+        if self
+            .supervisor
+            .status(&server.dir)?
+            .is_some_and(|s| s.status.is_alive())
+        {
+            return Err(LifecycleError::Busy {
+                name: name.to_owned(),
+                phase,
+            });
+        }
+        Ok(())
+    }
+
+    /// 工作区级运行状态闸：区内任一服务器存活则拒绝（`workspace remove --purge` 用）
+    ///
+    /// 错误点名第一台活着的服务器，让用户知道停谁。
+    ///
+    /// # Errors
+    ///
+    /// 区内有服务器在运行返回 [`LifecycleError::Busy`]；注册表失败时返回
+    /// [`LifecycleError::Registry`]
+    pub fn ensure_workspace_stopped(
+        &self,
+        workspace_id: &domain::workspace::WorkspaceId,
+    ) -> Result<(), LifecycleError> {
+        for srv in self.registry.list()? {
+            if srv.meta.workspace_id != *workspace_id {
+                continue;
+            }
+            if self
+                .supervisor
+                .status(&srv.dir)?
+                .is_some_and(|s| s.status.is_alive())
+            {
+                return Err(LifecycleError::Busy {
+                    name: srv.meta.name.as_str().to_owned(),
+                    phase: "工作区内有服务器在运行",
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// 实时状态；`Ok(None)` = 未在运行
     ///
     /// # Errors
@@ -237,18 +347,23 @@ impl ServerLifecycleService {
 
     /// 全量服务器的实时状态（`server list` 状态列用）
     ///
-    /// 逐台探测；连不上 = `None`（未在运行）。按键取值，顺序不保证。
+    /// 逐台探测，单台协议失败不拖死整个列表：失败记为该键的 `Err`，
+    /// 由调用方决定渲染为 `unknown` 还是上抛。`Ok(None)` = 未在运行。
+    /// 按键取值，顺序不保证。
     ///
     /// # Errors
     ///
-    /// 注册表失败，或任一 supervisor 协议失败
-    pub fn statuses(&self) -> Result<HashMap<String, Option<SupervisorStatus>>, LifecycleError> {
+    /// 仅注册表失败时返回错误；supervisor 单台失败在值里
+    pub fn statuses(
+        &self,
+    ) -> Result<HashMap<String, Result<Option<SupervisorStatus>, SupervisorError>>, LifecycleError>
+    {
         let servers = self.registry.list()?;
         let mut out = HashMap::with_capacity(servers.len());
         for srv in servers {
             out.insert(
                 srv.meta.name.as_str().to_owned(),
-                self.supervisor.status(&srv.dir)?,
+                self.supervisor.status(&srv.dir),
             );
         }
         Ok(out)
@@ -510,12 +625,13 @@ mod tests {
     use domain::server::artifact::{Checksum, ChecksumAlgorithm};
     use domain::server::meta::InstalledJar;
     use domain::server::version::{ServerVariant, VersionId};
+    use domain::server::world::{DataVersion, WorldInfo};
     use domain::workspace::{Workspace, WorkspaceId, WorkspaceName};
     use port::{
-        ArchiveExtractor, ArtifactDownloader, CancellationToken, DownloadError, DownloadRequest,
-        DownloadedArtifact, ExtractError, JavaPackageRequest, JavaRuntimeRepository, JavaScanner,
-        JavaSourceRegistryPort, ProgressSink, RepositoryError, ServerRepository, SourceError,
-        WorkspaceRepository,
+        ArchiveExtractor, ArtifactDownloader, CancellationToken, CoreInspector, DownloadError,
+        DownloadRequest, DownloadedArtifact, ExtractError, InspectError, JavaPackageRequest,
+        JavaRuntimeRepository, JavaScanner, JavaSourceRegistryPort, ProgressSink, RepositoryError,
+        ServerJarSource, ServerRepository, SourceError, WorkspaceRepository,
     };
     use std::io::Write as _;
     use std::sync::Mutex;
@@ -793,6 +909,42 @@ mod tests {
         }
         fn extract(&self, _archive: &Path, _dest: &Path) -> Result<(), ExtractError> {
             Ok(())
+        }
+    }
+
+    /// 服务端来源替身：拒之门外即可（Busy 测试不会走到它）
+    struct NoopJarSource;
+
+    #[async_trait::async_trait]
+    impl ServerJarSource for NoopJarSource {
+        fn variant(&self) -> ServerVariant {
+            ServerVariant::Vanilla
+        }
+        fn name(&self) -> &'static str {
+            "noop"
+        }
+        async fn versions(
+            &self,
+        ) -> Result<Vec<domain::server::version::ServerVersion>, SourceError> {
+            Ok(Vec::new())
+        }
+        async fn artifact(
+            &self,
+            _version: &VersionId,
+        ) -> Result<port::ResolvedArtifact, SourceError> {
+            Err(SourceError::NotFound(VersionId::new("none")))
+        }
+    }
+
+    /// 核心检查替身：无世界、无数据版本
+    struct NoopInspector;
+
+    impl CoreInspector for NoopInspector {
+        fn world_info(&self, _server_dir: &Path) -> Result<Option<WorldInfo>, InspectError> {
+            Ok(None)
+        }
+        fn jar_data_version(&self, _jar: &Path) -> Result<Option<DataVersion>, InspectError> {
+            Ok(None)
         }
     }
 
@@ -1471,6 +1623,84 @@ mod tests {
         assert!(supervisor.starts().is_empty());
     }
 
+    // ---- 生命周期敏感编排：remove / install ----
+
+    /// 运行中删除必须被拒（Linux 上会蒸发存档），判定收敛在 service
+    #[test]
+    fn remove_server_rejects_running() {
+        let fixture = Fixture::new(true);
+        let supervisor = Arc::new(FakeSupervisor::running());
+        let svc = service(
+            &fixture,
+            java_service(MemJavaRepo::new(Vec::new(), false), vec![]),
+            Arc::clone(&supervisor),
+        );
+        let err = svc.remove_server("alpha", false).expect_err("must fail");
+        assert!(
+            matches!(
+                err,
+                LifecycleError::Busy {
+                    phase: "删除", ..
+                }
+            ),
+            "{err:?}"
+        );
+        // 目录与登记都保留
+        assert!(fixture.server_dir.exists());
+    }
+
+    /// 未运行时删除放行：注销登记（默认不删盘）
+    #[test]
+    fn remove_server_allows_when_stopped() {
+        let fixture = Fixture::new(true);
+        let supervisor = Arc::new(FakeSupervisor::default());
+        let svc = service(
+            &fixture,
+            java_service(MemJavaRepo::new(Vec::new(), false), vec![]),
+            Arc::clone(&supervisor),
+        );
+        let removed = svc.remove_server("alpha", false).expect("remove");
+        assert_eq!(removed.meta.name.as_str(), "alpha");
+        assert!(fixture.registry.get("alpha").is_err());
+    }
+
+    /// 运行中换核心必须被拒（Linux 上 rename 成功但 JVM 用旧 inode）
+    #[tokio::test]
+    async fn install_jar_checked_rejects_running() {
+        let fixture = Fixture::new(true);
+        let supervisor = Arc::new(FakeSupervisor::running());
+        let svc = service(
+            &fixture,
+            java_service(MemJavaRepo::new(Vec::new(), false), vec![]),
+            Arc::clone(&supervisor),
+        );
+        let installer =
+            crate::ServerInstaller::new(Arc::new(NoopJarSource), Arc::new(NoopDownloader));
+        let err = svc
+            .install_jar_checked(
+                "alpha",
+                &VersionId::new("1.21.2"),
+                &installer,
+                &NoopInspector,
+                None,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("must fail");
+        assert!(
+            matches!(
+                err,
+                LifecycleError::Busy {
+                    phase: "更换核心",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        // 旧核心原样保留
+        assert!(fixture.server_dir.join("server.jar").is_file());
+    }
+
     // ---- status / send / logs ----
 
     #[test]
@@ -1557,7 +1787,8 @@ mod tests {
         );
         let map = running.statuses().expect("statuses");
         assert_eq!(map.len(), 1);
-        let view = map.get("alpha").expect("alpha").as_ref().expect("view");
+        let probe = map.get("alpha").expect("alpha");
+        let view = probe.as_ref().expect("probe ok").as_ref().expect("view");
         assert!(view.status.is_alive());
 
         let idle = service(
@@ -1566,7 +1797,55 @@ mod tests {
             Arc::new(FakeSupervisor::default()),
         );
         let map = idle.statuses().expect("statuses");
-        assert!(map.get("alpha").expect("alpha").is_none());
+        assert!(
+            map.get("alpha")
+                .expect("alpha")
+                .as_ref()
+                .expect("probe ok")
+                .is_none()
+        );
+    }
+
+    /// 单台探测失败记 Err，不拖死整个列表
+    #[test]
+    fn statuses_degrade_single_probe_failure() {
+        let fixture = Fixture::new(true);
+        let svc = ServerLifecycleService::new(
+            Arc::clone(&fixture.registry),
+            java_service(MemJavaRepo::new(vec![], true), vec![]),
+            Arc::new(ProbeFailSupervisor),
+        );
+        let map = svc.statuses().expect("statuses");
+        assert_eq!(map.len(), 1);
+        assert!(map.get("alpha").expect("alpha").is_err());
+    }
+
+    /// 状态探测恒失败的替身
+    struct ProbeFailSupervisor;
+
+    impl SupervisorPort for ProbeFailSupervisor {
+        fn start(
+            &self,
+            _request: SupervisorStartRequest,
+        ) -> Result<SupervisorStartOutcome, SupervisorError> {
+            Err(SupervisorError::Unreachable("probe fail".to_owned()))
+        }
+        fn stop(
+            &self,
+            _server_dir: &Path,
+            _spec: StopSpec,
+        ) -> Result<StopOutcome, SupervisorError> {
+            Err(SupervisorError::Unreachable("probe fail".to_owned()))
+        }
+        fn status(&self, _server_dir: &Path) -> Result<Option<SupervisorStatus>, SupervisorError> {
+            Err(SupervisorError::Protocol("version mismatch".to_owned()))
+        }
+        fn send_line(&self, _server_dir: &Path, _line: &str) -> Result<(), SupervisorError> {
+            Err(SupervisorError::Unreachable("probe fail".to_owned()))
+        }
+        fn shutdown(&self, _server_dir: &Path) -> Result<(), SupervisorError> {
+            Ok(())
+        }
     }
 
     #[test]

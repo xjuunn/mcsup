@@ -1,4 +1,4 @@
-use crate::fs_error::FsError;
+use crate::fs_error::{FsError, deletion_hint};
 use domain::workspace::{InvalidWorkspaceName, Workspace, WorkspaceId, WorkspaceName};
 use port::{RepositoryError, ServerRepository, WorkspaceRepository};
 use serde::{Deserialize, Serialize};
@@ -413,27 +413,6 @@ fn normalize_path(path: &Path) -> PathBuf {
 fn normalize_workspace(mut ws: Workspace) -> Workspace {
     ws.path = normalize_path(&ws.path);
     ws
-}
-
-/// Windows 上目录被占用时 `remove_dir_all` 报 `ERROR_SHARING_VIOLATION`（os error 32）
-///
-/// 常见于有终端把该目录当工作目录、资源管理器开着它。补一句可操作提示，
-/// 否则用户只看到一个 os error 32，不知道该干什么。
-#[cfg(windows)]
-fn deletion_hint(err: std::io::Error) -> std::io::Error {
-    const ERROR_SHARING_VIOLATION: i32 = 32;
-    if err.raw_os_error() == Some(ERROR_SHARING_VIOLATION) {
-        return std::io::Error::other(format!(
-            "{err}（目录正被占用：常见于终端的工作目录就在其中，或资源管理器/其他程序打开着；退出占用后重试）"
-        ));
-    }
-    err
-}
-
-/// 非 Windows 没有这个错误码
-#[cfg(not(windows))]
-fn deletion_hint(err: std::io::Error) -> std::io::Error {
-    err
 }
 
 #[cfg(test)]

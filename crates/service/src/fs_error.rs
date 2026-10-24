@@ -39,3 +39,30 @@ impl FsError {
         }
     }
 }
+
+/// 目录删除失败的共用提示：Windows 上目录被占用时 `remove_dir_all` 报
+/// `ERROR_SHARING_VIOLATION`（os error 32）
+///
+/// 常见于有终端把该目录当工作目录、资源管理器开着它。补一句可操作提示，
+/// 否则用户只看到一个 os error 32，不知道该干什么。
+/// registry / workspace / java 共用，禁止再各写一份。
+pub(crate) fn deletion_hint(err: std::io::Error) -> std::io::Error {
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    if cfg!(windows) && err.raw_os_error() == Some(ERROR_SHARING_VIOLATION) {
+        return std::io::Error::other(format!(
+            "{err}（目录正被占用：常见于终端的工作目录就在其中，或资源管理器/其他程序打开着；退出占用后重试）"
+        ));
+    }
+    err
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_windows_and_other_errors_pass_through() {
+        let err = std::io::Error::other("boom");
+        assert_eq!(deletion_hint(err).to_string(), "boom");
+    }
+}

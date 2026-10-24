@@ -10,9 +10,16 @@
 //! 带出 `port` 与 `domain`。
 //!
 //! 新增能力 crate 时同步三处：可选依赖、feature 级联、下方重导出。
+//! `bootstrap` 是组合 feature：重导出全部内层并附 [`bootstrap`] 模块
+//! （默认组合根，第三方零拼装装配）。
 
 #![warn(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
+
+/// 默认组合根：`McsupBuilder` 一次装配全部默认实现
+#[cfg(feature = "bootstrap")]
+#[cfg_attr(docsrs, doc(cfg(feature = "bootstrap")))]
+pub mod bootstrap;
 
 #[cfg(feature = "domain")]
 #[cfg_attr(docsrs, doc(cfg(feature = "domain")))]

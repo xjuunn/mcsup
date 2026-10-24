@@ -12,6 +12,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::io::{self, BufRead, Write};
 
+/// CLI `--output json` 的行类型（唯一真相来源，禁止各入口自行定义 DTO）
+pub mod cli;
+
 /// IPC 协议版本；不匹配直接报错，禁止猜测兼容
 pub const PROTOCOL_VERSION: u32 = 1;
 

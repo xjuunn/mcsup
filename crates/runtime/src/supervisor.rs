@@ -2,6 +2,7 @@
 //!
 //! 单线程主循环负责收尸与 accept（非阻塞轮询），每个连接在独立线程应答；
 //! 优雅停机靠 stdin 注入 `stop`，宽限到期且 `force` 才强杀。
+use crate::client;
 use crate::endpoint;
 use crate::launch::{self, MinecraftLaunch};
 use domain::server::layout::{console_log_path, run_dir};
@@ -390,13 +391,25 @@ fn exit_decision(view: &View, shutdown: &AtomicBool, exited_at: Option<Instant>)
 ///
 /// # 错误
 ///
-/// 通过返回码表达：`0` 正常停机，`1` 致命错误或服务端崩溃退出
+/// 通过返回码表达：`0` 正常停机，`1` 致命错误或服务端崩溃退出，
+/// `2` 端点已被另一个活着的 supervisor 占用（拒绝成为第二个）
 pub(crate) fn run_with<F>(server_dir: &Path, spawn: F) -> i32
 where
     F: FnOnce() -> io::Result<Child>,
 {
     #[cfg(unix)]
     ignore_hup();
+
+    // 双进程竞态闸：CLI 侧的 probe→spawn 有窗口，两个并发 start 会各自
+    // 通过「不在运行」检查。此处再探一次：端点上已有活的 supervisor 时
+    // 拒绝启动（返回 2），绝不清理别人的端点——清了会让两个 Minecraft
+    // 写同一个 world。探测本身失败按「无主」处理，bind 冲突仍会拦下
+    if let Ok(Some(status)) = client::probe_status(server_dir)
+        && status.status.is_alive()
+    {
+        supervisor_note("another live supervisor owns the endpoint; refusing to start");
+        return 2;
+    }
 
     let (shared, listener) = match prepare(server_dir, spawn) {
         Ok(prepared) => prepared,

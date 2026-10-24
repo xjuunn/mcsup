@@ -263,6 +263,8 @@ if [ -f "$pkg_manifest" ] && [ -f "$pkg_lib" ]; then
 		provider) printf '%s' 'domain port provider' ;;
 		storage) printf '%s' 'domain port storage' ;;
 		runtime) printf '%s' 'domain port protocol runtime' ;;
+		# 组合 feature：一次拉入全部内层（默认组合根）
+		bootstrap) printf '%s' 'domain port protocol service file java provider storage runtime' ;;
 		*) printf '%s' '' ;;
 		esac
 	}

@@ -14,8 +14,10 @@
 scripts/check.sh
 ```
 
-它依次运行 architecture / fmt / check / clippy / test，其中 fmt 只检查不修改
-（`cargo fmt --all -- --check`）。
+它依次运行 architecture / fmt / check / clippy / test / doc / feature
+powerset / deny。fmt 只检查不修改（`cargo fmt --all -- --check`）；
+deny 缺 cargo-deny 时静默跳过（本地绿灯 ≠ CI 绿灯，建议安装）；其余
+任一失败即中止并报出步骤名。
 
 提交时 `.githooks/pre-commit` 先对本次提交的 Rust 文件运行 `cargo fmt` 并重新
 暂存，再运行本脚本，保证进入提交的代码已格式化。CI 相反：fmt job 只运行

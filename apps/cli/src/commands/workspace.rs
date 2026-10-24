@@ -4,27 +4,13 @@ use crate::output::Printer;
 use crate::prompts::{self, WorkspaceLocation};
 use anyhow::{Context, Result};
 use comfy_table::Table;
+use mcsup::protocol::cli::{
+    DoctorFindingJson, DoctorJson, WorkspaceInitRow, WorkspaceRemoveJson, WorkspaceRow,
+    WorkspaceUseJson,
+};
 use mcsup::service::{InitOutcome, ServerRegistry, WorkspaceService, absolute_path};
-use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-/// `workspace list` 单行（JSON 模式序列化用）
-#[derive(Serialize)]
-struct WorkspaceRow<'a> {
-    name: &'a str,
-    path: String,
-    servers: usize,
-    current: bool,
-}
-
-/// `workspace init` 结果（JSON 模式序列化用）
-#[derive(Serialize)]
-struct InitRow<'a> {
-    name: &'a str,
-    path: String,
-    status: &'a str,
-}
 
 pub(crate) fn run(action: WorkspaceAction, printer: Printer) -> Result<()> {
     let store = bootstrap::open_store()?;
@@ -151,7 +137,7 @@ pub(crate) fn init(
     match svc.init(&dir, name.as_deref())? {
         InitOutcome::Created(ws) => printer.print_outcome(
             &format!("已创建并注册: {} ({})", ws.name, ws.path.display()),
-            &InitRow {
+            &WorkspaceInitRow {
                 name: ws.name.as_str(),
                 path: ws.path.display().to_string(),
                 status: "created",
@@ -159,7 +145,7 @@ pub(crate) fn init(
         )?,
         InitOutcome::Recovered(ws) => printer.print_outcome(
             &format!("已补注册（上次中断）: {} ({})", ws.name, ws.path.display()),
-            &InitRow {
+            &WorkspaceInitRow {
                 name: ws.name.as_str(),
                 path: ws.path.display().to_string(),
                 status: "recovered",
@@ -172,7 +158,7 @@ pub(crate) fn init(
                 ws.path.display(),
                 ws.name
             ),
-            &InitRow {
+            &WorkspaceInitRow {
                 name: ws.name.as_str(),
                 path: ws.path.display().to_string(),
                 status: "already",
@@ -222,10 +208,10 @@ fn use_ws(svc: &WorkspaceService, name: Option<&str>, printer: Printer) -> Resul
     let ws = svc.set_current(&selector)?;
     printer.print_outcome(
         &format!("当前工作区已切换为 {} ({})", ws.name, ws.path.display()),
-        &serde_json::json!({
-            "name": ws.name.as_str(),
-            "path": ws.path.display().to_string(),
-        }),
+        &WorkspaceUseJson {
+            name: ws.name.as_str(),
+            path: ws.path.display().to_string(),
+        },
     )
 }
 
@@ -265,6 +251,9 @@ fn pick_workspace(svc: &WorkspaceService, printer: Printer) -> Result<String> {
 fn remove(svc: &WorkspaceService, name: &str, purge: bool, printer: Printer) -> Result<()> {
     // 先解析：名字不对时不必问，顺带把路径给用户看（删除不可恢复）
     let ws = svc.resolve(name)?;
+    // 区内任一服务器在运行则拒绝（purge 会连着运行中的存档一起删）：
+    // 判定收敛在 lifecycle service，入口不各自补检查
+    super::lifecycle::lifecycle_service()?.ensure_workspace_stopped(&ws.id)?;
     // 删了不可恢复：可交互时问一句，默认不删；`--purge` 是显式指令，不再问
     let purge = if purge || !printer.is_interactive() {
         purge
@@ -304,11 +293,11 @@ fn remove(svc: &WorkspaceService, name: &str, purge: bool, printer: Printer) -> 
         } else {
             format!("已注销（磁盘数据保留）: {}", ws.name)
         },
-        &serde_json::json!({
-            "name": ws.name.as_str(),
-            "path": ws.path.display().to_string(),
-            "purged": purge,
-        }),
+        &WorkspaceRemoveJson {
+            name: ws.name.as_str(),
+            path: ws.path.display().to_string(),
+            purged: purge,
+        },
     )?;
     // 删除的是当前工作区时告知移交结果，避免用户找不到「当前」去哪了
     if ws.is_current
@@ -323,10 +312,14 @@ fn doctor(reg: &ServerRegistry, printer: Printer) -> Result<()> {
     use mcsup::service::DoctorLevel;
 
     let findings = reg.doctor()?;
+    let level_str = |level: DoctorLevel| match level {
+        DoctorLevel::Error => "error",
+        DoctorLevel::Warning => "warning",
+    };
     if findings.is_empty() {
         printer.print_outcome(
             "检查通过：工作区与注册表一致",
-            &serde_json::json!({ "findings": [] }),
+            &DoctorJson { findings: vec![] },
         )?;
         return Ok(());
     }
@@ -344,19 +337,17 @@ fn doctor(reg: &ServerRegistry, printer: Printer) -> Result<()> {
             }
         }
     }
-    printer.print_outcome(
-        &format!("发现 {} 个问题", findings.len()),
-        &serde_json::json!({
-            "findings": findings.iter().map(|f| serde_json::json!({
-                "level": match f.level {
-                    DoctorLevel::Error => "error",
-                    DoctorLevel::Warning => "warning",
-                },
-                "workspace": f.workspace,
-                "message": f.message,
-            })).collect::<Vec<_>>(),
-        }),
-    )?;
+    let payload = DoctorJson {
+        findings: findings
+            .iter()
+            .map(|f| DoctorFindingJson {
+                level: level_str(f.level),
+                workspace: f.workspace.as_deref(),
+                message: f.message.clone(),
+            })
+            .collect(),
+    };
+    printer.print_outcome(&format!("发现 {} 个问题", findings.len()), &payload)?;
     if findings.iter().any(|f| f.level == DoctorLevel::Error) {
         anyhow::bail!("发现错误级问题，请按提示处理");
     }

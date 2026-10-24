@@ -11,58 +11,9 @@ use crate::progress::{ScanProgress, TaskSpinner};
 use crate::prompts;
 use anyhow::{Context, Result, anyhow};
 use comfy_table::{ContentArrangement, Table};
-use mcsup::domain::server::settings::{ServerSettings, SettingKey};
+use mcsup::domain::server::settings::SettingKey;
+use mcsup::protocol::cli::{JarJson, SetJson, VersionJson};
 use mcsup::service::{DEFAULT_RAM_MIB, JavaService, ServerSettingsService, SettingChange};
-use serde::Serialize;
-
-/// `server set` 结果（JSON 模式序列化用）
-#[derive(Serialize)]
-struct SetJson {
-    name: String,
-    key: String,
-    value: String,
-    settings: SettingsJson,
-}
-
-/// 属性集的机器视图（`server set` / `server version` 共用）
-#[derive(Serialize)]
-struct SettingsJson {
-    java_version: Option<i64>,
-    ram_mib: Option<u32>,
-    autostart: bool,
-}
-
-impl From<ServerSettings> for SettingsJson {
-    fn from(settings: ServerSettings) -> Self {
-        Self {
-            java_version: settings
-                .java_major
-                .map(mcsup::domain::java::JavaMajor::as_i64),
-            ram_mib: settings.ram_mib,
-            autostart: settings.autostart,
-        }
-    }
-}
-
-/// `server version` 结果（JSON 模式序列化用）
-#[derive(Serialize)]
-struct VersionJson<'a> {
-    name: &'a str,
-    version: &'a str,
-    variant: &'a str,
-    /// 核心来源（按变体取自已注册来源）；无匹配来源时为 `未知`
-    source: &'a str,
-    /// 已安装核心；尚未安装时为 `null`
-    jar: Option<JarJson>,
-}
-
-#[derive(Serialize)]
-struct JarJson {
-    path: String,
-    size: u64,
-    checksum_algo: &'static str,
-    checksum: String,
-}
 
 fn settings_service() -> Result<ServerSettingsService> {
     Ok(ServerSettingsService::new(
@@ -134,7 +85,12 @@ pub(crate) fn set(
             value: change.value,
             settings: change.settings.into(),
         },
-    )
+    )?;
+    // autostart 目前只持久化、无调度器消费：如实告知，不假装生效
+    if key == SettingKey::Autostart {
+        printer.print_section("注意: autostart 已记录但尚未生效（自动拉起调度器待实现）");
+    }
+    Ok(())
 }
 
 /// `server version`：注册版本 + 核心来源 / 大小 / 校验和

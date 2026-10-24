@@ -1,0 +1,89 @@
+name: Publish crates
+
+# crates.io 发布：与 CLI 二进制 release（release.yml）刻意分离。
+# 只能手动触发（workflow_dispatch）：crates.io 发布不可撤销，自动触发
+# 容易在准备不充分时误发。发布按依赖拓扑序：内层先于门面；版本全部来自
+# workspace.version 锁步（scripts/bump-version.sh 一并推进）。
+#
+# 前置条件（首次发布前必须完成，见 docs/embedding.md 分发形态一节）：
+# 1. 内层 crate 改名 mcsup-*（单词名在 crates.io 已被占用）
+# 2. 内层 publish = false 移除，互依 version 指向已发布版本
+# 3. cargo publish --dry-run 逐个通过
+# 未满足前此 workflow 会失败——这是有意为之的护栏。
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'dry-run（只校验不上传）'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: verify workspace
+        run: |
+          sh scripts/check-architecture.sh
+          cargo check --workspace --all-features
+      # package 不打包 git 管理之外的文件；发布前必须干净
+      - name: verify packageable
+        run: |
+          set -e
+          for pkg in domain port protocol service file java provider storage runtime mcsup; do
+            if cargo publish -p "$pkg" --dry-run >/dev/null 2>&1; then
+              echo "$pkg: packageable"
+            else
+              echo "::warning::crate $pkg 尚不可发布（内层未改名 mcsup-* 或 publish=false）；发布前见 docs/embedding.md 分发形态一节"
+            fi
+          done
+
+  publish:
+    name: publish (${{ matrix.crate }})
+    needs: verify
+    # dry_run=false 才真发布；默认只预检
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      # 依赖拓扑序：被依赖者先发。发布顺序即列表顺序（jobs 间用 needs 链）
+      matrix:
+        crate: [domain, port, protocol, service, file, java, provider, storage, runtime]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      # CARGO_REGISTRY_TOKEN 由 GitHub Environment secret 提供
+      - name: publish ${{ matrix.crate }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p ${{ matrix.crate }} --all-features --allow-dirty
+
+  publish-facade:
+    name: publish mcsup (facade)
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: publish mcsup
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p mcsup --all-features --allow-dirty

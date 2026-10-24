@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use mcsup::domain::server::version::{ServerVariant, ServerVersion, VersionId, VersionKind};
 use mcsup::file::FileCoreInspector;
 use mcsup::port::ServerJarSource;
-use mcsup::service::{ServerInstaller, ServerRegistry};
+use mcsup::service::ServerInstaller;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
@@ -44,7 +44,7 @@ pub(crate) async fn run(
             VersionSource::Latest => VersionId::new("latest"),
         },
     };
-    let (size, destination) = download_jar(&registry, name, &version_id, source, printer).await?;
+    let (size, destination) = download_jar(name, &version_id, source, printer).await?;
     printer.print_installed(&version_id, size, &destination)
 }
 
@@ -72,11 +72,13 @@ fn default_version_source(has_jar: bool, interactive: bool) -> VersionSource {
 
 /// 下载并登记服务端核心；不打印结果行（由调用方输出，保证 JSON 单行契约）
 ///
+/// 经 lifecycle 编排：运行中换核心被拒绝（Linux 上 rename 会成功但 JVM
+/// 仍用旧 inode，用户以为升级了实际没有），判定收敛在 service。
+///
 /// # Errors
 ///
-/// 服务器不存在、版本不存在、来源不可达或传输 / 校验失败时返回错误
+/// 服务器不存在、版本不存在、来源不可达、传输 / 校验失败或运行中拒绝时返回错误
 pub(crate) async fn download_jar(
-    registry: &ServerRegistry,
     name: &str,
     version_id: &VersionId,
     source: Arc<dyn ServerJarSource>,
@@ -85,14 +87,15 @@ pub(crate) async fn download_jar(
     let downloader = Arc::new(bootstrap::build_downloader()?);
     let installer = ServerInstaller::new(source, downloader);
     let inspector = FileCoreInspector::new();
+    let lifecycle = super::lifecycle::lifecycle_service()?;
 
     // 解析版本到首字节之间没有任何进度回调，先挂 spinner 保证整段有回显；
     // 首个进度到达后由 session 内的 BarSink 接手同一条线，切换成进度显示
     let message = format!("解析并下载 {version_id}");
     let session = InstallSession::new(message, printer.is_human());
     info!(version = %version_id, server = name, "开始安装");
-    let outcome = registry
-        .install_jar(
+    let outcome = lifecycle
+        .install_jar_checked(
             name,
             version_id,
             &installer,

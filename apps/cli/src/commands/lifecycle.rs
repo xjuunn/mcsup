@@ -13,63 +13,16 @@ use crate::prompts;
 use anyhow::{Context, Result};
 use comfy_table::Table;
 use mcsup::port::{StopOutcome, StopSpec, SupervisorStartOutcome};
-use mcsup::runtime::LocalSupervisor;
+use mcsup::protocol::cli::{LogLineJson, LogsTailJson, SendJson, StartJson, StatusJson, StopJson};
 use mcsup::service::{LifecycleError, ServerLifecycleService, StartOptions};
-use serde::Serialize;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// `server start` / `server restart` 结果（JSON 模式序列化用）
-#[derive(Serialize)]
-struct StartJson<'a> {
-    name: &'a str,
-    supervisor_pid: u32,
-}
-
-/// `server stop` 结果（JSON 模式序列化用）
-#[derive(Serialize)]
-struct StopJson<'a> {
-    name: &'a str,
-    outcome: &'a str,
-    elapsed_secs: Option<u64>,
-}
-
-/// `server status` 结果（JSON 模式序列化用）
-#[derive(Serialize)]
-struct StatusJson<'a> {
-    name: &'a str,
-    version: &'a str,
-    variant: &'a str,
-    running: bool,
-    status: &'a str,
-    pid: Option<u32>,
-    uptime_secs: Option<u64>,
-    exit_code: Option<i32>,
-}
-
-/// `server send` 结果（JSON 模式序列化用）
-#[derive(Serialize)]
-struct SendJson<'a> {
-    name: &'a str,
-    command: &'a str,
-}
-
-/// `server logs --tail` 结果（JSON 模式序列化用）
-#[derive(Serialize)]
-struct LogsTailJson<'a> {
-    name: &'a str,
-    lines: Vec<String>,
-}
-
-/// 装配生命周期服务：注册表 + Java + 本机 supervisor
+/// 装配生命周期服务：经库侧组合根（`mcsup::bootstrap`）统一装配，
+/// CLI 不再手工拼注册表 + Java + supervisor
 pub(crate) fn lifecycle_service() -> Result<Arc<ServerLifecycleService>> {
-    let registry = bootstrap::open_registry()?;
-    let java = bootstrap::open_java_service()?;
-    Ok(Arc::new(ServerLifecycleService::new(
-        registry,
-        java,
-        Arc::new(LocalSupervisor),
-    )))
+    let mcsup = bootstrap::open_mcsup()?;
+    Ok(Arc::new(mcsup.lifecycle.clone()))
 }
 
 /// 单阶段回显：进度在结果返回前收掉，错误路径不留悬空 spinner
@@ -443,7 +396,7 @@ fn print_stream_line(printer: Printer, line: &str) -> Result<()> {
     if printer.is_human() {
         print_raw_line(line);
     } else {
-        let payload = serde_json::json!({ "line": line });
+        let payload = LogLineJson { line };
         let text = serde_json::to_string(&payload)?;
         output::print_json_line(&text);
     }

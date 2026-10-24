@@ -112,6 +112,8 @@ impl Printer {
 
     /// 安装成功结果： JSON 模式输出单行数据对象
     ///
+    /// 行类型来自 [`mcsup::protocol::cli::InstalledJson`]（唯一契约来源）。
+    ///
     /// # Errors
     ///
     /// 序列化结果失败时返回底层错误
@@ -136,7 +138,7 @@ impl Printer {
                 Ok(())
             }
             OutputFormat::Json => {
-                let payload = InstalledJson {
+                let payload = mcsup::protocol::cli::InstalledJson {
                     version: version.to_string(),
                     path: destination.display().to_string(),
                     size,
@@ -233,7 +235,16 @@ fn lifecycle_exit_code(err: &mcsup::service::LifecycleError) -> u8 {
         Life::Supervisor(_) => 5,
         Life::NoJar { .. } | Life::NoJava | Life::UnknownJavaMajor { .. } => 3,
         Life::EulaRequired => 2,
-        Life::AlreadyRunning | Life::NotRunning => 4,
+        // 运行中（含删除 / 换核心被拒）：状态冲突
+        Life::AlreadyRunning | Life::NotRunning | Life::Busy { .. } => 4,
+        // 换核心失败：注册表 / 来源 / 下载各按原判级，其余 1
+        Life::InstallJar(jar) => match jar {
+            mcsup::service::InstallJarError::Registry(reg) => registry_exit_code(reg),
+            mcsup::service::InstallJarError::Install(install) => install_exit_code(install),
+            // 世界与目标版本冲突：状态冲突，不重试同一版本
+            mcsup::service::InstallJarError::Downgrade { .. } => 4,
+            _ => 1,
+        },
         // StopTimedOut / Io 与未来新增变体：通用 1
         _ => 1,
     }
@@ -331,13 +342,6 @@ impl Default for Printer {
     fn default() -> Self {
         Self::new(OutputFormat::Human)
     }
-}
-
-#[derive(Debug, Serialize)]
-struct InstalledJson {
-    version: String,
-    path: String,
-    size: u64,
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -571,6 +575,34 @@ mod tests {
         .context("停止失败")
         .unwrap_err();
         assert_eq!(Printer::exit_code(&err), 1);
+    }
+
+    /// 运行中的删除 / 换核心被拒（Busy）：状态冲突 → 4
+    #[test]
+    fn lifecycle_busy_maps_to_exit_code_4() {
+        let err = Err::<(), _>(mcsup::service::LifecycleError::Busy {
+            name: "alpha".to_owned(),
+            phase: "删除",
+        })
+        .context("删除失败")
+        .unwrap_err();
+        assert_eq!(Printer::exit_code(&err), 4);
+    }
+
+    /// 换核心的 Downgrade 经 `LifecycleError::InstallJar` 包装同样还原为 4
+    #[test]
+    fn lifecycle_install_jar_downgrade_maps_to_exit_code_4() {
+        use mcsup::domain::server::world::DataVersion;
+        use mcsup::service::{InstallJarError, LifecycleError};
+        let err = Err::<(), _>(LifecycleError::InstallJar(InstallJarError::Downgrade {
+            world: DataVersion::new(4786),
+            target: DataVersion::new(4554),
+            world_version: "26.1".to_owned(),
+            target_version: "1.21.9".to_owned(),
+        }))
+        .context("安装服务端失败")
+        .unwrap_err();
+        assert_eq!(Printer::exit_code(&err), 4);
     }
 
     /// 用户取消（Ctrl-C 协作取消）：130 = 128 + SIGINT，与后端失败 5 区分

@@ -95,15 +95,35 @@ crate 级依赖方向断言（实现层之间不互相依赖）尚待补入该�
 推论：**启动器会主动注入自己的进程管理**。MCSUP 不和宿主抢进程所有权，
 而是通过 port 把控制权交出去。
 
+已实施（`crates/mcsup/src/bootstrap.rs`，feature = "bootstrap"）：门面
+提供 `McsupBuilder` + `Mcsup` 组合根，注入面与当初设计一致——
+`supervisor` / `downloader` / `scanner` / `java_registry` / `extractor` /
+`store`（具体连接）/ `server_repository` + `workspace_repository`（按
+trait 换仓库实现）/ `jar_sources`，每个字段都是 `Option`，不注入就用
+内置实现。CLI 与库侧共用同一个组合根（`apps/cli` 已改走
+`mcsup::bootstrap`），不再各拼一套。待补：同步入口（`start_blocking`）
+与事件注入（EventSink）。
+
+默认 supervisor 约束：`LocalSupervisor` 经 mcsup CLI 的 `__supervise`
+子命令拉起子进程，`server start` 必须在 `StartOptions::supervisor_exe`
+传入 mcsup CLI 路径（CLI 传 `current_exe()`，成立）；第三方宿主没有
+这个子命令，应注入自己的 `SupervisorPort`。exe 缺失在 spawn 前报
+指名错误，不留 5 秒超时的模糊失败。
+
 ```rust
 pub struct McsupBuilder { /* 每个字段都是 Option */ }
 
 impl McsupBuilder {
-    pub fn process_spawner(self, s: Arc<dyn ProcessSpawner>) -> Self;
-    pub fn java_resolver(self, r: Arc<dyn JavaResolver>) -> Self;
-    pub fn server_repository(self, r: Option<Arc<dyn ServerRepository>>) -> Self;
-    pub fn event_sink(self, s: Arc<dyn EventSink>) -> Self;
-    pub fn build(self) -> Result<Mcsup, McsupError>;
+    pub fn supervisor(self, s: Arc<dyn SupervisorPort>) -> Self;
+    pub fn downloader(self, d: Arc<dyn ArtifactDownloader>) -> Self;
+    pub fn scanner(self, s: Arc<dyn JavaScanner>) -> Self;
+    pub fn extractor(self, e: Arc<dyn ArchiveExtractor>) -> Self;
+    pub fn java_registry(self, r: Arc<dyn JavaSourceRegistryPort>) -> Self;
+    pub fn store(self, s: Arc<SqliteStore>) -> Self;
+    pub fn server_repository(self, r: Arc<dyn ServerRepository>) -> Self;
+    pub fn workspace_repository(self, r: Arc<dyn WorkspaceRepository>) -> Self;
+    pub fn jar_sources(self, s: Vec<Arc<dyn ServerJarSource>>) -> Self;
+    pub fn build(self, data_dir: &Path) -> Result<Mcsup, BootstrapError>;
 }
 ```
 
@@ -137,6 +157,11 @@ impl Mcsup {
 机器接口（CLI JSON、API 的 REST 与 WebSocket、MCP）共享同一套类型，来自
 `protocol` 模块。TUI 直接经 `service` 工作，不另立契约；Web 作为独立项目消费
 REST / WebSocket。
+
+已实施：CLI `--output json` 的全部行类型收敛在
+`crates/protocol/src/cli.rs`（`protocol::cli`），`apps/cli` 不再自定义
+DTO；行类型字段名已用测试钉住形状。未来的 REST / 桌面端直接复用
+`protocol::cli` 这批类型。
 
 JSON 输出格式、REST body、WebSocket 消息都是这批类型的 serde 形式。
 改一处，所有入口同步。破坏性变更走新增字段 + `schema` 版本号，
@@ -235,11 +260,15 @@ runtime  = ["dep:runtime", "port", "protocol"]
 
 级联规则：feature 引用同级 feature，被引用者带出其可选依赖——只要
 `mcsup::port` 可命名，`mcsup::domain` 必可命名。每新增一个内层 crate，
-同步三处：可选依赖（`path + version`）、feature 级联、`lib.rs` 的
-`pub use`。
+同步三处：根 `[workspace.dependencies]` 的互依声明（`path + version`
+唯一携带处）、门面可选依赖（`workspace = true` + `optional`）与
+feature 级联、`lib.rs` 的 `pub use`。内层 manifest 一律
+`xxx.workspace = true` 继承，禁止再写版本字面量。
 
 组合 feature（`minimal` / `full`）尚未声明：`check-architecture.sh` 的
 feature_bundles 目前只豁免 `default`，新增组合 feature 时同步豁免。
+已声明的组合 feature 是 `bootstrap`（默认组合根，见下），允许集合已
+加入 `facade_allow`。
 
 feature 语义必须机器校验。如果 `file` 硬依赖 `provider`，那
 `features = ["file"]` 会把 `reqwest` 拉进来，这个 feature 就是假的。
@@ -294,11 +323,13 @@ mcsup = { version = "0.1", default-features = false, features = ["full"] }
 依赖拓扑序，每步结束都是可用状态。已落地：domain、port、protocol、
 service、file、java、provider、storage、runtime（内层 crate + 门面 feature
 同步）、apps/cli（workspace / java / server create·install·link·remove 与生命周期
-start·stop·restart·status·console·send·logs 已接通，其余命令为桩）。
+start·stop·restart·status·console·send·logs 已接通，其余命令为桩）、
+门面 `bootstrap` 组合根（`McsupBuilder`，CLI 已改走）、CLI JSON 行类型
+收敛（`protocol::cli`，apps/cli 全部命令已切换）。
 后续按序：
 
 ```
-1  cli         库侧命令语义 + 渲染 + JSON
+1  cli         库侧命令语义 + 渲染 + JSON（渲染入薄层，语义下沉门面）
 2  sidecar     protocol 的 HTTP 绑定
 ```
 

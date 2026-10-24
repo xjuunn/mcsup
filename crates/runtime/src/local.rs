@@ -53,6 +53,20 @@ impl SupervisorPort for LocalSupervisor {
             client::wait_gone(dir, GONE_WAIT);
         }
 
+        // 默认 supervisor 经 `__supervise` 子命令拉起：exe 缺失或不是
+        // mcsup CLI 时，把失败提前到 spawn 前并指名原因，而不是让用户
+        // 5 秒超时后看到一句难懂的 Unreachable
+        if !request.supervisor_exe.is_file() {
+            return Err(SupervisorError::Spawn(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "supervisor exe not found: {}（默认 LocalSupervisor 需要传入 \
+                     mcsup CLI 的路径；宿主启动器应注入自己的 SupervisorPort）",
+                    request.supervisor_exe.display()
+                ),
+            )));
+        }
+
         std::fs::create_dir_all(run_dir(dir))?;
         let log = std::fs::OpenOptions::new()
             .create(true)

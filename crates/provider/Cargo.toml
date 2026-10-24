@@ -7,19 +7,35 @@ license.workspace = true
 publish = false
 
 [dependencies]
-async-trait = "0.1.92"
-domain = { path = "../domain" }
-port = { path = "../port" }
-reqwest = { version = "0.13.5", features = ["json"] }
-serde = { version = "1.0.229", features = ["derive"] }
-thiserror = "2.0.21"
-tokio = { version = "1.53.2", features = ["time"] }
+async-trait.workspace = true
+domain = { version = "0.1.0", path = "../domain" }
+port = { version = "0.1.0", path = "../port" }
+# default-features = false 砍掉默认的 rustls(aws-lc-rs) 栈：aws-lc 要从源码
+# 编译整套 C 库（cc/cmake 构建脚本 + 数百 C 文件），拖慢构建、放大 MSVC
+# %TEMP% 依赖，对 Minecraft 服务器工具毫无必要。改用 rustls + ring：
+# 全 Rust 实现（仅 ring 有少量预汇编），安全面足够，provider 代码零改动
+# （reqwest API 不因 TLS 后端变化）。
+reqwest = { version = "0.13.5", default-features = false, features = [
+    "json",
+    "charset",
+    "http2",
+    "rustls-no-provider",
+] }
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+] }
+serde = { workspace = true, features = ["derive"] }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["time"] }
 tracing.workspace = true
-url = "2.5.8"
+url.workspace = true
 
 [lints]
 workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
-tokio = { version = "1.53.2", features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt"] }

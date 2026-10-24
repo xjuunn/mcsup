@@ -1,31 +1,29 @@
 use crate::config;
 use anyhow::{Context, Result, anyhow};
+use mcsup::bootstrap::Mcsup;
 use mcsup::domain::server::version::ServerVariant;
-use mcsup::file::{CommandExtractor, FileDownloader};
-use mcsup::java::HostJavaScanner;
 use mcsup::port::ServerJarSource;
-use mcsup::provider::http::HttpByteSource;
-use mcsup::provider::java::JavaSourceRegistry;
-use mcsup::provider::mojang::MojangSource;
-use mcsup::service::{JavaService, ServerRegistry};
-use mcsup::storage::SqliteStore;
+use mcsup::service::JavaService;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 /// 打开元数据库（配置目录下的 `mcsup/db`）
 ///
 /// 所有命令从这里取库，禁止各自拼 `config::database_path()` + `open`。
-pub(crate) fn open_store() -> Result<Arc<SqliteStore>> {
+pub(crate) fn open_store() -> Result<Arc<mcsup::storage::SqliteStore>> {
     let path = config::database_path()?;
-    let store =
-        SqliteStore::open(&path).with_context(|| format!("打开元数据库 {}", path.display()))?;
+    let store = mcsup::storage::SqliteStore::open(&path)
+        .with_context(|| format!("打开元数据库 {}", path.display()))?;
     Ok(Arc::new(store))
 }
 
 /// 装配 `ServerRegistry`（服务器 + 工作目录两个仓库）
-pub(crate) fn open_registry() -> Result<Arc<ServerRegistry>> {
+pub(crate) fn open_registry() -> Result<Arc<mcsup::service::ServerRegistry>> {
     let store = open_store()?;
-    Ok(Arc::new(ServerRegistry::new(store.clone(), store)))
+    Ok(Arc::new(mcsup::service::ServerRegistry::new(
+        store.clone(),
+        store,
+    )))
 }
 
 /// 平台 Java 安装根目录（`{data_dir}/mcsup/java`），不存在则创建
@@ -35,21 +33,15 @@ pub(crate) fn java_root() -> Result<PathBuf> {
     Ok(root)
 }
 
-/// 组装下载器：HTTP 传输 + 断点续传范围请求
-pub(crate) fn build_downloader() -> Result<FileDownloader> {
-    let bytes = Arc::new(HttpByteSource::new().context("初始化 HTTP 传输")?);
-    Ok(FileDownloader::new(bytes.clone()).with_range_source(bytes))
-}
-
 /// 装配 `JavaService`
 ///
 /// 源列表在此只组装不打网络；延迟探测排序由 service 在安装阶段
 /// （[`mcsup::service::InstallStage::Probing`]）触发，本地命令因此零网络开销。
 pub(crate) fn open_java_service() -> Result<JavaService> {
-    let scanner = Arc::new(HostJavaScanner::new());
-    let registry = Arc::new(JavaSourceRegistry::all_sources());
+    let scanner = Arc::new(mcsup::java::HostJavaScanner::new());
+    let registry = Arc::new(mcsup::provider::java::JavaSourceRegistry::all_sources());
     let downloader = Arc::new(build_downloader()?);
-    let extractor = Arc::new(CommandExtractor::new());
+    let extractor = Arc::new(mcsup::file::CommandExtractor::new());
     Ok(JavaService::new(
         open_store()?,
         scanner,
@@ -60,12 +52,18 @@ pub(crate) fn open_java_service() -> Result<JavaService> {
     ))
 }
 
+/// 组装下载器：HTTP 传输 + 断点续传范围请求
+pub(crate) fn build_downloader() -> Result<mcsup::file::FileDownloader> {
+    let bytes = Arc::new(mcsup::provider::http::HttpByteSource::new().context("初始化 HTTP 传输")?);
+    Ok(mcsup::file::FileDownloader::new(bytes.clone()).with_range_source(bytes))
+}
+
 /// 已注册的服务端 JAR 来源（能力查询的数据源；接入新 provider 时在此装配）
 ///
 /// 构造不打网络，只准备客户端。
 pub(crate) fn jar_sources() -> Result<Vec<Arc<dyn ServerJarSource>>> {
     Ok(vec![Arc::new(
-        MojangSource::new().context("初始化 Mojang 源")?,
+        mcsup::provider::mojang::MojangSource::new().context("初始化 Mojang 源")?,
     )])
 }
 
@@ -129,6 +127,16 @@ pub(crate) fn join_variants(available: &[ServerVariant]) -> String {
         .map(|v| v.as_str())
         .collect::<Vec<_>>()
         .join("、")
+}
+
+/// 库侧默认组合根（`mcsup::bootstrap`）：CLI 全部命令的统一装配口径。
+///
+/// 单一入口：路径来自 `config`，网络能力与默认实现全部来自库侧组合根，
+/// CLI 不再自己拼 `SqliteStore` / 下载器 / Java 服务。第三方宿主用同一个
+/// 组合根即可获得与 CLI 完全一致的默认行为。
+pub(crate) fn open_mcsup() -> Result<Mcsup> {
+    let data_dir = config::platform_data_dir()?;
+    Mcsup::open(&data_dir).context("装配 mcsup 组合根")
 }
 
 #[cfg(test)]

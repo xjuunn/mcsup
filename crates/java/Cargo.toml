@@ -7,8 +7,8 @@ license.workspace = true
 publish = false
 
 [dependencies]
-domain = { path = "../domain" }
-port = { path = "../port" }
+domain = { version = "0.1.0", path = "../domain" }
+port = { version = "0.1.0", path = "../port" }
 tracing.workspace = true
 
 [lints]

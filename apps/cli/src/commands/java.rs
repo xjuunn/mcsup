@@ -5,21 +5,12 @@ use anyhow::{Context, Result, anyhow};
 use comfy_table::{ContentArrangement, Table};
 use inquire::Select;
 use mcsup::domain::java::{JavaMajor, JavaPackageType, JavaRuntime, JavaVendor};
+use mcsup::protocol::cli::{JavaInstallJson, JavaRow, JavaScanJson, JavaUninstallJson};
 use mcsup::service::{InstallStage, JavaService, UninstallOutcome};
 use std::path::{Path, PathBuf};
 use tracing::info;
 
 use crate::bootstrap;
-
-/// `java list` 单行（JSON 模式序列化用）
-#[derive(serde::Serialize)]
-struct JavaRow<'a> {
-    major: i64,
-    version: &'a str,
-    vendor: &'a str,
-    managed: bool,
-    path: String,
-}
 
 pub(crate) fn list(printer: Printer) -> Result<()> {
     let service = bootstrap::open_java_service()?;
@@ -86,27 +77,11 @@ pub(crate) fn scan(printer: Printer) -> Result<()> {
             "扫描完成：新注册 {} 个，跳过 {} 个",
             outcome.registered, outcome.skipped
         ),
-        &ScanRow {
+        &JavaScanJson {
             registered: outcome.registered,
             skipped: outcome.skipped,
         },
     )
-}
-
-/// `java scan` 结果（JSON 模式序列化用）
-#[derive(serde::Serialize)]
-struct ScanRow {
-    registered: usize,
-    skipped: usize,
-}
-
-/// `java install` 结果（JSON 模式序列化用）
-#[derive(serde::Serialize)]
-struct InstallJavaRow<'a> {
-    major: i64,
-    version: &'a str,
-    vendor: &'a str,
-    path: String,
 }
 
 /// 安装 Java 并返回结果（供 server start 调用）
@@ -163,7 +138,7 @@ pub(crate) async fn install_with_outcome(
             outcome.runtime.vendor,
             outcome.runtime.path.display()
         ),
-        &InstallJavaRow {
+        &JavaInstallJson {
             major: outcome.runtime.major.as_i64(),
             version: outcome.runtime.version.as_str(),
             vendor: outcome.runtime.vendor.as_str(),
@@ -184,13 +159,6 @@ pub(crate) async fn install(
     Ok(())
 }
 
-/// `java uninstall` 结果（JSON 模式序列化用）
-#[derive(serde::Serialize)]
-struct UninstallJavaRow {
-    path: String,
-    kind: &'static str,
-}
-
 pub(crate) fn uninstall(target: Option<&str>, dir: Option<&Path>, printer: Printer) -> Result<()> {
     let service = bootstrap::open_java_service()?;
     let path = resolve_target(&service, target, dir, printer)?;
@@ -198,14 +166,14 @@ pub(crate) fn uninstall(target: Option<&str>, dir: Option<&Path>, printer: Print
     let (message, row) = match outcome {
         UninstallOutcome::RemovedManaged { path } => (
             format!("已删除 mcsup 管理的 Java: {}", path.display()),
-            UninstallJavaRow {
+            JavaUninstallJson {
                 path: path.display().to_string(),
                 kind: "managed",
             },
         ),
         UninstallOutcome::UnregisteredSystem { path } => (
             format!("已从注册表移除（文件保留）: {}", path.display()),
-            UninstallJavaRow {
+            JavaUninstallJson {
                 path: path.display().to_string(),
                 kind: "system",
             },

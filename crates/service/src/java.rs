@@ -108,6 +108,10 @@ impl InstallStage {
 }
 
 /// Java 生命周期编排：扫描、安装、卸载、列表
+///
+/// 各组件均为 `Arc`，克隆即共享同一套装配（组合根把同一实例交给
+/// `java` 命令与 lifecycle 编排两个消费者）。
+#[derive(Clone)]
 pub struct JavaService {
     repo: Arc<dyn JavaRuntimeRepository>,
     scanner: Arc<dyn JavaScanner>,

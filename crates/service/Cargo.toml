@@ -7,22 +7,22 @@ license.workspace = true
 publish = false
 
 [dependencies]
-async-trait = "0.1.92"
-domain = { path = "../domain" }
-port = { path = "../port" }
-serde = { version = "1.0.229", features = ["derive"] }
+async-trait.workspace = true
+domain = { version = "0.1.0", path = "../domain" }
+port = { version = "0.1.0", path = "../port" }
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-thiserror = "2.0.21"
-tokio = { version = "1.53.2", features = ["time", "macros"] }
-toml = "1.1.8"
+thiserror.workspace = true
+tokio = { workspace = true, features = ["time", "macros"] }
+toml.workspace = true
 tracing.workspace = true
-url = "2.5.8"
-uuid = { version = "1", features = ["v4"] }
+url.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true
 
 [dev-dependencies]
-storage = { path = "../storage" }
-tempfile = "3.27.0"
-tokio = { version = "1.53.2", features = ["macros", "rt"] }
+storage = { version = "0.1.0", path = "../storage" }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }

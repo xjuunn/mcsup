@@ -7,6 +7,7 @@ use comfy_table::{Cell, Color, Table};
 use mcsup::domain::server::status::ServerStatus;
 use mcsup::domain::server::version::{ServerVariant, VersionId};
 use mcsup::domain::workspace::WorkspaceId;
+use mcsup::protocol::cli::{CreateRow, RemoveJson, ServerRow};
 use mcsup::service::{ServerRegistry, ServerRegistryError, WorkspaceError, WorkspaceService};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -14,32 +15,14 @@ use std::path::Path;
 
 use super::install::{download_jar, pick_version};
 
-/// `server list` 单行（JSON 模式序列化用）
+/// 表格状态列着色用，不进 JSON（JSON 行类型在 `protocol::cli`）
 #[derive(Serialize)]
-struct ServerRow<'a> {
-    name: &'a str,
-    workspace: String,
-    version: &'a str,
-    variant: &'a str,
-    path: String,
-    jar: Option<String>,
-    linked: bool,
-    /// 领域状态口径；无 supervisor 时为 `stopped`
-    status: String,
-    /// 是否进程尚存（表格状态列着色用，不进 JSON）
+struct ServerRowView<'a> {
+    #[serde(flatten)]
+    row: ServerRow<'a>,
+    /// 是否进程尚存
     #[serde(skip)]
     running: bool,
-}
-
-/// `server create` / `server link` 结果（JSON 模式序列化用）
-#[derive(Serialize)]
-struct CreateRow<'a> {
-    name: &'a str,
-    version: &'a str,
-    variant: &'a str,
-    path: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    linked: Option<bool>,
 }
 
 pub(crate) fn open_registry() -> Result<std::sync::Arc<ServerRegistry>> {
@@ -73,27 +56,34 @@ pub(crate) fn list(printer: Printer) -> Result<()> {
     let all = reg.list().context("列出服务器失败")?;
     let ws_names = workspace_names()?;
     let statuses = super::lifecycle::lifecycle_service()?.statuses()?;
-    let rows: Vec<ServerRow<'_>> = all
+    let rows: Vec<ServerRowView<'_>> = all
         .iter()
         .map(|srv| {
-            let view = statuses
-                .get(srv.meta.name.as_str())
-                .and_then(Option::as_ref);
-            ServerRow {
-                name: srv.meta.name.as_str(),
-                workspace: ws_names
-                    .get(&srv.meta.workspace_id)
-                    .cloned()
-                    .unwrap_or_else(|| srv.meta.workspace_id.as_str().to_owned()),
-                version: srv.meta.version.as_str(),
-                variant: srv.meta.variant.as_str(),
-                path: srv.dir.display().to_string(),
-                jar: srv.meta.jar.as_ref().map(|j| j.path.display().to_string()),
-                linked: srv.linked,
-                status: view.map_or_else(
-                    || ServerStatus::Stopped.as_str().to_owned(),
-                    |s| s.status.as_str().to_owned(),
-                ),
+            // 单台探测失败记 unknown，不拖死整个列表
+            let probe = statuses.get(srv.meta.name.as_str());
+            let view = probe.and_then(|p| p.as_ref().ok()).and_then(Option::as_ref);
+            let unreachable = probe.is_some_and(Result::is_err);
+            ServerRowView {
+                row: ServerRow {
+                    name: srv.meta.name.as_str(),
+                    workspace: ws_names
+                        .get(&srv.meta.workspace_id)
+                        .cloned()
+                        .unwrap_or_else(|| srv.meta.workspace_id.as_str().to_owned()),
+                    version: srv.meta.version.as_str(),
+                    variant: srv.meta.variant.as_str(),
+                    path: srv.dir.display().to_string(),
+                    jar: srv.meta.jar.as_ref().map(|j| j.path.display().to_string()),
+                    linked: srv.linked,
+                    status: if unreachable {
+                        "unknown".to_owned()
+                    } else {
+                        view.map_or_else(
+                            || ServerStatus::Stopped.as_str().to_owned(),
+                            |s| s.status.as_str().to_owned(),
+                        )
+                    },
+                },
                 running: view.is_some_and(|s| s.status.is_alive()),
             }
         })
@@ -108,15 +98,15 @@ pub(crate) fn list(printer: Printer) -> Result<()> {
                 let status = if row.running {
                     Cell::new("运行中").fg(Color::Green)
                 } else {
-                    Cell::new("")
+                    Cell::new(&row.row.status)
                 };
                 table.add_row([
-                    Cell::new(row.name),
-                    Cell::new(&row.workspace),
-                    Cell::new(row.version),
-                    Cell::new(row.variant),
+                    Cell::new(row.row.name),
+                    Cell::new(&row.row.workspace),
+                    Cell::new(row.row.version),
+                    Cell::new(row.row.variant),
                     status,
-                    Cell::new(&row.path),
+                    Cell::new(&row.row.path),
                 ]);
             }
             table
@@ -201,7 +191,7 @@ pub(crate) async fn create(
         .with_context(|| format!("创建服务器 {name} 失败"))?;
 
     // 7. 下载核心：失败保留已注册结果，提示用 install 重试
-    if let Err(err) = download_jar(&reg, &name, &version_id, source, printer).await {
+    if let Err(err) = download_jar(&name, &version_id, source, printer).await {
         printer.print_warning(&format!(
             "服务器已创建但核心下载失败，可执行 mcsup server install {name} 重试"
         ));
@@ -386,7 +376,8 @@ pub(crate) fn remove(name: &str, purge: bool, printer: Printer) -> Result<()> {
     if purge && !srv.linked {
         super::chdir_out_of(&srv.dir);
     }
-    let out = reg.remove(name, purge)?;
+    // 删除经 lifecycle 编排：运行中拒绝（存档保护），判定收敛在 service
+    let out = super::lifecycle::lifecycle_service()?.remove_server(name, purge)?;
     printer.print_outcome(
         &if purge {
             format!("已删除并注销: {}", out.meta.name)
@@ -395,12 +386,12 @@ pub(crate) fn remove(name: &str, purge: bool, printer: Printer) -> Result<()> {
         } else {
             format!("已注销（磁盘数据保留）: {}", out.meta.name)
         },
-        &serde_json::json!({
-            "name": out.meta.name.as_str(),
-            "path": out.dir.display().to_string(),
-            "purged": purge,
-            "linked": out.linked,
-        }),
+        &RemoveJson {
+            name: out.meta.name.as_str().to_owned(),
+            path: out.dir.display().to_string(),
+            purged: purge,
+            linked: out.linked,
+        },
     )
 }
 

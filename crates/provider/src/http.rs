@@ -4,6 +4,7 @@ use port::{ByteReader, ByteSource, RangeSource, RemoteStat, SourceError};
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use std::ops::RangeInclusive;
+use std::sync::Once;
 use std::time::Duration;
 use url::Url;
 
@@ -15,8 +16,22 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 const USER_AGENT: &str = concat!("mcsup/", env!("CARGO_PKG_VERSION"));
 
+/// 安装 rustls 的 ring crypto provider（进程内一次）
+///
+/// reqwest 走 `rustls-no-provider`（TLS 栈不锁 aws-lc，见 provider 的
+/// Cargo.toml 注释），provider 由本 crate 显式提供：进程内首次构造
+/// reqwest Client 前装一次；宿主已装过自己的 provider 时（try 语义）
+/// 尊重宿主选择，不覆盖。
+fn install_crypto_provider() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 /// 元数据客户端
 pub(crate) fn build_client() -> Result<Client, SourceError> {
+    install_crypto_provider();
     Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
@@ -27,6 +42,7 @@ pub(crate) fn build_client() -> Result<Client, SourceError> {
 
 /// 大文件客户端
 pub(crate) fn build_stream_client() -> Result<Client, SourceError> {
+    install_crypto_provider();
     Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
