@@ -1,46 +1,73 @@
 name: Release CLI
 
-# CLI 二进制发布：推 v* tag 时跑完整门禁后构建各平台 mcsup 二进制并附到
-# GitHub Release。只发 CLI（bin 名 mcsup），不发 crates.io——crate 发布走
-# publish.yml，两者刻意分离：crates.io 发布不可撤销，且首次发布前必须先
-# 完成内层 crate 的 mcsup-* 改名（见 docs/embedding.md 分发形态一节）。
+# CLI 二进制发布：推 v* tag（或手动指定 tag）时跑完整门禁后构建各平台 mcsup
+# 二进制并附到 GitHub Release。只发 CLI（bin 名 mcsup），不发 crates.io——
+# crate 发布走 publish.yml，两者刻意分离：crates.io 发布不可撤销，且首次发布
+# 前必须先完成内层 crate 的 mcsup-* 改名（见 docs/embedding.md 分发形态一节）。
 on:
   push:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: '已存在的 tag（例如 v0.1.0）。重跑发布用；留空则用当前 ref'
+        required: false
+        type: string
+
+# 同一 tag 不并行发布：取消会留下半上传的 Release。
+concurrency:
+  group: release-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   # 门禁与 test.yml 保持同一套命令；release 前必须全绿
   check:
     name: gate
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.98.1
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # 防止 tag 与产物版本错位：v0.2.0 打出 0.1.0 的二进制
+      - name: tag matches workspace version
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          crate_version=$(cargo metadata --no-deps --locked --format-version 1 \
+            | jq -r '.packages[] | select(.name == "cli") | .version')
+          echo "tag=$RELEASE_TAG cli=$crate_version"
+          if [ "$version" != "$crate_version" ]; then
+            echo "::error::tag $RELEASE_TAG 与 cli 包版本 $crate_version 不一致"
+            exit 1
+          fi
       - name: architecture
         run: sh scripts/check-architecture.sh
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - name: test
-        run: cargo test --workspace --all-features
+        run: cargo test --locked --workspace --all-features
 
   build:
     name: build (${{ matrix.target }})
     needs: check
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -48,10 +75,12 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             archive: tar
+            native: true
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             archive: tar
             musl: true
+            native: true
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             archive: tar
@@ -68,17 +97,22 @@ jobs:
           - os: windows-2022
             target: x86_64-pc-windows-msvc
             archive: zip
+            native: true
           - os: windows-2022
             target: aarch64-pc-windows-msvc
             archive: zip
+          # macos-latest 是 arm64 runner：aarch64 原生编，x86_64 交叉编。
           - os: macos-latest
             target: x86_64-apple-darwin
             archive: tar
           - os: macos-latest
             target: aarch64-apple-darwin
             archive: tar
+            native: true
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.98.1
@@ -117,44 +151,84 @@ jobs:
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
           CC_x86_64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-        run: cargo build --release --target ${{ matrix.target }} -p cli
+        run: cargo build --release --locked --target ${{ matrix.target }} -p cli
       - name: build mcsup (cross)
         if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: cross build --release --target ${{ matrix.target }} -p cli
+        run: cross build --release --locked --target ${{ matrix.target }} -p cli
+      # 原生目标必须能跑起来，且版本与 tag 一致；交叉产物无法在这里验证。
+      - name: smoke test (unix)
+        if: matrix.native && matrix.archive == 'tar'
+        run: |
+          expected="${RELEASE_TAG#v}"
+          actual=$("target/${{ matrix.target }}/release/mcsup" --version)
+          echo "$actual"
+          if [ "$actual" != "mcsup $expected" ]; then
+            echo "::error::版本不匹配：$actual != mcsup $expected"
+            exit 1
+          fi
+      - name: smoke test (windows)
+        if: matrix.native && matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $expected = $env:RELEASE_TAG -replace '^v', ''
+          $actual = & "target/${{ matrix.target }}/release/mcsup.exe" --version
+          Write-Host $actual
+          if ($actual -ne "mcsup $expected") {
+            throw "版本不匹配：$actual != mcsup $expected"
+          }
+      # 打包目录放 staging/，dist/ 只留最终压缩包：上传与 release 的通配不会
+      # 把解包目录一起带进 artifact。
       - name: package (unix)
         if: matrix.archive == 'tar'
         run: |
-          name="mcsup-${GITHUB_REF_NAME}-${{ matrix.target }}"
-          mkdir -p "dist/$name"
-          cp "target/${{ matrix.target }}/release/mcsup" "dist/$name/"
-          cp README.md LICENSE "dist/$name/"
-          tar -czf "dist/$name.tar.gz" -C dist "$name"
+          name="mcsup-${RELEASE_TAG}-${{ matrix.target }}"
+          mkdir -p "staging/$name" dist
+          cp "target/${{ matrix.target }}/release/mcsup" "staging/$name/"
+          cp README.md LICENSE "staging/$name/"
+          tar -czf "dist/$name.tar.gz" -C staging "$name"
       - name: package (windows)
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          $name = "mcsup-$env:GITHUB_REF_NAME-${{ matrix.target }}"
-          New-Item -ItemType Directory -Force "dist/$name" | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/mcsup.exe" "dist/$name/"
-          Copy-Item README.md, LICENSE "dist/$name/"
-          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
+          $name = "mcsup-$env:RELEASE_TAG-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force "staging/$name", "dist" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/mcsup.exe" "staging/$name/"
+          Copy-Item README.md, LICENSE "staging/$name/"
+          Compress-Archive -Path "staging/$name" -DestinationPath "dist/$name.zip"
       - uses: actions/upload-artifact@v4
         with:
           name: mcsup-${{ matrix.target }}
           path: dist/*
+          if-no-files-found: error
+          retention-days: 1
 
   release:
     name: github release
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+      - name: checksums
+        run: |
+          cd dist
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
       - name: create release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS
           generate_release_notes: true
           fail_on_unmatched_files: true
+          # v0.2.0-rc1 这类 tag 自动标预发布
+          prerelease: ${{ contains(env.RELEASE_TAG, '-') }}

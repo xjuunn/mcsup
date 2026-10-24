@@ -26,6 +26,19 @@ toml = "1.1.8"
 uuid = { version = "1", features = ["v4"] }
 tempfile = "3.27.0"
 
+# 发布二进制是 CLI 的分发主体，体积直接影响下载与安装体验。
+# - opt-level = "z"：体积优先；实测比 "s" 小 8%，比 3 小 30%
+# - lto = "fat" + codegen-units = 1：跨 crate 内联与死代码消除，收益最大
+# - strip = true：符号表不进产物
+# - panic = "abort"：CLI 不依赖 unwind 语义，去掉展开表
+# 只影响 release，debug / test 不受影响。
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 rust_2018_idioms = { level = "warn", priority = -1 }

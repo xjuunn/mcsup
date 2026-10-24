@@ -1,0 +1,9 @@
+# 仅影响本仓库构建；下游通过 path / crates.io 使用库时不会继承。
+[env]
+# 元数据库只使用普通表；不编入未使用的全文检索和空间索引扩展。
+# 保留事务、WAL、外键、线程安全、迁移和其余 SQL 能力。
+# 不 force，允许调用方显式覆盖（例如需要打开含 FTS / RTREE 的外部库）。
+LIBSQLITE3_FLAGS = "-USQLITE_ENABLE_FTS3 -USQLITE_ENABLE_FTS3_PARENTHESIS -USQLITE_ENABLE_FTS5 -USQLITE_ENABLE_RTREE"
+# MSVC：拆分全局数据供链接器裁剪，减少 C 代码自动内联膨胀。
+# 仅为实测的 x86_64 MSVC 目标设置，不把 MSVC 参数传给其他工具链。
+CFLAGS_x86_64_pc_windows_msvc = "/Gw /Ob1"
