@@ -32,14 +32,15 @@ use port::{
 pub use props::{PropsError, PropsReport, ServerPropsService};
 pub use registry::{
     InstallJarError, InstallJarErrorKind, InstalledServerJar, RegisteredServer, ServerRegistry,
-    ServerRegistryError,
+    ServerRegistryError, ServerRegistryErrorKind,
 };
 pub use settings::{ServerSettingsService, SettingChange, SettingsError, SettingsErrorKind};
 use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
 pub use workspace::{
-    InitOutcome, MARKER_FILE, NOISE_ENTRIES, WorkspaceError, WorkspaceService, absolute_path,
+    InitOutcome, MARKER_FILE, NOISE_ENTRIES, WorkspaceError, WorkspaceErrorKind, WorkspaceService,
+    absolute_path,
 };
 
 /// 安装任务失败

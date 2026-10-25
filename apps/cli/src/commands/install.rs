@@ -33,7 +33,7 @@ pub(crate) async fn run(
     let srv = registry
         .get(name)
         .with_context(|| format!("服务器 {name} 不存在"))?;
-    let source = bootstrap::source_for(srv.meta.variant)?;
+    let source = bootstrap::source_for(srv.meta.variant, printer.lang())?;
     let version_id = match version {
         Some(raw) => VersionId::new(raw),
         None => match default_version_source(srv.meta.jar.is_some(), printer.is_interactive()) {

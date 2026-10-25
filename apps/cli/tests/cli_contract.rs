@@ -403,6 +403,46 @@ fn has_cjk(text: &str) -> bool {
         .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c) || ('\u{3000}'..='\u{303f}').contains(&c))
 }
 
+/// `--lang en` 下错误提示与界面文案不得混入中文
+///
+/// 只断言不出现 CJK，不断言具体措辞：文案措辞会调整，语言混排是回归。
+#[test]
+fn english_errors_have_no_chinese() {
+    let home = temp_home();
+    // 注册表错误（服务层 kind）
+    let out = run(home.path(), &["server", "remove", "nope", "--lang", "en"]);
+    assert_ne!(out.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !has_cjk(&stderr),
+        "stderr 混入中文:\n{}",
+        first_cjk_run(&stderr)
+    );
+    assert!(stderr.contains("not found"), "{stderr}");
+
+    // 工作区错误（service 判定 + CLI 渲染）
+    let missing = format!("{}", home.path().join("missing").display());
+    let out = run(home.path(), &["workspace", "use", &missing, "--lang", "en"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !has_cjk(&stderr),
+        "stderr 混入中文:\n{}",
+        first_cjk_run(&stderr)
+    );
+}
+
+/// `--lang zh` 下同一类错误给出中文
+#[test]
+fn chinese_errors_are_chinese() {
+    let home = temp_home();
+    let out = run(home.path(), &["server", "remove", "nope", "--lang", "zh"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(has_cjk(&stderr), "{stderr}");
+    assert!(stderr.contains("不存在"), "{stderr}");
+    // 不应再有英文兜底残留（Display 的英文短句）
+    assert!(!stderr.contains("server not found"), "{stderr}");
+}
+
 /// 报错时给出第一段中文及上下文，便于定位漏译条目
 fn first_cjk_run(text: &str) -> String {
     for line in text.lines() {

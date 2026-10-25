@@ -248,8 +248,11 @@ impl Printer {
     }
 }
 
-/// 结构化错误的用户提示：只认带 `kind()` 的那几类，其余（IO、注册表、
+/// 结构化错误的用户提示：只认带 `kind()` 的那几类，其余（IO、
 /// 下载源等）沿用它自己的 `Display`。文案集中在 [`crate::i18n`]。
+///
+/// 嵌套错误沿链路下钻：`LifecycleError::Registry` 之类是 transparent 包装，
+/// 没有 `kind()`，要落到内层才能取到判定。
 fn structured_message(err: &anyhow::Error, lang: Lang) -> Option<String> {
     for cause in err.chain() {
         if let Some(life) = cause.downcast_ref::<mcsup::service::LifecycleError>() {
@@ -263,6 +266,14 @@ fn structured_message(err: &anyhow::Error, lang: Lang) -> Option<String> {
         if let Some(settings) = cause.downcast_ref::<mcsup::service::SettingsError>() {
             let kind = settings.kind()?;
             return Some(crate::i18n::settings(&kind, lang));
+        }
+        if let Some(reg) = cause.downcast_ref::<mcsup::service::ServerRegistryError>() {
+            let kind = reg.kind()?;
+            return Some(crate::i18n::registry(&kind, lang));
+        }
+        if let Some(ws) = cause.downcast_ref::<mcsup::service::WorkspaceError>() {
+            let kind = ws.kind()?;
+            return Some(crate::i18n::workspace(&kind, lang));
         }
     }
     None

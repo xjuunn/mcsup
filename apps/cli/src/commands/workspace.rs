@@ -1,4 +1,4 @@
-﻿use crate::bootstrap;
+use crate::bootstrap;
 use crate::cli::WorkspaceAction;
 use crate::diagnostic::AppDiagnostic;
 use crate::output::Printer;
@@ -141,9 +141,23 @@ pub(crate) fn init(
         }
     }
 
-    match svc.init(&dir, name.as_deref())? {
+    report_init(svc.init(&dir, name.as_deref())?, printer)
+}
+
+/// 输出 `workspace init` 的三种结果；JSON 模式只出数据行，文案不参与
+fn report_init(outcome: InitOutcome, printer: Printer) -> Result<()> {
+    let lang = printer.lang();
+    match outcome {
         InitOutcome::Created(ws) => printer.print_outcome(
-            &format!("已创建并注册: {} ({})", ws.name, ws.path.display()),
+            &crate::i18n::pick(
+                lang,
+                format!("已创建并注册: {} ({})", ws.name, ws.path.display()),
+                format!(
+                    "created and registered: {} ({})",
+                    ws.name,
+                    ws.path.display()
+                ),
+            ),
             &WorkspaceInitRow {
                 name: ws.name.as_str(),
                 path: ws.path.display().to_string(),
@@ -151,7 +165,15 @@ pub(crate) fn init(
             },
         )?,
         InitOutcome::Recovered(ws) => printer.print_outcome(
-            &format!("已补注册（上次中断）: {} ({})", ws.name, ws.path.display()),
+            &crate::i18n::pick(
+                lang,
+                format!("已补注册（上次中断）: {} ({})", ws.name, ws.path.display()),
+                format!(
+                    "registered after an interrupted run: {} ({})",
+                    ws.name,
+                    ws.path.display()
+                ),
+            ),
             &WorkspaceInitRow {
                 name: ws.name.as_str(),
                 path: ws.path.display().to_string(),
@@ -159,11 +181,20 @@ pub(crate) fn init(
             },
         )?,
         InitOutcome::AlreadyRegistered(ws) => printer.print_outcome(
-            &format!(
-                "已注册过: {} ({})，可用 mcsup workspace use {}",
-                ws.name,
-                ws.path.display(),
-                ws.name
+            &crate::i18n::pick(
+                lang,
+                format!(
+                    "已注册过: {} ({})，可用 mcsup workspace use {}",
+                    ws.name,
+                    ws.path.display(),
+                    ws.name
+                ),
+                format!(
+                    "already registered: {} ({}); use `mcsup workspace use {}`",
+                    ws.name,
+                    ws.path.display(),
+                    ws.name
+                ),
             ),
             &WorkspaceInitRow {
                 name: ws.name.as_str(),
@@ -188,12 +219,22 @@ fn list(svc: &WorkspaceService, reg: &ServerRegistry, printer: Printer) -> Resul
             })
         })
         .collect::<Result<_>>()?;
+    let lang = printer.lang();
     printer.print_rows(
         &rows,
-        "尚无工作目录，先运行 mcsup workspace init",
+        crate::i18n::text(
+            lang,
+            "尚无工作目录，先运行 mcsup workspace init",
+            "no workspaces yet; run `mcsup workspace init` first",
+        ),
         || {
             let mut table = Table::new();
-            table.set_header(["名称", "路径", "服务器数", "当前"]);
+            table.set_header([
+                crate::i18n::text(lang, "名称", "name"),
+                crate::i18n::text(lang, "路径", "path"),
+                crate::i18n::text(lang, "服务器数", "servers"),
+                crate::i18n::text(lang, "当前", "current"),
+            ]);
             for (ws, row) in all.iter().zip(&rows) {
                 table.add_row([
                     ws.name.as_str().to_owned(),

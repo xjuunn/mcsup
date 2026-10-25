@@ -10,13 +10,23 @@
 
 use crate::locale::Lang;
 use mcsup::service::{
-    BusyOp, CheckKind, InstallJarErrorKind, LifecycleErrorKind, SettingsErrorKind,
+    BusyOp, CheckKind, InstallJarErrorKind, LifecycleErrorKind, ServerRegistryErrorKind,
+    SettingsErrorKind, WorkspaceErrorKind,
 };
 use std::time::Duration;
 
 /// 二元短文案：没有参数要插时才用这个，避免为零散界面词各建一个函数
 #[must_use]
 pub(crate) const fn text(lang: Lang, zh: &'static str, en: &'static str) -> &'static str {
+    match lang {
+        Lang::Zh => zh,
+        Lang::En => en,
+    }
+}
+
+/// 二元长文案：两侧已渲染好（含插值）时用这个
+#[must_use]
+pub(crate) fn pick(lang: Lang, zh: String, en: String) -> String {
     match lang {
         Lang::Zh => zh,
         Lang::En => en,
@@ -305,6 +315,87 @@ fn check_fix_en(kind: &CheckKind) -> String {
     }
 }
 
+/// 服务器注册表错误提示
+#[must_use]
+pub(crate) fn registry(kind: &ServerRegistryErrorKind<'_>, lang: Lang) -> String {
+    match kind {
+        ServerRegistryErrorKind::AlreadyExists { name } => match lang {
+            Lang::Zh => format!("服务器 {name} 已存在"),
+            Lang::En => format!("server {name} already exists"),
+        },
+        ServerRegistryErrorKind::NotFound { name } => match lang {
+            Lang::Zh => format!("服务器 {name} 不存在"),
+            Lang::En => format!("server {name} not found"),
+        },
+        ServerRegistryErrorKind::TargetInsideWorkspace { path } => match lang {
+            Lang::Zh => format!(
+                "目标位于某个工作区的 servers/ 内，不能链接：{}",
+                path.display()
+            ),
+            Lang::En => format!(
+                "the target is inside a workspace servers/ directory and cannot be linked: {}",
+                path.display()
+            ),
+        },
+        ServerRegistryErrorKind::WorkspaceMismatch { owner, selected } => match lang {
+            Lang::Zh => format!("该目录属于工作区 `{owner}`，但 --workspace 解析到 `{selected}`"),
+            Lang::En => format!(
+                "the target belongs to workspace `{owner}`, but --workspace resolved to `{selected}`"
+            ),
+        },
+        _ => "server registry operation failed".to_owned(),
+    }
+}
+
+/// 工作区错误提示
+#[must_use]
+pub(crate) fn workspace(kind: &WorkspaceErrorKind<'_>, lang: Lang) -> String {
+    match kind {
+        WorkspaceErrorKind::NotEmpty { path } => match lang {
+            Lang::Zh => format!("目录非空：{}", path.display()),
+            Lang::En => format!("directory is not empty: {}", path.display()),
+        },
+        WorkspaceErrorKind::NotAWorkspace { path } => match lang {
+            Lang::Zh => format!("不是工作区（缺少 workspace.toml）：{}", path.display()),
+            Lang::En => format!(
+                "not a workspace (missing workspace.toml): {}",
+                path.display()
+            ),
+        },
+        WorkspaceErrorKind::AlreadyExists { name } => match lang {
+            Lang::Zh => format!("已存在：{name}"),
+            Lang::En => format!("already exists: {name}"),
+        },
+        WorkspaceErrorKind::NotFound { name } => match lang {
+            Lang::Zh => format!("工作区不存在：{name}"),
+            Lang::En => format!("workspace not found: {name}"),
+        },
+        WorkspaceErrorKind::Ambiguous {
+            selector,
+            candidates,
+        } => match lang {
+            Lang::Zh => format!(
+                "工作区选择器 {selector:?} 匹配到多个候选：{}",
+                candidates.join(", ")
+            ),
+            Lang::En => format!(
+                "ambiguous workspace selector {selector:?}; candidates: {}",
+                candidates.join(", ")
+            ),
+        },
+        WorkspaceErrorKind::NoCurrent => match lang {
+            Lang::Zh => {
+                "尚无当前工作区，先执行 mcsup workspace init 或 mcsup workspace use".to_owned()
+            }
+            Lang::En => {
+                "no current workspace; run `mcsup workspace init` or `mcsup workspace use` first"
+                    .to_owned()
+            }
+        },
+        _ => "workspace operation failed".to_owned(),
+    }
+}
+
 /// 时长：`30s` / `1m30s`
 fn fmt_duration(waited: Duration) -> String {
     let secs = waited.as_secs();
@@ -320,7 +411,9 @@ mod tests {
     use super::*;
     use mcsup::domain::java::JavaMajor;
     use mcsup::domain::server::world::DataVersion;
-    use mcsup::service::{InstallJarError, LifecycleError, SettingsError};
+    use mcsup::service::{
+        InstallJarError, LifecycleError, ServerRegistryError, SettingsError, WorkspaceError,
+    };
 
     #[test]
     fn lifecycle_variants_render_chinese() {
@@ -448,6 +541,43 @@ mod tests {
             settings(&err.kind().expect("kind"), Lang::En),
             "Java 17 is not registered; run `mcsup java install 17`"
         );
+    }
+
+    #[test]
+    fn registry_renders_both_languages() {
+        let err = ServerRegistryError::NotFound("alpha".to_owned());
+        assert_eq!(
+            registry(&err.kind().expect("kind"), Lang::Zh),
+            "服务器 alpha 不存在"
+        );
+        assert_eq!(
+            registry(&err.kind().expect("kind"), Lang::En),
+            "server alpha not found"
+        );
+    }
+
+    #[test]
+    fn workspace_renders_both_languages() {
+        let err = WorkspaceError::NoCurrent;
+        assert_eq!(
+            workspace(&err.kind().expect("kind"), Lang::Zh),
+            "尚无当前工作区，先执行 mcsup workspace init 或 mcsup workspace use"
+        );
+        assert_eq!(
+            workspace(&err.kind().expect("kind"), Lang::En),
+            "no current workspace; run `mcsup workspace init` or `mcsup workspace use` first"
+        );
+        let missing = WorkspaceError::NotFound("ws".to_owned());
+        assert_eq!(
+            workspace(&missing.kind().expect("kind"), Lang::Zh),
+            "工作区不存在：ws"
+        );
+        // 包装变体不下钻：返回 None 让入口沿错误链继续找
+        let wrapped = WorkspaceError::AlreadyExists("ws".to_owned());
+        assert!(matches!(
+            wrapped.kind(),
+            Some(WorkspaceErrorKind::AlreadyExists { .. })
+        ));
     }
 
     #[test]

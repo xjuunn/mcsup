@@ -53,6 +53,57 @@ pub enum ServerRegistryError {
     WorkspaceMismatch { owner: String, selected: String },
 }
 
+impl ServerRegistryError {
+    /// 面向用户展示的分类；结构化错误不带文案，入口按此渲染提示
+    ///
+    /// 包装类变体（[`Self::Workspace`] / [`Self::Fs`] / [`Self::Repo`] /
+    /// [`Self::InvalidName`]）各自有自己的 `Display` 或 `kind`，此处返回 `None`
+    /// 让入口继续沿错误链找。
+    #[must_use]
+    pub fn kind(&self) -> Option<ServerRegistryErrorKind<'_>> {
+        let kind = match self {
+            Self::Workspace(_) | Self::Fs(_) | Self::Repo(_) | Self::InvalidName(_) => return None,
+            Self::AlreadyExists(name) => ServerRegistryErrorKind::AlreadyExists { name },
+            Self::NotFound(name) => ServerRegistryErrorKind::NotFound { name },
+            Self::TargetInsideWorkspace(path) => {
+                ServerRegistryErrorKind::TargetInsideWorkspace { path }
+            }
+            Self::WorkspaceMismatch { owner, selected } => {
+                ServerRegistryErrorKind::WorkspaceMismatch { owner, selected }
+            }
+        };
+        Some(kind)
+    }
+}
+
+/// [`ServerRegistryError::kind`] 的结果：只带判定与参数，文案由入口渲染
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub enum ServerRegistryErrorKind<'a> {
+    /// 名称冲突或目标目录已存在
+    AlreadyExists {
+        /// 服务器名
+        name: &'a str,
+    },
+    /// 服务器不存在
+    NotFound {
+        /// 服务器名
+        name: &'a str,
+    },
+    /// 目标位于某个工作区的 servers/ 内，禁止 link
+    TargetInsideWorkspace {
+        /// 目标路径
+        path: &'a Path,
+    },
+    /// 目标属于另一个工作区
+    WorkspaceMismatch {
+        /// 目标所属工作区
+        owner: &'a str,
+        /// `--workspace` 解析出的工作区
+        selected: &'a str,
+    },
+}
+
 /// 服务端核心安装失败（注册表定位 + 下载编排）
 ///
 /// [`Self::Inspect`] 与 [`Self::Downgrade`] 会被入口直接展示，文案由入口按
