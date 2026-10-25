@@ -11,11 +11,11 @@ impl LogLevel for ZhLevel {
     }
 
     fn verbose_help() -> Option<&'static str> {
-        Some("提升日志级别（可重复）")
+        Some(crate::meta::verbose_arg())
     }
 
     fn quiet_help() -> Option<&'static str> {
-        Some("降低日志级别（可重复）")
+        Some(crate::meta::quiet_arg())
     }
 }
 

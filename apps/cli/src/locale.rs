@@ -106,6 +106,33 @@ pub(crate) fn detect(choice: LangChoice) -> Lang {
     lang
 }
 
+/// 进程级界面语言
+///
+/// clap 的 `about` / `help` 参数在 `Cli::command()` 构建命令树时求值，那条路径
+/// 拿不到 `Cli`，只能从进程状态读。写入只发生在启动时一次，之后全是读，
+/// 不存在并发改写；测试里也用它切换断言语言。
+static CURRENT: std::sync::OnceLock<std::sync::RwLock<Lang>> = std::sync::OnceLock::new();
+
+fn cell() -> &'static std::sync::RwLock<Lang> {
+    CURRENT.get_or_init(|| std::sync::RwLock::new(Lang::En))
+}
+
+/// 当前进程语言；未设置时英文
+#[must_use]
+pub(crate) fn current() -> Lang {
+    // 锁中毒只会让语言停在旧值，不影响正确性，故用 unwrap_or_else 兜底
+    *cell()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// 设置进程语言
+pub(crate) fn set(lang: Lang) {
+    *cell()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = lang;
+}
+
 /// stdout 能否正确显示非 ASCII
 ///
 /// 非终端（管道 / 重定向到文件）不做编码判断：此时没有「显示」这回事，

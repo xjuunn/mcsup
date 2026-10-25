@@ -9,6 +9,7 @@ mod i18n;
 mod input;
 mod keymap;
 mod locale;
+mod meta;
 mod output;
 mod progress;
 mod prompts;

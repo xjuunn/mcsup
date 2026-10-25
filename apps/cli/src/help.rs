@@ -57,14 +57,19 @@ fn replacements(lang: Lang) -> &'static [(&'static str, &'static str)] {
 }
 
 /// 解析命令行；帮助 / 版本输出现已本地化，错误仍走 clap 默认
+///
+/// 语言必须在 `try_parse` **之前**写入进程状态：clap 构建命令树时会调用
+/// `crate::meta::*` 求值 `about` / `help`，那时命令树就已经定稿。
 pub(crate) fn parse() -> Cli {
+    let lang = Lang::detect_help();
+    crate::locale::set(lang);
     match Cli::try_parse() {
         Ok(cli) => cli,
-        Err(err) => exit_with(&err),
+        Err(err) => exit_with(&err, lang),
     }
 }
 
-fn exit_with(err: &clap::Error) -> ! {
+fn exit_with(err: &clap::Error, lang: Lang) -> ! {
     // 用法错误仍交给 clap 打印到 stderr 并以 2 退出
     if !matches!(
         err.kind(),
@@ -75,7 +80,7 @@ fn exit_with(err: &clap::Error) -> ! {
         err.exit();
     }
 
-    let text = localize(&render(err), Lang::detect_help(), replacements);
+    let text = localize(&render(err), lang, replacements);
     // 输出可能被管道截断（如 `mcsup --help | head`），写失败不算错误
     if err.use_stderr() {
         let mut stream = std::io::stderr();

@@ -367,24 +367,50 @@ fn no_args_help_is_chinese_on_stderr() {
     assert!(err.contains("命令:"), "{err}");
 }
 
-/// `--lang en` 在中文系统上也必须给英文帮助
+/// `--lang en` 在中文系统上也必须给英文帮助，且整份不残留任何中文
 #[test]
 fn help_output_follows_lang_flag() {
     let home = temp_home();
-    for args in [
-        vec!["--help", "--lang", "en"],
-        vec!["workspace", "-h", "--lang", "en"],
-    ] {
-        let out = run(home.path(), &args);
+    // 覆盖各层：顶层 / 一级子命令 / 二级子命令 / 带参数说明的命令
+    let cases: [&[&str]; 6] = [
+        &["--help", "--lang", "en"],
+        &["workspace", "-h", "--lang", "en"],
+        &["server", "--help", "--lang", "en"],
+        &["server", "create", "--help", "--lang", "en"],
+        &["java", "install", "--help", "--lang", "en"],
+        &["workspace", "doctor", "--help", "--lang", "en"],
+    ];
+    for args in cases {
+        let out = run(home.path(), args);
         assert_eq!(out.status.code(), Some(0), "{args:?}");
         let text = String::from_utf8_lossy(&out.stdout);
         assert!(text.contains("Usage:"), "{args:?}\n{text}");
         assert!(text.contains("Options:"), "{args:?}\n{text}");
-        assert!(!text.contains("用法:"), "{args:?} 不应残留中文:\n{text}");
+        assert!(
+            !has_cjk(&text),
+            "{args:?} 英文帮助残留中文:\n{}",
+            first_cjk_run(&text)
+        );
     }
     // `--lang=en` 等号写法与分开写等价，且在子命令之前也生效
     let out = run(home.path(), &["--lang=en", "workspace", "-h"]);
     assert!(String::from_utf8_lossy(&out.stdout).contains("Usage:"));
+}
+
+/// 是否含中日韩统一表意文字
+fn has_cjk(text: &str) -> bool {
+    text.chars()
+        .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c) || ('\u{3000}'..='\u{303f}').contains(&c))
+}
+
+/// 报错时给出第一段中文及上下文，便于定位漏译条目
+fn first_cjk_run(text: &str) -> String {
+    for line in text.lines() {
+        if has_cjk(line) {
+            return format!("  {line}");
+        }
+    }
+    "  (none)".to_owned()
 }
 
 /// 未给 `--lang` 时读 `MCSUP_LANG`
