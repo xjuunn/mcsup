@@ -103,7 +103,7 @@ pub(crate) fn version(name: &str, printer: Printer) -> Result<()> {
     let srv = reg
         .get(name)
         .with_context(|| format!("服务器 {name} 不存在"))?;
-    let source = bootstrap::pick_source(srv.meta.variant, &bootstrap::jar_sources()?)
+    let source = bootstrap::pick_source(&srv.meta.variant, &bootstrap::jar_sources()?)
         .map_or("未知", |source| source.name());
     let jar = srv.meta.jar.as_ref().map(|jar| JarJson {
         path: jar.path.display().to_string(),

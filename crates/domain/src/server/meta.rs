@@ -145,6 +145,8 @@ mod tests {
     fn variant_roundtrip() {
         assert_eq!(ServerVariant::parse("vanilla"), Ok(ServerVariant::Vanilla));
         assert_eq!(ServerVariant::NeoForge.as_str(), "neoforge");
-        assert!(ServerVariant::parse("quilt").is_err());
+        // 内置集合里的新变体都已登记；不在内置集合的名字仍然判错
+        assert_eq!(ServerVariant::parse("quilt"), Ok(ServerVariant::Quilt));
+        assert!(ServerVariant::parse("not-a-variant").is_err());
     }
 }

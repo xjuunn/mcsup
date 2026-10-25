@@ -9,5 +9,6 @@ pub mod meta;
 pub mod props;
 pub mod settings;
 pub mod status;
+pub mod variant;
 pub mod version;
 pub mod world;

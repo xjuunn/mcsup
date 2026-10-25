@@ -1,0 +1,68 @@
+[
+  {
+    "id": 133,
+    "time": "2025-03-28T16:16:41.212Z",
+    "channel": "STABLE",
+    "commits": [
+      {
+        "sha": "3cb8529bdbeeec9ff51df2c94e93dbe7e41bb811",
+        "time": "2025-03-28T15:50:48Z",
+        "message": "Add flag to simplify remote item matching logic\n"
+      }
+    ],
+    "downloads": {
+      "server:default": {
+        "name": "paper-1.21.1-133.jar",
+        "checksums": {
+          "sha256": "39bd8c00b9e18de91dcabd3cc3dcfa5328685a53b7187a2f63280c22e2d287b9"
+        },
+        "size": 49394394,
+        "url": "https://fill-data.papermc.io/v1/objects/39bd8c00b9e18de91dcabd3cc3dcfa5328685a53b7187a2f63280c22e2d287b9/paper-1.21.1-133.jar"
+      }
+    }
+  },
+  {
+    "id": 132,
+    "time": "2024-11-21T10:16:32.029Z",
+    "channel": "STABLE",
+    "commits": [
+      {
+        "sha": "b48403bd69f534ffd43fe2afb4e8e1f1ffa95fe1",
+        "time": "2024-11-21T10:03:37Z",
+        "message": "Update spark\n"
+      }
+    ],
+    "downloads": {
+      "server:default": {
+        "name": "paper-1.21.1-132.jar",
+        "checksums": {
+          "sha256": "49716b013342c75f5fa141c8cda2647aa0a1e1818d2a61aae0a43299e35ff418"
+        },
+        "size": 49381098,
+        "url": "https://fill-data.papermc.io/v1/objects/49716b013342c75f5fa141c8cda2647aa0a1e1818d2a61aae0a43299e35ff418/paper-1.21.1-132.jar"
+      }
+    }
+  },
+  {
+    "id": 131,
+    "time": "2024-10-31T17:45:49.784Z",
+    "channel": "STABLE",
+    "commits": [
+      {
+        "sha": "84281ceeefb9d294758a9a292ba6c01da40e8409",
+        "time": "2024-10-31T17:12:36Z",
+        "message": "Don't count mobs twice in per-player-mob-spawns\n"
+      }
+    ],
+    "downloads": {
+      "server:default": {
+        "name": "paper-1.21.1-131.jar",
+        "checksums": {
+          "sha256": "dc7dd1b6a3093641f182e874e52637682e9fa9bbcc8025a1f761c5bbec2dd341"
+        },
+        "size": 49385248,
+        "url": "https://fill-data.papermc.io/v1/objects/dc7dd1b6a3093641f182e874e52637682e9fa9bbcc8025a1f761c5bbec2dd341/paper-1.21.1-131.jar"
+      }
+    }
+  }
+]

@@ -33,13 +33,13 @@ pub(crate) async fn run(
     let srv = registry
         .get(name)
         .with_context(|| format!("服务器 {name} 不存在"))?;
-    let source = bootstrap::source_for(srv.meta.variant, printer.lang())?;
+    let source = bootstrap::source_for(&srv.meta.variant, printer.lang())?;
     let version_id = match version {
         Some(raw) => VersionId::new(raw),
         None => match default_version_source(srv.meta.jar.is_some(), printer.is_interactive()) {
             VersionSource::Recorded => srv.meta.version.clone(),
             VersionSource::Prompt => {
-                pick_version(source.as_ref(), srv.meta.variant, printer).await?
+                pick_version(source.as_ref(), &srv.meta.variant, printer).await?
             }
             VersionSource::Latest => VersionId::new("latest"),
         },
@@ -77,7 +77,7 @@ fn default_version_source(has_jar: bool, interactive: bool) -> VersionSource {
 /// 就要决定要不要组建 `InstallerContext`，只能按变体判。`_` 兜底覆盖
 /// `#[non_exhaustive]` 将来新增的变体：默认按「不需要」处理，避免把
 /// 直接可运行的来源也拦在 Java 检查上。
-fn needs_installer_java(variant: ServerVariant) -> bool {
+fn needs_installer_java(variant: &ServerVariant) -> bool {
     matches!(variant, ServerVariant::Forge | ServerVariant::NeoForge)
 }
 
@@ -113,14 +113,14 @@ pub(crate) async fn download_jar(
     // 安装器类来源才需要 java。这里**不能**把失败吞成 `None`：service 会把
     // 「没给上下文」报成笼统的 `NoJavaForInstaller`，用户永远看不到真正原因
     // 是「本机没装 Java」还是「装的 Java 与大版本要求不符」。
-    let installer_ctx = if needs_installer_java(variant) {
+    let installer_ctx = if needs_installer_java(&variant) {
+        // 先把名字取出来：闭包会在 `variant` 之后还要读它，直接捕获会与
+        // `lifecycle` 的借用冲突
+        let variant_name = variant.as_str().to_owned();
         let java_bin = lifecycle
             .installer_java_bin(name, &mut || {}, &mut |_| {})
             .with_context(|| {
-                format!(
-                    "{} 需要先运行安装器，但找不到可用的 Java 运行时",
-                    variant.as_str()
-                )
+                format!("{variant_name} 需要先运行安装器，但找不到可用的 Java 运行时")
             })?;
         Some(mcsup::service::InstallerContext {
             java_bin,
@@ -158,7 +158,7 @@ pub(crate) async fn download_jar(
 /// 列表获取失败、来源无版本或读取选择失败时返回错误
 pub(crate) async fn pick_version(
     source: &dyn ServerJarSource,
-    variant: ServerVariant,
+    variant: &ServerVariant,
     printer: Printer,
 ) -> Result<VersionId> {
     let spinner = TaskSpinner::new(

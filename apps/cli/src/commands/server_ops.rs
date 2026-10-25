@@ -189,18 +189,24 @@ pub(crate) async fn create(
     };
 
     // 6. 版本（交互拉列表选择；来源随变体能力匹配）
-    let source = bootstrap::source_for(variant, printer.lang())?;
+    let source = bootstrap::source_for(&variant, printer.lang())?;
     let version_id = if let Some(version) = version {
         VersionId::new(version)
     } else {
         prompts::step(printer, 3, 3, "服务端版本");
-        pick_version(source.as_ref(), variant, printer).await?
+        pick_version(source.as_ref(), &variant, printer).await?
     };
 
     // Java 版本要求不在此预取：下载核心时 `install_jar` 会随元数据一并回写，
     // 预取会重复打一遍 manifest/details 网络请求
     let srv = reg
-        .create(selector.as_deref(), &name, &version_id, variant, None)
+        .create(
+            selector.as_deref(),
+            &name,
+            &version_id,
+            variant.clone(),
+            None,
+        )
         .with_context(|| format!("创建服务器 {name} 失败"))?;
 
     // 7. 下载核心：失败保留已注册结果，提示用 install 重试
@@ -247,13 +253,24 @@ pub(crate) async fn create(
     Ok(())
 }
 
-/// 显式 `--variant`：解析 + 能力校验；未知 / 未支持都判用法错误（退出码 2）
+/// 显式 `--variant`：名字归一 + 能力校验；未知 / 未支持都判用法错误（退出码 2）
+///
+/// 两级判定，顺序不能反：
+///
+/// 1. **名字合法**（[`ServerVariant::from_id`]）：空串、控制字符、路径分隔符
+///    直接拒。内置名在这里归一成内置项，其余名字成为第三方变体。
+/// 2. **有来源**（`available`）：名字合法但组合根没注册对应来源时，才报
+///    「暂未支持」。
+///
+/// 第 1 步**不能**用 [`ServerVariant::parse`] 只认内置集合：第三方宿主注册了
+/// `Custom` 变体的来源后，CLI 必须能通过 `--variant` 指名它，否则那个变体
+/// 在 CLI 里永远无法创建——注册表说了支持，入口却拒绝。
 fn resolve_flag_variant(
     raw: &str,
     available: &[ServerVariant],
     lang: Lang,
 ) -> Result<ServerVariant> {
-    let parsed = ServerVariant::parse(raw).map_err(|_| {
+    let parsed = ServerVariant::from_id(raw).map_err(|_| {
         anyhow::Error::from(AppDiagnostic::usage(
             crate::i18n::pick(
                 lang,
@@ -295,9 +312,9 @@ fn resolve_flag_variant(
 fn default_variant(available: &[ServerVariant], lang: Lang) -> Result<ServerVariant> {
     available
         .iter()
-        .copied()
-        .find(|variant| *variant == ServerVariant::Vanilla)
-        .or_else(|| available.first().copied())
+        .find(|variant| **variant == ServerVariant::Vanilla)
+        .or_else(|| available.first())
+        .cloned()
         .ok_or_else(|| {
             anyhow::anyhow!(crate::i18n::pick(
                 lang,
@@ -310,7 +327,7 @@ fn default_variant(available: &[ServerVariant], lang: Lang) -> Result<ServerVari
 /// 交互变体选择：仅列可用；单可用项免提问（不打步骤回显）
 fn pick_variant(available: &[ServerVariant], printer: Printer) -> Result<ServerVariant> {
     if let [only] = available {
-        return Ok(*only);
+        return Ok(only.clone());
     }
     prompts::step(printer, 2, 3, "服务端变体");
     let labels: Vec<String> = available.iter().map(|v| v.as_str().to_owned()).collect();
@@ -323,7 +340,7 @@ fn variant_from_label(picked: &str, available: &[ServerVariant]) -> Option<Serve
     available
         .iter()
         .find(|variant| variant.as_str() == picked)
-        .copied()
+        .cloned()
 }
 
 /// 名称重输：语法由 prompts 校验，重复（注册表已有）时警示后重问
@@ -477,8 +494,9 @@ mod tests {
             ServerVariant::Vanilla
         );
 
-        // 拼写未知 → 用法错误（2），并列出可用变体（help 经 miette 渲染携带）
-        let unknown = resolve_flag_variant("paperx", &available, Lang::Zh).expect_err("未知变体");
+        // 名字非法（含路径分隔符）→ 用法错误（2），并列出可用变体（help 经
+        // miette 渲染携带）
+        let unknown = resolve_flag_variant("../evil", &available, Lang::Zh).expect_err("未知变体");
         assert_eq!(Printer::exit_code(&unknown), 2);
         let msg = unknown.to_string();
         assert!(msg.contains("未知变体"), "{msg}");
@@ -488,16 +506,49 @@ mod tests {
         );
         assert!(rendered.contains("vanilla"), "{rendered}");
 
-        // 能解析但未注册 provider → 同判用法错误（2），文案区分
-        let unsupported = resolve_flag_variant("paper", &available, Lang::Zh).expect_err("未支持");
-        assert_eq!(Printer::exit_code(&unsupported), 2);
-        let msg = unsupported.to_string();
-        assert!(msg.contains("暂未支持"), "{msg}");
-        let rendered = format!(
-            "{:?}",
-            miette::Report::new(unsupported.downcast::<AppDiagnostic>().expect("usage 诊断"))
+        // 名字合法但未注册 provider → 同判用法错误（2），文案区分。
+        // `paper` 是内置名，`paperx` 是合法第三方名：两者都走这一分支
+        for raw in ["paper", "paperx"] {
+            let unsupported = resolve_flag_variant(raw, &available, Lang::Zh).expect_err("未支持");
+            assert_eq!(Printer::exit_code(&unsupported), 2);
+            let msg = unsupported.to_string();
+            assert!(msg.contains("暂未支持"), "{msg}");
+            let rendered = format!(
+                "{:?}",
+                miette::Report::new(unsupported.downcast::<AppDiagnostic>().expect("usage 诊断"))
+            );
+            assert!(rendered.contains("vanilla"), "{rendered}");
+        }
+    }
+
+    /// 第三方变体：名字合法且已注册来源时可以通过 `--variant` 指定
+    ///
+    /// 这是 `Custom` 变体在设计上的唯一用途——宿主注册了来源，入口就必须能
+    /// 指名它。用 `parse`（只认内置名）做第一级判定时这里会失败。
+    #[test]
+    fn resolve_flag_variant_accepts_registered_custom_variant() {
+        let custom = ServerVariant::from_id("acme-server").expect("合法第三方名");
+        let available = vec![ServerVariant::Vanilla, custom.clone()];
+        assert_eq!(
+            resolve_flag_variant("acme-server", &available, Lang::Zh).expect("已注册"),
+            custom
         );
-        assert!(rendered.contains("vanilla"), "{rendered}");
+    }
+
+    /// 空名与首尾空白都在领域层被拒（`VariantId` 不隐式 trim）
+    ///
+    /// 静默 trim 会让 `--variant " paper"` 与 `paper` 变成同一个变体的两种写法，
+    /// 存储里读回来就分不清用户原本敲了什么。内部空格不受影响。
+    #[test]
+    fn resolve_flag_variant_does_not_trim_names() {
+        let available = vec![ServerVariant::Vanilla];
+        for raw in ["", " ", "\t", "vanilla ", " vanilla"] {
+            let err = resolve_flag_variant(raw, &available, Lang::Zh).expect_err("应被拒");
+            assert!(err.to_string().contains("未知变体"), "{raw:?}: {err}");
+        }
+        // 内部空格是名字的一部分，不是首尾空白
+        let err = resolve_flag_variant("acme server", &available, Lang::Zh).expect_err("未注册");
+        assert!(err.to_string().contains("暂未支持"), "{err}");
     }
 
     #[test]
