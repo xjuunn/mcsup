@@ -84,8 +84,7 @@ pub(crate) fn init(
     let wizard = interactive && dir_flag.is_none();
     let seq = svc.next_default_name()?.as_str().to_owned();
     let cwd = std::env::current_dir().context("获取当前工作目录失败")?;
-    let data_root = crate::config::platform_data_dir()?;
-
+    let data_root = crate::config::platform_data_dir();
     // 1/3 位置：--dir / 非交互直接给定；完整向导走三选项
     let loc = if wizard {
         prompts::step(printer, 1, 3, "选择目录");

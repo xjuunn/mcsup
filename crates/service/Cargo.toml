@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 async-trait.workspace = true
+dirs.workspace = true
 domain = { version = "0.1.0", path = "../domain" }
 port = { version = "0.1.0", path = "../port" }
 serde = { workspace = true, features = ["derive"] }

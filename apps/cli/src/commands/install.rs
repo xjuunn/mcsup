@@ -26,7 +26,7 @@ use tracing::info;
 pub(crate) async fn run(
     name: &str,
     version: Option<&str>,
-    _cfg: &crate::config::Config,
+    _cfg: &crate::config::ConfigFile,
     printer: Printer,
 ) -> Result<()> {
     let registry = bootstrap::open_registry()?;

@@ -57,7 +57,17 @@ pub(crate) enum Command {
         action: RemoteAction,
     },
     /// 环境自检
-    Doctor,
+    Doctor {
+        /// 只跑指定检查项（kebab-case，逗号分隔）；缺省全跑
+        #[arg(long, value_name = "KIND", value_delimiter = ',')]
+        only: Vec<String>,
+        /// warning 也视为失败（CI 用）
+        #[arg(long)]
+        strict: bool,
+        /// 跳过联网检查（来源连通性）
+        #[arg(long)]
+        offline: bool,
+    },
     /// 查看 / 编辑平台配置
     Config {
         #[command(subcommand)]
@@ -333,6 +343,8 @@ pub(crate) enum ConfigAction {
     Show,
     /// 设置配置项
     Set { key: String, value: String },
+    /// 恢复为平台缺省
+    Unset { key: String },
     /// 打开编辑器
     Edit,
 }

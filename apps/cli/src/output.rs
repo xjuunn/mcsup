@@ -1,7 +1,7 @@
 use crate::diagnostic::AppDiagnostic;
 use comfy_table::{Cell, Table};
 use mcsup::domain::server::version::VersionId;
-use owo_colors::OwoColorize;
+use owo_colors::{OwoColorize, Stream};
 use serde::Serialize;
 use std::fmt::{self};
 use std::io::IsTerminal;
@@ -47,7 +47,10 @@ impl Printer {
     #[allow(clippy::print_stdout)]
     pub(crate) fn print_warning(self, text: &str) {
         if self.format == OutputFormat::Human {
-            println!("{}", text.red());
+            println!(
+                "{}",
+                text.if_supports_color(Stream::Stdout, OwoColorize::red)
+            );
         }
     }
 
@@ -374,13 +377,20 @@ pub(crate) fn print_table(table: &Table) {
 
 #[allow(clippy::print_stdout)]
 fn print_styled(text: &str) {
-    println!("{}", text.bold());
+    // `bold()` 无条件写 ANSI，管道里会冒出转义序列；`if_supports_color` 才按
+    // 流是否终端 + 全局 override 决定
+    println!(
+        "{}",
+        text.if_supports_color(Stream::Stdout, OwoColorize::bold)
+    );
 }
 
 #[allow(clippy::print_stdout)]
 fn print_success(text: &str) {
-    let mark = "+".green();
-    println!("{mark} {text}");
+    println!(
+        "{} {text}",
+        "+".if_supports_color(Stream::Stdout, OwoColorize::green)
+    );
 }
 
 #[allow(clippy::print_stdout)]

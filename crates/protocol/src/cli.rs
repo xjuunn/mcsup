@@ -351,6 +351,93 @@ pub fn variant_str(variant: ServerVariant) -> &'static str {
     variant.as_str()
 }
 
+/// `config show` 的单行
+///
+/// `value` 永远是可用的生效值；`source` 说明它来自哪里，调用方不必自己去
+/// 比对缺省值。
+#[derive(Debug, Serialize)]
+pub struct ConfigRow<'a> {
+    /// 配置键（kebab-case）
+    pub key: &'a str,
+    /// 生效值
+    pub value: String,
+    /// 来源：`file`（配置文件中显式设置）/ `default`（平台缺省）
+    pub source: &'a str,
+}
+
+/// `config show` 结果
+#[derive(Debug, Serialize)]
+pub struct ConfigShowJson<'a> {
+    /// 行格式版本
+    pub schema: u32,
+    /// 配置文件路径
+    pub path: String,
+    /// 配置文件是否存在
+    pub exists: bool,
+    /// 全部配置键的生效值
+    pub items: Vec<ConfigRow<'a>>,
+}
+
+/// `config set` / `config unset` 结果
+#[derive(Debug, Serialize)]
+pub struct ConfigSetJson<'a> {
+    /// 被修改的键
+    pub key: &'a str,
+    /// 修改后的生效值
+    pub value: String,
+    /// `set` 时为 `Some`；`unset` 时为 `null`
+    pub previous: Option<String>,
+    /// 配置文件路径
+    pub path: String,
+}
+
+/// `doctor` 的一条发现
+#[derive(Debug, Serialize)]
+pub struct PlatformFindingJson<'a> {
+    /// 级别：`error` / `warning`
+    pub level: &'a str,
+    /// 发现类型标识（kebab-case）
+    pub kind: &'a str,
+    /// 结构化字段（含可寻址路径 / 名称）
+    pub detail: serde_json::Value,
+    /// 问题描述
+    pub message: String,
+    /// 修复建议
+    pub fix: String,
+}
+
+/// `doctor` 结果
+#[derive(Debug, Serialize)]
+pub struct PlatformDoctorJson<'a> {
+    /// 行格式版本
+    pub schema: u32,
+    /// 是否跑了联网检查
+    pub online: bool,
+    /// 是否存在 error 级发现
+    pub has_errors: bool,
+    /// error 级数量
+    pub errors: usize,
+    /// warning 级数量
+    pub warnings: usize,
+    /// 全部发现项
+    pub findings: Vec<PlatformFindingJson<'a>>,
+}
+
+/// `version` 结果
+#[derive(Debug, Serialize)]
+pub struct VersionInfoJson<'a> {
+    /// 程序名
+    pub name: &'a str,
+    /// 版本号（与 `--version` 一致）
+    pub version: &'a str,
+    /// 构建目标三元组
+    pub target: &'a str,
+    /// 编译配置：`debug` / `release`
+    pub profile: &'a str,
+    /// supervisor IPC 协议版本
+    pub protocol_version: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
