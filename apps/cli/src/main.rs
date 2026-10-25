@@ -4,6 +4,7 @@ mod commands;
 mod completions;
 mod config;
 mod diagnostic;
+mod help;
 mod input;
 mod keymap;
 mod output;
@@ -11,7 +12,6 @@ mod progress;
 mod prompts;
 mod verbosity;
 
-use clap::Parser;
 use std::{env, process::ExitCode};
 
 #[tokio::main]
@@ -20,7 +20,7 @@ async fn main() -> ExitCode {
     let _ = miette::set_hook(Box::new(
         |_| Box::new(miette::GraphicalReportHandler::new()),
     ));
-    let cli = cli::Cli::parse();
+    let cli = help::parse();
     verbosity::init(cli.verbose);
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "启动");
 
