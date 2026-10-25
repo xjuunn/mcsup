@@ -162,10 +162,13 @@ impl FabricSource {
 
     /// 按 [`Picks`] 选出 loader 与安装器版本
     ///
-    /// 两种策略都先确认版本在上游列表里：不存在的版本直接拼进下载地址只会
-    /// 得到 `400` / `404` 这类语义模糊的状态码错误，提前判定能如实报成
-    /// [`SourceError::NotFound`]。
+    /// `Fixed` 直接透传：上游对不存在的 loader / installer 会回 `400` 并附
+    /// `Unable to find valid version for ...`，该说明由 [`SourceError::Upstream`]
+    /// 保留下来，比本地再拉一遍列表更准确，也省掉两次请求。
     async fn pick_versions(&self, game: &str) -> Result<(String, String), SourceError> {
+        if let Picks::Fixed { loader, installer } = &self.picks {
+            return Ok((loader.clone(), installer.clone()));
+        }
         let loaders: Vec<LoaderVersion> = self
             .get(&format!("{}/v2/versions/loader", self.base_url), None)
             .await?;
@@ -177,20 +180,17 @@ impl FabricSource {
     }
 }
 
-/// 按 [`Picks`] 选出 loader 与安装器版本，任一缺失返回 `None`
+/// 按 [`Picks`] 选出 loader 与安装器版本，`LatestStable` 无稳定版时返回 `None`
 ///
-/// 纯函数：不碰网络，便于覆盖「固定版本是否存在」这类分支。
+/// 纯函数：不碰网络，便于覆盖「没有稳定版」这类分支。
 fn select_versions(
     picks: &Picks,
     loaders: &[LoaderVersion],
     installers: &[InstallerVersion],
 ) -> Option<(String, String)> {
     match picks {
-        Picks::Fixed { loader, installer } => {
-            let has_loader = loaders.iter().any(|v| &v.version == loader);
-            let has_installer = installers.iter().any(|v| &v.version == installer);
-            (has_loader && has_installer).then(|| (loader.clone(), installer.clone()))
-        }
+        // 不会走到：`Fixed` 在 `pick_versions` 里已提前返回
+        Picks::Fixed { loader, installer } => Some((loader.clone(), installer.clone())),
         Picks::LatestStable => {
             let loader = pick_stable(loaders.iter().map(|v| (v.version.as_str(), v.stable)))?;
             let installer = pick_stable(installers.iter().map(|v| (v.version.as_str(), v.stable)))?;
@@ -443,37 +443,25 @@ mod tests {
         );
     }
 
-    /// 固定版本存在于列表时如实返回
-    #[test]
-    fn select_versions_fixed_hits_existing_version() {
-        let picks = Picks::Fixed {
-            loader: "0.16.10".to_owned(),
-            installer: "1.1.2".to_owned(),
-        };
-        let loaders = loaders();
-        let installers = installers();
+    /// 固定 loader / installer：直接透传，不再拉列表校验
+    ///
+    /// 上游对不存在的组合回 `400` + `Unable to find valid version for ...`，
+    /// 由 `SourceError::Upstream` 带出，比本地多拉两次列表更准确
+    #[tokio::test]
+    async fn fixed_picks_pass_through_without_listing() {
+        let source = FabricSource::builder()
+            .picks(Picks::Fixed {
+                loader: "9.9.9".to_owned(),
+                installer: "8.8.8".to_owned(),
+            })
+            .base_url("https://example.invalid/fabric-meta")
+            .build()
+            .expect("fabric source");
+        // 不存在的 loader / installer 也必须原样返回：不联网、不校验
         assert_eq!(
-            select_versions(&picks, &loaders, &installers),
-            Some(("0.16.10".to_owned(), "1.1.2".to_owned()))
+            source.pick_versions("1.21.1").await.expect("透传"),
+            ("9.9.9".to_owned(), "8.8.8".to_owned())
         );
-    }
-
-    /// 固定的 loader 或 installer 不在列表里时返回 `None`（上层报 `NotFound`），
-    /// 而不是把不存在的版本拼进下载地址换来 400 / 404
-    #[test]
-    fn select_versions_fixed_rejects_unknown_version() {
-        let bad_loader = Picks::Fixed {
-            loader: "9.9.9".to_owned(),
-            installer: "1.1.2".to_owned(),
-        };
-        let bad_installer = Picks::Fixed {
-            loader: "0.16.10".to_owned(),
-            installer: "9.9.9".to_owned(),
-        };
-        let loaders = loaders();
-        let installers = installers();
-        assert_eq!(select_versions(&bad_loader, &loaders, &installers), None);
-        assert_eq!(select_versions(&bad_installer, &loaders, &installers), None);
     }
 
     /// 默认策略选最新稳定 loader + 最新稳定 installer

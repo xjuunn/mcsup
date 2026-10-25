@@ -361,9 +361,13 @@ fn download_exit_code(err: &mcsup::port::DownloadError) -> u8 {
 
 fn source_exit_code(source: &mcsup::port::SourceError) -> u8 {
     match source {
-        mcsup::port::SourceError::NotFound(_) => 3,
+        // 400 是「你给的版本组合不存在」，与 NotFound 同为「资源不存在」，
+        // 归 3；其余上游拒绝（5xx 等）仍是后端失败
+        mcsup::port::SourceError::NotFound(_)
+        | mcsup::port::SourceError::Upstream { status: 400, .. } => 3,
         mcsup::port::SourceError::Network(_)
         | mcsup::port::SourceError::Status { .. }
+        | mcsup::port::SourceError::Upstream { .. }
         | mcsup::port::SourceError::Init(_) => 5,
         _ => 1,
     }

@@ -82,12 +82,34 @@ impl ByteSource for HttpByteSource {
             .map_err(map_transport)?;
         let status = response.status();
         if !status.is_success() {
-            return Err(SourceError::Status {
-                status: status.as_u16(),
-            });
+            let code = status.as_u16();
+            return Err(rejection(code, extract_message(response).await));
         }
         Ok(Box::new(HttpBody { response }))
     }
+}
+
+/// 上游响应体里可读的错误说明，最多取 [`MESSAGE_LIMIT`] 字节
+///
+/// 上游常以纯文本回一句原因（如 Fabric 的 `Unable to find valid version for
+/// loader_version`），比只剩状态码有用得多；读不出来时返回空串。
+const MESSAGE_LIMIT: usize = 512;
+
+async fn extract_message(response: reqwest::Response) -> Option<String> {
+    let text = response.text().await.ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.chars().take(MESSAGE_LIMIT).collect())
+}
+
+/// 非 2xx 的归类：有可读说明时用 [`SourceError::Upstream`] 保留原文，
+/// 否则退回 [`SourceError::Status`]
+fn rejection(status: u16, message: Option<String>) -> SourceError {
+    message.map_or(SourceError::Status { status }, |message| {
+        SourceError::Upstream { status, message }
+    })
 }
 
 struct HttpBody {
@@ -130,12 +152,13 @@ where
     let status = response.status();
     if !status.is_success() {
         let code = status.as_u16();
+        // 目标版本已判定不存在时不读 body：`NotFound` 比上游文案更贴合调用方语义
         if code == 404
             && let Some(id) = not_found_id
         {
             return Err(SourceError::NotFound(id));
         }
-        return Err(SourceError::Status { status: code });
+        return Err(rejection(code, extract_message(response).await));
     }
     response.json().await.map_err(|err| {
         if err.is_decode() {

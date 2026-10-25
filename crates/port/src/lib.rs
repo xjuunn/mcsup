@@ -25,6 +25,13 @@ pub enum SourceError {
     /// 上游返回非成功状态码
     #[error("unexpected HTTP status: {status}")]
     Status { status: u16 },
+    /// 上游明确拒绝了请求并说明了原因（如 Fabric 的
+    /// `Unable to find valid version for loader_version`）
+    ///
+    /// 与 [`Self::Status`] 的区别：这里保留了上游响应体，错误信息可直接展示给
+    /// 用户，不必再猜哪里配错了。
+    #[error("upstream rejected the request ({status}): {message}")]
+    Upstream { status: u16, message: String },
     /// 传输层失败，连接、超时、状态码，通常可重试
     #[error("network error: {0}")]
     Network(#[source] Box<dyn std::error::Error + Send + Sync>),
@@ -40,7 +47,10 @@ impl SourceError {
     #[must_use]
     pub fn retryable(&self) -> bool {
         match self {
-            Self::Status { status } => *status == 429 || *status >= 500,
+            // 400 是请求本身不对（版本号配错），重试同样不会成功
+            Self::Status { status } | Self::Upstream { status, .. } => {
+                *status == 429 || *status >= 500
+            }
             Self::Network(_) => true,
             Self::NotFound(_) | Self::Decode(_) | Self::Init(_) => false,
         }
@@ -849,5 +859,36 @@ mod tests {
         assert!(SourceError::Status { status: 429 }.retryable());
         assert!(!SourceError::Status { status: 404 }.retryable());
         assert!(!SourceError::NotFound(VersionId::new("1.21.1")).retryable());
+    }
+
+    /// 上游拒绝时按状态码判定：400 是参数错（重试无用），5xx / 429 可重试
+    #[test]
+    fn upstream_rejection_retryability_follows_status() {
+        let bad_request = SourceError::Upstream {
+            status: 400,
+            message: "Unable to find valid version for loader_version".to_owned(),
+        };
+        assert!(!bad_request.retryable());
+        assert!(bad_request.to_string().contains("400"), "{bad_request}");
+        assert!(
+            bad_request
+                .to_string()
+                .contains("Unable to find valid version"),
+            "上游原文必须保留: {bad_request}"
+        );
+        assert!(
+            SourceError::Upstream {
+                status: 503,
+                message: String::new()
+            }
+            .retryable()
+        );
+        assert!(
+            SourceError::Upstream {
+                status: 429,
+                message: String::new()
+            }
+            .retryable()
+        );
     }
 }
