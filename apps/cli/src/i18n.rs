@@ -10,8 +10,8 @@
 
 use crate::locale::Lang;
 use mcsup::service::{
-    BusyOp, CheckKind, InstallJarErrorKind, LifecycleErrorKind, ServerRegistryErrorKind,
-    SettingsErrorKind, WorkspaceErrorKind,
+    BackupErrorKind, BusyOp, CheckKind, InstallJarErrorKind, LifecycleErrorKind,
+    ServerRegistryErrorKind, SettingsErrorKind, WorkspaceErrorKind,
 };
 use std::time::Duration;
 
@@ -166,6 +166,59 @@ pub(crate) fn settings(kind: &SettingsErrorKind<'_>, lang: Lang) -> String {
             Lang::En => format!("Java {major} is not registered; run `mcsup java install {major}`"),
         },
         _ => "failed to update server settings".to_owned(),
+    }
+}
+
+/// 备份错误提示
+#[must_use]
+pub(crate) fn backup(kind: &BackupErrorKind<'_>, lang: Lang) -> String {
+    match kind {
+        BackupErrorKind::SnapshotNotFound { id } => pick(
+            lang,
+            format!("快照 {id} 不存在，可用 mcsup server backup ls <name> 查看"),
+            format!("snapshot {id} does not exist; run `mcsup server backup ls <name>`"),
+        ),
+        BackupErrorKind::NotRestorable { id, status } => pick(
+            lang,
+            format!("快照 {id} 不可恢复（状态: {status}），只能从完整快照恢复"),
+            format!("snapshot {id} is not restorable (status: {status})"),
+        ),
+        BackupErrorKind::RestoreWhileRunning { name } => pick(
+            lang,
+            format!("服务器 {name} 正在运行，原地恢复前需先 mcsup server stop {name}"),
+            format!(
+                "server {name} is running; run `mcsup server stop {name}` before restoring in place"
+            ),
+        ),
+        BackupErrorKind::TargetExists { name } => pick(
+            lang,
+            format!("目标服务器 {name} 已存在，请换一个 --to 名称"),
+            format!("target server {name} already exists; choose another --to name"),
+        ),
+        BackupErrorKind::EmptyScope => pick(
+            lang,
+            "备份范围内没有任何文件，无可备份内容".to_owned(),
+            "nothing to back up in the configured scope".to_owned(),
+        ),
+        BackupErrorKind::VerifyFailed { id, broken } => pick(
+            lang,
+            format!("快照 {id} 校验失败：{} 个对象损坏或缺失", broken.len()),
+            format!(
+                "snapshot {id} is broken: {} corrupt or missing object(s)",
+                broken.len()
+            ),
+        ),
+        BackupErrorKind::InvalidLabel { raw } => pick(
+            lang,
+            format!("快照标签非法: {raw}（不能包含控制字符或换行，长度有上限）"),
+            format!("invalid snapshot label: {raw}"),
+        ),
+        BackupErrorKind::ConflictingRetention => pick(
+            lang,
+            "--keep 与 --older-than 只能二选一".to_owned(),
+            "--keep and --older-than are mutually exclusive".to_owned(),
+        ),
+        _ => "backup operation failed".to_owned(),
     }
 }
 

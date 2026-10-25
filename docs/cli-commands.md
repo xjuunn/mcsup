@@ -89,7 +89,7 @@
 | 顶层 | `ws` workspace · `srv` server · `mp` modpack · `jv` java · `rmt` remote · `doc` doctor · `cfg` config · `up` update · `comp` completions · `ver` version |
 | `workspace` | `in` / `new` init · `ls` list · `sw` use · `rm` remove · `doc` doctor |
 | `server` | `ls` list · `cr` create · `in` install · `up` start · `down` stop · `rs` restart · `st` status · `con` console · `snd` send · `log` logs · `prop` props · `cfg` set · `rm` remove · `ln` link · `ver` version · `bak` backup · `md` mod |
-| `server backup` | `cr` create · `ls` list · `rt` restore · `vf` verify · `pr` prune |
+| `server backup` | `cr` create · `ls` list · `rt` restore · `rm` delete · `vf` verify · `pr` prune |
 | `server mod` | `ls` list · `in` install · `rm` remove · `up` update · `od` outdated |
 | `modpack` | `ls` list · `in` install |
 | `java` | `ls` list · `sc` scan · `in` install · `un` / `rm` uninstall |
@@ -108,7 +108,7 @@ mcsup
 │   ├── start (up) / stop (down) / restart (rs)
 │   ├── status (st) / console (con) / send (snd) / logs (log)
 │   ├── props (prop) / set (cfg) / remove (rm) / version (ver)
-│   ├── backup (bak)  create (cr) · list (ls) · restore (rt) · verify (vf) · prune (pr)
+│   ├── backup (bak)  create (cr) · list (ls) · restore (rt) · delete (rm) · verify (vf) · prune (pr)
 │   └── mod (md)      list (ls) · install (in) · remove (rm) · update (up) · outdated (od)
 ├── modpack (mp)              # 整合包：一键建整包服务器
 │   ├── install (in) <pack> [--name <name>] [--workspace <ws>]
@@ -163,16 +163,22 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | `java-version` | 运行时版本 | 绑定本服务的 JVM 大版本（从 `mcsup java` 已注册运行时中按 major 匹配） |
 | `ram` | 如 `2G` / `1024M` | 启动内存上限 |
 | `autostart` | `true` / `false` | 机器启动时自动拉起 |
+| `backup-scope` | 如 `world,mods` 或 `all` | 备份范围：逗号分隔的顶层目录；缺省（`all`）= 整个服务器目录 |
 
 ## mcsup server backup（备份，属于服务端）
 
+备份按工作区共享 CAS 存储：`{workspace}/backups/cas` 存内容对象（SHA-256 两级分片），`{workspace}/backups/snapshots` 存快照记录。同一工作区内多台服务器、多个快照对相同内容只存一份。
+
 | 子命令 | 用法 | 说明 |
 | --- | --- | --- |
-| `create` | `mcsup server backup create <name> [--label <text>]` | 先触发 `save-all`、锁世界，再快照；返回快照 ID |
-| `list` | `mcsup server backup list <name>` | 快照列表：ID、时间、大小、完整性 |
-| `restore` | `mcsup server backup restore <name> <id> [--to <新名>]` | 恢复；`--to` 恢复到新服务，不动原服务 |
-| `verify` | `mcsup server backup verify <name> <id>` | 校验快照完整性（CAS/checksum） |
-| `prune` | `mcsup server backup prune <name> --keep <n> \| --older-than <dur>` | 按保留数或年龄清理 |
+| `create` | `mcsup server backup create <name> [--label <text>] [--scope <a,b>] [--no-reuse]` | 默认全量，有历史时按父快照增量复用未改动文件。运行中的服务器先发 `save-off`，完成后发 `save-on`（不停服）。`--scope` 覆盖服务属性 `backup-scope`，缺省为整个服务器目录。`--no-reuse` 强制重读全部文件 |
+| `list` | `mcsup server backup list <name> [--page <n>] [--page-size <n>]` | 分页历史表格：ID、时间、状态、文件数、大小、标签（缺省 20 条/页） |
+| `restore` | `mcsup server backup restore <name> [<id>] [--to <新名>]` | 恢复。缺 `id` 时交互选择。**原地恢复要求服务器已停止**（运行中返回退出码 4），恢复前自动生成安全快照；`--to` 恢复到新服务，原服务不动 |
+| `delete` | `mcsup server backup delete <name> [<id>]` | 删除某个快照记录；内容对象不即时删除，交由 `prune` 回收 |
+| `verify` | `mcsup server backup verify <name> [<id>]` | 校验快照引用的所有对象存在且哈希匹配；有损坏时返回退出码 1 |
+| `prune` | `mcsup server backup prune <name> [--keep <n> \| --older-than <dur>] [--dry-run]` | 按保留数或年龄删除快照，并回收整个工作区中不再被任何快照引用的 CAS 对象。`--dry-run` 只预览 |
+
+备份范围也可由服务属性 `backup-scope` 设定为仅备份个别顶层目录（见 `mcsup server set`）。
 
 ## mcsup server mod（Mod，属于服务端）
 

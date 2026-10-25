@@ -412,6 +412,125 @@ pub(crate) fn server_backup() -> &'static str {
 }
 
 #[must_use]
+pub(crate) fn backup_create() -> &'static str {
+    t(
+        "创建备份（默认全量，有历史时增量复用未改动文件）",
+        "create a backup (full by default; reuses unchanged files from history)",
+    )
+}
+
+#[must_use]
+pub(crate) fn backup_list() -> &'static str {
+    t(
+        "列出备份历史（支持分页）",
+        "list backup history (paginated)",
+    )
+}
+
+#[must_use]
+pub(crate) fn backup_restore() -> &'static str {
+    t(
+        "从备份恢复（原地恢复需先停服；--to 恢复到新服务）",
+        "restore from a backup (stop the server for in-place; --to restores into a new server)",
+    )
+}
+
+#[must_use]
+pub(crate) fn backup_delete() -> &'static str {
+    t(
+        "删除某个备份（对象交给 prune 回收）",
+        "delete a backup (objects reclaimed by prune)",
+    )
+}
+
+#[must_use]
+pub(crate) fn backup_verify() -> &'static str {
+    t(
+        "校验备份对象完整性与哈希",
+        "verify backup object integrity and hashes",
+    )
+}
+
+#[must_use]
+pub(crate) fn backup_prune() -> &'static str {
+    t(
+        "按保留策略清理备份并回收无引用对象（--dry-run 只预览）",
+        "prune backups by retention policy and reclaim unreferenced objects (--dry-run previews)",
+    )
+}
+
+#[must_use]
+pub(crate) fn backup_label_arg() -> &'static str {
+    t(
+        "快照标签，如 before-upgrade",
+        "snapshot label, e.g. before-upgrade",
+    )
+}
+
+#[must_use]
+pub(crate) fn backup_id_arg() -> &'static str {
+    t("快照 id（可用 ls 查看）", "snapshot id (see ls)")
+}
+
+#[must_use]
+pub(crate) fn backup_to_arg() -> &'static str {
+    t(
+        "恢复到新服务名（原服务保持不动）；缺省为原地恢复",
+        "restore into a new server name (original untouched); default is in-place",
+    )
+}
+
+#[must_use]
+pub(crate) fn backup_scope_arg() -> &'static str {
+    t(
+        "备份范围：逗号分隔的顶层目录（如 world,mods）；缺省用服务属性 backup-scope，再缺省为全部",
+        "backup scope: comma-separated top-level entries (e.g. world,mods); falls back to the backup-scope setting, then to everything",
+    )
+}
+
+#[must_use]
+pub(crate) fn backup_no_reuse_arg() -> &'static str {
+    t(
+        "禁用增量复用，强制重读全部文件（怀疑元数据不可靠时）",
+        "disable incremental reuse and re-read every file",
+    )
+}
+
+#[must_use]
+pub(crate) fn backup_page_arg() -> &'static str {
+    t("页码（1 基）", "page number (1-based)")
+}
+
+#[must_use]
+pub(crate) fn backup_page_size_arg() -> &'static str {
+    t("每页条数", "entries per page")
+}
+
+#[must_use]
+pub(crate) fn backup_keep_arg() -> &'static str {
+    t(
+        "只保留最近 N 份快照",
+        "keep only the most recent N snapshots",
+    )
+}
+
+#[must_use]
+pub(crate) fn backup_older_than_arg() -> &'static str {
+    t(
+        "删除早于该时长的快照（如 7d、24h、30m）",
+        "delete snapshots older than this age (e.g. 7d, 24h, 30m)",
+    )
+}
+
+#[must_use]
+pub(crate) fn backup_dry_run_arg() -> &'static str {
+    t(
+        "只预览将删除的内容，不实际修改",
+        "preview what would be removed without changing anything",
+    )
+}
+
+#[must_use]
 pub(crate) fn server_mod() -> &'static str {
     t("服务端 Mod", "server mods")
 }

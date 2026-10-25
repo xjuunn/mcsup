@@ -69,6 +69,8 @@ pub struct Mcsup {
     pub java: JavaService,
     /// 生命周期编排（start / stop / status / send / logs）
     pub lifecycle: ServerLifecycleService,
+    /// 备份编排（create / list / restore / delete / verify / prune）
+    pub backup: service::BackupService,
     /// 已注册的服务端 JAR 来源（能力查询数据源）
     pub jar_sources: Vec<Arc<dyn ServerJarSource>>,
     /// 元数据仓库句柄（Workspace / Server / Java 三个仓库共用）
@@ -296,12 +298,15 @@ impl McsupBuilder {
             Arc::clone(&workspaces_repo),
         ));
         let workspaces = WorkspaceService::new(workspaces_repo, servers_repo);
+        let supervisor: Arc<dyn port::SupervisorPort> = self
+            .supervisor
+            .unwrap_or_else(|| Arc::new(runtime::LocalSupervisor));
         let lifecycle = ServerLifecycleService::new(
             Arc::clone(&registry),
             java.clone(),
-            self.supervisor
-                .unwrap_or_else(|| Arc::new(runtime::LocalSupervisor)),
+            Arc::clone(&supervisor),
         );
+        let backup = service::BackupService::new(Arc::clone(&registry), supervisor);
 
         let jar_sources: Vec<Arc<dyn ServerJarSource>> = match self.jar_sources {
             Some(sources) => sources,
@@ -315,6 +320,7 @@ impl McsupBuilder {
             registry,
             java,
             lifecycle,
+            backup,
             jar_sources,
             store,
         })

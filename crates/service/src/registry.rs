@@ -1052,7 +1052,7 @@ mod tests {
                 .iter_mut()
                 .find(|m| &m.name == name)
                 .ok_or_else(|| RepositoryError::NotFound(name.as_str().to_owned()))?;
-            meta.settings = *settings;
+            meta.settings = settings.clone();
             meta.updated_at = updated_at;
             Ok(meta.clone())
         }

@@ -70,6 +70,9 @@ pub(crate) struct ServerEntry {
     pub(crate) ram_mib: Option<i32>,
     #[serde(default)]
     pub(crate) autostart: bool,
+    /// 备份范围：逗号分隔的顶层项；空 = 整个服务器目录
+    #[serde(default)]
+    pub(crate) backup_scope: Vec<String>,
 }
 
 /// 记录文件的一项：Java 运行时
@@ -138,6 +141,7 @@ impl From<&ServerMeta> for ServerEntry {
                 .ram_mib
                 .and_then(|mib| i32::try_from(mib).ok()),
             autostart: meta.settings.autostart,
+            backup_scope: meta.settings.backup_scope.entries().to_vec(),
         }
     }
 }
@@ -197,6 +201,8 @@ impl TryFrom<ServerEntry> for ServerMeta {
             java_major,
             ram_mib,
             autostart: entry.autostart,
+            backup_scope: domain::backup::BackupScope::from_entries(entry.backup_scope)
+                .map_err(|err| RepositoryError::Corrupt(format!("backup scope: {err}")))?,
         };
 
         Ok(Self {

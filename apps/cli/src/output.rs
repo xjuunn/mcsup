@@ -177,6 +177,9 @@ impl Printer {
             if let Some(props) = cause.downcast_ref::<mcsup::service::PropsError>() {
                 return props_exit_code(props);
             }
+            if let Some(backup) = cause.downcast_ref::<mcsup::service::BackupError>() {
+                return backup_exit_code(backup);
+            }
             if let Some(settings) = cause.downcast_ref::<mcsup::service::SettingsError>() {
                 return settings_exit_code(settings);
             }
@@ -270,6 +273,10 @@ fn structured_message(err: &anyhow::Error, lang: Lang) -> Option<String> {
             let kind = settings.kind()?;
             return Some(crate::i18n::settings(&kind, lang));
         }
+        if let Some(backup) = cause.downcast_ref::<mcsup::service::BackupError>() {
+            let kind = backup.kind()?;
+            return Some(crate::i18n::backup(&kind, lang));
+        }
         if let Some(reg) = cause.downcast_ref::<mcsup::service::ServerRegistryError>() {
             let kind = reg.kind()?;
             return Some(crate::i18n::registry(&kind, lang));
@@ -313,6 +320,20 @@ fn props_exit_code(err: &mcsup::service::PropsError) -> u8 {
     match err {
         Props::Registry(reg) => registry_exit_code(reg),
         Props::InvalidSet(_) => 2,
+        _ => 1,
+    }
+}
+
+/// 备份判级：原地恢复时服务器在运行 / 目标已存在 → 4（状态冲突）、
+/// 快照或服务器不存在 → 3、标签 / 保留策略非法 → 2、其余（IO / CAS / 记录）→ 1
+fn backup_exit_code(err: &mcsup::service::BackupError) -> u8 {
+    use mcsup::service::BackupError as Bak;
+    match err {
+        Bak::Registry(reg) => registry_exit_code(reg),
+        Bak::SnapshotNotFound(_) => 3,
+        // NotRestorable / 运行中做原地恢复 / 目标已存在：状态冲突
+        Bak::NotRestorable { .. } | Bak::RestoreWhileRunning { .. } | Bak::TargetExists(_) => 4,
+        Bak::InvalidLabel { .. } | Bak::ConflictingRetention => 2,
         _ => 1,
     }
 }

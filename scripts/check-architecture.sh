@@ -257,14 +257,15 @@ if [ -f "$pkg_manifest" ] && [ -f "$pkg_lib" ]; then
 		domain) printf '%s' 'domain' ;;
 		port) printf '%s' 'domain port' ;;
 		protocol) printf '%s' 'domain protocol' ;;
-		service) printf '%s' 'domain port service' ;;
+		service) printf '%s' 'domain port backup service' ;;
 		file) printf '%s' 'domain port file' ;;
 		java) printf '%s' 'domain port java' ;;
 		provider) printf '%s' 'domain port provider' ;;
 		storage) printf '%s' 'domain port storage' ;;
 		runtime) printf '%s' 'domain port protocol runtime' ;;
+		backup) printf '%s' 'domain port backup' ;;
 		# 组合 feature：一次拉入全部内层（默认组合根）
-		bootstrap) printf '%s' 'domain port protocol service file java provider storage runtime' ;;
+		bootstrap) printf '%s' 'domain port protocol service backup file java provider storage runtime' ;;
 		*) printf '%s' '' ;;
 		esac
 	}
