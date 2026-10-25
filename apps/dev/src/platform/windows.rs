@@ -1,20 +1,18 @@
-//! Windows 通知、截屏、文件管理器定位与事件日志。
+//! Windows 通知、文件管理器定位与事件日志。
 //!
 //! 通知直接调用 `WinRT` `Windows.UI.Notifications`（Toast），不启动
 //! `PowerShell`：文案在 Rust 侧拼进系统提供的 Toast 模板，由 `WinRT` 构建
 //! `ToastNotification` 并交给 `ToastNotificationManager` 显示。
 //!
-//! 事件日志、截屏、资源管理器定位同样不起脚本：事件日志经
-//! `wevtutil`（系统自带、无脚本解释）读取，截屏经 `WinRT` 的
-//! `Windows.Graphics.Capture` 之外的最短路径——`Graphics.CopyFromScreen`
-//! 不可用时如实报错，不伪造空白图。
+//! 事件日志与资源管理器定位同样不起脚本：事件日志经 `wevtutil`
+//! （系统自带、无脚本解释）读取。
 
 use std::path::Path;
 
 use windows::UI::Notifications::{ToastNotification, ToastNotificationManager, ToastTemplateType};
 use windows::core::HSTRING;
 
-use super::{CaptureError, Notification, NotifyError, RevealError};
+use super::{Notification, NotifyError, RevealError};
 use crate::tools::ToolError;
 use crate::tools::logs::LogEntry;
 
@@ -113,19 +111,6 @@ fn history_len() -> Option<u32> {
         .ok()?;
     let items = history.GetHistory().ok()?;
     items.Size().ok()
-}
-
-/// 截屏在当前实现下不可用。
-///
-/// `Graphics.CopyFromScreen` 需要 Win32 GDI，而仓库 `forbid(unsafe_code)` 禁止
-/// 直接调用。`Windows.Graphics.Capture` 需要窗口句柄与用户授权，不适合
-/// 作为工具的后台截图通道。这里如实报错，不返回伪造的空白图。
-pub(crate) fn capture_screen(_path: &Path) -> Result<(), CaptureError> {
-    Err(CaptureError::Unavailable(
-        "Windows 截屏需要 GDI / 屏幕捕获 API，与仓库 forbid(unsafe_code) 冲突；\
-         请使用系统截图工具（Win+Shift+S）"
-            .to_owned(),
-    ))
 }
 
 /// 在资源管理器中选中指定路径。

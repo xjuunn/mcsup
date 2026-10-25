@@ -97,18 +97,6 @@ impl DevToolsServer {
         tools::logs::read_system_log(Parameters(request)).await
     }
 
-    /// 截取屏幕。
-    #[tool(
-        name = "take_screenshot",
-        description = "截取整个屏幕并保存到 .mcsup-dev/screenshots/，返回绝对路径。需要看界面状态时使用；Windows 上不可用，会返回明确原因。"
-    )]
-    pub(crate) async fn take_screenshot(
-        &self,
-        Parameters(request): Parameters<tools::screenshot::TakeScreenshotRequest>,
-    ) -> Result<String, String> {
-        tools::screenshot::take_screenshot(Parameters(request)).await
-    }
-
     /// 在文件管理器中定位路径。
     #[tool(
         name = "open_path",
@@ -124,7 +112,7 @@ impl DevToolsServer {
     /// 列出本服务提供的工具。
     #[tool(
         name = "list_tools",
-        description = "列出本服务可用工具的名称、用途，以及当前平台的通知、截屏、定位通道。"
+        description = "列出本服务可用工具的名称、用途，以及当前平台的通知、定位通道。"
     )]
     pub(crate) fn list_tools() -> Result<String, String> {
         let payload = serde_json::json!({
