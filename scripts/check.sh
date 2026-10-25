@@ -2,8 +2,9 @@
 # 本地质量门禁。flag 与 .github/workflows/test.yml 保持一致。
 #
 # 用法：
-#   scripts/check.sh              跑完整门禁
-#   scripts/check.sh fmt clippy   只跑指定步骤（供 MCP 工具按需调用）
+#   scripts/check.sh                        跑完整门禁
+#   scripts/check.sh fmt clippy             只跑指定步骤（供 MCP 工具按需调用）
+#   scripts/check.sh "feature powerset"     多词步骤要把整串作为一个参数传
 #
 # 不传参数时行为与 CI 完全一致；传参只用于开发期的局部验证。
 
@@ -13,14 +14,18 @@ root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 
 # 选定要跑的步骤：无参数即全部。
+#
+# `architecture fmt check clippy test e2e doc` 是单 token；
+# `feature powerset` 与 `deny` 含空格，作为整串一次传入（`"feature powerset"`）。
 requested=''
 if [ "$#" -gt 0 ]; then
 	for arg in "$@"; do
-		case " architecture fmt check clippy test doc deny " in
+		case " architecture fmt check clippy test e2e doc deny feature powerset " in
 			*" $arg "*) ;;
 			*)
 				printf '未知步骤：%s\n' "$arg" >&2
-				printf '可选：architecture / fmt / check / clippy / test / doc / deny\n' >&2
+				printf '可选：architecture / fmt / check / clippy / test / e2e / doc / deny\n' >&2
+				printf '多词步骤要整串传：scripts/check.sh "feature powerset"\n' >&2
 				exit 2
 				;;
 		esac

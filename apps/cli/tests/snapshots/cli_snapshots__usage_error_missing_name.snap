@@ -1,0 +1,6 @@
+---
+source: apps/cli/tests/cli_snapshots.rs
+expression: stderr(&out)
+---
+server create 缺少服务器名称
+非交互模式：mcsup server create <name> --version <VER>

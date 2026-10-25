@@ -332,6 +332,21 @@ impl ServerLifecycleService {
         Ok(self.registry.remove(name, purge, cwd)?)
     }
 
+    /// 删盘前置闸：运行中或其余删盘条件不满足时立刻拒绝
+    ///
+    /// 给入口在弹「删除磁盘数据?」之前用：交互入口先问再拒，用户会在确认框
+    /// 与手输名称之后才看到拒绝原因。判定与 [`Self::remove_server`] 同源
+    /// （运行状态 + [`ServerRegistry::ensure_purgeable`]），不改任何状态。
+    ///
+    /// # Errors
+    ///
+    /// 运行中返回 [`LifecycleError::Busy`]；其余见
+    /// [`ServerRegistry::ensure_purgeable`]
+    pub fn ensure_server_purgeable(&self, name: &str, cwd: &Path) -> Result<(), LifecycleError> {
+        self.ensure_stopped(name, BusyOp::Remove)?;
+        Ok(self.registry.ensure_purgeable(name, cwd)?)
+    }
+
     /// 安装 / 更换服务端核心的统一入口：运行中拒绝，再转
     /// [`ServerRegistry::install_jar`]
     ///
@@ -355,6 +370,7 @@ impl ServerLifecycleService {
         inspector: &dyn CoreInspector,
         installer_ctx: Option<&crate::InstallerContext>,
         progress: Option<&dyn ProgressSink>,
+        stages: Option<&dyn crate::StageSink>,
         cancel: &CancellationToken,
     ) -> Result<crate::InstalledServerJar, LifecycleError> {
         self.ensure_stopped(name, BusyOp::InstallJar)?;
@@ -367,6 +383,7 @@ impl ServerLifecycleService {
                 inspector,
                 installer_ctx,
                 progress,
+                stages,
                 cancel,
             )
             .await?)
@@ -1808,6 +1825,7 @@ mod tests {
                 &VersionId::new("1.21.2"),
                 &installer,
                 &NoopInspector,
+                None,
                 None,
                 None,
                 &CancellationToken::new(),

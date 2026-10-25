@@ -1,0 +1,5 @@
+---
+source: apps/cli/tests/cli_snapshots.rs
+expression: shape(&empty)
+---
+[]

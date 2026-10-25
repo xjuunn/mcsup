@@ -313,10 +313,19 @@ fn remove(svc: &WorkspaceService, name: &str, purge: bool, printer: Printer) -> 
     // 区内任一服务器在运行则拒绝（purge 会连着运行中的存档一起删）：
     // 判定收敛在 lifecycle service，入口不各自补检查
     super::lifecycle::lifecycle_service()?.ensure_workspace_stopped(&ws.id)?;
+    // 终端的工作目录：service 据此拒绝「删掉调用方所在目录」
+    let cwd = std::env::current_dir().context("获取当前工作目录失败")?;
+    // 删盘的前置条件先过一次：目录不是一个合法工作区、或终端就站在待删目录里时
+    // 直接报出来，不让用户先答完两个确认框、最后一步才被拒
+    if purge {
+        svc.ensure_purgeable(name, &cwd)?;
+    }
     // 删了不可恢复：可交互时问一句，默认不删；`--purge` 是显式指令，不再问
     let purge = if purge || !printer.is_interactive() {
         purge
     } else {
+        // 普通注销不删目录，先问「是否连磁盘数据一起删」；回答是后再按删盘的前置校验
+        // 拦一次，用户此时尚未确认名称
         let confirmed = prompts::confirm_yes(
             &format!(
                 "删除 {} ({}) 的磁盘数据?",
@@ -327,6 +336,7 @@ fn remove(svc: &WorkspaceService, name: &str, purge: bool, printer: Printer) -> 
         )
         .context("已取消注销")?;
         if confirmed {
+            svc.ensure_purgeable(name, &cwd)?;
             // 同意删盘后再上一道闸：红色警示 + 手输工作区名称，防误删存档与备份
             printer.print_warning(&format!(
                 "警告: 将永久删除 {} ({}) 中的所有存档、备份等文件，此操作无法恢复",
@@ -340,12 +350,9 @@ fn remove(svc: &WorkspaceService, name: &str, purge: bool, printer: Printer) -> 
         }
         confirmed
     };
-    // 终端的工作目录：service 据此拒绝「删掉调用方所在目录」
-    let cwd = std::env::current_dir().context("获取当前工作目录失败")?;
     if purge {
-        // 自身工作目录在目标里时我们自己也持有句柄，先退到目标之外；
-        // 这一步只解决删除失败，终端的工作目录不由我们释放。终端也在目标内时
-        // 由 service 拒绝（无法从子进程改变父进程的工作目录）
+        // 自身工作目录在目标里时我们自己也持有句柄；终端已在目标外（上面的校验
+        // 保证），这一步只解决本进程的句柄，终端的工作目录不由我们释放
         super::chdir_out_of(&ws.path);
     }
     let out = svc.remove(name, purge, &cwd)?;

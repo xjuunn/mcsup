@@ -1,0 +1,11 @@
+---
+source: apps/cli/tests/cli_snapshots.rs
+expression: shape(&report)
+---
+{
+  "errors": "number",
+  "findings": [],
+  "has_errors": "bool",
+  "schema": "number",
+  "warnings": "number"
+}

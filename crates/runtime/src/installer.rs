@@ -125,6 +125,14 @@ fn build_installer_command(java_bin: &Path, installer: &Path, dir: &Path) -> Com
     command
 }
 
+/// 等待读线程收尾的上限
+///
+/// 进程退出后管道未必 EOF：安装器（`Forge` / `NeoForge`）会再拉起子 JVM，
+/// Windows 上子孙进程继承同一对句柄，只要它们还活着，`read` 就不会返回 0。
+/// 无限 `join` 会让整个安装既等不到结果、也不响应 Ctrl+C——进度条停在 100%
+/// 之后永久冻结。超过这个时间就放弃等待：已经收到的输出足够拼失败原因。
+const READER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// 运行命令并收集输出，期间响应取消与超时
 ///
 /// 关键点是**不能**用 `Command::output()`：它会一直阻塞到进程退出，安装器联网
@@ -183,22 +191,44 @@ fn run_and_capture(
         std::thread::sleep(POLL_INTERVAL);
     };
 
-    // 进程已退出：读线程此时会因管道 EOF 结束。必须 join 读取线程而不是靠
-    // `recv_timeout` 猜「收完了」——进程退出与读线程把最后一块数据放进通道之间
-    // 存在时间差，靠超时会让尾部输出偶发丢失。
-    for reader in readers {
-        let _ = reader.join();
-    }
-    drain(&rx, &mut stdout, &mut stderr);
-    // 读线程已全部结束，通道里不会再有新数据；把剩余分块收干净
-    while let Ok((is_stdout, chunk)) = rx.try_recv() {
-        if is_stdout {
-            stdout.extend_from_slice(&chunk);
-        } else {
-            stderr.extend_from_slice(&chunk);
-        }
-    }
+    // 进程已退出：正常情况下读线程会因管道 EOF 结束，join 后取全尾部输出。
+    // 但管道可能被子 JVM 持有（见 [`READER_JOIN_TIMEOUT`]），所以只等有限时间，
+    // 超时就带着已收到的输出返回，不把用户吊死在这里。
+    join_readers(readers, &rx, &mut stdout, &mut stderr);
     Ok((status, stdout, stderr))
+}
+
+/// 限时等待读线程，把通道里剩余的分块收进输出缓冲
+///
+/// 以「每个读线程结束」为完成条件，整体不超过 [`READER_JOIN_TIMEOUT`]。
+/// 超时后不再 join（读线程会被遗弃；管道的所有权已在其中，不会泄漏到主线程），
+/// 已到达的数据全部保留。
+fn join_readers(
+    readers: Vec<std::thread::JoinHandle<()>>,
+    rx: &mpsc::Receiver<(bool, Vec<u8>)>,
+    stdout: &mut Vec<u8>,
+    stderr: &mut Vec<u8>,
+) {
+    let deadline = Instant::now() + READER_JOIN_TIMEOUT;
+    let mut pending = readers;
+    while !pending.is_empty() {
+        pending.retain(|reader| !reader.is_finished());
+        drain(rx, stdout, stderr);
+        if pending.is_empty() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            tracing::debug!(
+                remaining = pending.len(),
+                "installer output pipes did not close, \
+                 likely held by a grandchild JVM; stop waiting"
+            );
+            break;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    // 读线程已结束（或确定不再等）：把通道里剩下的分块收干净
+    drain(rx, stdout, stderr);
 }
 
 /// 把通道里已到达的分块全部收下
@@ -557,6 +587,41 @@ mod tests {
         assert!(
             !has_expected_marker(dir.path()),
             "测试前提：没有任何预期产物"
+        );
+    }
+
+    /// 父进程退出后管道被子进程持有：不能卡在 join 上无限等待
+    ///
+    /// 复刻 `Forge` 安装器拉起的子 JVM 继承 stdout/stderr 句柄的情形：父进程
+    /// 打印一行就退出，但子进程仍持有同一对管道。修复前这里会一直等到子进程
+    /// 结束（也既不响应取消），表现为 `server create` 在进度条走完后卡死。
+    #[test]
+    fn exits_even_when_grandchild_holds_pipes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // 父进程把 stdout 重定向进文件（于是**只有**那个后台子进程持有管道），
+        // 随后立即退出；子进程睡一阵才退出。
+        let mut cmd = if cfg!(windows) {
+            let mut cmd = Command::new("cmd");
+            cmd.args(["/C", "start /b ping -n 60 127.0.0.1 >nul && exit 0"]);
+            cmd
+        } else {
+            // 后台 `sleep` 继承 stdout/stderr，父 shell 立刻退出
+            shell_command("sleep 60 & echo boom; exit 0")
+        };
+        cmd.current_dir(dir.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let started = Instant::now();
+        run_and_capture(cmd, DEFAULT_INSTALLER_TIMEOUT, &CancellationToken::new())
+            .expect("should not hang");
+        let elapsed = started.elapsed();
+
+        // 父进程先退出，最坏也要在 join 上限内返回，而不是等子进程的 60 秒
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "管道被子进程持有时应限时返回，实际 {elapsed:?}"
         );
     }
 }
