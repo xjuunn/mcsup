@@ -131,7 +131,9 @@ pub(crate) async fn download_jar(
     };
 
     // 解析版本到首字节之间没有任何进度回调，先挂 spinner 保证整段有回显；
-    // 首个进度到达后由 session 内的 BarSink 接手同一条线，切换成进度显示
+    // 首个进度到达后由 session 内的 BarSink 接手同一条线，切换成进度显示。
+    // 下载结束后还有运行安装器（几分钟）与登记核心，两者只经阶段回显——不给
+    // 阶段回调，进度条会停在 100% 冻结，看起来就是卡死。
     let message = format!("解析并下载 {version_id}");
     let session = InstallSession::new(message, printer.is_human());
     info!(version = %version_id, server = name, "开始安装");
@@ -142,6 +144,7 @@ pub(crate) async fn download_jar(
             &installer,
             &inspector,
             installer_ctx.as_ref(),
+            Some(&session),
             Some(&session),
             session.cancel(),
         )

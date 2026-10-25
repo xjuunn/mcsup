@@ -15,7 +15,7 @@ use thiserror::Error;
 
 use crate::fs_error::{FsError, deletion_hint};
 use crate::workspace::WorkspaceError;
-use crate::{InstallError, InstalledDownload, ServerInstaller};
+use crate::{InstallError, InstallStage, InstalledDownload, ServerInstaller};
 
 const SERVER_MARKER: &str = "mcsup.json";
 const SERVER_MARKER_SCHEMA: u32 = 1;
@@ -655,6 +655,7 @@ impl ServerRegistry {
         inspector: &dyn CoreInspector,
         installer_ctx: Option<&crate::InstallerContext>,
         progress: Option<&dyn ProgressSink>,
+        stages: Option<&dyn crate::StageSink>,
         cancel: &CancellationToken,
     ) -> Result<InstalledServerJar, InstallJarError> {
         let srv = self.get(name)?;
@@ -663,7 +664,9 @@ impl ServerRegistry {
         // （来源其实是直接可运行的 jar）时清掉临时文件，回落到下方直接路径。
         if let Some(ctx) = installer_ctx
             && let Some(installed) = self
-                .install_via_installer(name, version, installer, ctx, &srv.dir, progress, cancel)
+                .install_via_installer(
+                    name, version, installer, ctx, &srv.dir, progress, stages, cancel,
+                )
                 .await?
         {
             return Ok(installed);
@@ -676,7 +679,7 @@ impl ServerRegistry {
 
         let world = inspector.world_info(&srv.dir)?;
         let out: InstalledDownload = installer
-            .install(version, staging.clone(), None, progress, cancel)
+            .install(version, staging.clone(), None, progress, None, cancel)
             .await?;
         let target = match inspector.jar_data_version(&staging) {
             Ok(target) => target,
@@ -743,6 +746,7 @@ impl ServerRegistry {
         ctx: &crate::InstallerContext,
         dir: &Path,
         progress: Option<&dyn ProgressSink>,
+        stages: Option<&dyn crate::StageSink>,
         cancel: &CancellationToken,
     ) -> Result<Option<InstalledServerJar>, InstallJarError> {
         let installer_path = dir.join(STAGING_INSTALLER);
@@ -751,7 +755,14 @@ impl ServerRegistry {
         // 污染备份，也会让下次安装误以为「已经下过」。失败路径同样要清——
         // 否则一次网络中断就在服务器目录留下一个 9MB 的死文件。
         let out = installer
-            .install(version, installer_path.clone(), Some(ctx), progress, cancel)
+            .install(
+                version,
+                installer_path.clone(),
+                Some(ctx),
+                progress,
+                stages,
+                cancel,
+            )
             .await;
         let _ = std::fs::remove_file(&installer_path);
         let out = out?;
@@ -760,6 +771,9 @@ impl ServerRegistry {
             return Ok(None);
         }
 
+        if let Some(sink) = stages {
+            sink.on_stage(InstallStage::Finalizing);
+        }
         let files = forge_args_files(version.as_str(), dir);
         if files.is_empty() {
             return Err(InstallError::Layout(format!(
@@ -1885,6 +1899,7 @@ mod tests {
                 &inspector,
                 None,
                 None,
+                None,
                 &CancellationToken::new(),
             )
             .await
@@ -1924,6 +1939,7 @@ mod tests {
                 &VersionId::new("26.1"),
                 &installer,
                 &inspector,
+                None,
                 None,
                 None,
                 &CancellationToken::new(),

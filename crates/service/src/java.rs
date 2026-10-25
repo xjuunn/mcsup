@@ -91,6 +91,12 @@ pub enum InstallStage {
     Downloading,
     /// 解压并注册
     Extracting,
+    /// 下载安装器本体（`Forge` / `NeoForge` 等 install 方式的来源）
+    DownloadingInstaller,
+    /// 运行安装器产出服务端目录：耗时可长达数分钟，必须有回显
+    Installing,
+    /// 安装完成，登记服务端核心（写注册表）
+    Finalizing,
 }
 
 impl InstallStage {
@@ -103,6 +109,9 @@ impl InstallStage {
             Self::Resolving => "解析下载地址…",
             Self::Downloading => "下载 Java…",
             Self::Extracting => "解压并注册…",
+            Self::DownloadingInstaller => "下载安装器…",
+            Self::Installing => "运行安装器（下载 libraries 可能需要几分钟）…",
+            Self::Finalizing => "登记服务端核心…",
         }
     }
 }

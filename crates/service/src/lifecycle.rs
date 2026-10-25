@@ -355,6 +355,7 @@ impl ServerLifecycleService {
         inspector: &dyn CoreInspector,
         installer_ctx: Option<&crate::InstallerContext>,
         progress: Option<&dyn ProgressSink>,
+        stages: Option<&dyn crate::StageSink>,
         cancel: &CancellationToken,
     ) -> Result<crate::InstalledServerJar, LifecycleError> {
         self.ensure_stopped(name, BusyOp::InstallJar)?;
@@ -367,6 +368,7 @@ impl ServerLifecycleService {
                 inspector,
                 installer_ctx,
                 progress,
+                stages,
                 cancel,
             )
             .await?)
@@ -1808,6 +1810,7 @@ mod tests {
                 &VersionId::new("1.21.2"),
                 &installer,
                 &NoopInspector,
+                None,
                 None,
                 None,
                 &CancellationToken::new(),

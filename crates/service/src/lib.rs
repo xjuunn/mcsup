@@ -144,6 +144,9 @@ impl ServerInstaller {
     /// 就地安装成服务端目录。`installer` 仅在需要时读取：来源声明为
     /// [`port::InstallKind::Direct`] 时传 `None` 即可。
     ///
+    /// `stages` 用于回显安装器阶段：下载完成到安装完成之间可能长达数分钟
+    /// （安装器要联网拉 libraries），没有阶段回调时用户只看到冻结的进度条。
+    ///
     /// # Errors
     ///
     /// 版本不存在、来源不可达、下载/校验失败、安装器执行失败或任务被取消时
@@ -154,6 +157,7 @@ impl ServerInstaller {
         destination: PathBuf,
         installer: Option<&InstallerContext>,
         progress: Option<&dyn ProgressSink>,
+        stages: Option<&dyn StageSink>,
         cancel: &CancellationToken,
     ) -> Result<InstalledDownload, InstallError> {
         let mut status = DownloadStatus::Pending.transition(DownloadStatus::Downloading)?;
@@ -161,6 +165,11 @@ impl ServerInstaller {
         let checksum = resolved.artifact.checksum.clone();
         let java_major = resolved.java_major;
         let install = resolved.install;
+        let notify = |stage: InstallStage| {
+            if let Some(sink) = stages {
+                sink.on_stage(stage);
+            }
+        };
 
         // 上游未提供哈希 / 大小时不传校验条件：Fabric 等服务端 JAR 走 chunked
         // 且无 Content-Length，占位值参与比对必然失败，只能以「无校验」下载。
@@ -174,6 +183,11 @@ impl ServerInstaller {
             expected: (!unverified).then(|| checksum.clone()),
             expected_size: (!unverified && known_size).then_some(resolved.artifact.size),
         };
+        notify(if install == port::InstallKind::Installer {
+            InstallStage::DownloadingInstaller
+        } else {
+            InstallStage::Downloading
+        });
         let artifact = self.downloader.download(&request, progress, cancel).await?;
         status = status.transition(DownloadStatus::Verifying)?;
 
@@ -191,8 +205,12 @@ impl ServerInstaller {
                     destination.display()
                 ))
             })?;
+            // 从这里到返回之间是纯阻塞执行（几分钟量级），阶段文案让用户知道
+            // 进度条停在 100% 之后还在干活
+            notify(InstallStage::Installing);
             ctx.runner
                 .run_installer(&ctx.java_bin, &destination, dir, cancel)?;
+            notify(InstallStage::Finalizing);
         }
 
         status = status.transition(DownloadStatus::Ready)?;
@@ -316,6 +334,7 @@ mod tests {
                 PathBuf::from("/tmp/server.jar"),
                 None,
                 None,
+                None,
                 &CancellationToken::new(),
             )
             .await?;
@@ -345,6 +364,7 @@ mod tests {
             .install(
                 &VersionId::new("1.21.1"),
                 PathBuf::from("/tmp/server.jar"),
+                None,
                 None,
                 None,
                 &CancellationToken::new(),
@@ -389,6 +409,7 @@ mod tests {
                 PathBuf::from("/tmp/server.jar"),
                 None,
                 None,
+                None,
                 &CancellationToken::new(),
             )
             .await;
@@ -421,6 +442,7 @@ mod tests {
             .install(
                 &VersionId::new("1.21.1"),
                 PathBuf::from("/tmp/server.jar"),
+                None,
                 None,
                 None,
                 &CancellationToken::new(),
@@ -465,6 +487,7 @@ mod tests {
             .install(
                 &VersionId::new("1.21.1"),
                 PathBuf::from("/tmp/server.jar"),
+                None,
                 None,
                 None,
                 &CancellationToken::new(),
