@@ -11,6 +11,8 @@
 
 mod client;
 #[cfg(test)]
+mod console_encoding_tests;
+#[cfg(test)]
 mod e2e_tests;
 mod endpoint;
 mod launch;

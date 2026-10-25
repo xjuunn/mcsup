@@ -229,6 +229,44 @@ fn send_line_reaches_child_stdout_in_console_log() {
     assert_eq!(shutdown_and_join(dir, handle), 0);
 }
 
+/// 非 UTF-8 输出必须按原始字节落盘
+///
+/// 服务端在 Windows 下按系统代码页（GBK）输出中文；若 `pump` 先用
+/// `from_utf8_lossy` 解码，GBK 字节会被替换成 U+FFFD 写入 `console.log`，
+/// 日志永久损坏。这里让子进程吐 GBK 字节，断言日志里是原字节、没有替换符。
+#[test]
+fn console_log_keeps_non_utf8_bytes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    // GBK 的「正在」= 0xD5 0xFD 0xD4 0xDA，printf 的 \x 转义按字节输出
+    let handle = start(
+        dir,
+        "echo 'Done (0.1s)!'; printf '\\325\\375\\324\\332\\n'; read line",
+    );
+    wait_ready(dir);
+    poll_status(dir, |s| s.status == port::ServerStatus::Running, 5).expect("running");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let gbk = [0xD5u8, 0xFD, 0xD4, 0xDA];
+    loop {
+        let bytes = std::fs::read(console_log_path(dir)).unwrap_or_default();
+        if bytes.windows(gbk.len()).any(|w| w == gbk) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "console.log 未保留原始 GBK 字节");
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let bytes = std::fs::read(console_log_path(dir)).expect("read console.log");
+    assert!(
+        !bytes.windows(3).any(|w| w == [0xEF, 0xBB, 0xBF]),
+        "日志不应出现 U+FFFD 替换符"
+    );
+
+    wait_terminal(dir);
+    assert_eq!(shutdown_and_join(dir, handle), 0);
+}
+
 #[test]
 fn send_after_exit_reports_not_running() {
     let tmp = tempfile::tempdir().expect("tempdir");
