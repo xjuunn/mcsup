@@ -182,11 +182,15 @@ impl JsonStore {
         self.root.join(collection.dir())
     }
 
-    /// 记录文件路径；`id` 必须是单个普通文件名片段
+    /// 记录文件路径；`id` 必须是单层普通文件名片段
     ///
-    /// `id` 进路径前必须校验：它既来自目录扫描的文件名，也来自记录内容。
-    /// 含 `.` / 分隔符 / 盘符的 id 会把写入引到集合目录之外（如 `..`），
-    /// 或让不同 id 映射到同一文件。这类 id 视为损坏而不是拼接后放行。
+    /// `id` 进路径前必须校验：它既来自目录扫描的文件名（见
+    /// [`Self::record_id_of`]），也来自记录内容。含分隔符 / `..` / 盘符的 id
+    /// 会把写入引到集合目录之外，或让不同 id 映射到同一文件。
+    /// 这类 id 视为损坏而不是拼接后放行。
+    ///
+    /// 规则不是白名单：`server link` 就地注册与旧版数据都可能带来带点的 id，
+    /// 只要求「单层、非 `.` / `..`」，保证 `collection_dir()/id.json` 不越界。
     fn record_path(&self, collection: Collection, id: &str) -> Result<PathBuf, RepositoryError> {
         if !is_safe_record_id(id) {
             return Err(RepositoryError::Corrupt(format!(
@@ -201,6 +205,24 @@ impl JsonStore {
 
     fn state_path(&self, collection: Collection) -> PathBuf {
         self.collection_dir(collection).join(STATE_FILE)
+    }
+
+    /// 记录文件 id（文件名去掉 `.json`）；`state.json` 不是记录
+    ///
+    /// 与 [`Self::record_path`] 同一口径：`<id>.json` 里 `<id>` 必须是单层名，
+    /// 否则扫目录会得到空 id 或跨层路径，拼回去指向别的文件。
+    fn record_id_of(path: &Path) -> Option<String> {
+        // Windows 上 `file_stem` 与 `extension` 会把 `x.` 这类尾点名识别成不同
+        // 扩展名；先按字符串口径取 `<id>.json` 再校验 id，避免平台分叉
+        let name = path.file_name()?.to_str()?;
+        if name == STATE_FILE {
+            return None;
+        }
+        let id = name.strip_suffix(".json")?;
+        if !is_safe_record_id(id) {
+            return None;
+        }
+        Some(id.to_owned())
     }
 
     /// 进程内排队 + 跨进程锁
@@ -276,17 +298,14 @@ impl JsonStore {
         for entry in entries {
             let entry = entry.map_err(storage_err)?;
             let path = entry.path();
-            if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some(RECORD_EXT) {
-                continue;
-            }
-            // 状态文件不是记录
-            if path.file_name().and_then(|n| n.to_str()) == Some(STATE_FILE) {
-                continue;
-            }
-            let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+            // 文件名规则与 record_path 同口径：不是 `<安全 id>.json` 的一律不是记录
+            let Some(id) = Self::record_id_of(&path) else {
                 continue;
             };
-            match self.load_record::<T>(collection, id) {
+            if !path.is_file() {
+                continue;
+            }
+            match self.load_record::<T>(collection, &id) {
                 Ok(Some(record)) => records.push(record),
                 // 扫描与读取之间被删除：跳过
                 Ok(None) => {}
@@ -325,16 +344,12 @@ impl JsonStore {
         let mut out = Vec::new();
         for entry in entries {
             let path = entry.map_err(storage_err)?.path();
-            if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some(RECORD_EXT) {
-                continue;
-            }
-            if path.file_name().and_then(|n| n.to_str()) == Some(STATE_FILE) {
-                continue;
-            }
-            let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+            let Some(id) = Self::record_id_of(&path) else {
                 continue;
             };
-            let id = id.to_owned();
+            if !path.is_file() {
+                continue;
+            }
             match self.load_record::<T>(collection, &id) {
                 Ok(Some(record)) => out.push((path, Ok(record))),
                 Ok(None) => {}
@@ -544,14 +559,15 @@ fn sync_parent(_path: &Path) {}
 
 /// 记录 id 是否可安全地作为文件名使用
 ///
-/// 只允许字母、数字、`-` 和 `_`：覆盖 UUID 与 `java-21` 这类生成式 id，
-/// 同时排除路径分隔符、`.`（会与扩展名或 `..` 混淆）和盘符。
+/// 只排除「单层文件名的越界形态」：空、`.` / `..`、含分隔符、含 NUL。
+/// 不要求字母表——`server link` 就地注册的服务器 id 取自目录名，磁盘上本来
+/// 就可能带点（`my.server`），白名单会在扫目录时直接丢掉整条记录。
+///
+/// 安全前提是**单层**：`collection_dir()/id.json` 中 `id` 不含 `/`、`\` 或就是
+/// `..` 时不可能离开集合目录；`state.json` 由调用侧单独排除（见
+/// [`JsonStore::record_id_of`]）。
 fn is_safe_record_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 128
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    !id.is_empty() && id.len() <= 128 && id != "." && id != ".." && !id.contains(['/', '\\', '\0'])
 }
 
 fn storage_err(err: impl std::error::Error + Send + Sync + 'static) -> RepositoryError {
@@ -1614,7 +1630,7 @@ mod tests {
     #[test]
     fn unsafe_record_id_is_rejected() {
         let store = store_with_ws();
-        for bad in ["..", "a..b", "a/b", "a\\b", "C:evil", "", "a.json"] {
+        for bad in ["..", ".", "a/b", "a\\b", ""] {
             assert!(
                 store.record_path(Collection::Workspaces, bad).is_err(),
                 "{bad} 必须被拒绝"
@@ -1627,6 +1643,42 @@ mod tests {
         assert!(
             store.record_path(Collection::Java, "java-21").is_ok(),
             "生成式 id 必须通过"
+        );
+        assert!(
+            store
+                .record_path(Collection::Servers, "my.server")
+                .is_ok_and(|path| path.parent()
+                    == Some(store.collection_dir(Collection::Servers).as_path())),
+            "带点的单层 id 必须留在集合目录内"
+        );
+    }
+
+    /// 扫目录时 id 与 `record_path` 同口径：`state.json` 不是记录，
+    /// 空 id / 越界 id 不会被拼成指向别的文件的路径
+    #[test]
+    fn scan_ids_share_record_path_rules() {
+        let store = store_with_ws();
+        for (name, id) in [
+            ("state.json", None),
+            (".json", None),
+            ("a.json", Some("a")),
+            ("my.server.json", Some("my.server")),
+        ] {
+            assert_eq!(
+                JsonStore::record_id_of(Path::new(name)).as_deref(),
+                id,
+                "{name}"
+            );
+        }
+        let dir = store.collection_dir(Collection::Servers);
+        for name in ["state.json", ".json", "leftover.bak"] {
+            std::fs::write(dir.join(name), b"{}").expect("seed");
+        }
+        std::fs::write(dir.join(".json"), r#"{"schema":1,"id":""}"#).expect("seed");
+        assert!(
+            ServerRepository::list(&store)
+                .expect("list 不得被非记录文件拖垮")
+                .is_empty()
         );
     }
 

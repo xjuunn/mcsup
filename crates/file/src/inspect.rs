@@ -77,6 +77,8 @@ impl CoreInspector for FileCoreInspector {
 /// `server.properties` 的 `level-name`，缺省 `world`
 ///
 /// 世界目录名由服务端属性决定，写死 `world` 会在自定义目录时漏检。
+/// 该属性是纯文本，也可能是手改过的 `../../x`：只保留单层目录名，
+/// 越界的值按缺省处理，绝不让它在 `server_dir` 之外拼出路径。
 fn level_name(server_dir: &Path) -> Result<String, InspectError> {
     let path = server_dir.join("server.properties");
     let text = match std::fs::read_to_string(&path) {
@@ -88,9 +90,14 @@ fn level_name(server_dir: &Path) -> Result<String, InspectError> {
     let name = props
         .get("level-name")
         .map(str::trim)
-        .filter(|name| !name.is_empty())
+        .filter(|name| is_single_segment(name))
         .unwrap_or("world");
     Ok(name.to_owned())
+}
+
+/// 是否单层目录名：非空、非 `.` / `..`、不含分隔符与盘符
+fn is_single_segment(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', ':', '\0'])
 }
 
 fn read_capped(path: &Path, limit: u64) -> Result<Vec<u8>, InspectError> {
@@ -133,4 +140,52 @@ fn too_large(len: usize, limit: u64) -> bool {
 
 fn zip_message(err: &ZipError) -> String {
     err.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn level_name_defaults_when_missing_or_unsafe() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let props = tmp.path().join("server.properties");
+        for raw in [
+            "level-name=../../etc",
+            "level-name=/etc",
+            "level-name=..",
+            "level-name=",
+        ] {
+            std::fs::write(&props, format!("{raw}\n")).expect("write");
+            assert_eq!(
+                level_name(tmp.path()).expect("level name"),
+                "world",
+                "{raw} 必须按缺省处理"
+            );
+        }
+        std::fs::write(&props, "level-name=my.world\n").expect("write");
+        assert_eq!(level_name(tmp.path()).expect("level name"), "my.world");
+    }
+
+    /// 越界 `level-name` 不得让世界探测读到服务器目录之外的文件
+    #[test]
+    fn world_info_ignores_escaping_level_name() {
+        let root = tempfile::tempdir().expect("tmp");
+        let outside = root.path().join("outside");
+        let server = root.path().join("server");
+        std::fs::create_dir_all(outside.join("world")).expect("mkdir");
+        std::fs::create_dir_all(&server).expect("mkdir");
+        // 服务器目录外放一个存在的 level.dat；探测若跟随越界路径就会读到它
+        std::fs::write(outside.join("world").join("level.dat"), b"junk").expect("write");
+        std::fs::write(
+            server.join("server.properties"),
+            "level-name=../outside/world\n",
+        )
+        .expect("write");
+
+        let info = FileCoreInspector::new()
+            .world_info(&server)
+            .expect("缺省路径不存在时应返回 None 而不是解析外部文件");
+        assert!(info.is_none(), "got {info:?}");
+    }
 }

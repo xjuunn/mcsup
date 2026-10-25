@@ -369,6 +369,20 @@ impl ServerRegistry {
             }
             std::fs::remove_file(&srv.dir).map_err(|err| ServerRegistryError::io(&srv.dir, err))?;
         } else if purge {
+            // 目录由 `ws.path/servers/<rel_dir>` 拼出，记录被手改后可能指向
+            // 工作区外。删除前必须拿到文件系统证据：目录里的 mcsup.json 与该
+            // 记录同 id。「宁可拒绝、让用户确认」优先于「猜一个目录删掉」。
+            if !server_dir_matches(&srv.dir, &srv.meta.id) {
+                return Err(ServerRegistryError::Fs(FsError::marker(
+                    srv.dir.clone(),
+                    format!(
+                        "refusing to purge: {} does not hold a {SERVER_MARKER} \
+                         belonging to server {}; fix the record or delete it manually",
+                        srv.dir.display(),
+                        srv.meta.name.as_str()
+                    ),
+                )));
+            }
             std::fs::remove_dir_all(&srv.dir)
                 .map_err(|err| ServerRegistryError::io(&srv.dir, deletion_hint(err)))?;
         }
@@ -650,7 +664,6 @@ impl ServerRegistry {
         })?;
         Ok(ws.path.join("servers").join(&meta.rel_dir))
     }
-
     /// 目标在任一工作区的 `servers/` 子树内时拒绝：通过 servers/ 再链回
     /// servers/ 会成环，盘点与删除都会失控
     fn reject_target_inside_workspace_servers(
@@ -829,6 +842,18 @@ fn in_place_dir_name(target: &Path, name: Option<&str>) -> Result<ServerName, Se
         }
     }
     Ok(dir_name)
+}
+
+/// 目录里是否有属于该 id 的 `mcsup.json`（`--purge` 前置闸）
+///
+/// `server link` 就地注册的目录本来就有 marker；由 `server create` 建的目录
+/// 也有。missing / 损坏 / id 不符一律不放行——记录指向别处时不能拿整个目录
+/// 赌一次，让用户确认后手工处理。
+fn server_dir_matches(dir: &Path, id: &ServerId) -> bool {
+    match read_server_marker(dir) {
+        Ok(Some(marker)) => marker.id == id.as_str(),
+        Ok(None) | Err(_) => false,
+    }
 }
 
 /// 读取 `mcsup.json`；不存在返回 `Ok(None)`，损坏返回错误
@@ -1378,6 +1403,34 @@ mod tests {
         assert!(err.to_string().contains("linked"));
         assert!(external.join("keep.txt").is_file());
         assert!(reg.get("ext").is_ok());
+    }
+
+    /// `mcsup.json` 与记录 id 不一致（记录被手改 / 目录被换掉）时，
+    /// `--purge` 必须拒绝而不是照删
+    #[test]
+    fn remove_purge_rejects_dir_without_matching_marker() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let reg = registry_with_ws(tmp.path());
+        let srv = reg
+            .create(
+                None,
+                "alpha",
+                &VersionId::new("1.21.1"),
+                ServerVariant::Vanilla,
+                None,
+            )
+            .expect("create");
+        // 把 marker 换成别的 id：目录已不是这条记录对应的服务器
+        std::fs::write(
+            srv.dir.join("mcsup.json"),
+            r#"{"schema":1,"id":"550e8400-e29b-41d4-a716-4466554400aa","name":"other"}"#,
+        )
+        .expect("tamper");
+
+        let err = reg.remove("alpha", true).expect_err("必须拒绝");
+        assert!(err.to_string().contains("refusing to purge"), "got {err}");
+        assert!(srv.dir.is_dir(), "目录不能被删");
+        assert!(reg.get("alpha").is_ok(), "记录必须保留");
     }
 
     #[cfg(unix)]

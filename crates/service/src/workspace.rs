@@ -217,10 +217,13 @@ impl WorkspaceService {
     ///
     /// # Errors
     ///
-    /// 不存在、IO 或注册表失败时返回 [`WorkspaceError`]
+    /// 不存在、目标不是该工作区目录、IO 或注册表失败时返回 [`WorkspaceError`]
     pub fn remove(&self, selector: &str, purge: bool) -> Result<Workspace, WorkspaceError> {
         let ws = self.resolve(selector)?;
         if purge && ws.path.exists() {
+            if !is_deletable(&ws) {
+                return Err(WorkspaceError::NotAWorkspace(ws.path.clone()));
+            }
             std::fs::remove_dir_all(&ws.path)
                 .map_err(|err| WorkspaceError::io(&ws.path, deletion_hint(err)))?;
         }
@@ -338,6 +341,21 @@ pub(crate) fn resolve_selector(
             selector: selector.to_owned(),
             candidates: many.iter().map(|w| w.name.as_str().to_owned()).collect(),
         }),
+    }
+}
+
+/// 目录是否确实是这条记录对应的工作目录（`--purge` 前置闸）
+///
+/// 记录里的 `path` 是唯一决定「删哪里」的字段。它被手改成 `/`、另一个磁盘
+/// 根或家目录时，`remove_dir_all` 会照删不误。删除前必须拿到文件系统上的
+/// 独立证据：目录里的 `workspace.toml` 与该记录同 id。
+///
+/// marker 缺失 / 损坏时不放行——记录对不上磁盘时宁可拒绝删除，
+/// 让用户确认后手工处理，也不拿整个目录赌一次。
+fn is_deletable(ws: &Workspace) -> bool {
+    match read_marker(&ws.path) {
+        Ok(Some(found)) => found.id == ws.id.as_str(),
+        Ok(None) | Err(_) => false,
     }
 }
 
@@ -815,13 +833,44 @@ mod tests {
         let (svc, tmp) = svc();
         let dir = tmp.path().join("ws");
         svc.init(&dir, Some("ws01")).expect("init");
-        // 把目录换成同名文件：remove_dir_all 在各平台都会失败
+        // 换成同名普通文件：不是目录也不像工作区，删除闸先拒绝；记录必须保留，
+        // 用户删除该文件后重试即可
         std::fs::remove_dir_all(&dir).expect("rmdir");
         std::fs::write(&dir, "occupied").expect("file");
 
         let err = svc.remove("ws01", true).expect_err("must fail");
-        assert!(matches!(err, WorkspaceError::Fs(FsError::Io { .. })));
+        assert!(
+            matches!(err, WorkspaceError::Fs(FsError::Io { .. }))
+                || matches!(err, WorkspaceError::NotAWorkspace(_)),
+            "got {err:?}"
+        );
         // 记录还在，占用解除后重试即可自愈
         assert!(svc.resolve("ws01").is_ok());
+    }
+
+    /// `path` 被改成别处（根目录 / 家目录等）时，`--purge` 不得跟着删
+    ///
+    /// 记录里的 path 是唯一决定删哪里的字段；目标目录没有对应 marker 时
+    /// 必须拒绝，而不是把整棵目录树当真。
+    #[test]
+    fn purge_rejects_path_without_matching_marker() {
+        let repo = Arc::new(MemRepo::new());
+        let servers = Arc::new(MemServers::new());
+        let svc = WorkspaceService::new(repo.clone(), servers);
+        let tmp = tempfile::tempdir().expect("tmp");
+        svc.init(&tmp.path().join("ws"), Some("ws01"))
+            .expect("init");
+        // 目录名对不上记录（模拟 path 被手改成某个别的目录）
+        let foreign = tmp.path().join("other");
+        std::fs::create_dir_all(&foreign).expect("mkdir");
+        repo.items.lock().expect("lock")[0].path = foreign.clone();
+
+        let err = svc.remove("ws01", true).expect_err("必须拒绝");
+        assert!(
+            matches!(err, WorkspaceError::NotAWorkspace(_)),
+            "got {err:?}"
+        );
+        assert!(foreign.is_dir(), "目标目录不能被删");
+        assert!(svc.resolve("ws01").is_ok(), "记录必须保留");
     }
 }
