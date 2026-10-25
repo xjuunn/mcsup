@@ -72,11 +72,24 @@ apps/cli    apps/server    apps/agent    apps/mcp
 
 任务完成不等于可以提交。发现暂存内容有问题时指出问题，不要修正。
 
-开发任务（新功能 / bugfix）默认从 master 新建 worktree 完成，除非用户明确要求。
+每个任务必须在新建的 worktree 中完成，禁止在主工作区改动代码。
+
+开工前第一件事是确认所处位置：当前目录不是独立 worktree 就新建，不存在
+「改动小、先在这做」的例外。在主工作区看到自己的改动即为违规，立即停止并
+报告。
+
 完成后运行 `scripts/check.sh`，测试必须完全通过；经用户明确同意后，才提交并
 合入 master。合入前如有冲突，先解决冲突。合入后删除该 worktree，下一个任务
 重新从 master 新建。提交信息规范见
 `docs/development-workflow.md` 的「提交信息规范」。
+
+任务结束时必须调用 `dev-tools` 的 `send_notification` 通知用户：
+
+- title 写当前 worktree 的功能名
+- 内容写为什么通知：已完成、需要用户确认、受阻待决策
+- title 与内容都要简短
+
+通知是完成标准的一部分，不依赖用户是否在盯着对话。调用失败时在回复中说明。
 
 ## 6. AI 写作规范
 
