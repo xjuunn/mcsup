@@ -1,23 +1,25 @@
 name: Release CLI
 
-# CLI 二进制发布：推 v* tag（或手动指定 tag）时跑完整门禁后构建各平台 mcsup
+# CLI 二进制发布：手动指定已存在的 v* tag 时跑完整门禁后构建各平台 mcsup
 # 二进制并附到 GitHub Release。只发 CLI（bin 名 mcsup），不发 crates.io——
 # crate 发布走 publish.yml，两者刻意分离：crates.io 发布不可撤销，且首次发布
 # 前必须先完成内层 crate 的 mcsup-* 改名（见 docs/embedding.md 分发形态一节）。
+#
+# 只手动触发（workflow_dispatch）：与 test.yml 一致，推 tag 不自动跑，避免
+# 每次打 tag 都消耗一轮多平台构建额度。tag 必填且必须是仓库里已存在的 tag
+# （`git tag v0.2.0 && git push origin v0.2.0` 之后再来触发），三个 job 都按它
+# checkout，产出的二进制版本与该 tag 一致。
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
       tag:
-        description: '已存在的 tag（例如 v0.1.0）。重跑发布用；留空则用当前 ref'
-        required: false
+        description: '已存在的 tag（例如 v0.1.0）；必填，决定 Release 版本'
+        required: true
         type: string
 
 # 同一 tag 不并行发布：取消会留下半上传的 Release。
 concurrency:
-  group: release-${{ inputs.tag || github.ref }}
+  group: release-${{ inputs.tag }}
   cancel-in-progress: false
 
 permissions:
@@ -25,7 +27,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  RELEASE_TAG: ${{ inputs.tag }}
 
 jobs:
   # 门禁与 test.yml 保持同一套命令；release 前必须全绿

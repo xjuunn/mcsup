@@ -68,8 +68,9 @@ mcsup/
 │
 ├── .github/
 │   └── workflows/
-│       ├── ci.yml                # CI
-│       └── release.yml           # Release
+│       ├── test.yml              # CI（手动触发）
+│       ├── release.yml           # Release CLI（手动触发）
+│       └── publish.yml           # crates.io 发布（手动触发）
 │
 ├── Cargo.toml                    # Workspace 配置
 ├── Cargo.lock                    # 依赖锁定
