@@ -123,6 +123,7 @@ fn into_atrifact(
         location,
         java_major,
         install: port::InstallKind::Direct,
+        installer_args_dir: None,
     })
 }
 

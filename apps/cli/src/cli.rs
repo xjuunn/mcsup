@@ -123,6 +123,9 @@ pub(crate) enum Command {
         /// 参数文件启动（Forge / NeoForge）：依次 `@` 展开的相对路径，可重复
         #[arg(long = "arg-file", value_name = "PATH")]
         arg_file: Vec<PathBuf>,
+        /// 追加给服务端的程序参数（参数文件之后，可重复；默认 `nogui`）
+        #[arg(long = "server-arg", value_name = "ARG")]
+        server_arg: Vec<String>,
         #[arg(long, value_name = "MIB", help = crate::meta::supervise_ram_arg())]
         ram: Option<u32>,
     },

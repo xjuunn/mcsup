@@ -33,10 +33,14 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// 慢速网络；再久基本可以判定为卡死。
 const DEFAULT_INSTALLER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
-/// 安装器成功后在 `dir` 中应存在的参数文件（任一即算成功产物）
+/// 安装器成功后应产出的文件（任一即算「装过」）
 ///
-/// `Forge` 会生成 `run.sh` / `run.bat` 与 `user_jvm_args.txt`；用参数文件判断
-/// 比输出文案更可靠（文案可能随版本变化）。
+/// 只看 `user_jvm_args.txt` / `run.sh` / `run.bat` 不够：安装器**先**写这几个
+/// 文件，**后**才下载 `libraries/`。下载中途失败（网络中断、401、磁盘满）时
+/// 退出码非零，但若安装器把这几份文件留在了目录里，只按「存在」判定就会把
+/// 一次半途而废的安装记成成功——服务器随后必然启动失败（`Missing required
+/// library`）。因此判据是「平台参数文件存在且它 `-jar` 指向的入口 JAR 也在」：
+/// 参数文件是安装器在依赖齐备后才写的，入口 JAR 与它同级，是最晚一批产物。
 const EXPECTED_MARKERS: &[&str] = &["user_jvm_args.txt", "run.sh", "run.bat"];
 
 /// 安装器成功后残留的自身日志（约 2MB，不属服务端产物）
@@ -251,8 +255,68 @@ fn tail_of(stdout: &[u8], stderr: &[u8]) -> String {
 }
 
 /// 安装目录下是否存在任一预期产物文件
+///
+/// 见 [`EXPECTED_MARKERS`]：存在参数文件只说明安装器跑过前半段。真正的判据是
+/// **入口 JAR 也在**——参数文件里 `-jar` 指向的那个文件存在，才说明这一版
+/// 安装已经下载完依赖。
 fn has_expected_marker(dir: &Path) -> bool {
-    EXPECTED_MARKERS.iter().any(|name| dir.join(name).is_file())
+    if !EXPECTED_MARKERS.iter().any(|name| dir.join(name).is_file()) {
+        return false;
+    }
+    // 参数文件存在但入口 JAR 缺失 = 安装中途失败；扫一遍 libraries 里的参数文件
+    // （安装器在下载依赖前就写了它们），全部通过才算成功
+    for args_file in args_files_in(dir) {
+        let Ok(content) = std::fs::read_to_string(&args_file) else {
+            // 读不出来时无法确认入口，按失败处理，让调用方重试
+            return false;
+        };
+        let origin = args_file.parent().unwrap_or(dir);
+        if let Some(entry) = launch_entry(&content, origin)
+            && !entry.is_file()
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// 目录下安装器写出的参数文件（`user_jvm_args.txt` 除外：它不含入口）
+fn args_files_in(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return files;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            files.extend(args_files_in(&path));
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.ends_with("_args.txt") && name != "user_jvm_args.txt" {
+            files.push(path);
+        }
+    }
+    files
+}
+
+/// 从 Java 参数文件里找出 `-jar` 指向的入口 JAR（相对 `origin` 解析）
+///
+/// 参数文件是空白分隔的一行参数；`-jar` 的值就是入口。找不到 `-jar` 时返回
+/// `None`（如 `user_jvm_args.txt` 只有 JVM 参数），调用方不据此判失败。
+fn launch_entry(content: &str, origin: &Path) -> Option<PathBuf> {
+    let tokens: Vec<&str> = content.split_whitespace().collect();
+    let index = tokens.iter().position(|token| *token == "-jar")?;
+    let jar = tokens.get(index + 1)?;
+    // 参数文件里可能写 Windows 或 Unix 分隔符，统一按平台约定拼相对路径
+    let normalized = jar.replace('\\', std::path::MAIN_SEPARATOR_STR);
+    let path = Path::new(&normalized);
+    Some(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        origin.join(path)
+    })
 }
 
 /// 安装器产出的参数文件相对路径（供启动使用）
@@ -305,6 +369,49 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         assert!(!has_expected_marker(dir.path()));
         std::fs::write(dir.path().join("user_jvm_args.txt"), b"# args").expect("write");
+        assert!(has_expected_marker(dir.path()));
+    }
+
+    /// 从参数文件里找不到 `-jar` 时视为入口未知（`None`），不据此判失败
+    #[test]
+    fn launch_entry_reads_jar_after_flag() {
+        let origin = Path::new("/srv/mc/a");
+        assert_eq!(
+            launch_entry("-Xmx4G -jar forge-26.3-66.1.0-shim.jar\n", origin),
+            Some(origin.join("forge-26.3-66.1.0-shim.jar"))
+        );
+        // 反斜杠按平台分隔符归一
+        assert_eq!(
+            launch_entry("-jar libraries\\forge\\server.jar", origin),
+            Some(origin.join("libraries").join("forge").join("server.jar"))
+        );
+        assert_eq!(launch_entry("# -Xmx4G\n", origin), None);
+        assert_eq!(launch_entry("-jar", origin), None);
+    }
+
+    /// 参数文件存在但入口 JAR 缺失时不算装好
+    #[test]
+    fn marker_requires_launch_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("user_jvm_args.txt"), b"# args").expect("write");
+        let nested = dir
+            .path()
+            .join("libraries")
+            .join("net")
+            .join("minecraftforge")
+            .join("forge")
+            .join("26.3-66.1.0");
+        std::fs::create_dir_all(&nested).expect("mkdir");
+        std::fs::write(
+            nested.join("win_args.txt"),
+            b"-Djava.net.preferIPv6Addresses=system -jar forge-26.3-66.1.0-shim.jar",
+        )
+        .expect("write");
+        assert!(
+            !has_expected_marker(dir.path()),
+            "参数文件在、入口 JAR 不在：安装是中途中止的"
+        );
+        std::fs::write(nested.join("forge-26.3-66.1.0-shim.jar"), b"jar").expect("write");
         assert!(has_expected_marker(dir.path()));
     }
 

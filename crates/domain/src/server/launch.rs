@@ -9,6 +9,9 @@
 
 use std::path::PathBuf;
 
+/// 服务端统一的程序参数：不尝试开图形界面
+const NOGUI: &str = "nogui";
+
 /// 服务端启动方式
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -23,11 +26,13 @@ pub enum LaunchSpec {
     /// 无 `-jar` 入口，靠一串 `@文件` 拼出命令行（`Forge` / `NeoForge`）
     ///
     /// 实际命令形如 `java @user_jvm_args.txt @libraries/.../unix_args.txt nogui`：
-    /// 前段是调用方自己的 JVM 参数文件，后段是安装器产出的参数文件。
-    /// 路径全部相对服务器目录。
+    /// 前段是调用方自己的 JVM 参数文件，后段是安装器产出的参数文件，
+    /// 末尾的 `nogui` 由 [`Self::program_args`] 钉死。路径全部相对服务器目录。
     Args {
         /// 依次展开的参数文件，相对服务器目录
         files: Vec<PathBuf>,
+        /// 追加给服务端的程序参数（参数文件之后、以独立 token 传入）
+        args: Vec<String>,
     },
 }
 
@@ -43,6 +48,36 @@ impl LaunchSpec {
     pub fn args(files: impl IntoIterator<Item = impl Into<PathBuf>>) -> Self {
         Self::Args {
             files: files.into_iter().map(Into::into).collect(),
+            args: vec![NOGUI.to_owned()],
+        }
+    }
+
+    /// 追加给服务端的程序参数
+    ///
+    /// `Jar` 与 `Args` 都是 `nogui`：服务端不该尝试开图形界面。以后要加
+    /// `--universe` 一类参数时，两边都从这里取，避免逐处漏改。
+    #[must_use]
+    pub fn program_args(&self) -> Vec<String> {
+        match self {
+            Self::Jar { .. } => vec![NOGUI.to_owned()],
+            Self::Args { args, .. } => args.clone(),
+        }
+    }
+
+    /// 替换程序参数
+    ///
+    /// `Args` 形态直接落 `args`；`Jar` 形态的服务端参数只有 `nogui`，没有
+    /// 第二份存储位置，因此非空的 `args` 只在不等于默认值时无法表达——届时
+    /// 保持默认（`Jar` 启动的真实调用只传 `nogui`）。空 `args` 保留默认值，
+    /// 不把「没传」误当成「不要 nogui」。
+    #[must_use]
+    pub fn with_program_args(self, args: Vec<String>) -> Self {
+        if args.is_empty() {
+            return self;
+        }
+        match self {
+            Self::Jar { .. } => self,
+            Self::Args { files, .. } => Self::Args { files, args },
         }
     }
 
@@ -54,7 +89,7 @@ impl LaunchSpec {
     pub fn primary_file(&self) -> &std::path::Path {
         match self {
             Self::Jar { path } => path,
-            Self::Args { files } => files
+            Self::Args { files, .. } => files
                 .first()
                 .map_or_else(|| std::path::Path::new(""), PathBuf::as_path),
         }
@@ -65,7 +100,7 @@ impl LaunchSpec {
     pub fn is_empty(&self) -> bool {
         match self {
             Self::Jar { .. } => false,
-            Self::Args { files } => files.is_empty(),
+            Self::Args { files, .. } => files.is_empty(),
         }
     }
 }
@@ -93,7 +128,10 @@ mod tests {
 
     #[test]
     fn empty_args_spec_is_empty() {
-        let spec = LaunchSpec::Args { files: Vec::new() };
+        let spec = LaunchSpec::Args {
+            files: Vec::new(),
+            args: vec![NOGUI.to_owned()],
+        };
         assert!(spec.is_empty());
         assert_eq!(spec.primary_file(), std::path::Path::new(""));
     }
@@ -101,7 +139,7 @@ mod tests {
     #[test]
     fn args_spec_preserves_order() {
         let spec = LaunchSpec::args(["a.txt", "b.txt", "c.txt"]);
-        let LaunchSpec::Args { files } = spec else {
+        let LaunchSpec::Args { files, args } = spec else {
             panic!("应为 Args");
         };
         assert_eq!(
@@ -111,6 +149,17 @@ mod tests {
                 PathBuf::from("b.txt"),
                 PathBuf::from("c.txt")
             ]
+        );
+        assert_eq!(args, vec![NOGUI.to_owned()]);
+    }
+
+    /// 两种形态都以 `nogui` 收尾：服务端不该尝试开图形界面
+    #[test]
+    fn program_args_end_with_nogui_for_both_forms() {
+        assert_eq!(LaunchSpec::jar("server.jar").program_args(), vec!["nogui"]);
+        assert_eq!(
+            LaunchSpec::args(["user_jvm_args.txt"]).program_args(),
+            vec!["nogui"]
         );
     }
 }

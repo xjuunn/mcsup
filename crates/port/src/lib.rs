@@ -70,6 +70,13 @@ pub struct ResolvedArtifact {
     /// `Forge` / `NeoForge` 下载得到的是**安装器**，必须运行它才会产出服务端。
     /// 由来源声明，service 据此决定下载后是否继续安装。
     pub install: InstallKind,
+    /// 安装器产出的启动参数文件所在目录名（仅 [`InstallKind::Installer`] 有意义）
+    ///
+    /// 平台把启动参数文件放在 `libraries/<group>/<artifact>/{目录名}/` 下，而
+    /// `VersionId` 只有 MC 版本（`1.21.1`），目录名却是完整 build 串
+    /// （`1.21.1-52.0.1`）。目录名怎么定是平台知识，只有来源知道，因此由来源
+    /// 在解析时一并给出，service 直接用它拼路径，不重建平台的版本选择口径。
+    pub installer_args_dir: Option<String>,
 }
 
 /// 下载物的用途

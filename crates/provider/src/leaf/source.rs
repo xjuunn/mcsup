@@ -213,7 +213,7 @@ impl ServerJarSource for LeafSource {
         if let Some(checksum) = parse_sha256_hex(&primary.sha256) {
             downloads = downloads.checksum(checksum);
         }
-        Ok(downloads.resolve(version))
+        Ok(downloads.resolve(version, None))
     }
 }
 

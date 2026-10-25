@@ -203,7 +203,7 @@ impl ServerJarSource for QuiltSource {
         let _mc = self.resolve_mc(version).await?;
         let _loader = self.pick_loader().await?;
         let location = parse_https_url(&self.installer_url)?;
-        Ok(Downloads::installer(location).resolve(version))
+        Ok(Downloads::installer(location).resolve(version, None))
     }
 }
 

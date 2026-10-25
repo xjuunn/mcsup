@@ -60,28 +60,25 @@ pub(crate) fn jvm_args(ram_mib: Option<u32>) -> Vec<String> {
 
 /// 组装启动命令（不 spawn）
 ///
-/// `Jar` 追加 `-jar <abs> nogui`；`Args` 依次追加 `@<abs>` 与 `nogui`。两条
-/// 分支都以 `nogui` 收尾：服务端不应尝试开图形界面。
+/// `Jar` 追加 `-jar <abs>`，`Args` 依次追加 `@<abs>`；两者之后都追加
+/// [`LaunchSpec::program_args`]（默认 `nogui`）：服务端不应尝试开图形界面。
 pub(crate) fn build_command(launch: &MinecraftLaunch) -> Command {
     let mut command = Command::new(&launch.java_bin);
     command.args(jvm_args(launch.ram_mib));
     match &launch.launch {
         LaunchSpec::Jar { path } => {
-            command
-                .arg("-jar")
-                .arg(launch.server_dir.join(path))
-                .arg("nogui");
+            command.arg("-jar").arg(launch.server_dir.join(path));
         }
-        LaunchSpec::Args { files } => {
+        LaunchSpec::Args { files, .. } => {
             for file in files {
                 command.arg(format!("@{}", launch.server_dir.join(file).display()));
             }
-            command.arg("nogui");
         }
         // `LaunchSpec` 是 `#[non_exhaustive]`：未知形态按 JAR 启动兜底不会更强，
         // 直接只跑 JVM 参数——真实调用不会走到这里（上层已校验）
         _ => {}
     }
+    command.args(launch.launch.program_args());
     command.current_dir(&launch.server_dir);
     command
 }

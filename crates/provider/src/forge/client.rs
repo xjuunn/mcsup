@@ -214,6 +214,20 @@ impl ForgeSource {
             ))))
         })
     }
+
+    /// 解析版本 → 具体 build 串（含 `Picks` 口径）
+    ///
+    /// 版本 → MC 版本 → build 是一条有校验的链，集中在这里避免调用方各拼一次。
+    async fn resolve_build(&self, version: &VersionId) -> Result<String, SourceError> {
+        let mc = self.resolve_mc(version).await?;
+        let build = self.pick_build(&mc).await?;
+        if !(ForgeBuild { full: &build }).is_valid() {
+            return Err(SourceError::Decode(Box::new(std::io::Error::other(
+                format!("invalid forge build `{build}`"),
+            ))));
+        }
+        Ok(build)
+    }
 }
 
 #[async_trait]
@@ -235,14 +249,8 @@ impl ServerJarSource for ForgeSource {
     }
 
     async fn artifact(&self, version: &VersionId) -> Result<ResolvedArtifact, SourceError> {
-        let mc = self.resolve_mc(version).await?;
-        let build = self.pick_build(&mc).await?;
+        let build = self.resolve_build(version).await?;
         let forge_build = ForgeBuild { full: &build };
-        if !forge_build.is_valid() {
-            return Err(SourceError::Decode(Box::new(std::io::Error::other(
-                format!("invalid forge build `{build}`"),
-            ))));
-        }
         let location = parse_https_url(&self.installer_url(&forge_build))?;
         let checksum = self.fetch_checksum(&forge_build).await?;
         // 大小：`.sha1` 侧车不含大小，单独发 HEAD 取。取不到就按「未声明」
@@ -253,7 +261,8 @@ impl ServerJarSource for ForgeSource {
             .flatten()
             .unwrap_or(0);
         // Forge 的元数据不声明 Java 要求，按 MC 版本推算，避免启动时挑错 JVM
-        let java_major = domain::server::version::required_java_major(mc.as_str());
+        let mc = build.split_once('-').map_or(build.as_str(), |(mc, _)| mc);
+        let java_major = domain::server::version::required_java_major(mc);
         Ok(ResolvedArtifact {
             artifact: domain::server::artifact::JarArtifact {
                 version: version.clone(),
@@ -263,6 +272,7 @@ impl ServerJarSource for ForgeSource {
             location,
             java_major,
             install: port::InstallKind::Installer,
+            installer_args_dir: Some(build),
         })
     }
 }

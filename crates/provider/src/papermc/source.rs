@@ -301,7 +301,7 @@ impl ServerJarSource for PaperSource {
         if let Some(checksum) = download.sha256().and_then(parse_sha256_hex) {
             resolved = resolved.checksum(checksum);
         }
-        Ok(resolved.resolve(version))
+        Ok(resolved.resolve(version, None))
     }
 }
 

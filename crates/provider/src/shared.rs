@@ -173,8 +173,14 @@ impl Downloads {
     }
 
     /// 落成 [`ResolvedArtifact`]，`version` 由调用方的请求决定
+    ///
+    /// `installer_args_dir` 只有安装器类来源需要（见字段文档），其余传 `None`。
     #[must_use]
-    pub(crate) fn resolve(self, version: &VersionId) -> ResolvedArtifact {
+    pub(crate) fn resolve(
+        self,
+        version: &VersionId,
+        installer_args_dir: Option<String>,
+    ) -> ResolvedArtifact {
         ResolvedArtifact {
             artifact: JarArtifact {
                 version: version.clone(),
@@ -184,6 +190,7 @@ impl Downloads {
             location: self.location,
             java_major: self.java_major,
             install: self.install,
+            installer_args_dir,
         }
     }
 }
@@ -335,7 +342,7 @@ mod tests {
     #[test]
     fn downloads_direct_has_unverified_checksum_and_zero_size() {
         let url: Url = "https://example.com/server.jar".parse().expect("url");
-        let resolved = Downloads::direct(url).resolve(&VersionId::new("1.21.1"));
+        let resolved = Downloads::direct(url).resolve(&VersionId::new("1.21.1"), None);
         assert_eq!(resolved.install, InstallKind::Direct);
         assert_eq!(resolved.artifact.size, 0);
         assert!(!resolved.artifact.checksum.is_verified());
@@ -358,7 +365,7 @@ mod tests {
         let resolved = Downloads::direct(url)
             .install(InstallKind::Installer)
             .java_major(None)
-            .resolve(&VersionId::new("1.21.1"));
+            .resolve(&VersionId::new("1.21.1"), None);
         assert_eq!(resolved.install, InstallKind::Installer);
     }
 
@@ -369,7 +376,7 @@ mod tests {
         let resolved = Downloads::direct(url)
             .checksum(checksum.clone())
             .size(1024)
-            .resolve(&VersionId::new("1.21.1"));
+            .resolve(&VersionId::new("1.21.1"), None);
         assert_eq!(resolved.artifact.size, 1024);
         assert_eq!(
             resolved.artifact.checksum.algorithm(),
@@ -381,7 +388,7 @@ mod tests {
     #[test]
     fn downloads_installer_sets_kind() {
         let url: Url = "https://example.com/installer.jar".parse().expect("url");
-        let resolved = Downloads::installer(url).resolve(&VersionId::new("1.21.1"));
+        let resolved = Downloads::installer(url).resolve(&VersionId::new("1.21.1"), None);
         assert_eq!(resolved.install, InstallKind::Installer);
     }
 

@@ -126,7 +126,7 @@ pub(crate) fn launch_columns(spec: Option<&LaunchSpec>) -> (Option<String>, Vec<
             Some("jar".to_owned()),
             vec![path.to_string_lossy().into_owned()],
         ),
-        Some(LaunchSpec::Args { files }) => (
+        Some(LaunchSpec::Args { files, .. }) => (
             Some("args".to_owned()),
             files
                 .iter()
@@ -252,9 +252,9 @@ impl TryFrom<ServerEntry> for ServerMeta {
                     .first()
                     .map_or_else(|| PathBuf::from("server.jar"), PathBuf::from),
             }),
-            Some("args") => Some(LaunchSpec::Args {
-                files: entry.launch_files.iter().map(PathBuf::from).collect(),
-            }),
+            Some("args") => Some(LaunchSpec::args(
+                entry.launch_files.iter().map(PathBuf::from),
+            )),
             // 旧记录无此列：留给上层按历史口径推断（`server.jar`）
             None => None,
             Some(other) => {

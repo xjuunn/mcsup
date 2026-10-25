@@ -170,7 +170,7 @@ impl ServerJarSource for SpongeSource {
         let checksum = self.fetch_checksum(&resolved).await?;
         Ok(Downloads::direct(location)
             .checksum(checksum)
-            .resolve(version))
+            .resolve(version, None))
     }
 }
 

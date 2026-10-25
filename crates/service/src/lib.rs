@@ -96,6 +96,8 @@ pub struct InstalledDownload {
     pub java_major: Option<domain::java::JavaMajor>,
     /// 下载物是否为安装器（决定下载后是否运行它、以及最终启动方式）
     pub install: port::InstallKind,
+    /// 安装器产物的版本目录名（`Forge` 的完整 build 串）；非安装器来源恒为 `None`
+    pub build: Option<String>,
 }
 
 /// 安装器执行所需的运行环境
@@ -161,6 +163,10 @@ impl ServerInstaller {
         let checksum = resolved.artifact.checksum.clone();
         let java_major = resolved.java_major;
         let install = resolved.install;
+        // 安装器产出的启动参数文件在 `libraries/.../{build}/` 下，目录名是平台
+        // 自己的版本串（Forge 为 `26.3-66.1.0`），与 `VersionId`（`26.3`）不同；
+        // 由来源在解析时给出，这里只负责往下传。
+        let build = resolved.installer_args_dir;
 
         // 上游未提供哈希 / 大小时不传校验条件：Fabric 等服务端 JAR 走 chunked
         // 且无 Content-Length，占位值参与比对必然失败，只能以「无校验」下载。
@@ -202,6 +208,7 @@ impl ServerInstaller {
             checksum,
             java_major,
             install,
+            build,
         })
     }
 }
@@ -212,6 +219,7 @@ mod tests {
     use domain::server::artifact::{Checksum, ChecksumAlgorithm, JarArtifact};
     use port::{DownloadError, DownloadedArtifact, ResolvedArtifact, SourceError};
     use std::error::Error;
+    use std::path::Path;
     use std::sync::Mutex;
 
     struct FakeSource {
@@ -291,6 +299,7 @@ mod tests {
             location: "https://example.invalid/server.jar".parse()?,
             java_major: None,
             install: port::InstallKind::Direct,
+            installer_args_dir: None,
         })
     }
 
@@ -372,6 +381,7 @@ mod tests {
                     location: "https://example.invalid/placeholder.jar".parse()?,
                     java_major: None,
                     install: port::InstallKind::Direct,
+                    installer_args_dir: None,
                 },
             }),
             Arc::new(FakeDownloader::new(
@@ -455,6 +465,7 @@ mod tests {
                     location: "https://example.invalid/server.jar".parse()?,
                     java_major: None,
                     install: port::InstallKind::Direct,
+                    installer_args_dir: None,
                 },
                 not_found: false,
             }),
@@ -477,6 +488,73 @@ mod tests {
         // 落库的 checksum 仍是未校验占位值，真实大小以下载结果为准
         assert!(!out.checksum.is_verified());
         assert_eq!(out.artifact.size, 293_000);
+        Ok(())
+    }
+
+    // ---- 安装器路径：extras 必须写进服务器目录 ----
+
+    /// 假安装器执行器：模拟安装器把参数文件写进目录，再记录被调用次数
+    struct FakeRunner {
+        calls: Arc<Mutex<usize>>,
+    }
+
+    impl port::InstallerRunner for FakeRunner {
+        fn run_installer(
+            &self,
+            _java_bin: &Path,
+            _installer: &Path,
+            dir: &Path,
+            _cancel: &CancellationToken,
+        ) -> Result<(), port::InstallerError> {
+            *self.calls.lock().expect("lock") += 1;
+            std::fs::write(dir.join("user_jvm_args.txt"), b"# args").expect("write");
+            Ok(())
+        }
+    }
+
+    /// 安装器跑完后，安装器产出的参数文件目录名随结果一起带出
+    ///
+    /// 该目录名由来源给出（`Forge` 为 `26.3-66.1.0`），与 `VersionId`
+    /// （`26.3`）不同；service 据此拼参数文件路径。
+    #[tokio::test]
+    async fn installer_args_dir_is_returned() -> Result<(), Box<dyn Error>> {
+        let dir = tempfile::tempdir()?;
+        let mut artifact = resolved()?;
+        artifact.install = port::InstallKind::Installer;
+        artifact.installer_args_dir = Some("26.3-66.1.0".to_owned());
+        let calls = Arc::new(Mutex::new(0));
+        let installer = ServerInstaller::new(
+            Arc::new(FakeSource {
+                resolved: artifact,
+                not_found: false,
+            }),
+            Arc::new(FakeDownloader::new(
+                DownloadedArtifact {
+                    path: dir.path().join(".forge-installer.jar"),
+                    size: 12,
+                },
+                false,
+            )),
+        );
+        let ctx = InstallerContext {
+            java_bin: PathBuf::from("/jdk/bin/java"),
+            runner: Arc::new(FakeRunner {
+                calls: Arc::clone(&calls),
+            }),
+        };
+
+        let out = installer
+            .install(
+                &VersionId::new("26.3"),
+                dir.path().join(".forge-installer.jar"),
+                Some(&ctx),
+                None,
+                &CancellationToken::new(),
+            )
+            .await?;
+
+        assert_eq!(*calls.lock().expect("lock"), 1);
+        assert_eq!(out.build.as_deref(), Some("26.3-66.1.0"));
         Ok(())
     }
 }

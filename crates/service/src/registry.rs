@@ -760,7 +760,11 @@ impl ServerRegistry {
             return Ok(None);
         }
 
-        let files = forge_args_files(version.as_str(), dir);
+        // 参数文件所在目录名是安装器产物的完整 build 串（`26.3-66.1.0`），
+        // 不是 `VersionId` 里的 MC 版本（`26.3`）——拿 MC 版本拼路径必然落空，
+        // 只能找到 `user_jvm_args.txt`，启动时就少了平台参数文件。
+        let build = out.build.as_deref().unwrap_or_else(|| version.as_str());
+        let files = forge_args_files(build, dir);
         if files.is_empty() {
             return Err(InstallError::Layout(format!(
                 "安装器完成后在 {} 找不到启动参数文件",
@@ -768,9 +772,7 @@ impl ServerRegistry {
             ))
             .into());
         }
-        let launch = LaunchSpec::Args {
-            files: files.clone(),
-        };
+        let launch = LaunchSpec::args(files.iter().cloned());
         // 参数文件启动没有单一核心 JAR：以首个参数文件作「核心」记录，
         // 大小与 SHA1 记安装器下载值（安装产物本身由 libraries/ 表达）
         let jar = InstalledJar {
@@ -1805,6 +1807,7 @@ mod tests {
                 location: url::Url::parse("https://example.invalid/server.jar").expect("url"),
                 java_major: None,
                 install: port::InstallKind::Direct,
+                installer_args_dir: None,
             })
         }
 
@@ -1936,5 +1939,41 @@ mod tests {
             b"new"
         );
         assert!(!created.dir.join(STAGING_JAR).exists());
+    }
+
+    /// 平台参数文件目录名是完整 build 串，不是 MC 版本号
+    ///
+    /// 回归：`install_via_installer` 曾用 `version.as_str()`（`26.3`）拼路径，
+    /// 而安装器把 `win_args.txt` 放在 `forge/26.3-66.1.0/`，结果只记录到
+    /// `user_jvm_args.txt`，启动时 JVM 少了平台参数文件、把 `nogui` 当成主类。
+    #[test]
+    fn forge_args_files_resolve_under_full_build_dir() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dir = tmp.path();
+        std::fs::write(dir.join(FORGE_USER_ARGS), b"#").expect("user args");
+        let build_dir = dir.join("libraries/net/minecraftforge/forge/26.3-66.1.0");
+        std::fs::create_dir_all(&build_dir).expect("build dir");
+        let platform = if cfg!(windows) {
+            "win_args.txt"
+        } else {
+            "unix_args.txt"
+        };
+        std::fs::write(build_dir.join(platform), b"#").expect("platform args");
+
+        let files = forge_args_files("26.3-66.1.0", dir);
+        assert_eq!(
+            files,
+            vec![
+                PathBuf::from(FORGE_USER_ARGS),
+                PathBuf::from(format!(
+                    "libraries/net/minecraftforge/forge/26.3-66.1.0/{platform}"
+                )),
+            ],
+            "完整 build 串必须解析到平台参数文件"
+        );
+
+        // 只给 MC 版本（旧口径）时找不到平台参数文件——正是当初的 bug 形态
+        let stale = forge_args_files("26.3", dir);
+        assert_eq!(stale, vec![PathBuf::from(FORGE_USER_ARGS)]);
     }
 }

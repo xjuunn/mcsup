@@ -214,7 +214,7 @@ impl ServerJarSource for PurpurSource {
         }
         let location = parse_https_url(&self.download_url(&resolved, &build))?;
         // 上游无哈希：`Downloads::direct` 的默认就是 unverified + size 0
-        Ok(Downloads::direct(location).resolve(version))
+        Ok(Downloads::direct(location).resolve(version, None))
     }
 }
 
