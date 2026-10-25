@@ -93,6 +93,9 @@ fn create_without_version_exits_2() {
 }
 
 /// 显式未支持的变体 → 用法错误 2，文案列出当前可用变体（能力查询口径）
+///
+/// 样本变体必须**真的没有来源**：`spigot` 因 DMCA 无官方分发，组合根不注册
+/// 它的来源，适合当「未支持」的稳定样本。
 #[test]
 fn create_unsupported_variant_exits_2_and_lists_available() {
     let home = temp_home();
@@ -105,7 +108,7 @@ fn create_unsupported_variant_exits_2_and_lists_available() {
             "--version",
             "1.21.1",
             "--variant",
-            "paper",
+            "spigot",
             "--output",
             "json",
             "--lang",
@@ -119,7 +122,11 @@ fn create_unsupported_variant_exits_2_and_lists_available() {
     assert!(err.contains("vanilla"), "{err}");
 }
 
-/// 未知变体拼写同样判用法错误 2 并列出可用项
+/// 名字合法但没有来源的变体同样判用法错误 2 并列出可用项
+///
+/// `paperx` 不是拼写错误，而是一个**合法的第三方变体名**——它只是没有注册
+/// 来源。这正是「先校名字、再查注册表」两级判定的结果：入口不该把「我没注册
+/// 这个来源」说成「你不认识这个词」。
 #[test]
 fn create_unknown_variant_exits_2() {
     let home = temp_home();
@@ -133,6 +140,32 @@ fn create_unknown_variant_exits_2() {
             "1.21.1",
             "--variant",
             "paperx",
+            "--output",
+            "json",
+            "--lang",
+            "zh",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("暂未支持变体 paperx"), "{err}");
+    assert!(err.contains("vanilla"), "{err}");
+}
+
+/// 非法变体名（含路径分隔符）判用法错误 2，报「未知变体」
+#[test]
+fn create_malformed_variant_name_exits_2() {
+    let home = temp_home();
+    let out = run(
+        home.path(),
+        &[
+            "server",
+            "create",
+            "srv1",
+            "--version",
+            "1.21.1",
+            "--variant",
+            "../evil",
             "--output",
             "json",
             "--lang",

@@ -1,4 +1,4 @@
-﻿//! 默认组合根：把「开箱即用」的装配从 `apps/cli` 下沉到库侧
+//! 默认组合根：把「开箱即用」的装配从 `apps/cli` 下沉到库侧
 //!
 //! 第三方 Rust 宿主不必自己拼 `JsonStore` + 各实现——这里给出与 CLI
 //! 完全相同的一套默认装配；要接管某项能力时，用 `McsupBuilder` 注入
@@ -16,7 +16,13 @@ use provider::fabric::FabricSource;
 use provider::forge::ForgeSource;
 use provider::http::HttpByteSource;
 use provider::java::JavaSourceRegistry;
+use provider::leaf::LeafSource;
 use provider::mojang::MojangSource;
+use provider::neoforge::NeoForgeSource;
+use provider::papermc::{PaperProject, PaperSource};
+use provider::purpur::PurpurSource;
+use provider::quilt::QuiltSource;
+use provider::sponge::SpongeSource;
 use service::{JavaService, ServerLifecycleService, ServerRegistry, WorkspaceService};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -312,11 +318,7 @@ impl McsupBuilder {
 
         let jar_sources: Vec<Arc<dyn ServerJarSource>> = match self.jar_sources {
             Some(sources) => sources,
-            None => vec![
-                Arc::new(MojangSource::new().map_err(|err| BootstrapError::Source(Box::new(err)))?),
-                Arc::new(FabricSource::new().map_err(|err| BootstrapError::Source(Box::new(err)))?),
-                Arc::new(ForgeSource::new().map_err(|err| BootstrapError::Source(Box::new(err)))?),
-            ],
+            None => default_jar_sources()?,
         };
 
         Ok(Mcsup {
@@ -331,10 +333,56 @@ impl McsupBuilder {
     }
 }
 
+/// 默认的来源集合（与 CLI 完全一致）
+///
+/// 这是「开箱即用能装哪些变体」的唯一口径。顺序有意义：同一变体若被注册多次，
+/// [`port::ServerJarSource`] 的查找按列表顺序取第一个，因此这里每种变体只出现
+/// 一次。Paper 系四个变体共用一次 [`PaperSource`] 实现，按 [`PaperProject`]
+/// 参数化——这就是「不同启动方式复用、不每变体各写一套」的落地形态。
+///
+/// 构造只准备 HTTP 客户端，不打网络；任一来源构造失败（如 rustls provider
+/// 装不上）即整体失败，不静默降级成「少几个变体」。
+///
+/// # Errors
+///
+/// 任一来源构造失败时返回 [`BootstrapError::Source`]
+pub fn default_jar_sources() -> Result<Vec<Arc<dyn ServerJarSource>>, BootstrapError> {
+    fn wrap<E>(
+        result: Result<E, port::SourceError>,
+    ) -> Result<Arc<dyn ServerJarSource>, BootstrapError>
+    where
+        E: ServerJarSource + 'static,
+    {
+        result
+            .map(|source| Arc::new(source) as Arc<dyn ServerJarSource>)
+            .map_err(|err| BootstrapError::Source(Box::new(err)))
+    }
+
+    let mut sources: Vec<Arc<dyn ServerJarSource>> = vec![
+        wrap(MojangSource::new())?,
+        wrap(FabricSource::new())?,
+        wrap(ForgeSource::new())?,
+        wrap(NeoForgeSource::new())?,
+        wrap(PurpurSource::new())?,
+        wrap(LeafSource::new())?,
+        wrap(QuiltSource::new())?,
+        wrap(SpongeSource::new())?,
+    ];
+    // Paper 系：一个实现，按项目参数化
+    for project in [
+        PaperProject::Paper,
+        PaperProject::Folia,
+        PaperProject::Velocity,
+        PaperProject::Waterfall,
+    ] {
+        sources.push(wrap(PaperSource::new(project))?);
+    }
+    Ok(sources)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
     /// 内存库 + 全默认装配必须能跑通：第三方「零拼装」的验收线
     #[test]
     fn builds_with_in_memory_store() {
@@ -369,5 +417,57 @@ mod tests {
             "{variants:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 默认来源覆盖**全部**内置变体（除 `Unknown`）
+    ///
+    /// 这是「注册表不漏项」的断言：新增内置变体却忘了在
+    /// [`default_jar_sources`] 里装配来源时，这里会直接失败。
+    #[test]
+    fn default_jar_sources_cover_every_builtin_variant() {
+        use domain::server::variant::ServerVariant;
+
+        let sources = default_jar_sources().expect("默认来源");
+        let registered: Vec<ServerVariant> = sources.iter().map(|s| s.variant()).collect();
+
+        let mut missing: Vec<&str> = Vec::new();
+        for variant in ServerVariant::builtin() {
+            if variant != &ServerVariant::Unknown && !registered.contains(variant) {
+                missing.push(variant.as_str());
+            }
+        }
+        assert!(missing.is_empty(), "缺少来源的变体：{missing:?}");
+
+        // 每种变体只注册一次：重复注册时 `pick_source` 只认第一个，
+        // 第二个会变成永远走不到的死代码
+        let mut seen: Vec<ServerVariant> = Vec::new();
+        for variant in &registered {
+            assert!(
+                !seen.contains(variant),
+                "变体 {} 被重复注册",
+                variant.as_str()
+            );
+            seen.push(variant.clone());
+        }
+    }
+
+    /// 来源名与变体标识的关系是**有意**分层的
+    ///
+    /// `name()` 是「数据来源」，`variant().as_str()` 是「服务端软件」。多数来源
+    /// 二者同名（paper 来自 PaperMC），但原版的来源是 Mojang 的官网，因此
+    /// `name()` 为 `mojang` 而变体为 `vanilla`。这里把这个例外钉死：不要为了让
+    /// 两者一致去改任何一方，它们本来就是两个概念。
+    #[test]
+    fn source_names_follow_the_upstream_not_the_variant() {
+        let sources = default_jar_sources().expect("默认来源");
+        for source in &sources {
+            let variant = source.variant();
+            let name = source.name();
+            if name == "mojang" {
+                assert_eq!(variant, domain::server::variant::ServerVariant::Vanilla);
+                continue;
+            }
+            assert_eq!(name, variant.as_str(), "来源名与变体标识不一致");
+        }
     }
 }

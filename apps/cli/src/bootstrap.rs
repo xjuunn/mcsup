@@ -59,15 +59,14 @@ pub(crate) fn build_downloader() -> Result<mcsup::file::FileDownloader> {
     Ok(mcsup::file::FileDownloader::new(bytes.clone()).with_range_source(bytes))
 }
 
-/// 已注册的服务端 JAR 来源（能力查询的数据源；接入新 provider 时在此装配）
+/// 已注册的服务端 JAR 来源（能力查询的数据源）
+///
+/// 直接复用库侧组合根的 [`mcsup::bootstrap::default_jar_sources`]：CLI 与库侧
+/// **只有一份**变体注册表，新增变体不会出现「库支持、CLI 不支持」的漂移。
 ///
 /// 构造不打网络，只准备客户端。
 pub(crate) fn jar_sources() -> Result<Vec<Arc<dyn ServerJarSource>>> {
-    Ok(vec![
-        Arc::new(mcsup::provider::mojang::MojangSource::new().context("初始化 Mojang 源")?),
-        Arc::new(mcsup::provider::fabric::FabricSource::new().context("初始化 Fabric 源")?),
-        Arc::new(mcsup::provider::forge::ForgeSource::new().context("初始化 Forge 源")?),
-    ])
+    mcsup::bootstrap::default_jar_sources().context("初始化服务端来源")
 }
 
 /// 可创建 / 可安装的变体集合：来源 `variant()` 去重，保持注册顺序
