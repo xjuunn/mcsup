@@ -31,6 +31,7 @@ owo-colors = { version = "4.4.0", features = ["supports-colors"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 shell-words = "1.1.1"
+sys-locale = "0.3.2"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 toml.workspace = true
 tracing.workspace = true

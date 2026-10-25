@@ -1,5 +1,6 @@
 use crate::bootstrap;
 use crate::diagnostic::AppDiagnostic;
+use crate::locale::Lang;
 use crate::output::Printer;
 use crate::prompts;
 use anyhow::{Context, Result};
@@ -88,15 +89,27 @@ pub(crate) fn list(printer: Printer) -> Result<()> {
             }
         })
         .collect();
+    let lang = printer.lang();
     printer.print_rows(
         &rows,
-        "尚无服务器，先运行 mcsup server create",
+        crate::i18n::text(
+            lang,
+            "尚无服务器，先运行 mcsup server create",
+            "no servers yet; run `mcsup server create` first",
+        ),
         || {
             let mut table = Table::new();
-            table.set_header(["名称", "工作区", "版本", "变体", "状态", "路径"]);
+            table.set_header([
+                crate::i18n::text(lang, "名称", "name"),
+                crate::i18n::text(lang, "工作区", "workspace"),
+                crate::i18n::text(lang, "版本", "version"),
+                crate::i18n::text(lang, "变体", "variant"),
+                crate::i18n::text(lang, "状态", "status"),
+                crate::i18n::text(lang, "路径", "path"),
+            ]);
             for row in &rows {
                 let status = if row.running {
-                    Cell::new("运行中").fg(Color::Green)
+                    Cell::new(crate::i18n::text(lang, "运行中", "running")).fg(Color::Green)
                 } else {
                     Cell::new(&row.row.status)
                 };
@@ -148,8 +161,8 @@ pub(crate) async fn create(
     // 2. 变体能力：flag / 非交互默认先解析（显式未支持 → 退出码 2）
     let available = bootstrap::available_variants()?;
     let variant = match variant {
-        Some(raw) => Some(resolve_flag_variant(raw, &available)?),
-        None if !interactive => Some(default_variant(&available)?),
+        Some(raw) => Some(resolve_flag_variant(raw, &available, printer.lang())?),
+        None if !interactive => Some(default_variant(&available, printer.lang())?),
         None => None,
     };
 
@@ -176,7 +189,7 @@ pub(crate) async fn create(
     };
 
     // 6. 版本（交互拉列表选择；来源随变体能力匹配）
-    let source = bootstrap::source_for(variant)?;
+    let source = bootstrap::source_for(variant, printer.lang())?;
     let version_id = if let Some(version) = version {
         VersionId::new(version)
     } else {
@@ -192,18 +205,31 @@ pub(crate) async fn create(
 
     // 7. 下载核心：失败保留已注册结果，提示用 install 重试
     if let Err(err) = download_jar(&name, &version_id, source, printer).await {
-        printer.print_warning(&format!(
-            "服务器已创建但核心下载失败，可执行 mcsup server install {name} 重试"
+        printer.print_warning(&crate::i18n::pick(
+            printer.lang(),
+            format!("服务器已创建但核心下载失败，可执行 mcsup server install {name} 重试"),
+            format!(
+                "server created but the core download failed; run `mcsup server install {name}` to retry"
+            ),
         ));
         return Err(err);
     }
 
     printer.print_outcome(
-        &format!(
-            "已创建: {} {} → {}",
-            srv.meta.name,
-            srv.meta.version,
-            srv.dir.display()
+        &crate::i18n::pick(
+            printer.lang(),
+            format!(
+                "已创建: {} {} → {}",
+                srv.meta.name,
+                srv.meta.version,
+                srv.dir.display()
+            ),
+            format!(
+                "created: {} {} → {}",
+                srv.meta.name,
+                srv.meta.version,
+                srv.dir.display()
+            ),
         ),
         &CreateRow {
             name: srv.meta.name.as_str(),
@@ -213,22 +239,52 @@ pub(crate) async fn create(
             linked: None,
         },
     )?;
-    printer.print_section(&format!("完成。运行 mcsup server start {name} 启动"));
+    printer.print_section(&crate::i18n::pick(
+        printer.lang(),
+        format!("完成。运行 mcsup server start {name} 启动"),
+        format!("done. run `mcsup server start {name}` to start it"),
+    ));
     Ok(())
 }
 
 /// 显式 `--variant`：解析 + 能力校验；未知 / 未支持都判用法错误（退出码 2）
-fn resolve_flag_variant(raw: &str, available: &[ServerVariant]) -> Result<ServerVariant> {
+fn resolve_flag_variant(
+    raw: &str,
+    available: &[ServerVariant],
+    lang: Lang,
+) -> Result<ServerVariant> {
     let parsed = ServerVariant::parse(raw).map_err(|_| {
         anyhow::Error::from(AppDiagnostic::usage(
-            format!("未知变体: {raw}"),
-            Some(format!("可用变体：{}", bootstrap::join_variants(available))),
+            crate::i18n::pick(
+                lang,
+                format!("未知变体: {raw}"),
+                format!("unknown variant: {raw}"),
+            ),
+            Some(crate::i18n::pick(
+                lang,
+                format!("可用变体：{}", bootstrap::join_variants(available, lang)),
+                format!(
+                    "available variants: {}",
+                    bootstrap::join_variants(available, lang)
+                ),
+            )),
         ))
     })?;
     if !available.contains(&parsed) {
         return Err(AppDiagnostic::usage(
-            format!("暂未支持变体 {raw}"),
-            Some(format!("当前可用：{}", bootstrap::join_variants(available))),
+            crate::i18n::pick(
+                lang,
+                format!("暂未支持变体 {raw}"),
+                format!("variant not supported yet: {raw}"),
+            ),
+            Some(crate::i18n::pick(
+                lang,
+                format!("当前可用：{}", bootstrap::join_variants(available, lang)),
+                format!(
+                    "currently available: {}",
+                    bootstrap::join_variants(available, lang)
+                ),
+            )),
         )
         .into());
     }
@@ -236,13 +292,19 @@ fn resolve_flag_variant(raw: &str, available: &[ServerVariant]) -> Result<Server
 }
 
 /// 非交互缺省变体：优先 vanilla（历史缺省值），否则取首个可用
-fn default_variant(available: &[ServerVariant]) -> Result<ServerVariant> {
+fn default_variant(available: &[ServerVariant], lang: Lang) -> Result<ServerVariant> {
     available
         .iter()
         .copied()
         .find(|variant| *variant == ServerVariant::Vanilla)
         .or_else(|| available.first().copied())
-        .ok_or_else(|| anyhow::anyhow!("没有可用的服务端来源（provider 未注册）"))
+        .ok_or_else(|| {
+            anyhow::anyhow!(crate::i18n::pick(
+                lang,
+                "没有可用的服务端来源（provider 未注册）".to_owned(),
+                "no server jar source available (no provider registered)".to_owned(),
+            ))
+        })
 }
 
 /// 交互变体选择：仅列可用；单可用项免提问（不打步骤回显）
@@ -403,12 +465,12 @@ mod tests {
     fn resolve_flag_variant_gates_by_capability_with_usage_exit() {
         let available = vec![ServerVariant::Vanilla];
         assert_eq!(
-            resolve_flag_variant("vanilla", &available).expect("可用变体"),
+            resolve_flag_variant("vanilla", &available, Lang::Zh).expect("可用变体"),
             ServerVariant::Vanilla
         );
 
         // 拼写未知 → 用法错误（2），并列出可用变体（help 经 miette 渲染携带）
-        let unknown = resolve_flag_variant("paperx", &available).expect_err("未知变体");
+        let unknown = resolve_flag_variant("paperx", &available, Lang::Zh).expect_err("未知变体");
         assert_eq!(Printer::exit_code(&unknown), 2);
         let msg = unknown.to_string();
         assert!(msg.contains("未知变体"), "{msg}");
@@ -419,7 +481,7 @@ mod tests {
         assert!(rendered.contains("vanilla"), "{rendered}");
 
         // 能解析但未注册 provider → 同判用法错误（2），文案区分
-        let unsupported = resolve_flag_variant("paper", &available).expect_err("未支持");
+        let unsupported = resolve_flag_variant("paper", &available, Lang::Zh).expect_err("未支持");
         assert_eq!(Printer::exit_code(&unsupported), 2);
         let msg = unsupported.to_string();
         assert!(msg.contains("暂未支持"), "{msg}");
@@ -433,15 +495,17 @@ mod tests {
     #[test]
     fn default_variant_prefers_vanilla_then_first_available() {
         assert_eq!(
-            default_variant(&[ServerVariant::Vanilla, ServerVariant::Paper]).expect("默认"),
+            default_variant(&[ServerVariant::Vanilla, ServerVariant::Paper], Lang::Zh)
+                .expect("默认"),
             ServerVariant::Vanilla
         );
         assert_eq!(
-            default_variant(&[ServerVariant::Paper, ServerVariant::Fabric]).expect("首个"),
+            default_variant(&[ServerVariant::Paper, ServerVariant::Fabric], Lang::Zh)
+                .expect("首个"),
             ServerVariant::Paper
         );
         assert!(
-            default_variant(&[])
+            default_variant(&[], Lang::Zh)
                 .expect_err("空能力集必须报错")
                 .to_string()
                 .contains("provider")

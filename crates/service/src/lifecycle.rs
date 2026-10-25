@@ -53,6 +53,9 @@ pub struct StartOptions {
 }
 
 /// 生命周期操作失败
+///
+/// 变体若被入口直接展示，文案由入口按 `kind()` 渲染：本层的 `Display` 只用于
+/// 日志与调试，不是面向用户的最终口径（见 `docs/reliability-security.md`）。
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum LifecycleError {
@@ -66,21 +69,19 @@ pub enum LifecycleError {
     #[error(transparent)]
     Supervisor(#[from] SupervisorError),
     /// 未安装核心，或核心文件已不在磁盘
-    #[error("服务器 {name} 未安装核心，可执行 mcsup server install {name}")]
+    #[error("server {name} has no core jar")]
     NoJar {
         /// 服务器名
         name: String,
     },
     /// EULA 未同意且未带 `--accept-eula`
-    #[error("EULA 未同意（需 eula=true），可加 --accept-eula 重试")]
+    #[error("Mojang EULA is not accepted")]
     EulaRequired,
     /// 本机没有可用 Java 运行时
-    #[error("未发现可用 Java 运行时，可执行 mcsup java install 安装")]
+    #[error("no usable Java runtime found")]
     NoJava,
     /// 绑定的大版本没有任何已注册运行时
-    #[error(
-        "服务器 {name} 绑定的 Java 大版本 {major} 无已注册运行时，可执行 mcsup java install {major} 安装"
-    )]
+    #[error("server {name} requires Java {major}, which is not registered")]
     UnknownJavaMajor {
         /// 服务器名
         name: String,
@@ -88,24 +89,24 @@ pub enum LifecycleError {
         major: domain::java::JavaMajor,
     },
     /// 服务器已在运行
-    #[error("服务器已在运行")]
+    #[error("server is already running")]
     AlreadyRunning,
     /// 服务器未在运行
-    #[error("服务器未在运行")]
+    #[error("server is not running")]
     NotRunning,
     /// 目标操作与运行状态冲突：删除 / 换核心不允许在运行中进行
-    #[error("服务器 {name} 正在运行（{phase}），请先 mcsup server stop {name}")]
+    #[error("server {name} is running, refusing to {op:?}")]
     Busy {
         /// 服务器名
         name: String,
-        /// 被拒绝的操作（如「删除」「更换核心」）
-        phase: &'static str,
+        /// 被拒绝的操作
+        op: BusyOp,
     },
     /// 安装 / 更换核心失败（来源、下载、校验、世界降级）
     #[error(transparent)]
     InstallJar(#[from] InstallJarError),
     /// 宽限到期仍未退出（未加 `--force`）
-    #[error("停机超时（已等待 {waited:?}），可加 --force 强杀")]
+    #[error("stop timed out after {waited:?}")]
     StopTimedOut {
         /// 已等待的时长
         waited: Duration,
@@ -113,6 +114,72 @@ pub enum LifecycleError {
     /// 文件读写失败
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+/// 因服务器正在运行而被拒绝的操作
+///
+/// 判定结果的一部分，不带文案；入口据此决定提示措辞。
+/// 工作区级拦截时 `server` 是区内第一台活着的服务器。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BusyOp {
+    /// 删除
+    Remove,
+    /// 更换核心
+    InstallJar,
+    /// 注销整个工作区
+    WorkspaceRemove,
+}
+
+impl LifecycleError {
+    /// 面向用户展示的分类；结构化错误不带文案，入口按此渲染提示
+    #[must_use]
+    pub fn kind(&self) -> Option<LifecycleErrorKind<'_>> {
+        let kind = match self {
+            Self::Registry(_)
+            | Self::Java(_)
+            | Self::Supervisor(_)
+            | Self::InstallJar(_)
+            | Self::Io(_) => return None,
+            Self::NoJar { name } => LifecycleErrorKind::NoJar { name },
+            Self::EulaRequired => LifecycleErrorKind::EulaRequired,
+            Self::NoJava => LifecycleErrorKind::NoJava,
+            Self::UnknownJavaMajor { name, major } => LifecycleErrorKind::UnknownJavaMajor {
+                name,
+                major: *major,
+            },
+            Self::AlreadyRunning => LifecycleErrorKind::AlreadyRunning,
+            Self::NotRunning => LifecycleErrorKind::NotRunning,
+            Self::Busy { name, op } => LifecycleErrorKind::Busy { name, op: *op },
+            Self::StopTimedOut { waited } => LifecycleErrorKind::StopTimedOut { waited: *waited },
+        };
+        Some(kind)
+    }
+}
+
+/// [`LifecycleError::kind`] 的结果：只带判定与参数，文案由入口渲染
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub enum LifecycleErrorKind<'a> {
+    /// 未安装核心
+    NoJar { name: &'a str },
+    /// EULA 未同意
+    EulaRequired,
+    /// 本机没有可用 Java
+    NoJava,
+    /// 绑定的大版本未注册
+    UnknownJavaMajor {
+        name: &'a str,
+        major: domain::java::JavaMajor,
+    },
+    /// 已在运行
+    AlreadyRunning,
+    /// 未在运行
+    NotRunning,
+    /// 运行中被拒
+    Busy { name: &'a str, op: BusyOp },
+    /// 停机超时
+    StopTimedOut { waited: Duration },
 }
 
 /// 服务器生命周期编排
@@ -257,7 +324,7 @@ impl ServerLifecycleService {
         name: &str,
         purge: bool,
     ) -> Result<crate::RegisteredServer, LifecycleError> {
-        self.ensure_stopped(name, "删除")?;
+        self.ensure_stopped(name, BusyOp::Remove)?;
         Ok(self.registry.remove(name, purge)?)
     }
 
@@ -282,7 +349,7 @@ impl ServerLifecycleService {
         progress: Option<&dyn ProgressSink>,
         cancel: &CancellationToken,
     ) -> Result<crate::InstalledServerJar, LifecycleError> {
-        self.ensure_stopped(name, "更换核心")?;
+        self.ensure_stopped(name, BusyOp::InstallJar)?;
         Ok(self
             .registry
             .install_jar(name, version, installer, inspector, progress, cancel)
@@ -290,7 +357,7 @@ impl ServerLifecycleService {
     }
 
     /// 运行状态闸：任一服务器存活则拒绝（Busy），供生命周期敏感操作共用
-    fn ensure_stopped(&self, name: &str, phase: &'static str) -> Result<(), LifecycleError> {
+    fn ensure_stopped(&self, name: &str, op: BusyOp) -> Result<(), LifecycleError> {
         let server = self.registry.get(name)?;
         if self
             .supervisor
@@ -299,7 +366,7 @@ impl ServerLifecycleService {
         {
             return Err(LifecycleError::Busy {
                 name: name.to_owned(),
-                phase,
+                op,
             });
         }
         Ok(())
@@ -328,7 +395,7 @@ impl ServerLifecycleService {
             {
                 return Err(LifecycleError::Busy {
                     name: srv.meta.name.as_str().to_owned(),
-                    phase: "工作区内有服务器在运行",
+                    op: BusyOp::WorkspaceRemove,
                 });
             }
         }
@@ -1640,7 +1707,8 @@ mod tests {
             matches!(
                 err,
                 LifecycleError::Busy {
-                    phase: "删除", ..
+                    op: BusyOp::Remove,
+                    ..
                 }
             ),
             "{err:?}"
@@ -1691,7 +1759,7 @@ mod tests {
             matches!(
                 err,
                 LifecycleError::Busy {
-                    phase: "更换核心",
+                    op: BusyOp::InstallJar,
                     ..
                 }
             ),
