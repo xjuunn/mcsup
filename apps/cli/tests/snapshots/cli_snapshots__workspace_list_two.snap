@@ -1,0 +1,18 @@
+---
+source: apps/cli/tests/cli_snapshots.rs
+expression: shape(&listed)
+---
+[
+  {
+    "current": "bool",
+    "name": "string",
+    "path": "string",
+    "servers": "number"
+  },
+  {
+    "current": "bool",
+    "name": "string",
+    "path": "string",
+    "servers": "number"
+  }
+]

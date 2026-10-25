@@ -1,0 +1,8 @@
+---
+source: apps/cli/tests/cli_snapshots.rs
+expression: normalized
+---
+schema = 1
+id = "<uuid>"
+name = "ws1"
+created_at = <timestamp>

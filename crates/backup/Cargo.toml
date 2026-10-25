@@ -20,4 +20,6 @@ tracing.workspace = true
 workspace = true
 
 [dev-dependencies]
+proptest.workspace = true
 tempfile.workspace = true
+testkit = { version = "0.1.0", path = "../testkit" }

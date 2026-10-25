@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 # crates/mcsup 是唯一发布单元。第一个 app 落地时在这里补上 "apps/*"：
-members = ["apps/cli","apps/dev","crates/backup","crates/domain", "crates/file","crates/java", "crates/mcsup", "crates/port", "crates/protocol", "crates/provider", "crates/runtime", "crates/service", "crates/storage"]
+members = ["apps/cli","apps/dev","crates/backup","crates/domain", "crates/file","crates/java", "crates/mcsup", "crates/port", "crates/protocol", "crates/provider", "crates/runtime", "crates/service", "crates/storage", "crates/testkit"]
 
 [workspace.package]
 version = "0.1.0"
@@ -26,6 +26,10 @@ url = "2.5.8"
 toml = "1.1.8"
 uuid = { version = "1", features = ["v4"] }
 tempfile = "3.27.0"
+# 属性测试：随机输入打穿领域判定（路径穿越、哈希键空间）
+proptest = "1.12.0"
+# 快照测试：CLI 机器契约（JSON 输出、落盘格式）一旦变形立即红
+insta = "1.44.2"
 
 # 发布二进制是 CLI 的分发主体，体积直接影响下载与安装体验。
 # - opt-level = "z"：体积优先；实测比 "s" 小 8%，比 3 小 30%

@@ -1,0 +1,9 @@
+---
+source: apps/cli/tests/cli_snapshots.rs
+expression: value
+---
+{
+  "name": "ws1",
+  "path": "<workspace>",
+  "status": "created"
+}

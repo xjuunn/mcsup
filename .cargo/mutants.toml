@@ -1,0 +1,28 @@
+# cargo-mutants 配置：变异测试只对领域层与服务层开
+#
+# 为什么只用这两个目标：变异测试的成本是「每个变异体一次完整构建 + 一次
+# 测试」，全 workspace 跑一轮要几小时。价值最高的地方是判定逻辑（domain）
+# 与编排时序（service）——入口层与实现层靠契约测试与集成测试覆盖更划算。
+#
+# 基线阶段（2-3 周）只统计、不设阈值：先看存活率是多少，再决定卡在哪里。
+# 直接定阈值会让第一次跑就被历史遗留挡住，最后整个门禁被关掉。
+#
+# 用法：
+#   cargo mutants -p domain -p service        # 基线统计
+#   cargo mutants -p domain -p service --list # 只列出会做哪些变异
+
+exclude_globs = [
+  "crates/testkit/**",
+  "apps/cli/**",
+  "apps/dev/**",
+]
+
+# `#[cfg(test)]` 与 Display 实现被改掉不影响行为，只会在报告里制造噪声
+exclude_re = [
+  "^impl fmt::Display for ",
+  "^impl std::fmt::Display for ",
+]
+
+# 一个变异体跑多久算超时：集成测试里有秒级的落盘等待，留足余量
+# （默认 20 秒会让「真的慢」被误判成「被杀死」）
+timeout = 120

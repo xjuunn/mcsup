@@ -28,4 +28,6 @@ workspace = true
 service = { version = "0.1.0", path = "." }
 storage = { version = "0.1.0", path = "../storage" }
 tempfile.workspace = true
+testkit = { version = "0.1.0", path = "../testkit" }
 tokio = { workspace = true, features = ["macros", "rt"] }
+uuid.workspace = true

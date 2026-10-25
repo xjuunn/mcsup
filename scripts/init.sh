@@ -18,7 +18,9 @@ fi
 printf 'rustc %s\n' "$(rustc --version)"
 
 printf '\n==> cargo tools\n'
-for tool in cargo-hack cargo-deny; do
+# 全量门禁必需：cargo-hack（feature powerset）、cargo-deny（许可证 / advisory）
+# 测试深度用的按需工具：装在这里是为了新机器不必再猜「门禁为什么跑不起来」
+for tool in cargo-hack cargo-deny cargo-nextest cargo-mutants cargo-llvm-cov; do
 	sub=${tool#cargo-}
 	if cargo "$sub" --version >/dev/null 2>&1; then
 		printf '%s 已安装\n' "$tool"

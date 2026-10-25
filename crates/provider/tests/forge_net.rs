@@ -1,23 +1,27 @@
-//! Forge 来源的端到端契约测试（真实请求官方 API）
+//! Forge 来源的端到端探测（真实请求官方 API）
 //!
-//! 默认不跑：联网测试在 CI 上不稳定，且会拖慢门禁。设 `MCSUP_NET_TESTS=1`
-//! 手动执行，用于验证「端点可达 + 解析结果与官方一致」。
+//! **默认不跑**，用 `#[ignore]` 标出，而不是靠环境变量提前 `return`：
+//!
+//! ```text
+//! cargo test -p provider --test forge_net -- --ignored --nocapture
+//! ```
+//!
+//! 原因：靠环境变量跳过的测试在报告里仍是 `passed`，看起来「覆盖了联网路径」，
+//! 实际一行都没跑。`ignored` 在结果里单独计数，一眼就能看出它没被执行。
+//! 夜间 job 会显式跑这一组（见 `.github/workflows/test.yml`）。
+//!
+//! 这里只验证「端点可达 + 解析结果与官方一致」，与 `testkit::http` 的离线
+//! 回环测试互补：离线测试钉协议层，这组钉上游的真实响应形状。
 
 use domain::server::artifact::ChecksumAlgorithm;
 use domain::server::version::{ServerVariant, VersionId};
 use port::ServerJarSource;
 use provider::forge::ForgeSource;
 
-fn enabled() -> bool {
-    std::env::var("MCSUP_NET_TESTS").is_ok_and(|v| v == "1")
-}
-
 /// `versions()` 能拉到真实 MC 版本列表，且声明 forge 变体
 #[tokio::test]
+#[ignore = "需要真实网络：用 --ignored 手动执行，或由夜间 job 跑"]
 async fn versions_reach_official_api() {
-    if !enabled() {
-        return;
-    }
     let source = ForgeSource::new().expect("forge source");
     let versions = source.versions().await.expect("versions");
     assert!(!versions.is_empty(), "官方应返回 MC 版本列表");
@@ -30,10 +34,8 @@ async fn versions_reach_official_api() {
 
 /// `artifact("1.21.1")` 解析出安装器地址与真实 SHA1
 #[tokio::test]
+#[ignore = "需要真实网络：用 --ignored 手动执行，或由夜间 job 跑"]
 async fn artifact_resolves_installer_with_sha1() {
-    if !enabled() {
-        return;
-    }
     let source = ForgeSource::new().expect("forge source");
     let resolved = source
         .artifact(&VersionId::new("1.21.1"))
@@ -53,10 +55,8 @@ async fn artifact_resolves_installer_with_sha1() {
 
 /// 不存在的 MC 版本如实报 `NotFound`
 #[tokio::test]
+#[ignore = "需要真实网络：用 --ignored 手动执行，或由夜间 job 跑"]
 async fn missing_mc_version_is_not_found() {
-    if !enabled() {
-        return;
-    }
     let source = ForgeSource::new().expect("forge source");
     let err = source
         .artifact(&VersionId::new("1.99.999"))

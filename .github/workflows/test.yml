@@ -5,6 +5,9 @@ on:
     branches: [master, main]
   pull_request:
   workflow_dispatch:
+  # 夜间：跑白天的门禁装不下的深度检查（变异测试、联网探测）
+  schedule:
+    - cron: "0 18 * * *"
 
 # 同一分支的新 push 取消旧的运行，避免占用额度。
 concurrency:
@@ -198,10 +201,92 @@ jobs:
       - name: cargo deny check
         run: cargo deny check
 
+  # 快照断言必须是「有人看过才更新」：CI 上发现 .snap.new 就是失败。
+  # 与本地 `cargo insta review` 的分工：本地用它改，CI 只用来拦。
+  snapshots:
+    name: snapshots
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test (snapshots)
+        env:
+          INSTA_UPDATE: "no"
+          INSTA_FORCE_PASS: "0"
+        run: cargo test --workspace --all-features --test cli_snapshots
+      # insta 在 CI 上不会写 .snap.new，但会留在 testdata 里；这里再兜一层：
+      # 有人误把 `.snap.new` 提交进来时，必须当场发现
+      - name: reject pending snapshots
+        run: |
+          found=$(git ls-files '*.snap.new' '*.pending-snap')
+          if [ -n "$found" ]; then
+            echo "仓库里存在未确认的快照，先 cargo insta review 再提交：" >&2
+            echo "$found" >&2
+            exit 1
+          fi
+
+  # ---- 夜间深度检查：不进 PR 门禁（太慢），靠 cron 每天跑一次 ----
+
+  # 变异测试：检查「测试能不能发现实现被改坏」。基线阶段只报告，不卡阈值。
+  mutants:
+    name: mutants
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mutants
+      - name: install cargo-mutants
+        run: cargo install cargo-mutants --locked
+      # 只变异 domain + service：判定与编排的价值最高，成本也最可控
+      - name: cargo mutants
+        run: |
+          cargo mutants -p domain -p service \
+            --output mutants.out \
+            --no-times || true
+          echo '## 变异测试（基线：只报告）' >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          if [ -f mutants.out/outcomes.json ]; then
+            jq -r '.[] | "\(.scenario.summary // "unknown")"' mutants.out/outcomes.json \
+              | sort | uniq -c | sort -rn \
+              | awk '{printf "| %s | %s |\n", $2, $1}' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: upload mutants report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-report
+          path: mutants.out
+          retention-days: 14
+
+  # 真实网络探测：`#[ignore]` 的那组用例。白天门禁永远不跑它们，
+  # 只有这里（夜间）显式执行，失败说明上游改了契约。
+  net:
+    name: net (ignored tests)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: run ignored network tests
+        run: cargo test -p provider --test forge_net -- --ignored --nocapture
+
   required:
     name: required checks
     if: always()
-    needs: [architecture, fmt, clippy, test, msrv, docs, features, deny]
+    needs: [architecture, fmt, clippy, test, msrv, docs, features, deny, snapshots]
     runs-on: ubuntu-latest
     steps:
       # required 失败时必须指出是哪个 job：原来 jq 输出丢进 /dev/null，日志是空的。
