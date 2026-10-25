@@ -72,8 +72,9 @@ jobs:
           - os: ubuntu-latest
             lang: en_US.UTF-8
             lc_all: en_US.UTF-8
-          # Windows / macOS 只跑一条：Windows 的 sys_locale 读系统设置而非 LANG，
-          # 这两个平台验的是「不因 locale 空值崩」，语言切换由显式 --lang 覆盖
+          # Windows / macOS 只跑一条：两个平台都不读 LANG，这条验的是
+          # 「locale 环境变量为空也不崩」，语言切换由显式 --lang 覆盖。
+          # macOS 的 LANG 还会被安全 check-in 强制覆盖，设了也不生效。
           - os: windows-latest
             lang: C
             lc_all: ""
@@ -103,10 +104,14 @@ jobs:
           LC_ALL: ${{ matrix.lc_all }}
           MCSUP_LANG: ""
         run: sh scripts/check-e2e.sh
-      # 语言矩阵下再验一次二进制本身：帮助必须能按环境给出正确语言（仅 Unix，
-      # Windows 的 locale 来源不同）。C / 空值回退英文，其余按主语言标签判定。
+      # 语言矩阵下再验一次二进制本身：帮助必须能按环境给出正确语言。
+      #
+      # 只在 Linux 跑：`sys_locale` 在 Linux 读 LANG，在 macOS 读
+      # `CFLocaleCopyPreferredLanguages()`（不读 LANG），在 Windows 读系统设置。
+      # 在 macOS 上用 `case "$LANG"` 推导期望值会得到必然错误的结论——
+      # macOS 的安全 check-in 还会强制覆盖 LANG，设什么都无效。
       - name: help follows platform locale
-        if: runner.os != 'Windows'
+        if: runner.os == 'Linux'
         run: |
           # cargo test 只构建测试目标，二进制要单独构建
           cargo build -p cli
@@ -121,7 +126,8 @@ jobs:
                printf '%s\n' "$help" >&2
                exit 1 ;;
           esac
-      # 显式 --lang 必须压过环境，两种取值都要验
+      # 显式 --lang 必须压过环境，两种取值都要验。
+      # macOS 也跑这条：`--lang` 走显式分支，不读平台 locale，所以是有效断言。
       - name: explicit --lang overrides platform locale
         if: runner.os != 'Windows'
         run: |

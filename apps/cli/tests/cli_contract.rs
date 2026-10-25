@@ -484,9 +484,9 @@ fn mcsup_lang_env_selects_language() {
 
 /// 平台 locale 决定语言：`LANG=en_US.UTF-8` 下不给中文
 ///
-/// 只在 Unix 生效，Windows 的 `sys_locale` 读系统设置而非 `LANG`。
+/// 只在 Linux 生效，理由同 `platform_locale_zh_gives_chinese`：macOS 不读 `LANG`。
 #[test]
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn platform_locale_en_gives_english() {
     let home = temp_home();
     let out = run_with_env(home.path(), &["--help"], &[("LANG", "en_US.UTF-8")]);
@@ -497,8 +497,10 @@ fn platform_locale_en_gives_english() {
 }
 
 /// 平台 locale 决定语言：`LANG=C` 无语言信息，回退英文
+///
+/// 只在 Linux 生效：macOS 不读 `LANG`，runner 上无论怎么设都可能是中文。
 #[test]
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn platform_locale_c_falls_back_to_english() {
     let home = temp_home();
     let out = run_with_env(home.path(), &["--help"], &[("LANG", "C")]);
@@ -509,8 +511,12 @@ fn platform_locale_c_falls_back_to_english() {
 }
 
 /// 平台 locale 决定语言：`LANG=zh_CN.UTF-8` 给中文
+///
+/// 只在 Linux 生效。macOS 的 `sys_locale` 走 `CFLocaleCopyPreferredLanguages()`
+/// 读系统语言偏好，**不读 `LANG`**，所以在 runner 上设 `LANG` 不会改变结果。
+/// 用 `target_os` 而不是 `cfg(unix)`：后者会把 macOS 一起算进来。
 #[test]
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn platform_locale_zh_gives_chinese() {
     let home = temp_home();
     let out = run_with_env(home.path(), &["--help"], &[("LANG", "zh_CN.UTF-8")]);
@@ -520,6 +526,9 @@ fn platform_locale_zh_gives_chinese() {
 }
 
 /// 显式 `--lang` 不能被平台 locale 翻回去
+///
+/// 仍在 `cfg(unix)` 下跑，包括 macOS：`--lang` 走显式分支，完全不碰 `sys_locale`，
+/// 所以这条在 macOS 上是有效的断言，与读不读 `LANG` 无关。
 #[test]
 #[cfg(unix)]
 fn lang_flag_beats_platform_locale() {
