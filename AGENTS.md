@@ -72,9 +72,10 @@ apps/cli    apps/server    apps/agent    apps/mcp
 
 任务完成不等于可以提交。发现暂存内容有问题时指出问题，不要修正。
 
-开发任务（新功能 / bugfix）默认在新建 worktree 中完成，除非用户明确要求。
+开发任务（新功能 / bugfix）默认从 master 新建 worktree 完成，除非用户明确要求。
 完成后运行 `scripts/check.sh`，测试必须完全通过；经用户明确同意后，才提交并
-合入 master。合入前如有冲突，先解决冲突。提交信息规范见
+合入 master。合入前如有冲突，先解决冲突。合入后删除该 worktree，下一个任务
+重新从 master 新建。提交信息规范见
 `docs/development-workflow.md` 的「提交信息规范」。
 
 ## 6. AI 写作规范
