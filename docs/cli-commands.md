@@ -36,27 +36,57 @@
   非法重输）→ 名称（默认=目录名，不合法退回序号 `workspaceNN`）→ 确认。
   非交互无 `--dir` 保持用当前目录 + service 序号的既有机器行为。
 
-命令层级：
+## 子命令简写
+
+每一级子命令都提供固定简写，**全拼始终有效**，简写只是额外入口：
+
+- 简写最少两个字母，单字母不提供（`mcsup s` 报 `unrecognized subcommand`）。
+- 简写是显式登记的别名，不做前缀推断：`mcsup server l` 不会猜成 `list`。
+- 歧义与拼错由 clap 报错并列出候选；`--help` 展示 `[alias: ...]`。
+- 简写与全拼解析到同一个命令，退出码、stdout / JSON 输出完全一致。
+- 别名表在 `apps/cli/src/cli.rs` 的 `#[command(visible_alias = ...)]`，
+  由单测保证「≥ 2 个字母」且「同层不重复」。
+
+| 层级 | 简写 |
+| --- | --- |
+| 顶层 | `ws` workspace · `srv` server · `mp` modpack · `jv` java · `rmt` remote · `doc` doctor · `cfg` config · `up` update · `comp` completions · `ver` version |
+| `workspace` | `in` / `new` init · `ls` list · `sw` use · `rm` remove · `doc` doctor |
+| `server` | `ls` list · `cr` create · `in` install · `up` start · `down` stop · `rs` restart · `st` status · `con` console · `snd` send · `log` logs · `prop` props · `cfg` set · `rm` remove · `ln` link · `ver` version · `bak` backup · `md` mod |
+| `server backup` | `cr` create · `ls` list · `rt` restore · `vf` verify · `pr` prune |
+| `server mod` | `ls` list · `in` install · `rm` remove · `up` update · `od` outdated |
+| `modpack` | `ls` list · `in` install |
+| `java` | `ls` list · `sc` scan · `in` install · `un` / `rm` uninstall |
+| `remote` | `ls` list · `dp` deploy · `pg` ping · `rm` remove |
+| `config` | `ls` show · `st` set · `us` unset · `ed` edit |
+
+## 命令层级
 
 ```
 mcsup
-├── workspace                 # 工作区：创建 / 注册表 / 当前切换
-│   ├── init [--dir <path>] [--name <name>]
-│   ├── list / use [<name>] / remove <name> [--purge] / doctor
-├── server                    # 单台服务：生命周期 + 属主内容
-│   ├── list / create / link / install / start / stop / restart
-│   ├── status / console / send / logs / props / set / remove / version
-│   ├── backup    create · list · restore · verify · prune
-│   └── mod       list · install · remove · update · outdated
-├── modpack                   # 整合包：一键建整包服务器
-│   ├── install <pack> [--name <name>] [--workspace <ws>]
-│   └── update <name>
-├── java                      # 机器级 JVM 运行时
-│   └── list / install / uninstall / default
-├── remote                    # 远端执行位置（Backend）
-│   └── list / deploy / ping / remove
-└── doctor / config / update / completions / version / help
+├── workspace (ws)            # 工作区：创建 / 注册表 / 当前切换
+│   ├── init (in|new) [--dir <path>] [--name <name>]
+│   ├── list (ls) / use (sw) [<name>] / remove (rm) <name> [--purge] / doctor (doc)
+├── server (srv)              # 单台服务：生命周期 + 属主内容
+│   ├── list (ls) / create (cr) / link (ln) / install (in)
+│   ├── start (up) / stop (down) / restart (rs)
+│   ├── status (st) / console (con) / send (snd) / logs (log)
+│   ├── props (prop) / set (cfg) / remove (rm) / version (ver)
+│   ├── backup (bak)  create (cr) · list (ls) · restore (rt) · verify (vf) · prune (pr)
+│   └── mod (md)      list (ls) · install (in) · remove (rm) · update (up) · outdated (od)
+├── modpack (mp)              # 整合包：一键建整包服务器
+│   ├── install (in) <pack> [--name <name>] [--workspace <ws>]
+│   └── list (ls) [<query>]
+├── java (jv)                 # 机器级 JVM 运行时
+│   └── list (ls) / scan (sc) / install (in) / uninstall (un|rm)
+├── remote (rmt)              # 远端执行位置（Backend）
+│   └── list (ls) / deploy (dp) / ping (pg) / remove (rm)
+└── doctor (doc) / config (cfg) / update (up)
+    / completions (comp) / version (ver) / help
 ```
+
+`config` 子命令：`show (ls)` / `set (st)` / `unset (us)` / `edit (ed)`。
+
+括号内为简写，最少两个字母，全拼始终有效。
 
 CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、JSON 等
 机器契约见 `docs/embedding.md` 的 CLI 契约一节。

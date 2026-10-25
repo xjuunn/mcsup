@@ -581,3 +581,78 @@ fn doctor_reports_invalid_config() {
         "{invalid}"
     );
 }
+
+/// 简写与全拼是同一个命令：stdout 逐字节一致、退出码一致
+#[test]
+fn subcommand_shorthand_matches_long_form() {
+    let home = temp_home();
+    let ws = home.path().join("wsdir");
+    let init = run(
+        home.path(),
+        &[
+            "ws",
+            "in",
+            "--dir",
+            ws.to_str().expect("utf8"),
+            "--name",
+            "ws1",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(init.status.code(), Some(0), "stderr: {}", stderr(&init));
+
+    for (short, long) in [
+        (
+            vec!["ws", "ls", "--output", "json"],
+            vec!["workspace", "list", "--output", "json"],
+        ),
+        (
+            vec!["srv", "ls", "--output", "json"],
+            vec!["server", "list", "--output", "json"],
+        ),
+        (
+            vec!["jv", "ls", "--output", "json"],
+            vec!["java", "list", "--output", "json"],
+        ),
+    ] {
+        let from_short = run(home.path(), &short);
+        let from_long = run(home.path(), &long);
+        assert_eq!(
+            from_short.status.code(),
+            from_long.status.code(),
+            "{short:?} 与 {long:?} 退出码不同"
+        );
+        assert!(
+            !from_short.stdout.is_empty(),
+            "{short:?} 无 stdout，stderr: {}",
+            stderr(&from_short)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&from_short.stdout),
+            String::from_utf8_lossy(&from_long.stdout),
+            "{short:?} 与 {long:?} stdout 不一致"
+        );
+    }
+}
+
+/// 单字母不提供简写：按未知子命令报错退出，不推断、不执行
+#[test]
+fn single_letter_shorthand_is_rejected() {
+    let home = temp_home();
+    for args in [vec!["s"], vec!["w"], vec!["server", "l"]] {
+        let out = run(home.path(), &args);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{args:?} stderr: {}",
+            stderr(&out)
+        );
+        assert!(out.stdout.is_empty(), "{args:?} 不得输出数据");
+        assert!(
+            stderr(&out).contains("unrecognized subcommand"),
+            "{args:?}: {}",
+            stderr(&out)
+        );
+    }
+}
