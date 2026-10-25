@@ -8,6 +8,7 @@ mod help;
 mod i18n;
 mod input;
 mod keymap;
+mod locale;
 mod output;
 mod progress;
 mod prompts;
@@ -22,25 +23,28 @@ async fn main() -> ExitCode {
         |_| Box::new(miette::GraphicalReportHandler::new()),
     ));
     let cli = help::parse();
+    // 语言先于一切输出确定：帮助之外的提示都经 Printer 出去
+    let lang = locale::detect(locale::LangChoice::parse(&cli.lang));
+    let printer = output::Printer::new(cli.output, lang);
     verbosity::init(cli.verbose);
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "启动");
 
     let cfg = match config::Config::load(cli.config.as_deref()) {
         Ok(cfg) => cfg,
         Err(err) => {
-            output::Printer::render_error(err);
+            printer.render_error(err);
             return ExitCode::from(1);
         }
     };
 
-    match commands::run(cli, &cfg).await {
+    match commands::run(cli, &cfg, lang).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             let code = output::Printer::exit_code(&err);
             // 130 只有「用户取消」一条来路（Ctrl-C 协作取消），中间文件已由
             // 下层静默清理完：不打印错误，直接以取消码退出
             if code != 130 {
-                output::Printer::render_error(err);
+                printer.render_error(err);
             }
             ExitCode::from(code)
         }

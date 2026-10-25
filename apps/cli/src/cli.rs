@@ -25,6 +25,15 @@ pub(crate) struct Cli {
     /// 配置文件路径，缺省用系统配置目录下的 mcsup/config.toml
     #[arg(long, global = true, value_name = "PATH")]
     pub(crate) config: Option<PathBuf>,
+    /// 界面语言：auto按环境自动判断 zh中文 en英文（只影响提示文案，--output json 不受影响）
+    #[arg(
+        long,
+        global = true,
+        value_name = "LANG",
+        default_value = "auto",
+        value_parser = ["auto", "zh", "en"]
+    )]
+    pub(crate) lang: String,
     #[command(subcommand)]
     pub(crate) command: Command,
 }

@@ -1,18 +1,34 @@
 //! 结构化错误 → 面向用户的提示文本
 //!
 //! `domain` / `service` 的错误只携带判定与参数（`kind()`），文案在这里集中渲染。
-//! 入口据此输出中文提示；将来接入多语言时只改这一处，判定逻辑不受影响。
+//! 判定与语言无关，同一份 `kind()` 按 [`Lang`] 出不同文案。
+//!
+//! 语言由 [`crate::locale`] 解析（`--lang` > `MCSUP_LANG` > 平台 locale），
+//! 显式传入而非全局状态：入口拿到的 `Lang` 一路往下传，测试可以直接断言两种语言。
 //!
 //! 各错误的 `Display` 仍是英文短句，只用于日志与调试，不是用户口径。
 
+use crate::locale::Lang;
 use mcsup::service::{
     BusyOp, CheckKind, InstallJarErrorKind, LifecycleErrorKind, SettingsErrorKind,
 };
 use std::time::Duration;
 
+/// 二元短文案：没有参数要插时才用这个，避免为零散界面词各建一个函数
+#[must_use]
+pub(crate) const fn text(lang: Lang, zh: &'static str, en: &'static str) -> &'static str {
+    match lang {
+        Lang::Zh => zh,
+        Lang::En => en,
+    }
+}
+
 /// 生命周期错误提示
 #[must_use]
-pub(crate) fn lifecycle(kind: &LifecycleErrorKind<'_>) -> String {
+pub(crate) fn lifecycle(kind: &LifecycleErrorKind<'_>, lang: Lang) -> String {
+    if !lang.is_zh() {
+        return lifecycle_en(kind);
+    }
     match kind {
         LifecycleErrorKind::NoJar { name } => {
             format!("服务器 {name} 未安装核心，可执行 mcsup server install {name}")
@@ -31,27 +47,61 @@ pub(crate) fn lifecycle(kind: &LifecycleErrorKind<'_>) -> String {
         LifecycleErrorKind::Busy { name, op } => match op {
             BusyOp::Remove | BusyOp::InstallJar => format!(
                 "服务器 {name} 正在运行（{}），请先 mcsup server stop {name}",
-                busy_op(*op)
+                busy_op(*op, lang)
             ),
             BusyOp::WorkspaceRemove => {
                 format!("工作区内有服务器在运行（{name}），请先 mcsup server stop {name}")
             }
             _ => format!("服务器 {name} 正在运行，请先 mcsup server stop {name}"),
         },
-        LifecycleErrorKind::StopTimedOut { waited } => {
-            format!(
-                "停机超时（已等待 {}），可加 --force 强杀",
-                fmt_duration(*waited)
-            )
+        LifecycleErrorKind::StopTimedOut { waited } => format!(
+            "停机超时（已等待 {}），可加 --force 强杀",
+            fmt_duration(*waited)
+        ),
+        // non_exhaustive：新增判定在补文案前沿用英文措辞，不漏掉提示
+        _ => lifecycle_en(kind),
+    }
+}
+
+fn lifecycle_en(kind: &LifecycleErrorKind<'_>) -> String {
+    match kind {
+        LifecycleErrorKind::NoJar { name } => {
+            format!("server {name} has no core jar; run `mcsup server install {name}`")
         }
-        // non_exhaustive：新增判定在此补文案前先从英文短句兜底
-        _ => String::new(),
+        LifecycleErrorKind::EulaRequired => {
+            "the Mojang EULA is not accepted; retry with --accept-eula".to_owned()
+        }
+        LifecycleErrorKind::NoJava => {
+            "no usable Java runtime found; run `mcsup java install`".to_owned()
+        }
+        LifecycleErrorKind::UnknownJavaMajor { name, major } => format!(
+            "server {name} is pinned to Java {major}, which is not registered; run `mcsup java install {major}`"
+        ),
+        LifecycleErrorKind::AlreadyRunning => "the server is already running".to_owned(),
+        LifecycleErrorKind::NotRunning => "the server is not running".to_owned(),
+        LifecycleErrorKind::Busy { name, op } => match op {
+            BusyOp::WorkspaceRemove => format!(
+                "a server in this workspace is still running ({name}); run `mcsup server stop {name}` first"
+            ),
+            other => format!(
+                "server {name} is running; refusing to {} — run `mcsup server stop {name}` first",
+                busy_op_en(*other)
+            ),
+        },
+        LifecycleErrorKind::StopTimedOut { waited } => format!(
+            "stop timed out after {}; add --force to kill it",
+            fmt_duration(*waited)
+        ),
+        _ => "operation failed".to_owned(),
     }
 }
 
 /// 运行中被拒绝的操作
 #[must_use]
-pub(crate) fn busy_op(op: BusyOp) -> &'static str {
+pub(crate) fn busy_op(op: BusyOp, lang: Lang) -> &'static str {
+    if !lang.is_zh() {
+        return busy_op_en(op);
+    }
     match op {
         BusyOp::Remove => "删除",
         BusyOp::InstallJar => "更换核心",
@@ -60,37 +110,61 @@ pub(crate) fn busy_op(op: BusyOp) -> &'static str {
     }
 }
 
+fn busy_op_en(op: BusyOp) -> &'static str {
+    match op {
+        BusyOp::Remove => "remove it",
+        BusyOp::InstallJar => "replace its core",
+        BusyOp::WorkspaceRemove => "remove the workspace",
+        _ => "proceed",
+    }
+}
+
 /// 核心安装错误提示
 #[must_use]
-pub(crate) fn install_jar(kind: &InstallJarErrorKind<'_>) -> String {
+pub(crate) fn install_jar(kind: &InstallJarErrorKind<'_>, lang: Lang) -> String {
     match kind {
-        InstallJarErrorKind::Inspect => "无法检查世界或目标核心的兼容性".to_owned(),
+        InstallJarErrorKind::Inspect => match lang {
+            Lang::Zh => "无法检查世界或目标核心的兼容性".to_owned(),
+            Lang::En => "failed to inspect the world or the target core".to_owned(),
+        },
         InstallJarErrorKind::Downgrade {
             world,
             target,
             world_version,
             target_version,
-        } => format!(
-            "世界由 {world_version}（DataVersion {world}）创建，目标版本 {target_version}（DataVersion {target}）更低；Minecraft 不支持降级世界。请改用 {world_version} 或更高版本，或备份并移走世界目录后重试"
-        ),
-        _ => String::new(),
+        } => match lang {
+            Lang::Zh => format!(
+                "世界由 {world_version}（DataVersion {world}）创建，目标版本 {target_version}（DataVersion {target}）更低；Minecraft 不支持降级世界。请改用 {world_version} 或更高版本，或备份并移走世界目录后重试"
+            ),
+            Lang::En => format!(
+                "the world was created by {world_version} (DataVersion {world}), which is newer than the target {target_version} (DataVersion {target}); Minecraft cannot downgrade a world. Use {world_version} or newer, or back up and move the world directory away before retrying"
+            ),
+        },
+        // non_exhaustive：新增判定在补文案前沿用英文措辞
+        _ => "failed to install the core".to_owned(),
     }
 }
 
 /// 服务属性错误提示
 #[must_use]
-pub(crate) fn settings(kind: &SettingsErrorKind<'_>) -> String {
+pub(crate) fn settings(kind: &SettingsErrorKind<'_>, lang: Lang) -> String {
     match kind {
-        SettingsErrorKind::UnknownJavaMajor { major, .. } => {
-            format!("未注册的大版本 Java {major}，可执行 mcsup java install {major} 安装")
-        }
-        _ => String::new(),
+        SettingsErrorKind::UnknownJavaMajor { major, .. } => match lang {
+            Lang::Zh => {
+                format!("未注册的大版本 Java {major}，可执行 mcsup java install {major} 安装")
+            }
+            Lang::En => format!("Java {major} is not registered; run `mcsup java install {major}`"),
+        },
+        _ => "failed to update server settings".to_owned(),
     }
 }
 
 /// doctor 发现的问题描述
 #[must_use]
-pub(crate) fn check(kind: &CheckKind) -> String {
+pub(crate) fn check(kind: &CheckKind, lang: Lang) -> String {
+    if !lang.is_zh() {
+        return check_en(kind);
+    }
     match kind {
         CheckKind::NoCurrentWorkspace => "没有任何当前工作区".to_owned(),
         CheckKind::WorkspaceDirMissing { .. } => "工作目录在磁盘上不存在".to_owned(),
@@ -110,22 +184,58 @@ pub(crate) fn check(kind: &CheckKind) -> String {
             "服务器记录的目录不是 servers/ 的直接子目录".to_owned()
         }
         CheckKind::OrphanServerRecord { .. } => "服务器记录指向的工作区已不存在".to_owned(),
-        _ => String::new(),
+        _ => check_en(kind),
+    }
+}
+
+fn check_en(kind: &CheckKind) -> String {
+    match kind {
+        CheckKind::NoCurrentWorkspace => "no current workspace".to_owned(),
+        CheckKind::WorkspaceDirMissing { .. } => "the workspace directory is missing".to_owned(),
+        CheckKind::WorkspaceMarkerMissing { .. } => {
+            "the workspace directory has no workspace.toml, so its identity is unknown".to_owned()
+        }
+        CheckKind::WorkspaceMarkerMismatch { .. } => {
+            "workspace.toml does not match the registry record".to_owned()
+        }
+        CheckKind::ServersDirUnreadable { reason, .. } => format!(
+            "servers/ cannot be listed ({reason}); the server inventory of this workspace is unreliable"
+        ),
+        CheckKind::DanglingLink { .. } => "a symlink points to a missing target".to_owned(),
+        CheckKind::OnDiskNotRegistered { .. } => {
+            "a server directory on disk is not registered".to_owned()
+        }
+        CheckKind::RegisteredButMissing { .. } => {
+            "a registered server cannot be found on disk".to_owned()
+        }
+        CheckKind::RelDirNotDirectChild { .. } => {
+            "a server record points outside the direct children of servers/".to_owned()
+        }
+        CheckKind::OrphanServerRecord { .. } => {
+            "a server record points to a workspace that no longer exists".to_owned()
+        }
+        _ => "unknown finding".to_owned(),
     }
 }
 
 /// doctor 发现问题的定位行
 #[must_use]
-pub(crate) fn check_location(kind: &CheckKind) -> String {
+pub(crate) fn check_location(kind: &CheckKind, lang: Lang) -> String {
     if matches!(kind, CheckKind::NoCurrentWorkspace) {
-        return "运行 mcsup workspace use <name> 指定当前工作区".to_owned();
+        return match lang {
+            Lang::Zh => "运行 mcsup workspace use <name> 指定当前工作区".to_owned(),
+            Lang::En => "run `mcsup workspace use <name>` to pick a workspace".to_owned(),
+        };
     }
     kind.locate()
 }
 
 /// doctor 发现问题的修复建议：只给动作，doctor 本身不写任何东西
 #[must_use]
-pub(crate) fn check_fix(kind: &CheckKind) -> String {
+pub(crate) fn check_fix(kind: &CheckKind, lang: Lang) -> String {
+    if !lang.is_zh() {
+        return check_fix_en(kind);
+    }
     match kind {
         CheckKind::NoCurrentWorkspace => "`mcsup workspace use <name>`".to_owned(),
         CheckKind::WorkspaceDirMissing { .. } => {
@@ -156,7 +266,42 @@ pub(crate) fn check_fix(kind: &CheckKind) -> String {
         CheckKind::OrphanServerRecord { name, .. } => {
             format!("`mcsup server remove {name}` 清理孤儿记录")
         }
-        _ => String::new(),
+        _ => check_fix_en(kind),
+    }
+}
+
+fn check_fix_en(kind: &CheckKind) -> String {
+    match kind {
+        CheckKind::NoCurrentWorkspace => "`mcsup workspace use <name>`".to_owned(),
+        CheckKind::WorkspaceDirMissing { .. } => {
+            "move the directory back, or unregister it with `mcsup workspace remove <name>`".to_owned()
+        }
+        CheckKind::WorkspaceMarkerMissing { path } => format!(
+            "rebuild workspace.toml once the ownership is confirmed (id must match the record), or unregister and run `workspace init {}` again",
+            path.display()
+        ),
+        CheckKind::WorkspaceMarkerMismatch { .. } => {
+            "this directory is no longer the workspace of this record: unregister the record, or restore the original marker".to_owned()
+        }
+        CheckKind::ServersDirUnreadable { .. } => "check directory permissions".to_owned(),
+        CheckKind::DanglingLink { path } => format!(
+            "run `mcsup server remove <name>` to drop the link, or restore the target and retry (link: {})",
+            path.display()
+        ),
+        CheckKind::OnDiskNotRegistered { path } => format!(
+            "run `mcsup server link {}` to register it again, or delete the directory",
+            path.display()
+        ),
+        CheckKind::RegisteredButMissing { name, .. } => {
+            format!("run `mcsup server remove {name}`, or restore the directory to its original place")
+        }
+        CheckKind::RelDirNotDirectChild { name, .. } => {
+            format!("run `mcsup server remove {name}` and then `server link` again")
+        }
+        CheckKind::OrphanServerRecord { name, .. } => {
+            format!("run `mcsup server remove {name}` to clear the orphan record")
+        }
+        _ => "inspect and fix the finding manually".to_owned(),
     }
 }
 
@@ -183,24 +328,51 @@ mod tests {
             name: "alpha".to_owned(),
         };
         assert_eq!(
-            lifecycle(&no_jar.kind().expect("kind")),
+            lifecycle(&no_jar.kind().expect("kind"), Lang::Zh),
             "服务器 alpha 未安装核心，可执行 mcsup server install alpha"
         );
         assert_eq!(
-            lifecycle(&LifecycleError::EulaRequired.kind().expect("kind")),
+            lifecycle(
+                &LifecycleError::EulaRequired.kind().expect("kind"),
+                Lang::Zh
+            ),
             "EULA 未同意（需 eula=true），可加 --accept-eula 重试"
         );
         assert_eq!(
-            lifecycle(&LifecycleError::AlreadyRunning.kind().expect("kind")),
+            lifecycle(
+                &LifecycleError::AlreadyRunning.kind().expect("kind"),
+                Lang::Zh
+            ),
             "服务器已在运行"
         );
         let timeout = LifecycleError::StopTimedOut {
             waited: Duration::from_secs(90),
         };
         assert_eq!(
-            lifecycle(&timeout.kind().expect("kind")),
+            lifecycle(&timeout.kind().expect("kind"), Lang::Zh),
             "停机超时（已等待 1m30s），可加 --force 强杀"
         );
+    }
+
+    /// 同一份判定在英文下必须给出英文，且不残留中文
+    #[test]
+    fn lifecycle_variants_render_english() {
+        let no_jar = LifecycleError::NoJar {
+            name: "alpha".to_owned(),
+        };
+        let text = lifecycle(&no_jar.kind().expect("kind"), Lang::En);
+        assert!(text.contains("alpha"), "{text}");
+        assert!(text.contains("no core jar"), "{text}");
+        assert!(!text.contains("服务器"), "{text}");
+
+        let busy = LifecycleError::Busy {
+            name: "alpha".to_owned(),
+            op: BusyOp::Remove,
+        };
+        let text = lifecycle(&busy.kind().expect("kind"), Lang::En);
+        assert!(text.contains("is running"), "{text}");
+        assert!(text.contains("remove it"), "{text}");
+        assert!(!text.contains("正在运行"), "{text}");
     }
 
     /// 运行中被拒：删除 / 换核心按操作名，工作区级拦截点名区内第一台活着的服务器
@@ -211,7 +383,7 @@ mod tests {
             op: BusyOp::Remove,
         };
         assert_eq!(
-            lifecycle(&remove.kind().expect("kind")),
+            lifecycle(&remove.kind().expect("kind"), Lang::Zh),
             "服务器 alpha 正在运行（删除），请先 mcsup server stop alpha"
         );
         let install = LifecycleError::Busy {
@@ -219,7 +391,7 @@ mod tests {
             op: BusyOp::InstallJar,
         };
         assert_eq!(
-            lifecycle(&install.kind().expect("kind")),
+            lifecycle(&install.kind().expect("kind"), Lang::Zh),
             "服务器 alpha 正在运行（更换核心），请先 mcsup server stop alpha"
         );
         let ws = LifecycleError::Busy {
@@ -227,38 +399,66 @@ mod tests {
             op: BusyOp::WorkspaceRemove,
         };
         assert_eq!(
-            lifecycle(&ws.kind().expect("kind")),
+            lifecycle(&ws.kind().expect("kind"), Lang::Zh),
             "工作区内有服务器在运行（alpha），请先 mcsup server stop alpha"
         );
     }
 
-    #[test]
-    fn install_jar_downgrade_renders_chinese() {
-        let err = InstallJarError::Downgrade {
+    fn downgrade() -> InstallJarError {
+        InstallJarError::Downgrade {
             world: DataVersion::new(4786),
             target: DataVersion::new(4554),
             world_version: "26.1".to_owned(),
             target_version: "1.21.9".to_owned(),
-        };
-        let text = install_jar(&err.kind().expect("kind"));
-        assert!(text.contains("世界由 26.1"), "{text}");
-        assert!(text.contains("Minecraft 不支持降级世界"), "{text}");
-        assert!(!text.contains("not supported"), "{text}");
+        }
+    }
+
+    #[test]
+    fn install_jar_downgrade_renders_both_languages() {
+        let err = downgrade();
+        let zh = install_jar(&err.kind().expect("kind"), Lang::Zh);
+        assert!(zh.contains("世界由 26.1"), "{zh}");
+        assert!(zh.contains("Minecraft 不支持降级世界"), "{zh}");
+
+        let en = install_jar(&err.kind().expect("kind"), Lang::En);
+        assert!(en.contains("cannot downgrade a world"), "{en}");
+        assert!(!en.contains("世界"), "{en}");
+
         assert_eq!(
-            install_jar(&InstallJarErrorKind::Inspect),
+            install_jar(&InstallJarErrorKind::Inspect, Lang::Zh),
             "无法检查世界或目标核心的兼容性"
+        );
+        assert_eq!(
+            install_jar(&InstallJarErrorKind::Inspect, Lang::En),
+            "failed to inspect the world or the target core"
         );
     }
 
     #[test]
-    fn settings_unknown_major_renders_chinese() {
+    fn settings_unknown_major_renders_both_languages() {
         let err = SettingsError::UnknownJavaMajor {
             name: "alpha".to_owned(),
             major: JavaMajor::parse(17).expect("17"),
         };
         assert_eq!(
-            settings(&err.kind().expect("kind")),
+            settings(&err.kind().expect("kind"), Lang::Zh),
             "未注册的大版本 Java 17，可执行 mcsup java install 17 安装"
+        );
+        assert_eq!(
+            settings(&err.kind().expect("kind"), Lang::En),
+            "Java 17 is not registered; run `mcsup java install 17`"
+        );
+    }
+
+    #[test]
+    fn check_renders_both_languages() {
+        let kind = CheckKind::NoCurrentWorkspace;
+        assert_eq!(check(&kind, Lang::Zh), "没有任何当前工作区");
+        assert_eq!(check(&kind, Lang::En), "no current workspace");
+        assert_eq!(check_fix(&kind, Lang::Zh), "`mcsup workspace use <name>`");
+        assert_eq!(
+            check_location(&kind, Lang::En),
+            "run `mcsup workspace use <name>` to pick a workspace"
         );
     }
 }

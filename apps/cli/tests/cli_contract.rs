@@ -25,20 +25,32 @@ fn temp_home() -> TempDir {
 }
 
 fn run(home: &Path, args: &[&str]) -> Output {
+    run_with_env(home, args, &[])
+}
+
+/// 带额外环境变量的运行：语言相关断言必须显式指定，否则结果随机器 locale 变
+fn run_with_env(home: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_mcsup"));
     cmd.args(args)
         .env("HOME", home)
         .env("USERPROFILE", home)
         .env("XDG_DATA_HOME", home.join("share"))
         .env("XDG_CONFIG_HOME", home.join("config"))
-        // 清掉宿主环境的干扰变量（空值在入口按缺省处理）
+        // 清掉可能干扰语言判定的外部变量，由调用方显式给出
+        .env_remove("MCSUP_LANG")
+        .env_remove("LANG")
+        .env_remove("LC_ALL")
+        .env_remove("LC_CTYPE")
+        // 空值覆盖到配置文件里的默认值，避免落到用户真实环境
         .env("MCSUP_WORKSPACE", "")
-        .stdin(Stdio::null()) // 非 TTY：交互兜底必须关闭
+        .stdin(Stdio::null()) // 非 TTY：交互提问会被拒
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
     cmd.output().expect("运行 mcsup")
 }
-
 fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
@@ -304,10 +316,10 @@ fn help_output_is_chinese() {
         "[possible values: ",
     ];
     let cases: [&[&str]; 4] = [
-        &["--help"],
-        &["workspace", "-h"],
-        &["server", "backup", "create", "--help"],
-        &["help", "server"],
+        &["--help", "--lang", "zh"],
+        &["workspace", "-h", "--lang", "zh"],
+        &["server", "backup", "create", "--help", "--lang", "zh"],
+        &["--lang", "zh", "help", "server"],
     ];
     let home = temp_home();
     for args in cases {
@@ -321,23 +333,98 @@ fn help_output_is_chinese() {
                 "{args:?} 残留英文 {english}:\n{text}"
             );
         }
-        for chinese in ["用法:", "选项:", "打印帮助信息"] {
+        for chinese in ["用法:", "选项:"] {
             assert!(text.contains(chinese), "{args:?} 缺少 {chinese}:\n{text}");
         }
     }
 }
 
+/// 内建 `-h` / `-V` 的说明也要中文化，长/短两种 help 提示都覆盖
+#[test]
+fn builtin_flag_help_is_chinese() {
+    let home = temp_home();
+    let out = run(home.path(), &["--help", "--lang", "zh"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("打印帮助信息"), "{text}");
+    assert!(text.contains("打印版本信息"), "{text}");
+    assert!(!text.contains("Print help"), "{text}");
+    assert!(!text.contains("Print version"), "{text}");
+}
+
 /// 无参缺子命令：仍是帮助 + 用法错误 2，只是文案换成中文
+///
+/// 空参数走 clap 的 `arg_required_else_help` → 帮助渲染通道；语言只能由
+/// 环境决定，此时未给任何命令行参数
 #[test]
 fn no_args_help_is_chinese_on_stderr() {
     let home = temp_home();
-    let out = run(home.path(), &[]);
+    let out = run_with_env(home.path(), &[], &[("MCSUP_LANG", "zh_CN.UTF-8")]);
     assert_eq!(out.status.code(), Some(2));
     assert!(out.stdout.is_empty(), "用法错误不得输出数据");
     let err = stderr(&out);
     assert!(err.contains("用法:"), "{err}");
     assert!(!err.contains("Usage:"), "{err}");
     assert!(err.contains("命令:"), "{err}");
+}
+
+/// `--lang en` 在中文系统上也必须给英文帮助
+#[test]
+fn help_output_follows_lang_flag() {
+    let home = temp_home();
+    for args in [
+        vec!["--help", "--lang", "en"],
+        vec!["workspace", "-h", "--lang", "en"],
+    ] {
+        let out = run(home.path(), &args);
+        assert_eq!(out.status.code(), Some(0), "{args:?}");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.contains("Usage:"), "{args:?}\n{text}");
+        assert!(text.contains("Options:"), "{args:?}\n{text}");
+        assert!(!text.contains("用法:"), "{args:?} 不应残留中文:\n{text}");
+    }
+    // `--lang=en` 等号写法与分开写等价，且在子命令之前也生效
+    let out = run(home.path(), &["--lang=en", "workspace", "-h"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Usage:"));
+}
+
+/// 未给 `--lang` 时读 `MCSUP_LANG`
+#[test]
+fn mcsup_lang_env_selects_language() {
+    let home = temp_home();
+    let out = run_with_env(home.path(), &["--help"], &[("MCSUP_LANG", "en")]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Usage:"));
+    let out = run_with_env(home.path(), &["--help"], &[("MCSUP_LANG", "zh_CN.UTF-8")]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("用法:"));
+}
+
+/// `--lang` 压过 `MCSUP_LANG`
+#[test]
+fn lang_flag_overrides_env() {
+    let home = temp_home();
+    let out = run_with_env(
+        home.path(),
+        &["--help", "--lang", "en"],
+        &[("MCSUP_LANG", "zh_CN.UTF-8")],
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Usage:"));
+}
+
+/// 机器可读输出与语言无关：`--output json` 的 stdout 在两种语言下逐字节相同
+#[test]
+fn json_stdout_is_language_independent() {
+    let home = temp_home();
+    let zh = run(
+        home.path(),
+        &["workspace", "list", "--output", "json", "--lang", "zh"],
+    );
+    let en = run(
+        home.path(),
+        &["workspace", "list", "--output", "json", "--lang", "en"],
+    );
+    assert_eq!(zh.status.code(), en.status.code());
+    assert!(zh.status.success(), "stderr: {}", stderr(&zh));
+    assert_eq!(zh.stdout, en.stdout, "JSON 输出不得随语言变化");
+    assert!(zh.stderr.is_empty(), "stderr: {}", stderr(&zh));
 }
 
 /// `--version` 走中文化后的帮助通道，仍退 0 且只写 stdout

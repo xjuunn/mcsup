@@ -1,4 +1,4 @@
-use crate::bootstrap;
+﻿use crate::bootstrap;
 use crate::cli::WorkspaceAction;
 use crate::diagnostic::AppDiagnostic;
 use crate::output::Printer;
@@ -350,20 +350,29 @@ fn doctor_cmd(
     let warnings = findings.len() - errors;
 
     if printer.is_human() {
+        let lang = printer.lang();
         if findings.is_empty() {
-            printer.print_section("检查通过：工作区与注册表一致");
+            printer.print_section(crate::i18n::text(
+                lang,
+                "检查通过：工作区与注册表一致",
+                "check passed: the workspace matches the registry",
+            ));
         } else {
             for f in &findings {
                 let tag = match f.severity() {
                     Severity::Error => "ERROR",
                     Severity::Warning => "WARN",
                 };
-                let scope = f.workspace.as_deref().map_or("(全局)", |w| w);
+                let scope = f
+                    .workspace
+                    .as_deref()
+                    .map_or(crate::i18n::text(lang, "(全局)", "(global)"), |w| w);
                 let line = format!(
-                    "[{tag}] {scope}: {}\n        {}\n        修复：{}",
-                    crate::i18n::check(&f.kind),
-                    crate::i18n::check_location(&f.kind),
-                    crate::i18n::check_fix(&f.kind)
+                    "[{tag}] {scope}: {}\n        {}\n        {}: {}",
+                    crate::i18n::check(&f.kind, lang),
+                    crate::i18n::check_location(&f.kind, lang),
+                    crate::i18n::text(lang, "修复", "fix"),
+                    crate::i18n::check_fix(&f.kind, lang)
                 );
                 match f.severity() {
                     Severity::Error => printer.print_warning(&line),
@@ -385,7 +394,7 @@ fn doctor_cmd(
                 kind: f.kind.as_str(),
                 workspace: f.workspace.as_deref(),
                 detail: detail_json(&f.kind),
-                message: crate::i18n::check(&f.kind),
+                message: crate::i18n::check(&f.kind, printer.lang()),
             })
             .collect(),
     };

@@ -1,4 +1,5 @@
 use crate::diagnostic::AppDiagnostic;
+use crate::locale::Lang;
 use comfy_table::{Cell, Table};
 use mcsup::domain::server::version::VersionId;
 use owo_colors::OwoColorize;
@@ -28,12 +29,19 @@ impl fmt::Display for OutputFormat {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Printer {
     format: OutputFormat,
+    lang: Lang,
 }
 
 impl Printer {
     #[must_use]
-    pub(crate) const fn new(format: OutputFormat) -> Self {
-        Self { format }
+    pub(crate) const fn new(format: OutputFormat, lang: Lang) -> Self {
+        Self { format, lang }
+    }
+
+    /// 界面语言：命令自行拼提示文本时用
+    #[must_use]
+    pub(crate) const fn lang(self) -> Lang {
+        self.lang
     }
 
     /// 一段粗体标题，仅人类模式，JSON 模式不输出非数据行
@@ -213,8 +221,8 @@ impl Printer {
     }
 
     /// 用 miette 渲染错误到 stderr
-    pub(crate) fn render_error(err: anyhow::Error) {
-        if let Some(message) = structured_message(&err) {
+    pub(crate) fn render_error(self, err: anyhow::Error) {
+        if let Some(message) = structured_message(&err, self.lang) {
             print_error_line(&format!("mcsup: {message}"));
             return;
         }
@@ -242,19 +250,19 @@ impl Printer {
 
 /// 结构化错误的用户提示：只认带 `kind()` 的那几类，其余（IO、注册表、
 /// 下载源等）沿用它自己的 `Display`。文案集中在 [`crate::i18n`]。
-fn structured_message(err: &anyhow::Error) -> Option<String> {
+fn structured_message(err: &anyhow::Error, lang: Lang) -> Option<String> {
     for cause in err.chain() {
         if let Some(life) = cause.downcast_ref::<mcsup::service::LifecycleError>() {
             let kind = life.kind()?;
-            return Some(crate::i18n::lifecycle(&kind));
+            return Some(crate::i18n::lifecycle(&kind, lang));
         }
         if let Some(jar) = cause.downcast_ref::<mcsup::service::InstallJarError>() {
             let kind = jar.kind()?;
-            return Some(crate::i18n::install_jar(&kind));
+            return Some(crate::i18n::install_jar(&kind, lang));
         }
         if let Some(settings) = cause.downcast_ref::<mcsup::service::SettingsError>() {
             let kind = settings.kind()?;
-            return Some(crate::i18n::settings(&kind));
+            return Some(crate::i18n::settings(&kind, lang));
         }
     }
     None
@@ -377,7 +385,7 @@ fn repo_exit_code(err: &mcsup::port::RepositoryError) -> u8 {
 
 impl Default for Printer {
     fn default() -> Self {
-        Self::new(OutputFormat::Human)
+        Self::new(OutputFormat::Human, Lang::Zh)
     }
 }
 
