@@ -166,10 +166,17 @@ impl TryFrom<ServerEntry> for ServerMeta {
             (Some(path), Some(size), Some(algo), Some(hex)) => {
                 let algorithm = ChecksumAlgorithm::parse(&algo)
                     .map_err(|err| corrupt("checksum algo", &algo, err))?;
+                // 空 hex 是「上游未提供校验和」的落盘形态（如 Fabric），
+                // 重建时必须还原为未校验，不能当成真实哈希去比对
+                let checksum = if hex.is_empty() {
+                    Checksum::unverified()
+                } else {
+                    Checksum::new(algorithm, hex)
+                };
                 Some(InstalledJar {
                     path: PathBuf::from(path),
                     size: u64::try_from(size).unwrap_or(u64::MAX),
-                    checksum: Checksum::new(algorithm, hex),
+                    checksum,
                 })
             }
             (None, None, None, None) => None,

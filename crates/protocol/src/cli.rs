@@ -207,8 +207,10 @@ pub struct JarJson {
     pub size: u64,
     /// 校验算法（如 `sha1`）
     pub checksum_algo: &'static str,
-    /// 校验和十六进制
+    /// 校验和十六进制；上游未提供校验和时为空串
     pub checksum: String,
+    /// 是否有真实校验和；`false` 时 `checksum` 为空，不得作为校验依据
+    pub verified: bool,
 }
 
 /// `server version` 结果

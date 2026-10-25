@@ -63,9 +63,10 @@ pub(crate) fn build_downloader() -> Result<mcsup::file::FileDownloader> {
 ///
 /// 构造不打网络，只准备客户端。
 pub(crate) fn jar_sources() -> Result<Vec<Arc<dyn ServerJarSource>>> {
-    Ok(vec![Arc::new(
-        mcsup::provider::mojang::MojangSource::new().context("初始化 Mojang 源")?,
-    )])
+    Ok(vec![
+        Arc::new(mcsup::provider::mojang::MojangSource::new().context("初始化 Mojang 源")?),
+        Arc::new(mcsup::provider::fabric::FabricSource::new().context("初始化 Fabric 源")?),
+    ])
 }
 
 /// 可创建 / 可安装的变体集合：来源 `variant()` 去重，保持注册顺序
@@ -229,8 +230,9 @@ mod tests {
     }
 
     #[test]
-    fn jar_sources_reports_vanilla_capability() {
+    fn jar_sources_reports_vanilla_and_fabric_capability() {
         let available = available_variants().expect("来源装配");
         assert!(available.contains(&ServerVariant::Vanilla), "{available:?}");
+        assert!(available.contains(&ServerVariant::Fabric), "{available:?}");
     }
 }

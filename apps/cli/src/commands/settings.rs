@@ -110,6 +110,7 @@ pub(crate) fn version(name: &str, printer: Printer) -> Result<()> {
         size: jar.size,
         checksum_algo: jar.checksum.algorithm().as_str(),
         checksum: jar.checksum.hex().to_owned(),
+        verified: jar.checksum.is_verified(),
     });
     let payload = VersionJson {
         name: srv.meta.name.as_str(),
@@ -131,8 +132,7 @@ pub(crate) fn version(name: &str, printer: Printer) -> Result<()> {
             Some(jar) => {
                 table.add_row(["核心", jar.path.as_str()]);
                 table.add_row(["大小", output::human_bytes(jar.size).as_str()]);
-                let checksum = format!("{}:{}", jar.checksum_algo, jar.checksum);
-                table.add_row(["校验和", checksum.as_str()]);
+                table.add_row(["校验和", checksum_label(jar).as_str()]);
             }
             None => {
                 table.add_row(["核心", "尚未安装"]);
@@ -147,6 +147,18 @@ pub(crate) fn version(name: &str, printer: Printer) -> Result<()> {
         let line = serde_json::to_string(&payload)?;
         output::print_json_line(&line);
         Ok(())
+    }
+}
+
+/// 校验和的展示文案
+///
+/// 上游未提供哈希（如 Fabric 服务端 JAR）时如实说明，不显示残缺的 `sha1:`；
+/// 有哈希时统一为 `算法:十六进制`。
+fn checksum_label(jar: &JarJson) -> String {
+    if jar.verified {
+        format!("{}:{}", jar.checksum_algo, jar.checksum)
+    } else {
+        "未提供（上游无校验和）".to_owned()
     }
 }
 
@@ -316,5 +328,33 @@ mod tests {
         }
         assert_eq!(key_from_label("ram"), None);
         assert_eq!(key_from_label("其他（说明）"), None);
+    }
+
+    fn jar(verified: bool) -> JarJson {
+        JarJson {
+            path: "server.jar".to_owned(),
+            size: 1,
+            checksum_algo: "sha1",
+            checksum: if verified {
+                "abc".to_owned()
+            } else {
+                String::new()
+            },
+            verified,
+        }
+    }
+
+    /// 有真实哈希时显示 `算法:十六进制`
+    #[test]
+    fn checksum_label_shows_algo_and_hex_when_verified() {
+        assert_eq!(checksum_label(&jar(true)), "sha1:abc");
+    }
+
+    /// 上游无哈希（Fabric）时如实说明，不能显示残缺的 `sha1:`
+    #[test]
+    fn checksum_label_explains_missing_checksum() {
+        let label = checksum_label(&jar(false));
+        assert_eq!(label, "未提供（上游无校验和）");
+        assert!(!label.starts_with("sha1:"), "{label}");
     }
 }
