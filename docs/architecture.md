@@ -235,9 +235,41 @@ Backup = File CAS + Snapshot：文件按内容哈希存入 CAS（`File → Hash 
 Object`），相同内容只存一次；Snapshot 记录各文件到哈希的映射。支持 Snapshot、
 去重、Restore、Retention、GC、完整性校验、并发备份与失败恢复。
 
-运行中备份必须先 `save-all`、等待完成、`save-off`，再建 Snapshot，最后恢复
-save 状态。任何异常都必须在 finally / cleanup 中恢复 Server 状态，禁止让
-服务器永久停在 save-off。
+运行中备份的命令序列：先发 `save-off`（暂停写盘）→ `save-all flush`（落盘）→
+等待片刻 → 建 Snapshot → 发 `save-on` 恢复写盘。备份不停服。`save-on` 由 RAII
+守卫兜底，任何异常路径（扫描失败、CAS 写入失败、panic）都会执行，禁止让服务器
+永久停在 save-off。
+
+归属：
+
+- 领域模型与判定（`Snapshot` / `SnapshotContent` / `BackupScope` /
+  `RetentionPolicy` / `parse_age` / 恢复前置条件）在 `domain::backup`。
+- 能力 trait（`ContentStore` / `SnapshotRepository`）在 `port::backup`。
+- 编排（发控制台命令、增量复用提示、恢复物化、GC 引用计数、快照 id 生成）在
+  `service::backup::BackupService`，依赖 `ServerRegistry` + `Arc<dyn SupervisorPort>`
+  （不依赖 `ServerLifecycleService`）。
+- 实现层在 `backup`：`cas`（SHA-256 两级分片对象存储）、`scan`（目录扫描与
+  `(size, mtime)` 复用提示）、`store`（`snapshot.json` / `snapshot.partial` 记录）。
+
+存储布局按工作区共享，`BackupLayout::for_server` 由 `server.dir` 与 `rel_dir`
+反推工作区根：
+
+```
+{workspace}/backups/cas/ab/cd/<sha256>         # 内容对象，哈希即键
+{workspace}/backups/snapshots/<id>/snapshot.json
+{workspace}/backups/snapshots/<id>/snapshot.partial   # 写入中标记；只剩它即 failed
+```
+
+扫描口径：不跟随符号链接；跳过运行期产物（顶层 `run/`、`console.log`）；按
+`BackupScope` 过滤，缺省为整个服务器目录。`mcsup.json` 恒在服务器目录并被备份。
+
+增量 = 与父快照比较：复用提示必须用父快照记录时的 `(size, mtime)`
+（`SnapshotContent::stamps()`）与当前磁盘比对，而不是用当前文件的 mtime 反推。
+快照记录删除墓碑（`deleted`），否则恢复后已删文件会复活；原地恢复另外清除
+「快照范围内、磁盘上存在但快照里没有」的文件（老快照无父快照、无墓碑）。
+
+删除快照不即时删 CAS 对象，交由 prune / GC 回收；GC 的引用计数跨整个工作区
+统计，避免删掉被其他服务器快照共享的对象。
 
 # Protocol / Transport
 

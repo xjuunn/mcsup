@@ -1205,6 +1205,7 @@ mod tests {
             java_major: Some(JavaMajor::parse(21).expect("21")),
             ram_mib: Some(2048),
             autostart: true,
+            backup_scope: domain::backup::BackupScope::all(),
         };
         let updated = ServerRepository::update_settings(
             &store,

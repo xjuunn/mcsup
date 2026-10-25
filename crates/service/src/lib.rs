@@ -1,3 +1,4 @@
+mod backup;
 mod doctor;
 mod fs_error;
 mod java;
@@ -12,6 +13,11 @@ mod workspace;
 
 /// `workspace doctor` 的检查项标识清单（`--only` 校验与帮助文案共用）
 pub const KNOWN_KINDS: &[&str] = CheckKind::KNOWN_KINDS;
+pub use backup::{
+    BackupError, BackupErrorKind, BackupService, CreateOptions, CreateOutcome,
+    DEFAULT_FLUSH_WAIT_MS, DeleteOutcome, MAX_LABEL_LEN, PruneOutcome, RestoreOutcome,
+    SnapshotPage, VerifyOutcome,
+};
 pub use doctor::{CheckKind, DoctorError, DoctorService, Finding, Report, Severity};
 use domain::server::download::DownloadStatus;
 use domain::server::error::InvalidTransition;

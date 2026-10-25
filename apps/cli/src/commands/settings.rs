@@ -11,7 +11,7 @@ use crate::progress::{ScanProgress, TaskSpinner};
 use crate::prompts;
 use anyhow::{Context, Result, anyhow};
 use comfy_table::{ContentArrangement, Table};
-use mcsup::domain::server::settings::SettingKey;
+use mcsup::domain::server::settings::{BACKUP_SCOPE_ALL, SettingKey};
 use mcsup::protocol::cli::{JarJson, SetJson, VersionJson};
 use mcsup::service::{DEFAULT_RAM_MIB, JavaService, ServerSettingsService, SettingChange};
 
@@ -179,6 +179,7 @@ fn key_help(key: SettingKey) -> &'static str {
         SettingKey::JavaVersion => "绑定 JVM 大版本",
         SettingKey::Ram => "启动内存上限",
         SettingKey::Autostart => "开机自动拉起",
+        SettingKey::BackupScope => "备份范围（逗号分隔的顶层目录；all 表示全部）",
     }
 }
 
@@ -221,6 +222,16 @@ fn prompt_value(
             let picked = prompts::select_bool("开机自动拉起", default)?;
             Ok(picked.to_string())
         }
+        SettingKey::BackupScope => {
+            let default = current
+                .value_of(SettingKey::BackupScope)
+                .unwrap_or_else(|| BACKUP_SCOPE_ALL.to_owned());
+            prompts::input_text(
+                "备份范围",
+                &default,
+                "逗号分隔的顶层目录，如 world,mods；all 表示整个服务器目录",
+            )
+        }
     }
 }
 
@@ -262,6 +273,7 @@ fn value_hint(key: SettingKey) -> String {
         SettingKey::JavaVersion => "21".to_owned(),
         SettingKey::Ram => "2G".to_owned(),
         SettingKey::Autostart => "true".to_owned(),
+        SettingKey::BackupScope => "world,mods".to_owned(),
     };
     format!("非交互模式：mcsup server set <name> {key} <value>（如 {example}）")
 }

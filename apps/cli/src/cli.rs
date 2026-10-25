@@ -7,6 +7,9 @@ use std::path::PathBuf;
 /// 日志默认回看行数：`logs --tail` 缺省值，`console` 附加时回放的历史行数
 pub(crate) const LOG_TAIL_DEFAULT: usize = 30;
 
+/// 备份历史每页条数缺省值（`backup ls --page-size`）
+pub(crate) const BACKUP_PAGE_SIZE: usize = 20;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "mcsup",
@@ -303,30 +306,64 @@ pub(crate) enum ServerAction {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum BackupAction {
+    #[command(about = crate::meta::backup_create())]
     #[command(visible_alias = "cr")]
     Create {
         name: String,
-        #[arg(long)]
+        #[arg(long, help = crate::meta::backup_label_arg())]
         label: Option<String>,
+        #[arg(long, value_name = "ITEMS", help = crate::meta::backup_scope_arg())]
+        scope: Option<String>,
+        #[arg(long, help = crate::meta::backup_no_reuse_arg())]
+        no_reuse: bool,
     },
+    #[command(about = crate::meta::backup_list())]
     #[command(visible_alias = "ls")]
-    List { name: String },
+    List {
+        name: String,
+        #[arg(long, value_name = "N", default_value_t = 1, help = crate::meta::backup_page_arg())]
+        page: usize,
+        #[arg(
+            long = "page-size",
+            value_name = "N",
+            default_value_t = BACKUP_PAGE_SIZE,
+            help = crate::meta::backup_page_size_arg()
+        )]
+        page_size: usize,
+    },
+    #[command(about = crate::meta::backup_restore())]
     #[command(visible_alias = "rt")]
     Restore {
         name: String,
-        id: String,
-        #[arg(long, value_name = "NAME")]
+        #[arg(help = crate::meta::backup_id_arg())]
+        id: Option<String>,
+        #[arg(long, value_name = "NAME", help = crate::meta::backup_to_arg())]
         to: Option<String>,
     },
+    #[command(about = crate::meta::backup_delete())]
+    #[command(visible_alias = "rm")]
+    Delete {
+        name: String,
+        #[arg(help = crate::meta::backup_id_arg())]
+        id: Option<String>,
+    },
+    #[command(about = crate::meta::backup_verify())]
     #[command(visible_alias = "vf")]
-    Verify { name: String, id: String },
+    Verify {
+        name: String,
+        #[arg(help = crate::meta::backup_id_arg())]
+        id: Option<String>,
+    },
+    #[command(about = crate::meta::backup_prune())]
     #[command(visible_alias = "pr")]
     Prune {
         name: String,
-        #[arg(long, value_name = "N")]
+        #[arg(long, value_name = "N", help = crate::meta::backup_keep_arg())]
         keep: Option<usize>,
-        #[arg(long, value_name = "AGE")]
+        #[arg(long, value_name = "AGE", help = crate::meta::backup_older_than_arg())]
         older_than: Option<String>,
+        #[arg(long, help = crate::meta::backup_dry_run_arg())]
+        dry_run: bool,
     },
 }
 

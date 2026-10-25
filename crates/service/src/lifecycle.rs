@@ -771,7 +771,7 @@ mod tests {
                 .iter_mut()
                 .find(|m| m.name == *name)
                 .ok_or_else(|| RepositoryError::NotFound(name.as_str().to_owned()))?;
-            meta.settings = *settings;
+            meta.settings = settings.clone();
             meta.updated_at = updated_at;
             Ok(meta.clone())
         }
@@ -1333,6 +1333,7 @@ mod tests {
                     java_major: Some(JavaMajor::parse(17).expect("17")),
                     ram_mib: None,
                     autostart: false,
+                    backup_scope: domain::backup::BackupScope::all(),
                 },
             )
             .expect("settings");
@@ -1442,6 +1443,7 @@ mod tests {
                     java_major: Some(JavaMajor::parse(17).expect("17")),
                     ram_mib: None,
                     autostart: false,
+                    backup_scope: domain::backup::BackupScope::all(),
                 },
             )
             .expect("settings");
@@ -1475,6 +1477,7 @@ mod tests {
                     java_major: None,
                     ram_mib: Some(4096),
                     autostart: false,
+                    backup_scope: domain::backup::BackupScope::all(),
                 },
             )
             .expect("settings");

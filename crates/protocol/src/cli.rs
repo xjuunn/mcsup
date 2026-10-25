@@ -448,6 +448,118 @@ pub struct VersionInfoJson<'a> {
     pub protocol_version: u32,
 }
 
+/// `backup list` 单行
+///
+/// 字段口径与 `service` 层的快照类型对齐，但只暴露稳定、机器可读的
+/// 部分：`scope` 是顶层项列表，`created_at` 是 Unix 秒。
+#[derive(Debug, Serialize)]
+pub struct BackupRow<'a> {
+    /// 快照 id
+    pub id: &'a str,
+    /// 所属服务器名
+    pub server: &'a str,
+    /// 用户标签；无标签为 `null`
+    pub label: Option<&'a str>,
+    /// 父快照 id（增量基线）；首份为 `null`
+    pub parent: Option<&'a str>,
+    /// 状态：`in_progress` / `complete` / `failed`
+    pub status: &'a str,
+    /// 备份范围（顶层项）；空数组 = 整个服务器目录
+    pub scope: Vec<String>,
+    /// 条目数
+    pub files: usize,
+    /// 本次新建的 CAS 对象数
+    pub added: usize,
+    /// 复用已存在对象的文件数
+    pub reused: usize,
+    /// 逻辑总字节数
+    pub total_bytes: u64,
+    /// 本次净增字节数
+    pub added_bytes: u64,
+    /// 快照创建时服务器是否在运行
+    pub server_online: bool,
+    /// 创建时间（Unix 秒）
+    pub created_at: i64,
+}
+
+/// `backup list` 分页信封
+#[derive(Debug, Serialize)]
+pub struct BackupListJson<'a> {
+    /// 本页快照（按时间倒序）
+    pub items: Vec<BackupRow<'a>>,
+    /// 该服务器快照总数
+    pub total: usize,
+    /// 当前页码（1 基）
+    pub page: usize,
+    /// 每页条数
+    pub page_size: usize,
+    /// 总页数
+    pub pages: usize,
+}
+
+/// `backup create` 结果
+#[derive(Debug, Serialize)]
+pub struct BackupCreateJson<'a> {
+    /// 新建的快照
+    pub snapshot: BackupRow<'a>,
+    /// 扫描期跳过的条目数（运行期文件、范围外、符号链接）
+    pub skipped: usize,
+}
+
+/// `backup restore` 结果
+#[derive(Debug, Serialize)]
+pub struct BackupRestoreJson<'a> {
+    /// 被恢复的快照 id
+    pub snapshot: &'a str,
+    /// 恢复目标目录绝对路径
+    pub destination: String,
+    /// 写回的文件数
+    pub files: usize,
+    /// 写回的字节数
+    pub bytes: u64,
+    /// 原地恢复前自动生成的安全快照 id；`--to` 恢复为 `null`
+    pub safety_snapshot: Option<&'a str>,
+    /// 按墓碑 / 快照外文件删除的路径数
+    pub deleted: usize,
+}
+
+/// `backup delete` 结果
+#[derive(Debug, Serialize)]
+pub struct BackupDeleteJson<'a> {
+    /// 被删除的快照 id
+    pub id: &'a str,
+    /// 该快照释放的 CAS 对象数（可被 prune 回收）
+    pub orphaned: usize,
+}
+
+/// `backup verify` 结果
+#[derive(Debug, Serialize)]
+pub struct BackupVerifyJson<'a> {
+    /// 被校验的快照 id
+    pub id: &'a str,
+    /// 是否完好
+    pub healthy: bool,
+    /// 被引用的对象数（去重后）
+    pub objects: usize,
+    /// 校验通过的字节数
+    pub bytes: u64,
+    /// 损坏或缺失的对象哈希
+    pub broken: Vec<&'a str>,
+}
+
+/// `backup prune` 结果
+#[derive(Debug, Serialize)]
+pub struct BackupPruneJson<'a> {
+    /// 被删除的快照 id 列表
+    pub removed: Vec<&'a str>,
+    /// 回收的 CAS 对象数
+    pub objects_reclaimed: usize,
+    /// 回收的字节数
+    pub bytes_reclaimed: u64,
+    /// 是否只是试运行
+    pub dry_run: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,5 +608,63 @@ mod tests {
     #[test]
     fn variant_str_matches_domain() {
         assert_eq!(variant_str(ServerVariant::Vanilla), "vanilla");
+    }
+
+    /// 备份分页信封与单行字段名是公开契约，钉住形状
+    #[test]
+    fn backup_list_shape_is_stable() {
+        let row = BackupRow {
+            id: "20260101t000000-abcdef",
+            server: "alpha",
+            label: Some("before-upgrade"),
+            parent: None,
+            status: "complete",
+            scope: vec!["world".to_owned()],
+            files: 3,
+            added: 2,
+            reused: 1,
+            total_bytes: 100,
+            added_bytes: 40,
+            server_online: true,
+            created_at: 1_700_000_000,
+        };
+        let page = BackupListJson {
+            items: vec![row],
+            total: 1,
+            page: 1,
+            page_size: 10,
+            pages: 1,
+        };
+        let json = serde_json::to_string(&page).expect("serialize");
+        for field in [
+            "\"total\":1",
+            "\"page\":1",
+            "\"page_size\":10",
+            "\"pages\":1",
+            "\"id\":\"20260101t000000-abcdef\"",
+            "\"label\":\"before-upgrade\"",
+            "\"parent\":null",
+            "\"status\":\"complete\"",
+            "\"scope\":[\"world\"]",
+            "\"server_online\":true",
+        ] {
+            assert!(json.contains(field), "missing {field}: {json}");
+        }
+    }
+
+    /// 恢复结果的 `safety_snapshot` 为 `null` 时也要出现（`--to` 语义）
+    #[test]
+    fn backup_restore_reports_null_safety_snapshot() {
+        let restore = BackupRestoreJson {
+            snapshot: "20260101t000000-abcdef",
+            destination: "/srv/copy".to_owned(),
+            files: 2,
+            bytes: 12,
+            safety_snapshot: None,
+            deleted: 0,
+        };
+        let json = serde_json::to_string(&restore).expect("serialize");
+        assert!(json.contains("\"safety_snapshot\":null"), "{json}");
+        assert!(json.contains("\"destination\":\"/srv/copy\""), "{json}");
     }
 }

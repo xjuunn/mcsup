@@ -3,6 +3,7 @@
 //! 属性键统一 kebab-case，随领域扩展追加；所有值格式判定收敛在此，
 //! 入口（CLI / API / MCP）只做参数搬运与交互补齐。
 
+use crate::backup::BackupScope;
 use crate::java::JavaMajor;
 use std::fmt;
 use thiserror::Error;
@@ -34,11 +35,18 @@ pub enum SettingKey {
     Ram,
     /// 机器启动时自动拉起
     Autostart,
+    /// 备份范围：逗号分隔的顶层项；缺省 = 整个服务器目录
+    BackupScope,
 }
 
 impl SettingKey {
     /// 全部键：交互选择、用法提示与文档的唯一清单
-    pub const ALL: [SettingKey; 3] = [Self::JavaVersion, Self::Ram, Self::Autostart];
+    pub const ALL: [SettingKey; 4] = [
+        Self::JavaVersion,
+        Self::Ram,
+        Self::Autostart,
+        Self::BackupScope,
+    ];
 
     /// 键名（kebab-case，即命令行口径）
     #[must_use]
@@ -47,6 +55,7 @@ impl SettingKey {
             Self::JavaVersion => "java-version",
             Self::Ram => "ram",
             Self::Autostart => "autostart",
+            Self::BackupScope => "backup-scope",
         }
     }
 
@@ -60,6 +69,7 @@ impl SettingKey {
             "java-version" => Ok(Self::JavaVersion),
             "ram" => Ok(Self::Ram),
             "autostart" => Ok(Self::Autostart),
+            "backup-scope" => Ok(Self::BackupScope),
             _ => Err(UnknownSettingKey {
                 raw: raw.to_owned(),
             }),
@@ -74,7 +84,7 @@ impl fmt::Display for SettingKey {
 }
 
 /// 服务属性集：`server set` 的持久化对象
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ServerSettings {
     /// 绑定的 JVM 大版本；`None` = 自动取已注册运行时中的最高大版本
     pub java_major: Option<JavaMajor>,
@@ -82,6 +92,8 @@ pub struct ServerSettings {
     pub ram_mib: Option<u32>,
     /// 机器启动时自动拉起
     pub autostart: bool,
+    /// 备份范围；缺省（[`BackupScope::all`]）= 整个服务器目录
+    pub backup_scope: BackupScope,
 }
 
 impl ServerSettings {
@@ -110,6 +122,9 @@ impl ServerSettings {
                     _ => return Err(invalid()),
                 };
             }
+            SettingKey::BackupScope => {
+                self.backup_scope = parse_backup_scope(raw).map_err(|_| invalid())?;
+            }
         }
         Ok(())
     }
@@ -121,6 +136,12 @@ impl ServerSettings {
             SettingKey::JavaVersion => self.java_major.map(|major| major.to_string()),
             SettingKey::Ram => self.ram_mib.map(|mib| format!("{mib}M")),
             SettingKey::Autostart => Some(self.autostart.to_string()),
+            // 范围恒有值：空集合的展示口径就是「全部」
+            SettingKey::BackupScope => Some(if self.backup_scope.is_all() {
+                BACKUP_SCOPE_ALL.to_owned()
+            } else {
+                self.backup_scope.entries().join(",")
+            }),
         }
     }
 }
@@ -149,6 +170,35 @@ pub fn parse_ram_mib(raw: &str) -> Result<u32, InvalidSettingValue> {
         return Err(invalid());
     }
     Ok(mib)
+}
+
+/// 「全部」的范围字面量：显式写 `all` 与留空等价
+pub const BACKUP_SCOPE_ALL: &str = "all";
+
+/// 解析备份范围：逗号分隔的顶层项；空、`all`、`-` 都表示整个服务器目录
+///
+/// `server set backup-scope world,mods` 与 `--scope world,mods` 共用这一处，
+/// 避免两个入口的解析规则分叉。
+///
+/// # Errors
+///
+/// 某一项非法（含分隔符、`.` / `..`）时返回 [`InvalidSettingValue`]
+/// （key 恒为 [`SettingKey::BackupScope`]）
+pub fn parse_backup_scope(raw: &str) -> Result<BackupScope, InvalidSettingValue> {
+    let invalid = || InvalidSettingValue {
+        key: SettingKey::BackupScope,
+        raw: raw.to_owned(),
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "-" || trimmed.eq_ignore_ascii_case(BACKUP_SCOPE_ALL) {
+        return Ok(BackupScope::all());
+    }
+    let entries: Vec<&str> = trimmed
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+    BackupScope::from_entries(entries).map_err(|_| invalid())
 }
 
 #[cfg(test)]
@@ -201,10 +251,11 @@ mod tests {
                 java_major: Some(JavaMajor::parse(21).expect("21")),
                 ram_mib: Some(2048),
                 autostart: true,
+                backup_scope: BackupScope::all(),
             }
         );
 
-        let snapshot = settings;
+        let snapshot = settings.clone();
         assert!(settings.apply(SettingKey::JavaVersion, "abc").is_err());
         assert!(settings.apply(SettingKey::Autostart, "yes").is_err());
         // 失败的 apply 不改变属性集
@@ -223,5 +274,46 @@ mod tests {
 
         settings.apply(SettingKey::Ram, "2G").expect("ram");
         assert_eq!(settings.value_of(SettingKey::Ram), Some("2048M".to_owned()));
+    }
+
+    /// 备份范围缺省是「全部」，展示口径为 `all` 而不是空串
+    #[test]
+    fn backup_scope_defaults_to_all_and_displays_as_all() {
+        let mut settings = ServerSettings::default();
+        assert!(settings.backup_scope.is_all());
+        assert_eq!(
+            settings.value_of(SettingKey::BackupScope),
+            Some(BACKUP_SCOPE_ALL.to_owned())
+        );
+
+        settings
+            .apply(SettingKey::BackupScope, " world , mods ,, ")
+            .expect("scope");
+        assert_eq!(settings.backup_scope.entries(), ["mods", "world"]);
+        assert_eq!(
+            settings.value_of(SettingKey::BackupScope),
+            Some("mods,world".to_owned())
+        );
+
+        // `all` / `-` / 空 都回到整个目录
+        for raw in ["all", "ALL", "-", ""] {
+            settings
+                .apply(SettingKey::BackupScope, raw)
+                .unwrap_or_else(|_| panic!("{raw} should be accepted"));
+            assert!(settings.backup_scope.is_all(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn backup_scope_rejects_invalid_entries() {
+        let mut settings = ServerSettings::default();
+        for bad in ["../etc", "a/b", ".."] {
+            let err = settings
+                .apply(SettingKey::BackupScope, bad)
+                .expect_err("invalid scope");
+            assert_eq!(err.key, SettingKey::BackupScope);
+            assert_eq!(err.raw, bad);
+        }
+        assert!(settings.backup_scope.is_all(), "失败的 apply 不改变属性集");
     }
 }

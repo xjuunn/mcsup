@@ -18,6 +18,7 @@ domain = { path = "../domain", version = "0.1.0", optional = true }
 port = { path = "../port", version = "0.1.0", optional = true }
 protocol = { path = "../protocol", version = "0.1.0", optional = true }
 service = { path = "../service", version = "0.1.0", optional = true }
+backup = { path = "../backup", version = "0.1.0", optional = true }
 file = { path = "../file", version = "0.1.0", optional = true }
 java = { path = "../java", version = "0.1.0", optional = true }
 provider = { path = "../provider", version = "0.1.0", optional = true }
@@ -31,6 +32,7 @@ domain = ["dep:domain"]
 port = ["dep:port", "domain"]
 protocol = ["dep:protocol", "domain"]
 service = ["dep:service", "port"]
+backup = ["dep:backup", "port"]
 file = ["dep:file", "port"]
 java = ["dep:java", "port"]
 provider = ["dep:provider", "port"]
@@ -40,6 +42,7 @@ runtime = ["dep:runtime", "port", "protocol"]
 bootstrap = [
     "dep:storage",
     "dep:service",
+    "dep:backup",
     "dep:file",
     "dep:java",
     "dep:provider",

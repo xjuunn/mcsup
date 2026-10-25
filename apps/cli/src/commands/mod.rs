@@ -1,3 +1,4 @@
+mod backup;
 mod config;
 mod doctor;
 mod install;
@@ -8,7 +9,7 @@ mod server_ops;
 mod settings;
 mod workspace;
 
-use crate::cli::{Cli, Command, JavaAction, ServerAction};
+use crate::cli::{BackupAction, Cli, Command, JavaAction, ServerAction};
 use crate::config::ConfigFile;
 use crate::diagnostic::AppDiagnostic;
 use crate::locale::Lang;
@@ -163,13 +164,40 @@ async fn server(action: ServerAction, cfg: &ConfigFile, printer: Printer) -> Res
             ref workspace,
         } => server_ops::link(path, name.as_deref(), workspace.as_deref(), printer),
         ServerAction::Version { name } => settings::version(&name, printer),
-        ServerAction::Backup { .. } => err("backup"),
+        ServerAction::Backup { action } => backup(action, printer).await,
         ServerAction::Mod { .. } => err("mod"),
     }
 }
 
 fn err(what: &str) -> Result<()> {
     Err(AppDiagnostic::not_implemented(what).into())
+}
+
+async fn backup(action: BackupAction, printer: Printer) -> Result<()> {
+    match action {
+        BackupAction::Create {
+            name,
+            label,
+            scope,
+            no_reuse,
+        } => backup::create(&name, label.as_deref(), scope.as_deref(), no_reuse, printer).await,
+        BackupAction::List {
+            name,
+            page,
+            page_size,
+        } => backup::list(&name, page, page_size, printer),
+        BackupAction::Restore { name, id, to } => {
+            backup::restore(&name, id.as_deref(), to.as_deref(), printer).await
+        }
+        BackupAction::Delete { name, id } => backup::delete(&name, id.as_deref(), printer),
+        BackupAction::Verify { name, id } => backup::verify(&name, id.as_deref(), printer),
+        BackupAction::Prune {
+            name,
+            keep,
+            older_than,
+            dry_run,
+        } => backup::prune(&name, keep, older_than.as_deref(), dry_run, printer),
+    }
 }
 
 /// 目标目录包含当前工作目录时，先退出来

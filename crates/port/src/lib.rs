@@ -1,3 +1,6 @@
+pub mod backup;
+
+pub use backup::{CasError, ContentStore, SnapshotRepository, SnapshotStoreError};
 use domain::java::{JavaMajor, JavaPackageType, JavaRuntime, JavaVendor};
 use domain::server::artifact::{Checksum, JarArtifact};
 use domain::server::meta::{InstalledJar, ServerMeta, ServerName};

@@ -37,6 +37,10 @@ pub use protocol;
 #[cfg_attr(docsrs, doc(cfg(feature = "service")))]
 pub use service;
 
+#[cfg(feature = "backup")]
+#[cfg_attr(docsrs, doc(cfg(feature = "backup")))]
+pub use backup;
+
 #[cfg(feature = "file")]
 #[cfg_attr(docsrs, doc(cfg(feature = "file")))]
 pub use file;
