@@ -27,9 +27,18 @@ pub(crate) use linux::{CHANNEL, notify, reveal_in_file_manager};
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum NotifyError {
     /// 平台 API 直接返回的错误（不经过外部进程）。
+    /// 仅 Windows 的 Toast 实现区分此类错误，其他平台不构造。
+    #[cfg_attr(
+        not(target_os = "windows"),
+        allow(dead_code, reason = "仅 Windows Toast 实现使用")
+    )]
     #[error("{0}")]
     Platform(String),
     /// 通知已提交，但系统没有收录：通常是被通知设置或专注助手拦截。
+    #[cfg_attr(
+        not(target_os = "windows"),
+        allow(dead_code, reason = "仅 Windows Toast 实现使用")
+    )]
     #[error("通知已提交但未进入通知中心，请检查系统通知设置")]
     NotDisplayed,
     /// 外部通知命令启动失败（macOS / Linux 回退实现）。
@@ -94,6 +103,11 @@ impl Urgency {
 /// 在文件管理器中定位路径失败的原因。
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RevealError {
+    /// 仅 Windows 走 `explorer.exe` 时构造，其他平台用 `NotAvailable`。
+    #[cfg_attr(
+        not(target_os = "windows"),
+        allow(dead_code, reason = "仅 Windows 的 explorer.exe 实现使用")
+    )]
     #[error("{0}")]
     Platform(String),
     /// Linux 上 `xdg-open` 可能整体不可用；Windows / macOS 只有 `Platform`。

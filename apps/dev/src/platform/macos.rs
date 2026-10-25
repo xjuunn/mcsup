@@ -1,7 +1,7 @@
 //! macOS 通知：优先 `terminal-notifier`，缺失时回退 `osascript`。
 //!
 //! `osascript` 随系统提供；`terminal-notifier`（brew 安装）发送者名称可控，
-//! 存在时优先使用。脚本内容不在 shell 里插值，只做 AppleScript 字符串转义。
+//! 存在时优先使用。脚本内容不在 shell 里插值，只做 `AppleScript` 字符串转义。
 
 use std::path::Path;
 
@@ -13,7 +13,7 @@ const TERMINAL_NOTIFIER: &str = "terminal-notifier";
 pub(crate) const CHANNEL: &str = "macOS 通知中心（terminal-notifier，缺失时 osascript）";
 
 pub(crate) async fn notify(notification: &Notification) -> Result<(), NotifyError> {
-    if super::command_exists(TERMINAL_NOTIFIER).await {
+    if super::command_exists(TERMINAL_NOTIFIER) {
         return super::run_command(
             TERMINAL_NOTIFIER,
             &[
