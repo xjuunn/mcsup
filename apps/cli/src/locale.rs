@@ -76,34 +76,56 @@ impl LangChoice {
     }
 }
 
+/// 解析结果：语言 + 是否由用户显式指定
+///
+/// 「显式」指 `--lang` 或 `MCSUP_LANG` 点名了某种语言。终端码页回退只作用于
+/// 非显式场景，见 [`detect`]。
+#[derive(Debug, Clone, Copy)]
+struct Resolved {
+    /// 最终语言
+    lang: Lang,
+    /// 是否来自用户显式指定
+    explicit: bool,
+}
+
 /// 解析最终语言
 ///
 /// 自动路径的每一级都用 [`Lang::parse`] 解析，认不出的标签继续向下一级回退，
 /// 最终落到 [`Lang::En`]。
 #[must_use]
-pub(crate) fn resolve(choice: LangChoice, env_lang: Option<&str>, system: Option<&str>) -> Lang {
-    match choice {
-        LangChoice::Zh => Lang::Zh,
-        LangChoice::En => Lang::En,
-        LangChoice::Auto => env_lang
-            .and_then(Lang::parse)
-            .or_else(|| system.and_then(Lang::parse))
-            .unwrap_or(Lang::En),
+fn resolve(choice: LangChoice, env_lang: Option<&str>, system: Option<&str>) -> Resolved {
+    // 用户有没有表态：--lang 优先，其次 MCSUP_LANG；认不出的标签继续往下
+    let pinned = match choice {
+        LangChoice::Zh => Some(Lang::Zh),
+        LangChoice::En => Some(Lang::En),
+        LangChoice::Auto => env_lang.and_then(Lang::parse),
+    };
+    if let Some(lang) = pinned {
+        return Resolved {
+            lang,
+            explicit: true,
+        };
+    }
+    // 没人表态：平台 locale 只是默认值，不算用户指定
+    Resolved {
+        lang: system.and_then(Lang::parse).unwrap_or(Lang::En),
+        explicit: false,
     }
 }
 
 /// 按真实环境解析语言
 ///
-/// 终端不能显示 UTF-8 时回退英文：此时中文提示只会是乱码。
+/// 终端不能显示 UTF-8 时回退英文：此时中文提示只会是乱码。用户显式点名中文
+/// 的情形例外——那时回退等于无视指令，宁可让用户看到乱码再自行调整终端。
 #[must_use]
 pub(crate) fn detect(choice: LangChoice) -> Lang {
     let env_lang = std::env::var("MCSUP_LANG").ok();
     let system = sys_locale::get_locale();
-    let lang = resolve(choice, env_lang.as_deref(), system.as_deref());
-    if lang.is_zh() && !stdout_supports_utf8() {
+    let resolved = resolve(choice, env_lang.as_deref(), system.as_deref());
+    if !resolved.explicit && resolved.lang.is_zh() && !stdout_supports_utf8() {
         return Lang::En;
     }
-    lang
+    resolved.lang
 }
 
 /// 进程级界面语言
@@ -228,43 +250,46 @@ mod tests {
     /// 显式 `--lang` 压过环境变量与系统 locale
     #[test]
     fn explicit_choice_wins() {
-        assert_eq!(
-            resolve(LangChoice::En, Some("zh_CN.UTF-8"), Some("zh-CN")),
-            Lang::En
-        );
-        assert_eq!(
-            resolve(LangChoice::Zh, Some("en_US.UTF-8"), Some("en-US")),
-            Lang::Zh
-        );
+        let en = resolve(LangChoice::En, Some("zh_CN.UTF-8"), Some("zh-CN"));
+        assert_eq!(en.lang, Lang::En);
+        assert!(en.explicit);
+        let zh = resolve(LangChoice::Zh, Some("en_US.UTF-8"), Some("en-US"));
+        assert_eq!(zh.lang, Lang::Zh);
+        assert!(zh.explicit);
     }
 
     #[test]
     fn env_lang_wins_over_system() {
-        assert_eq!(
-            resolve(LangChoice::Auto, Some("en_US.UTF-8"), Some("zh-CN")),
-            Lang::En
-        );
-        assert_eq!(
-            resolve(LangChoice::Auto, Some("zh_CN.UTF-8"), Some("en-US")),
-            Lang::Zh
-        );
+        let en = resolve(LangChoice::Auto, Some("en_US.UTF-8"), Some("zh-CN"));
+        assert_eq!(en.lang, Lang::En);
+        assert!(en.explicit, "MCSUP_LANG 是用户表态");
+        let zh = resolve(LangChoice::Auto, Some("zh_CN.UTF-8"), Some("en-US"));
+        assert_eq!(zh.lang, Lang::Zh);
+        assert!(zh.explicit);
     }
 
     /// 环境变量认不出时继续看系统 locale，而不是直接英文
+    ///
+    /// 认不出的 `MCSUP_LANG` 不算表态：语言来自平台 locale，故不是 explicit。
     #[test]
     fn unknown_env_falls_back_to_system() {
-        assert_eq!(
-            resolve(LangChoice::Auto, Some("ja_JP.UTF-8"), Some("zh-CN")),
-            Lang::Zh
-        );
+        let r = resolve(LangChoice::Auto, Some("ja_JP.UTF-8"), Some("zh-CN"));
+        assert_eq!(r.lang, Lang::Zh);
+        assert!(!r.explicit, "认不出的 MCSUP_LANG 不构成用户指定");
     }
 
     /// 两级都认不出（或都没有）才回退英文
     #[test]
     fn unresolvable_falls_back_to_english() {
-        assert_eq!(resolve(LangChoice::Auto, None, None), Lang::En);
-        assert_eq!(resolve(LangChoice::Auto, None, Some("C.UTF-8")), Lang::En);
-        assert_eq!(resolve(LangChoice::Auto, Some(""), Some("POSIX")), Lang::En);
+        assert_eq!(resolve(LangChoice::Auto, None, None).lang, Lang::En);
+        assert_eq!(
+            resolve(LangChoice::Auto, None, Some("C.UTF-8")).lang,
+            Lang::En
+        );
+        assert_eq!(
+            resolve(LangChoice::Auto, Some(""), Some("POSIX")).lang,
+            Lang::En
+        );
     }
 
     #[test]
