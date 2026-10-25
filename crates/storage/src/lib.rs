@@ -1197,6 +1197,28 @@ mod tests {
         assert_eq!(updated.updated_at, 1_700_000_100);
     }
 
+    /// 未校验占位值（Fabric 服务端 JAR）落盘再读回必须仍是未校验：
+    /// 空 hex 若被当成真实哈希，后续比对会永久失败
+    #[test]
+    fn unverified_jar_checksum_survives_roundtrip() {
+        let store = store_with_ws();
+        add_server(&store, &sample_meta("alpha"));
+        let jar = InstalledJar {
+            path: PathBuf::from("server.jar"),
+            size: 293_000,
+            checksum: Checksum::unverified(),
+        };
+        let name = ServerName::parse("alpha").expect("valid");
+        ServerRepository::update_core(&store, &name, &VersionId::new("1.21.1"), &jar, None, 1)
+            .expect("update");
+
+        let got = ServerRepository::get(&store, &name).expect("get");
+        let stored = got.jar.expect("jar 应落盘");
+        assert_eq!(stored.size, 293_000);
+        assert!(!stored.checksum.is_verified(), "未校验语义必须保留");
+        assert_eq!(stored.checksum.hex(), "");
+    }
+
     #[test]
     fn update_settings_persists_and_bumps_timestamp() {
         let store = store_with_ws();

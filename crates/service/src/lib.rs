@@ -114,11 +114,14 @@ impl ServerInstaller {
         let checksum = resolved.artifact.checksum.clone();
         let java_major = resolved.java_major;
 
+        // 上游未提供哈希 / 大小时不传校验条件：Fabric 等服务端 JAR 走 chunked
+        // 且无 Content-Length，占位值参与比对必然失败，只能以「无校验」下载。
+        let unverified = !checksum.is_verified();
         let request = DownloadRequest {
             location: resolved.location,
             destination,
-            expected: Some(resolved.artifact.checksum),
-            expected_size: Some(resolved.artifact.size),
+            expected: (!unverified).then(|| checksum.clone()),
+            expected_size: (!unverified).then_some(resolved.artifact.size),
         };
         let artifact = self.downloader.download(&request, progress, cancel).await?;
         status = status.transition(DownloadStatus::Verifying)?;
@@ -138,15 +141,29 @@ mod tests {
     use domain::server::artifact::{Checksum, ChecksumAlgorithm, JarArtifact};
     use port::{DownloadError, DownloadedArtifact, ResolvedArtifact, SourceError};
     use std::error::Error;
+    use std::sync::Mutex;
 
     struct FakeSource {
         resolved: ResolvedArtifact,
         not_found: bool,
     }
 
+    #[derive(Clone)]
     struct FakeDownloader {
         downloaded: DownloadedArtifact,
         cancelled: bool,
+        /// 记录收到的请求，供断言校验条件是否下发
+        seen: Arc<Mutex<Option<DownloadRequest>>>,
+    }
+
+    impl FakeDownloader {
+        fn new(downloaded: DownloadedArtifact, cancelled: bool) -> Self {
+            Self {
+                downloaded,
+                cancelled,
+                seen: Arc::new(Mutex::new(None)),
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -178,10 +195,13 @@ mod tests {
     impl ArtifactDownloader for FakeDownloader {
         async fn download(
             &self,
-            _request: &DownloadRequest,
+            request: &DownloadRequest,
             _progress: Option<&dyn ProgressSink>,
             _cancel: &CancellationToken,
         ) -> Result<DownloadedArtifact, DownloadError> {
+            if let Ok(mut seen) = self.seen.lock() {
+                *seen = Some(request.clone());
+            }
             if self.cancelled {
                 Err(DownloadError::Cancelled)
             } else {
@@ -209,13 +229,13 @@ mod tests {
                 resolved: resolved()?,
                 not_found: false,
             }),
-            Arc::new(FakeDownloader {
-                downloaded: DownloadedArtifact {
+            Arc::new(FakeDownloader::new(
+                DownloadedArtifact {
                     path: PathBuf::from("/tmp/server.jar"),
                     size: 12,
                 },
-                cancelled: false,
-            }),
+                false,
+            )),
         );
 
         let out = installer
@@ -239,13 +259,13 @@ mod tests {
                 resolved: resolved()?,
                 not_found: false,
             }),
-            Arc::new(FakeDownloader {
-                downloaded: DownloadedArtifact {
+            Arc::new(FakeDownloader::new(
+                DownloadedArtifact {
                     path: PathBuf::from("/tmp/server.jar"),
                     size: 12,
                 },
-                cancelled: true,
-            }),
+                true,
+            )),
         );
 
         let result = installer
@@ -279,13 +299,13 @@ mod tests {
                     java_major: None,
                 },
             }),
-            Arc::new(FakeDownloader {
-                downloaded: DownloadedArtifact {
+            Arc::new(FakeDownloader::new(
+                DownloadedArtifact {
                     path: PathBuf::from("/tmp/server.jar"),
                     size: 12,
                 },
-                cancelled: false,
-            }),
+                false,
+            )),
         );
 
         let result = installer
@@ -301,6 +321,83 @@ mod tests {
             result,
             Err(InstallError::Source(SourceError::NotFound(_)))
         ));
+        Ok(())
+    }
+
+    /// 有真实校验和时，校验条件必须下发给下载器
+    #[tokio::test]
+    async fn verified_artifact_passes_checksum_to_downloader() -> Result<(), Box<dyn Error>> {
+        let downloader = Arc::new(FakeDownloader::new(
+            DownloadedArtifact {
+                path: PathBuf::from("/tmp/server.jar"),
+                size: 12,
+            },
+            false,
+        ));
+        let installer = ServerInstaller::new(
+            Arc::new(FakeSource {
+                resolved: resolved()?,
+                not_found: false,
+            }),
+            downloader.clone(),
+        );
+        installer
+            .install(
+                &VersionId::new("1.21.1"),
+                PathBuf::from("/tmp/server.jar"),
+                None,
+                &CancellationToken::new(),
+            )
+            .await?;
+
+        let seen = downloader.seen.lock().expect("lock").clone().expect("请求");
+        assert!(seen.expected.is_some(), "应下发校验和");
+        assert_eq!(seen.expected_size, Some(12));
+        Ok(())
+    }
+
+    /// 上游未提供校验和（如 Fabric）时不下发任何校验条件：
+    /// 否则占位值参与比对，下载必然以 `ChecksumMismatch` 失败
+    #[tokio::test]
+    async fn unverified_artifact_skips_checksum_verification() -> Result<(), Box<dyn Error>> {
+        let downloader = Arc::new(FakeDownloader::new(
+            DownloadedArtifact {
+                path: PathBuf::from("/tmp/server.jar"),
+                size: 293_000,
+            },
+            false,
+        ));
+        let installer = ServerInstaller::new(
+            Arc::new(FakeSource {
+                resolved: ResolvedArtifact {
+                    artifact: JarArtifact {
+                        version: VersionId::new("1.21.1"),
+                        size: 0,
+                        checksum: Checksum::unverified(),
+                    },
+                    location: "https://example.invalid/server.jar".parse()?,
+                    java_major: None,
+                },
+                not_found: false,
+            }),
+            downloader.clone(),
+        );
+
+        let out = installer
+            .install(
+                &VersionId::new("1.21.1"),
+                PathBuf::from("/tmp/server.jar"),
+                None,
+                &CancellationToken::new(),
+            )
+            .await?;
+
+        let seen = downloader.seen.lock().expect("lock").clone().expect("请求");
+        assert!(seen.expected.is_none(), "未校验时不得下发校验和");
+        assert_eq!(seen.expected_size, None, "未校验时不得下发大小");
+        // 落库的 checksum 仍是未校验占位值，真实大小以下载结果为准
+        assert!(!out.checksum.is_verified());
+        assert_eq!(out.artifact.size, 293_000);
         Ok(())
     }
 }

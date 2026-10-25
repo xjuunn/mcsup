@@ -12,6 +12,7 @@
 use file::{CommandExtractor, FileDownloader};
 use java::HostJavaScanner;
 use port::ServerJarSource;
+use provider::fabric::FabricSource;
 use provider::http::HttpByteSource;
 use provider::java::JavaSourceRegistry;
 use provider::mojang::MojangSource;
@@ -239,7 +240,7 @@ impl McsupBuilder {
         self
     }
 
-    /// 注入自定义服务端来源集合（默认只有 Mojang vanilla）
+    /// 注入自定义服务端来源集合（默认 Mojang vanilla + Fabric）
     #[must_use]
     pub fn jar_sources(mut self, sources: Vec<Arc<dyn ServerJarSource>>) -> Self {
         self.jar_sources = Some(sources);
@@ -305,9 +306,10 @@ impl McsupBuilder {
 
         let jar_sources: Vec<Arc<dyn ServerJarSource>> = match self.jar_sources {
             Some(sources) => sources,
-            None => vec![Arc::new(
-                MojangSource::new().map_err(|err| BootstrapError::Source(Box::new(err)))?,
-            )],
+            None => vec![
+                Arc::new(MojangSource::new().map_err(|err| BootstrapError::Source(Box::new(err)))?),
+                Arc::new(FabricSource::new().map_err(|err| BootstrapError::Source(Box::new(err)))?),
+            ],
         };
 
         Ok(Mcsup {
@@ -340,9 +342,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 变体能力来自注入的 `jar_sources`，默认只有 vanilla
+    /// 变体能力来自注入的 `jar_sources`，默认覆盖 vanilla 与 fabric
     #[test]
-    fn default_jar_sources_cover_vanilla() {
+    fn default_jar_sources_cover_vanilla_and_fabric() {
         let store = Arc::new(JsonStore::open_in_memory().expect("memory store"));
         let dir = std::env::temp_dir().join(format!("mcsup-bootstrap-cap-{}", std::process::id()));
         let mcsup = McsupBuilder::new()
@@ -352,6 +354,10 @@ mod tests {
         let variants: Vec<_> = mcsup.jar_sources.iter().map(|s| s.variant()).collect();
         assert!(
             variants.contains(&domain::server::version::ServerVariant::Vanilla),
+            "{variants:?}"
+        );
+        assert!(
+            variants.contains(&domain::server::version::ServerVariant::Fabric),
             "{variants:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
