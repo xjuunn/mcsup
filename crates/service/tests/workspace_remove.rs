@@ -56,7 +56,24 @@ fn remove_with_servers_without_purge_clears_fk() {
     assert!(store.list().expect("list servers").is_empty());
 }
 
+/// 删盘前置校验与 `remove` 同源：cwd 在待删目录内时拒绝，且不动任何状态
+#[test]
+fn ensure_purgeable_agrees_with_remove() {
+    let (_store, svc, tmp) = setup("ws01");
+    let dir = tmp.path().join("ws");
+
+    svc.ensure_purgeable("ws01", &dir)
+        .expect_err("cwd 在待删目录内必须拒绝");
+    assert!(dir.join("workspace.toml").is_file(), "目录不能被删");
+    assert!(svc.resolve("ws01").is_ok(), "记录必须保留");
+
+    let outside = tempfile::tempdir().expect("tmp outside");
+    svc.ensure_purgeable("ws01", outside.path()).expect("放行");
+    assert!(svc.resolve("ws01").is_ok(), "校验本身不改注册表");
+}
+
 /// 注册表里有服务器时，删盘 + 注销同样不能报外键错误
+
 #[test]
 fn remove_with_servers_and_purge_clears_fk() {
     let (store, svc, tmp) = setup("ws01");

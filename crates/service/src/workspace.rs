@@ -185,6 +185,32 @@ impl RemoveOutcome {
     }
 }
 
+impl WorkspaceService {
+    /// 删盘前的前置校验：该工作区现在能否执行 `remove` 的删盘部分
+    ///
+    /// 只做判定、不改任何状态，供入口在弹「删除磁盘数据?」之前调用：
+    /// 交互入口先问再拒，用户会在确认框与手输名称之后才看到拒绝原因，白走一遍。
+    /// 判定与 [`WorkspaceService::remove`] 共用同一份 cwd 包含关系检查，不会分叉。
+    ///
+    /// # Errors
+    ///
+    /// 不存在、目标不是该工作区目录（与 `remove` 的删盘分支同一判定）、
+    /// `cwd` 在目标内时返回 [`WorkspaceError`]
+    pub fn ensure_purgeable(&self, selector: &str, cwd: &Path) -> Result<(), WorkspaceError> {
+        let ws = self.resolve(selector)?;
+        let cwd = normalize_path(&absolute_path(cwd));
+        // `remove` 在目录已不存在时跳过删盘，这里同样不必拦
+        if !ws.path.exists() {
+            return Ok(());
+        }
+        ensure_outside(&cwd, &ws.path)?;
+        if !is_deletable(&ws) {
+            return Err(WorkspaceError::NotAWorkspace(ws.path.clone()));
+        }
+        Ok(())
+    }
+}
+
 /// 工作目录编排：判空、目录结构、marker、注册表
 pub struct WorkspaceService {
     repo: Arc<dyn WorkspaceRepository>,
@@ -1124,6 +1150,45 @@ mod tests {
 
         svc.remove("ws01", true, &sibling).expect("remove");
         assert!(!dir.exists());
+    }
+
+    /// 删盘前置校验与 `remove` 判同一件事，且不改任何状态
+    ///
+    /// 入口靠它把「cwd 在待删目录内」提前到确认框之前报出来，因此它必须
+    /// 在拒绝时什么都不动：目录、marker、注册记录都保持原样。
+    #[test]
+    fn ensure_purgeable_rejects_before_any_change() {
+        let (svc, tmp) = svc();
+        let dir = tmp.path().join("ws");
+        svc.init(&dir, Some("ws01")).expect("init");
+
+        svc.ensure_purgeable("ws01", &dir)
+            .expect_err("cwd 在待删目录内必须拒绝");
+        assert!(dir.join("workspace.toml").is_file(), "目录不能被删");
+        assert!(svc.resolve("ws01").is_ok(), "记录必须保留");
+
+        // 不在目标内时放行，同样不改状态
+        svc.ensure_purgeable("ws01", tmp.path()).expect("放行");
+        assert!(dir.join("workspace.toml").is_file());
+        assert!(svc.resolve("ws01").is_ok());
+    }
+
+    /// 目录里没有本记录之外的证据时不放行，免得 `--purge` 猜一个目录删掉
+    #[test]
+    fn ensure_purgeable_rejects_marker_mismatch() {
+        let (svc, tmp) = svc();
+        let dir = tmp.path().join("ws");
+        svc.init(&dir, Some("ws01")).expect("init");
+        std::fs::remove_file(dir.join("workspace.toml")).expect("rm marker");
+
+        let err = svc
+            .ensure_purgeable("ws01", tmp.path())
+            .expect_err("缺 marker 必须拒绝");
+        assert!(
+            matches!(err, WorkspaceError::NotAWorkspace { .. }),
+            "{err:?}"
+        );
+        assert!(dir.is_dir());
     }
 
     /// 仅注销（不带 `--purge`）不删目录，工作目录在不在里面都放行

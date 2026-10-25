@@ -308,6 +308,13 @@ pub struct PruneOutcome {
     pub dry_run: bool,
 }
 
+/// 按备份根目录创建 CAS 的工厂
+///
+/// 抽成别名是为了让 [`BackupService`] 的字段与构造参数读起来是一件事，
+/// 而不是三层泛型嵌套。公开是因为 [`BackupService::with_cas_factory`] 是
+/// 公开 API，调用方需要在签名里写出它。
+pub type CasFactory = Arc<dyn Fn(&Path) -> Arc<dyn ContentStore> + Send + Sync>;
+
 /// 备份编排服务
 ///
 /// 克隆即共享同一套装配（与 `ServerLifecycleService` 口径一致）。
@@ -315,6 +322,8 @@ pub struct PruneOutcome {
 pub struct BackupService {
     registry: Arc<ServerRegistry>,
     supervisor: Arc<dyn port::SupervisorPort>,
+    /// 按备份根目录创建 CAS；生产是 `CasStore`，测试可套故障注入
+    cas_factory: CasFactory,
 }
 
 impl std::fmt::Debug for BackupService {
@@ -328,11 +337,33 @@ impl BackupService {
     ///
     /// 只依赖「探测状态 + 注入一行」两项能力：备份不需要拉起进程、不需要
     /// Java，直接依赖 [`port::SupervisorPort`] 比依赖整套生命周期服务更小。
+    ///
+    /// CAS 由内部按工作区布局创建；需要替换实现（故障注入、远程对象存储）
+    /// 时用 [`Self::with_cas_factory`]。
     #[must_use]
     pub fn new(registry: Arc<ServerRegistry>, supervisor: Arc<dyn port::SupervisorPort>) -> Self {
+        Self::with_cas_factory(
+            registry,
+            supervisor,
+            Arc::new(|root: &Path| Arc::new(CasStore::new(root)) as Arc<dyn ContentStore>),
+        )
+    }
+
+    /// 组合注册表、supervisor 与自定义 CAS 工厂
+    ///
+    /// 工厂每次解析服务器布局时按备份根目录调用一次，返回该布局要用的
+    /// [`ContentStore`]。生产装配用 [`Self::new`]；集成测试用它在真实
+    /// `CasStore` 外面套故障注入，从而验证「存储出错时上层怎么收场」。
+    #[must_use]
+    pub fn with_cas_factory(
+        registry: Arc<ServerRegistry>,
+        supervisor: Arc<dyn port::SupervisorPort>,
+        cas_factory: CasFactory,
+    ) -> Self {
         Self {
             registry,
             supervisor,
+            cas_factory,
         }
     }
 
@@ -341,7 +372,8 @@ impl BackupService {
     /// 解析服务器并返回（注册信息、CAS、快照索引、备份根目录）
     fn resolve(&self, name: &str) -> Result<BackupLayout, BackupError> {
         let server = self.registry.get(name)?;
-        Ok(BackupLayout::for_server(&server))
+        let mut make = |root: &Path| (self.cas_factory)(root);
+        Ok(BackupLayout::for_server_with(&server, &mut make))
     }
 
     /// 服务器是否在运行
@@ -429,7 +461,16 @@ impl BackupService {
         let now = unix_now();
         let id = next_snapshot_id(now);
         layout.index.begin(&id)?;
-        let outcome = scan_tree(&layout.dir, &layout.cas, &rules, &mut |_| {})?;
+        // 占位目录建立之后的任何失败都必须清掉它：否则每失败一次就在
+        // `snapshots/` 里留下一个空的 `.partial`，越积越多，且下次 list 会
+        // 读到一条永远无法完成的记录。
+        let outcome = match scan_tree(&layout.dir, layout.cas.as_ref(), &rules, &mut |_| {}) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                let _ = layout.index.remove(&id);
+                return Err(err.into());
+            }
+        };
         if outcome.entries.is_empty() {
             // 空快照没有恢复价值，删掉占位目录后报错
             let _ = layout.index.remove(&id);
@@ -772,19 +813,23 @@ struct BackupLayout {
     /// 所属工作区目录
     workspace: PathBuf,
     /// CAS
-    cas: CasStore,
+    cas: Arc<dyn ContentStore>,
     /// 快照索引
     index: SnapshotIndex,
 }
 
 impl BackupLayout {
-    fn for_server(server: &RegisteredServer) -> Self {
+    /// 按产品口径装配：CAS 落在工作区的 `backups/`
+    fn for_server_with(
+        server: &RegisteredServer,
+        make_cas: &mut dyn FnMut(&Path) -> Arc<dyn ContentStore>,
+    ) -> Self {
         let workspace = server_workspace(&server.dir, &server.meta.rel_dir);
         let root = backup::workspace_backups_root(&workspace);
         Self {
             dir: server.dir.clone(),
             workspace,
-            cas: CasStore::new(&root),
+            cas: make_cas(&root),
             index: SnapshotIndex::new(&root),
         }
     }
@@ -1017,6 +1062,9 @@ fn materialize(
                 Err(err) => return Err(FsError::io(&staging, err).into()),
             }
             std::fs::create_dir_all(&staging).map_err(|err| FsError::io(&staging, err))?;
+            // 暂存区是「未完成的恢复」的墓碑：从这里到函数结束的**任何**退出
+            // 路径都必须清掉它，否则下次恢复会把上次的半成品当成草稿。
+            let _guard = StagingGuard::new(&staging);
 
             let mut files = 0;
             let mut bytes = 0u64;
@@ -1053,13 +1101,43 @@ fn materialize(
             // 快照里没有的文件（快照之后新建的）也必须删掉。只依赖墓碑不够——
             // 老快照（无父快照）根本没有墓碑记录。
             deleted += remove_untracked(destination, snapshot)?;
-            let _ = std::fs::remove_dir_all(&staging);
+            // 暂存区由 `_guard` 在离开作用域时清理
             Ok(Materialized {
                 destination: destination.to_path_buf(),
                 files,
                 bytes,
                 deleted,
             })
+        }
+    }
+}
+
+/// 原地恢复的暂存区守卫：离开作用域时删掉 `.mcsup-restore/`
+///
+/// 成功路径与失败路径都要清：成功时内容已换入，失败时半成品没有保留价值。
+/// 手动在每个 `?` 前面加清理代码是错的写法——漏一处就留一堆垃圾。
+struct StagingGuard<'a> {
+    path: &'a Path,
+}
+
+impl<'a> StagingGuard<'a> {
+    fn new(path: &'a Path) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for StagingGuard<'_> {
+    fn drop(&mut self) {
+        // Drop 里不能传播错误：删不掉只记日志（通常是杀毒软件占用句柄）；
+        // 目录本来就不存在是正常路径，不记日志。
+        if let Err(err) = std::fs::remove_dir_all(self.path)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                path = %self.path.display(),
+                error = %err,
+                "failed to clean up the restore staging directory"
+            );
         }
     }
 }
