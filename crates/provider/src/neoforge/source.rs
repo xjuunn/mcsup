@@ -214,7 +214,7 @@ impl ServerJarSource for NeoForgeSource {
         let checksum = self.fetch_checksum(&build).await?;
         Ok(Downloads::installer(location)
             .checksum(checksum)
-            .resolve(version, None))
+            .resolve(version, Some(build)))
     }
 }
 

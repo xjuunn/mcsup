@@ -694,7 +694,15 @@ impl ServerRegistry {
         if let Some(ctx) = installer_ctx
             && let Some(installed) = self
                 .install_via_installer(
-                    name, version, installer, ctx, &srv.dir, progress, stages, cancel,
+                    name,
+                    version,
+                    srv.meta.variant,
+                    installer,
+                    ctx,
+                    &srv.dir,
+                    progress,
+                    stages,
+                    cancel,
                 )
                 .await?
         {
@@ -771,6 +779,7 @@ impl ServerRegistry {
         &self,
         name: &str,
         version: &VersionId,
+        variant: ServerVariant,
         installer: &ServerInstaller,
         ctx: &crate::InstallerContext,
         dir: &Path,
@@ -807,7 +816,7 @@ impl ServerRegistry {
         // 不是 `VersionId` 里的 MC 版本（`26.3`）——拿 MC 版本拼路径必然落空，
         // 只能找到 `user_jvm_args.txt`，启动时就少了平台参数文件。
         let build = out.build.as_deref().unwrap_or_else(|| version.as_str());
-        let files = forge_args_files(build, dir);
+        let files = loader_args_files(&variant, build, dir);
         if files.is_empty() {
             return Err(InstallError::Layout(format!(
                 "安装器完成后在 {} 找不到启动参数文件",
@@ -842,14 +851,19 @@ impl ServerRegistry {
 
 /// 安装器产出的启动参数文件（相对服务器目录，按展开顺序）
 ///
-/// Forge 生成 `user_jvm_args.txt` 与平台专属的 `win_args.txt` /
-/// `unix_args.txt`。只返回磁盘上**确实存在**的那些，缺第一个（用户参数文件）
-/// 视为安装失败。平台参数文件路径由 `libraries/net/minecraftforge/forge/{build}`
-/// 推出；不存在时再扫一遍 `libraries` 兜底，容忍上游路径变化。
+/// `Forge` 与 `NeoForge` 的安装器都会写出 `user_jvm_args.txt` 与平台专属的
+/// `win_args.txt` / `unix_args.txt`，但 Maven 坐标不同：
 ///
-/// 兜底**只认文件名里带本 build 的**：一个目录里可能同时存在多个 Forge 版本的
+/// - `Forge`：`libraries/net/minecraftforge/forge/{build}`
+/// - `NeoForge`：`libraries/net/neoforged/neoforge/{build}`
+///
+/// 只返回磁盘上**确实存在**的那些，缺第一个（用户参数文件）视为安装失败。
+/// 平台参数文件路径由变体对应的坐标推出；不存在时再扫一遍 `libraries` 兜底，
+/// 容忍上游路径变化。
+///
+/// 兜底**只认所在目录名等于本 build 的**：一个目录里可能同时存在多个版本的
 /// `win_args.txt`（升级后旧版本目录不会自动清理），随便取第一个会拉起到旧版本。
-fn forge_args_files(build: &str, dir: &Path) -> Vec<PathBuf> {
+fn loader_args_files(variant: &ServerVariant, build: &str, dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     if !dir.join(FORGE_USER_ARGS).is_file() {
         return files;
@@ -861,21 +875,30 @@ fn forge_args_files(build: &str, dir: &Path) -> Vec<PathBuf> {
     } else {
         "unix_args.txt"
     };
-    let expected = dir
-        .join("libraries/net/minecraftforge/forge")
-        .join(build)
-        .join(platform);
-    if expected.is_file() {
-        files.push(PathBuf::from(format!(
-            "libraries/net/minecraftforge/forge/{build}/{platform}"
-        )));
-        return files;
+    if let Some(base) = loader_maven_base(variant) {
+        let relative = format!("{base}/{build}/{platform}");
+        if dir.join(&relative).is_file() {
+            files.push(PathBuf::from(relative));
+            return files;
+        }
     }
-    // 兜底：上游若改了版本目录命名，仍要求所在目录就是本 build
+    // 兜底：上游若改了坐标或版本目录命名，仍要求所在目录就是本 build
     if let Some(rel) = find_args_file(&dir.join("libraries"), platform, build) {
         files.push(rel);
     }
     files
+}
+
+/// 安装器类变体的 Maven 坐标前缀（相对服务器目录，不含 build 段）
+///
+/// 只有走 `@参数文件` 启动的变体才有值；其余（含未来新增的）返回 `None`，
+/// 由 [`loader_args_files`] 的兜底扫描决定能否找到。
+fn loader_maven_base(variant: &ServerVariant) -> Option<&'static str> {
+    match variant {
+        ServerVariant::Forge => Some("libraries/net/minecraftforge/forge"),
+        ServerVariant::NeoForge => Some("libraries/net/neoforged/neoforge"),
+        _ => None,
+    }
 }
 
 /// 在 `root` 下递归找本 build 的平台参数文件，返回相对服务器目录的路径。
@@ -2045,7 +2068,7 @@ mod tests {
         };
         std::fs::write(build_dir.join(platform), b"#").expect("platform args");
 
-        let files = forge_args_files("26.3-66.1.0", dir);
+        let files = loader_args_files(&ServerVariant::Forge, "26.3-66.1.0", dir);
         assert_eq!(
             files,
             vec![
@@ -2058,7 +2081,38 @@ mod tests {
         );
 
         // 只给 MC 版本（旧口径）时找不到平台参数文件——正是当初的 bug 形态
-        let stale = forge_args_files("26.3", dir);
+        let stale = loader_args_files(&ServerVariant::Forge, "26.3", dir);
         assert_eq!(stale, vec![PathBuf::from(FORGE_USER_ARGS)]);
+    }
+
+    /// `NeoForge` 的参数文件在自己的 Maven 坐标下，不能套用 `Forge` 的路径
+    ///
+    /// 回归：变体不参与判定时，`NeoForge` 去 `libraries/net/minecraftforge/forge/`
+    /// 找参数文件必然落空，症状与 `Forge` 当初一模一样（`nogui` 被当成主类）。
+    #[test]
+    fn neoforge_args_files_use_own_maven_coordinates() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dir = tmp.path();
+        std::fs::write(dir.join(FORGE_USER_ARGS), b"#").expect("user args");
+        let build_dir = dir.join("libraries/net/neoforged/neoforge/26.3.0.99");
+        std::fs::create_dir_all(&build_dir).expect("build dir");
+        let platform = if cfg!(windows) {
+            "win_args.txt"
+        } else {
+            "unix_args.txt"
+        };
+        std::fs::write(build_dir.join(platform), b"#").expect("platform args");
+
+        let files = loader_args_files(&ServerVariant::NeoForge, "26.3.0.99", dir);
+        assert_eq!(
+            files,
+            vec![
+                PathBuf::from(FORGE_USER_ARGS),
+                PathBuf::from(format!(
+                    "libraries/net/neoforged/neoforge/26.3.0.99/{platform}"
+                )),
+            ],
+            "NeoForge 必须解析到自己的坐标"
+        );
     }
 }
