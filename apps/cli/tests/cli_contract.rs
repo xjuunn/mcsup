@@ -25,8 +25,14 @@ fn temp_home() -> TempDir {
 }
 
 fn run(home: &Path, args: &[&str]) -> Output {
+    run_in(home, home, args)
+}
+
+/// 指定子进程工作目录的变体（验证「终端停在待删目录」这类路径相关行为）
+fn run_in(cwd: &Path, home: &Path, args: &[&str]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_mcsup"));
-    cmd.args(args)
+    cmd.current_dir(cwd)
+        .args(args)
         .env("HOME", home)
         .env("USERPROFILE", home)
         .env("XDG_DATA_HOME", home.join("share"))
@@ -169,6 +175,118 @@ fn workspace_init_then_list_stdout_single_json() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["name"], "ws1");
     assert_eq!(rows[0]["current"], true);
+}
+
+/// 终端工作目录就在待删工作区里：`workspace remove --purge` 退出 4，目录与登记都保留
+///
+/// Windows 上子进程改不了父进程的工作目录，真删掉之后调用方终端会停在已不
+/// 存在的路径上，之后任何子进程都拿不到工作目录（命令静默不执行）。
+#[test]
+fn workspace_purge_from_inside_dir_exits_4() {
+    let home = temp_home();
+    let ws = home.path().join("wsdir");
+    let init = run(
+        home.path(),
+        &[
+            "workspace",
+            "init",
+            "--dir",
+            ws.to_str().expect("utf8"),
+            "--name",
+            "ws1",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(init.status.code(), Some(0), "stderr: {}", stderr(&init));
+
+    // 子进程的工作目录 = 工作区目录本身
+    let out = run_in(
+        &ws,
+        home.path(),
+        &["workspace", "remove", "ws1", "--purge", "--output", "json"],
+    );
+    assert_eq!(out.status.code(), Some(4), "stderr: {}", stderr(&out));
+    assert!(out.stdout.is_empty(), "拒绝时不得输出数据");
+    let err = stderr(&out);
+    assert!(err.contains("is inside"), "{err}");
+    assert!(err.contains("move out of it first"), "{err}");
+
+    let list = run(home.path(), &["workspace", "list", "--output", "json"]);
+    let rows: serde_json::Value = serde_json::from_slice(&list.stdout).expect("list 输出数组");
+    assert_eq!(rows.as_array().expect("array").len(), 1, "登记必须保留");
+    assert!(ws.join("workspace.toml").is_file(), "目录必须原样保留");
+}
+
+/// `--purge` 时目录本就不存在：退出 0 注销登记，JSON 必须如实区分
+/// 「请求了删盘」与「磁盘真的删了」
+#[test]
+fn workspace_purge_missing_dir_reports_disk_not_purged() {
+    let home = temp_home();
+    let ws = home.path().join("wsdir");
+    let init = run(
+        home.path(),
+        &[
+            "workspace",
+            "init",
+            "--dir",
+            ws.to_str().expect("utf8"),
+            "--name",
+            "ws1",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(init.status.code(), Some(0), "stderr: {}", stderr(&init));
+    // 目录被人手工删掉，登记还在
+    std::fs::remove_dir_all(&ws).expect("rmdir");
+
+    let out = run(
+        home.path(),
+        &["workspace", "remove", "ws1", "--purge", "--output", "json"],
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let payload: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("remove stdout 必须是单个 JSON 对象");
+    assert_eq!(payload["name"], "ws1");
+    assert_eq!(payload["purged"], true, "请求了删盘");
+    assert_eq!(payload["disk_purged"], false, "磁盘目录本就不存在");
+
+    let list = run(home.path(), &["workspace", "list", "--output", "json"]);
+    let rows: serde_json::Value = serde_json::from_slice(&list.stdout).expect("list 输出数组");
+    assert!(rows.as_array().expect("array").is_empty(), "登记必须清理");
+}
+
+/// 正常删盘：`purged` 与 `disk_purged` 都为 true
+#[test]
+fn workspace_purge_existing_dir_reports_disk_purged() {
+    let home = temp_home();
+    let ws = home.path().join("wsdir");
+    let init = run(
+        home.path(),
+        &[
+            "workspace",
+            "init",
+            "--dir",
+            ws.to_str().expect("utf8"),
+            "--name",
+            "ws1",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(init.status.code(), Some(0), "stderr: {}", stderr(&init));
+
+    let out = run(
+        home.path(),
+        &["workspace", "remove", "ws1", "--purge", "--output", "json"],
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let payload: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("remove stdout 必须是单个 JSON 对象");
+    assert_eq!(payload["purged"], true);
+    assert_eq!(payload["disk_purged"], true);
+    assert!(!ws.exists());
 }
 
 /// 空注册表：doctor 退出 0，stdout 单行 JSON，字段形状固定

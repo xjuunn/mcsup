@@ -376,21 +376,29 @@ pub(crate) fn remove(name: &str, purge: bool, printer: Printer) -> Result<()> {
     if purge && !srv.linked {
         super::chdir_out_of(&srv.dir);
     }
-    // 删除经 lifecycle 编排：运行中拒绝（存档保护），判定收敛在 service
-    let out = super::lifecycle::lifecycle_service()?.remove_server(name, purge)?;
+    // 删除经 lifecycle 编排：运行中拒绝（存档保护）、cwd 在目录内拒绝，
+    // 判定收敛在 service
+    let cwd = std::env::current_dir().context("获取当前工作目录失败")?;
+    let out = super::lifecycle::lifecycle_service()?.remove_server(name, purge, &cwd)?;
+    let srv = &out.server;
+    let disk_purged = out.disk_purged();
     printer.print_outcome(
-        &if purge {
-            format!("已删除并注销: {}", out.meta.name)
-        } else if out.linked {
-            format!("已移除链接并注销: {}（目标目录保留）", out.meta.name)
+        &if disk_purged {
+            format!("已删除并注销: {}", srv.meta.name)
+        } else if srv.linked {
+            format!("已移除链接并注销: {}（目标目录保留）", srv.meta.name)
+        } else if purge {
+            // 请求了删盘但目录本就不在：不能说「已删除」，用户会以为删掉了存档
+            format!("已注销（磁盘数据本就不存在）: {}", srv.meta.name)
         } else {
-            format!("已注销（磁盘数据保留）: {}", out.meta.name)
+            format!("已注销（磁盘数据保留）: {}", srv.meta.name)
         },
         &RemoveJson {
-            name: out.meta.name.as_str().to_owned(),
-            path: out.dir.display().to_string(),
+            name: srv.meta.name.as_str().to_owned(),
+            path: srv.dir.display().to_string(),
             purged: purge,
-            linked: out.linked,
+            disk_purged,
+            linked: srv.linked,
         },
     )
 }

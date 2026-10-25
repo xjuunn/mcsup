@@ -158,6 +158,18 @@ pub(crate) fn init(
                 status: "recovered",
             },
         )?,
+        InitOutcome::MarkerRestored(ws) => printer.print_outcome(
+            &format!(
+                "已按注册记录重建 workspace.toml: {} ({})",
+                ws.name,
+                ws.path.display()
+            ),
+            &WorkspaceInitRow {
+                name: ws.name.as_str(),
+                path: ws.path.display().to_string(),
+                status: "marker-restored",
+            },
+        )?,
         InitOutcome::AlreadyRegistered(ws) => printer.print_outcome(
             &format!(
                 "已注册过: {} ({})，可用 mcsup workspace use {}",
@@ -288,15 +300,23 @@ fn remove(svc: &WorkspaceService, name: &str, purge: bool, printer: Printer) -> 
         }
         confirmed
     };
+    // 终端的工作目录：service 据此拒绝「删掉调用方所在目录」
+    let cwd = std::env::current_dir().context("获取当前工作目录失败")?;
     if purge {
         // 自身工作目录在目标里时我们自己也持有句柄，先退到目标之外；
-        // 终端的工作目录不由我们释放，那种情况只能提示用户 cd 出去
+        // 这一步只解决删除失败，终端的工作目录不由我们释放。终端也在目标内时
+        // 由 service 拒绝（无法从子进程改变父进程的工作目录）
         super::chdir_out_of(&ws.path);
     }
-    let ws = svc.remove(name, purge)?;
+    let out = svc.remove(name, purge, &cwd)?;
+    let ws = &out.workspace;
+    let disk_purged = out.disk_purged();
     printer.print_outcome(
-        &if purge {
+        &if disk_purged {
             format!("已注销并删除磁盘数据: {}", ws.name)
+        } else if purge {
+            // 请求了删盘但目录本就不在：不能说「已删除」，用户会以为删掉了内容
+            format!("已注销（磁盘数据本就不存在）: {}", ws.name)
         } else {
             format!("已注销（磁盘数据保留）: {}", ws.name)
         },
@@ -304,6 +324,7 @@ fn remove(svc: &WorkspaceService, name: &str, purge: bool, printer: Printer) -> 
             name: ws.name.as_str(),
             path: ws.path.display().to_string(),
             purged: purge,
+            disk_purged,
         },
     )?;
     // 删除的是当前工作区时告知移交结果，避免用户找不到「当前」去哪了

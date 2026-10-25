@@ -40,6 +40,17 @@ pub enum WorkspaceError {
     /// 尚无当前工作区
     #[error("no current workspace; run `mcsup workspace init` or `mcsup workspace use` first")]
     NoCurrent,
+    /// 当前进程的工作目录位于待删目录内：先删它会把调用方终端锁死在已删除路径上
+    #[error(
+        "current working directory {cwd} is inside {target}; move out of it first, \
+         then retry"
+    )]
+    CwdInsideTarget {
+        /// 当前工作目录
+        cwd: PathBuf,
+        /// 待删除目录
+        target: PathBuf,
+    },
     /// 文件系统 / marker 失败（共用载荷见 [`FsError`]）
     #[error(transparent)]
     Fs(#[from] FsError),
@@ -79,6 +90,30 @@ pub enum InitOutcome {
     Recovered(Workspace),
     /// 已在数据库中
     AlreadyRegistered(Workspace),
+    /// 目录已登记但 `workspace.toml` 丢失：按记录里的 id / 名称补写 marker
+    MarkerRestored(Workspace),
+}
+
+/// 注销结果：注销了哪条工作目录，以及磁盘是否真的删了
+#[derive(Debug, Clone)]
+pub struct RemoveOutcome {
+    /// 被注销的工作目录（注销前的快照）
+    pub workspace: Workspace,
+    /// 磁盘目录是否被本次调用实际删除
+    ///
+    /// `false` 表示本次没有删除动作：未带 `purge`，或目标目录本就不存在。
+    /// 入口据此报「已删除」与「磁盘数据本就不在」的区别。
+    pub disk_purged: bool,
+}
+
+impl RemoveOutcome {
+    /// 磁盘目录是否真的被本次调用删掉了
+    ///
+    /// 与 `purge` 请求参数不同：未带 `purge` 或目标本就不存在时为 `false`。
+    #[must_use]
+    pub fn disk_purged(&self) -> bool {
+        self.disk_purged
+    }
 }
 
 /// 工作目录编排：判空、目录结构、marker、注册表
@@ -115,6 +150,22 @@ impl WorkspaceService {
 
         if let Some(marker) = read_marker(&dir)? {
             return self.recover(dir, &marker, now);
+        }
+
+        // 目录指向一条已登记记录、但没有 marker：身份由记录给出，补写 marker。
+        // 不接管未登记的目录——那需要用户确认归属，判空闸继续拦
+        if let Some(ws) = self.registered_at(&dir)? {
+            create_layout(&dir)?;
+            write_marker(
+                &dir,
+                &MarkerToml {
+                    schema: MARKER_SCHEMA,
+                    id: ws.id.as_str().to_owned(),
+                    name: ws.name.as_str().to_owned(),
+                    created_at: ws.created_at,
+                },
+            )?;
+            return Ok(InitOutcome::MarkerRestored(ws));
         }
 
         if dir.exists() && !is_empty_dir(&dir)? {
@@ -215,17 +266,31 @@ impl WorkspaceService {
     /// 被删的是当前工作区时，当前标记移交给剩余中按名称排序的第一个；
     /// 无剩余则当前为空，后续缺省落点操作报 [`WorkspaceError::NoCurrent`]。
     ///
+    /// `cwd` 是调用方进程的工作目录。它在待删目录内时直接拒绝
+    /// （[`WorkspaceError::CwdInsideTarget`]）：Windows 上子进程无法改变父进程
+    /// 的工作目录，删掉之后调用方终端会停在一条已不存在的路径上，之后任何
+    /// 子进程（包括 mcsup 自己）都拿不到工作目录，表现为命令静默不执行。
+    ///
     /// # Errors
     ///
-    /// 不存在、目标不是该工作区目录、IO 或注册表失败时返回 [`WorkspaceError`]
-    pub fn remove(&self, selector: &str, purge: bool) -> Result<Workspace, WorkspaceError> {
+    /// 不存在、目标不是该工作区目录、`cwd` 在目标内、IO 或注册表失败时
+    /// 返回 [`WorkspaceError`]
+    pub fn remove(
+        &self,
+        selector: &str,
+        purge: bool,
+        cwd: &Path,
+    ) -> Result<RemoveOutcome, WorkspaceError> {
         let ws = self.resolve(selector)?;
+        let mut disk_purged = false;
         if purge && ws.path.exists() {
+            ensure_outside(cwd, &ws.path)?;
             if !is_deletable(&ws) {
                 return Err(WorkspaceError::NotAWorkspace(ws.path.clone()));
             }
             std::fs::remove_dir_all(&ws.path)
                 .map_err(|err| WorkspaceError::io(&ws.path, deletion_hint(err)))?;
+            disk_purged = true;
         }
         // 服务器登记引用工作目录（外键）：先清服务器，再注销工作目录
         self.servers.remove_by_workspace(&ws.id)?;
@@ -235,7 +300,10 @@ impl WorkspaceService {
         {
             self.repo.set_current(&next.id)?;
         }
-        Ok(ws)
+        Ok(RemoveOutcome {
+            workspace: ws,
+            disk_purged,
+        })
     }
 
     fn recover(
@@ -266,6 +334,23 @@ impl WorkspaceService {
         };
         self.repo.create(&ws)?;
         Ok(InitOutcome::Recovered(ws))
+    }
+
+    /// 该路径已登记的工作目录
+    ///
+    /// 路径按入库口径（[`absolute_path`]）比较：记录里存的就是绝对路径，
+    /// 这里的 `dir` 也已绝对化，直接相等即同一目录。
+    ///
+    /// # Errors
+    ///
+    /// 注册表读取失败时返回错误；未登记返回 `Ok(None)`
+    fn registered_at(&self, dir: &Path) -> Result<Option<Workspace>, WorkspaceError> {
+        Ok(self
+            .repo
+            .list()?
+            .into_iter()
+            .map(normalize_workspace)
+            .find(|ws| ws.path == dir))
     }
 
     /// 下一个默认工作区名：现存最大序号 + 1（`workspace01`、`workspace02`…）
@@ -313,10 +398,18 @@ pub(crate) enum MarkerState {
 /// 读 marker 并给出身份结论；IO 失败按 `Corrupt` 处理（读不出来就无法确认身份）
 pub(crate) fn read_marker_id(dir: &Path, expected: &WorkspaceId) -> MarkerState {
     match read_marker(dir) {
-        Ok(Some(marker)) if marker.id == expected.as_str() => MarkerState::Match,
-        Ok(Some(marker)) => MarkerState::Mismatch(marker.id),
+        Ok(Some(marker)) => marker_state(&marker, expected),
         Ok(None) => MarkerState::Missing,
         Err(_) => MarkerState::Corrupt,
+    }
+}
+
+/// marker → 身份结论（已解析的 marker，供 init 复用，避免读两遍）
+fn marker_state(marker: &MarkerToml, expected: &WorkspaceId) -> MarkerState {
+    if marker.id == expected.as_str() {
+        MarkerState::Match
+    } else {
+        MarkerState::Mismatch(marker.id.clone())
     }
 }
 
@@ -423,6 +516,24 @@ pub fn absolute_path(dir: &Path) -> PathBuf {
             .join(dir)
     };
     normalize_path(&joined)
+}
+
+/// 待删目录是否包含 `cwd`：包含时拒绝删除
+///
+/// Windows 上子进程改不了父进程的工作目录，删掉当前目录后调用方终端会停在
+/// 已不存在的路径上，之后任何子进程都拿不到工作目录（命令静默不执行）。
+/// `workspace remove --purge` 与 `server remove --purge` 共用这一份判定。
+///
+/// # Errors
+///
+/// `cwd` 规范化后位于 `target` 内时返回 [`WorkspaceError::CwdInsideTarget`]
+pub(crate) fn ensure_outside(cwd: &Path, target: &Path) -> Result<(), WorkspaceError> {
+    let cwd = normalize_path(&absolute_path(cwd));
+    let target = normalize_path(&absolute_path(target));
+    if cwd.starts_with(&target) {
+        return Err(WorkspaceError::CwdInsideTarget { cwd, target });
+    }
+    Ok(())
 }
 
 /// 去掉 `.` 组件与多余分隔符
@@ -621,7 +732,8 @@ mod tests {
         svc.init(&tmp.path().join("ws"), Some("ws01"))
             .expect("init");
 
-        svc.remove("ws01", false).expect("remove");
+        svc.remove("ws01", false, &tmp.path().join("elsewhere"))
+            .expect("remove");
 
         assert!(servers.cleared.load(std::sync::atomic::Ordering::SeqCst));
         assert!(svc.resolve("ws01").is_err());
@@ -714,7 +826,8 @@ mod tests {
         svc.init(&tmp.path().join("a"), None).expect("a"); // workspace01
         svc.init(&tmp.path().join("b"), Some("workspace02"))
             .expect("b");
-        svc.remove("workspace01", false).expect("remove");
+        svc.remove("workspace01", false, &tmp.path().join("elsewhere"))
+            .expect("remove");
         let InitOutcome::Created(c) = svc.init(&tmp.path().join("c"), None).expect("c") else {
             unreachable!("expected Created")
         };
@@ -737,6 +850,44 @@ mod tests {
         };
         assert_eq!(ws.name.as_str(), "half");
         assert!(ws.is_current);
+    }
+
+    /// 目录已登记但 marker 被删：按记录重建，沿用原 id 与名称
+    ///
+    /// 这是用户误删 `workspace.toml` 后的恢复路径：重建出的 marker 必须让
+    /// `is_deletable` 通过，否则 `--purge` 永远被拒。
+    #[test]
+    fn init_restores_missing_marker_from_record() {
+        let (svc, tmp) = svc();
+        let dir = tmp.path().join("ws");
+        svc.init(&dir, Some("ws01")).expect("init");
+        let before = svc.resolve("ws01").expect("resolve");
+        std::fs::remove_file(dir.join("workspace.toml")).expect("rm marker");
+
+        let outcome = svc.init(&dir, None).expect("restore");
+        let InitOutcome::MarkerRestored(ws) = outcome else {
+            unreachable!("expected MarkerRestored, got {outcome:?}")
+        };
+        assert_eq!(ws.id, before.id, "id 必须沿用记录，否则身份对不上");
+        assert_eq!(ws.name.as_str(), "ws01");
+        assert!(dir.join("workspace.toml").is_file());
+
+        // 重建后删除闸重新放行
+        let outside = tmp.path().join("elsewhere");
+        let out = svc.remove("ws01", true, &outside).expect("purge");
+        assert!(out.disk_purged());
+    }
+
+    /// 未登记的目录不因 init 被接管：判空闸仍然拦着，用户得先确认归属
+    #[test]
+    fn init_still_rejects_unregistered_non_empty_dir() {
+        let (svc, tmp) = svc();
+        let dir = tmp.path().join("foreign");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("keep.txt"), "x").expect("file");
+
+        let err = svc.init(&dir, None).expect_err("必须拒绝");
+        assert!(matches!(err, WorkspaceError::NotEmpty(_)), "got {err:?}");
     }
 
     #[test]
@@ -793,7 +944,8 @@ mod tests {
         let (svc, tmp) = svc();
         let dir = tmp.path().join("ws");
         svc.init(&dir, Some("ws01")).expect("init");
-        svc.remove("ws01", false).expect("remove");
+        svc.remove("ws01", false, &tmp.path().join("elsewhere"))
+            .expect("remove");
         assert!(dir.join("workspace.toml").is_file());
     }
 
@@ -806,7 +958,8 @@ mod tests {
         svc.init(&tmp.path().join("c"), Some("ws03")).expect("c");
         assert_eq!(svc.current_workspace().expect("cur").name.as_str(), "ws01");
 
-        svc.remove("ws01", false).expect("remove");
+        svc.remove("ws01", false, &tmp.path().join("elsewhere"))
+            .expect("remove");
 
         assert_eq!(svc.current_workspace().expect("cur").name.as_str(), "ws02");
     }
@@ -816,7 +969,8 @@ mod tests {
     fn remove_last_workspace_clears_current() {
         let (svc, tmp) = svc();
         svc.init(&tmp.path().join("a"), Some("ws01")).expect("a");
-        svc.remove("ws01", false).expect("remove");
+        svc.remove("ws01", false, &tmp.path().join("elsewhere"))
+            .expect("remove");
         assert!(matches!(
             svc.current_workspace().expect_err("none"),
             WorkspaceError::NoCurrent
@@ -828,8 +982,89 @@ mod tests {
         let (svc, tmp) = svc();
         let dir = tmp.path().join("ws");
         svc.init(&dir, Some("ws01")).expect("init");
-        svc.remove("ws01", true).expect("remove");
+        let out = svc
+            .remove("ws01", true, &tmp.path().join("elsewhere"))
+            .expect("remove");
         assert!(!dir.exists());
+        assert!(out.disk_purged(), "目录确实被删了，结果必须如实上报");
+    }
+
+    /// `--purge` 时目录本就不存在：注销照常成功，但不得上报成「删了磁盘」
+    ///
+    /// 上报错了用户会以为存档被删（实际根本没删），脚本也会误判磁盘状态。
+    #[test]
+    fn purge_reports_not_deleted_when_dir_missing() {
+        let (svc, tmp) = svc();
+        let dir = tmp.path().join("ws");
+        svc.init(&dir, Some("ws01")).expect("init");
+        std::fs::remove_dir_all(&dir).expect("rmdir");
+
+        let out = svc
+            .remove("ws01", true, &tmp.path().join("elsewhere"))
+            .expect("remove");
+        assert!(!out.disk_purged(), "没有可删的对象时必须是 false");
+        assert!(svc.resolve("ws01").is_err(), "登记仍要清理");
+    }
+
+    /// 仅注销不上报删盘
+    #[test]
+    fn unregister_reports_not_deleted() {
+        let (svc, tmp) = svc();
+        let dir = tmp.path().join("ws");
+        svc.init(&dir, Some("ws01")).expect("init");
+
+        let out = svc
+            .remove("ws01", false, &tmp.path().join("elsewhere"))
+            .expect("remove");
+        assert!(!out.disk_purged());
+        assert!(dir.join("workspace.toml").is_file());
+    }
+
+    /// 调用方工作目录就在待删目录内时拒绝删除
+    ///
+    /// Windows 上子进程改不了父进程的工作目录：真删掉之后调用方终端会停在
+    /// 已不存在的路径上，之后任何子进程都拿不到工作目录（命令静默不执行）。
+    /// 拒绝时目录与注册记录都必须原样保留，用户 cd 出去后重试即可。
+    #[test]
+    fn purge_rejects_cwd_inside_target() {
+        let (svc, tmp) = svc();
+        let dir = tmp.path().join("ws");
+        svc.init(&dir, Some("ws01")).expect("init");
+        // 当前目录在目标之内（含目标本身与子目录两种深度）
+        for cwd in [dir.clone(), dir.join("servers")] {
+            let err = svc.remove("ws01", true, &cwd).expect_err("必须拒绝");
+            let WorkspaceError::CwdInsideTarget { cwd: at, target } = &err else {
+                panic!("unexpected error: {err:?}");
+            };
+            assert_eq!(at, &cwd);
+            assert_eq!(target, &dir);
+            assert!(dir.join("workspace.toml").is_file(), "目录不能被删");
+            assert!(svc.resolve("ws01").is_ok(), "记录必须保留");
+        }
+    }
+
+    /// 不在目标内的目录（前缀相同但不是子目录）不算包含：`.../ws2` 不能挡住 `.../ws`
+    #[test]
+    fn purge_allows_cwd_sharing_name_prefix() {
+        let (svc, tmp) = svc();
+        let dir = tmp.path().join("ws");
+        svc.init(&dir, Some("ws01")).expect("init");
+        let sibling = tmp.path().join("ws2");
+        std::fs::create_dir_all(&sibling).expect("mkdir");
+
+        svc.remove("ws01", true, &sibling).expect("remove");
+        assert!(!dir.exists());
+    }
+
+    /// 仅注销（不带 `--purge`）不删目录，工作目录在不在里面都放行
+    #[test]
+    fn unregister_ignores_cwd_location() {
+        let (svc, tmp) = svc();
+        let dir = tmp.path().join("ws");
+        svc.init(&dir, Some("ws01")).expect("init");
+
+        svc.remove("ws01", false, &dir).expect("remove");
+        assert!(dir.join("workspace.toml").is_file());
     }
 
     /// 删除失败时必须保留注册记录：否则「记录已注销、目录只删了一半」无从重试
@@ -843,7 +1078,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("rmdir");
         std::fs::write(&dir, "occupied").expect("file");
 
-        let err = svc.remove("ws01", true).expect_err("must fail");
+        let err = svc
+            .remove("ws01", true, &tmp.path().join("elsewhere"))
+            .expect_err("must fail");
         assert!(
             matches!(err, WorkspaceError::Fs(FsError::Io { .. }))
                 || matches!(err, WorkspaceError::NotAWorkspace(_)),
@@ -870,7 +1107,9 @@ mod tests {
         std::fs::create_dir_all(&foreign).expect("mkdir");
         repo.items.lock().expect("lock")[0].path = foreign.clone();
 
-        let err = svc.remove("ws01", true).expect_err("必须拒绝");
+        let err = svc
+            .remove("ws01", true, &tmp.path().join("elsewhere"))
+            .expect_err("必须拒绝");
         assert!(
             matches!(err, WorkspaceError::NotAWorkspace(_)),
             "got {err:?}"

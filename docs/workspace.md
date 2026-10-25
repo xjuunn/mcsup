@@ -117,6 +117,18 @@ mcsup workspace init [--dir <path>] [--name <name>]
   任何服务器。禁止「工作区上下文」式的可见性切换。
 - 删除 current 时当前标记移交给剩余中按名称排序的第一个；无剩余则无当前，
   缺省落点操作报 `NoCurrent`。
+- `workspace remove --purge` / `server remove --purge` 的 `cwd` 闸：调用方
+  进程的工作目录位于待删目录内时拒绝（`CwdInsideTarget`，退出码 4）。子进程
+  改不了父进程的工作目录，真删掉会让调用方终端停在已不存在的路径上，之后
+  任何子进程都拿不到工作目录，表现为命令静默不执行。用户 cd 出去后重试即可。
+  判定在 service（`workspace::ensure_outside`），入口只传 `current_dir()`。
+- 删除结果必须如实区分「请求了删盘」与「磁盘真的删了」：`remove` 返回
+  `RemoveOutcome.disk_purged`，JSON 同时带 `purged` 与 `disk_purged`。目录
+  本就不存在时注销照常成功，但 `disk_purged=false`，人类输出报「磁盘数据本就
+  不存在」，不得说成已删除。
+- 目录已登记但 `workspace.toml` 丢失：`workspace init --dir <同一路径>` 按
+  记录里的 id / 名称 / `created_at` 重建 marker（`InitOutcome::MarkerRestored`），
+  不新建记录、不改 id。未登记的目录仍走判空闸，不被 init 接管。
 - `--workspace` 按名匹配：精确 → 唯一前缀 → 未找到或歧义时列候选报错。
   选择器优先级：flag > 环境变量 `MCSUP_WORKSPACE` > 当前工作区。
 - `server create` 不提供自由路径参数；服务器只能落在已注册工作目录的

@@ -122,8 +122,13 @@ pub struct RemoveJson {
     pub name: String,
     /// 服务器目录绝对路径
     pub path: String,
-    /// 是否连磁盘数据一并删除
+    /// 是否请求了连磁盘数据一并删除（即 `--purge`）
     pub purged: bool,
+    /// 目录是否真的被本次调用删掉了
+    ///
+    /// 与 `purged` 不同：未请求删除、链接服务器（只删链接）、或目录本就不存在
+    /// 时为 `false`。消费者据此区分「删成功」与「无事可做」。
+    pub disk_purged: bool,
     /// 是否链接服务器
     pub linked: bool,
 }
@@ -261,8 +266,13 @@ pub struct WorkspaceRemoveJson<'a> {
     pub name: &'a str,
     /// 目录绝对路径
     pub path: String,
-    /// 是否连磁盘数据一并删除
+    /// 是否请求了连磁盘数据一并删除（即 `--purge` / 交互确认）
     pub purged: bool,
+    /// 磁盘目录是否真的被删掉了
+    ///
+    /// 与 `purged` 不同：未请求删除，或目标目录本就不存在时为 `false`。
+    /// 消费者据此区分「删成功」与「无事可做」，不要用 `purged` 推断磁盘状态。
+    pub disk_purged: bool,
 }
 
 /// `workspace doctor` 发现项

@@ -109,6 +109,26 @@ pub struct RegisteredServer {
     pub linked: bool,
 }
 
+/// `server remove` 结果
+#[derive(Debug, Clone)]
+pub struct RemoveOutcome {
+    /// 被注销的服务器
+    pub server: RegisteredServer,
+    /// 目录是否被本次调用实际删除
+    ///
+    /// `false` 表示本次没有删除动作：未带 `purge`、链接服务器（只删链接），
+    /// 或普通目录本就不存在。入口据此区分「删成功」与「无事可做」。
+    pub disk_purged: bool,
+}
+
+impl RemoveOutcome {
+    /// 目录是否被本次调用实际删除
+    #[must_use]
+    pub fn disk_purged(&self) -> bool {
+        self.disk_purged
+    }
+}
+
 /// `server link` 结果
 #[derive(Debug, Clone)]
 pub struct LinkedServer {
@@ -354,11 +374,23 @@ impl ServerRegistry {
     /// `purge` 对链接服务器直接拒绝——目标在工作区外，删了无法恢复。
     /// 普通目录：默认仅注销保留磁盘；`purge` 时先删目录再注销。
     ///
+    /// `cwd` 是调用方进程的工作目录，位于待删目录内时拒绝
+    /// （[`WorkspaceError::CwdInsideTarget`]，与 `workspace remove --purge` 同一
+    /// 判定）：Windows 上子进程改不了父进程的工作目录，删掉后调用方终端会停在
+    /// 已不存在的路径上。
+    ///
     /// # Errors
     ///
-    /// 不存在、链接服务器带 `purge`、IO 或注册表失败时返回 [`ServerRegistryError`]
-    pub fn remove(&self, name: &str, purge: bool) -> Result<RegisteredServer, ServerRegistryError> {
+    /// 不存在、链接服务器带 `purge`、`cwd` 在待删目录内、IO 或注册表失败时
+    /// 返回 [`ServerRegistryError`]
+    pub fn remove(
+        &self,
+        name: &str,
+        purge: bool,
+        cwd: &Path,
+    ) -> Result<RemoveOutcome, ServerRegistryError> {
         let srv = self.get(name)?;
+        let mut disk_purged = false;
         if srv.linked {
             if purge {
                 return Err(ServerRegistryError::Fs(FsError::marker(
@@ -367,28 +399,38 @@ impl ServerRegistry {
                      and run `server remove` without --purge",
                 )));
             }
+            // 链接不是目录：删掉的是链接本身，目标目录仍在磁盘上
             std::fs::remove_file(&srv.dir).map_err(|err| ServerRegistryError::io(&srv.dir, err))?;
         } else if purge {
-            // 目录由 `ws.path/servers/<rel_dir>` 拼出，记录被手改后可能指向
-            // 工作区外。删除前必须拿到文件系统证据：目录里的 mcsup.json 与该
-            // 记录同 id。「宁可拒绝、让用户确认」优先于「猜一个目录删掉」。
-            if !server_dir_matches(&srv.dir, &srv.meta.id) {
-                return Err(ServerRegistryError::Fs(FsError::marker(
-                    srv.dir.clone(),
-                    format!(
-                        "refusing to purge: {} does not hold a {SERVER_MARKER} \
-                         belonging to server {}; fix the record or delete it manually",
-                        srv.dir.display(),
-                        srv.meta.name.as_str()
-                    ),
-                )));
+            crate::workspace::ensure_outside(cwd, &srv.dir)?;
+            // 目录本就不存在：没有可删的对象，注销登记即可（幂等）。
+            // 不能报成删成功，也不能因此拒绝——记录才是要清理的东西
+            if srv.dir.exists() {
+                // 目录由 `ws.path/servers/<rel_dir>` 拼出，记录被手改后可能指向
+                // 工作区外。删除前必须拿到文件系统证据：目录里的 mcsup.json 与该
+                // 记录同 id。「宁可拒绝、让用户确认」优先于「猜一个目录删掉」。
+                if !server_dir_matches(&srv.dir, &srv.meta.id) {
+                    return Err(ServerRegistryError::Fs(FsError::marker(
+                        srv.dir.clone(),
+                        format!(
+                            "refusing to purge: {} does not hold a {SERVER_MARKER} \
+                             belonging to server {}; fix the record or delete it manually",
+                            srv.dir.display(),
+                            srv.meta.name.as_str()
+                        ),
+                    )));
+                }
+                std::fs::remove_dir_all(&srv.dir)
+                    .map_err(|err| ServerRegistryError::io(&srv.dir, deletion_hint(err)))?;
+                disk_purged = true;
             }
-            std::fs::remove_dir_all(&srv.dir)
-                .map_err(|err| ServerRegistryError::io(&srv.dir, deletion_hint(err)))?;
         }
         let name = srv.meta.name.clone();
         self.servers.remove(&name)?;
-        Ok(srv)
+        Ok(RemoveOutcome {
+            server: srv,
+            disk_purged,
+        })
     }
 
     /// 全部服务器，按名称升序，附绝对目录
@@ -1196,7 +1238,7 @@ mod tests {
                 None,
             )
             .expect("create");
-        reg.remove("test", false).expect("unregister");
+        reg.remove("test", false, tmp.path()).expect("unregister");
 
         let out = reg.link(&created.dir, None, None).expect("recover");
 
@@ -1318,7 +1360,7 @@ mod tests {
         std::fs::write(external.join("keep.txt"), "data").expect("file");
         reg.link(&external, Some("ext"), None).expect("link");
 
-        let err = reg.remove("ext", true).expect_err("refuse");
+        let err = reg.remove("ext", true, tmp.path()).expect_err("refuse");
         assert!(err.to_string().contains("linked"));
         assert!(external.join("keep.txt").is_file());
         assert!(reg.get("ext").is_ok());
@@ -1346,9 +1388,64 @@ mod tests {
         )
         .expect("tamper");
 
-        let err = reg.remove("alpha", true).expect_err("必须拒绝");
+        let err = reg.remove("alpha", true, tmp.path()).expect_err("必须拒绝");
         assert!(err.to_string().contains("refusing to purge"), "got {err}");
         assert!(srv.dir.is_dir(), "目录不能被删");
+        assert!(reg.get("alpha").is_ok(), "记录必须保留");
+    }
+
+    /// 普通目录本就不存在时 `--purge`：注销照常成功，但不得上报成「删了磁盘」
+    ///
+    /// 记录还在、目录已被人手工删掉是常见状态；此时既不能拒绝（记录才是要清理
+    /// 的东西），也不能报成删成功（用户会以为存档被删）。
+    #[test]
+    fn remove_purge_reports_not_deleted_when_dir_missing() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let reg = registry_with_ws(tmp.path());
+        let srv = reg
+            .create(
+                None,
+                "alpha",
+                &VersionId::new("1.21.1"),
+                ServerVariant::Vanilla,
+                None,
+            )
+            .expect("create");
+        std::fs::remove_dir_all(&srv.dir).expect("rmdir");
+
+        let out = reg
+            .remove("alpha", true, tmp.path())
+            .expect("record must still be cleared");
+        assert!(!out.disk_purged(), "没有可删的对象时必须是 false");
+        assert!(reg.get("alpha").is_err(), "登记必须清理");
+    }
+
+    /// 调用方工作目录在待删目录内时拒绝：与 `workspace remove --purge` 同一判定
+    #[test]
+    fn remove_purge_rejects_cwd_inside_server_dir() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let reg = registry_with_ws(tmp.path());
+        let srv = reg
+            .create(
+                None,
+                "alpha",
+                &VersionId::new("1.21.1"),
+                ServerVariant::Vanilla,
+                None,
+            )
+            .expect("create");
+
+        let err = reg
+            .remove("alpha", true, &srv.dir)
+            .expect_err("must reject");
+        assert!(
+            matches!(
+                err,
+                ServerRegistryError::Workspace(WorkspaceError::CwdInsideTarget { .. })
+            ),
+            "{err:?}"
+        );
+        assert!(srv.dir.join("mcsup.json").is_file(), "目录不能被删");
         assert!(reg.get("alpha").is_ok(), "记录必须保留");
     }
 
@@ -1362,7 +1459,7 @@ mod tests {
         std::fs::write(external.join("keep.txt"), "data").expect("file");
         reg.link(&external, Some("ext"), None).expect("link");
 
-        reg.remove("ext", false).expect("remove");
+        reg.remove("ext", false, tmp.path()).expect("remove");
 
         assert!(reg.get("ext").is_err());
         assert!(external.join("keep.txt").is_file());
