@@ -55,6 +55,12 @@ impl LifecycleError {
 `#[non_exhaustive]` 的枚举在下游 `match` 必须带兜底分支；兜底不得静默丢弃，
 至少沿用英文措辞。
 
+## 进程级状态
+
+界面相关的一次性设置（如界面语言）可以放进程级状态，但必须同时满足：
+存在无法绕过的外部约束、写入点唯一且在启动早期完成、只影响界面表现。
+规则见 `docs/code-design.md` 的「进程级状态」一节。
+
 # 日志
 
 统一用 `tracing` / `tracing-subscriber`，支持结构化日志，至少区分 Application

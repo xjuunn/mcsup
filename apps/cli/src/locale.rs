@@ -131,8 +131,15 @@ pub(crate) fn detect(choice: LangChoice) -> Lang {
 /// 进程级界面语言
 ///
 /// clap 的 `about` / `help` 参数在 `Cli::command()` 构建命令树时求值，那条路径
-/// 拿不到 `Cli`，只能从进程状态读。写入只发生在启动时一次，之后全是读，
-/// 不存在并发改写；测试里也用它切换断言语言。
+/// 拿不到 `Cli`，只能从进程状态读。写入只发生在启动时一次（`help::parse` 在
+/// `try_parse` 之前），之后全是读，不存在并发改写；测试里也用它切换断言语言。
+///
+/// 这是「进程级状态」的唯一合规实例，判据见 `docs/code-design.md`：外部约束
+/// 不可绕过、写入点唯一、只影响界面表现、不参与业务判定。不要据此新增第二处
+/// 可变全局。
+///
+/// 用 `RwLock` 而非 `OnceLock<Lang>` 是为了让测试能来回切换；生产路径只有
+/// 一次写。
 static CURRENT: std::sync::OnceLock<std::sync::RwLock<Lang>> = std::sync::OnceLock::new();
 
 fn cell() -> &'static std::sync::RwLock<Lang> {
