@@ -204,7 +204,7 @@ pub(crate) async fn create(
         .with_context(|| format!("创建服务器 {name} 失败"))?;
 
     // 7. 下载核心：失败保留已注册结果，提示用 install 重试
-    if let Err(err) = download_jar(&name, &version_id, source, printer).await {
+    if let Err(err) = download_jar(&name, &version_id, source, variant, printer).await {
         printer.print_warning(&crate::i18n::pick(
             printer.lang(),
             format!("服务器已创建但核心下载失败，可执行 mcsup server install {name} 重试"),

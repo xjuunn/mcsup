@@ -133,8 +133,8 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | 子命令 | 用法 | 说明 |
 | --- | --- | --- |
 | `list` | `mcsup server list` | 列出所有服务与状态 |
-| `create` | `mcsup server create [<name>] [--version <ver>] [--variant <v>] [--workspace <ws>]` | 建站并下载核心 JAR（变体从可用能力列选，缺省 vanilla；版本交互从列表选，也接受 `latest` / `latest-snapshot` 别名）。TTY 缺名/缺版本进向导（名称重输直到唯一，步骤回显 `[n/3]`，参数给定则跳过对应步）；无工作区且可交互时先复用 `workspace init` 向导再继续；非 TTY 缺 `--version` 或缺名 → 退出码 2；显式变体未知/未支持 → 2 并列出可用变体；下载失败保留已注册结果，提示 `mcsup server install <name>` 重试 |
-| `install` | `mcsup server install <name> [--version <ver>]` | 给既有服务安装/更换服务端核心（JAR），校验后落盘；交互无 `--version` 从版本列表选择（Release/Snapshot/旧版标注），非 TTY 缺省 `latest` 解析为 manifest 当前稳定版；服务器不存在 → 退出码 3 |
+| `create` | `mcsup server create [<name>] [--version <ver>] [--variant <v>] [--workspace <ws>]` | 建站并下载核心 JAR（变体从可用能力列选，缺省 vanilla；版本交互从列表选，也接受 `latest` / `latest-snapshot` 别名）。TTY 缺名/缺版本进向导（名称重输直到唯一，步骤回显 `[n/3]`，参数给定则跳过对应步）；无工作区且可交互时先复用 `workspace init` 向导再继续；非 TTY 缺 `--version` 或缺名 → 退出码 2；显式变体未知/未支持 → 2 并列出可用变体；下载失败保留已注册结果，提示 `mcsup server install <name>` 重试。`--variant forge` 走「下载安装器 + 运行 `--installServer`」两步；`neoforge` 同理 |
+| `install` | `mcsup server install <name> [--version <ver>]` | 给既有服务安装/更换服务端核心（JAR），校验后落盘；交互无 `--version` 从版本列表选择（Release/Snapshot/旧版标注），非 TTY 缺省 `latest` 解析为 manifest 当前稳定版；服务器不存在 → 退出码 3。变体为 `forge` / `neoforge` 时要先运行安装器，缺可用 Java → 退出码 3 并提示先装 Java |
 | `start` | `mcsup server start <name> [--accept-eula]` | 经后台 supervisor 拉起 JVM（`server set java-version` 绑定了大版本则用该版本，否则取已注册 Java 最高大版本；核心 JAR 取已安装项；堆上限 `server set ram` 优先、缺省 2048 MiB），返回 supervisor PID；EULA 未同意时 TTY 询问，非交互缺 `--accept-eula` → 退出码 2；已在运行 → 4；无核心 / 无 Java / 绑定大版本无运行时 → 3；spawn / IPC 失败 → 5 |
 | `stop` | `mcsup server stop <name> [--grace <sec>] [--force]` | 先优雅停机（默认宽限 30s），宽限后 `--force` 强杀；未在运行幂等成功（exit 0）；超时未 `--force` → 退出码 1 并提示 `--force` |
 | `restart` | `mcsup server restart <name> [--accept-eula] [--grace <sec>] [--force]` | 先停后启：停机规格与 EULA 同 start / stop，停机超时中止不拉起 |
@@ -152,7 +152,7 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 
 | 子命令 | 用法 | 说明 |
 | --- | --- | --- |
-| `__supervise` | `mcsup __supervise --dir <path> --java <path> --jar <path> [--ram <mib>]` | `server start` 拉起的 supervisor 进程本体：托管 JVM、写 `console.log`、经本地 socket 提供状态 / 停机 / 注入 IPC；不在 `--help` 出现，退出码 0 正常停机 / 1 异常 |
+| `__supervise` | `mcsup __supervise --dir <path> --java <path> --jar <path> [--ram <mib>] [--arg-file <path> ...]` | `server start` 拉起的 supervisor 进程本体：托管 JVM、写 `console.log`、经本地 socket 提供状态 / 停机 / 注入 IPC；不在 `--help` 出现，退出码 0 正常停机 / 1 异常。`--jar` 与重复的 `--arg-file` 二选一：前者是单一核心 JAR，后者是参数文件启动（Forge 安装器产出的 `user_jvm_args.txt` + 平台 `*_args.txt`） |
 
 ### server set（服务属性）
 

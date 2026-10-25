@@ -197,6 +197,32 @@ pub(crate) async fn get_text(
     response.text().await.map_err(map_transport)
 }
 
+/// 用 `HEAD` 取资源大小（字节）
+///
+/// 部分上游只给哈希、不给大小（如 Forge 的 `.sha1` 侧车），而下载器需要大小
+/// 才能做长度校验与进度。取不到时返回 `None`——调用方应把大小当作「未声明」，
+/// 而不是当成 0 做严格比对。
+///
+/// # Errors
+///
+/// 网络失败或非成功状态码时返回 [`SourceError`]；仅在「服务器不返回
+/// `Content-Length`」时返回 `Ok(None)`
+pub(crate) async fn head_size(client: &Client, url: &str) -> Result<Option<u64>, SourceError> {
+    let response = client.head(url).send().await.map_err(map_transport)?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(SourceError::Status {
+            status: status.as_u16(),
+        });
+    }
+    Ok(response
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|size| *size > 0))
+}
+
 #[async_trait]
 impl RangeSource for HttpByteSource {
     async fn stat(&self, location: &Url) -> Result<RemoteStat, SourceError> {

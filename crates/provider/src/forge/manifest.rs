@@ -61,13 +61,20 @@ pub(crate) struct ForgeBuild<'a> {
 }
 
 impl ForgeBuild<'_> {
-    /// 是否为合法 build 串：必须含 `-` 且两侧非空
+    /// 是否为合法 build 串（会被拼进 URL 与文件名，必须严查）
+    ///
+    /// 形如 `{mc}-{forge}`，两段都只允许 ASCII 数字、字母与 `.` `_` `+`。
+    /// 这段字符串最终进入 `maven_dir()` / `installer_file()` 拼 URL 与本地路径，
+    /// 只挡 `-` 是不够的：`1.21.1-../../evil` 能一路穿到 URL 与文件系统。
     #[must_use]
     pub(crate) fn is_valid(&self) -> bool {
-        match self.full.split_once('-') {
-            Some((mc, forge)) => !mc.is_empty() && !forge.is_empty(),
-            None => false,
-        }
+        let Some((mc, forge)) = self.full.split_once('-') else {
+            return false;
+        };
+        !mc.is_empty()
+            && !forge.is_empty()
+            && mc.chars().all(is_safe_build_char)
+            && forge.chars().all(is_safe_build_char)
     }
 
     /// Maven 相对路径：`net/minecraftforge/forge/{full}`
@@ -81,6 +88,14 @@ impl ForgeBuild<'_> {
     pub(crate) fn installer_file(&self) -> String {
         format!("forge-{}-installer.jar", self.full)
     }
+}
+
+/// build 串里允许出现的字符
+///
+/// 覆盖真实版本号用到的字符（`1.21.1`、`52.0.1`、`1.7.10-10.13.4.1614`），
+/// 同时把 `/` `\` `:` 与空白挡在外面。
+fn is_safe_build_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+')
 }
 
 #[cfg(test)]
@@ -129,6 +144,26 @@ mod tests {
         assert!(!ForgeBuild { full: "1.21.1" }.is_valid());
         assert!(!ForgeBuild { full: "-52.0.1" }.is_valid());
         assert!(!ForgeBuild { full: "1.21.1-" }.is_valid());
+    }
+
+    /// build 串会被拼进 URL 与文件名：路径分隔符与空白一律非法
+    #[test]
+    fn build_validity_rejects_path_injection() {
+        for bad in [
+            "1.21.1-../../evil",
+            "1.21.1-52.0.1/../..",
+            "../1.21.1-52.0.1",
+            "1.21.1-52 0.1",
+            "1.21.1-52.0.1\t",
+            "1.21.1-52\\0.1",
+            "1.21.1:52.0.1",
+        ] {
+            assert!(!ForgeBuild { full: bad }.is_valid(), "应拒绝 {bad}");
+        }
+        // 真实存在的各种形态仍然通过
+        for good in ["1.21.1-52.0.1", "1.7.10-10.13.4.1614", "1.16.5-36.2.39"] {
+            assert!(ForgeBuild { full: good }.is_valid(), "应接受 {good}");
+        }
     }
 
     #[test]
