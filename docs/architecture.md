@@ -217,6 +217,20 @@ Provider 回答「外部资源从哪里获得」，对接 Mojang、Fabric、Forg
 Paper、Purpur、Modrinth 等：HTTP API、下载、版本 / Mod / Modpack 查询、
 Artifact 获取。Provider 不承担核心业务流程。
 
+已实现：Vanilla（Mojang version manifest）、Fabric（meta API）、Forge
+（Maven `maven-metadata.json` + `promotions_slim.json`，下载 installer JAR 并校验
+`.sha1` 侧车）。
+
+Forge 的下载物是**安装器**而非服务端：Provider 以 `port::InstallKind::Installer`
+声明这一点，并给出安装器产出的参数文件启动规格（`domain::LaunchSpec::Args`）。
+真正运行 `--installServer` 由 `port::InstallerRunner` 承担，本机实现是
+`runtime::LocalInstallerRunner`，因此 `service` 不依赖 `runtime`。
+Forge 的 Maven 元数据不声明 Java 要求，`java_major` 由
+`domain::server::version::required_java_major` 按 MC 版本推出。
+
+第三方接入同一 Provider 时走 builder 注入 `maven_base` / `files_base` / `picks`，
+与 Fabric 的做法一致，不需要改 service。
+
 # Storage
 
 Storage 持久化元数据：Workspace、Server、配置、Backup / Snapshot 元数据、

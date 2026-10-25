@@ -75,6 +75,12 @@ pub enum InstallError {
     /// 安装了新核心，但无法确定其启动方式或参数文件不全
     #[error("installed server layout is incomplete: {0}")]
     Layout(String),
+    /// 该来源要先运行安装器，但本机没有可用的 Java 运行时
+    #[error(
+        "installing this server requires Java to run the installer, \
+         but no Java runtime was found; install one with `mcsup java install`"
+    )]
+    NoJavaForInstaller,
 }
 
 /// 安装成功的结果
@@ -176,18 +182,17 @@ impl ServerInstaller {
             if cancel.is_cancelled() {
                 return Err(port::DownloadError::Cancelled.into());
             }
-            let ctx = installer.ok_or_else(|| {
-                InstallError::Layout(
-                    "来源声明需要运行安装器，但调用方未提供 InstallerContext".to_owned(),
-                )
-            })?;
+            // 没拿到上下文几乎总是「本机没有可用 Java」——这句话要说人话，
+            // 用户看到的是「为什么装不成」，而不是内部装配缺了什么
+            let ctx = installer.ok_or(InstallError::NoJavaForInstaller)?;
             let dir = destination.parent().ok_or_else(|| {
                 InstallError::Layout(format!(
                     "安装器下载路径没有父目录：{}",
                     destination.display()
                 ))
             })?;
-            ctx.runner.run_installer(&ctx.java_bin, &destination, dir)?;
+            ctx.runner
+                .run_installer(&ctx.java_bin, &destination, dir, cancel)?;
         }
 
         status = status.transition(DownloadStatus::Ready)?;

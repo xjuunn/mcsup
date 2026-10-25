@@ -157,12 +157,12 @@ impl ForgeSource {
         self.get(&self.metadata_url(), None).await
     }
 
-    /// 把版本标识（含 `latest` / `latest-snapshot` 别名）解析为具体 MC 版本
+    /// 把版本标识（含 `latest` 别名）解析为具体 MC 版本
     ///
     /// 与 Fabric 不同，Forge 的 `maven-metadata.json` 没有 stable 标记：
-    /// Forge 只发布正式 MC 版本对应的 build，快照 MC 基本没有 Forge 支持。
-    /// 因此 `latest` 取列表中**排序最后**的 MC 版本（`BTreeMap` 字典序），
-    /// `latest-snapshot` 无法区分，退回同一口径并仍要求字面存在于列表里。
+    /// Forge 只发布正式 MC 版本对应的 build，快照 MC 没有 Forge 支持。
+    /// 因此 `latest` 取列表中**排序最后**的 MC 版本（`BTreeMap` 字典序）；
+    /// `latest-snapshot` 不参与解析，会被如实报成「该版本没有 Forge」。
     ///
     /// 上游对不存在的 MC 版本会回 404；这里先对列表做存在性检查，把
     /// 「版本不存在」如实报成 [`SourceError::NotFound`]。
@@ -173,8 +173,21 @@ impl ForgeSource {
     }
 
     /// 在某个 MC 版本下选出 build 串
+    ///
+    /// `Picks::Fixed` 只认「形如 `{mc}-{forge}` 且 `mc` 就是请求的版本」：
+    /// 注入串同样会被拼进 URL 与文件名，不能只信调用方。
     async fn pick_build(&self, mc: &str) -> Result<String, SourceError> {
         if let Picks::Fixed { build } = &self.picks {
+            let forge_build = ForgeBuild { full: build };
+            let consistent = forge_build.is_valid()
+                && build
+                    .split_once('-')
+                    .is_some_and(|(build_mc, _)| build_mc == mc);
+            if !consistent {
+                return Err(SourceError::Decode(Box::new(std::io::Error::other(
+                    format!("fixed forge build `{build}` does not belong to Minecraft `{mc}`"),
+                ))));
+            }
             return Ok(build.clone());
         }
         let metadata = self.metadata().await?;
@@ -232,15 +245,23 @@ impl ServerJarSource for ForgeSource {
         }
         let location = parse_https_url(&self.installer_url(&forge_build))?;
         let checksum = self.fetch_checksum(&forge_build).await?;
+        // 大小：`.sha1` 侧车不含大小，单独发 HEAD 取。取不到就按「未声明」
+        // 处理（`size = 0`），下载器会跳过长度校验而不是判定失败
+        let size = crate::http::head_size(&self.http, location.as_str())
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        // Forge 的元数据不声明 Java 要求，按 MC 版本推算，避免启动时挑错 JVM
+        let java_major = domain::server::version::required_java_major(mc.as_str());
         Ok(ResolvedArtifact {
             artifact: domain::server::artifact::JarArtifact {
                 version: version.clone(),
-                // 大小由 HEAD 获得；此处只保证哈希正确，大小留给下载结果覆盖
-                size: 0,
+                size,
                 checksum,
             },
             location,
-            java_major: None,
+            java_major,
             install: port::InstallKind::Installer,
         })
     }
@@ -248,11 +269,15 @@ impl ServerJarSource for ForgeSource {
 
 /// 把版本标识解析为列表里的具体 MC 版本
 ///
-/// - `latest` / `latest-snapshot`：取 `BTreeMap` 排序最后的 MC 版本（最新）
+/// - `latest`：取 `BTreeMap` 排序最后的 MC 版本（最新正式版）
 /// - 字面版本：必须出现在列表里，否则 `None`（上层报 `NotFound`）
+///
+/// `latest-snapshot` 刻意**不**等同于 `latest`：Forge 只为正式版发布 build，
+/// 快照版没有对应产物。把两者混同会让用户以为在跑快照版，实际拿到正式版；
+/// 这里返回 `None`，由上层如实报「该版本没有 Forge」。
 fn resolve_mc_id(raw: &str, metadata: &MavenMetadata) -> Option<String> {
     match raw {
-        "latest" | "latest-snapshot" => latest_mc(metadata),
+        "latest" => latest_mc(metadata),
         other => metadata.contains_key(other).then(|| other.to_owned()),
     }
 }
@@ -460,6 +485,13 @@ mod tests {
         let meta = metadata();
         assert_eq!(resolve_mc_id("1.21.1", &meta).as_deref(), Some("1.21.1"));
         assert_eq!(resolve_mc_id("1.99.999", &meta), None);
+    }
+
+    /// `latest-snapshot` 不映射到 `latest`：Forge 没有快照版产物
+    #[test]
+    fn latest_snapshot_is_not_aliased_to_latest() {
+        let meta = metadata();
+        assert_eq!(resolve_mc_id("latest-snapshot", &meta), None);
     }
 
     /// 选中推荐 build：推荐值须存在于该 MC 列表

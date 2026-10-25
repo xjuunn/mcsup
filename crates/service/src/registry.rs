@@ -747,17 +747,18 @@ impl ServerRegistry {
     ) -> Result<Option<InstalledServerJar>, InstallJarError> {
         let installer_path = dir.join(STAGING_INSTALLER);
         let _ = std::fs::remove_file(&installer_path);
+        // 无论成功失败都清掉安装器 JAR：它不是服务端的一部分，留在目录里会
+        // 污染备份，也会让下次安装误以为「已经下过」。失败路径同样要清——
+        // 否则一次网络中断就在服务器目录留下一个 9MB 的死文件。
         let out = installer
             .install(version, installer_path.clone(), Some(ctx), progress, cancel)
-            .await?;
+            .await;
+        let _ = std::fs::remove_file(&installer_path);
+        let out = out?;
         if out.install != port::InstallKind::Installer {
-            // 不是安装器：清掉临时下载，交回调用方走直接路径
-            let _ = std::fs::remove_file(&installer_path);
+            // 不是安装器：临时下载已清，交回调用方走直接路径
             return Ok(None);
         }
-
-        // 运行完删除安装器：它不是服务端的一部分，留着会污染目录与备份
-        let _ = std::fs::remove_file(&installer_path);
 
         let files = forge_args_files(version.as_str(), dir);
         if files.is_empty() {
@@ -800,6 +801,9 @@ impl ServerRegistry {
 /// `unix_args.txt`。只返回磁盘上**确实存在**的那些，缺第一个（用户参数文件）
 /// 视为安装失败。平台参数文件路径由 `libraries/net/minecraftforge/forge/{build}`
 /// 推出；不存在时再扫一遍 `libraries` 兜底，容忍上游路径变化。
+///
+/// 兜底**只认文件名里带本 build 的**：一个目录里可能同时存在多个 Forge 版本的
+/// `win_args.txt`（升级后旧版本目录不会自动清理），随便取第一个会拉起到旧版本。
 fn forge_args_files(build: &str, dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     if !dir.join(FORGE_USER_ARGS).is_file() {
@@ -822,17 +826,19 @@ fn forge_args_files(build: &str, dir: &Path) -> Vec<PathBuf> {
         )));
         return files;
     }
-    // 兜底：在 libraries 下找任意 *args.txt（上游可能改版本目录命名）
-    if let Some(rel) = find_args_file(&dir.join("libraries"), platform) {
+    // 兜底：上游若改了版本目录命名，仍要求所在目录就是本 build
+    if let Some(rel) = find_args_file(&dir.join("libraries"), platform, build) {
         files.push(rel);
     }
     files
 }
 
-/// 在 `root` 下递归找首个名为 `name` 的文件，返回相对 `root` 上一级（即服务器
-/// 目录）的路径；找不到返回 `None`。深度受限，避免扫遍整个 libraries。
-fn find_args_file(root: &Path, name: &str) -> Option<PathBuf> {
-    fn walk(dir: &Path, name: &str, depth: usize) -> Option<PathBuf> {
+/// 在 `root` 下递归找本 build 的平台参数文件，返回相对服务器目录的路径。
+///
+/// 命中条件是「文件名匹配 **且** 所在目录名等于 `build`」——宁可找不到（由上层
+/// 报 Layout 错误）也不要拉起到另一个版本。深度受限，避免扫遍整个 libraries。
+fn find_args_file(root: &Path, name: &str, build: &str) -> Option<PathBuf> {
+    fn walk(dir: &Path, name: &str, build: &str, depth: usize) -> Option<PathBuf> {
         if depth == 0 {
             return None;
         }
@@ -840,16 +846,22 @@ fn find_args_file(root: &Path, name: &str) -> Option<PathBuf> {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                if let Some(found) = walk(&path, name, depth - 1) {
+                if let Some(found) = walk(&path, name, build, depth - 1) {
                     return Some(found);
                 }
-            } else if path.file_name().and_then(|n| n.to_str()) == Some(name) {
+            } else if path.file_name().and_then(|n| n.to_str()) == Some(name)
+                && path
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    == Some(build)
+            {
                 return Some(path);
             }
         }
         None
     }
-    let found = walk(root, name, 8)?;
+    let found = walk(root, name, build, 8)?;
     // 转成相对服务器目录：root 是 `{dir}/libraries`，取其父
     let server_dir = root.parent()?;
     found.strip_prefix(server_dir).ok().map(PathBuf::from)
