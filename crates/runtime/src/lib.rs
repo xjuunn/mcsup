@@ -21,7 +21,7 @@ mod local;
 mod process;
 mod supervisor;
 
-pub use installer::{LocalInstallerRunner, args_files_for};
+pub use installer::LocalInstallerRunner;
 pub use launch::MinecraftLaunch;
 pub use local::LocalSupervisor;
 pub use supervisor::run_supervisor;

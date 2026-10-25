@@ -67,12 +67,6 @@ impl LocalInstallerRunner {
             timeout: DEFAULT_INSTALLER_TIMEOUT,
         }
     }
-
-    /// 指定超时（测试与极端慢速网络用）
-    #[must_use]
-    pub fn with_timeout(timeout: Duration) -> Self {
-        Self { timeout }
-    }
 }
 
 impl InstallerRunner for LocalInstallerRunner {
@@ -349,20 +343,6 @@ fn launch_entry(content: &str, origin: &Path) -> Option<PathBuf> {
     })
 }
 
-/// 安装器产出的参数文件相对路径（供启动使用）
-#[must_use]
-pub fn args_files_for(build: &str) -> Vec<PathBuf> {
-    let platform_args = if cfg!(windows) {
-        format!("libraries/net/minecraftforge/forge/{build}/win_args.txt")
-    } else {
-        format!("libraries/net/minecraftforge/forge/{build}/unix_args.txt")
-    };
-    vec![
-        PathBuf::from("user_jvm_args.txt"),
-        PathBuf::from(platform_args),
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,14 +423,6 @@ mod tests {
         );
         std::fs::write(nested.join("forge-26.3-66.1.0-shim.jar"), b"jar").expect("write");
         assert!(has_expected_marker(dir.path()));
-    }
-
-    #[test]
-    fn args_files_order_user_before_platform() {
-        let files = args_files_for("1.21.1-52.0.1");
-        assert_eq!(files[0], PathBuf::from("user_jvm_args.txt"));
-        assert!(files[1].to_string_lossy().contains("1.21.1-52.0.1"));
-        assert!(files[1].to_string_lossy().contains("_args.txt"));
     }
 
     /// 取消已置位的令牌：不拉起进程直接报 Cancelled
