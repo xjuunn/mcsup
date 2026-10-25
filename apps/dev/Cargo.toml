@@ -1,0 +1,35 @@
+[package]
+name = "dev"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "mcsup-dev-tools"
+path = "src/main.rs"
+doc = false
+
+[dependencies]
+anyhow = "1.0.104"
+rmcp = { version = "3.7.0", default-features = false, features = ["macros", "server", "transport-io"] }
+schemars = "1.2.3"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", "time"] }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+# Windows 通知直接调用 WinRT Toast API，不启动 PowerShell。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Foundation",
+    "Data_Xml_Dom",
+    "UI_Notifications",
+    "UI_Notifications_Management",
+] }
+
+[lints]
+workspace = true
