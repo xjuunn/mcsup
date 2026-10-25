@@ -125,8 +125,6 @@ pub(crate) fn server_info() -> ServerConfig {
              - 提交前用 get_diff 自查改动。\n\
              - 需要用户确认时用 wait_for_user，它会阻塞到用户回复或超时。\n\
              - 任务结束用 send_notification 通知用户，title 写功能名，body 写为什么通知。\n\
-             - send_notification 必须是最后一个动作：用户被通知吸引回来时 agent 应已停止。\n\
-               发送前把所有工作做完；发了之后再做事，就再发一次说明最新状态。\n\
              - 路径参数一律相对工程根，不要传客户端 cwd 下的相对路径。",
         )
 }
