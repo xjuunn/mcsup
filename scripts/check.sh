@@ -12,6 +12,11 @@ set -eu
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 
+# 所有 worktree 共用一份构建缓存：冷缓存下整棵依赖树要编数分钟，而每个 worktree
+# 各编一遍纯属重复。目录定位见脚本内注释。已显式设置 CARGO_TARGET_DIR 时不动。
+. ./scripts/dev-tools-env.sh
+mcsup_use_shared_target
+
 # 选定要跑的步骤：无参数即全部。
 requested=''
 if [ "$#" -gt 0 ]; then
