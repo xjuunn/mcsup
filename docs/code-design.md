@@ -43,3 +43,18 @@ Provider、Storage、Backend、FileStore。
 目标平台是 Windows、macOS、Linux，尤其关注 Path、Process、Permission、Signal、
 Shell、Java、Filesystem、Terminal。禁止默认假设 Unix / Linux / bash / systemd；
 Windows 必须是一等公民。
+
+## 平台专属代码
+
+条件编译的代码只在目标平台编译，因此本机能过不代表 CI 能过：
+
+- 一个类型 / 常量 / 函数只在某个平台的分支里被构造或调用时，其他平台的
+  `dead_code` 会把它们当垃圾。用 `#[cfg_attr(<其他平台>, allow(dead_code, reason = "..."))]`
+  显式标注，不要改成 `#[allow(dead_code)]`——那会在真正产生无用代码时也闭嘴。
+- 被 `cfg` 分走的 `async fn` 若在某个平台没有 `await`，会触发
+  `clippy::unused_async`。给每个平台写各自的函数体，不要在一个函数里用
+  `cfg` 块拼分支。
+- `cfg` 分支里的返回值形状必须一致：一侧 `async`、一侧同步时，调用点无法
+  用同一份代码同时等待，最终只能两边都写成 `async`。
+- 本地编译不到的分支（macOS / Linux 文件）改完后，在 CI 或交叉编译前不要
+  假定通过；至少逐行核对被调函数的签名与同步性。

@@ -59,7 +59,10 @@ fn stderr(out: &Output) -> String {
 #[test]
 fn create_without_name_exits_2() {
     let home = temp_home();
-    let out = run(home.path(), &["server", "create", "--output", "json"]);
+    let out = run(
+        home.path(),
+        &["server", "create", "--output", "json", "--lang", "zh"],
+    );
     assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
     assert!(out.stdout.is_empty(), "用法错误不得输出数据");
     assert!(stderr(&out).contains("缺少服务器名称"), "{}", stderr(&out));
@@ -94,6 +97,8 @@ fn create_unsupported_variant_exits_2_and_lists_available() {
             "paper",
             "--output",
             "json",
+            "--lang",
+            "zh",
         ],
     );
     assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
@@ -119,6 +124,8 @@ fn create_unknown_variant_exits_2() {
             "paperx",
             "--output",
             "json",
+            "--lang",
+            "zh",
         ],
     );
     assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
@@ -130,7 +137,10 @@ fn create_unknown_variant_exits_2() {
 #[test]
 fn workspace_use_without_name_exits_2() {
     let home = temp_home();
-    let out = run(home.path(), &["workspace", "use", "--output", "json"]);
+    let out = run(
+        home.path(),
+        &["workspace", "use", "--output", "json", "--lang", "zh"],
+    );
     assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
     assert!(out.stdout.is_empty());
     assert!(stderr(&out).contains("工作区名称"), "{}", stderr(&out));
@@ -247,7 +257,16 @@ fn workspace_doctor_unknown_only_exits_2() {
     let home = temp_home();
     let out = run(
         home.path(),
-        &["workspace", "doctor", "--only", "nope", "--output", "json"],
+        &[
+            "workspace",
+            "doctor",
+            "--only",
+            "nope",
+            "--output",
+            "json",
+            "--lang",
+            "zh",
+        ],
     );
     assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
     assert!(out.stdout.is_empty(), "用法错误不得输出数据");
@@ -689,7 +708,7 @@ fn config_set_show_unset_roundtrip() {
 #[test]
 fn config_set_unknown_key_exits_2() {
     let home = temp_home();
-    let out = run(home.path(), &["config", "set", "nope", "1"]);
+    let out = run(home.path(), &["config", "set", "nope", "1", "--lang", "zh"]);
     assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
     assert!(out.stdout.is_empty(), "用法错误不得输出数据");
     let err = stderr(&out);
@@ -705,7 +724,16 @@ fn config_set_invalid_value_exits_2_and_writes_nothing() {
     let config = config.to_str().expect("utf8");
     let out = run(
         home.path(),
-        &["--config", config, "config", "set", "java-source", "nope"],
+        &[
+            "--config",
+            config,
+            "config",
+            "set",
+            "java-source",
+            "nope",
+            "--lang",
+            "zh",
+        ],
     );
     assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
     let err = stderr(&out);
@@ -717,7 +745,7 @@ fn config_set_invalid_value_exits_2_and_writes_nothing() {
 #[test]
 fn config_edit_without_tty_exits_2() {
     let home = temp_home();
-    let out = run(home.path(), &["config", "edit"]);
+    let out = run(home.path(), &["config", "edit", "--lang", "zh"]);
     assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
     assert!(out.stdout.is_empty(), "用法错误不得输出数据");
     assert!(stderr(&out).contains("交互终端"), "{}", stderr(&out));
