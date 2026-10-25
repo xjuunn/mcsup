@@ -122,6 +122,9 @@ mcsup workspace init [--dir <path>] [--name <name>]
   改不了父进程的工作目录，真删掉会让调用方终端停在已不存在的路径上，之后
   任何子进程都拿不到工作目录，表现为命令静默不执行。用户 cd 出去后重试即可。
   判定在 service（`workspace::ensure_outside`），入口只传 `current_dir()`。
+  交互入口在弹「删除磁盘数据?」之前先调 `WorkspaceService::ensure_purgeable`
+  （服务器侧 `LifecycleService::ensure_server_purgeable`），删盘条件与
+  `remove` 同源，不满足时立刻报错，不让用户先答完确认框与名称才被拒。
 - 删除结果必须如实区分「请求了删盘」与「磁盘真的删了」：`remove` 返回
   `RemoveOutcome.disk_purged`，JSON 同时带 `purged` 与 `disk_purged`。目录
   本就不存在时注销照常成功，但 `disk_purged=false`，人类输出报「磁盘数据本就

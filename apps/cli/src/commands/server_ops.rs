@@ -436,12 +436,16 @@ pub(crate) fn remove(name: &str, purge: bool, printer: Printer) -> Result<()> {
     let purge = if purge || !printer.is_interactive() {
         purge
     } else {
+        // 普通注销不删目录，先问「是否连磁盘数据一起删」；回答是后再按删盘的前置校验
+        // 拦一次（与 --purge 同一道闸），用户此时尚未确认名称
         let confirmed = prompts::confirm_yes(
             &format!("删除 {name} ({}) 的磁盘数据?", srv.dir.display()),
             false,
         )
         .context("已取消注销")?;
         if confirmed {
+            let cwd = std::env::current_dir().context("获取当前工作目录失败")?;
+            super::lifecycle::lifecycle_service()?.ensure_server_purgeable(name, &cwd)?;
             // 同意删盘后再上一道闸：红色警示 + 手输服务器名称，防误删存档与备份
             printer.print_warning(&format!(
                 "警告: 将永久删除 {name} ({}) 中的所有存档、备份等文件，此操作无法恢复",
@@ -451,13 +455,19 @@ pub(crate) fn remove(name: &str, purge: bool, printer: Printer) -> Result<()> {
         }
         confirmed
     };
-    // 链接服务器不会真删目录，不必退出来
-    if purge && !srv.linked {
-        super::chdir_out_of(&srv.dir);
+    // 终端的工作目录：service 据此拒绝「删掉调用方所在目录」
+    let cwd = std::env::current_dir().context("获取当前工作目录失败")?;
+    if purge {
+        // 删盘前置条件先过一次：`--purge` 是显式指令，条件不满足直接报错，
+        // 不必等 service 在删除那一刻才拒
+        super::lifecycle::lifecycle_service()?.ensure_server_purgeable(name, &cwd)?;
+        // 链接服务器不会真删目录，不必退出来
+        if !srv.linked {
+            super::chdir_out_of(&srv.dir);
+        }
     }
     // 删除经 lifecycle 编排：运行中拒绝（存档保护）、cwd 在目录内拒绝，
     // 判定收敛在 service
-    let cwd = std::env::current_dir().context("获取当前工作目录失败")?;
     let out = super::lifecycle::lifecycle_service()?.remove_server(name, purge, &cwd)?;
     let srv = &out.server;
     let disk_purged = out.disk_purged();

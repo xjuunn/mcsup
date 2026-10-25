@@ -507,24 +507,12 @@ impl ServerRegistry {
             // 链接不是目录：删掉的是链接本身，目标目录仍在磁盘上
             std::fs::remove_file(&srv.dir).map_err(|err| ServerRegistryError::io(&srv.dir, err))?;
         } else if purge {
-            crate::workspace::ensure_outside(cwd, &srv.dir)?;
-            // 目录本就不存在：没有可删的对象，注销登记即可（幂等）。
-            // 不能报成删成功，也不能因此拒绝——记录才是要清理的东西
+            // 前置闸：目录本就不存在时放行（没有可删的对象，注销登记即可，幂等）。
+            // 不能报成删成功，也不能因此拒绝——记录才是要清理的东西。
+            // 目录由 `ws.path/servers/<rel_dir>` 拼出，记录被手改后可能指向工作区
+            // 外，删除前必须拿到文件系统证据（`mcsup.json` 与该记录同 id）。
+            self.ensure_purgeable(name, cwd)?;
             if srv.dir.exists() {
-                // 目录由 `ws.path/servers/<rel_dir>` 拼出，记录被手改后可能指向
-                // 工作区外。删除前必须拿到文件系统证据：目录里的 mcsup.json 与该
-                // 记录同 id。「宁可拒绝、让用户确认」优先于「猜一个目录删掉」。
-                if !server_dir_matches(&srv.dir, &srv.meta.id) {
-                    return Err(ServerRegistryError::Fs(FsError::marker(
-                        srv.dir.clone(),
-                        format!(
-                            "refusing to purge: {} does not hold a {SERVER_MARKER} \
-                             belonging to server {}; fix the record or delete it manually",
-                            srv.dir.display(),
-                            srv.meta.name.as_str()
-                        ),
-                    )));
-                }
                 std::fs::remove_dir_all(&srv.dir)
                     .map_err(|err| ServerRegistryError::io(&srv.dir, deletion_hint(err)))?;
                 disk_purged = true;
@@ -536,6 +524,47 @@ impl ServerRegistry {
             server: srv,
             disk_purged,
         })
+    }
+
+    /// 删盘前的前置校验：该服务器现在能否执行 `remove` 的删盘部分
+    ///
+    /// 只做判定、不改任何状态，供入口在弹「删除磁盘数据?」之前调用：交互入口
+    /// 先问再拒，用户会在确认框与手输名称之后才看到拒绝原因，白走一遍。
+    /// 判定与 [`ServerRegistry::remove`] 的删盘分支一致：
+    ///
+    /// - 链接服务器带 `purge` → 拒绝（目标在工作区外）
+    /// - 目录不存在 → 放行（`remove` 此时只清登记）
+    /// - `cwd` 在目录内 → [`WorkspaceError::CwdInsideTarget`]
+    /// - 目录里的 `mcsup.json` 不属于该记录 → 拒绝
+    ///
+    /// # Errors
+    ///
+    /// 不存在，或上述任一条件不满足时返回 [`ServerRegistryError`]
+    pub fn ensure_purgeable(&self, name: &str, cwd: &Path) -> Result<(), ServerRegistryError> {
+        let srv = self.get(name)?;
+        if srv.linked {
+            return Err(ServerRegistryError::Fs(FsError::marker(
+                srv.dir.clone(),
+                "refusing to purge a linked server; delete the target manually \
+                 and run `server remove` without --purge",
+            )));
+        }
+        if !srv.dir.exists() {
+            return Ok(());
+        }
+        crate::workspace::ensure_outside(cwd, &srv.dir)?;
+        if !server_dir_matches(&srv.dir, &srv.meta.id) {
+            return Err(ServerRegistryError::Fs(FsError::marker(
+                srv.dir.clone(),
+                format!(
+                    "refusing to purge: {} does not hold a {SERVER_MARKER} \
+                     belonging to server {}; fix the record or delete it manually",
+                    srv.dir.display(),
+                    srv.meta.name.as_str()
+                ),
+            )));
+        }
+        Ok(())
     }
 
     /// 全部服务器，按名称升序，附绝对目录
@@ -1731,6 +1760,46 @@ mod tests {
         );
         assert!(srv.dir.join("mcsup.json").is_file(), "目录不能被删");
         assert!(reg.get("alpha").is_ok(), "记录必须保留");
+    }
+
+    /// 链接服务器带 `purge` 时前置校验就拒绝：与 `remove` 同一判定
+    #[cfg(unix)]
+    #[test]
+    fn ensure_purgeable_rejects_linked_server() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let reg = registry_with_ws(tmp.path());
+        let external = tmp.path().join("external");
+        std::fs::create_dir_all(&external).expect("mkdir");
+        let out = reg.link(&external, Some("ext"), None).expect("link");
+        assert!(out.server.linked);
+
+        assert!(reg.ensure_purgeable("ext", tmp.path()).is_err());
+        assert!(reg.get("ext").is_ok(), "记录必须保留");
+        assert!(external.is_dir(), "目标目录不能被删");
+    }
+
+    /// 删盘前置校验：cwd 在服务器目录内时拒绝，且不改任何状态
+    ///
+    /// 入口靠它把拒绝提前到确认框之前，因此拒绝时必须什么都不动。
+    #[test]
+    fn ensure_purgeable_rejects_cwd_inside_server_dir() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let reg = registry_with_ws(tmp.path());
+        let srv = reg
+            .create(
+                None,
+                "alpha",
+                &VersionId::new("1.21.1"),
+                ServerVariant::Vanilla,
+                None,
+            )
+            .expect("create");
+
+        assert!(reg.ensure_purgeable("alpha", &srv.dir).is_err());
+        assert!(srv.dir.join("mcsup.json").is_file(), "目录不能被删");
+        assert!(reg.get("alpha").is_ok(), "记录必须保留");
+
+        reg.ensure_purgeable("alpha", tmp.path()).expect("放行");
     }
 
     #[cfg(unix)]
