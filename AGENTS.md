@@ -81,8 +81,34 @@ worktree 的建立与复用：
 - 当前 worktree 尚未提交 → 继续在其中做，不管这次的改动是不是新功能；
   一个 worktree 可以承载多次改动，提交一次即关闭。
 
-在主工作区看到自己的改动即为违规，立即停止并报告；不存在「改动小、先在这做」
-的例外。
+## 开工前必须执行的判定（不可跳过）
+
+改任何文件之前，先跑并读结果：
+
+```
+git rev-parse --show-toplevel
+git worktree list
+git status --short --branch
+```
+
+判定规则：`--show-toplevel` 的输出若等于 `git worktree list` 的**第一条**（主工作区），
+则当前就在主工作区上，**必须先 `git worktree add` 建出独立 worktree 再动手**。
+
+这不是建议而是硬性前置条件：判定的结果要写进回复里（例如「当前在 worktree
+`.../mcsup-xxx`，分支 `feat/xxx`」），没有这句就等于没判定。主工作区路径是
+`C:\Space\Projects\mcsup`，它永远不是可以开工的地方。
+
+以下说法一律不成立，出现即为违规：
+
+```
+「这次改动很小，先在主工作区做」        → 不存在大小例外
+「先把改动做出来，最后再挪去 worktree」  → 挪的过程已污染 master
+「没找到现成 worktree，先直接改」        → 没找到就新建，这是唯一动作
+「只改了文档 / 只改一行」              → 修改即写工作区，与行数无关
+```
+
+在主工作区看到自己的改动即为违规，**立即停止并如实报告**，不要试图用 `git
+stash` / `git checkout` 掩盖——如实说明哪几个文件被动了，由用户处置。
 
 完成后运行 `scripts/check.sh`，测试必须完全通过，然后提交。提交信息规范见
 `docs/development-workflow.md` 的「提交信息规范」。
