@@ -3,6 +3,7 @@ pub mod download;
 pub mod error;
 pub mod eula;
 pub mod event;
+pub mod launch;
 pub mod layout;
 pub mod meta;
 pub mod props;

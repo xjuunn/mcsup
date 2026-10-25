@@ -15,11 +15,13 @@ mod console_encoding_tests;
 #[cfg(test)]
 mod e2e_tests;
 mod endpoint;
+mod installer;
 mod launch;
 mod local;
 mod process;
 mod supervisor;
 
+pub use installer::{LocalInstallerRunner, args_files_for};
 pub use launch::MinecraftLaunch;
 pub use local::LocalSupervisor;
 pub use supervisor::run_supervisor;

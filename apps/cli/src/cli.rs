@@ -117,8 +117,12 @@ pub(crate) enum Command {
         dir: PathBuf,
         #[arg(long, value_name = "PATH", help = crate::meta::supervise_java_arg())]
         java: PathBuf,
+        /// 单 JAR 启动：核心 JAR 相对路径（与服务端目录拼绝对）
         #[arg(long, value_name = "PATH", help = crate::meta::supervise_jar_arg())]
-        jar: PathBuf,
+        jar: Option<PathBuf>,
+        /// 参数文件启动（Forge / NeoForge）：依次 `@` 展开的相对路径，可重复
+        #[arg(long = "arg-file", value_name = "PATH")]
+        arg_file: Vec<PathBuf>,
         #[arg(long, value_name = "MIB", help = crate::meta::supervise_ram_arg())]
         ram: Option<u32>,
     },

@@ -69,6 +69,12 @@ pub enum InstallError {
     /// 状态机流转出错
     #[error(transparent)]
     Status(#[from] InvalidTransition),
+    /// 安装器执行失败（`Forge` / `NeoForge`）
+    #[error(transparent)]
+    Installer(#[from] port::InstallerError),
+    /// 安装了新核心，但无法确定其启动方式或参数文件不全
+    #[error("installed server layout is incomplete: {0}")]
+    Layout(String),
 }
 
 /// 安装成功的结果
@@ -82,6 +88,28 @@ pub struct InstalledDownload {
     pub checksum: domain::server::artifact::Checksum,
     /// 该版本要求的 Java 大版本（版本详情 `javaVersion.majorVersion`）
     pub java_major: Option<domain::java::JavaMajor>,
+    /// 下载物是否为安装器（决定下载后是否运行它、以及最终启动方式）
+    pub install: port::InstallKind,
+}
+
+/// 安装器执行所需的运行环境
+///
+/// 由调用方（持有 `JavaService` 的 service 层）解析好 `java_bin` 后传入；
+/// `ServerInstaller` 自身不查 Java，保持「来源 + 下载 + 安装」的单一职责。
+#[derive(Clone)]
+pub struct InstallerContext {
+    /// 运行安装器的 `java` 可执行文件
+    pub java_bin: PathBuf,
+    /// 安装器执行器
+    pub runner: Arc<dyn port::InstallerRunner>,
+}
+
+impl std::fmt::Debug for InstallerContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InstallerContext")
+            .field("java_bin", &self.java_bin)
+            .finish_non_exhaustive()
+    }
 }
 
 /// 服务端安装编排
@@ -105,13 +133,20 @@ impl ServerInstaller {
 
     /// 解析选中版本并下载
     ///
+    /// 直接可运行的服务端（原版 / Fabric / Paper）下到 `destination` 即结束；
+    /// 安装器（Forge / NeoForge）先下到 `destination`，再由 `installer`
+    /// 就地安装成服务端目录。`installer` 仅在需要时读取：来源声明为
+    /// [`port::InstallKind::Direct`] 时传 `None` 即可。
+    ///
     /// # Errors
     ///
-    /// 版本不存在、来源不可达、下载/校验失败或任务被取消时返回 [`InstallError`]
+    /// 版本不存在、来源不可达、下载/校验失败、安装器执行失败或任务被取消时
+    /// 返回 [`InstallError`]
     pub async fn install(
         &self,
         version: &VersionId,
         destination: PathBuf,
+        installer: Option<&InstallerContext>,
         progress: Option<&dyn ProgressSink>,
         cancel: &CancellationToken,
     ) -> Result<InstalledDownload, InstallError> {
@@ -119,24 +154,49 @@ impl ServerInstaller {
         let resolved = self.source.artifact(version).await?;
         let checksum = resolved.artifact.checksum.clone();
         let java_major = resolved.java_major;
+        let install = resolved.install;
 
         // 上游未提供哈希 / 大小时不传校验条件：Fabric 等服务端 JAR 走 chunked
         // 且无 Content-Length，占位值参与比对必然失败，只能以「无校验」下载。
+        // 大小 `0` 表示来源未声明（如 Forge 只给了 SHA1 侧车）：0 字节不可能是
+        // 真实文件，按「未知」处理，不当作期望值参与比对。
         let unverified = !checksum.is_verified();
+        let known_size = resolved.artifact.size > 0;
         let request = DownloadRequest {
             location: resolved.location,
-            destination,
+            destination: destination.clone(),
             expected: (!unverified).then(|| checksum.clone()),
-            expected_size: (!unverified).then_some(resolved.artifact.size),
+            expected_size: (!unverified && known_size).then_some(resolved.artifact.size),
         };
         let artifact = self.downloader.download(&request, progress, cancel).await?;
         status = status.transition(DownloadStatus::Verifying)?;
+
+        // 安装器：下载物是安装器本身，就地运行它产出服务端目录
+        if install == port::InstallKind::Installer {
+            if cancel.is_cancelled() {
+                return Err(port::DownloadError::Cancelled.into());
+            }
+            let ctx = installer.ok_or_else(|| {
+                InstallError::Layout(
+                    "来源声明需要运行安装器，但调用方未提供 InstallerContext".to_owned(),
+                )
+            })?;
+            let dir = destination.parent().ok_or_else(|| {
+                InstallError::Layout(format!(
+                    "安装器下载路径没有父目录：{}",
+                    destination.display()
+                ))
+            })?;
+            ctx.runner.run_installer(&ctx.java_bin, &destination, dir)?;
+        }
+
         status = status.transition(DownloadStatus::Ready)?;
         Ok(InstalledDownload {
             status,
             artifact,
             checksum,
             java_major,
+            install,
         })
     }
 }
@@ -225,6 +285,7 @@ mod tests {
             },
             location: "https://example.invalid/server.jar".parse()?,
             java_major: None,
+            install: port::InstallKind::Direct,
         })
     }
 
@@ -248,6 +309,7 @@ mod tests {
             .install(
                 &VersionId::new("1.21.1"),
                 PathBuf::from("/tmp/server.jar"),
+                None,
                 None,
                 &CancellationToken::new(),
             )
@@ -279,6 +341,7 @@ mod tests {
                 &VersionId::new("1.21.1"),
                 PathBuf::from("/tmp/server.jar"),
                 None,
+                None,
                 &CancellationToken::new(),
             )
             .await;
@@ -303,6 +366,7 @@ mod tests {
                     },
                     location: "https://example.invalid/placeholder.jar".parse()?,
                     java_major: None,
+                    install: port::InstallKind::Direct,
                 },
             }),
             Arc::new(FakeDownloader::new(
@@ -318,6 +382,7 @@ mod tests {
             .install(
                 &VersionId::new("1.21.1"),
                 PathBuf::from("/tmp/server.jar"),
+                None,
                 None,
                 &CancellationToken::new(),
             )
@@ -352,6 +417,7 @@ mod tests {
                 &VersionId::new("1.21.1"),
                 PathBuf::from("/tmp/server.jar"),
                 None,
+                None,
                 &CancellationToken::new(),
             )
             .await?;
@@ -383,6 +449,7 @@ mod tests {
                     },
                     location: "https://example.invalid/server.jar".parse()?,
                     java_major: None,
+                    install: port::InstallKind::Direct,
                 },
                 not_found: false,
             }),
@@ -393,6 +460,7 @@ mod tests {
             .install(
                 &VersionId::new("1.21.1"),
                 PathBuf::from("/tmp/server.jar"),
+                None,
                 None,
                 &CancellationToken::new(),
             )

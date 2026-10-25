@@ -80,6 +80,7 @@ impl Fixture {
             version: VersionId::new("1.21.1"),
             variant: ServerVariant::Vanilla,
             jar: None,
+            launch: None,
             settings: ServerSettings::default(),
             java_major: None,
             created_at: now,

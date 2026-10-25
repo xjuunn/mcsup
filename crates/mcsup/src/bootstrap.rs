@@ -13,6 +13,7 @@ use file::{CommandExtractor, FileDownloader};
 use java::HostJavaScanner;
 use port::ServerJarSource;
 use provider::fabric::FabricSource;
+use provider::forge::ForgeSource;
 use provider::http::HttpByteSource;
 use provider::java::JavaSourceRegistry;
 use provider::mojang::MojangSource;
@@ -314,6 +315,7 @@ impl McsupBuilder {
             None => vec![
                 Arc::new(MojangSource::new().map_err(|err| BootstrapError::Source(Box::new(err)))?),
                 Arc::new(FabricSource::new().map_err(|err| BootstrapError::Source(Box::new(err)))?),
+                Arc::new(ForgeSource::new().map_err(|err| BootstrapError::Source(Box::new(err)))?),
             ],
         };
 

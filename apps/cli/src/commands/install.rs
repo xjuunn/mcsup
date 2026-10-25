@@ -75,9 +75,15 @@ fn default_version_source(has_jar: bool, interactive: bool) -> VersionSource {
 /// 经 lifecycle 编排：运行中换核心被拒绝（Linux 上 rename 会成功但 JVM
 /// 仍用旧 inode，用户以为升级了实际没有），判定收敛在 service。
 ///
+/// `Forge` / `NeoForge` 的下载物是安装器，需要先跑 `--installServer`：调用方在此
+/// 按与服务端启动同一套口径挑好 java，连同 [`LocalInstallerRunner`] 组成
+/// [`InstallerContext`] 交给 service。原版 / Fabric 用不到它（来源声明
+/// `Direct` 时 service 不会读取）。
+///
 /// # Errors
 ///
-/// 服务器不存在、版本不存在、来源不可达、传输 / 校验失败或运行中拒绝时返回错误
+/// 服务器不存在、版本不存在、来源不可达、传输 / 校验失败、安装器执行失败或
+/// 运行中拒绝时返回错误
 pub(crate) async fn download_jar(
     name: &str,
     version_id: &VersionId,
@@ -88,6 +94,16 @@ pub(crate) async fn download_jar(
     let installer = ServerInstaller::new(source, downloader);
     let inspector = FileCoreInspector::new();
     let lifecycle = super::lifecycle::lifecycle_service()?;
+
+    // 安装器类来源才需要 java；挑不出来（无 Java）时不阻断——直接可运行的
+    // 来源根本不读这个上下文，让 service 按 `InstallKind` 自行决定。
+    let installer_java = lifecycle
+        .installer_java_bin(name, &mut || {}, &mut |_| {})
+        .ok();
+    let installer_ctx = installer_java.map(|java_bin| mcsup::service::InstallerContext {
+        java_bin,
+        runner: Arc::new(mcsup::runtime::LocalInstallerRunner::new()),
+    });
 
     // 解析版本到首字节之间没有任何进度回调，先挂 spinner 保证整段有回显；
     // 首个进度到达后由 session 内的 BarSink 接手同一条线，切换成进度显示
@@ -100,6 +116,7 @@ pub(crate) async fn download_jar(
             version_id,
             &installer,
             &inspector,
+            installer_ctx.as_ref(),
             Some(&session),
             session.cancel(),
         )

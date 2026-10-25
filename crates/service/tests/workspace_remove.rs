@@ -33,6 +33,7 @@ fn add_server(store: &JsonStore, workspace_id: &WorkspaceId) {
         version: VersionId::new("1.21.1"),
         variant: ServerVariant::Vanilla,
         jar: None,
+        launch: None,
         settings: domain::server::settings::ServerSettings::default(),
         java_major: None,
         created_at: 1_700_000_000,

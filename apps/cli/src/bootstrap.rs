@@ -66,6 +66,7 @@ pub(crate) fn jar_sources() -> Result<Vec<Arc<dyn ServerJarSource>>> {
     Ok(vec![
         Arc::new(mcsup::provider::mojang::MojangSource::new().context("初始化 Mojang 源")?),
         Arc::new(mcsup::provider::fabric::FabricSource::new().context("初始化 Fabric 源")?),
+        Arc::new(mcsup::provider::forge::ForgeSource::new().context("初始化 Forge 源")?),
     ])
 }
 

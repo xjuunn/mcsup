@@ -882,6 +882,7 @@ impl ServerRepository for JsonStore {
         name: &ServerName,
         version: &VersionId,
         jar: &domain::server::meta::InstalledJar,
+        launch: Option<&domain::server::launch::LaunchSpec>,
         required_java_major: Option<domain::java::JavaMajor>,
         updated_at: i64,
     ) -> Result<ServerMeta, RepositoryError> {
@@ -892,6 +893,9 @@ impl ServerRepository for JsonStore {
         entry.jar_size = Some(i64::try_from(jar.size).unwrap_or(i64::MAX));
         entry.checksum_algo = Some(jar.checksum.algorithm().as_str().to_owned());
         entry.checksum = Some(jar.checksum.hex().to_owned());
+        let (kind, files) = models::launch_columns(launch);
+        entry.launch_kind = kind;
+        entry.launch_files = files;
         entry.required_java_major = required_java_major.map(domain::java::JavaMajor::as_i64);
         entry.updated_at = updated_at;
         self.write_record(Collection::Servers, &entry.id, &entry)?;
@@ -1110,6 +1114,7 @@ mod tests {
             version: VersionId::new("1.21.1"),
             variant: ServerVariant::Vanilla,
             jar: None,
+            launch: None,
             settings: domain::server::settings::ServerSettings::default(),
             java_major: None,
             created_at: 1_700_000_000,
@@ -1187,6 +1192,7 @@ mod tests {
             &ServerName::parse("alpha").expect("valid"),
             &version,
             &jar,
+            None,
             Some(required),
             1_700_000_100,
         )
@@ -1209,8 +1215,16 @@ mod tests {
             checksum: Checksum::unverified(),
         };
         let name = ServerName::parse("alpha").expect("valid");
-        ServerRepository::update_core(&store, &name, &VersionId::new("1.21.1"), &jar, None, 1)
-            .expect("update");
+        ServerRepository::update_core(
+            &store,
+            &name,
+            &VersionId::new("1.21.1"),
+            &jar,
+            None,
+            None,
+            1,
+        )
+        .expect("update");
 
         let got = ServerRepository::get(&store, &name).expect("get");
         let stored = got.jar.expect("jar 应落盘");
