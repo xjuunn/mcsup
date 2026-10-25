@@ -35,7 +35,8 @@ git config core.hookspath .githooks
 ```
 
 CI（[test.yml](.github/workflows/test.yml)）与本门禁保持同一套命令；
-fmt 未通过直接报错，不自动格式化。
+fmt 未通过直接报错，不自动格式化。CI 只手动触发（`gh workflow run test.yml
+--ref <分支>`），提交与推送都不会自动消耗额度。
 
 ## 架构红线（评审必查）
 
@@ -51,8 +52,8 @@ fmt 未通过直接报错，不自动格式化。
 
 ## 发布
 
-- CLI：合并后打 `v*` tag，[release.yml](.github/workflows/release.yml)
-  自动构建多平台二进制并创建 GitHub Release。
+- CLI：手动触发 [release.yml](.github/workflows/release.yml)，填入已存在的
+  `v*` tag，构建多平台二进制并创建 GitHub Release。打 tag 不会自动发布。
 - crate：手动触发 [publish.yml](.github/workflows/publish.yml)
   （先 dry-run）。首次发布前需完成内层改名 `mcsup-*`，见
   [docs/embedding.md](docs/embedding.md) 分发形态一节。

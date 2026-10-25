@@ -58,17 +58,28 @@ worktree 的建立与复用：
 `apps/cli/src/cli.rs` 与 `docs/cli-commands.md` 几乎每个任务都会碰，是冲突高发
 点，务必在开工时对齐，而不是留到最后。
 
-## 推送即触发 CI
+## CI 只能手动触发
 
-`.github/workflows/test.yml` 在 `pull_request` 上与 `push: [master, main]` 上都会
-运行。合入 master **之前**想让 CI 给出信号，就推功能分支：
+`.github/workflows/test.yml` **不监听 `push` 和 `pull_request`**，只保留
+`workflow_dispatch`。原因是 GitHub Actions 额度有限，自动触发会让每次提交都跑满
+os × locale 矩阵，额度很快用光。
+
+需要 CI 信号时手动跑一次，指向要验证的分支：
+
+```
+gh workflow run test.yml --ref <分支名>
+gh run watch
+```
+
+或在 GitHub 的 Actions 页面选择 Test → Run workflow。分支必须先推到
+`origin`，`workflow_dispatch` 只能引用远端已有的 ref：
 
 ```
 git push -u origin HEAD:refs/heads/<功能分支名>
 ```
 
 CI 是唯一能跑满 os × locale 矩阵的地方（见「代码质量门禁」）。本地 `check.sh`
-通过不等于 CI 通过，至少要把分支推上去看一眼结果再合入。
+通过不等于 CI 通过；需要确认时手动触发一次，合入前看一眼结果。
 
 `.githooks/pre-push` 在推送前检查两件事：当前分支是否已落后 `origin/master`
 （落后就提示先合并）、HEAD 与 `origin/master` 是否可干净合并。跳过用

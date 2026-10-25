@@ -1,12 +1,13 @@
 name: Test
 
+# 只手动触发（workflow_dispatch）：GitHub Actions 额度有限，自动触发会让每次
+# 提交都跑满 os × locale 矩阵，额度很快用光。需要 CI 信号时到 Actions 页面
+# 手动 Run workflow，或 `gh workflow run test.yml --ref <分支>`。
+# 同理不监听 push / pull_request，避免任何提交自动消耗额度。
 on:
-  push:
-    branches: [master, main]
-  pull_request:
   workflow_dispatch:
 
-# 同一分支的新 push 取消旧的运行，避免占用额度。
+# 同一分支重复手动触发取消旧的运行，避免占用额度：group 仍按 ref 收敛。
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true

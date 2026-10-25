@@ -304,6 +304,15 @@ pub enum InstallerError {
         /// 安装目录
         dir: PathBuf,
     },
+    /// 任务被取消，安装器进程已被终止
+    #[error("installer was cancelled")]
+    Cancelled,
+    /// 安装器运行超过允许时长，进程已被终止
+    #[error("installer timed out after {secs}s")]
+    TimedOut {
+        /// 超时秒数
+        secs: u64,
+    },
 }
 
 /// 执行服务端安装器
@@ -315,17 +324,22 @@ pub enum InstallerError {
 /// 实现要求：
 /// - 在 `dir` 内以它为工作目录运行，产出（`libraries/`、参数文件）落在 `dir`
 /// - 返回前确认预期的启动参数文件已生成，否则报 [`InstallerError::NoOutput`]
+/// - **必须响应取消**：安装器联网拉取 libraries 可达数分钟，用户按 Ctrl+C
+///   不能只等它跑完。取消时终止子进程并返回 [`InstallerError::Cancelled`]
+/// - 必须有上限：超过实现自定的超时同样终止子进程并返回
+///   [`InstallerError::TimedOut`]，否则网络卡住会让安装永久挂起
 pub trait InstallerRunner: Send + Sync {
     /// 运行安装器，产出服务端目录
     ///
     /// # Errors
     ///
-    /// 启动失败、非零退出或产物缺失时返回 [`InstallerError`]
+    /// 启动失败、非零退出、产物缺失、被取消或超时返回 [`InstallerError`]
     fn run_installer(
         &self,
         java_bin: &Path,
         installer: &Path,
         dir: &Path,
+        cancel: &CancellationToken,
     ) -> Result<(), InstallerError>;
 }
 

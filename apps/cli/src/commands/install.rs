@@ -44,7 +44,8 @@ pub(crate) async fn run(
             VersionSource::Latest => VersionId::new("latest"),
         },
     };
-    let (size, destination) = download_jar(name, &version_id, source, printer).await?;
+    let (size, destination) =
+        download_jar(name, &version_id, source, srv.meta.variant, printer).await?;
     printer.print_installed(&version_id, size, &destination)
 }
 
@@ -70,6 +71,16 @@ fn default_version_source(has_jar: bool, interactive: bool) -> VersionSource {
     }
 }
 
+/// 该变体是否要先运行安装器（因而必须有 Java）
+///
+/// 与 `port::InstallKind::Installer` 是同一批变体，但入口在拿到 artifact 之前
+/// 就要决定要不要组建 `InstallerContext`，只能按变体判。`_` 兜底覆盖
+/// `#[non_exhaustive]` 将来新增的变体：默认按「不需要」处理，避免把
+/// 直接可运行的来源也拦在 Java 检查上。
+fn needs_installer_java(variant: ServerVariant) -> bool {
+    matches!(variant, ServerVariant::Forge | ServerVariant::NeoForge)
+}
+
 /// 下载并登记服务端核心；不打印结果行（由调用方输出，保证 JSON 单行契约）
 ///
 /// 经 lifecycle 编排：运行中换核心被拒绝（Linux 上 rename 会成功但 JVM
@@ -77,17 +88,21 @@ fn default_version_source(has_jar: bool, interactive: bool) -> VersionSource {
 ///
 /// `Forge` / `NeoForge` 的下载物是安装器，需要先跑 `--installServer`：调用方在此
 /// 按与服务端启动同一套口径挑好 java，连同 [`LocalInstallerRunner`] 组成
-/// [`InstallerContext`] 交给 service。原版 / Fabric 用不到它（来源声明
-/// `Direct` 时 service 不会读取）。
+/// [`InstallerContext`] 交给 service。
+///
+/// 只有安装器类来源（[`ServerVariant::Forge`] / [`ServerVariant::NeoForge`]）
+/// 才要求 Java：直接可运行的来源（原版 / Fabric / Paper）不读上下文，因此
+/// 缺 Java 不影响它们——判定按 `variant` 收敛在这里，不散到每个来源。
 ///
 /// # Errors
 ///
-/// 服务器不存在、版本不存在、来源不可达、传输 / 校验失败、安装器执行失败或
-/// 运行中拒绝时返回错误
+/// 服务器不存在、版本不存在、来源不可达、传输 / 校验失败、安装器执行失败、
+/// 安装器类来源但本机没有可用 Java，或运行中拒绝时返回错误
 pub(crate) async fn download_jar(
     name: &str,
     version_id: &VersionId,
     source: Arc<dyn ServerJarSource>,
+    variant: ServerVariant,
     printer: Printer,
 ) -> Result<(u64, PathBuf)> {
     let downloader = Arc::new(bootstrap::build_downloader()?);
@@ -95,15 +110,25 @@ pub(crate) async fn download_jar(
     let inspector = FileCoreInspector::new();
     let lifecycle = super::lifecycle::lifecycle_service()?;
 
-    // 安装器类来源才需要 java；挑不出来（无 Java）时不阻断——直接可运行的
-    // 来源根本不读这个上下文，让 service 按 `InstallKind` 自行决定。
-    let installer_java = lifecycle
-        .installer_java_bin(name, &mut || {}, &mut |_| {})
-        .ok();
-    let installer_ctx = installer_java.map(|java_bin| mcsup::service::InstallerContext {
-        java_bin,
-        runner: Arc::new(mcsup::runtime::LocalInstallerRunner::new()),
-    });
+    // 安装器类来源才需要 java。这里**不能**把失败吞成 `None`：service 会把
+    // 「没给上下文」报成笼统的 `NoJavaForInstaller`，用户永远看不到真正原因
+    // 是「本机没装 Java」还是「装的 Java 与大版本要求不符」。
+    let installer_ctx = if needs_installer_java(variant) {
+        let java_bin = lifecycle
+            .installer_java_bin(name, &mut || {}, &mut |_| {})
+            .with_context(|| {
+                format!(
+                    "{} 需要先运行安装器，但找不到可用的 Java 运行时",
+                    variant.as_str()
+                )
+            })?;
+        Some(mcsup::service::InstallerContext {
+            java_bin,
+            runner: Arc::new(mcsup::runtime::LocalInstallerRunner::new()),
+        })
+    } else {
+        None
+    };
 
     // 解析版本到首字节之间没有任何进度回调，先挂 spinner 保证整段有回显；
     // 首个进度到达后由 session 内的 BarSink 接手同一条线，切换成进度显示
