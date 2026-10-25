@@ -323,7 +323,8 @@ mcsup = { version = "0.1", default-features = false, features = ["full"] }
 依赖拓扑序，每步结束都是可用状态。已落地：domain、port、protocol、
 service、file、java、provider、storage、runtime（内层 crate + 门面 feature
 同步）、apps/cli（workspace / java / server create·install·link·remove 与生命周期
-start·stop·restart·status·console·send·logs 已接通，其余命令为桩）、
+start·stop·restart·status·console·send·logs 已接通，`workspace doctor` 体检已接通，
+其余命令为桩）、
 门面 `bootstrap` 组合根（`McsupBuilder`，CLI 已改走）、CLI JSON 行类型
 收敛（`protocol::cli`，apps/cli 全部命令已切换）。
 后续按序：

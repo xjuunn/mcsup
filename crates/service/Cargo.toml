@@ -23,6 +23,7 @@ uuid.workspace = true
 workspace = true
 
 [dev-dependencies]
+service = { version = "0.1.0", path = "." }
 storage = { version = "0.1.0", path = "../storage" }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }

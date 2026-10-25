@@ -295,24 +295,29 @@ impl WorkspaceService {
     }
 }
 
-/// `workspace doctor` 单项检查结果
-#[derive(Debug, Clone)]
-pub struct DoctorFinding {
-    /// 严重程度：error 非零退出，warning 仅提示
-    pub level: DoctorLevel,
-    /// 所属工作区（全局检查可为空）
-    pub workspace: Option<String>,
-    /// 人类可读的问题描述
-    pub message: String,
+/// `workspace.toml` 的读取结论：marker 是否存在、是否指向这条记录
+///
+/// `doctor` 需要区分「没有 marker」「marker 属于别的目录」「marker 读不懂」：
+/// 前者说明目录身份不成立，后者说明文件损坏，处理方式不同。
+pub(crate) enum MarkerState {
+    /// marker 存在且 `id` 与记录一致
+    Match,
+    /// 目录里没有 marker
+    Missing,
+    /// marker 存在但 `id` 与记录不一致（携带 marker 里的 id）
+    Mismatch(String),
+    /// marker 无法解析或 schema 不支持
+    Corrupt,
 }
 
-/// doctor 检查级别
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DoctorLevel {
-    /// 需要处理的问题，退出码非零
-    Error,
-    /// 提示性问题，退出码零
-    Warning,
+/// 读 marker 并给出身份结论；IO 失败按 `Corrupt` 处理（读不出来就无法确认身份）
+pub(crate) fn read_marker_id(dir: &Path, expected: &WorkspaceId) -> MarkerState {
+    match read_marker(dir) {
+        Ok(Some(marker)) if marker.id == expected.as_str() => MarkerState::Match,
+        Ok(Some(marker)) => MarkerState::Mismatch(marker.id),
+        Ok(None) => MarkerState::Missing,
+        Err(_) => MarkerState::Corrupt,
+    }
 }
 
 /// 按名选择器从候选表里解析工作区：精确 → 唯一前缀 → 报错

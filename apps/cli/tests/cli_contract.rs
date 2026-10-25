@@ -170,3 +170,112 @@ fn workspace_init_then_list_stdout_single_json() {
     assert_eq!(rows[0]["name"], "ws1");
     assert_eq!(rows[0]["current"], true);
 }
+
+/// 空注册表：doctor 退出 0，stdout 单行 JSON，字段形状固定
+#[test]
+fn workspace_doctor_clean_registry_exits_0() {
+    let home = temp_home();
+    let out = run(home.path(), &["workspace", "doctor", "--output", "json"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let payload: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("doctor stdout 必须是单个 JSON 对象");
+    assert_eq!(payload["schema"], 1);
+    assert_eq!(payload["has_errors"], false);
+    assert_eq!(payload["errors"], 0);
+    assert_eq!(payload["warnings"], 0);
+    assert_eq!(payload["findings"].as_array().expect("array").len(), 0);
+}
+
+/// 工作目录被删 → 错误级发现，退出 1（数据要人处理，不是程序崩溃）
+#[test]
+fn workspace_doctor_missing_dir_exits_1() {
+    let home = temp_home();
+    let ws = home.path().join("wsdir");
+    let init = run(
+        home.path(),
+        &[
+            "workspace",
+            "init",
+            "--dir",
+            ws.to_str().expect("utf8"),
+            "--name",
+            "ws1",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(init.status.code(), Some(0), "stderr: {}", stderr(&init));
+    std::fs::remove_dir_all(&ws).expect("rmdir");
+
+    let out = run(home.path(), &["workspace", "doctor", "--output", "json"]);
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).expect("JSON");
+    assert_eq!(payload["has_errors"], true);
+    let findings = payload["findings"].as_array().expect("array");
+    let kinds: Vec<&str> = findings
+        .iter()
+        .map(|f| f["kind"].as_str().expect("kind"))
+        .collect();
+    assert!(kinds.contains(&"workspace-dir-missing"), "{kinds:?}");
+    // 结构化字段可寻址，不是只给人看的字符串
+    let missing = findings
+        .iter()
+        .find(|f| f["kind"] == "workspace-dir-missing")
+        .expect("finding");
+    assert_eq!(missing["level"], "error");
+    assert_eq!(missing["workspace"], "ws1");
+    assert_eq!(missing["detail"]["kind"], "workspace-dir-missing");
+    assert!(missing["detail"]["path"].is_string());
+    assert!(missing["message"].is_string(), "兼容字段仍在");
+}
+
+/// `--only` 拼错 → 用法错误 2，列出可用检查项
+#[test]
+fn workspace_doctor_unknown_only_exits_2() {
+    let home = temp_home();
+    let out = run(
+        home.path(),
+        &["workspace", "doctor", "--only", "nope", "--output", "json"],
+    );
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(out.stdout.is_empty(), "用法错误不得输出数据");
+    let err = stderr(&out);
+    assert!(err.contains("未知检查项"), "{err}");
+    assert!(err.contains("dangling-link"), "{err}");
+}
+
+/// `--only` 过滤只影响展示：没选中的错误级发现不左右退出码
+#[test]
+fn workspace_doctor_only_filters_report_and_exit() {
+    let home = temp_home();
+    let ws = home.path().join("wsdir");
+    run(
+        home.path(),
+        &[
+            "workspace",
+            "init",
+            "--dir",
+            ws.to_str().expect("utf8"),
+            "--name",
+            "ws1",
+            "--output",
+            "json",
+        ],
+    );
+    std::fs::remove_dir_all(&ws).expect("rmdir");
+
+    let out = run(
+        home.path(),
+        &[
+            "workspace",
+            "doctor",
+            "--only",
+            "dangling-link",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).expect("JSON");
+    assert_eq!(payload["errors"], 0);
+}

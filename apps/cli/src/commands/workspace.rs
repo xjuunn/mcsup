@@ -1,5 +1,6 @@
 use crate::bootstrap;
 use crate::cli::WorkspaceAction;
+use crate::diagnostic::AppDiagnostic;
 use crate::output::Printer;
 use crate::prompts::{self, WorkspaceLocation};
 use anyhow::{Context, Result};
@@ -8,20 +9,26 @@ use mcsup::protocol::cli::{
     DoctorFindingJson, DoctorJson, WorkspaceInitRow, WorkspaceRemoveJson, WorkspaceRow,
     WorkspaceUseJson,
 };
-use mcsup::service::{InitOutcome, ServerRegistry, WorkspaceService, absolute_path};
+use mcsup::service::{
+    CheckKind, DoctorService, Finding, InitOutcome, ServerRegistry, Severity, WorkspaceService,
+    absolute_path,
+};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub(crate) fn run(action: WorkspaceAction, printer: Printer) -> Result<()> {
     let store = bootstrap::open_store()?;
     let reg = Arc::new(ServerRegistry::new(store.clone(), store.clone()));
-    let svc = WorkspaceService::new(store.clone(), store);
+    let svc = WorkspaceService::new(store.clone(), store.clone());
     match action {
         WorkspaceAction::Init { dir, name } => init(&svc, dir.as_deref(), name.as_deref(), printer),
         WorkspaceAction::List => list(&svc, &reg, printer),
         WorkspaceAction::Use { name } => use_ws(&svc, name.as_deref(), printer),
         WorkspaceAction::Remove { name, purge } => remove(&svc, &name, purge, printer),
-        WorkspaceAction::Doctor => doctor(&reg, printer),
+        WorkspaceAction::Doctor { only, strict } => {
+            let doctor = DoctorService::new(store.clone(), store);
+            doctor_cmd(&doctor, &only, strict, printer)
+        }
     }
 }
 
@@ -219,7 +226,7 @@ fn use_ws(svc: &WorkspaceService, name: Option<&str>, printer: Printer) -> Resul
 fn pick_workspace(svc: &WorkspaceService, printer: Printer) -> Result<String> {
     // 缺必选参数：非交互 / JSON 下不提问、不落库，直接用法错误（退出码 2）
     if !printer.is_interactive() {
-        return Err(crate::diagnostic::AppDiagnostic::usage(
+        return Err(AppDiagnostic::usage(
             "workspace use 缺少工作区名称",
             Some("非交互模式：mcsup workspace use <名称>".to_owned()),
         )
@@ -308,50 +315,141 @@ fn remove(svc: &WorkspaceService, name: &str, purge: bool, printer: Printer) -> 
     Ok(())
 }
 
-fn doctor(reg: &ServerRegistry, printer: Printer) -> Result<()> {
-    use mcsup::service::DoctorLevel;
+/// 全部检查项标识（`service::KNOWN_KINDS` 是本模块的唯一来源）
+const KNOWN_KINDS: &[&str] = mcsup::service::KNOWN_KINDS;
 
-    let findings = reg.doctor()?;
-    let level_str = |level: DoctorLevel| match level {
-        DoctorLevel::Error => "error",
-        DoctorLevel::Warning => "warning",
-    };
-    if findings.is_empty() {
-        printer.print_outcome(
-            "检查通过：工作区与注册表一致",
-            &DoctorJson { findings: vec![] },
-        )?;
-        return Ok(());
+fn doctor_cmd(
+    doctor: &DoctorService,
+    only: &[String],
+    strict: bool,
+    printer: Printer,
+) -> Result<()> {
+    for kind in only {
+        if !KNOWN_KINDS.contains(&kind.as_str()) {
+            return Err(AppDiagnostic::usage(
+                format!("未知检查项: {kind}"),
+                Some(format!("可用检查项: {}", KNOWN_KINDS.join(", "))),
+            )
+            .into());
+        }
     }
+
+    let report = doctor.run()?;
+    // --only 过滤只影响展示与退出码判定，检查本身仍然全跑：
+    // 过滤在 service 里做会让「不关心」变成「不检查」，掩盖连带问题
+    let findings: Vec<&Finding> = report
+        .findings()
+        .iter()
+        .filter(|f| only.is_empty() || only.iter().any(|k| k == f.kind.as_str()))
+        .collect();
+
+    let errors = findings
+        .iter()
+        .filter(|f| f.severity() == Severity::Error)
+        .count();
+    let warnings = findings.len() - errors;
+
     if printer.is_human() {
-        for f in &findings {
-            let scope = f.workspace.as_deref().unwrap_or("(全局)");
-            let level = match f.level {
-                DoctorLevel::Error => "ERROR",
-                DoctorLevel::Warning => "WARN",
-            };
-            let line = format!("[{level}] {scope}: {}", f.message);
-            match f.level {
-                DoctorLevel::Error => printer.print_warning(&line),
-                DoctorLevel::Warning => printer.print_section(&line),
+        if findings.is_empty() {
+            printer.print_section("检查通过：工作区与注册表一致");
+        } else {
+            for f in &findings {
+                let tag = match f.severity() {
+                    Severity::Error => "ERROR",
+                    Severity::Warning => "WARN",
+                };
+                let scope = f.workspace.as_deref().map_or("(全局)", |w| w);
+                let line = format!(
+                    "[{tag}] {scope}: {}\n        {}\n        修复：{}",
+                    f.kind.describe(),
+                    f.kind.locate(),
+                    f.kind.fix_hint()
+                );
+                match f.severity() {
+                    Severity::Error => printer.print_warning(&line),
+                    Severity::Warning => printer.print_section(&line),
+                }
             }
         }
     }
+
     let payload = DoctorJson {
+        schema: 1,
+        has_errors: errors > 0,
+        errors,
+        warnings,
         findings: findings
             .iter()
             .map(|f| DoctorFindingJson {
-                level: level_str(f.level),
+                level: f.severity().as_str(),
+                kind: f.kind.as_str(),
                 workspace: f.workspace.as_deref(),
-                message: f.message.clone(),
+                detail: detail_json(&f.kind),
+                message: f.kind.describe(),
             })
             .collect(),
     };
-    printer.print_outcome(&format!("发现 {} 个问题", findings.len()), &payload)?;
-    if findings.iter().any(|f| f.level == DoctorLevel::Error) {
-        anyhow::bail!("发现错误级问题，请按提示处理");
+    let summary = if findings.is_empty() {
+        "检查通过".to_owned()
+    } else {
+        format!(
+            "发现 {} 个问题（{errors} error, {warnings} warning）",
+            findings.len()
+        )
+    };
+    printer.print_outcome(&summary, &payload)?;
+
+    if errors > 0 || (strict && warnings > 0) {
+        return Err(AppDiagnostic::findings(errors).into());
     }
     Ok(())
+}
+
+/// 结构化字段：与 `Kind` 同源，kind 与 detail 不可能不一致
+fn detail_json(kind: &CheckKind) -> serde_json::Value {
+    match kind {
+        CheckKind::WorkspaceDirMissing { path }
+        | CheckKind::WorkspaceMarkerMissing { path }
+        | CheckKind::DanglingLink { path }
+        | CheckKind::OnDiskNotRegistered { path } => {
+            serde_json::json!({ "kind": kind.as_str(), "path": path })
+        }
+        CheckKind::WorkspaceMarkerMismatch {
+            path,
+            found,
+            expected,
+        } => serde_json::json!({
+            "kind": kind.as_str(),
+            "path": path,
+            "found": found,
+            "expected": expected,
+        }),
+        CheckKind::ServersDirUnreadable { path, reason } => {
+            serde_json::json!({ "kind": kind.as_str(), "path": path, "reason": reason })
+        }
+        CheckKind::RegisteredButMissing { name, path } => serde_json::json!({
+            "kind": kind.as_str(),
+            "name": name.as_str(),
+            "path": path,
+        }),
+        CheckKind::RelDirNotDirectChild {
+            name,
+            rel_dir,
+            workspace_path,
+        } => serde_json::json!({
+            "kind": kind.as_str(),
+            "name": name.as_str(),
+            "rel_dir": rel_dir,
+            "workspace_path": workspace_path,
+        }),
+        CheckKind::OrphanServerRecord { name, workspace_id } => serde_json::json!({
+            "kind": kind.as_str(),
+            "name": name.as_str(),
+            "workspace_id": workspace_id,
+        }),
+        // 新增类型时这里退化为最小形状；需要可寻址字段时补分支
+        _ => serde_json::json!({ "kind": kind.as_str() }),
+    }
 }
 
 #[cfg(test)]

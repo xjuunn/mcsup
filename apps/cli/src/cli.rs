@@ -106,7 +106,15 @@ pub(crate) enum WorkspaceAction {
         purge: bool,
     },
     /// 检查工作区与注册表一致性
-    Doctor,
+    #[command(name = "doctor")]
+    Doctor {
+        /// 只跑指定检查项（kebab-case，逗号分隔）；缺省全跑
+        #[arg(long, value_name = "KIND", value_delimiter = ',')]
+        only: Vec<String>,
+        /// warning 也视为失败（CI 用）
+        #[arg(long)]
+        strict: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

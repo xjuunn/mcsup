@@ -13,7 +13,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::fs_error::{FsError, deletion_hint};
-use crate::workspace::{DoctorFinding, DoctorLevel, WorkspaceError};
+use crate::workspace::WorkspaceError;
 use crate::{InstallError, InstalledDownload, ServerInstaller};
 
 const SERVER_MARKER: &str = "mcsup.json";
@@ -389,87 +389,6 @@ impl ServerRegistry {
         let name = srv.meta.name.clone();
         self.servers.remove(&name)?;
         Ok(srv)
-    }
-
-    /// `workspace doctor`：检查注册表与磁盘的一致性
-    ///
-    /// 检查项：无当前工作区（warning）、工作目录缺失、`servers/` 下悬空符号
-    /// 链接、磁盘有目录 / 链接但未入库、登记的服务器目录不存在。
-    ///
-    /// # Errors
-    ///
-    /// 注册表失败时返回 [`ServerRegistryError`]
-    pub fn doctor(&self) -> Result<Vec<DoctorFinding>, ServerRegistryError> {
-        let mut out = Vec::new();
-        let workspaces = self.workspaces.list()?;
-        if self.workspaces.current()?.is_none() {
-            out.push(DoctorFinding {
-                level: DoctorLevel::Warning,
-                workspace: None,
-                message: "no current workspace; run `mcsup workspace use <name>` to set one"
-                    .to_owned(),
-            });
-        }
-        let registered: Vec<ServerMeta> = self.servers.list()?;
-        for ws in &workspaces {
-            let ws_name = ws.name.as_str().to_owned();
-            if !ws.path.is_dir() {
-                out.push(DoctorFinding {
-                    level: DoctorLevel::Error,
-                    workspace: Some(ws_name.clone()),
-                    message: format!("workspace directory missing: {}", ws.path.display()),
-                });
-                continue;
-            }
-            let servers_dir = ws.path.join("servers");
-            let mut seen_on_disk = std::collections::BTreeSet::new();
-            if let Ok(entries) = std::fs::read_dir(&servers_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    let fname = entry.file_name().to_string_lossy().into_owned();
-                    seen_on_disk.insert(fname.clone());
-                    let Ok(ft) = entry.file_type() else { continue };
-                    if ft.is_symlink() && std::fs::metadata(&path).is_err() {
-                        out.push(DoctorFinding {
-                            level: DoctorLevel::Error,
-                            workspace: Some(ws_name.clone()),
-                            message: format!("dangling symlink: {}", path.display()),
-                        });
-                        continue;
-                    }
-                    if !registered
-                        .iter()
-                        .any(|m| m.workspace_id == ws.id && m.rel_dir == Path::new(&fname))
-                    {
-                        out.push(DoctorFinding {
-                            level: DoctorLevel::Warning,
-                            workspace: Some(ws_name.clone()),
-                            message: format!(
-                                "on disk but not registered: {} \
-                                 (run `server link {}` to re-register it, or remove it)",
-                                path.display(),
-                                path.display()
-                            ),
-                        });
-                    }
-                }
-            }
-            for meta in registered.iter().filter(|m| m.workspace_id == ws.id) {
-                let dir = servers_dir.join(&meta.rel_dir);
-                if dir.symlink_metadata().is_err() {
-                    out.push(DoctorFinding {
-                        level: DoctorLevel::Error,
-                        workspace: Some(ws_name.clone()),
-                        message: format!(
-                            "registered but missing on disk: {} (run `server remove {}`)",
-                            dir.display(),
-                            meta.name.as_str()
-                        ),
-                    });
-                }
-            }
-        }
-        Ok(out)
     }
 
     /// 全部服务器，按名称升序，附绝对目录
@@ -1473,37 +1392,6 @@ mod tests {
             )
             .expect_err("refuse");
         assert!(matches!(err, ServerRegistryError::AlreadyExists(_)));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn doctor_reports_drift() {
-        let tmp = tempfile::tempdir().expect("tmp");
-        let reg = registry_with_ws(tmp.path());
-        reg.create(
-            None,
-            "alpha",
-            &VersionId::new("1.21.1"),
-            ServerVariant::Vanilla,
-            None,
-        )
-        .expect("create");
-        // 磁盘有目录但未入库
-        std::fs::create_dir_all(tmp.path().join("ws/servers/orphan")).expect("mkdir");
-        // 悬空符号链接
-        std::os::unix::fs::symlink(
-            tmp.path().join("no-such-target"),
-            tmp.path().join("ws/servers/dangling"),
-        )
-        .expect("dangling");
-        // 登记了但磁盘缺失
-        std::fs::remove_dir_all(tmp.path().join("ws/servers/alpha")).expect("rmdir");
-
-        let findings = reg.doctor().expect("doctor");
-        let msgs: Vec<&str> = findings.iter().map(|f| f.message.as_str()).collect();
-        assert!(msgs.iter().any(|m| m.contains("dangling symlink")));
-        assert!(msgs.iter().any(|m| m.contains("not registered")));
-        assert!(msgs.iter().any(|m| m.contains("missing on disk")));
     }
 
     struct FakeSource;

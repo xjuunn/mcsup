@@ -125,9 +125,25 @@ mcsup workspace init [--dir <path>] [--name <name>]
   带合法 `mcsup.json` 时复用其 id，损坏则拒绝，id 已注册也拒绝；注册失败
   回滚符号链接。链接服务器 `server remove --purge` 直接拒绝（目标在工作区
   外，删除不可恢复），普通 `remove` 仅移除链接与登记。
-- `workspace doctor` 检查：无当前（warning）、工作目录缺失、`servers/` 下
-  悬空符号链接、磁盘有目录但未登记、已登记但磁盘缺失；错误级问题使退出码
-  非零。
+- `workspace doctor` 只读体检，检查项固定为枚举（`service::CheckKind`），
+  每项带稳定 kebab-case 标识；判定与文案在 `service`，CLI 只做渲染与退出码：
+
+  | 检查项 | 级别 | 判据 |
+  | --- | --- | --- |
+  | `no-current-workspace` | warning | 有工作目录但当前标记为空（一个都没有是合法首次状态，不报） |
+  | `workspace-dir-missing` | error | 记录中的目录在磁盘上不存在，该工作区后续检查到此为止 |
+  | `workspace-marker-missing` | error | 目录在但缺 `workspace.toml`，无法确认身份 |
+  | `workspace-marker-mismatch` | error | `workspace.toml` 的 id 与记录不一致 |
+  | `servers-dir-unreadable` | error | `servers/` 无法列举（不吞成「无问题」） |
+  | `dangling-link` | error | `servers/` 下符号链接目标不存在 |
+  | `on-disk-not-registered` | warning | 磁盘有目录 / 链接但注册表里没有 |
+  | `registered-but-missing` | error | 已登记但磁盘上找不到 |
+  | `rel-dir-not-direct-child` | error | `rel_dir` 不是单层相对路径（`..` / 分隔符 / 绝对路径） |
+  | `orphan-server-record` | error | 服务器记录指向的工作目录不在注册表里 |
+
+  有 error 级发现 → 退出码 1（`AppDiagnostic`，不是 `anyhow` 兜底）；注册表
+  自身读失败 → 5（后端失败），与「数据有问题」区分。`--strict` 让 warning
+  也算失败，`--only <kind,...>` 过滤展示与退出码判定（检查仍然全跑）。
 - `server move` 暂不实现（v1 之后再评估，与 `link` 一起做语义会交叉）。
 
 # 元数据存储布局

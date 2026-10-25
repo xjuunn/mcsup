@@ -1,3 +1,4 @@
+mod doctor;
 mod fs_error;
 mod java;
 mod lifecycle;
@@ -7,6 +8,12 @@ mod settings;
 mod util;
 mod workspace;
 
+/// `workspace doctor` 的检查项标识清单（`--only` 校验与帮助文案共用）
+pub const KNOWN_KINDS: &[&str] = CheckKind::KNOWN_KINDS;
+pub use doctor::{CheckKind, DoctorError, DoctorService, Finding, Report, Severity};
+use domain::server::download::DownloadStatus;
+use domain::server::error::InvalidTransition;
+use domain::server::version::VersionId;
 pub use fs_error::FsError;
 pub use java::{
     InstallOutcome, InstallStage, JavaError, JavaService, RemoteJavaPackage, ScanOutcome,
@@ -17,26 +24,21 @@ pub use lifecycle::{
 };
 /// Java 源聚合端口（定义在 `port`，此处转出便于既有调用方）
 pub use port::JavaSourceRegistryPort;
+use port::{
+    ArtifactDownloader, CancellationToken, DownloadRequest, DownloadedArtifact, ProgressSink,
+    ServerJarSource,
+};
 pub use props::{PropsError, PropsReport, ServerPropsService};
 pub use registry::{
     InstallJarError, InstalledServerJar, RegisteredServer, ServerRegistry, ServerRegistryError,
 };
 pub use settings::{ServerSettingsService, SettingChange, SettingsError};
-pub use workspace::{
-    DoctorFinding, DoctorLevel, InitOutcome, MARKER_FILE, NOISE_ENTRIES, WorkspaceError,
-    WorkspaceService, absolute_path,
-};
-
-use domain::server::download::DownloadStatus;
-use domain::server::error::InvalidTransition;
-use domain::server::version::VersionId;
-use port::{
-    ArtifactDownloader, CancellationToken, DownloadRequest, DownloadedArtifact, ProgressSink,
-    ServerJarSource,
-};
 use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
+pub use workspace::{
+    InitOutcome, MARKER_FILE, NOISE_ENTRIES, WorkspaceError, WorkspaceService, absolute_path,
+};
 
 /// 安装任务失败
 #[derive(Debug, Error)]

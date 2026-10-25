@@ -125,7 +125,7 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | `list` | `mcsup workspace list` | 已注册工作目录：名称、路径、服务器数、是否当前 |
 | `use` | `mcsup workspace use [<name>]` | 切换当前工作区；不带名字在 TTY 下交互选择；只影响 `create` / `link` 缺省落点，不隐藏其他目录的服务器 |
 | `remove` | `mcsup workspace remove <name> [--purge]` | 注销工作目录，同时清除该工作目录下的服务器登记；交互下询问是否删除磁盘数据（默认不删），同意后红色警示并要求输入工作区名称确认，`--purge` 跳过询问直接删除；删除失败（目录被占用）保留注册，退出占用后重试即可；删除当前工作区时当前标记移交给剩余中按名称排序的第一个 |
-| `doctor` | `mcsup workspace doctor` | 检查工作区与注册表一致性：工作目录缺失、悬空链接、磁盘/登记漂移、无当前工作区；发现错误级问题非零退出 |
+| `doctor` | `mcsup workspace doctor [--only <kind,...>] [--strict]` | 只读体检工作区与注册表一致性：10 项检查（见 `docs/workspace.md` 的表），error 级非零退出；`--only` 按检查项标识过滤，`--strict` 让 warning 也算失败 |
 
 ## mcsup modpack（整合包：一键建整包服务器）
 

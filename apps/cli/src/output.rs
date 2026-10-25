@@ -190,6 +190,14 @@ impl Printer {
             if let Some(install) = cause.downcast_ref::<mcsup::service::InstallError>() {
                 return install_exit_code(install);
             }
+            if let Some(doctor) = cause.downcast_ref::<mcsup::service::DoctorError>() {
+                // 注册表都读不出来：不是「数据有问题」而是「后端不可用」，
+                // 与体检发现 error 级问题的 1 区分开
+                return match doctor {
+                    mcsup::service::DoctorError::Repo(_) => 5,
+                    _ => 1,
+                };
+            }
             if let Some(source) = cause.downcast_ref::<mcsup::port::SourceError>() {
                 return source_exit_code(source);
             }

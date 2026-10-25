@@ -266,19 +266,35 @@ pub struct WorkspaceRemoveJson<'a> {
 }
 
 /// `workspace doctor` 发现项
+///
+/// `kind` 是稳定标识（`service::CheckKind::as_str`），`detail` 携带该类型的
+/// 可寻址字段。`message` 保留一个版本周期以兼容既有消费者，新代码只用
+/// `kind` + `detail`。
 #[derive(Debug, Serialize)]
 pub struct DoctorFindingJson<'a> {
     /// 级别：`error` / `warning`
     pub level: &'a str,
+    /// 发现类型标识（kebab-case）
+    pub kind: &'a str,
     /// 所属工作区；全局发现为 `null`
     pub workspace: Option<&'a str>,
-    /// 问题描述
+    /// 该类型的结构化字段
+    pub detail: serde_json::Value,
+    /// 问题描述（兼容字段）
     pub message: String,
 }
 
 /// `workspace doctor` 结果
 #[derive(Debug, Serialize)]
 pub struct DoctorJson<'a> {
+    /// 行格式版本
+    pub schema: u32,
+    /// 是否存在 error 级发现
+    pub has_errors: bool,
+    /// error 级数量
+    pub errors: usize,
+    /// warning 级数量
+    pub warnings: usize,
     /// 全部发现项
     pub findings: Vec<DoctorFindingJson<'a>>,
 }

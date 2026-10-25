@@ -61,4 +61,14 @@ impl AppDiagnostic {
             help: None,
         }
     }
+
+    /// 体检发现错误级问题：数据要人处理，不是程序失败（退出码 1）
+    #[must_use]
+    pub(crate) fn findings(errors: usize) -> Self {
+        Self {
+            exit_code: 1,
+            message: format!("发现 {errors} 个错误级问题，请按提示处理"),
+            help: Some("修复后可再次运行 `mcsup workspace doctor` 复核".to_owned()),
+        }
+    }
 }
