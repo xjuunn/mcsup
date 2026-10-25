@@ -73,27 +73,57 @@
 `domain` / `service` 的结构化错误只携带判定（`kind()`）与参数，`Display`
 是英文短句、仅供日志；用户可见文案一律由入口按 `kind()` 渲染。
 
-命令层级：
+## 子命令简写
+
+每一级子命令都提供固定简写，**全拼始终有效**，简写只是额外入口：
+
+- 简写最少两个字母，单字母不提供（`mcsup s` 报 `unrecognized subcommand`）。
+- 简写是显式登记的别名，不做前缀推断：`mcsup server l` 不会猜成 `list`。
+- 歧义与拼错由 clap 报错并列出候选；`--help` 展示 `[alias: ...]`。
+- 简写与全拼解析到同一个命令，退出码、stdout / JSON 输出完全一致。
+- 别名表在 `apps/cli/src/cli.rs` 的 `#[command(visible_alias = ...)]`，
+  由单测保证「≥ 2 个字母」且「同层不重复」。
+
+| 层级 | 简写 |
+| --- | --- |
+| 顶层 | `ws` workspace · `srv` server · `mp` modpack · `jv` java · `rmt` remote · `doc` doctor · `cfg` config · `up` update · `comp` completions · `ver` version |
+| `workspace` | `in` / `new` init · `ls` list · `sw` use · `rm` remove · `doc` doctor |
+| `server` | `ls` list · `cr` create · `in` install · `up` start · `down` stop · `rs` restart · `st` status · `con` console · `snd` send · `log` logs · `prop` props · `cfg` set · `rm` remove · `ln` link · `ver` version · `bak` backup · `md` mod |
+| `server backup` | `cr` create · `ls` list · `rt` restore · `vf` verify · `pr` prune |
+| `server mod` | `ls` list · `in` install · `rm` remove · `up` update · `od` outdated |
+| `modpack` | `ls` list · `in` install |
+| `java` | `ls` list · `sc` scan · `in` install · `un` / `rm` uninstall |
+| `remote` | `ls` list · `dp` deploy · `pg` ping · `rm` remove |
+| `config` | `ls` show · `st` set · `us` unset · `ed` edit |
+
+## 命令层级
 
 ```
 mcsup
-├── workspace                 # 工作区：创建 / 注册表 / 当前切换
-│   ├── init [--dir <path>] [--name <name>]
-│   ├── list / use [<name>] / remove <name> [--purge] / doctor
-├── server                    # 单台服务：生命周期 + 属主内容
-│   ├── list / create / link / install / start / stop / restart
-│   ├── status / console / send / logs / props / set / remove / version
-│   ├── backup    create · list · restore · verify · prune
-│   └── mod       list · install · remove · update · outdated
-├── modpack                   # 整合包：一键建整包服务器
-│   ├── install <pack> [--name <name>] [--workspace <ws>]
-│   └── update <name>
-├── java                      # 机器级 JVM 运行时
-│   └── list / install / uninstall / default
-├── remote                    # 远端执行位置（Backend）
-│   └── list / deploy / ping / remove
-└── doctor / config / update / completions / version / help
+├── workspace (ws)            # 工作区：创建 / 注册表 / 当前切换
+│   ├── init (in|new) [--dir <path>] [--name <name>]
+│   ├── list (ls) / use (sw) [<name>] / remove (rm) <name> [--purge] / doctor (doc)
+├── server (srv)              # 单台服务：生命周期 + 属主内容
+│   ├── list (ls) / create (cr) / link (ln) / install (in)
+│   ├── start (up) / stop (down) / restart (rs)
+│   ├── status (st) / console (con) / send (snd) / logs (log)
+│   ├── props (prop) / set (cfg) / remove (rm) / version (ver)
+│   ├── backup (bak)  create (cr) · list (ls) · restore (rt) · verify (vf) · prune (pr)
+│   └── mod (md)      list (ls) · install (in) · remove (rm) · update (up) · outdated (od)
+├── modpack (mp)              # 整合包：一键建整包服务器
+│   ├── install (in) <pack> [--name <name>] [--workspace <ws>]
+│   └── list (ls) [<query>]
+├── java (jv)                 # 机器级 JVM 运行时
+│   └── list (ls) / scan (sc) / install (in) / uninstall (un|rm)
+├── remote (rmt)              # 远端执行位置（Backend）
+│   └── list (ls) / deploy (dp) / ping (pg) / remove (rm)
+└── doctor (doc) / config (cfg) / update (up)
+    / completions (comp) / version (ver) / help
 ```
+
+`config` 子命令：`show (ls)` / `set (st)` / `unset (us)` / `edit (ed)`。
+
+括号内为简写，最少两个字母，全拼始终有效。
 
 CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、JSON 等
 机器契约见 `docs/embedding.md` 的 CLI 契约一节。
@@ -202,9 +232,42 @@ JVM 安装在平台数据目录 `{data_dir}/mcsup/java/`，不属于任何工作
 
 | 子命令 | 用法 | 说明 |
 | --- | --- | --- |
-| `doctor` | `mcsup doctor` | 自检：路径权限、Java、provider 连通、远端 |
-| `config` | `mcsup config show \| set <key> <value> \| edit` | 查看/修改/编辑平台配置，`edit` 打开 `$EDITOR` |
+| `doctor` | `mcsup doctor [--only <kind,...>] [--strict] [--offline]` | 平台环境自检：数据目录可写、配置可解析、Java 可用、来源可达。error 级非零退出；`--only` 按检查项标识过滤（只影响展示与退出码，检查本身全跑），`--strict` 让 warning 也算失败；`--offline` 跳过联网检查并在报告里标注「已跳过」，不伪装成通过 |
+| `config` | `mcsup config show \| set <key> <value> \| unset <key> \| edit` | 查看/修改/重置/编辑平台配置；`edit` 打开 `$VISUAL` / `$EDITOR`，非交互下退 2 |
 | `update` | `mcsup update [--version <v>]` | 升级 mcsup 自身 |
 | `completions` | `mcsup completions <zsh\|bash\|fish>` | 生成 shell 补全脚本 |
-| `version` | `mcsup version` | 版本、构建与协议信息 |
+| `version` | `mcsup version` | 版本、构建与协议信息（`mcsup --version` 只打一行 `mcsup <ver>`，两者互不影响） |
 | `help` | `mcsup help [<group>]` | 分组帮助 |
+
+### doctor 检查项
+
+`--only` 的取值即 JSON 的 `kind`，顺序稳定：
+
+| `kind` | 级别 | 含义 |
+| --- | --- | --- |
+| `data-dir-missing` | warning | 数据目录尚未创建（首次写元数据时自动创建） |
+| `data-dir-not-writable` | error | 数据目录存在但写入探测失败 |
+| `config-invalid` | error | `config.toml` 无法解析或取值非法 |
+| `config-source-unknown` | error | 配置里的来源名未在 provider 注册 |
+| `no-java` | error | 没有可用的 Java 运行时 |
+| `no-java-scanned` | warning | 已扫描过本机但未发现 Java |
+| `java-missing` | error | 登记的 Java 路径已不在磁盘上 |
+| `no-jar-source` | error | 没有可用的服务端下载源 |
+| `source-unreachable` | error | 来源不可达（`--offline` 时不出此项） |
+| `source-empty` | error | 来源返回空版本列表（`--offline` 时不出此项） |
+
+`doctor` 只读：不建目录、不改配置、不写注册表，修复由报告里的 `fix` 提示引导用户执行。
+
+### config.toml 键表
+
+文件位于 `{data_dir}/config.toml`，`--config <path>` 可覆盖。键名 kebab-case，
+未写入的键取平台缺省；`config unset <key>` 即删除该项回到缺省（已是缺省时为幂等成功）。
+
+| 键 | 类型 | 取值 | 缺省 |
+| --- | --- | --- | --- |
+| `data-dir` | 路径 | 绝对路径；`~` 展开，相对路径按当前目录展开，只做词法规整不解析符号链接 | 系统数据目录下的 `mcsup` |
+| `download-mirror` | 枚举 | `mojang` | `mojang` |
+| `java-source` | 枚举 | `adoptium` / `azul` / `foojay` | `all`（全部内置来源） |
+
+写入走「临时文件 → fsync → rename」，写入失败时旧配置原样保留；校验在落地前完成，
+取值非法时文件不会被创建或改动。

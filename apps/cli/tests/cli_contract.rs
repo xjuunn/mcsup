@@ -554,3 +554,310 @@ fn version_exits_0_on_stdout() {
     assert!(out.stderr.is_empty());
     assert!(String::from_utf8_lossy(&out.stdout).contains("mcsup"));
 }
+
+/// release CI 逐行比对 `mcsup --version` 与 workspace 版本：格式必须精确
+#[test]
+fn dash_version_is_exact_line() {
+    let home = temp_home();
+    let out = run(home.path(), &["--version"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim_end(),
+        concat!("mcsup ", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+/// `mcsup version` 与 `--version` 是两条通道：JSON 字段齐全且版本号一致
+#[test]
+fn version_json_reports_build_fields() {
+    let home = temp_home();
+    let out = run(home.path(), &["version", "--output", "json"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let payload: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("version stdout 必须是单个 JSON 对象");
+    assert_eq!(payload["name"], "mcsup");
+    assert_eq!(payload["version"], env!("CARGO_PKG_VERSION"));
+    assert!(
+        payload["target"].as_str().is_some_and(|t| !t.is_empty()),
+        "{payload}"
+    );
+    assert!(matches!(
+        payload["profile"].as_str(),
+        Some("debug" | "release")
+    ));
+    assert_eq!(payload["protocol_version"], 1);
+}
+
+/// 配置文件不存在时 `config show` 仍给出全部键的生效值，来源标 `default`
+#[test]
+fn config_show_without_file_reports_defaults() {
+    let home = temp_home();
+    let out = run(home.path(), &["config", "show", "--output", "json"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let payload: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("config show 必须输出单个 JSON 对象");
+    assert_eq!(payload["exists"], false);
+    let items = payload["items"].as_array().expect("items");
+    let keys: Vec<&str> = items
+        .iter()
+        .map(|i| i["key"].as_str().expect("key"))
+        .collect();
+    assert_eq!(keys, ["data-dir", "download-mirror", "java-source"]);
+    assert!(items.iter().all(|i| i["source"] == "default"), "{items:?}");
+}
+
+/// `set` → `show` → `unset` 往返：文件落地、生效值回退、`unset` 幂等
+#[test]
+fn config_set_show_unset_roundtrip() {
+    let home = temp_home();
+    let config = home.path().join("custom").join("config.toml");
+    let config = config.to_str().expect("utf8");
+
+    let set = run(
+        home.path(),
+        &[
+            "--config",
+            config,
+            "config",
+            "set",
+            "java-source",
+            "azul",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(set.status.code(), Some(0), "stderr: {}", stderr(&set));
+    let set_payload: serde_json::Value =
+        serde_json::from_slice(&set.stdout).expect("config set 单行对象");
+    assert_eq!(set_payload["key"], "java-source");
+    assert_eq!(set_payload["value"], "azul");
+    assert_eq!(set_payload["previous"], serde_json::Value::Null);
+
+    let show = run(
+        home.path(),
+        &["--config", config, "config", "show", "--output", "json"],
+    );
+    assert_eq!(show.status.code(), Some(0), "stderr: {}", stderr(&show));
+    let show_payload: serde_json::Value = serde_json::from_slice(&show.stdout).expect("show");
+    assert_eq!(show_payload["exists"], true);
+    let java = show_payload["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|i| i["key"] == "java-source")
+        .expect("java-source 行");
+    assert_eq!(java["value"], "azul");
+    assert_eq!(java["source"], "file");
+
+    let unset = run(
+        home.path(),
+        &[
+            "--config",
+            config,
+            "config",
+            "unset",
+            "java-source",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(unset.status.code(), Some(0), "stderr: {}", stderr(&unset));
+    let unset_payload: serde_json::Value = serde_json::from_slice(&unset.stdout).expect("unset");
+    assert_eq!(unset_payload["value"], "all");
+    assert_eq!(unset_payload["previous"], "azul");
+
+    // 已是缺省再 unset：幂等成功，不制造「改了什么」的错觉
+    let again = run(
+        home.path(),
+        &[
+            "--config",
+            config,
+            "config",
+            "unset",
+            "java-source",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(again.status.code(), Some(0), "stderr: {}", stderr(&again));
+    let again_payload: serde_json::Value = serde_json::from_slice(&again.stdout).expect("unset2");
+    assert_eq!(again_payload["previous"], serde_json::Value::Null);
+    assert_eq!(again_payload["value"], "all");
+}
+
+/// 键名拼错 → 用法错误 2，并列出可用键
+#[test]
+fn config_set_unknown_key_exits_2() {
+    let home = temp_home();
+    let out = run(home.path(), &["config", "set", "nope", "1"]);
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(out.stdout.is_empty(), "用法错误不得输出数据");
+    let err = stderr(&out);
+    assert!(err.contains("未知配置键"), "{err}");
+    assert!(err.contains("data-dir"), "{err}");
+}
+
+/// 取值不在枚举表内 → 用法错误 2，文件保持未创建（先校验后落地）
+#[test]
+fn config_set_invalid_value_exits_2_and_writes_nothing() {
+    let home = temp_home();
+    let config = home.path().join("config.toml");
+    let config = config.to_str().expect("utf8");
+    let out = run(
+        home.path(),
+        &["--config", config, "config", "set", "java-source", "nope"],
+    );
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("adoptium"), "{err}");
+    assert!(!Path::new(config).exists(), "校验失败不得写文件");
+}
+
+/// 非交互下 `config edit` 无法进编辑器：退 2 而不是静默成功
+#[test]
+fn config_edit_without_tty_exits_2() {
+    let home = temp_home();
+    let out = run(home.path(), &["config", "edit"]);
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(out.stdout.is_empty(), "用法错误不得输出数据");
+    assert!(stderr(&out).contains("交互终端"), "{}", stderr(&out));
+}
+
+/// `doctor --offline` 跳过联网检查：payload 明说 `online: false`，不伪装成通过
+#[test]
+fn doctor_offline_json_reports_online_false() {
+    let home = temp_home();
+    let out = run(home.path(), &["doctor", "--offline", "--output", "json"]);
+    let payload: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("doctor 必须输出单个 JSON 对象");
+    assert_eq!(payload["online"], false, "{payload}");
+    assert_eq!(payload["schema"], 1);
+    assert!(payload["findings"].is_array(), "{payload}");
+    // 离线时不能出现联网检查项的结论
+    let findings = payload["findings"].as_array().expect("findings");
+    assert!(
+        findings
+            .iter()
+            .all(|f| f["kind"] != "source-unreachable" && f["kind"] != "source-empty"),
+        "{findings:?}"
+    );
+}
+
+/// `doctor --only` 拼错 → 用法错误 2，列出可用检查项
+#[test]
+fn doctor_unknown_only_exits_2() {
+    let home = temp_home();
+    let out = run(home.path(), &["doctor", "--only", "nope"]);
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("data-dir-missing"), "{err}");
+}
+
+/// 配置损坏时 doctor 必须报 `config-invalid` 并退 1：体检工具不能把故障报成通过
+#[test]
+fn doctor_reports_invalid_config() {
+    let home = temp_home();
+    let config = home.path().join("config.toml");
+    std::fs::write(&config, "java-source = \"nope\"\n").expect("写入非法配置");
+    let out = run(
+        home.path(),
+        &[
+            "--config",
+            config.to_str().expect("utf8"),
+            "doctor",
+            "--offline",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).expect("doctor json");
+    assert_eq!(payload["has_errors"], true, "{payload}");
+    let findings = payload["findings"].as_array().expect("findings");
+    let invalid = findings
+        .iter()
+        .find(|f| f["kind"] == "config-invalid")
+        .expect("必须报 config-invalid");
+    assert_eq!(invalid["level"], "error");
+    assert!(
+        invalid["fix"]
+            .as_str()
+            .is_some_and(|f| f.contains("config")),
+        "{invalid}"
+    );
+}
+
+/// 简写与全拼是同一个命令：stdout 逐字节一致、退出码一致
+#[test]
+fn subcommand_shorthand_matches_long_form() {
+    let home = temp_home();
+    let ws = home.path().join("wsdir");
+    let init = run(
+        home.path(),
+        &[
+            "ws",
+            "in",
+            "--dir",
+            ws.to_str().expect("utf8"),
+            "--name",
+            "ws1",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(init.status.code(), Some(0), "stderr: {}", stderr(&init));
+
+    for (short, long) in [
+        (
+            vec!["ws", "ls", "--output", "json"],
+            vec!["workspace", "list", "--output", "json"],
+        ),
+        (
+            vec!["srv", "ls", "--output", "json"],
+            vec!["server", "list", "--output", "json"],
+        ),
+        (
+            vec!["jv", "ls", "--output", "json"],
+            vec!["java", "list", "--output", "json"],
+        ),
+    ] {
+        let from_short = run(home.path(), &short);
+        let from_long = run(home.path(), &long);
+        assert_eq!(
+            from_short.status.code(),
+            from_long.status.code(),
+            "{short:?} 与 {long:?} 退出码不同"
+        );
+        assert!(
+            !from_short.stdout.is_empty(),
+            "{short:?} 无 stdout，stderr: {}",
+            stderr(&from_short)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&from_short.stdout),
+            String::from_utf8_lossy(&from_long.stdout),
+            "{short:?} 与 {long:?} stdout 不一致"
+        );
+    }
+}
+
+/// 单字母不提供简写：按未知子命令报错退出，不推断、不执行
+#[test]
+fn single_letter_shorthand_is_rejected() {
+    let home = temp_home();
+    for args in [vec!["s"], vec!["w"], vec!["server", "l"]] {
+        let out = run(home.path(), &args);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{args:?} stderr: {}",
+            stderr(&out)
+        );
+        assert!(out.stdout.is_empty(), "{args:?} 不得输出数据");
+        assert!(
+            stderr(&out).contains("unrecognized subcommand"),
+            "{args:?}: {}",
+            stderr(&out)
+        );
+    }
+}

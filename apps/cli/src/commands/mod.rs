@@ -1,3 +1,5 @@
+mod config;
+mod doctor;
 mod install;
 mod java;
 mod lifecycle;
@@ -7,14 +9,14 @@ mod settings;
 mod workspace;
 
 use crate::cli::{Cli, Command, JavaAction, ServerAction};
-use crate::config::Config;
+use crate::config::ConfigFile;
 use crate::diagnostic::AppDiagnostic;
 use crate::locale::Lang;
 use crate::output::Printer;
 use anyhow::{Context, Result};
 use std::path::Path;
 
-pub(crate) async fn run(cli: Cli, cfg: &Config, lang: Lang) -> Result<()> {
+pub(crate) async fn run(cli: Cli, cfg: &ConfigFile, lang: Lang) -> Result<()> {
     let printer = Printer::new(cli.output, lang);
     match cli.command {
         Command::Workspace { action } => workspace::run(action, printer),
@@ -22,11 +24,12 @@ pub(crate) async fn run(cli: Cli, cfg: &Config, lang: Lang) -> Result<()> {
         Command::Modpack { .. } => err("modpack"),
         Command::Java { action } => java(action, printer).await,
         Command::Remote { .. } => err("remote"),
-        Command::Doctor => err("doctor"),
-        Command::Config { .. } => {
-            printer.print_section(&format!("配置: {}", cfg.path.display()));
-            Ok(())
-        }
+        Command::Doctor {
+            only,
+            strict,
+            offline,
+        } => doctor::run(cfg, &only, strict, offline, printer).await,
+        Command::Config { action } => config::run(action, printer),
         Command::Update => err("update"),
         Command::Supervise {
             dir,
@@ -51,12 +54,53 @@ pub(crate) async fn run(cli: Cli, cfg: &Config, lang: Lang) -> Result<()> {
             }
         }
         Command::Completions { shell } => crate::completions::generate(shell),
-        Command::Version => {
-            printer.print_section(&format!("mcsup {}", env!("CARGO_PKG_VERSION")));
-            Ok(())
-        }
+        Command::Version => print_version(printer),
     }
 }
+
+/// `mcsup version`：版本、构建与协议信息
+///
+/// 与 `mcsup --version`（只打 `mcsup <ver>`）是两条通道，后者被 CI 与脚本
+/// 按行精确比对，改动这里不影响它。
+fn print_version(printer: Printer) -> Result<()> {
+    let payload = mcsup::protocol::cli::VersionInfoJson {
+        name: "mcsup",
+        version: env!("CARGO_PKG_VERSION"),
+        target: target_triple(),
+        profile: PROFILE,
+        protocol_version: mcsup::protocol::PROTOCOL_VERSION,
+    };
+    if printer.is_human() {
+        let mut table = comfy_table::Table::new();
+        table.set_header(["项", "值"]);
+        table.add_row(["程序", payload.name]);
+        table.add_row(["版本", payload.version]);
+        table.add_row(["目标平台", payload.target]);
+        table.add_row(["构建", payload.profile]);
+        table.add_row(["协议", &payload.protocol_version.to_string()]);
+        crate::output::print_table(&table);
+        return Ok(());
+    }
+    printer.print_outcome("", &payload)
+}
+
+/// 构建目标描述
+///
+/// 交叉编译（CI 的 `--target`）时由外部注入 `TARGET`；本地构建没有该变量，
+/// 退回 `os-arch`，不冒充完整三元组，也不输出 `unknown`。
+fn target_triple() -> &'static str {
+    static LOCAL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    option_env!("TARGET").unwrap_or_else(|| {
+        LOCAL.get_or_init(|| format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH))
+    })
+}
+
+/// 编译配置
+const PROFILE: &str = if cfg!(debug_assertions) {
+    "debug"
+} else {
+    "release"
+};
 
 async fn java(action: JavaAction, printer: Printer) -> Result<()> {
     match action {
@@ -73,7 +117,7 @@ async fn java(action: JavaAction, printer: Printer) -> Result<()> {
     }
 }
 
-async fn server(action: ServerAction, cfg: &Config, printer: Printer) -> Result<()> {
+async fn server(action: ServerAction, cfg: &ConfigFile, printer: Printer) -> Result<()> {
     match action {
         ServerAction::List => server_ops::list(printer),
         ServerAction::Create {

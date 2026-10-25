@@ -107,6 +107,30 @@ pub(crate) fn doctor() -> &'static str {
 }
 
 #[must_use]
+pub(crate) fn doctor_only_arg() -> &'static str {
+    t(
+        "只跑指定检查项（kebab-case，逗号分隔）；缺省全跑",
+        "run only the given checks (kebab-case, comma separated); all by default",
+    )
+}
+
+#[must_use]
+pub(crate) fn doctor_strict_arg() -> &'static str {
+    t(
+        "warning 也视为失败（CI 用）",
+        "treat warnings as failures (for CI)",
+    )
+}
+
+#[must_use]
+pub(crate) fn doctor_offline_arg() -> &'static str {
+    t(
+        "跳过联网检查（来源连通性）",
+        "skip network checks (source reachability)",
+    )
+}
+
+#[must_use]
 pub(crate) fn config() -> &'static str {
     t("查看 / 编辑平台配置", "view or edit platform configuration")
 }
@@ -470,6 +494,11 @@ pub(crate) fn config_show() -> &'static str {
 #[must_use]
 pub(crate) fn config_set() -> &'static str {
     t("设置配置项", "set a configuration entry")
+}
+
+#[must_use]
+pub(crate) fn config_unset() -> &'static str {
+    t("恢复为平台缺省", "restore the platform default")
 }
 
 #[must_use]

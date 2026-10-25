@@ -10,7 +10,8 @@
 
 任何改动遵循「先理解后编码」的流程与完成标准，见
 [docs/development-workflow.md](docs/development-workflow.md)。
-新功能 / bugfix 默认在新建 worktree 中完成，见
+新功能 / bugfix 在 worktree 中完成，任务边界是提交：已提交即删除该 worktree，
+未提交则继续在其中做。见
 [docs/development-workflow.md](docs/development-workflow.md) 任务交付流程。
 架构归属与依赖方向见 [AGENTS.md](AGENTS.md) 的「代码归属与依赖方向」一节；
 拿不准某段代码属于哪层时先读 [docs/architecture.md](docs/architecture.md)。

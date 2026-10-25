@@ -15,6 +15,8 @@ mod progress;
 mod prompts;
 mod verbosity;
 
+use crate::config::ConfigFile;
+use std::io::IsTerminal;
 use std::{env, process::ExitCode};
 
 #[tokio::main]
@@ -27,16 +29,11 @@ async fn main() -> ExitCode {
     // 语言先于一切输出确定：帮助之外的提示都经 Printer 出去
     let lang = locale::detect(locale::LangChoice::parse(&cli.lang));
     let printer = output::Printer::new(cli.output, lang);
+    init_color(cli.output);
     verbosity::init(cli.verbose);
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "启动");
 
-    let cfg = match config::Config::load(cli.config.as_deref()) {
-        Ok(cfg) => cfg,
-        Err(err) => {
-            printer.render_error(err);
-            return ExitCode::from(1);
-        }
-    };
+    let cfg = ConfigFile::locate(cli.config.as_deref());
 
     match commands::run(cli, &cfg, lang).await {
         Ok(()) => ExitCode::SUCCESS,
@@ -50,6 +47,18 @@ async fn main() -> ExitCode {
             ExitCode::from(code)
         }
     }
+}
+
+/// 着色开关：只在 stdout 是终端时启用
+///
+/// `owo_colors` 默认按全局条件判定，管道 / 重定向下仍会写 ANSI 转义，
+/// 冒到 `config show | grep` 这类用法里。`--output json` 本就只剩一行数据，
+/// 不参与着色。
+fn init_color(output: output::OutputFormat) {
+    let enabled = output == output::OutputFormat::Human
+        && std::io::stdout().is_terminal()
+        && env::var_os("NO_COLOR").is_none();
+    owo_colors::set_override(enabled);
 }
 
 /// release 用 `panic = "abort"` 压体积，展开被关闭后 [`input::RawMode`] 的

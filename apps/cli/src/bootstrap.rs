@@ -12,7 +12,7 @@ use std::sync::Arc;
 ///
 /// 所有命令从这里取库，禁止各自拼 `config::database_path()` + `open`。
 pub(crate) fn open_store() -> Result<Arc<mcsup::storage::JsonStore>> {
-    let path = config::database_path()?;
+    let path = config::database_path();
     let store = mcsup::storage::JsonStore::open(&path)
         .with_context(|| format!("打开元数据仓库 {}", path.display()))?;
     Ok(Arc::new(store))
@@ -29,7 +29,7 @@ pub(crate) fn open_registry() -> Result<Arc<mcsup::service::ServerRegistry>> {
 
 /// 平台 Java 安装根目录（`{data_dir}/mcsup/java`），不存在则创建
 pub(crate) fn java_root() -> Result<PathBuf> {
-    let root = config::platform_data_dir()?.join("java");
+    let root = config::platform_data_dir().join("java");
     std::fs::create_dir_all(&root).with_context(|| format!("创建 Java 目录 {}", root.display()))?;
     Ok(root)
 }
@@ -153,7 +153,7 @@ pub(crate) fn join_variants(available: &[ServerVariant], lang: Lang) -> String {
 /// CLI 不再自己拼 `JsonStore` / 下载器 / Java 服务。第三方宿主用同一个
 /// 组合根即可获得与 CLI 完全一致的默认行为。
 pub(crate) fn open_mcsup() -> Result<Mcsup> {
-    let data_dir = config::platform_data_dir()?;
+    let data_dir = config::platform_data_dir();
     Mcsup::open(&data_dir).context("装配 mcsup 组合根")
 }
 

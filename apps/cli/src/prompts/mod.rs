@@ -101,9 +101,9 @@ impl std::fmt::Display for LocationChoice {
 ///
 /// # Errors
 ///
-/// 读取终端输入或解析数据目录失败时返回底层错误
+/// 读取终端输入失败时返回底层错误
 pub(crate) fn pick_workspace_location() -> Result<WorkspaceLocation> {
-    let data_root = crate::config::platform_data_dir()?.join("workspaces");
+    let data_root = crate::config::platform_data_dir().join("workspaces");
     let cwd = std::env::current_dir().context("获取当前工作目录失败")?;
     let choices = vec![
         LocationChoice {
