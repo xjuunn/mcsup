@@ -40,6 +40,10 @@ pub(crate) const OFFICIAL_META: &str = "https://meta.fabricmc.net";
 /// 挑选 loader / 安装器版本的口径
 ///
 /// 允许调用方接管选择策略（固定版本、按实验版、灰度），而不必重写整个来源。
+///
+/// 这是给宿主的扩展点：[`LatestStable`](Self::LatestStable) 是 CLI 实际使用的
+/// 口径，[`Fixed`](Self::Fixed) 目前只能通过 [`FabricSource::builder`] 注入，
+/// 没有配置项驱动。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Picks {
     /// 最新稳定版；无稳定版时退回列表首项（最新）
@@ -58,6 +62,8 @@ pub enum Picks {
 ///
 /// 用 [`FabricSource::new`] 得到对接官方的默认实例；第三方镜像通过
 /// [`FabricSource::builder`] 改 `base_url`，自定义版本策略改 `picks`。
+///
+/// [`FabricSource::new`] 是唯一的出厂路径，CLI 与库侧组合根都用它。
 pub struct FabricSource {
     http: Client,
     /// Meta 根地址（不带尾斜杠），官方或镜像
@@ -121,17 +127,7 @@ impl ServerJarSource for FabricSource {
     async fn versions(&self) -> Result<Vec<ServerVersion>, SourceError> {
         let url = format!("{}/v2/versions/game", self.base_url);
         let games: Vec<GameVersion> = self.get(&url, None).await?;
-        Ok(games
-            .into_iter()
-            .map(|game| ServerVersion {
-                id: VersionId::new(game.version),
-                kind: game_kind(game.stable),
-                variant: ServerVariant::Fabric,
-                // Fabric 只关心 loader 自身的最低 Java 要求，MC 版本要求的
-                // Java 大版本由原版元数据给出，这里不做猜测
-                java_major: None,
-            })
-            .collect())
+        Ok(games.into_iter().map(into_server_version).collect())
     }
 
     async fn artifact(&self, version: &VersionId) -> Result<ResolvedArtifact, SourceError> {
@@ -228,6 +224,19 @@ fn resolve_game_id(raw: &str, games: Vec<GameVersion>) -> Option<String> {
         .map(|game| game.version)
 }
 
+/// 一条上游游戏版本记录 → 领域版本
+///
+/// Fabric 只关心 loader 自身的最低 Java 要求，MC 版本要求的 Java 大版本由
+/// 原版元数据给出，这里不做猜测，一律 `None`。
+fn into_server_version(game: GameVersion) -> ServerVersion {
+    ServerVersion {
+        id: VersionId::new(game.version),
+        kind: game_kind(game.stable),
+        variant: ServerVariant::Fabric,
+        java_major: None,
+    }
+}
+
 /// `stable` 标记 → 领域版本类别
 ///
 /// Fabric Meta 只区分稳定与快照，没有原版的「历史版本」档，因此非稳定版
@@ -264,6 +273,10 @@ enum UrlError {
 ///
 /// 第三方镜像（如 BMCLAPI 的 `/fabric-meta`）只需换 [`Self::base_url`]；
 /// 版本选择策略通过 [`Self::picks`] 接管。
+///
+/// 宿主扩展点：CLI 与库侧组合根都直接用 [`FabricSource::new`]，没有配置项
+/// 驱动这里的镜像 / 版本策略；需要时由宿主构造并注入
+/// `McsupBuilder::jar_sources`。
 #[derive(Debug, Default)]
 pub struct FabricSourceBuilder {
     base_url: Option<String>,
@@ -519,21 +532,18 @@ mod tests {
         assert_eq!(resolve_game_id("1.99.999", games()), None);
     }
 
-    /// 版本列表按 `stable` 标注类别，且全部声明 fabric 变体
+    /// 上游记录经 `into_server_version`（`versions()` 实际使用的映射）转换：
+    /// `stable` 标注类别，且全部声明 fabric 变体、不带 Java 要求
     #[test]
     fn version_list_marks_kind_and_variant() {
-        let mapped: Vec<_> = games()
-            .into_iter()
-            .map(|game| ServerVersion {
-                id: VersionId::new(game.version),
-                kind: game_kind(game.stable),
-                variant: ServerVariant::Fabric,
-                java_major: None,
-            })
-            .collect();
+        let mapped: Vec<_> = games().into_iter().map(into_server_version).collect();
         assert_eq!(mapped[0].id, VersionId::new("26.4-snapshot-5"));
         assert_eq!(mapped[0].kind, VersionKind::Snapshot);
         assert_eq!(mapped[1].kind, VersionKind::Release);
         assert!(mapped.iter().all(|v| v.variant == ServerVariant::Fabric));
+        assert!(
+            mapped.iter().all(|v| v.java_major.is_none()),
+            "Fabric 不做 MC Java 版本的猜测"
+        );
     }
 }
