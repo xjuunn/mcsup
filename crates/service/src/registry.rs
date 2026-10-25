@@ -1,3 +1,4 @@
+use domain::server::launch::LaunchSpec;
 use domain::server::meta::{InstalledJar, ServerId, ServerMeta, ServerName};
 use domain::server::settings::ServerSettings;
 use domain::server::version::{ServerVariant, VersionId};
@@ -22,6 +23,10 @@ const SERVER_MARKER_SCHEMA: u32 = 1;
 const SERVER_JAR: &str = "server.jar";
 /// 安装暂存文件：先下载到这里，校验通过后再原子替换 `server.jar`
 const STAGING_JAR: &str = ".server.jar.installing";
+/// 安装器暂存文件名：安装器下载到这里，运行完即删除（不留在服务器目录）
+const STAGING_INSTALLER: &str = ".forge-installer.jar";
+/// Forge 安装器产出的首个启动参数文件（[`LaunchSpec::Args`] 的第一项）
+const FORGE_USER_ARGS: &str = "user_jvm_args.txt";
 
 /// 服务器注册操作失败
 #[derive(Debug, Error)]
@@ -241,8 +246,10 @@ pub struct InstalledServerJar {
     pub server: RegisteredServer,
     /// 写入的元数据
     pub jar: InstalledJar,
-    /// 核心绝对路径
+    /// 核心绝对路径（单 JAR 启动时的 JAR；参数文件启动时为第一个参数文件）
     pub destination: PathBuf,
+    /// 本次安装确定的启动方式
+    pub launch: LaunchSpec,
 }
 
 /// 服务器注册表编排：归属工作目录、目录创建、marker、注册
@@ -320,6 +327,7 @@ impl ServerRegistry {
             version: version.clone(),
             variant,
             jar: None,
+            launch: None,
             settings: ServerSettings::default(),
             java_major,
             created_at: now,
@@ -444,6 +452,7 @@ impl ServerRegistry {
             version: VersionId::new("unknown"),
             variant: ServerVariant::Unknown,
             jar: None,
+            launch: None,
             settings: ServerSettings::default(),
             java_major: None,
             created_at: now,
@@ -575,14 +584,20 @@ impl ServerRegistry {
         name: &str,
         version: &VersionId,
         jar: &InstalledJar,
+        launch: Option<&LaunchSpec>,
         required_java_major: Option<domain::java::JavaMajor>,
         updated_at: i64,
     ) -> Result<RegisteredServer, ServerRegistryError> {
         let name =
             ServerName::parse(name).map_err(|_| ServerRegistryError::NotFound(name.to_owned()))?;
-        let meta =
-            self.servers
-                .update_core(&name, version, jar, required_java_major, updated_at)?;
+        let meta = self.servers.update_core(
+            &name,
+            version,
+            jar,
+            launch,
+            required_java_major,
+            updated_at,
+        )?;
         let dir = self.absolute_dir(&meta)?;
         let linked = dir
             .symlink_metadata()
@@ -612,34 +627,56 @@ impl ServerRegistry {
         Ok(RegisteredServer { meta, dir, linked })
     }
 
-    /// 给既有服务器安装核心：定位目录 → 下载到暂存文件 → 校验数据版本 →
-    /// 原子替换 `server.jar` → 回写元数据
+    /// 给既有服务器安装核心
     ///
-    /// 目标目录由注册表回答，入口不再拿当前工作目录当目标。先下到暂存文件是
-    /// 为了在覆盖旧核心前完成降级检查：校验不过时旧核心原样保留。
+    /// 两条路径按来源声明的 [`port::InstallKind`] 分流：
+    ///
+    /// - **直接可运行**（原版 / Fabric / Paper）：下载到暂存文件 → 校验数据版本
+    ///   → 原子替换 `server.jar` → 回写元数据。先下到暂存文件是为了在覆盖旧核心
+    ///   前完成降级检查：校验不过时旧核心原样保留。
+    /// - **安装器**（Forge / NeoForge）：把安装器下到服务器目录并就地运行，产出
+    ///   `libraries/` 与参数文件；启动方式记为 [`LaunchSpec::Args`]。安装器完成后
+    ///   即删除，不留在服务器目录。
+    ///
+    /// 目标目录由注册表回答，入口不再拿当前工作目录当目标。
     ///
     /// # Errors
     ///
-    /// 服务器不存在返回 [`InstallJarError::Registry`]；来源、下载或校验失败返回
-    /// [`InstallJarError::Install`]；元数据读取失败返回 [`InstallJarError::Inspect`]；
-    /// 目标版本低于世界数据版本返回 [`InstallJarError::Downgrade`]
+    /// 服务器不存在返回 [`InstallJarError::Registry`]；来源、下载、校验或安装器
+    /// 执行失败返回 [`InstallJarError::Install`]；元数据读取失败返回
+    /// [`InstallJarError::Inspect`]；目标版本低于世界数据版本返回
+    /// [`InstallJarError::Downgrade`]
+    #[allow(clippy::too_many_arguments)]
     pub async fn install_jar(
         &self,
         name: &str,
         version: &VersionId,
         installer: &ServerInstaller,
         inspector: &dyn CoreInspector,
+        installer_ctx: Option<&crate::InstallerContext>,
         progress: Option<&dyn ProgressSink>,
         cancel: &CancellationToken,
     ) -> Result<InstalledServerJar, InstallJarError> {
         let srv = self.get(name)?;
+
+        // 安装器路径：下载物是安装器而非服务端。先试这条路，拿不到产物
+        // （来源其实是直接可运行的 jar）时清掉临时文件，回落到下方直接路径。
+        if let Some(ctx) = installer_ctx
+            && let Some(installed) = self
+                .install_via_installer(name, version, installer, ctx, &srv.dir, progress, cancel)
+                .await?
+        {
+            return Ok(installed);
+        }
+
+        // —— 直接可运行的服务端：下载到暂存文件 → 降级检查 → 原子替换 ——
         let destination = srv.dir.join(SERVER_JAR);
         let staging = srv.dir.join(STAGING_JAR);
         let _ = std::fs::remove_file(&staging);
 
         let world = inspector.world_info(&srv.dir)?;
         let out: InstalledDownload = installer
-            .install(version, staging.clone(), progress, cancel)
+            .install(version, staging.clone(), None, progress, cancel)
             .await?;
         let target = match inspector.jar_data_version(&staging) {
             Ok(target) => target,
@@ -674,14 +711,151 @@ impl ServerRegistry {
             size: out.artifact.size,
             checksum: out.checksum,
         };
-        let srv = self.update_core(name, version, &jar, out.java_major, crate::util::unix_now())?;
+        let launch = LaunchSpec::jar(SERVER_JAR);
+        let srv = self.update_core(
+            name,
+            version,
+            &jar,
+            Some(&launch),
+            out.java_major,
+            crate::util::unix_now(),
+        )?;
         Ok(InstalledServerJar {
             server: srv,
             jar,
             destination,
+            launch,
         })
     }
 
+    /// 安装器路径：下载安装器到服务器目录 → 就地运行 → 记录参数文件启动方式
+    ///
+    /// 返回 `Ok(None)` 表示本次来源不是安装器（调用方继续走直接下载路径）；
+    /// `Ok(Some(..))` 表示安装器安装已完成。
+    // 参数同样是编排必需的输入（目标、版本、下载器、安装器上下文、目录、进度、
+    // 取消），与 [`Self::install_jar`] 保持同一套平铺签名
+    #[allow(clippy::too_many_arguments)]
+    async fn install_via_installer(
+        &self,
+        name: &str,
+        version: &VersionId,
+        installer: &ServerInstaller,
+        ctx: &crate::InstallerContext,
+        dir: &Path,
+        progress: Option<&dyn ProgressSink>,
+        cancel: &CancellationToken,
+    ) -> Result<Option<InstalledServerJar>, InstallJarError> {
+        let installer_path = dir.join(STAGING_INSTALLER);
+        let _ = std::fs::remove_file(&installer_path);
+        let out = installer
+            .install(version, installer_path.clone(), Some(ctx), progress, cancel)
+            .await?;
+        if out.install != port::InstallKind::Installer {
+            // 不是安装器：清掉临时下载，交回调用方走直接路径
+            let _ = std::fs::remove_file(&installer_path);
+            return Ok(None);
+        }
+
+        // 运行完删除安装器：它不是服务端的一部分，留着会污染目录与备份
+        let _ = std::fs::remove_file(&installer_path);
+
+        let files = forge_args_files(version.as_str(), dir);
+        if files.is_empty() {
+            return Err(InstallError::Layout(format!(
+                "安装器完成后在 {} 找不到启动参数文件",
+                dir.display()
+            ))
+            .into());
+        }
+        let launch = LaunchSpec::Args {
+            files: files.clone(),
+        };
+        // 参数文件启动没有单一核心 JAR：以首个参数文件作「核心」记录，
+        // 大小与 SHA1 记安装器下载值（安装产物本身由 libraries/ 表达）
+        let jar = InstalledJar {
+            path: files[0].clone(),
+            size: out.artifact.size,
+            checksum: out.checksum,
+        };
+        let srv = self.update_core(
+            name,
+            version,
+            &jar,
+            Some(&launch),
+            out.java_major,
+            crate::util::unix_now(),
+        )?;
+        Ok(Some(InstalledServerJar {
+            destination: dir.join(&files[0]),
+            server: srv,
+            jar,
+            launch,
+        }))
+    }
+}
+
+/// 安装器产出的启动参数文件（相对服务器目录，按展开顺序）
+///
+/// Forge 生成 `user_jvm_args.txt` 与平台专属的 `win_args.txt` /
+/// `unix_args.txt`。只返回磁盘上**确实存在**的那些，缺第一个（用户参数文件）
+/// 视为安装失败。平台参数文件路径由 `libraries/net/minecraftforge/forge/{build}`
+/// 推出；不存在时再扫一遍 `libraries` 兜底，容忍上游路径变化。
+fn forge_args_files(build: &str, dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if !dir.join(FORGE_USER_ARGS).is_file() {
+        return files;
+    }
+    files.push(PathBuf::from(FORGE_USER_ARGS));
+
+    let platform = if cfg!(windows) {
+        "win_args.txt"
+    } else {
+        "unix_args.txt"
+    };
+    let expected = dir
+        .join("libraries/net/minecraftforge/forge")
+        .join(build)
+        .join(platform);
+    if expected.is_file() {
+        files.push(PathBuf::from(format!(
+            "libraries/net/minecraftforge/forge/{build}/{platform}"
+        )));
+        return files;
+    }
+    // 兜底：在 libraries 下找任意 *args.txt（上游可能改版本目录命名）
+    if let Some(rel) = find_args_file(&dir.join("libraries"), platform) {
+        files.push(rel);
+    }
+    files
+}
+
+/// 在 `root` 下递归找首个名为 `name` 的文件，返回相对 `root` 上一级（即服务器
+/// 目录）的路径；找不到返回 `None`。深度受限，避免扫遍整个 libraries。
+fn find_args_file(root: &Path, name: &str) -> Option<PathBuf> {
+    fn walk(dir: &Path, name: &str, depth: usize) -> Option<PathBuf> {
+        if depth == 0 {
+            return None;
+        }
+        let entries = std::fs::read_dir(dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = walk(&path, name, depth - 1) {
+                    return Some(found);
+                }
+            } else if path.file_name().and_then(|n| n.to_str()) == Some(name) {
+                return Some(path);
+            }
+        }
+        None
+    }
+    let found = walk(root, name, 8)?;
+    // 转成相对服务器目录：root 是 `{dir}/libraries`，取其父
+    let server_dir = root.parent()?;
+    found.strip_prefix(server_dir).ok().map(PathBuf::from)
+}
+
+impl ServerRegistry {
     /// 某工作目录下的服务器数量（注册表口径，与 `server list` 同源）
     ///
     /// `workspace list` 的「服务器数」用这个，不要在入口数磁盘目录——
@@ -795,6 +969,7 @@ impl ServerRegistry {
             version: VersionId::new("unknown"),
             variant: ServerVariant::Unknown,
             jar: None,
+            launch: None,
             settings: ServerSettings::default(),
             java_major: None,
             created_at: now,
@@ -1027,6 +1202,7 @@ mod tests {
             name: &ServerName,
             version: &VersionId,
             jar: &InstalledJar,
+            _launch: Option<&LaunchSpec>,
             required_java_major: Option<domain::java::JavaMajor>,
             updated_at: i64,
         ) -> Result<ServerMeta, RepositoryError> {
@@ -1616,6 +1792,7 @@ mod tests {
                 },
                 location: url::Url::parse("https://example.invalid/server.jar").expect("url"),
                 java_major: None,
+                install: port::InstallKind::Direct,
             })
         }
 
@@ -1695,6 +1872,7 @@ mod tests {
                 &installer,
                 &inspector,
                 None,
+                None,
                 &CancellationToken::new(),
             )
             .await
@@ -1734,6 +1912,7 @@ mod tests {
                 &VersionId::new("26.1"),
                 &installer,
                 &inspector,
+                None,
                 None,
                 &CancellationToken::new(),
             )

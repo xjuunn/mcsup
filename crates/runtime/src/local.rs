@@ -20,6 +20,11 @@ pub struct LocalSupervisor;
 
 impl LocalSupervisor {
     /// 组装 `mcsup __supervise ...` 启动命令
+    ///
+    /// 启动方式按 [`domain::server::launch::LaunchSpec`] 分流：`Jar` 传
+    /// `--jar <相对路径>`，`Args` 依次传 `--arg-file <相对路径>`。路径保持
+    /// **相对服务器目录**（supervisor 以 `--dir` 为 cwd，由它拼绝对），与
+    /// `MinecraftLaunch` 的约定一致。
     fn supervisor_command(request: &SupervisorStartRequest) -> Command {
         let mut command = Command::new(&request.supervisor_exe);
         command
@@ -27,9 +32,20 @@ impl LocalSupervisor {
             .arg("--dir")
             .arg(&request.server_dir)
             .arg("--java")
-            .arg(&request.java_bin)
-            .arg("--jar")
-            .arg(&request.jar_path);
+            .arg(&request.java_bin);
+        match &request.launch {
+            domain::server::launch::LaunchSpec::Jar { path } => {
+                command.arg("--jar").arg(path);
+            }
+            domain::server::launch::LaunchSpec::Args { files } => {
+                for file in files {
+                    command.arg("--arg-file").arg(file);
+                }
+            }
+            // `LaunchSpec` 是 `#[non_exhaustive]`：未知形态不传启动参数，
+            // supervisor 会以「无启动入口」失败——不静默跑错命令
+            _ => {}
+        }
         if let Some(ram_mib) = request.ram_mib {
             command.arg("--ram").arg(ram_mib.to_string());
         }

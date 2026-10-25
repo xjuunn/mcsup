@@ -1185,6 +1185,7 @@ mod tests {
             name: &ServerName,
             version: &VersionId,
             jar: &domain::server::meta::InstalledJar,
+            _launch: Option<&domain::server::launch::LaunchSpec>,
             required_java_major: Option<domain::java::JavaMajor>,
             updated_at: i64,
         ) -> Result<ServerMeta, RepositoryError> {

@@ -219,6 +219,53 @@ fn create_fabric_variant_keeps_registry_on_download_failure() {
     assert!(marker_of(&ws, "fab1").is_file(), "磁盘与注册表不一致");
 }
 
+/// Forge 变体必须被识别并进入安装流程：显式 `--variant forge` 未注册时会以
+/// 用法错误 2 退出，已注册则走到下载（离线失败为 5）；失败同样保留注册结果。
+///
+/// Forge 的下载物是安装器，但离线环境下连元数据都取不到，压根不会进入
+/// 「执行安装器」阶段——本测试只覆盖变体注册与失败映射，不触碰真实安装。
+#[test]
+fn create_forge_variant_keeps_registry_on_download_failure() {
+    let home = temp_home();
+    let ws = init_workspace(&home, "ws1");
+
+    let create = run_in_env(
+        home.path(),
+        &[
+            "server",
+            "create",
+            "forge1",
+            "--version",
+            "1.21.1",
+            "--variant",
+            "forge",
+            "--output",
+            "json",
+        ],
+        &[
+            ("HTTPS_PROXY", DEAD_PROXY),
+            ("HTTP_PROXY", DEAD_PROXY),
+            ("ALL_PROXY", DEAD_PROXY),
+        ],
+    );
+    assert_eq!(
+        create.status.code(),
+        Some(5),
+        "forge 变体应被识别并进入下载（失败为 5），stderr: {}",
+        stderr(&create)
+    );
+    assert!(create.stdout.is_empty(), "失败时 stdout 应为空");
+
+    let list = run(home.path(), &["server", "list", "--output", "json"]);
+    ok(&list, "server list");
+    let parsed = stdout_json(&list);
+    let rows = parsed.as_array().expect("list 是数组");
+    assert_eq!(rows.len(), 1, "create 失败应保留注册结果: {parsed}");
+    assert_eq!(rows[0]["name"], "forge1");
+    assert_eq!(rows[0]["variant"], "forge", "变体必须如实记录");
+    assert!(marker_of(&ws, "forge1").is_file(), "磁盘与注册表不一致");
+}
+
 /// 完整读路径：init → list 空 → remove 不存在的服务器 → 退出码 3
 ///
 /// 不联网，覆盖「注册表为空时的读路径」与「未找到 → 3」的端到端映射。

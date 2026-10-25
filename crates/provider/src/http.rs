@@ -169,6 +169,34 @@ where
     })
 }
 
+/// GET 并读取为纯文本，用于非 JSON 的小文件（如 Forge 的 `.sha1` 侧车）
+///
+/// 与 [`get_json`] 共用同一套错误归类：`not_found_id` 非空且状态码为 404 时归
+/// 为 [`SourceError::NotFound`]，其余非 2xx 走 [`rejection`]。body 读取失败归
+/// [`SourceError::Network`]。
+///
+/// # Errors
+///
+/// 网络失败、非成功状态码或 body 读取失败时返回 [`SourceError`]
+pub(crate) async fn get_text(
+    client: &Client,
+    url: &str,
+    not_found_id: Option<VersionId>,
+) -> Result<String, SourceError> {
+    let response = client.get(url).send().await.map_err(map_transport)?;
+    let status = response.status();
+    if !status.is_success() {
+        let code = status.as_u16();
+        if code == 404
+            && let Some(id) = not_found_id
+        {
+            return Err(SourceError::NotFound(id));
+        }
+        return Err(rejection(code, extract_message(response).await));
+    }
+    response.text().await.map_err(map_transport)
+}
+
 #[async_trait]
 impl RangeSource for HttpByteSource {
     async fn stat(&self, location: &Url) -> Result<RemoteStat, SourceError> {

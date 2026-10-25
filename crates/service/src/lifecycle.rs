@@ -241,16 +241,16 @@ impl ServerLifecycleService {
             return Err(LifecycleError::AlreadyRunning);
         }
 
-        let jar_rel = server
+        // 启动方式：优先用安装时记录的 `LaunchSpec`；旧库记录（无 launch）
+        // 回退到历史口径——`server.jar`。核心文件是否存在按 spec 的主文件判定：
+        // `Jar` 是那个 JAR，`Args` 是第一个参数文件（安装器总会产出它）。
+        let launch = server
             .meta
-            .jar
-            .as_ref()
-            .map(|jar| jar.path.clone())
-            .ok_or_else(|| LifecycleError::NoJar {
-                name: name.to_owned(),
-            })?;
-        let jar_path = server.dir.join(&jar_rel);
-        if !jar_path.is_file() {
+            .launch
+            .clone()
+            .unwrap_or_else(|| domain::server::launch::LaunchSpec::jar("server.jar"));
+        let primary = server.dir.join(launch.primary_file());
+        if launch.is_empty() || !primary.is_file() {
             return Err(LifecycleError::NoJar {
                 name: name.to_owned(),
             });
@@ -265,7 +265,7 @@ impl ServerLifecycleService {
         let request = SupervisorStartRequest {
             server_dir: server.dir.clone(),
             java_bin: java_bin_under(&runtime.path),
-            jar_path,
+            launch,
             // 优先级：显式选项 > 服务属性（server set ram）> 平台默认
             ram_mib: Some(opts.ram_mib.or(settings.ram_mib).unwrap_or(DEFAULT_RAM_MIB)),
             supervisor_exe: opts.supervisor_exe.clone(),
@@ -344,20 +344,54 @@ impl ServerLifecycleService {
     /// 运行中返回 [`LifecycleError::Busy`]；其余见
     /// [`crate::InstallJarError`]（经 [`LifecycleError::Registry`]
     /// 的扩展转换，见 `From` 实现）
+    // 参数都是编排必需的输入（目标、版本、来源、校验器、安装器上下文、进度、
+    // 取消），拆结构体只会把调用方搞得更绕，保持平铺
+    #[allow(clippy::too_many_arguments)]
     pub async fn install_jar_checked(
         &self,
         name: &str,
         version: &VersionId,
         installer: &crate::ServerInstaller,
         inspector: &dyn CoreInspector,
+        installer_ctx: Option<&crate::InstallerContext>,
         progress: Option<&dyn ProgressSink>,
         cancel: &CancellationToken,
     ) -> Result<crate::InstalledServerJar, LifecycleError> {
         self.ensure_stopped(name, BusyOp::InstallJar)?;
         Ok(self
             .registry
-            .install_jar(name, version, installer, inspector, progress, cancel)
+            .install_jar(
+                name,
+                version,
+                installer,
+                inspector,
+                installer_ctx,
+                progress,
+                cancel,
+            )
             .await?)
+    }
+
+    /// 为服务端安装器挑一个 `java`：口径与 [`Self::start`] 完全一致
+    ///
+    /// 只有安装器类来源（Forge / NeoForge）需要：它得先用一个 JVM 跑
+    /// `--installServer`。挑选依据仍是「服务属性 > 版本要求 > 最新」——与
+    /// 启动同一套挑选口径（`pick_runtime`），避免安装与启动用不同 Java 导致行为分叉。
+    ///
+    /// # Errors
+    ///
+    /// 服务器不存在、无可用 Java 或注册表失败时返回 [`LifecycleError`]
+    pub fn installer_java_bin(
+        &self,
+        name: &str,
+        on_first_scan: &mut dyn FnMut(),
+        on_found: &mut dyn FnMut(&ScannedJava),
+    ) -> Result<PathBuf, LifecycleError> {
+        let server = self.registry.get(name)?;
+        let settings = server.meta.settings;
+        let runtimes = self.java.list_or_scan(on_first_scan, on_found)?;
+        let runtime = pick_runtime(&runtimes, settings.java_major, server.meta.java_major, name)?;
+        Ok(java_bin_under(&runtime.path))
     }
 
     /// 运行状态闸：任一服务器存活则拒绝（Busy），供生命周期敏感操作共用
@@ -707,6 +741,11 @@ mod tests {
     use std::io::Write as _;
     use std::sync::Mutex;
 
+    /// 单 JAR 启动规格（相对服务器目录）
+    fn mcsup_launch_jar(path: &str) -> domain::server::launch::LaunchSpec {
+        domain::server::launch::LaunchSpec::jar(path)
+    }
+
     // ---- 注册表 / Java 测试替身 ----
 
     struct MemServers {
@@ -746,6 +785,7 @@ mod tests {
             name: &domain::server::meta::ServerName,
             version: &VersionId,
             jar: &InstalledJar,
+            _launch: Option<&domain::server::launch::LaunchSpec>,
             required_java_major: Option<JavaMajor>,
             updated_at: i64,
         ) -> Result<domain::server::meta::ServerMeta, RepositoryError> {
@@ -1175,6 +1215,7 @@ mod tests {
                             checksum: Checksum::new(ChecksumAlgorithm::Sha1, "0".repeat(40)),
                         },
                         None,
+                        None,
                         1_700_000_000,
                     )
                     .expect("jar");
@@ -1308,7 +1349,11 @@ mod tests {
         assert_eq!(requests.len(), 1);
         let request = &requests[0];
         assert_eq!(request.server_dir, fixture.server_dir);
-        assert_eq!(request.jar_path, fixture.server_dir.join("server.jar"));
+        assert_eq!(
+            request.launch,
+            mcsup_launch_jar("server.jar"),
+            "默认启动方式为相对服务器目录的 server.jar"
+        );
         assert_eq!(request.java_bin, java_bin_under(Path::new("/opt/java21")));
         assert_eq!(request.ram_mib, Some(DEFAULT_RAM_MIB));
         assert_eq!(
@@ -1373,6 +1418,7 @@ mod tests {
                     size: 3,
                     checksum: Checksum::new(ChecksumAlgorithm::Sha1, "0".repeat(40)),
                 },
+                None,
                 Some(JavaMajor::parse(21).expect("21")),
                 1_700_000_000,
             )
@@ -1409,6 +1455,7 @@ mod tests {
                     size: 3,
                     checksum: Checksum::new(ChecksumAlgorithm::Sha1, "0".repeat(40)),
                 },
+                None,
                 Some(JavaMajor::parse(25).expect("25")),
                 1_700_000_000,
             )
@@ -1761,6 +1808,7 @@ mod tests {
                 &VersionId::new("1.21.2"),
                 &installer,
                 &NoopInspector,
+                None,
                 None,
                 &CancellationToken::new(),
             )

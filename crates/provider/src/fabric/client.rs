@@ -143,6 +143,7 @@ impl ServerJarSource for FabricSource {
             },
             location,
             java_major: None,
+            install: port::InstallKind::Direct,
         })
     }
 }

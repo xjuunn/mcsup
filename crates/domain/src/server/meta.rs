@@ -89,6 +89,9 @@ pub struct ServerMeta {
     pub variant: ServerVariant,
     /// 尚未执行 `server install` 时为 `None`
     pub jar: Option<InstalledJar>,
+    /// 服务端启动方式；`None` 时按 [`super::launch::LaunchSpec::jar`] 的
+    /// 历史口径（`server.jar`）推断，兼容旧库记录
+    pub launch: Option<super::launch::LaunchSpec>,
     /// 服务属性（`server set` 持久化）
     pub settings: super::settings::ServerSettings,
     /// 该服务端版本要求的 Java 大版本（来自版本详情的 javaVersion.majorVersion）

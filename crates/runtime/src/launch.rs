@@ -1,6 +1,15 @@
 //! 服务端启动参数与 JVM 命令构造
 ///
-/// 「怎么启动 Minecraft」是 Runtime 的职责：JVM 参数、jar、工作目录。
+/// 「怎么启动 Minecraft」是 Runtime 的职责：JVM 参数、jar / 参数文件、工作目录。
+///
+/// 两种启动形态由 [`domain::server::launch::LaunchSpec`] 表达：
+///
+/// - `Jar`：原版 / Fabric / Paper，`java -Xmx… -jar <jar> nogui`
+/// - `Args`：`Forge` / `NeoForge`，`java -Xmx… @user_jvm_args.txt @…_args.txt nogui`
+///
+/// `LaunchSpec` 里是**相对服务器目录**的路径，这里统一拼成绝对路径再进命令行，
+/// 避免依赖 JVM 的 `user.dir` 解析（supervisor spawn 时的 cwd 未必等于服务器目录）。
+use domain::server::launch::LaunchSpec;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
@@ -11,13 +20,13 @@ pub struct MinecraftLaunch {
     pub server_dir: PathBuf,
     /// `java` 可执行文件
     pub java_bin: PathBuf,
-    /// 服务端核心 JAR 绝对路径
-    pub jar_path: PathBuf,
+    /// 启动方式（相对服务器目录的路径，`build_command` 负责拼绝对）
+    pub launch: LaunchSpec,
     /// 堆内存上限（MiB）；`None` 用 JVM 默认
     pub ram_mib: Option<u32>,
 }
 
-/// JVM 参数（堆上限），jar 与 nogui 由 [`build_command`] 追加
+/// JVM 参数（堆上限），其余启动参数由 [`build_command`] 追加
 #[must_use]
 pub(crate) fn jvm_args(ram_mib: Option<u32>) -> Vec<String> {
     match ram_mib {
@@ -27,10 +36,29 @@ pub(crate) fn jvm_args(ram_mib: Option<u32>) -> Vec<String> {
 }
 
 /// 组装启动命令（不 spawn）
+///
+/// `Jar` 追加 `-jar <abs> nogui`；`Args` 依次追加 `@<abs>` 与 `nogui`。两条
+/// 分支都以 `nogui` 收尾：服务端不应尝试开图形界面。
 pub(crate) fn build_command(launch: &MinecraftLaunch) -> Command {
     let mut command = Command::new(&launch.java_bin);
     command.args(jvm_args(launch.ram_mib));
-    command.arg("-jar").arg(&launch.jar_path).arg("nogui");
+    match &launch.launch {
+        LaunchSpec::Jar { path } => {
+            command
+                .arg("-jar")
+                .arg(launch.server_dir.join(path))
+                .arg("nogui");
+        }
+        LaunchSpec::Args { files } => {
+            for file in files {
+                command.arg(format!("@{}", launch.server_dir.join(file).display()));
+            }
+            command.arg("nogui");
+        }
+        // `LaunchSpec` 是 `#[non_exhaustive]`：未知形态按 JAR 启动兜底不会更强，
+        // 直接只跑 JVM 参数——真实调用不会走到这里（上层已校验）
+        _ => {}
+    }
     command.current_dir(&launch.server_dir);
     command
 }
@@ -57,13 +85,28 @@ pub(crate) fn spawn_minecraft(launch: &MinecraftLaunch) -> std::io::Result<Child
 mod tests {
     use super::*;
 
-    fn launch(ram: Option<u32>) -> MinecraftLaunch {
+    fn jar_launch(ram: Option<u32>) -> MinecraftLaunch {
         MinecraftLaunch {
             server_dir: PathBuf::from("/srv/mc/a"),
             java_bin: PathBuf::from("/jdk/bin/java"),
-            jar_path: PathBuf::from("/srv/mc/a/server.jar"),
+            launch: LaunchSpec::jar("server.jar"),
             ram_mib: ram,
         }
+    }
+
+    fn args_launch(files: &[&str]) -> MinecraftLaunch {
+        MinecraftLaunch {
+            server_dir: PathBuf::from("/srv/mc/a"),
+            java_bin: PathBuf::from("/jdk/bin/java"),
+            launch: LaunchSpec::args(files.iter().copied()),
+            ram_mib: Some(2048),
+        }
+    }
+
+    fn args_of(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
     }
 
     #[test]
@@ -73,25 +116,59 @@ mod tests {
     }
 
     #[test]
-    fn command_runs_in_server_dir_with_nogui() {
-        let cmd = build_command(&launch(Some(1024)));
+    fn jar_command_runs_in_server_dir_with_nogui() {
+        let cmd = build_command(&jar_launch(Some(1024)));
         assert_eq!(cmd.get_program(), PathBuf::from("/jdk/bin/java"));
-        let args: Vec<_> = cmd
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
+        let expected_jar = PathBuf::from("/srv/mc/a").join("server.jar");
         assert_eq!(
-            args,
+            args_of(&cmd),
             vec![
                 "-Xmx1024M".to_owned(),
                 "-jar".to_owned(),
-                "/srv/mc/a/server.jar".to_owned(),
+                expected_jar.to_string_lossy().into_owned(),
                 "nogui".to_owned(),
             ]
         );
         assert_eq!(
             cmd.get_current_dir(),
             Some(std::path::Path::new("/srv/mc/a"))
+        );
+    }
+
+    /// Args 启动：`@绝对路径` 依次展开，以 nogui 收尾，无 `-jar`
+    #[test]
+    fn args_command_expands_parameter_files() {
+        let cmd = build_command(&args_launch(&[
+            "user_jvm_args.txt",
+            "libraries/net/minecraftforge/forge/1.21.1-52.0.1/unix_args.txt",
+        ]));
+        let args = args_of(&cmd);
+        let dir = std::path::Path::new("/srv/mc/a");
+        let expected_user = format!("@{}", dir.join("user_jvm_args.txt").display());
+        let expected_platform = format!(
+            "@{}",
+            dir.join("libraries/net/minecraftforge/forge/1.21.1-52.0.1/unix_args.txt")
+                .display()
+        );
+        assert_eq!(
+            args,
+            vec![
+                "-Xmx2048M".to_owned(),
+                expected_user,
+                expected_platform,
+                "nogui".to_owned(),
+            ]
+        );
+        assert!(!args.iter().any(|a| a == "-jar"), "Args 启动不应带 -jar");
+    }
+
+    /// Args 里没有文件时只留下 JVM 参数与 nogui（不会 panic）
+    #[test]
+    fn empty_args_launch_still_runs_jvm_with_nogui() {
+        let cmd = build_command(&args_launch(&[]));
+        assert_eq!(
+            args_of(&cmd),
+            vec!["-Xmx2048M".to_owned(), "nogui".to_owned()]
         );
     }
 }

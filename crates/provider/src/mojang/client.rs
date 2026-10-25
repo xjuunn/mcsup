@@ -122,6 +122,7 @@ fn into_atrifact(
         artifact,
         location,
         java_major,
+        install: port::InstallKind::Direct,
     })
 }
 

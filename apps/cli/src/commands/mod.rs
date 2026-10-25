@@ -36,13 +36,25 @@ pub(crate) async fn run(cli: Cli, cfg: &ConfigFile, lang: Lang) -> Result<()> {
             dir,
             java,
             jar,
+            arg_file,
             ram,
         } => {
-            // 隐藏入口：server start 拉起的守护进程本体，判定在 runtime
+            // 隐藏入口：server start 拉起的守护进程本体，判定在 runtime。
+            // `--jar` 与 `--arg-file` 二选一：前者单 JAR，后者参数文件串。
+            let launch = match (jar, arg_file.is_empty()) {
+                (Some(jar), true) => domain_launch_jar(jar),
+                (None, false) => domain_launch_args(arg_file),
+                // 两者都给或都不给：入口参数错误，明确报出而不是猜
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "__supervise 需要且仅需要 --jar 或至少一个 --arg-file"
+                    ));
+                }
+            };
             let launch = mcsup::runtime::MinecraftLaunch {
                 server_dir: dir,
                 java_bin: java,
-                jar_path: jar,
+                launch,
                 ram_mib: ram,
             };
             let code = tokio::task::spawn_blocking(move || mcsup::runtime::run_supervisor(&launch))
@@ -171,6 +183,16 @@ async fn server(action: ServerAction, cfg: &ConfigFile, printer: Printer) -> Res
 
 fn err(what: &str) -> Result<()> {
     Err(AppDiagnostic::not_implemented(what).into())
+}
+
+/// 单 JAR 启动规格（`__supervise --jar`）
+fn domain_launch_jar(jar: std::path::PathBuf) -> mcsup::domain::server::launch::LaunchSpec {
+    mcsup::domain::server::launch::LaunchSpec::Jar { path: jar }
+}
+
+/// 参数文件启动规格（`__supervise --arg-file ...`）
+fn domain_launch_args(files: Vec<std::path::PathBuf>) -> mcsup::domain::server::launch::LaunchSpec {
+    mcsup::domain::server::launch::LaunchSpec::Args { files }
 }
 
 async fn backup(action: BackupAction, printer: Printer) -> Result<()> {

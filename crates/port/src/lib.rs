@@ -64,6 +64,24 @@ pub struct ResolvedArtifact {
     pub location: Url,
     /// 版本要求的 Java 大版本（来源自版本详情）
     pub java_major: Option<JavaMajor>,
+    /// 下载物的用途：直接就是服务端，还是需要进一步安装
+    ///
+    /// 大多数来源（原版 / Fabric / Paper）下载得到的就是可运行服务端；
+    /// `Forge` / `NeoForge` 下载得到的是**安装器**，必须运行它才会产出服务端。
+    /// 由来源声明，service 据此决定下载后是否继续安装。
+    pub install: InstallKind,
+}
+
+/// 下载物的用途
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum InstallKind {
+    /// 下载即可运行的服务端 JAR（原版 / Fabric / Paper）
+    #[default]
+    Direct,
+    /// 下载的是安装器，需运行 `java -jar <installer> --installServer <dir>`
+    /// 才能产出服务端目录（`Forge` / `NeoForge`）
+    Installer,
 }
 
 /// 服务端 JAR 来源
@@ -265,6 +283,52 @@ pub trait ArtifactDownloader: Send + Sync {
 #[error("{0}")]
 pub struct ExtractError(pub String);
 
+/// 运行服务端安装器失败
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum InstallerError {
+    /// 无法启动 java（路径不存在、权限不足）
+    #[error("failed to launch installer: {0}")]
+    Spawn(#[source] std::io::Error),
+    /// 安装器非零退出（附带上游输出的尾部）
+    #[error("installer exited with {code}: {tail}")]
+    Failed {
+        /// 退出码
+        code: i32,
+        /// 安装器输出的末尾若干行，供排查
+        tail: String,
+    },
+    /// 安装器报告成功，但预期的产物缺失（如参数文件没生成）
+    #[error("installer finished but produced no server in {dir}")]
+    NoOutput {
+        /// 安装目录
+        dir: PathBuf,
+    },
+}
+
+/// 执行服务端安装器
+///
+/// `Forge` / `NeoForge` 的下载物是安装器而非服务端：必须运行
+/// `java -jar <installer> --installServer <dir>` 才会产出可启动的目录。
+/// 这是一次外部进程调用，抽象成 port 让 service 保持可测试，远端执行也能接。
+///
+/// 实现要求：
+/// - 在 `dir` 内以它为工作目录运行，产出（`libraries/`、参数文件）落在 `dir`
+/// - 返回前确认预期的启动参数文件已生成，否则报 [`InstallerError::NoOutput`]
+pub trait InstallerRunner: Send + Sync {
+    /// 运行安装器，产出服务端目录
+    ///
+    /// # Errors
+    ///
+    /// 启动失败、非零退出或产物缺失时返回 [`InstallerError`]
+    fn run_installer(
+        &self,
+        java_bin: &Path,
+        installer: &Path,
+        dir: &Path,
+    ) -> Result<(), InstallerError>;
+}
+
 /// 归档解压能力
 ///
 /// 解压是重活（外部工具链，将来的远端执行同样在此之后），不在 service 内
@@ -402,6 +466,7 @@ pub trait ServerRepository: Send + Sync {
         name: &ServerName,
         version: &VersionId,
         jar: &InstalledJar,
+        launch: Option<&domain::server::launch::LaunchSpec>,
         required_java_major: Option<JavaMajor>,
         updated_at: i64,
     ) -> Result<ServerMeta, RepositoryError>;
@@ -712,8 +777,8 @@ pub struct SupervisorStartRequest {
     pub server_dir: PathBuf,
     /// `java` 可执行文件
     pub java_bin: PathBuf,
-    /// 服务端核心 JAR 绝对路径
-    pub jar_path: PathBuf,
+    /// 服务端启动方式（相对服务器目录）：单 JAR 或参数文件串
+    pub launch: domain::server::launch::LaunchSpec,
     /// 堆内存上限；`None` 用 JVM 默认
     pub ram_mib: Option<u32>,
     /// 用于再拉起 supervisor 的可执行文件（`mcsup` 本体）
