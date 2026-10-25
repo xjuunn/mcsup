@@ -423,6 +423,58 @@ fn mcsup_lang_env_selects_language() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("用法:"));
 }
 
+/// 平台 locale 决定语言：`LANG=en_US.UTF-8` 下不给中文
+///
+/// 只在 Unix 生效，Windows 的 `sys_locale` 读系统设置而非 `LANG`。
+#[test]
+#[cfg(unix)]
+fn platform_locale_en_gives_english() {
+    let home = temp_home();
+    let out = run_with_env(home.path(), &["--help"], &[("LANG", "en_US.UTF-8")]);
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("Usage:"), "{text}");
+    assert!(!has_cjk(&text), "LANG=en_US.UTF-8 下不应出现中文:\n{text}");
+}
+
+/// 平台 locale 决定语言：`LANG=C` 无语言信息，回退英文
+#[test]
+#[cfg(unix)]
+fn platform_locale_c_falls_back_to_english() {
+    let home = temp_home();
+    let out = run_with_env(home.path(), &["--help"], &[("LANG", "C")]);
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("Usage:"), "{text}");
+    assert!(!has_cjk(&text), "LANG=C 下不应出现中文:\n{text}");
+}
+
+/// 平台 locale 决定语言：`LANG=zh_CN.UTF-8` 给中文
+#[test]
+#[cfg(unix)]
+fn platform_locale_zh_gives_chinese() {
+    let home = temp_home();
+    let out = run_with_env(home.path(), &["--help"], &[("LANG", "zh_CN.UTF-8")]);
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("用法:"), "{text}");
+}
+
+/// 显式 `--lang` 不能被平台 locale 翻回去
+#[test]
+#[cfg(unix)]
+fn lang_flag_beats_platform_locale() {
+    let home = temp_home();
+    let out = run_with_env(
+        home.path(),
+        &["--help", "--lang", "en"],
+        &[("LANG", "zh_CN.UTF-8")],
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("Usage:"), "{text}");
+    assert!(!has_cjk(&text), "{text}");
+}
+
 /// `--lang` 压过 `MCSUP_LANG`
 #[test]
 fn lang_flag_overrides_env() {

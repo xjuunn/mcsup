@@ -56,20 +56,71 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   test:
-    name: test (${{ matrix.os }})
+    name: test (${{ matrix.os }}, ${{ matrix.lang }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          # Linux 跑全语言组合：locale 经 LANG 生效，三种输入都要覆盖
+          - os: ubuntu-latest
+            lang: C
+            lc_all: C
+          - os: ubuntu-latest
+            lang: zh_CN.UTF-8
+            lc_all: zh_CN.UTF-8
+          - os: ubuntu-latest
+            lang: en_US.UTF-8
+            lc_all: en_US.UTF-8
+          # Windows / macOS 只跑一条：Windows 的 sys_locale 读系统设置而非 LANG，
+          # 这两个平台验的是「不因 locale 空值崩」，语言切换由显式 --lang 覆盖
+          - os: windows-latest
+            lang: C
+            lc_all: ""
+          - os: macos-latest
+            lang: zh_CN.UTF-8
+            lc_all: zh_CN.UTF-8
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.98.1
       - uses: Swatinem/rust-cache@v2
+      # 断言测试不依赖运行机器的 locale：显式给出语言环境，结果必须仍然全绿。
+      # 未设置 locale 的 Ubuntu 默认 C.UTF-8，中文用例会走回退路径，故显式指定。
       - name: cargo test
+        env:
+          LANG: ${{ matrix.lang }}
+          LC_ALL: ${{ matrix.lc_all }}
+          MCSUP_LANG: ""
         run: cargo test --workspace --all-features
+      # 语言矩阵下再验一次二进制本身：帮助必须能按环境给出正确语言（仅 Unix，
+      # Windows 的 locale 来源不同）。C / 空值回退英文，其余按主语言标签判定。
+      - name: help follows platform locale
+        if: runner.os != 'Windows'
+        run: |
+          # cargo test 只构建测试目标，二进制要单独构建
+          cargo build -p cli
+          help=$(target/debug/mcsup --help 2>&1)
+          case "$LANG" in
+            zh*) expected='用法:' ;;
+            *)   expected='Usage:' ;;
+          esac
+          case "$help" in
+            *"$expected"*) echo "OK: LANG=$LANG -> $expected" ;;
+            *) echo "FAIL: LANG=$LANG 期望 '$expected'，实际输出：" >&2
+               printf '%s\n' "$help" >&2
+               exit 1 ;;
+          esac
+      # 显式 --lang 必须压过环境，两种取值都要验
+      - name: explicit --lang overrides platform locale
+        if: runner.os != 'Windows'
+        run: |
+          zh=$(target/debug/mcsup --help --lang zh 2>&1)
+          en=$(target/debug/mcsup --help --lang en 2>&1)
+          case "$zh" in *'用法:'*) ;; *) echo "FAIL: --lang zh 未给中文" >&2; exit 1 ;; esac
+          case "$en" in *'Usage:'*) ;; *) echo "FAIL: --lang en 未给英文" >&2; exit 1 ;; esac
+          echo "OK: --lang 压过 LANG=$LANG"
 
   # MSRV = [workspace.package] rust-version。clippy.toml 的 msrv 必须一致。
   msrv:

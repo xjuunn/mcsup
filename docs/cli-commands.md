@@ -36,6 +36,41 @@
   非法重输）→ 名称（默认=目录名，不合法退回序号 `workspaceNN`）→ 确认。
   非交互无 `--dir` 保持用当前目录 + service 序号的既有机器行为。
 
+### 界面语言
+
+面向人的文案（帮助、错误提示、进度、doctor 输出）跟随界面语言；机器可读的
+输出不随语言变化，见 `docs/embedding.md` 的 CLI 机器契约。
+
+优先级：
+
+```
+--lang <auto|zh|en>  >  MCSUP_LANG  >  平台 locale（sys-locale）  >  英文
+```
+
+- `--lang auto`（默认）按上面顺序解析；认不出的语言标签逐级向下回退，
+  不直接跳英文。例如 `MCSUP_LANG=ja_JP` 且 `LANG=zh_CN.UTF-8` 时给中文。
+- 语言标签只取主语言子标签：`zh` / `zh-CN` / `zh_CN.UTF-8` / `zh-Hant-TW`
+  一律中文，`en*` 一律英文。
+- 终端明确声明非 UTF-8 字符集（如 `LANG=zh_CN.GBK`）时回退英文：中文在那种
+  终端上只会是乱码。非终端（管道、重定向）不做此判断。
+- `--output json` 的 stdout、错误分类、退出码与语言无关，逐字节稳定。
+- Windows 的 locale 来自系统设置而非 `LANG` / `LC_ALL`。
+
+文案落点：
+
+| 内容 | 位置 |
+| --- | --- |
+| 命令元数据（`about` / 参数说明） | `apps/cli/src/meta.rs` |
+| 结构化错误提示、doctor 文本 | `apps/cli/src/i18n.rs` |
+| clap 硬编码文案（`Usage:` 等） | `apps/cli/src/help.rs` 的替换表 |
+| 语言解析 | `apps/cli/src/locale.rs` |
+
+命令元数据不能用 `///` 文档注释写文案：clap 在编译期把它固化成字面量，
+运行时切不了语言。必须写成 `about = crate::meta::xxx()` 形式的表达式。
+
+`domain` / `service` 的结构化错误只携带判定（`kind()`）与参数，`Display`
+是英文短句、仅供日志；用户可见文案一律由入口按 `kind()` 渲染。
+
 命令层级：
 
 ```
