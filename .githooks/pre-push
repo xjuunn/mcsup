@@ -1,0 +1,43 @@
+#!/bin/sh
+# 推送前检查：目标分支（默认 master）能干净合并到当前分支，且门禁已通过。
+#
+# 为什么在 pre-push 而不是 pre-commit：
+# - pre-commit 要快，每个提交都跑一遍合并检查不现实；
+# - push 是「即将进入 CI / 可能被合入」的节点，冲突与门禁问题应当在这里暴露，
+#   而不是等任务结束合 master 时一次撞上几十处冲突。
+#
+# 跳过：MCSUP_SKIP_PREPUSH=1（例如推送与 master 无关的实验分支）。
+
+set -e
+
+if [ "${MCSUP_SKIP_PREPUSH:-}" = "1" ]; then
+	echo "pre-push：MCSUP_SKIP_PREPUSH=1，跳过检查"
+	exit 0
+fi
+
+upstream=${MCSUP_BASE:-origin/master}
+
+# 未 fetch 过的远端不阻塞推送（比如刚克隆、只想推分支）
+if ! git rev-parse --verify --quiet "$upstream" >/dev/null; then
+	echo "pre-push：找不到 $upstream，跳过合并检查（先 git fetch 可启用）"
+	exit 0
+fi
+
+behind=$(git rev-list --count "HEAD..$upstream" 2>/dev/null || echo 0)
+if [ "$behind" != "0" ]; then
+	echo "pre-push：当前分支落后 $upstream $behind 个提交"
+	echo "          推送前请先合并：git fetch && git merge $upstream"
+	echo "          早合并把冲突暴露在小改动时点，优于任务结束时一次爆发。"
+	echo ""
+	echo "  继续推送会带着过期基线，可能让 CI 通过但合入时冲突。"
+	echo "  确认要继续可设 MCSUP_SKIP_PREPUSH=1。"
+	exit 1
+fi
+
+if ! git merge-tree --write-tree HEAD "$upstream" >/dev/null 2>&1; then
+	echo "pre-push：HEAD 与 $upstream 合并有冲突"
+	echo "          先解决：git fetch && git merge $upstream"
+	exit 1
+fi
+
+echo "pre-push：已与 $upstream 对齐，无合并冲突"

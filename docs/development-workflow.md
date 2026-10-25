@@ -23,11 +23,62 @@ worktree 的建立与复用：
 按以下顺序交付：
 
 1. 按上述规则确定在哪个 worktree 工作。
-2. 完成后运行 `scripts/check.sh`，测试必须完全通过。
-3. 经用户明确同意后，才提交并合入 master；合入前如有冲突，先解决冲突。
-4. 任务结束时调用 `dev-tools` 的 `send_notification` 通知用户。title 写当前
+2. 开工后先 `git fetch`，并在做任何改动前把 `origin/master` 并入 worktree。
+3. 完成后运行 `scripts/check.sh`，测试必须完全通过。
+4. 经用户明确同意后，才提交并合入 master；合入前如有冲突，先解决冲突。
+5. 任务结束时调用 `dev-tools` 的 `send_notification` 通知用户。title 写当前
    worktree 的功能名，内容写为什么通知（已完成 / 需要用户确认 / 受阻待决策），
    title 与内容都简短。调用失败时在回复中说明。
+
+## 先合并上游，再跑门禁
+
+```
+开工时  → git fetch && git merge origin/master
+提交前  → git fetch；若 origin/master 前进，再 merge 一次
+```
+
+原因：冲突的代价随改动量增长。等到任务结束才合并，撞上的是「整个任务的改动」
+对「master 上所有并行改动」，冲突一次爆发且分散在多个文件里；开场就对齐，撞上的
+只是「本次零改动」对「上游变化」，无从冲突。
+
+`apps/cli/src/cli.rs` 与 `docs/cli-commands.md` 几乎每个任务都会碰，是冲突高发
+点，务必在开工时对齐，而不是留到最后。
+
+## 推送即触发 CI
+
+`.github/workflows/test.yml` 在 `pull_request` 上与 `push: [master, main]` 上都会
+运行。合入 master **之前**想让 CI 给出信号，就推功能分支：
+
+```
+git push -u origin HEAD:refs/heads/<功能分支名>
+```
+
+CI 是唯一能跑满 os × locale 矩阵的地方（见「代码质量门禁」）。本地 `check.sh`
+通过不等于 CI 通过，至少要把分支推上去看一眼结果再合入。
+
+`.githooks/pre-push` 在推送前检查两件事：当前分支是否已落后 `origin/master`
+（落后就提示先合并）、HEAD 与 `origin/master` 是否可干净合并。跳过用
+`MCSUP_SKIP_PREPUSH=1`。
+
+# worktree 回收
+
+worktree 各自带一份 `target`，单个 1–4 GB，只有删掉 worktree 才回收得回来。
+
+不建议把所有 worktree 指到同一个 `CARGO_TARGET_DIR`：多个 agent 同时跑
+`check.sh` 时会争用同一份 target 目录里的锁与构建产物，并行退化成本地排队，
+而且不同分支对同一 `target` 的交替写入会互相触发重编译。体积问题是「没回收」
+而不是「没共享」，所以这里的做法是及时删 worktree：
+
+```
+sh scripts/worktree-status.sh        # 每个 worktree 的状态、落后数、target 体积
+sh scripts/clean-worktrees.sh        # 预览哪些可删
+sh scripts/clean-worktrees.sh --yes  # 真正删除（拒绝删有未跟踪文件的）
+```
+
+判定与上面「worktree 的建立与复用」一致：无未提交改动且已全部合入 = 应删。
+
+需要跨 worktree 复用依赖编译结果时，用 `sccache`（`RUSTC_WRAPPER=sccache`）
+而不是共享 target 目录：它只共享编译结果，不共享构建状态与锁。
 
 ---
 
@@ -39,14 +90,27 @@ worktree 的建立与复用：
 scripts/check.sh
 ```
 
-它依次运行 architecture / fmt / check / clippy / test / doc / feature
+它依次运行 architecture / fmt / check / clippy / test / e2e / doc / feature
 powerset / deny。fmt 只检查不修改（`cargo fmt --all -- --check`）；
 deny 缺 cargo-deny 时静默跳过（本地绿灯 ≠ CI 绿灯，建议安装）；其余
 任一失败即中止并报出步骤名。
 
+`e2e` 单独成步（`scripts/check-e2e.sh`），跑 `apps/cli/tests/cli_e2e.rs`：真实
+二进制 + 真实临时目录，断言命令串起来之后注册表与磁盘是否一致。只改文档时可
+`MCSUP_SKIP_E2E=1` 跳过，其余情况不许跳。
+
+`test` 与 `e2e` 的分工：前者是单元 / 契约测试，证明单个判定与输出形状正确；
+后者证明多条命令串起来后状态仍正确。check.sh 通过只证明「测过的部分对」，
+不证明业务逻辑对。
+
 提交时 `.githooks/pre-commit` 先对本次提交的 Rust 文件运行 `cargo fmt` 并重新
 暂存，再运行本脚本，保证进入提交的代码已格式化。CI 相反：fmt job 只运行
 `cargo fmt --all -- --check`，未通过直接报错，不自动格式化。
+
+hooks 只有执行过 `scripts/init.sh` 才生效（它配置 `core.hooksPath=.githooks`）。
+`core.hooksPath` 是 repository 级配置，在主仓库配一次，所有 worktree 共享。
+没配时 `git commit` 不会跑门禁——这时必须手工跑 `scripts/check.sh`，不能因为
+「没报错」就认为门禁过了。
 
 按需追加：性能相关 `cargo bench`，API 相关时 integration test。
 
@@ -80,7 +144,9 @@ deny 缺 cargo-deny 时静默跳过（本地绿灯 ≠ CI 绿灯，建议安装�
 [ ] 大文件 Streaming，无无意义 Clone 与明显内存浪费
 [ ] 无明显性能退化，必要时有 Benchmark
 [ ] Unit / Integration / Failure Path / Edge Case 测试完整
+[ ] 新增或改动的用户可见路径有端到端覆盖（`apps/cli/tests/cli_e2e.rs`）
 [ ] 没有无意义重构，没有破坏已有功能
+[ ] 已与 origin/master 对齐（冲突在开工时消掉，不是合入时）
 [ ] scripts/check.sh 通过
 ```
 

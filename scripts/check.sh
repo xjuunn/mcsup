@@ -61,6 +61,15 @@ run 'fmt' cargo fmt --all -- --check
 run 'check' cargo check --workspace --all-targets --all-features
 run 'clippy' cargo clippy --workspace --all-targets --all-features -- -D warnings
 run 'test' cargo test --workspace --all-features
+
+# 端到端单独成步：失败时要一眼看出是契约测试挂的还是真实进程链路挂的。
+# 只改文档 / 注释时可 MCSUP_SKIP_E2E=1 跳过，CI 不跳过。
+if [ "${MCSUP_SKIP_E2E:-}" = "1" ]; then
+	printf '\n==> e2e（已按 MCSUP_SKIP_E2E=1 跳过）\n'
+else
+	run 'e2e' sh scripts/check-e2e.sh
+fi
+
 run 'doc' env 'RUSTDOCFLAGS=-D warnings' cargo doc --workspace --all-features --no-deps
 
 if want 'feature powerset'; then
