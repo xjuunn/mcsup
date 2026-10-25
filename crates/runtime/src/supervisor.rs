@@ -90,20 +90,28 @@ fn record_exit(view: &mut View, code: i32) {
 }
 
 /// 收集子进程输出：逐行写 `console.log` 并做就绪判定
+///
+/// 日志按**原始字节**落盘，不做解码：服务端在 Windows 下按系统代码页（GBK）
+/// 输出中文，用 `from_utf8_lossy` 先解码会把非 UTF-8 字节替换成 U+FFFD，
+/// 写进日志的中文就永久损坏了。编码解释留给读取 / 展示端。
+///
+/// 就绪判定用 lossy 字符串匹配 ASCII 标记（[`READY_MARKER`]），编码无关。
 fn pump<R: BufRead + Send + 'static>(mut reader: R, shared: &Shared) {
     let mut buf = Vec::new();
     loop {
         buf.clear();
         match reader.read_until(b'\n', &mut buf) {
-            Ok(0) | Err(_) => break, // EOF 或非法字节序列：放弃该流，进程监护不受影响
+            Ok(0) | Err(_) => break, // EOF 或读取失败：放弃该流，进程监护不受影响
             Ok(_) => {
-                let owned = String::from_utf8_lossy(&buf).into_owned();
-                let line = owned.trim_end_matches(['\n', '\r']);
                 {
+                    // 原样写出收到的字节，仅保证以换行结尾
                     let mut log = lock(&shared.log);
-                    let _ = writeln!(log, "{line}");
+                    let _ = log.write_all(strip_line_ending(&buf));
+                    let _ = log.write_all(b"\n");
                     let _ = log.flush();
                 }
+                let decoded = String::from_utf8_lossy(&buf);
+                let line = decoded.trim_end_matches(['\n', '\r']);
                 if line.contains(READY_MARKER) {
                     let mut view = lock(&shared.view);
                     if view.status == ServerStatus::Starting
@@ -115,6 +123,14 @@ fn pump<R: BufRead + Send + 'static>(mut reader: R, shared: &Shared) {
             }
         }
     }
+}
+
+/// 去掉行尾的 `\n` / `\r\n`，返回不含行尾的字节切片
+///
+/// 写入端统一补一个 `\n`，避免不同平台的子进程输出混入多余空行。
+fn strip_line_ending(bytes: &[u8]) -> &[u8] {
+    let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    bytes.strip_suffix(b"\r").unwrap_or(bytes)
 }
 
 /// 向服务端 stdin 注入单行（剥掉换行，保持单行语义）
@@ -470,4 +486,27 @@ pub fn run_supervisor(launch: &MinecraftLaunch) -> i32 {
     let launch = launch.clone();
     let server_dir = launch.server_dir.clone();
     run_with(&server_dir, move || launch::spawn_minecraft(&launch))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_line_ending;
+
+    /// 行尾统一剥成不含换行的字节，供写入端补单个 `\n`
+    #[test]
+    fn strip_line_ending_removes_trailing_newline() {
+        assert_eq!(strip_line_ending(b"abc\n"), b"abc");
+        assert_eq!(strip_line_ending(b"abc\r\n"), b"abc");
+        assert_eq!(strip_line_ending(b"abc"), b"abc");
+        assert_eq!(strip_line_ending(b"\n"), b"");
+        assert_eq!(strip_line_ending(b""), b"");
+    }
+
+    /// 非 UTF-8 字节（如 GBK 中文）必须原样保留，不能被解码替换
+    #[test]
+    fn strip_line_ending_keeps_non_utf8_bytes() {
+        // GBK 的「正在」（0xD5 0xFD 0xD4 0xDA），不是合法 UTF-8
+        let gbk = b"\xD5\xFD\xD4\xDA\n";
+        assert_eq!(strip_line_ending(gbk), b"\xD5\xFD\xD4\xDA");
+    }
 }
