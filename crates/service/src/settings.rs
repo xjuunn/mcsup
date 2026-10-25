@@ -25,10 +25,38 @@ pub enum SettingsError {
     #[error(transparent)]
     InvalidValue(#[from] InvalidSettingValue),
     /// 绑定的大版本没有任何已注册运行时
-    #[error("未注册的大版本 Java {major}，可执行 mcsup java install {major} 安装")]
+    #[error("Java {major} is not registered")]
     UnknownJavaMajor {
         /// 服务器名
         name: String,
+        /// 未注册的大版本
+        major: JavaMajor,
+    },
+}
+
+impl SettingsError {
+    /// 面向用户展示的分类；结构化错误不带文案，入口按此渲染提示
+    #[must_use]
+    pub fn kind(&self) -> Option<SettingsErrorKind<'_>> {
+        let kind = match self {
+            Self::Registry(_) | Self::Java(_) | Self::InvalidValue(_) => return None,
+            Self::UnknownJavaMajor { name, major } => SettingsErrorKind::UnknownJavaMajor {
+                name,
+                major: *major,
+            },
+        };
+        Some(kind)
+    }
+}
+
+/// [`SettingsError::kind`] 的结果：只带判定与参数，文案由入口渲染
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub enum SettingsErrorKind<'a> {
+    /// 绑定的大版本未注册
+    UnknownJavaMajor {
+        /// 服务器名
+        name: &'a str,
         /// 未注册的大版本
         major: JavaMajor,
     },

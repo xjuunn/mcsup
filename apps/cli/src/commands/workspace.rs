@@ -361,9 +361,9 @@ fn doctor_cmd(
                 let scope = f.workspace.as_deref().map_or("(全局)", |w| w);
                 let line = format!(
                     "[{tag}] {scope}: {}\n        {}\n        修复：{}",
-                    f.kind.describe(),
-                    f.kind.locate(),
-                    f.kind.fix_hint()
+                    crate::i18n::check(&f.kind),
+                    crate::i18n::check_location(&f.kind),
+                    crate::i18n::check_fix(&f.kind)
                 );
                 match f.severity() {
                     Severity::Error => printer.print_warning(&line),
@@ -385,7 +385,7 @@ fn doctor_cmd(
                 kind: f.kind.as_str(),
                 workspace: f.workspace.as_deref(),
                 detail: detail_json(&f.kind),
-                message: f.kind.describe(),
+                message: crate::i18n::check(&f.kind),
             })
             .collect(),
     };

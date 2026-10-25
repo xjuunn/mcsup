@@ -20,7 +20,8 @@ pub use java::{
     StageSink, UninstallOutcome,
 };
 pub use lifecycle::{
-    DEFAULT_RAM_MIB, LifecycleError, LogWatch, ServerLifecycleService, StartOptions, StatusReport,
+    BusyOp, DEFAULT_RAM_MIB, LifecycleError, LifecycleErrorKind, LogWatch, ServerLifecycleService,
+    StartOptions, StatusReport,
 };
 /// Java 源聚合端口（定义在 `port`，此处转出便于既有调用方）
 pub use port::JavaSourceRegistryPort;
@@ -30,9 +31,10 @@ use port::{
 };
 pub use props::{PropsError, PropsReport, ServerPropsService};
 pub use registry::{
-    InstallJarError, InstalledServerJar, RegisteredServer, ServerRegistry, ServerRegistryError,
+    InstallJarError, InstallJarErrorKind, InstalledServerJar, RegisteredServer, ServerRegistry,
+    ServerRegistryError,
 };
-pub use settings::{ServerSettingsService, SettingChange, SettingsError};
+pub use settings::{ServerSettingsService, SettingChange, SettingsError, SettingsErrorKind};
 use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;

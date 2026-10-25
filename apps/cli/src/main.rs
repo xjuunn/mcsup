@@ -5,6 +5,7 @@ mod completions;
 mod config;
 mod diagnostic;
 mod help;
+mod i18n;
 mod input;
 mod keymap;
 mod output;

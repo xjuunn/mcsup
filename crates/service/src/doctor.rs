@@ -125,36 +125,11 @@ impl CheckKind {
         }
     }
 
-    /// 问题描述：同一类型永远同一条文案，入口不各自另写一份
-    #[must_use]
-    pub fn describe(&self) -> String {
-        match self {
-            Self::NoCurrentWorkspace => "没有任何当前工作区".to_owned(),
-            Self::WorkspaceDirMissing { .. } => "工作目录在磁盘上不存在".to_owned(),
-            Self::WorkspaceMarkerMissing { .. } => {
-                "工作目录缺少 workspace.toml，身份无法确认".to_owned()
-            }
-            Self::WorkspaceMarkerMismatch { .. } => {
-                "workspace.toml 的身份与注册记录不一致".to_owned()
-            }
-            Self::ServersDirUnreadable { reason, .. } => {
-                format!("servers/ 无法列举（{reason}），该工作区的服务器盘点不可信")
-            }
-            Self::DanglingLink { .. } => "符号链接指向的目标不存在".to_owned(),
-            Self::OnDiskNotRegistered { .. } => "磁盘上有未登记的服务器目录".to_owned(),
-            Self::RegisteredButMissing { .. } => "服务器已登记但磁盘上找不到".to_owned(),
-            Self::RelDirNotDirectChild { .. } => {
-                "服务器记录的目录不是 servers/ 的直接子目录".to_owned()
-            }
-            Self::OrphanServerRecord { .. } => "服务器记录指向的工作区已不存在".to_owned(),
-        }
-    }
-
     /// 可寻址位置：路径 / 名称，人类输出的第二行
     #[must_use]
     pub fn locate(&self) -> String {
         match self {
-            Self::NoCurrentWorkspace => "运行 mcsup workspace use <name> 指定当前工作区".to_owned(),
+            Self::NoCurrentWorkspace => "mcsup workspace use <name>".to_owned(),
             Self::WorkspaceDirMissing { path }
             | Self::WorkspaceMarkerMissing { path }
             | Self::WorkspaceMarkerMismatch { path, .. }
@@ -169,42 +144,6 @@ impl CheckKind {
             }
             Self::OrphanServerRecord { name, workspace_id } => {
                 format!("{name} → workspace_id {workspace_id}")
-            }
-        }
-    }
-
-    /// 修复建议：只给动作，doctor 本身不写任何东西
-    #[must_use]
-    pub fn fix_hint(&self) -> String {
-        match self {
-            Self::NoCurrentWorkspace => "`mcsup workspace use <name>`".to_owned(),
-            Self::WorkspaceDirMissing { .. } => {
-                "把目录移回原位，或 `mcsup workspace remove <name>` 注销".to_owned()
-            }
-            Self::WorkspaceMarkerMissing { path } => format!(
-                "确认目录归属后重建 workspace.toml（id 需与记录一致），或注销后重新 `workspace init {}`",
-                path.display()
-            ),
-            Self::WorkspaceMarkerMismatch { .. } => {
-                "该目录已不是这条记录的工作区：确认后注销记录，或恢复原 marker".to_owned()
-            }
-            Self::ServersDirUnreadable { .. } => "检查目录权限".to_owned(),
-            Self::DanglingLink { path } => format!(
-                "`mcsup server remove <name>` 移除链接，或恢复目标后重试（链接：{}）",
-                path.display()
-            ),
-            Self::OnDiskNotRegistered { path } => format!(
-                "`mcsup server link {}` 重新登记，或删除该目录",
-                path.display()
-            ),
-            Self::RegisteredButMissing { name, .. } => {
-                format!("`mcsup server remove {name}`，或把目录恢复到原位")
-            }
-            Self::RelDirNotDirectChild { name, .. } => {
-                format!("`mcsup server remove {name}` 后重新 `server link`")
-            }
-            Self::OrphanServerRecord { name, .. } => {
-                format!("`mcsup server remove {name}` 清理孤儿记录")
             }
         }
     }
