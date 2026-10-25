@@ -1,0 +1,45 @@
+{
+  "project_id": "leaf",
+  "project_name": "Leaf",
+  "version": "1.21.11",
+  "builds": [
+    {
+      "build": 178,
+      "time": "2026-08-30T16:49:13.029Z",
+      "channel": "default",
+      "promoted": false,
+      "changes": [
+        {
+          "commit": "762f88470729bfa0fe03b44f0db1a8ac688aa0bc",
+          "summary": "Fix biome retrieving glitches on edges (#901)",
+          "message": "Fix biome retrieving glitches on edges (#901)\n"
+        }
+      ],
+      "downloads": {
+        "primary": {
+          "name": "leaf-1.21.11-178.jar",
+          "sha256": "b01c2f6037f97a4e1cd1d23dc6574ebb4839de12395b62aa465fac63db263627"
+        }
+      }
+    },
+    {
+      "build": 179,
+      "time": "2026-09-12T15:20:48.702Z",
+      "channel": "default",
+      "promoted": false,
+      "changes": [
+        {
+          "commit": "12f438e06b8a35d6584687565ec5eeacb373972c",
+          "summary": "Use legacy tracker ticking (#911)",
+          "message": "Use legacy tracker ticking (#911)\n"
+        }
+      ],
+      "downloads": {
+        "primary": {
+          "name": "leaf-1.21.11-179.jar",
+          "sha256": "5da79782215c1a25edcd7c73b3523b7ecb7f4b86dc8a5846a176ed69bc2cd020"
+        }
+      }
+    }
+  ]
+}

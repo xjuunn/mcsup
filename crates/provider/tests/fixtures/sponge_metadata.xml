@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 截取：上游 maven-metadata.xml 共 3000+ 个 version，这里只保留最新 5 个 -->
+<metadata modelVersion="1.1.0">
+  <groupId>org.spongepowered</groupId>
+  <artifactId>spongevanilla</artifactId>
+  <versioning>
+    <latest>26.3-21.0.0-RC2755</latest>
+    <release>26.3-21.0.0-RC2755</release>
+    <versions>
+      <version>26.3-21.0.0-RC2724</version>
+      <version>26.3-21.0.0-RC2725</version>
+      <version>26.3-21.0.0-RC2744</version>
+      <version>26.3-21.0.0-RC2745</version>
+      <version>26.3-21.0.0-RC2755</version>
+    </versions>
+    <lastUpdated>20261025023644</lastUpdated>
+  </versioning>
+</metadata>
