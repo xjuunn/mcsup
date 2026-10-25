@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use super::{CaptureError, Notification, NotifyError, RevealError, Urgency};
+use super::{Notification, NotifyError, RevealError, Urgency};
 
 const TERMINAL_NOTIFIER: &str = "terminal-notifier";
 
@@ -43,28 +43,6 @@ pub(crate) async fn notify(notification: &Notification) -> Result<(), NotifyErro
 
 fn escape_applescript(raw: &str) -> String {
     raw.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-/// 用系统自带的 `screencapture` 截取整个屏幕。
-///
-/// `-x` 关闭快门音：工具调用不应制造意外噪音。
-pub(crate) fn capture_screen(path: &Path) -> Result<(), CaptureError> {
-    let status = std::process::Command::new("screencapture")
-        .arg("-x")
-        .arg(path)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|error| CaptureError::Platform(format!("启动 screencapture 失败: {error}")))?;
-
-    if status.success() {
-        return Ok(());
-    }
-    Err(CaptureError::Platform(format!(
-        "screencapture 退出码 {}（可能缺少「屏幕录制」权限）",
-        status.code().unwrap_or(-1)
-    )))
 }
 
 /// 用 `open -R` 在访达中选中路径。

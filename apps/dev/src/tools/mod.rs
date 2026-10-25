@@ -9,7 +9,6 @@ pub(crate) mod diff;
 pub(crate) mod logs;
 pub(crate) mod notify;
 pub(crate) mod paths;
-pub(crate) mod screenshot;
 pub(crate) mod wait;
 pub(crate) mod workspace;
 
@@ -74,10 +73,6 @@ pub(crate) fn tool_router() -> ToolRouter<DevToolsServer> {
             DevToolsServer::read_system_log,
         ))
         .with_route((
-            DevToolsServer::take_screenshot_tool_attr(),
-            DevToolsServer::take_screenshot,
-        ))
-        .with_route((
             DevToolsServer::open_path_tool_attr(),
             DevToolsServer::open_path,
         ))
@@ -101,7 +96,6 @@ pub(crate) fn catalogue() -> Vec<serde_json::Value> {
         describe(DevToolsServer::get_build_diagnostics_tool_attr()),
         describe(DevToolsServer::wait_for_user_tool_attr()),
         describe(DevToolsServer::read_system_log_tool_attr()),
-        describe(DevToolsServer::take_screenshot_tool_attr()),
         describe(DevToolsServer::open_path_tool_attr()),
         describe(DevToolsServer::list_tools_tool_attr()),
     ]
@@ -113,7 +107,6 @@ pub(crate) fn platform_report() -> serde_json::Value {
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
         "notification": notify::channel(),
-        "screenshot": screenshot::channel(),
         "reveal": paths::channel(),
     })
 }

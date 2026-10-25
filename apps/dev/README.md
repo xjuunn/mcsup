@@ -15,7 +15,6 @@
 | `get_build_diagnostics` | 跑 `cargo check`，把编译错误解析成结构化列表 |
 | `wait_for_user` | 写入待确认问题并阻塞等待用户回复 |
 | `read_system_log` | 读取 Windows 事件日志，可按事件 id 与时间过滤 |
-| `take_screenshot` | 截屏保存到 `.mcsup-dev/screenshots/` |
 | `open_path` | 在系统文件管理器中定位工程内路径 |
 | `list_tools` | 列出可用工具、当前平台与各通道说明 |
 
@@ -57,11 +56,11 @@ MCP 是请求-响应模型，工具执行期间 agent 无法继续对话，因�
 
 工具只调用 `src/platform/` 的函数，平台差异在该目录按 `cfg` 分文件：
 
-| 平台 | 通知 | 截屏 | 文件管理器 |
-| --- | --- | --- | --- |
-| Windows | `Windows.UI.Notifications` Toast（WinRT） | 不可用，见下 | `explorer.exe` |
-| macOS | 通知中心（`terminal-notifier` 可选，回退 `osascript`） | `screencapture` | `open -R` |
-| Linux | `notify-send` | `grim` / `gnome-screenshot` / `import` | `xdg-open` |
+| 平台 | 通知 | 文件管理器 |
+| --- | --- | --- |
+| Windows | `Windows.UI.Notifications` Toast（WinRT） | `explorer.exe` |
+| macOS | 通知中心（`terminal-notifier` 可选，回退 `osascript`） | `open -R` |
+| Linux | `notify-send` | `xdg-open` |
 
 Windows 通知不启动任何外部进程：文案写进系统 Toast 模板的文本节点（由 MSXML
 转义），发送后读一次通知中心历史确认系统已收录；被拦截时返回
@@ -69,12 +68,6 @@ Windows 通知不启动任何外部进程：文案写进系统 Toast 模板的�
 
 Windows 事件日志经 `wevtutil`（系统自带，参数为固定字面量）读取，在 Rust 侧
 解析 XML——不走 `/f:text`，因为后者的消息文本依赖消息 DLL，缺 DLL 时只剩占位符。
-
-### Windows 截屏为何不可用
-
-`Graphics.CopyFromScreen` 需要 Win32 GDI 调用，`Windows.Graphics.Capture` 需要
-窗口句柄与用户授权。前者与仓库 `forbid(unsafe_code)` 冲突，后者不适合后台工具。
-`take_screenshot` 在 Windows 上返回明确的不可用原因，不返回伪造的空白图。
 
 ## 构建与接入
 
