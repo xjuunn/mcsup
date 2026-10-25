@@ -273,6 +273,7 @@ crate，是第三方依赖的唯一入口与发布主体。内层 crate 现为 `
 | Browser UI（独立项目，不在本仓库） | 通过 `apps/server` 的 API 接入 |
 | 开发工具 | `apps/dev` |
 | Benchmark | `apps/bench` |
+| 测试基础设施（dev-only） | `crates/testkit` |
 
 依赖方向：
 
@@ -317,7 +318,7 @@ Backend 只回答「在哪里执行」，不回答「能不能执行」——后
 | `docs/development-workflow.md` | 开发流程、代码质量门禁、完成标准、任务交付流程、提交信息规范 | 规划一次开发任务、判断任务是否完成、规范提交信息时 |
 | `docs/principles.md` | 最终开发原则、Agent 最终行为准则 | 判断某个设计取舍是否合理时 |
 | `docs/rust-standards.md` | 设计模式、Rust 开发规范、错误处理、日志、代码风格 | 写实现代码、定义错误类型、打日志时 |
-| `docs/testing.md` | 测试分层、测试矩阵、测试优先级、性能测试 | 设计测试、评估测试覆盖时 |
+| `docs/testing.md` | 四层测试架构、七道门禁、`testkit`、AI 测试硬性约束、测试矩阵、测试优先级、性能测试 | 设计测试、评估测试覆盖时 |
 | `docs/concurrency-performance.md` | 并发设计、性能原则、资源生命周期、Cancellation、Timeout、网络设计 | 涉及并发、性能、IO、任务取消时 |
 | `docs/reliability-security.md` | 安全、路径安全、数据库设计、配置设计、API Compatibility、向后兼容、可观测性 | 处理用户输入、密钥、配置、协议兼容时 |
 | `docs/code-design.md` | God Object、God Trait、依赖管理、跨平台 | 设计模块接口、引入依赖、处理平台差异时 |

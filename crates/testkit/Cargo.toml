@@ -1,0 +1,24 @@
+[package]
+name = "testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# 测试基础设施：只作 dev-dependency，不发布、不进门面
+publish = false
+
+[dependencies]
+async-trait.workspace = true
+domain = { version = "0.1.0", path = "../domain" }
+port = { version = "0.1.0", path = "../port" }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+url.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# 测试机自测用：验证桩与契约夹具自身行为正确
+serde_json.workspace = true
