@@ -94,6 +94,15 @@ jobs:
           LC_ALL: ${{ matrix.lc_all }}
           MCSUP_LANG: ""
         run: cargo test --workspace --all-features
+      # 端到端单独成步：`cargo test --workspace` 虽会顺带跑 tests/cli_e2e.rs，
+      # 但那是「碰巧」，不是约定。这里显式跑 check.sh 调用的同一个脚本，
+      # 保证本地与 CI 跑的是同一组用例、同一套结论。
+      - name: e2e
+        env:
+          LANG: ${{ matrix.lang }}
+          LC_ALL: ${{ matrix.lc_all }}
+          MCSUP_LANG: ""
+        run: sh scripts/check-e2e.sh
       # 语言矩阵下再验一次二进制本身：帮助必须能按环境给出正确语言（仅 Unix，
       # Windows 的 locale 来源不同）。C / 空值回退英文，其余按主语言标签判定。
       - name: help follows platform locale
