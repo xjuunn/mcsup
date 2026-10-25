@@ -7,19 +7,21 @@
 mod windows;
 
 #[cfg(target_os = "windows")]
-pub(crate) use windows::{CHANNEL, notify};
+pub(crate) use windows::{
+    CHANNEL, capture_screen, list_event_logs, notify, read_event_log, reveal_in_file_manager,
+};
 
 #[cfg(target_os = "macos")]
 mod macos;
 
 #[cfg(target_os = "macos")]
-pub(crate) use macos::{CHANNEL, notify};
+pub(crate) use macos::{CHANNEL, capture_screen, notify, reveal_in_file_manager};
 
 #[cfg(all(unix, not(target_os = "macos")))]
 mod linux;
 
 #[cfg(all(unix, not(target_os = "macos")))]
-pub(crate) use linux::{CHANNEL, notify};
+pub(crate) use linux::{CHANNEL, capture_screen, notify, reveal_in_file_manager};
 
 /// 发送一条系统通知的错误。
 #[derive(Debug, thiserror::Error)]
@@ -61,10 +63,12 @@ pub(crate) struct Notification {
     pub(crate) title: String,
     pub(crate) body: String,
     /// `low` / `normal` / `critical`（默认 `normal`），由各平台映射成自己的分级。
-    /// Windows 的 `WinRT` Toast 没有分级的原生入口，该字段在 Windows 上不参与渲染。
     #[cfg_attr(
         target_os = "windows",
-        allow(dead_code, reason = "Windows 无对应分级入口")
+        allow(
+            dead_code,
+            reason = "Windows Toast 的分级只影响音效与停留策略，尚未接入"
+        )
     )]
     pub(crate) urgency: Urgency,
 }
@@ -85,6 +89,34 @@ impl Urgency {
             _ => None,
         }
     }
+}
+
+/// 截屏失败的原因。
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CaptureError {
+    /// Windows 上截屏不可用，永远只构造 `Unavailable`。
+    #[cfg_attr(
+        target_os = "windows",
+        allow(dead_code, reason = "Windows 无可用截屏通道")
+    )]
+    #[error("{0}")]
+    Platform(String),
+    #[error("截屏命令未安装或不可用：{0}")]
+    Unavailable(String),
+}
+
+/// 在文件管理器中定位路径失败的原因。
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RevealError {
+    #[error("{0}")]
+    Platform(String),
+    /// Linux 上 `xdg-open` 可能整体不可用；Windows / macOS 只有 `Platform`。
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "仅 Linux 区分命令缺失")
+    )]
+    #[error("无法在文件管理器中定位：{0}")]
+    NotAvailable(String),
 }
 
 /// 执行通知命令并等待结果。子进程由 tokio 托管，超时后 kill。

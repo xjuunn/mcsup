@@ -2,6 +2,9 @@
 **/*.rs.bk
 *.pdb
 
+# 开发工具（apps/dev）运行时产物：待确认请求、回复、截图。
+.mcsup-dev/
+
 .env
 .env.*
 !.env.example
