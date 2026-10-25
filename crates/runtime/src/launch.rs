@@ -17,13 +17,36 @@ pub struct MinecraftLaunch {
     pub ram_mib: Option<u32>,
 }
 
-/// JVM 参数（堆上限），jar 与 nogui 由 [`build_command`] 追加
+/// 强制 JVM 以 UTF-8 写标准输出 / 错误与文件
+///
+/// 服务端在 Windows 下默认按系统代码页（GBK）输出，中文写进 `console.log`
+/// 后无法与 UTF-8 区分，回放必然乱码。这里统一钉成 UTF-8：
+///
+/// - `file.encoding`：默认字符集。JDK 18（JEP 400）起已是 UTF-8，但 17 及以下
+///   仍随系统，显式设置以覆盖旧版本。
+/// - `stdout.encoding` / `stderr.encoding`：`System.out/err` 的编码。
+///   **JEP 400 明确不改这两条流的编码**（跟随控制台代码页），必须单独指定。
+///   JDK 19 起是公开属性。
+/// - `sun.stdout.encoding` / `sun.stderr.encoding`：JDK 17 及以下的等价私有
+///   属性。新版会忽略，写上以兼容旧运行时。
+///
+/// 只影响新启动的进程。已写入磁盘的旧日志不会因此改变。
+const ENCODING_ARGS: &[&str] = &[
+    "-Dfile.encoding=UTF-8",
+    "-Dstdout.encoding=UTF-8",
+    "-Dstderr.encoding=UTF-8",
+    "-Dsun.stdout.encoding=UTF-8",
+    "-Dsun.stderr.encoding=UTF-8",
+];
+
+/// JVM 参数（堆上限 + UTF-8 编码），jar 与 nogui 由 [`build_command`] 追加
 #[must_use]
 pub(crate) fn jvm_args(ram_mib: Option<u32>) -> Vec<String> {
-    match ram_mib {
-        Some(mib) => vec![format!("-Xmx{mib}M")],
-        None => Vec::new(),
+    let mut args: Vec<String> = ENCODING_ARGS.iter().map(|arg| (*arg).to_owned()).collect();
+    if let Some(mib) = ram_mib {
+        args.push(format!("-Xmx{mib}M"));
     }
+    args
 }
 
 /// 组装启动命令（不 spawn）
@@ -67,9 +90,19 @@ mod tests {
     }
 
     #[test]
-    fn jvm_args_only_encode_ram_limit() {
-        assert_eq!(jvm_args(Some(2048)), vec!["-Xmx2048M".to_owned()]);
-        assert!(jvm_args(None).is_empty());
+    fn jvm_args_pins_utf8_and_ram_limit() {
+        assert_eq!(
+            jvm_args(Some(2048)),
+            vec![
+                "-Dfile.encoding=UTF-8".to_owned(),
+                "-Dstdout.encoding=UTF-8".to_owned(),
+                "-Dstderr.encoding=UTF-8".to_owned(),
+                "-Dsun.stdout.encoding=UTF-8".to_owned(),
+                "-Dsun.stderr.encoding=UTF-8".to_owned(),
+                "-Xmx2048M".to_owned(),
+            ]
+        );
+        assert_eq!(jvm_args(None), ENCODING_ARGS);
     }
 
     #[test]
@@ -83,6 +116,11 @@ mod tests {
         assert_eq!(
             args,
             vec![
+                "-Dfile.encoding=UTF-8".to_owned(),
+                "-Dstdout.encoding=UTF-8".to_owned(),
+                "-Dstderr.encoding=UTF-8".to_owned(),
+                "-Dsun.stdout.encoding=UTF-8".to_owned(),
+                "-Dsun.stderr.encoding=UTF-8".to_owned(),
                 "-Xmx1024M".to_owned(),
                 "-jar".to_owned(),
                 "/srv/mc/a/server.jar".to_owned(),
