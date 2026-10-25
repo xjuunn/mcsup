@@ -315,6 +315,9 @@ impl ServerLifecycleService {
     /// 「蒸发」、进程变幽灵），Windows 上因占用中途失败——平台行为分叉，
     /// 必须在 service 层统一拦下，禁止入口各自补检查。
     ///
+    /// `cwd` 是调用方进程的工作目录，位于待删目录内时由
+    /// [`ServerRegistry::remove`] 拒绝（同 `workspace remove --purge`）。
+    ///
     /// # Errors
     ///
     /// 运行中返回 [`LifecycleError::Busy`]；其余见
@@ -323,9 +326,10 @@ impl ServerLifecycleService {
         &self,
         name: &str,
         purge: bool,
-    ) -> Result<crate::RegisteredServer, LifecycleError> {
+        cwd: &Path,
+    ) -> Result<crate::registry::RemoveOutcome, LifecycleError> {
         self.ensure_stopped(name, BusyOp::Remove)?;
-        Ok(self.registry.remove(name, purge)?)
+        Ok(self.registry.remove(name, purge, cwd)?)
     }
 
     /// 安装 / 更换服务端核心的统一入口：运行中拒绝，再转
@@ -1702,7 +1706,9 @@ mod tests {
             java_service(MemJavaRepo::new(Vec::new(), false), vec![]),
             Arc::clone(&supervisor),
         );
-        let err = svc.remove_server("alpha", false).expect_err("must fail");
+        let err = svc
+            .remove_server("alpha", false, &fixture.server_dir.join(".."))
+            .expect_err("must fail");
         assert!(
             matches!(
                 err,
@@ -1727,8 +1733,10 @@ mod tests {
             java_service(MemJavaRepo::new(Vec::new(), false), vec![]),
             Arc::clone(&supervisor),
         );
-        let removed = svc.remove_server("alpha", false).expect("remove");
-        assert_eq!(removed.meta.name.as_str(), "alpha");
+        let removed = svc
+            .remove_server("alpha", false, &fixture.server_dir.join(".."))
+            .expect("remove");
+        assert_eq!(removed.server.meta.name.as_str(), "alpha");
         assert!(fixture.registry.get("alpha").is_err());
     }
 

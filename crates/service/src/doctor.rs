@@ -326,7 +326,19 @@ impl DoctorService {
             });
         };
 
-        // workspace.toml 的存在与身份先查：它是 remove --purge 的前置闸，
+        // 目录本身先判：不存在时「缺 marker」只是同一个根因的副作用，
+        // 再报一条会让用户以为要手工重建 marker（实际重建不了）
+        if !ws.path.is_dir() {
+            push(
+                out,
+                CheckKind::WorkspaceDirMissing {
+                    path: ws.path.clone(),
+                },
+            );
+            return;
+        }
+
+        // workspace.toml 的存在与身份：它是 remove --purge 的前置闸，
         // 也对齐「目录是不是这条记录的那个目录」
         match crate::workspace::read_marker_id(&ws.path, &ws.id) {
             MarkerState::Missing => push(
@@ -343,18 +355,8 @@ impl DoctorService {
                     expected: ws.id.as_str().to_owned(),
                 },
             ),
-            // marker 存在且 id 一致：目录身份成立，但不代表目录仍然是目录
+            // marker 存在且 id 一致：目录身份成立
             MarkerState::Match | MarkerState::Corrupt => {}
-        }
-
-        if !ws.path.is_dir() {
-            push(
-                out,
-                CheckKind::WorkspaceDirMissing {
-                    path: ws.path.clone(),
-                },
-            );
-            return;
         }
 
         let servers_dir = ws.path.join("servers");

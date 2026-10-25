@@ -44,11 +44,11 @@ fn add_server(store: &JsonStore, workspace_id: &WorkspaceId) {
 /// 注册表里有服务器时，注销工作目录必须先清服务器登记（不删盘）
 #[test]
 fn remove_with_servers_without_purge_clears_fk() {
-    let (store, svc, _tmp) = setup("ws01");
+    let (store, svc, tmp) = setup("ws01");
     let ws = svc.resolve("ws01").expect("resolve");
     add_server(&store, &ws.id);
 
-    svc.remove("ws01", false)
+    svc.remove("ws01", false, tmp.path())
         .expect("remove must not hit FOREIGN KEY");
 
     assert!(svc.resolve("ws01").is_err());
@@ -62,10 +62,13 @@ fn remove_with_servers_and_purge_clears_fk() {
     let ws = svc.resolve("ws01").expect("resolve");
     add_server(&store, &ws.id);
     let dir = tmp.path().join("ws");
+    let outside = tempfile::tempdir().expect("tmp outside");
 
-    svc.remove("ws01", true)
+    let out = svc
+        .remove("ws01", true, outside.path())
         .expect("remove must not hit FOREIGN KEY");
 
     assert!(!dir.exists());
+    assert!(out.disk_purged());
     assert!(store.list().expect("list servers").is_empty());
 }

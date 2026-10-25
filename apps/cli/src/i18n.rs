@@ -383,6 +383,18 @@ pub(crate) fn workspace(kind: &WorkspaceErrorKind<'_>, lang: Lang) -> String {
                 candidates.join(", ")
             ),
         },
+        WorkspaceErrorKind::CwdInsideTarget { cwd, target } => match lang {
+            Lang::Zh => format!(
+                "当前工作目录在待删目录内（{} 位于 {}），先 cd 出去再重试",
+                cwd.display(),
+                target.display()
+            ),
+            Lang::En => format!(
+                "current working directory {} is inside {}; move out of it first",
+                cwd.display(),
+                target.display()
+            ),
+        },
         WorkspaceErrorKind::NoCurrent => match lang {
             Lang::Zh => {
                 "尚无当前工作区，先执行 mcsup workspace init 或 mcsup workspace use".to_owned()

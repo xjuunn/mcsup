@@ -364,7 +364,9 @@ fn workspace_exit_code(err: &mcsup::service::WorkspaceError) -> u8 {
         mcsup::service::WorkspaceError::NotFound(_) | mcsup::service::WorkspaceError::NoCurrent => {
             3
         }
-        mcsup::service::WorkspaceError::AlreadyExists(_) => 4,
+        // 名称冲突 / 工作目录挡着删除：都是状态冲突，处理后可重试
+        mcsup::service::WorkspaceError::AlreadyExists(_)
+        | mcsup::service::WorkspaceError::CwdInsideTarget { .. } => 4,
         mcsup::service::WorkspaceError::Repo(repo) => repo_exit_code(repo),
         _ => 1,
     }
@@ -543,6 +545,30 @@ mod tests {
             .context("创建服务器失败")
             .unwrap_err();
         assert_eq!(Printer::exit_code(&err), 3);
+    }
+
+    /// 终端停在待删目录里：资源被占用，退出来即可重试，判 4
+    #[test]
+    fn cwd_inside_target_maps_to_exit_code_4() {
+        use mcsup::service::{ServerRegistryError, WorkspaceError};
+        let err = Err::<(), _>(WorkspaceError::CwdInsideTarget {
+            cwd: std::path::PathBuf::from("/ws/servers/alpha"),
+            target: std::path::PathBuf::from("/ws"),
+        })
+        .context("注销工作区失败")
+        .unwrap_err();
+        assert_eq!(Printer::exit_code(&err), 4);
+
+        // `server remove` 经注册表包装后同样还原为 4
+        let err = Err::<(), _>(ServerRegistryError::Workspace(
+            WorkspaceError::CwdInsideTarget {
+                cwd: std::path::PathBuf::from("/ws/servers/alpha"),
+                target: std::path::PathBuf::from("/ws/servers/alpha"),
+            },
+        ))
+        .context("删除服务器失败")
+        .unwrap_err();
+        assert_eq!(Printer::exit_code(&err), 4);
     }
 
     /// 用法错误（非交互缺必选参数 / 取值不合法）：退出码 2

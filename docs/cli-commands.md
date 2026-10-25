@@ -145,7 +145,7 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | `props` | `mcsup server props <name> [key=value ...]` | 无参列出 `server.properties`（TTY 下随后进入交互：选键改值、逐项写入、Esc 退出）；`key=value` 直接写入并提醒重启生效；单独 `key` 缺值时 TTY 交互输入、非 TTY → 退出码 2；键 / 值非法 → 2 |
 | `set` | `mcsup server set <name> [<key>] [<value>]` | 设置服务属性，见下表；TTY 下缺 key 从键列表选、缺 value 按类型补齐（java-version 从已注册大版本选、ram 输入、autostart 二选一）；非 TTY 缺参 → 退出码 2；`java-version` 绑定无运行时的大版本 → 3 |
 | `link` | `mcsup server link <path> [--name <name>] [--workspace <ws>]` | 注册服务器目录：外部目录建符号链接进工作区（目标不能在任一工作区 `servers/` 内）；目标是某工作区 `servers/` 的直接子目录时不建链接、就地注册（恢复注册丢失的服务器，名称必须与目录名一致，`--workspace` 必须与目录归属一致）；带 `mcsup.json` 时复用其身份 |
-| `remove` | `mcsup server remove <name> [--purge]` | 默认注销保留磁盘；交互下询问是否删除磁盘数据（默认不删），同意后红色警示并要求输入服务器名称确认；`--purge` 跳过询问直接删目录（链接服务器拒绝 `--purge`，仅移除链接）；非交互不询问 |
+| `remove` | `mcsup server remove <name> [--purge]` | 默认注销保留磁盘；交互下询问是否删除磁盘数据（默认不删），同意后红色警示并要求输入服务器名称确认；`--purge` 跳过询问直接删目录（链接服务器拒绝 `--purge`，仅移除链接）；非交互不询问；终端工作目录就在该服务器目录内时拒绝（退出码 4，cd 出去后重试）；JSON 同时输出 `purged`（请求了删盘）与 `disk_purged`（磁盘真的删了），目录本就不存在时后者为 `false` |
 | `version` | `mcsup server version <name>` | 当前安装的版本、变体、来源（provider 名）、核心大小与校验和；未安装核心提示 `server install` |
 
 ### 内部入口（隐藏）
@@ -191,7 +191,7 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | `init` | `mcsup workspace init [--dir <path>] [--name <name>]` | 创建并注册工作目录；无 `--dir` 进入交互（默认当前目录），目录必须为空 |
 | `list` | `mcsup workspace list` | 已注册工作目录：名称、路径、服务器数、是否当前 |
 | `use` | `mcsup workspace use [<name>]` | 切换当前工作区；不带名字在 TTY 下交互选择；只影响 `create` / `link` 缺省落点，不隐藏其他目录的服务器 |
-| `remove` | `mcsup workspace remove <name> [--purge]` | 注销工作目录，同时清除该工作目录下的服务器登记；交互下询问是否删除磁盘数据（默认不删），同意后红色警示并要求输入工作区名称确认，`--purge` 跳过询问直接删除；删除失败（目录被占用）保留注册，退出占用后重试即可；删除当前工作区时当前标记移交给剩余中按名称排序的第一个 |
+| `remove` | `mcsup workspace remove <name> [--purge]` | 注销工作目录，同时清除该工作目录下的服务器登记；交互下询问是否删除磁盘数据（默认不删），同意后红色警示并要求输入工作区名称确认，`--purge` 跳过询问直接删除；终端工作目录就在该工作区内时拒绝（退出码 4，cd 出去后重试）；删除失败（目录被占用）保留注册，退出占用后重试即可；JSON 同时输出 `purged`（请求了删盘）与 `disk_purged`（磁盘真的删了），目录本就不存在时后者为 `false`；删除当前工作区时当前标记移交给剩余中按名称排序的第一个 |
 | `doctor` | `mcsup workspace doctor [--only <kind,...>] [--strict]` | 只读体检工作区与注册表一致性：10 项检查（见 `docs/workspace.md` 的表），error 级非零退出；`--only` 按检查项标识过滤，`--strict` 让 warning 也算失败 |
 
 ## mcsup modpack（整合包：一键建整包服务器）
