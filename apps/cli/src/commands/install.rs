@@ -165,11 +165,14 @@ pub(crate) async fn pick_version(
         format!("获取 {} 版本列表", variant.as_str()),
         printer.is_human(),
     );
-    let versions = source.versions().await.context("获取版本列表失败")?;
+    let mut versions = source.versions().await.context("获取版本列表失败")?;
     spinner.finish();
     if versions.is_empty() {
         anyhow::bail!("{} 暂无可用版本", variant.as_str());
     }
+    // 顺序由领域层统一：各来源给出的顺序不一致（Forge 的 BTreeMap 是串字典序，
+    // `1.10` 会落在 `1.1` 之后），入口不再各自排序
+    ServerVersion::sort_display_order(&mut versions);
     let choices = version_choices(&versions);
     let picked = prompts::select_filter_scoped(
         "选择版本",
@@ -204,6 +207,8 @@ pub(crate) fn version_label(version: &ServerVersion) -> String {
     match version.kind {
         VersionKind::Release => version.id.to_string(),
         VersionKind::Snapshot => format!("{}（快照）", version.id),
+        // `VersionKind` 是 `#[non_exhaustive]`：`Historical` 与将来新增的种类
+        // 都按旧版展示，不 panic
         _ => format!("{}（旧版）", version.id),
     }
 }
