@@ -11,12 +11,13 @@ mod workspace;
 use crate::cli::{Cli, Command, JavaAction, ServerAction};
 use crate::config::ConfigFile;
 use crate::diagnostic::AppDiagnostic;
+use crate::locale::Lang;
 use crate::output::Printer;
 use anyhow::{Context, Result};
 use std::path::Path;
 
-pub(crate) async fn run(cli: Cli, cfg: &ConfigFile) -> Result<()> {
-    let printer = Printer::new(cli.output);
+pub(crate) async fn run(cli: Cli, cfg: &ConfigFile, lang: Lang) -> Result<()> {
+    let printer = Printer::new(cli.output, lang);
     match cli.command {
         Command::Workspace { action } => workspace::run(action, printer),
         Command::Server { action } => server(action, cfg, printer).await,

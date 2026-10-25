@@ -59,6 +59,65 @@ impl WorkspaceError {
     fn marker(path: impl Into<PathBuf>, message: impl Into<String>) -> Self {
         FsError::marker(path, message).into()
     }
+
+    /// 面向用户展示的分类；结构化错误不带文案，入口按此渲染提示
+    ///
+    /// 包装类变体（[`Self::Fs`] / [`Self::Repo`] / [`Self::InvalidName`]）各有
+    /// 自己的 `Display`，此处返回 `None` 让入口继续沿错误链找。
+    #[must_use]
+    pub fn kind(&self) -> Option<WorkspaceErrorKind<'_>> {
+        let kind = match self {
+            Self::Fs(_) | Self::Repo(_) | Self::InvalidName(_) => return None,
+            Self::NotEmpty(path) => WorkspaceErrorKind::NotEmpty { path },
+            Self::NotAWorkspace(path) => WorkspaceErrorKind::NotAWorkspace { path },
+            Self::AlreadyExists(name) => WorkspaceErrorKind::AlreadyExists { name },
+            Self::NotFound(name) => WorkspaceErrorKind::NotFound { name },
+            Self::Ambiguous {
+                selector,
+                candidates,
+            } => WorkspaceErrorKind::Ambiguous {
+                selector,
+                candidates,
+            },
+            Self::NoCurrent => WorkspaceErrorKind::NoCurrent,
+        };
+        Some(kind)
+    }
+}
+
+/// [`WorkspaceError::kind`] 的结果：只带判定与参数，文案由入口渲染
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub enum WorkspaceErrorKind<'a> {
+    /// 目标目录非空
+    NotEmpty {
+        /// 目标路径
+        path: &'a Path,
+    },
+    /// 目录缺少 `workspace.toml`
+    NotAWorkspace {
+        /// 目标路径
+        path: &'a Path,
+    },
+    /// 名称或路径冲突
+    AlreadyExists {
+        /// 冲突的名称或路径
+        name: &'a str,
+    },
+    /// 工作目录不存在
+    NotFound {
+        /// 名称或路径
+        name: &'a str,
+    },
+    /// 前缀匹配到多个工作目录
+    Ambiguous {
+        /// 用户给的选择器
+        selector: &'a str,
+        /// 候选名称
+        candidates: &'a [String],
+    },
+    /// 尚无当前工作区
+    NoCurrent,
 }
 
 /// `workspace.toml` 载荷（service 层直接读写，不抽 port）

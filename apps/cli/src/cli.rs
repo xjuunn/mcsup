@@ -11,105 +11,119 @@ pub(crate) const LOG_TAIL_DEFAULT: usize = 30;
 #[command(
     name = "mcsup",
     version,
-    about = "一站式 Minecraft 服务器管理工具",
+    about = crate::meta::about(),
     // propagate_version = true,
     arg_required_else_help = true
 )]
 pub(crate) struct Cli {
-    /// 日志级别：-v 提升、-q 降低
     #[command(flatten)]
     pub(crate) verbose: Verbosity<ZhLevel>,
-    /// 输出格式：human默认 或者json
-    #[arg(long, global = true, value_enum, default_value = "human")]
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        default_value = "human",
+        help = crate::meta::output_arg()
+    )]
     pub(crate) output: OutputFormat,
-    /// 配置文件路径，缺省用系统配置目录下的 mcsup/config.toml
-    #[arg(long, global = true, value_name = "PATH")]
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        help = crate::meta::config_arg()
+    )]
     pub(crate) config: Option<PathBuf>,
+    #[arg(
+        long,
+        global = true,
+        value_name = "LANG",
+        default_value = "auto",
+        value_parser = ["auto", "zh", "en"],
+        help = crate::meta::lang_arg()
+    )]
+    pub(crate) lang: String,
     #[command(subcommand)]
     pub(crate) command: Command,
 }
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
-    /// 工作目录：创建 / 注册表 / 默认切换
+    #[command(about = crate::meta::workspace())]
     #[command(visible_alias = "ws")]
     Workspace {
         #[command(subcommand)]
         action: WorkspaceAction,
     },
-    /// 服务端生命周期与运维
+    #[command(about = crate::meta::server())]
     #[command(visible_alias = "srv")]
     Server {
         #[command(subcommand)]
         action: ServerAction,
     },
-    /// 整合包
+    #[command(about = crate::meta::modpack())]
     #[command(visible_alias = "mp")]
     Modpack {
         #[command(subcommand)]
         action: ModpackAction,
     },
-    /// JVM 运行时
+    #[command(about = crate::meta::java())]
     #[command(visible_alias = "jv")]
     Java {
         #[command(subcommand)]
         action: JavaAction,
     },
-    /// 远程执行位置
+    #[command(about = crate::meta::remote())]
     #[command(visible_alias = "rmt")]
     Remote {
         #[command(subcommand)]
         action: RemoteAction,
     },
-    /// 环境自检
+    #[command(about = crate::meta::doctor())]
     #[command(visible_alias = "doc")]
     Doctor {
-        /// 只跑指定检查项（kebab-case，逗号分隔）；缺省全跑
-        #[arg(long, value_name = "KIND", value_delimiter = ',')]
+        #[arg(
+            long,
+            value_name = "KIND",
+            value_delimiter = ',',
+            help = crate::meta::doctor_only_arg()
+        )]
         only: Vec<String>,
-        /// warning 也视为失败（CI 用）
-        #[arg(long)]
+        #[arg(long, help = crate::meta::doctor_strict_arg())]
         strict: bool,
-        /// 跳过联网检查（来源连通性）
-        #[arg(long)]
+        #[arg(long, help = crate::meta::doctor_offline_arg())]
         offline: bool,
     },
-    /// 查看 / 编辑平台配置
+    #[command(about = crate::meta::config())]
     #[command(visible_alias = "cfg")]
     Config {
         #[command(subcommand)]
         action: ConfigAction,
     },
-    /// 升级自身
+    #[command(about = crate::meta::update())]
     #[command(visible_alias = "up")]
     Update,
-    /// 生成 shell 补全脚本
+    #[command(about = crate::meta::completions())]
     #[command(visible_alias = "comp")]
     Completions { shell: clap_complete::Shell },
-    /// 版本信息
+    #[command(about = crate::meta::version())]
     #[command(visible_alias = "ver")]
     Version,
-    /// supervisor 进程入口（server start 自动拉起，不面向用户）
-    #[command(name = "__supervise", hide = true)]
+    #[command(name = "__supervise", hide = true, about = crate::meta::supervise())]
     Supervise {
-        /// 服务器目录
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", help = crate::meta::supervise_dir_arg())]
         dir: PathBuf,
-        /// java 可执行文件
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", help = crate::meta::supervise_java_arg())]
         java: PathBuf,
-        /// 服务端核心 JAR
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", help = crate::meta::supervise_jar_arg())]
         jar: PathBuf,
-        /// 堆上限（MiB）
-        #[arg(long, value_name = "MIB")]
+        #[arg(long, value_name = "MIB", help = crate::meta::supervise_ram_arg())]
         ram: Option<u32>,
     },
 }
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum WorkspaceAction {
-    /// 创建并注册工作目录
+    #[command(about = crate::meta::workspace_init())]
     #[command(visible_alias = "in", visible_alias = "new")]
     Init {
         #[arg(long, value_name = "PATH")]
@@ -117,153 +131,169 @@ pub(crate) enum WorkspaceAction {
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
     },
-    /// 已注册工作目录
+    #[command(about = crate::meta::workspace_list())]
     #[command(visible_alias = "ls")]
     List,
-    /// 切换当前工作区；不带名字时交互选择
+    #[command(about = crate::meta::workspace_use())]
     #[command(visible_alias = "sw")]
     Use { name: Option<String> },
-    /// 注销工作目录
+    #[command(about = crate::meta::workspace_remove())]
     #[command(visible_alias = "rm")]
     Remove {
         name: String,
         #[arg(long)]
         purge: bool,
     },
-    /// 检查工作区与注册表一致性
-    #[command(name = "doctor", visible_alias = "doc")]
+    #[command(name = "doctor", about = crate::meta::workspace_doctor())]
+    #[command(visible_alias = "doc")]
     Doctor {
-        /// 只跑指定检查项（kebab-case，逗号分隔）；缺省全跑
-        #[arg(long, value_name = "KIND", value_delimiter = ',')]
+        #[arg(
+            long,
+            value_name = "KIND",
+            value_delimiter = ',',
+            help = crate::meta::workspace_doctor_only_arg()
+        )]
         only: Vec<String>,
-        /// warning 也视为失败（CI 用）
-        #[arg(long)]
+        #[arg(long, help = crate::meta::workspace_doctor_strict_arg())]
         strict: bool,
     },
 }
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum ServerAction {
-    /// 列出所有服务
+    #[command(about = crate::meta::server_list())]
     #[command(visible_alias = "ls")]
     List,
-    /// 创建服务；缺名称 / 版本时交互补齐（非交互必填，见全局交互约定）
+    #[command(about = crate::meta::server_create())]
     #[command(visible_alias = "cr")]
     Create {
-        /// 服务器名；缺省且可交互时提示输入
-        #[arg(value_name = "NAME")]
+        #[arg(value_name = "NAME", help = crate::meta::server_create_name_arg())]
         name: Option<String>,
-        /// 服务端版本；缺省且可交互时从版本列表选择
-        #[arg(long, value_name = "VER")]
+        #[arg(
+            long,
+            value_name = "VER",
+            help = crate::meta::server_create_version_arg()
+        )]
         version: Option<String>,
         #[arg(long, value_name = "VAR")]
         variant: Option<String>,
         #[arg(long, value_name = "WS")]
         workspace: Option<String>,
     },
-    /// 安装 / 更换服务端核心
+    #[command(about = crate::meta::server_install())]
     #[command(visible_alias = "in")]
     Install {
         name: String,
         #[arg(long, value_name = "VER")]
         version: Option<String>,
     },
-    /// 启动服务
+    #[command(about = crate::meta::server_start())]
     #[command(visible_alias = "up")]
     Start {
         name: String,
-        /// 同意 Mojang EULA（写 eula=true）
-        #[arg(long)]
+        #[arg(long, help = crate::meta::server_accept_eula_arg())]
         accept_eula: bool,
     },
-    /// 停止服务
+    #[command(about = crate::meta::server_stop())]
     #[command(visible_alias = "down")]
     Stop {
         name: String,
-        /// 优雅停机宽限秒数
-        #[arg(long, value_name = "SEC", default_value_t = 30)]
+        #[arg(
+            long,
+            value_name = "SEC",
+            default_value_t = 30,
+            help = crate::meta::server_grace_arg()
+        )]
         grace: u64,
-        /// 宽限到期后强杀
-        #[arg(long)]
+        #[arg(long, help = crate::meta::server_force_arg())]
         force: bool,
     },
-    /// 重启服务（先停后启）
+    #[command(about = crate::meta::server_restart())]
     #[command(visible_alias = "rs")]
     Restart {
         name: String,
-        /// 同意 Mojang EULA（写 eula=true）
-        #[arg(long)]
+        #[arg(long, help = crate::meta::server_accept_eula_arg())]
         accept_eula: bool,
-        /// 优雅停机宽限秒数
-        #[arg(long, value_name = "SEC", default_value_t = 30)]
+        #[arg(
+            long,
+            value_name = "SEC",
+            default_value_t = 30,
+            help = crate::meta::server_grace_arg()
+        )]
         grace: u64,
-        /// 宽限到期后强杀
-        #[arg(long)]
+        #[arg(long, help = crate::meta::server_force_arg())]
         force: bool,
     },
-    /// 服务状态
+    #[command(about = crate::meta::server_status())]
     #[command(visible_alias = "st")]
     Status { name: String },
-    /// 附加交互控制台
+    #[command(about = crate::meta::server_console())]
     #[command(visible_alias = "con")]
     Console { name: String },
-    /// 注入单条命令
+    #[command(about = crate::meta::server_send())]
     #[command(visible_alias = "snd")]
     Send { name: String, command: String },
-    /// 查看日志
+    #[command(about = crate::meta::server_logs())]
     #[command(visible_alias = "log")]
     Logs {
         name: String,
-        /// 显示末尾行数
-        #[arg(long, value_name = "N", default_value_t = LOG_TAIL_DEFAULT)]
+        #[arg(
+            long,
+            value_name = "N",
+            default_value_t = LOG_TAIL_DEFAULT,
+            help = crate::meta::server_logs_tail_arg()
+        )]
         tail: usize,
-        /// 持续跟踪新增（JSON 模式输出 JSONL）
-        #[arg(long)]
+        #[arg(long, help = crate::meta::server_logs_follow_arg())]
         follow: bool,
     },
-    /// 读写 server.properties
+    #[command(about = crate::meta::server_props())]
     #[command(visible_alias = "prop")]
     Props { name: String, kv: Vec<String> },
-    /// 设置服务属性
+    #[command(about = crate::meta::server_set())]
     #[command(visible_alias = "cfg")]
     Set {
         name: String,
-        /// 属性键；缺省且可交互时从键列表选择
-        #[arg(value_name = "KEY")]
+        #[arg(value_name = "KEY", help = crate::meta::server_set_key_arg())]
         key: Option<String>,
-        /// 属性值；缺省且可交互时按键类型输入或选择
-        #[arg(value_name = "VALUE")]
+        #[arg(value_name = "VALUE", help = crate::meta::server_set_value_arg())]
         value: Option<String>,
     },
-    /// 删除服务
+    #[command(about = crate::meta::server_remove())]
     #[command(visible_alias = "rm")]
     Remove {
         name: String,
         #[arg(long)]
         purge: bool,
     },
-    /// 链接外部服务器目录到工作区
+    #[command(about = crate::meta::server_link())]
     #[command(visible_alias = "ln")]
     Link {
-        /// 外部服务器目录
+        #[arg(help = crate::meta::server_link_path_arg())]
         path: PathBuf,
-        /// 注册名，缺省取目录名或 marker 名
-        #[arg(long, value_name = "NAME")]
+        #[arg(
+            long,
+            value_name = "NAME",
+            help = crate::meta::server_link_name_arg()
+        )]
         name: Option<String>,
-        /// 目标工作区，缺省当前工作区
-        #[arg(long, value_name = "WS")]
+        #[arg(
+            long,
+            value_name = "WS",
+            help = crate::meta::server_workspace_arg()
+        )]
         workspace: Option<String>,
     },
-    /// 服务版本信息
+    #[command(about = crate::meta::server_version())]
     #[command(visible_alias = "ver")]
     Version { name: String },
-    /// 备份
+    #[command(about = crate::meta::server_backup())]
     #[command(visible_alias = "bak")]
     Backup {
         #[command(subcommand)]
         action: BackupAction,
     },
-    /// 服务端 Mod
+    #[command(about = crate::meta::server_mod())]
     #[command(visible_alias = "md")]
     Mod {
         #[command(subcommand)]
@@ -330,35 +360,35 @@ pub(crate) enum ModpackAction {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum JavaAction {
-    /// 列出已注册的 Java 运行时（未扫描过则自动扫描）
+    #[command(about = crate::meta::java_list())]
     #[command(visible_alias = "ls")]
     List,
-    /// 重新扫描本机 Java
+    #[command(about = crate::meta::java_scan())]
     #[command(visible_alias = "sc")]
     Scan,
-    /// 从远端下载安装 Java
+    #[command(about = crate::meta::java_install())]
     #[command(visible_alias = "in")]
     Install {
-        /// 大版本号，如 17 / 21；缺省时交互选择
+        #[arg(help = crate::meta::java_install_version_arg())]
         version: Option<String>,
-        /// 只装 JRE，不装完整 JDK
-        #[arg(long)]
+        #[arg(long, help = crate::meta::java_install_jre_arg())]
         jre: bool,
-        /// 发行版：temurin / zulu / liberica / corretto
-        #[arg(long, value_name = "VENDOR")]
+        #[arg(
+            long,
+            value_name = "VENDOR",
+            help = crate::meta::java_install_vendor_arg()
+        )]
         vendor: Option<String>,
     },
-    /// 卸载 Java（系统 Java 仅移除注册记录）
     #[command(
         arg_required_else_help = true,
-        visible_alias = "un",
-        visible_alias = "rm"
+        about = crate::meta::java_uninstall()
     )]
+    #[command(visible_alias = "un", visible_alias = "rm")]
     Uninstall {
-        /// 大版本号或运行时路径
+        #[arg(help = crate::meta::java_uninstall_target_arg())]
         target: Option<String>,
-        /// 运行时路径（路径含空格时推荐，如 "…/Application Support/…"）
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", help = crate::meta::java_uninstall_dir_arg())]
         dir: Option<PathBuf>,
     },
 }
@@ -382,16 +412,16 @@ pub(crate) enum RemoteAction {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum ConfigAction {
-    /// 显示平台配置
+    #[command(about = crate::meta::config_show())]
     #[command(visible_alias = "ls")]
     Show,
-    /// 设置配置项
+    #[command(about = crate::meta::config_set())]
     #[command(visible_alias = "st")]
     Set { key: String, value: String },
-    /// 恢复为平台缺省
+    #[command(about = crate::meta::config_unset())]
     #[command(visible_alias = "us")]
     Unset { key: String },
-    /// 打开编辑器
+    #[command(about = crate::meta::config_edit())]
     #[command(visible_alias = "ed")]
     Edit,
 }

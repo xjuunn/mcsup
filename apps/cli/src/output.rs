@@ -1,4 +1,5 @@
 use crate::diagnostic::AppDiagnostic;
+use crate::locale::Lang;
 use comfy_table::{Cell, Table};
 use mcsup::domain::server::version::VersionId;
 use owo_colors::{OwoColorize, Stream};
@@ -28,12 +29,19 @@ impl fmt::Display for OutputFormat {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Printer {
     format: OutputFormat,
+    lang: Lang,
 }
 
 impl Printer {
     #[must_use]
-    pub(crate) const fn new(format: OutputFormat) -> Self {
-        Self { format }
+    pub(crate) const fn new(format: OutputFormat, lang: Lang) -> Self {
+        Self { format, lang }
+    }
+
+    /// 界面语言：命令自行拼提示文本时用
+    #[must_use]
+    pub(crate) const fn lang(self) -> Lang {
+        self.lang
     }
 
     /// 一段粗体标题，仅人类模式，JSON 模式不输出非数据行
@@ -173,12 +181,16 @@ impl Printer {
                 return settings_exit_code(settings);
             }
             if let Some(jar) = cause.downcast_ref::<mcsup::service::InstallJarError>() {
-                return match jar {
-                    mcsup::service::InstallJarError::Registry(reg) => registry_exit_code(reg),
-                    mcsup::service::InstallJarError::Install(install) => install_exit_code(install),
+                return match jar.kind() {
                     // 世界与目标版本冲突：状态冲突，不重试同一版本
-                    mcsup::service::InstallJarError::Downgrade { .. } => 4,
-                    _ => 1,
+                    Some(mcsup::service::InstallJarErrorKind::Downgrade { .. }) => 4,
+                    _ => match jar {
+                        mcsup::service::InstallJarError::Registry(reg) => registry_exit_code(reg),
+                        mcsup::service::InstallJarError::Install(install) => {
+                            install_exit_code(install)
+                        }
+                        _ => 1,
+                    },
                 };
             }
             if let Some(reg) = cause.downcast_ref::<mcsup::service::ServerRegistryError>() {
@@ -212,7 +224,11 @@ impl Printer {
     }
 
     /// 用 miette 渲染错误到 stderr
-    pub(crate) fn render_error(err: anyhow::Error) {
+    pub(crate) fn render_error(self, err: anyhow::Error) {
+        if let Some(message) = structured_message(&err, self.lang) {
+            print_error_line(&format!("mcsup: {message}"));
+            return;
+        }
         match err.downcast::<AppDiagnostic>() {
             Ok(diag) => {
                 use miette::Diagnostic as _;
@@ -235,8 +251,37 @@ impl Printer {
     }
 }
 
-/// 下载失败 → 5 后端失败；用户取消 → 130（128 + SIGINT），与 Ctrl-C 强制
-/// 退出码一致，调用方凭码区分「取消」与「失败」
+/// 结构化错误的用户提示：只认带 `kind()` 的那几类，其余（IO、
+/// 下载源等）沿用它自己的 `Display`。文案集中在 [`crate::i18n`]。
+///
+/// 嵌套错误沿链路下钻：`LifecycleError::Registry` 之类是 transparent 包装，
+/// 没有 `kind()`，要落到内层才能取到判定。
+fn structured_message(err: &anyhow::Error, lang: Lang) -> Option<String> {
+    for cause in err.chain() {
+        if let Some(life) = cause.downcast_ref::<mcsup::service::LifecycleError>() {
+            let kind = life.kind()?;
+            return Some(crate::i18n::lifecycle(&kind, lang));
+        }
+        if let Some(jar) = cause.downcast_ref::<mcsup::service::InstallJarError>() {
+            let kind = jar.kind()?;
+            return Some(crate::i18n::install_jar(&kind, lang));
+        }
+        if let Some(settings) = cause.downcast_ref::<mcsup::service::SettingsError>() {
+            let kind = settings.kind()?;
+            return Some(crate::i18n::settings(&kind, lang));
+        }
+        if let Some(reg) = cause.downcast_ref::<mcsup::service::ServerRegistryError>() {
+            let kind = reg.kind()?;
+            return Some(crate::i18n::registry(&kind, lang));
+        }
+        if let Some(ws) = cause.downcast_ref::<mcsup::service::WorkspaceError>() {
+            let kind = ws.kind()?;
+            return Some(crate::i18n::workspace(&kind, lang));
+        }
+    }
+    None
+}
+
 /// 生命周期错误判级：状态冲突 4、缺资源 3、EULA 用法 2、后端 5、其余 1
 fn lifecycle_exit_code(err: &mcsup::service::LifecycleError) -> u8 {
     use mcsup::service::LifecycleError as Life;
@@ -249,12 +294,13 @@ fn lifecycle_exit_code(err: &mcsup::service::LifecycleError) -> u8 {
         // 运行中（含删除 / 换核心被拒）：状态冲突
         Life::AlreadyRunning | Life::NotRunning | Life::Busy { .. } => 4,
         // 换核心失败：注册表 / 来源 / 下载各按原判级，其余 1
-        Life::InstallJar(jar) => match jar {
-            mcsup::service::InstallJarError::Registry(reg) => registry_exit_code(reg),
-            mcsup::service::InstallJarError::Install(install) => install_exit_code(install),
-            // 世界与目标版本冲突：状态冲突，不重试同一版本
-            mcsup::service::InstallJarError::Downgrade { .. } => 4,
-            _ => 1,
+        Life::InstallJar(jar) => match jar.kind() {
+            Some(mcsup::service::InstallJarErrorKind::Downgrade { .. }) => 4,
+            _ => match jar {
+                mcsup::service::InstallJarError::Registry(reg) => registry_exit_code(reg),
+                mcsup::service::InstallJarError::Install(install) => install_exit_code(install),
+                _ => 1,
+            },
         },
         // StopTimedOut / Io 与未来新增变体：通用 1
         _ => 1,
@@ -283,6 +329,8 @@ fn settings_exit_code(err: &mcsup::service::SettingsError) -> u8 {
     }
 }
 
+/// 下载失败 → 5 后端失败；用户取消 → 130（128 + SIGINT），与 Ctrl-C 强制
+/// 退出码一致，调用方凭码区分「取消」与「失败」
 fn download_exit_code(err: &mcsup::port::DownloadError) -> u8 {
     match err {
         mcsup::port::DownloadError::Cancelled => 130,
@@ -351,7 +399,7 @@ fn repo_exit_code(err: &mcsup::port::RepositoryError) -> u8 {
 
 impl Default for Printer {
     fn default() -> Self {
-        Self::new(OutputFormat::Human)
+        Self::new(OutputFormat::Human, Lang::Zh)
     }
 }
 
@@ -600,7 +648,7 @@ mod tests {
     fn lifecycle_busy_maps_to_exit_code_4() {
         let err = Err::<(), _>(mcsup::service::LifecycleError::Busy {
             name: "alpha".to_owned(),
-            phase: "删除",
+            op: mcsup::service::BusyOp::Remove,
         })
         .context("删除失败")
         .unwrap_err();

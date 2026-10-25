@@ -53,7 +53,61 @@ pub enum ServerRegistryError {
     WorkspaceMismatch { owner: String, selected: String },
 }
 
+impl ServerRegistryError {
+    /// 面向用户展示的分类；结构化错误不带文案，入口按此渲染提示
+    ///
+    /// 包装类变体（[`Self::Workspace`] / [`Self::Fs`] / [`Self::Repo`] /
+    /// [`Self::InvalidName`]）各自有自己的 `Display` 或 `kind`，此处返回 `None`
+    /// 让入口继续沿错误链找。
+    #[must_use]
+    pub fn kind(&self) -> Option<ServerRegistryErrorKind<'_>> {
+        let kind = match self {
+            Self::Workspace(_) | Self::Fs(_) | Self::Repo(_) | Self::InvalidName(_) => return None,
+            Self::AlreadyExists(name) => ServerRegistryErrorKind::AlreadyExists { name },
+            Self::NotFound(name) => ServerRegistryErrorKind::NotFound { name },
+            Self::TargetInsideWorkspace(path) => {
+                ServerRegistryErrorKind::TargetInsideWorkspace { path }
+            }
+            Self::WorkspaceMismatch { owner, selected } => {
+                ServerRegistryErrorKind::WorkspaceMismatch { owner, selected }
+            }
+        };
+        Some(kind)
+    }
+}
+
+/// [`ServerRegistryError::kind`] 的结果：只带判定与参数，文案由入口渲染
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub enum ServerRegistryErrorKind<'a> {
+    /// 名称冲突或目标目录已存在
+    AlreadyExists {
+        /// 服务器名
+        name: &'a str,
+    },
+    /// 服务器不存在
+    NotFound {
+        /// 服务器名
+        name: &'a str,
+    },
+    /// 目标位于某个工作区的 servers/ 内，禁止 link
+    TargetInsideWorkspace {
+        /// 目标路径
+        path: &'a Path,
+    },
+    /// 目标属于另一个工作区
+    WorkspaceMismatch {
+        /// 目标所属工作区
+        owner: &'a str,
+        /// `--workspace` 解析出的工作区
+        selected: &'a str,
+    },
+}
+
 /// 服务端核心安装失败（注册表定位 + 下载编排）
+///
+/// [`Self::Inspect`] 与 [`Self::Downgrade`] 会被入口直接展示，文案由入口按
+/// [`InstallJarError::kind`] 渲染；本层 `Display` 只用于日志与调试。
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum InstallJarError {
@@ -64,11 +118,11 @@ pub enum InstallJarError {
     #[error(transparent)]
     Install(#[from] InstallError),
     /// 世界或目标核心的元数据无法读取
-    #[error("无法检查世界或目标核心的兼容性")]
+    #[error("failed to inspect world or core metadata")]
     Inspect(#[from] port::InspectError),
     /// 目标核心低于世界数据版本：Minecraft 不支持降级世界
     #[error(
-        "世界由 {world_version}（DataVersion {world}）创建，目标版本 {target_version}（DataVersion {target}）更低；Minecraft 不支持降级世界。请改用 {world_version} 或更高版本，或备份并移走世界目录后重试"
+        "world data version {world} is newer than target core data version {target}; downgrading a world is not supported"
     )]
     Downgrade {
         /// 世界数据版本
@@ -79,6 +133,48 @@ pub enum InstallJarError {
         world_version: String,
         /// 用户选择的目标版本
         target_version: String,
+    },
+}
+
+impl InstallJarError {
+    /// 面向用户展示的分类；结构化错误不带文案，入口按此渲染提示
+    #[must_use]
+    pub fn kind(&self) -> Option<InstallJarErrorKind<'_>> {
+        let kind = match self {
+            Self::Registry(_) | Self::Install(_) => return None,
+            Self::Inspect(_) => InstallJarErrorKind::Inspect,
+            Self::Downgrade {
+                world,
+                target,
+                world_version,
+                target_version,
+            } => InstallJarErrorKind::Downgrade {
+                world: *world,
+                target: *target,
+                world_version,
+                target_version,
+            },
+        };
+        Some(kind)
+    }
+}
+
+/// [`InstallJarError::kind`] 的结果：只带判定与参数，文案由入口渲染
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub enum InstallJarErrorKind<'a> {
+    /// 世界或目标核心元数据无法读取
+    Inspect,
+    /// 目标核心低于世界数据版本
+    Downgrade {
+        /// 世界数据版本
+        world: DataVersion,
+        /// 目标核心数据版本
+        target: DataVersion,
+        /// 世界对应的版本名
+        world_version: &'a str,
+        /// 用户选择的目标版本
+        target_version: &'a str,
     },
 }
 

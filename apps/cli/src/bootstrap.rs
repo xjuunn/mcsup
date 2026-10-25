@@ -1,4 +1,5 @@
-﻿use crate::config;
+use crate::config;
+use crate::locale::Lang;
 use anyhow::{Context, Result, anyhow};
 use mcsup::bootstrap::Mcsup;
 use mcsup::domain::server::version::ServerVariant;
@@ -102,31 +103,48 @@ pub(crate) fn pick_source(
 }
 
 /// 变体 → 来源；未注册变体报错并列出当前可用项
-pub(crate) fn source_for(variant: ServerVariant) -> Result<Arc<dyn ServerJarSource>> {
+pub(crate) fn source_for(variant: ServerVariant, lang: Lang) -> Result<Arc<dyn ServerJarSource>> {
     let sources = jar_sources()?;
-    pick_source(variant, &sources)
-        .ok_or_else(|| anyhow!("{}", unsupported_message(variant, &available_of(&sources))))
+    pick_source(variant, &sources).ok_or_else(|| {
+        anyhow!(
+            "{}",
+            unsupported_message(variant, &available_of(&sources), lang)
+        )
+    })
 }
 
 /// 未支持 / 未知变体的统一错误文案（纯逻辑，入口与测试共用）
-pub(crate) fn unsupported_message(variant: ServerVariant, available: &[ServerVariant]) -> String {
-    format!(
-        "暂未支持变体 {}；当前可用：{}",
-        variant.as_str(),
-        join_variants(available)
+pub(crate) fn unsupported_message(
+    variant: ServerVariant,
+    available: &[ServerVariant],
+    lang: Lang,
+) -> String {
+    crate::i18n::pick(
+        lang,
+        format!(
+            "暂未支持变体 {}；当前可用：{}",
+            variant.as_str(),
+            join_variants(available, lang)
+        ),
+        format!(
+            "variant not supported yet: {}; currently available: {}",
+            variant.as_str(),
+            join_variants(available, lang)
+        ),
     )
 }
 
-/// 可用变体拼接为 `vanilla、paper` 形式
-pub(crate) fn join_variants(available: &[ServerVariant]) -> String {
+/// 可用变体拼接为 `vanilla、paper` / `vanilla, paper` 形式
+pub(crate) fn join_variants(available: &[ServerVariant], lang: Lang) -> String {
     if available.is_empty() {
-        return "（无）".to_owned();
+        return crate::i18n::text(lang, "（无）", "(none)").to_owned();
     }
+    let sep = crate::i18n::text(lang, "、", ", ");
     available
         .iter()
         .map(|v| v.as_str())
         .collect::<Vec<_>>()
-        .join("、")
+        .join(sep)
 }
 
 /// 库侧默认组合根（`mcsup::bootstrap`）：CLI 全部命令的统一装配口径。
@@ -203,10 +221,10 @@ mod tests {
 
     #[test]
     fn unsupported_message_lists_available_variants() {
-        let msg = unsupported_message(ServerVariant::Paper, &[ServerVariant::Vanilla]);
+        let msg = unsupported_message(ServerVariant::Paper, &[ServerVariant::Vanilla], Lang::Zh);
         assert!(msg.contains("paper"), "{msg}");
         assert!(msg.contains("vanilla"), "{msg}");
-        let empty = unsupported_message(ServerVariant::Paper, &[]);
+        let empty = unsupported_message(ServerVariant::Paper, &[], Lang::Zh);
         assert!(empty.contains("无"), "{empty}");
     }
 

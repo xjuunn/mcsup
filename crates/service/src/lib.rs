@@ -22,7 +22,8 @@ pub use java::{
     StageSink, UninstallOutcome,
 };
 pub use lifecycle::{
-    DEFAULT_RAM_MIB, LifecycleError, LogWatch, ServerLifecycleService, StartOptions, StatusReport,
+    BusyOp, DEFAULT_RAM_MIB, LifecycleError, LifecycleErrorKind, LogWatch, ServerLifecycleService,
+    StartOptions, StatusReport,
 };
 pub use platform_config::{
     Config, ConfigKey, ConfigValueError, EffectiveValue, FEATURE_HEADER, JAVA_SOURCE_ALL,
@@ -37,14 +38,16 @@ use port::{
 };
 pub use props::{PropsError, PropsReport, ServerPropsService};
 pub use registry::{
-    InstallJarError, InstalledServerJar, RegisteredServer, ServerRegistry, ServerRegistryError,
+    InstallJarError, InstallJarErrorKind, InstalledServerJar, RegisteredServer, ServerRegistry,
+    ServerRegistryError, ServerRegistryErrorKind,
 };
-pub use settings::{ServerSettingsService, SettingChange, SettingsError};
+pub use settings::{ServerSettingsService, SettingChange, SettingsError, SettingsErrorKind};
 use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
 pub use workspace::{
-    InitOutcome, MARKER_FILE, NOISE_ENTRIES, WorkspaceError, WorkspaceService, absolute_path,
+    InitOutcome, MARKER_FILE, NOISE_ENTRIES, WorkspaceError, WorkspaceErrorKind, WorkspaceService,
+    absolute_path,
 };
 
 /// 安装任务失败
