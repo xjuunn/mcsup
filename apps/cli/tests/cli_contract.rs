@@ -170,3 +170,66 @@ fn workspace_init_then_list_stdout_single_json() {
     assert_eq!(rows[0]["name"], "ws1");
     assert_eq!(rows[0]["current"], true);
 }
+
+/// clap 硬编码的英文标题 / 内置 flag 说明 / 内置 help 子命令说明必须全部中文化
+#[test]
+fn help_output_is_chinese() {
+    const ENGLISH: [&str; 11] = [
+        "Usage:",
+        "Commands:",
+        "Arguments:",
+        "Options:",
+        "Print help",
+        "Print version",
+        "Print this message",
+        "Increase logging verbosity",
+        "Decrease logging verbosity",
+        "[default: ",
+        "[possible values: ",
+    ];
+    let cases: [&[&str]; 4] = [
+        &["--help"],
+        &["workspace", "-h"],
+        &["server", "backup", "create", "--help"],
+        &["help", "server"],
+    ];
+    let home = temp_home();
+    for args in cases {
+        let out = run(home.path(), args);
+        assert_eq!(out.status.code(), Some(0), "{args:?}");
+        assert!(out.stderr.is_empty(), "{args:?} 帮助不应写 stderr");
+        let text = String::from_utf8_lossy(&out.stdout);
+        for english in ENGLISH {
+            assert!(
+                !text.contains(english),
+                "{args:?} 残留英文 {english}:\n{text}"
+            );
+        }
+        for chinese in ["用法:", "选项:", "打印帮助信息"] {
+            assert!(text.contains(chinese), "{args:?} 缺少 {chinese}:\n{text}");
+        }
+    }
+}
+
+/// 无参缺子命令：仍是帮助 + 用法错误 2，只是文案换成中文
+#[test]
+fn no_args_help_is_chinese_on_stderr() {
+    let home = temp_home();
+    let out = run(home.path(), &[]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty(), "用法错误不得输出数据");
+    let err = stderr(&out);
+    assert!(err.contains("用法:"), "{err}");
+    assert!(!err.contains("Usage:"), "{err}");
+    assert!(err.contains("命令:"), "{err}");
+}
+
+/// `--version` 走中文化后的帮助通道，仍退 0 且只写 stdout
+#[test]
+fn version_exits_0_on_stdout() {
+    let home = temp_home();
+    let out = run(home.path(), &["--version"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stderr.is_empty());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("mcsup"));
+}

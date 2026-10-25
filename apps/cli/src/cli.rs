@@ -1,4 +1,5 @@
 use crate::output::OutputFormat;
+use crate::verbosity::ZhLevel;
 use clap::{Parser, Subcommand};
 use clap_verbosity_flag::Verbosity;
 use std::path::PathBuf;
@@ -17,7 +18,7 @@ pub(crate) const LOG_TAIL_DEFAULT: usize = 30;
 pub(crate) struct Cli {
     /// 日志级别：-v 提升、-q 降低
     #[command(flatten)]
-    pub(crate) verbose: Verbosity,
+    pub(crate) verbose: Verbosity<ZhLevel>,
     /// 输出格式：human默认 或者json
     #[arg(long, global = true, value_enum, default_value = "human")]
     pub(crate) output: OutputFormat,
