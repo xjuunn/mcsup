@@ -188,8 +188,7 @@ impl TryFrom<ServerEntry> for ServerMeta {
             ServerName::parse(&entry.name).map_err(|err| corrupt("name", &entry.name, err))?;
         let workspace_id = WorkspaceId::parse(&entry.workspace_id)
             .map_err(|err| corrupt("workspace_id", &entry.workspace_id, err))?;
-        let variant = ServerVariant::parse(&entry.variant)
-            .map_err(|err| corrupt("variant", &entry.variant, err))?;
+        let variant = ServerVariant::from_id(entry.variant.as_str());
         let jar = match (
             entry.jar_path,
             entry.jar_size,

@@ -1,5 +1,7 @@
 use std::fmt;
 
+pub use super::variant::{ServerVariant, VariantId};
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct VersionId(String);
 
@@ -28,18 +30,6 @@ pub enum VersionKind {
     Historical,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ServerVariant {
-    Vanilla,
-    Fabric,
-    Forge,
-    NeoForge,
-    Paper,
-    /// 外部目录链接（`server link`）进来的服务器，变体未知
-    Unknown,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerVersion {
     pub id: VersionId,
@@ -51,34 +41,18 @@ pub struct ServerVersion {
 }
 
 impl ServerVariant {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Vanilla => "vanilla",
-            Self::Fabric => "fabric",
-            Self::Forge => "forge",
-            Self::NeoForge => "neoforge",
-            Self::Paper => "paper",
-            Self::Unknown => "unknown",
-        }
-    }
-
-    /// 解析变体名
+    /// 解析为**内置**变体
+    ///
+    /// 只认内置集合：用于 `--variant` 这类需要尽早报错的入口。第三方变体不经
+    /// 此路径校验，而是由组合根已注册的来源集合决定（见
+    /// [`Self::from_id`]）。
     ///
     /// # Errors
     ///
-    /// 名称不在已知集合内时返回 [`super::error::UnknownVariant`]
+    /// 名称不在内置集合内时返回 [`super::error::UnknownVariant`]
     pub fn parse(raw: &str) -> Result<Self, super::error::UnknownVariant> {
-        match raw {
-            "vanilla" => Ok(Self::Vanilla),
-            "fabric" => Ok(Self::Fabric),
-            "forge" => Ok(Self::Forge),
-            "neoforge" => Ok(Self::NeoForge),
-            "paper" => Ok(Self::Paper),
-            "unknown" => Ok(Self::Unknown),
-            other => Err(super::error::UnknownVariant {
-                raw: other.to_owned(),
-            }),
-        }
+        Self::known(raw).ok_or_else(|| super::error::UnknownVariant {
+            raw: raw.to_owned(),
+        })
     }
 }

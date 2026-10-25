@@ -33,13 +33,13 @@ pub(crate) async fn run(
     let srv = registry
         .get(name)
         .with_context(|| format!("服务器 {name} 不存在"))?;
-    let source = bootstrap::source_for(srv.meta.variant, printer.lang())?;
+    let source = bootstrap::source_for(&srv.meta.variant, printer.lang())?;
     let version_id = match version {
         Some(raw) => VersionId::new(raw),
         None => match default_version_source(srv.meta.jar.is_some(), printer.is_interactive()) {
             VersionSource::Recorded => srv.meta.version.clone(),
             VersionSource::Prompt => {
-                pick_version(source.as_ref(), srv.meta.variant, printer).await?
+                pick_version(source.as_ref(), &srv.meta.variant, printer).await?
             }
             VersionSource::Latest => VersionId::new("latest"),
         },
@@ -133,7 +133,7 @@ pub(crate) async fn download_jar(
 /// 列表获取失败、来源无版本或读取选择失败时返回错误
 pub(crate) async fn pick_version(
     source: &dyn ServerJarSource,
-    variant: ServerVariant,
+    variant: &ServerVariant,
     printer: Printer,
 ) -> Result<VersionId> {
     let spinner = TaskSpinner::new(

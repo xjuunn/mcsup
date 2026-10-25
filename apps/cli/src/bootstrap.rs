@@ -93,19 +93,19 @@ pub(crate) fn available_of(sources: &[Arc<dyn ServerJarSource>]) -> Vec<ServerVa
 /// `Unknown` 是历史数据兜底（旧注册 / marker 缺失），回落 vanilla 来源；
 /// 其余未注册变体返回 `None`，由调用方给出「可用变体」错误。
 pub(crate) fn pick_source(
-    variant: ServerVariant,
+    variant: &ServerVariant,
     sources: &[Arc<dyn ServerJarSource>],
 ) -> Option<Arc<dyn ServerJarSource>> {
-    let target = if variant == ServerVariant::Unknown {
-        ServerVariant::Vanilla
+    let target = if *variant == ServerVariant::Unknown {
+        &ServerVariant::Vanilla
     } else {
         variant
     };
-    sources.iter().find(|s| s.variant() == target).cloned()
+    sources.iter().find(|s| &s.variant() == target).cloned()
 }
 
 /// 变体 → 来源；未注册变体报错并列出当前可用项
-pub(crate) fn source_for(variant: ServerVariant, lang: Lang) -> Result<Arc<dyn ServerJarSource>> {
+pub(crate) fn source_for(variant: &ServerVariant, lang: Lang) -> Result<Arc<dyn ServerJarSource>> {
     let sources = jar_sources()?;
     pick_source(variant, &sources).ok_or_else(|| {
         anyhow!(
@@ -117,7 +117,7 @@ pub(crate) fn source_for(variant: ServerVariant, lang: Lang) -> Result<Arc<dyn S
 
 /// 未支持 / 未知变体的统一错误文案（纯逻辑，入口与测试共用）
 pub(crate) fn unsupported_message(
-    variant: ServerVariant,
+    variant: &ServerVariant,
     available: &[ServerVariant],
     lang: Lang,
 ) -> String {
@@ -144,7 +144,7 @@ pub(crate) fn join_variants(available: &[ServerVariant], lang: Lang) -> String {
     let sep = crate::i18n::text(lang, "、", ", ");
     available
         .iter()
-        .map(|v| v.as_str())
+        .map(ServerVariant::as_str)
         .collect::<Vec<_>>()
         .join(sep)
 }
@@ -172,7 +172,7 @@ mod tests {
     #[async_trait::async_trait]
     impl ServerJarSource for FakeSource {
         fn variant(&self) -> ServerVariant {
-            self.variant
+            self.variant.clone()
         }
 
         fn name(&self) -> &'static str {
@@ -192,7 +192,7 @@ mod tests {
     fn sources(variants: &[ServerVariant]) -> Vec<Arc<dyn ServerJarSource>> {
         variants
             .iter()
-            .map(|v| Arc::new(FakeSource { variant: *v }) as Arc<dyn ServerJarSource>)
+            .map(|v| Arc::new(FakeSource { variant: v.clone() }) as Arc<dyn ServerJarSource>)
             .collect()
     }
 
@@ -213,20 +213,20 @@ mod tests {
     #[test]
     fn pick_source_finds_by_variant_and_unknown_falls_back_to_vanilla() {
         let list = sources(&[ServerVariant::Vanilla, ServerVariant::Paper]);
-        assert!(pick_source(ServerVariant::Paper, &list).is_some());
+        assert!(pick_source(&ServerVariant::Paper, &list).is_some());
         // Unknown → vanilla 兜底
-        assert!(pick_source(ServerVariant::Unknown, &list).is_some());
+        assert!(pick_source(&ServerVariant::Unknown, &list).is_some());
         let vanilla_only = sources(&[ServerVariant::Vanilla]);
-        assert!(pick_source(ServerVariant::Paper, &vanilla_only).is_none());
-        assert!(pick_source(ServerVariant::Paper, &[]).is_none());
+        assert!(pick_source(&ServerVariant::Paper, &vanilla_only).is_none());
+        assert!(pick_source(&ServerVariant::Paper, &[]).is_none());
     }
 
     #[test]
     fn unsupported_message_lists_available_variants() {
-        let msg = unsupported_message(ServerVariant::Paper, &[ServerVariant::Vanilla], Lang::Zh);
+        let msg = unsupported_message(&ServerVariant::Paper, &[ServerVariant::Vanilla], Lang::Zh);
         assert!(msg.contains("paper"), "{msg}");
         assert!(msg.contains("vanilla"), "{msg}");
-        let empty = unsupported_message(ServerVariant::Paper, &[], Lang::Zh);
+        let empty = unsupported_message(&ServerVariant::Paper, &[], Lang::Zh);
         assert!(empty.contains("无"), "{empty}");
     }
 

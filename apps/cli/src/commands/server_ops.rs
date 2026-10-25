@@ -189,12 +189,12 @@ pub(crate) async fn create(
     };
 
     // 6. 版本（交互拉列表选择；来源随变体能力匹配）
-    let source = bootstrap::source_for(variant, printer.lang())?;
+    let source = bootstrap::source_for(&variant, printer.lang())?;
     let version_id = if let Some(version) = version {
         VersionId::new(version)
     } else {
         prompts::step(printer, 3, 3, "服务端版本");
-        pick_version(source.as_ref(), variant, printer).await?
+        pick_version(source.as_ref(), &variant, printer).await?
     };
 
     // Java 版本要求不在此预取：下载核心时 `install_jar` 会随元数据一并回写，
@@ -295,9 +295,9 @@ fn resolve_flag_variant(
 fn default_variant(available: &[ServerVariant], lang: Lang) -> Result<ServerVariant> {
     available
         .iter()
-        .copied()
-        .find(|variant| *variant == ServerVariant::Vanilla)
-        .or_else(|| available.first().copied())
+        .find(|variant| **variant == ServerVariant::Vanilla)
+        .or_else(|| available.first())
+        .cloned()
         .ok_or_else(|| {
             anyhow::anyhow!(crate::i18n::pick(
                 lang,
@@ -310,7 +310,7 @@ fn default_variant(available: &[ServerVariant], lang: Lang) -> Result<ServerVari
 /// 交互变体选择：仅列可用；单可用项免提问（不打步骤回显）
 fn pick_variant(available: &[ServerVariant], printer: Printer) -> Result<ServerVariant> {
     if let [only] = available {
-        return Ok(*only);
+        return Ok(only.clone());
     }
     prompts::step(printer, 2, 3, "服务端变体");
     let labels: Vec<String> = available.iter().map(|v| v.as_str().to_owned()).collect();
@@ -323,7 +323,7 @@ fn variant_from_label(picked: &str, available: &[ServerVariant]) -> Option<Serve
     available
         .iter()
         .find(|variant| variant.as_str() == picked)
-        .copied()
+        .cloned()
 }
 
 /// 名称重输：语法由 prompts 校验，重复（注册表已有）时警示后重问

@@ -359,7 +359,7 @@ pub struct JavaUninstallJson {
 
 /// 变体名到展示名：保持与 `ServerVariant::as_str` 一致，供渲染层复用
 #[must_use]
-pub fn variant_str(variant: ServerVariant) -> &'static str {
+pub fn variant_str(variant: &ServerVariant) -> &str {
     variant.as_str()
 }
 
@@ -609,7 +609,7 @@ mod tests {
 
     #[test]
     fn variant_str_matches_domain() {
-        assert_eq!(variant_str(ServerVariant::Vanilla), "vanilla");
+        assert_eq!(variant_str(&ServerVariant::Vanilla), "vanilla");
     }
 
     /// 备份分页信封与单行字段名是公开契约，钉住形状
