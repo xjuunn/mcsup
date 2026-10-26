@@ -1,0 +1,565 @@
+//! 远端只读镜像仓库：`port` 仓库 trait 的远端实现
+//!
+//! 三个实现都持有 [`RemoteLink`]，读路径直接把对端的 `list` 结果解回领域对象。
+//! 客户端不维护第二套注册表——「本地缓存 + TTL 刷新」留给装配层（组合仓库）
+//! 做，镜像本身永远说真话：能读到的是对端此刻的状态，读不到就报错。
+//!
+//! # 写操作为什么在镜像上而不在 service
+//!
+//! 客户端**不实现** `create` / `update_core` 这类 trait 方法去伪装本地仓库：
+//! `WorkspaceService::init` 会在本机建目录、写 marker，这些动作必须在**对端**
+//! 发生。镜像因此只暴露与帧一一对应的显式方法（`create` / `remove`），
+//! 调用方（组合仓库的路由层）按来源决定「本地走 service、
+//! 远端走这些方法」，不存在「假装有仓库」后仍在本机做文件系统动作的歧义。
+//!
+//! # `list_sourced` 与镜像的来源
+//!
+//! 单来源实现默认全部标 [`Origin::Local`]，镜像覆写成 [`Origin::Remote`]——
+//! 这是「组合仓库给合并列表标注来源」机制下，远端一方的真实标注。
+
+use super::link::RemoteLink;
+use domain::java::JavaRuntime;
+use domain::server::launch::LaunchSpec;
+use domain::server::meta::{InstalledJar, ServerMeta, ServerName};
+use domain::server::settings::ServerSettings;
+use domain::server::version::VersionId;
+use domain::workspace::{Workspace, WorkspaceId, WorkspaceName};
+use port::{Origin, RepositoryError, Sourced};
+use protocol::remote::{Request, Response};
+use std::path::Path;
+
+/// 工作目录镜像
+#[derive(Debug, Clone)]
+pub struct RemoteWorkspaceRepository {
+    link: RemoteLink,
+    origin: Origin,
+}
+
+impl RemoteWorkspaceRepository {
+    /// 构造；`origin` 是这台远端的来源标注
+    #[must_use]
+    pub fn new(link: RemoteLink, origin: Origin) -> Self {
+        Self { link, origin }
+    }
+
+    /// 在对端创建工作目录（`dir` 是**对端**机器上的路径）
+    ///
+    /// 返回对端创建 / 恢复出的工作目录记录。
+    ///
+    /// # Errors
+    ///
+    /// 对端拒绝（目录非空、名称冲突…）或传输失败时返回 [`RepositoryError`]
+    pub fn init(&self, dir: &Path, name: Option<&str>) -> Result<Workspace, RepositoryError> {
+        let response = self.link.expect(
+            &Request::WorkspaceInit {
+                dir: dir.to_string_lossy().into_owned(),
+                name: name.map(str::to_owned),
+            },
+            "workspaces",
+        )?;
+        match response {
+            Response::Workspaces { mut items } => {
+                let wire = items.pop().ok_or_else(|| {
+                    RepositoryError::Corrupt("workspace.init returned no record".to_owned())
+                })?;
+                Workspace::try_from(wire)
+            }
+            other => Err(unexpected(other, "workspace.init")),
+        }
+    }
+
+    /// 切换对端的当前工作区
+    ///
+    /// 「当前工作区」是对端的状态：客户端 `workspace use prod-box/w1` 时，
+    /// 对端下一次缺省落点就在 `w1`。
+    ///
+    /// # Errors
+    ///
+    /// 对端拒绝或传输失败时返回 [`RepositoryError`]
+    pub fn set_current(&self, selector: &str) -> Result<Workspace, RepositoryError> {
+        let response = self.link.expect(
+            &Request::WorkspaceUse {
+                selector: selector.to_owned(),
+            },
+            "workspaces",
+        )?;
+        match response {
+            Response::Workspaces { mut items } => {
+                let wire = items.pop().ok_or_else(|| {
+                    RepositoryError::Corrupt("workspace.use returned no record".to_owned())
+                })?;
+                Workspace::try_from(wire)
+            }
+            other => Err(unexpected(other, "workspace.use")),
+        }
+    }
+
+    /// 注销对端的工作目录；`purge` 时对端一并删盘
+    ///
+    /// # Errors
+    ///
+    /// 对端拒绝或传输失败时返回 [`RepositoryError`]
+    pub fn remove(&self, selector: &str, purge: bool) -> Result<bool, RepositoryError> {
+        let response = self.link.expect(
+            &Request::WorkspaceRemove {
+                selector: selector.to_owned(),
+                purge,
+            },
+            "removed",
+        )?;
+        match response {
+            Response::Removed { disk_purged } => Ok(disk_purged),
+            other => Err(unexpected(other, "workspace.remove")),
+        }
+    }
+}
+
+impl port::WorkspaceRepository for RemoteWorkspaceRepository {
+    fn create(&self, _ws: &Workspace) -> Result<(), RepositoryError> {
+        Err(RepositoryError::Storage(Box::new(std::io::Error::other(
+            "creating a remote workspace goes through RemoteWorkspaceRepository::init",
+        ))))
+    }
+
+    fn get(&self, id: &WorkspaceId) -> Result<Workspace, RepositoryError> {
+        self.list()?
+            .into_iter()
+            .find(|ws| &ws.id == id)
+            .ok_or_else(|| RepositoryError::NotFound(id.as_str().to_owned()))
+    }
+
+    fn get_by_name(&self, name: &WorkspaceName) -> Result<Workspace, RepositoryError> {
+        self.list()?
+            .into_iter()
+            .find(|ws| &ws.name == name)
+            .ok_or_else(|| RepositoryError::NotFound(name.as_str().to_owned()))
+    }
+
+    fn list(&self) -> Result<Vec<Workspace>, RepositoryError> {
+        let response = self.link.expect(&Request::WorkspaceList, "workspaces")?;
+        match response {
+            Response::Workspaces { items } => {
+                let mut out = Vec::with_capacity(items.len());
+                decode_list("workspace", items, Workspace::try_from, &mut out)?;
+                Ok(out)
+            }
+            other => Err(unexpected(other, "workspace.list")),
+        }
+    }
+
+    fn current(&self) -> Result<Option<Workspace>, RepositoryError> {
+        Ok(self.list()?.into_iter().find(|ws| ws.is_current))
+    }
+
+    fn set_current(&self, id: &WorkspaceId) -> Result<(), RepositoryError> {
+        let ws = self.get(id)?;
+        self.set_current(ws.name.as_str())?;
+        Ok(())
+    }
+
+    fn remove(&self, id: &WorkspaceId) -> Result<(), RepositoryError> {
+        let ws = self.get(id)?;
+        self.remove(ws.name.as_str(), false)?;
+        Ok(())
+    }
+
+    fn relink_path(
+        &self,
+        _id: &WorkspaceId,
+        _path: &Path,
+        _updated_at: i64,
+    ) -> Result<(), RepositoryError> {
+        Err(RepositoryError::Storage(Box::new(std::io::Error::other(
+            "relinking a remote workspace is a local-only operation",
+        ))))
+    }
+
+    fn list_sourced(&self) -> Result<Vec<Sourced<Workspace>>, RepositoryError> {
+        Ok(self
+            .list()?
+            .into_iter()
+            .map(|ws| Sourced::new(self.origin.clone(), ws))
+            .collect())
+    }
+}
+
+/// 服务器镜像
+#[derive(Debug, Clone)]
+pub struct RemoteServerRepository {
+    link: RemoteLink,
+    origin: Origin,
+}
+
+impl RemoteServerRepository {
+    /// 构造；`origin` 是这台远端的来源标注
+    #[must_use]
+    pub fn new(link: RemoteLink, origin: Origin) -> Self {
+        Self { link, origin }
+    }
+
+    /// 在对端创建服务器登记（不下载核心；核心安装是对端的事）
+    ///
+    /// # Errors
+    ///
+    /// 对端拒绝（名称冲突、工作区不存在…）或传输失败时返回 [`RepositoryError`]
+    pub fn create(
+        &self,
+        workspace: Option<&str>,
+        name: &str,
+        version: &str,
+        variant: &str,
+        java_major: Option<i64>,
+    ) -> Result<ServerMeta, RepositoryError> {
+        let response = self.link.expect(
+            &Request::ServerCreate {
+                workspace: workspace.map(str::to_owned),
+                name: name.to_owned(),
+                version: version.to_owned(),
+                variant: variant.to_owned(),
+                java_major,
+            },
+            "servers",
+        )?;
+        match response {
+            Response::Servers { mut items } => {
+                let wire = items.pop().ok_or_else(|| {
+                    RepositoryError::Corrupt("server.create returned no record".to_owned())
+                })?;
+                ServerMeta::try_from(wire)
+            }
+            other => Err(unexpected(other, "server.create")),
+        }
+    }
+
+    /// 注销对端的服务器；`purge` 时对端一并删盘
+    ///
+    /// # Errors
+    ///
+    /// 对端拒绝或传输失败时返回 [`RepositoryError`]
+    pub fn remove(&self, name: &str, purge: bool) -> Result<bool, RepositoryError> {
+        let response = self.link.expect(
+            &Request::ServerRemove {
+                name: name.to_owned(),
+                purge,
+            },
+            "removed",
+        )?;
+        match response {
+            Response::Removed { disk_purged } => Ok(disk_purged),
+            other => Err(unexpected(other, "server.remove")),
+        }
+    }
+}
+
+impl port::ServerRepository for RemoteServerRepository {
+    fn create(&self, _meta: &ServerMeta) -> Result<(), RepositoryError> {
+        Err(RepositoryError::Storage(Box::new(std::io::Error::other(
+            "creating a remote server goes through RemoteServerRepository::create",
+        ))))
+    }
+
+    fn get(&self, name: &ServerName) -> Result<ServerMeta, RepositoryError> {
+        self.list()?
+            .into_iter()
+            .find(|meta| &meta.name == name)
+            .ok_or_else(|| RepositoryError::NotFound(name.as_str().to_owned()))
+    }
+
+    fn list(&self) -> Result<Vec<ServerMeta>, RepositoryError> {
+        let response = self.link.expect(&Request::ServerList, "servers")?;
+        match response {
+            Response::Servers { items } => {
+                let mut out = Vec::with_capacity(items.len());
+                decode_list("server", items, ServerMeta::try_from, &mut out)?;
+                Ok(out)
+            }
+            other => Err(unexpected(other, "server.list")),
+        }
+    }
+
+    fn update_core(
+        &self,
+        _name: &ServerName,
+        _version: &VersionId,
+        _jar: &InstalledJar,
+        _launch: Option<&LaunchSpec>,
+        _required_java_major: Option<domain::java::JavaMajor>,
+        _updated_at: i64,
+    ) -> Result<ServerMeta, RepositoryError> {
+        Err(RepositoryError::Storage(Box::new(std::io::Error::other(
+            "installing a core on a remote server is a remote-side operation",
+        ))))
+    }
+
+    fn update_settings(
+        &self,
+        _name: &ServerName,
+        _settings: &ServerSettings,
+        _updated_at: i64,
+    ) -> Result<ServerMeta, RepositoryError> {
+        Err(RepositoryError::Storage(Box::new(std::io::Error::other(
+            "updating remote server settings is not in this protocol version",
+        ))))
+    }
+
+    fn remove(&self, name: &ServerName) -> Result<(), RepositoryError> {
+        self.remove(name.as_str(), false)?;
+        Ok(())
+    }
+
+    fn remove_by_workspace(&self, _workspace_id: &WorkspaceId) -> Result<(), RepositoryError> {
+        Err(RepositoryError::Storage(Box::new(std::io::Error::other(
+            "removing remote servers by workspace is not exposed; remove individually",
+        ))))
+    }
+
+    fn relink(
+        &self,
+        _name: &ServerName,
+        _workspace_id: &WorkspaceId,
+        _rel_dir: &Path,
+        _updated_at: i64,
+    ) -> Result<ServerMeta, RepositoryError> {
+        Err(RepositoryError::Storage(Box::new(std::io::Error::other(
+            "relinking a remote server is a remote-side operation",
+        ))))
+    }
+
+    fn list_sourced(&self) -> Result<Vec<Sourced<ServerMeta>>, RepositoryError> {
+        Ok(self
+            .list()?
+            .into_iter()
+            .map(|meta| Sourced::new(self.origin.clone(), meta))
+            .collect())
+    }
+}
+
+/// Java 运行时镜像
+///
+/// 扫描是对端的事（[`Self::scan`]），镜像侧的 `upsert` / `remove` /
+/// `mark_scanned` 没有意义——那些动作只改对端本机的注册表。
+#[derive(Debug, Clone)]
+pub struct RemoteJavaRepository {
+    link: RemoteLink,
+    origin: Origin,
+}
+
+impl RemoteJavaRepository {
+    /// 构造；`origin` 是这台远端的来源标注
+    #[must_use]
+    pub fn new(link: RemoteLink, origin: Origin) -> Self {
+        Self { link, origin }
+    }
+
+    /// 让对端扫一遍本机 JVM 并登记（`force = true`）
+    ///
+    /// # Errors
+    ///
+    /// 对端扫描失败或传输失败时返回 [`RepositoryError`]
+    pub fn scan(&self) -> Result<Vec<JavaRuntime>, RepositoryError> {
+        let response = self.link.expect(&Request::JavaScan, "javas")?;
+        match response {
+            Response::Javas { items } => {
+                let mut out = Vec::with_capacity(items.len());
+                decode_list("java", items, JavaRuntime::try_from, &mut out)?;
+                Ok(out)
+            }
+            other => Err(unexpected(other, "java.scan")),
+        }
+    }
+}
+
+impl port::JavaRuntimeRepository for RemoteJavaRepository {
+    fn upsert(&self, _runtime: &JavaRuntime) -> Result<(), RepositoryError> {
+        Err(RepositoryError::Storage(Box::new(std::io::Error::other(
+            "registering a remote JVM is a remote-side operation",
+        ))))
+    }
+
+    fn list(&self) -> Result<Vec<JavaRuntime>, RepositoryError> {
+        let response = self.link.expect(&Request::JavaList, "javas")?;
+        match response {
+            Response::Javas { items } => {
+                let mut out = Vec::with_capacity(items.len());
+                decode_list("java", items, JavaRuntime::try_from, &mut out)?;
+                Ok(out)
+            }
+            other => Err(unexpected(other, "java.list")),
+        }
+    }
+
+    fn get_by_path(&self, path: &Path) -> Result<JavaRuntime, RepositoryError> {
+        self.list()?
+            .into_iter()
+            .find(|rt| rt.path == path)
+            .ok_or_else(|| RepositoryError::NotFound(path.display().to_string()))
+    }
+
+    fn remove(&self, _path: &Path) -> Result<(), RepositoryError> {
+        Err(RepositoryError::Storage(Box::new(std::io::Error::other(
+            "unregistering a remote JVM is a remote-side operation",
+        ))))
+    }
+
+    fn scan_state(&self) -> Result<Option<i64>, RepositoryError> {
+        // 扫描状态是对端本机口径，镜像不缓存它；对端在 list 时自己补扫
+        Ok(None)
+    }
+
+    fn mark_scanned(&self, _at: i64) -> Result<(), RepositoryError> {
+        Err(RepositoryError::Storage(Box::new(std::io::Error::other(
+            "scan state is remote-side state",
+        ))))
+    }
+
+    fn list_sourced(&self) -> Result<Vec<Sourced<JavaRuntime>>, RepositoryError> {
+        Ok(self
+            .list()?
+            .into_iter()
+            .map(|rt| Sourced::new(self.origin.clone(), rt))
+            .collect())
+    }
+}
+
+/// 把载荷列表解成领域对象；任何一条解不出来都按记录损坏上报
+fn decode_list<T, U>(
+    what: &'static str,
+    items: Vec<T>,
+    mut convert: impl FnMut(T) -> Result<U, RepositoryError>,
+    out: &mut Vec<U>,
+) -> Result<(), RepositoryError> {
+    for item in items {
+        match convert(item) {
+            Ok(value) => out.push(value),
+            Err(err) => return Err(RepositoryError::Corrupt(format!("{what}: {err}"))),
+        }
+    }
+    Ok(())
+}
+
+/// 分派表之外的响应形态：说明两端协议版本对不上或有分叉，按损坏上报
+///
+/// 按值接收：调用点都是 `match` 的 `other` 绑定，把所有权交给这里最直接。
+#[allow(clippy::needless_pass_by_value)]
+fn unexpected(response: Response, op: &'static str) -> RepositoryError {
+    RepositoryError::Corrupt(format!("{op} returned an unexpected frame: {response:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::remote::testkit::{PairingHarness, encoding};
+    use domain::server::version::ServerVariant;
+    use port::JavaRuntimeRepository as _;
+    use port::ServerRepository as _;
+    use port::WorkspaceRepository as _;
+    use std::path::PathBuf;
+
+    fn origin() -> Origin {
+        Origin::Remote(port::RemoteName::parse("test-box").expect("name"))
+    }
+
+    #[test]
+    fn workspace_list_and_get_roundtrip_over_real_tls() {
+        let harness = PairingHarness::spawn();
+        let link = harness.link();
+        let repo = RemoteWorkspaceRepository::new(link, origin());
+        let workspaces = repo.list().expect("list");
+        // agent 的空数据目录：还没有工作区
+        assert!(workspaces.is_empty());
+        assert!(repo.current().expect("current").is_none());
+    }
+
+    #[test]
+    fn workspace_init_creates_on_the_agent_side() {
+        let harness = PairingHarness::spawn();
+        let agent_dir = harness.agent_data.join("srv");
+        let repo = RemoteWorkspaceRepository::new(harness.link(), origin());
+        let ws = repo.init(&agent_dir, Some("w1")).expect("init");
+        assert_eq!(ws.name.as_str(), "w1");
+        // 垫片不落盘：目录是否真被创建由 `crates/mcsup` 的 agent 集成测试负责
+        assert_eq!(ws.path.to_string_lossy(), agent_dir.to_string_lossy());
+
+        let list = repo.list().expect("list");
+        assert_eq!(list.len(), 1);
+
+        let got = repo.get(&ws.id).expect("get");
+        assert_eq!(got.id, ws.id);
+        let by_name = repo.get_by_name(&ws.name).expect("get_by_name");
+        assert_eq!(by_name.name.as_str(), "w1");
+
+        let sourced = repo.list_sourced().expect("sourced");
+        assert!(matches!(&sourced[0].origin, Origin::Remote(_)));
+        assert!(sourced[0].value.is_current, "第一个工作区自动成为当前");
+    }
+
+    #[test]
+    fn server_list_and_create_roundtrip_over_real_tls() {
+        let harness = PairingHarness::spawn();
+        let agent_dir = harness.agent_data.join("srv");
+        let workspaces = RemoteWorkspaceRepository::new(harness.link(), origin());
+        workspaces.init(&agent_dir, Some("w1")).expect("init ws");
+
+        let servers = RemoteServerRepository::new(harness.link(), origin());
+        let list = servers.list().expect("list");
+        assert!(list.is_empty());
+
+        let created = servers
+            .create(Some("w1"), "web", "1.21.1", "vanilla", Some(21))
+            .expect("create");
+        assert_eq!(created.name.as_str(), "web");
+
+        let after = servers.list().expect("list");
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].id, created.id);
+
+        let got = servers.get(&created.name).expect("get");
+        assert_eq!(got.version.as_str(), "1.21.1");
+        assert!(matches!(got.variant, ServerVariant::Vanilla));
+
+        let sourced = servers.list_sourced().expect("sourced");
+        assert!(matches!(&sourced[0].origin, Origin::Remote(_)));
+
+        // 重复创建：垫片不查重，这里只验证「创建 → 列表可见 → 注销」闭环；
+        // 重复拒绝由对端 service 保证（agent 集成测试已覆盖）
+        assert!(!servers.remove("web", false).expect("remove"));
+        assert!(servers.list().expect("list").is_empty());
+        let err = servers.get(&created.name).expect_err("gone");
+        assert!(matches!(err, RepositoryError::NotFound(_)), "{err:?}");
+    }
+
+    #[test]
+    fn java_list_over_real_tls() {
+        let harness = PairingHarness::spawn();
+        let java = RemoteJavaRepository::new(harness.link(), origin());
+        // agent 数据目录没有 JVM，也没有 java 注册记录；list 触发对端扫描后为空
+        let list = java.list().expect("list");
+        assert!(list.is_empty());
+        let sourced = java.list_sourced().expect("sourced");
+        assert!(sourced.is_empty());
+
+        let path = PathBuf::from("/nowhere/java");
+        let err = java.get_by_path(&path).expect_err("not found");
+        assert!(matches!(err, RepositoryError::NotFound(_)), "{err:?}");
+
+        // 扫描是对端动作：对端登记 0 条 JVM 时正常返回空列表（不报错）
+        let scanned = java.scan().expect("scan");
+        assert!(scanned.is_empty());
+    }
+
+    #[test]
+    fn trait_write_methods_are_explicitly_unsupported() {
+        // 编译期验证：这些方法存在且返回错误，而不是 panic
+        let harness = PairingHarness::spawn();
+        let servers = RemoteServerRepository::new(harness.link(), origin());
+        let name = ServerName::parse("web").expect("name");
+        let meta = encoding::server_meta(&name, encoding::workspace_id());
+        let err = port::ServerRepository::create(&servers, &meta).expect_err("unsupported");
+        assert!(matches!(err, RepositoryError::Storage(_)), "{err:?}");
+
+        let java = RemoteJavaRepository::new(harness.link(), origin());
+        let err = port::JavaRuntimeRepository::upsert(&java, &encoding::java_runtime())
+            .expect_err("unsupported");
+        assert!(matches!(err, RepositoryError::Storage(_)), "{err:?}");
+    }
+}

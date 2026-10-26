@@ -17,6 +17,8 @@ use port::{
 use std::path::Path;
 use std::sync::Arc;
 
+pub mod remote;
+
 /// 本机执行位置
 ///
 /// supervisor / installer 默认是 `runtime` 的实现，也可被宿主启动器替换

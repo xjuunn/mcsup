@@ -149,7 +149,8 @@ done
 #   service -> domain port
 #   <实现层> -> domain port + 契约 crate（runtime 额外允许 protocol）
 #   transport -> 契约 crate           （transport 只搬字节，不含业务判定）
-#   backend -> domain port + 实现层     （执行位置聚合器，唯一允许组合具体实现）
+#   backend -> domain port protocol + 实现层  （执行位置聚合器，唯一允许组合具体实现；
+#              protocol 是契约 crate：远端镜像要解帧）
 #   mcsup   -> 任意内层（门面）
 #   apps    -> 只允许 mcsup
 # 实现层之间除 backend 外互不依赖。
@@ -205,10 +206,10 @@ for manifest in $manifests; do
 			;;
 		backend)
 			case "$dep" in
-			domain | port) ;;
+			domain | port | protocol) ;;
 			*)
 				if ! contains "$dep" "$impl_layers"; then
-					fail "backend -> $dep: 只允许依赖 domain / port 或实现层"
+					fail "backend -> $dep: 只允许依赖 domain / port / protocol 或实现层"
 				fi
 				;;
 			esac
@@ -365,7 +366,7 @@ if [ -f "$pkg_manifest" ] && [ -f "$pkg_lib" ]; then
 		runtime) printf '%s' 'auth domain port protocol runtime' ;;
 		backup) printf '%s' 'domain port backup' ;;
 		transport) printf '%s' 'auth domain port protocol transport' ;;
-		backend) printf '%s' 'auth backend backup domain port protocol runtime' ;;
+		backend) printf '%s' 'auth backend backup domain port protocol runtime transport' ;;
 		# 组合 feature：一次拉入全部内层（默认组合根）
 		bootstrap) printf '%s' 'auth backend backup domain file java port protocol provider runtime service storage transport' ;;
 		# 组合 feature：agent 侧要装配整套服务 + 传输 + supervisor 入口

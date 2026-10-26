@@ -8,11 +8,17 @@ publish = false
 
 [dependencies]
 backup = { version = "0.1.0", path = "../backup" }
+domain = { version = "0.1.0", path = "../domain" }
 port = { version = "0.1.0", path = "../port" }
+protocol = { version = "0.1.0", path = "../protocol" }
 runtime = { version = "0.1.0", path = "../runtime" }
+thiserror.workspace = true
+tracing.workspace = true
+transport = { version = "0.1.0", path = "../transport" }
 
 [lints]
 workspace = true
 
 [dev-dependencies]
+auth = { version = "0.1.0", path = "../auth" }
 tempfile.workspace = true
