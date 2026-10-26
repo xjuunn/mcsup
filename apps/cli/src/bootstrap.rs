@@ -70,9 +70,35 @@ pub(crate) fn jar_sources() -> Result<Vec<Arc<dyn ServerJarSource>>> {
 }
 
 /// 可创建 / 可安装的变体集合：来源 `variant()` 去重，保持注册顺序
+///
+/// 在此基础上追加「非 JAR 来源」的变体：整合包由 `port::ModpackSource` 承载，
+/// 没有 `ServerJarSource`，但同样应出现在 `server create` 的候选列表里。
 pub(crate) fn available_variants() -> Result<Vec<ServerVariant>> {
     let sources = jar_sources()?;
-    Ok(available_of(&sources))
+    Ok(available_with_modpack(available_of(&sources)))
+}
+
+/// 在可用变体后追加整合包变体（若尚未包含）
+///
+/// 单独成函数便于测试：是否出现整合包取决于整合包来源是否注册，而不是
+/// 入口写死。
+pub(crate) fn available_with_modpack(mut available: Vec<ServerVariant>) -> Vec<ServerVariant> {
+    if !available.contains(&ServerVariant::ModrinthModpack) {
+        available.push(ServerVariant::ModrinthModpack);
+    }
+    available
+}
+
+/// 该变体是否由整合包承载（需要走整合包开服流程）
+pub(crate) fn is_modpack(variant: &ServerVariant) -> bool {
+    mcsup::service::is_modpack_variant(variant)
+}
+
+/// 整合包开服服务
+pub(crate) fn modpack_service() -> Result<mcsup::service::ModpackService> {
+    let data_dir = config::platform_data_dir();
+    let mc = Mcsup::open(&data_dir).context("装配整合包服务")?;
+    Ok(mc.modpack)
 }
 
 /// [`available_variants`] 的纯逻辑内核（可注入假来源测试）

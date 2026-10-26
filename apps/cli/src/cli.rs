@@ -70,12 +70,6 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: ServerAction,
     },
-    #[command(about = crate::meta::modpack())]
-    #[command(visible_alias = "mp")]
-    Modpack {
-        #[command(subcommand)]
-        action: ModpackAction,
-    },
     #[command(about = crate::meta::java())]
     #[command(visible_alias = "jv")]
     Java {
@@ -211,6 +205,12 @@ pub(crate) enum ServerAction {
             help = crate::meta::server_workspace_dir_arg()
         )]
         workspace_dir: Option<PathBuf>,
+        #[arg(
+            long = "modpack",
+            value_name = "ID",
+            help = crate::meta::server_create_modpack_arg()
+        )]
+        modpack: Option<String>,
     },
     #[command(about = crate::meta::server_install())]
     #[command(visible_alias = "in")]
@@ -464,20 +464,6 @@ pub(crate) enum ModAction {
 }
 
 #[derive(Debug, Subcommand)]
-pub(crate) enum ModpackAction {
-    #[command(visible_alias = "ls")]
-    List { query: Option<String> },
-    #[command(visible_alias = "in")]
-    Install {
-        pack: String,
-        #[arg(long, value_name = "NAME")]
-        name: Option<String>,
-        #[arg(long, value_name = "WS")]
-        workspace: Option<String>,
-    },
-}
-
-#[derive(Debug, Subcommand)]
 pub(crate) enum JavaAction {
     #[command(about = crate::meta::java_list())]
     #[command(visible_alias = "ls")]
@@ -631,7 +617,7 @@ mod tests {
     /// 一级与二级简写与全拼解析到同一命令
     #[test]
     fn shorthand_matches_long_form() {
-        let cases: [(&[&str], &[&str]); 7] = [
+        let cases: [(&[&str], &[&str]); 6] = [
             (&["ws", "ls"], &["workspace", "list"]),
             (
                 &["srv", "bak", "ls", "alpha"],
@@ -641,7 +627,6 @@ mod tests {
                 &["srv", "md", "od", "alpha"],
                 &["server", "mod", "outdated", "alpha"],
             ),
-            (&["mp", "in", "atm9"], &["modpack", "install", "atm9"]),
             (&["jv", "un", "17"], &["java", "uninstall", "17"]),
             (&["rmt", "ls"], &["remote", "list"]),
             (&["cfg", "st", "a", "b"], &["config", "set", "a", "b"]),

@@ -8,6 +8,7 @@ use comfy_table::{Cell, Color, Table};
 use mcsup::domain::server::status::ServerStatus;
 use mcsup::domain::server::version::{ServerVariant, VersionId};
 use mcsup::domain::workspace::{WorkspaceId, WorkspaceName};
+use mcsup::port::ServerJarSource;
 use mcsup::protocol::cli::{CreateRow, RemoveJson, ServerRow};
 use mcsup::service::{
     InitOutcome, ServerRegistry, ServerRegistryError, WorkspaceError, WorkspaceService,
@@ -16,6 +17,7 @@ use mcsup::service::{
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::install::{download_jar, pick_version};
 
@@ -29,7 +31,7 @@ struct ServerRowView<'a> {
     running: bool,
 }
 
-pub(crate) fn open_registry() -> Result<std::sync::Arc<ServerRegistry>> {
+pub(crate) fn open_registry() -> Result<Arc<ServerRegistry>> {
     bootstrap::open_registry()
 }
 
@@ -195,6 +197,8 @@ pub(crate) struct CreateArgs<'a> {
     pub(crate) workspace_name: Option<&'a str>,
     /// 与 `--workspace` 配合：要新建的工作区目录
     pub(crate) workspace_dir: Option<&'a Path>,
+    /// 整合包项目 ID / slug（`--modpack`，隐含 `--variant modrinth-modpack`）
+    pub(crate) modpack: Option<&'a str>,
 }
 
 /// `server create`：非交互走参数直通（缺必选参数 → 退出码 2），
@@ -211,8 +215,15 @@ pub(crate) async fn create(args: CreateArgs<'_>, printer: Printer) -> Result<()>
         workspace,
         workspace_name,
         workspace_dir,
+        modpack,
     } = args;
     let interactive = printer.is_interactive();
+    // `--modpack` 隐含整合包变体：避免用户同时写两个参数还写错
+    let variant = if modpack.is_some() {
+        Some("modrinth-modpack")
+    } else {
+        variant
+    };
 
     // 1. 用法闸（先于落库与联网，快速失败）
     if name.is_none() && !interactive {
@@ -222,7 +233,10 @@ pub(crate) async fn create(args: CreateArgs<'_>, printer: Printer) -> Result<()>
         )
         .into());
     }
-    if version.is_none() && !interactive {
+    // 整合包变体的 `--version` 是整合包版本 ID，可省略（取最新正式版），
+    // 因此不套用「非交互必须给版本」的闸门
+    let modpack_mode = variant.is_some_and(|raw| raw.eq_ignore_ascii_case("modrinth-modpack"));
+    if version.is_none() && !interactive && !modpack_mode {
         return Err(AppDiagnostic::usage(
             "server create 缺少 --version",
             Some("非交互模式必填；交互终端下可省略后从版本列表选择".to_owned()),
@@ -276,13 +290,22 @@ pub(crate) async fn create(args: CreateArgs<'_>, printer: Printer) -> Result<()>
         None => pick_variant(&available, printer)?,
     };
 
-    // 6. 版本（交互拉列表选择；来源随变体能力匹配）
-    let source = bootstrap::source_for(&variant, printer.lang())?;
-    let version_id = if let Some(version) = version {
-        VersionId::new(version)
+    // 6. 按变体分流：整合包先选包（拿清单的 MC 版本），其余拉核心版本列表
+    let (version_id, source, modpack) = if bootstrap::is_modpack(&variant) {
+        let picked = super::modpack::pick_modpack(modpack, version, printer).await?;
+        // 整合包的 MC 版本由清单声明，注册表要如实记录它
+        let version_id = VersionId::new(picked.minecraft.clone());
+        (version_id, None, Some(picked))
     } else {
-        prompts::step(printer, 3, 3, "服务端版本");
-        pick_version(source.as_ref(), &variant, printer).await?
+        // 版本（交互拉列表选择；来源随变体能力匹配）
+        let source = bootstrap::source_for(&variant, printer.lang())?;
+        let version_id = if let Some(version) = version {
+            VersionId::new(version)
+        } else {
+            prompts::step(printer, 3, 3, "服务端版本");
+            pick_version(source.as_ref(), &variant, printer).await?
+        };
+        (version_id, Some(source), None)
     };
 
     // Java 版本要求不在此预取：下载核心时 `install_jar` 会随元数据一并回写，
@@ -297,19 +320,67 @@ pub(crate) async fn create(args: CreateArgs<'_>, printer: Printer) -> Result<()>
         )
         .with_context(|| format!("创建服务器 {name} 失败"))?;
 
-    // 7. 下载核心：失败保留已注册结果，提示用 install 重试
-    if let Err(err) = download_jar(&name, &version_id, source, variant, printer).await {
+    // 7. 布置服务端（核心 / 整合包），失败保留已注册结果
+    setup_server(
+        &name,
+        &srv.dir,
+        &version_id,
+        source,
+        &variant,
+        modpack,
+        printer,
+    )
+    .await?;
+    report_created(&srv, printer)
+}
+
+/// 创建服务器之后的服务端布置
+///
+/// - 整合包：装加载器核心 → 铺 overrides → 下载清单文件
+/// - 其余变体：下载核心 JAR
+///
+/// 失败时给出一条「已创建、可重试」的提示并把错误原样返回：服务器已经落库，
+/// 不存在「回滚到没创建」的语义，重试入口是 `server install`。
+///
+/// # Errors
+///
+/// 核心下载失败、整合包取回 / 布置失败，或变体既非整合包又没有核心来源时返回错误
+async fn setup_server(
+    name: &str,
+    dir: &Path,
+    version_id: &VersionId,
+    source: Option<Arc<dyn ServerJarSource>>,
+    variant: &ServerVariant,
+    modpack: Option<super::modpack::PickedModpack>,
+    printer: Printer,
+) -> Result<()> {
+    let outcome = match (modpack, source) {
+        (Some(modpack), _) => super::modpack::install_modpack(name, dir, &modpack, printer).await,
+        (None, Some(source)) => download_jar(name, version_id, source, variant.clone(), printer)
+            .await
+            .map(|_| ()),
+        // 变体既不是整合包、又没有核心来源：前面已按能力校验过，走到这里说明
+        // 注册表与变体集合不一致，如实报错而不是静默成功
+        (None, None) => Err(anyhow::anyhow!(
+            "{}",
+            crate::i18n::pick(
+                printer.lang(),
+                format!("变体 {} 没有可用的服务端来源", variant.as_str()),
+                format!("variant {} has no server source", variant.as_str()),
+            )
+        )),
+    };
+    if let Err(err) = outcome {
         printer.print_warning(&crate::i18n::pick(
             printer.lang(),
-            format!("服务器已创建但核心下载失败，可执行 mcsup server install {name} 重试"),
+            format!("服务器已创建但服务端布置失败，可执行 mcsup server install {name} 重试"),
             format!(
-                "server created but the core download failed; run `mcsup server install {name}` to retry"
+                "server created but the server setup failed; run `mcsup server install {name}` to retry"
             ),
         ));
         return Err(err);
     }
-
-    report_created(&srv, printer)
+    Ok(())
 }
 
 /// `server create` 的结果输出：human 一行 + 后续提示，JSON 单个对象

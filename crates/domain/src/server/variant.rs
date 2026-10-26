@@ -104,6 +104,13 @@ pub enum ServerVariant {
     SpongeVanilla,
     /// Leaf（Paper 的轻量分支）
     Leaf,
+    /// Modrinth 整合包：由整合包清单决定加载器与游戏版本
+    ///
+    /// 它不是一种「服务端软件」，而是「按整合包布置服务端」的来源：安装时先
+    /// 取回 `.mrpack`，读清单拿到 Minecraft 版本与加载器版本，再装对应 loader
+    /// 并把服务端侧文件落到各自目录。因此它没有 `ServerJarSource`，只有
+    /// `port::ModpackSource`。
+    ModrinthModpack,
     /// 外部目录链接（`server link`）进来的服务器，变体未知
     Unknown,
     /// 第三方自定义变体
@@ -133,6 +140,7 @@ impl ServerVariant {
             Self::Quilt => "quilt",
             Self::SpongeVanilla => "spongevanilla",
             Self::Leaf => "leaf",
+            Self::ModrinthModpack => "modrinth-modpack",
             Self::Unknown => "unknown",
             Self::Custom(id) => id.as_str(),
         }
@@ -200,6 +208,7 @@ impl ServerVariant {
             Self::Quilt,
             Self::SpongeVanilla,
             Self::Leaf,
+            Self::ModrinthModpack,
             Self::Unknown,
         ]
     }
@@ -222,6 +231,7 @@ impl ServerVariant {
             Self::Quilt => "Quilt",
             Self::SpongeVanilla => "SpongeVanilla",
             Self::Leaf => "Leaf",
+            Self::ModrinthModpack => "Modrinth Modpack",
             Self::Unknown => "Unknown",
             Self::Custom(id) => id.as_str(),
         }
@@ -233,11 +243,14 @@ impl ServerVariant {
     /// `paper` …）。原版与未知变体没有加载器，返回 `None`——调用方据此不按
     /// 加载器过滤，而不是拿一个上游不认识的名字去查。
     ///
+    /// 整合包同理返回 `None`：它的加载器由清单里的 `dependencies` 决定，而不是
+    /// 由变体本身决定。
+    ///
     /// 映射口径收敛在领域层：入口与服务端都从这里取，不各自维护一张表。
     #[must_use]
     pub fn content_loader(&self) -> Option<&str> {
         match self {
-            Self::Vanilla | Self::Unknown => None,
+            Self::Vanilla | Self::Unknown | Self::ModrinthModpack => None,
             Self::Fabric => Some("fabric"),
             Self::Forge => Some("forge"),
             Self::NeoForge => Some("neoforge"),
@@ -267,6 +280,7 @@ impl ServerVariant {
             "quilt" => Self::Quilt,
             "spongevanilla" => Self::SpongeVanilla,
             "leaf" => Self::Leaf,
+            "modrinth-modpack" => Self::ModrinthModpack,
             "unknown" => Self::Unknown,
             _ => return None,
         })
