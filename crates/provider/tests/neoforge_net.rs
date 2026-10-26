@@ -26,14 +26,48 @@ async fn versions_reach_official_api() {
             .iter()
             .all(|v| v.variant == ServerVariant::NeoForge)
     );
-    // 不应出现无法映射到正式 MC 的快照项
+    // 不应出现无法映射到正式 MC 的快照项；MC 从 `1.21.11` 之后改用年份制版本号
+    // （`26.x`），两代形状都应出现，且绝不能出现虚构的 `1.26.x`
     assert!(
-        versions.iter().all(|v| v.id.as_str().starts_with("1.")),
+        versions.iter().all(|v| {
+            let id = v.id.as_str();
+            (id.starts_with("1.") || id.starts_with("26.")) && !id.starts_with("1.26.")
+        }),
         "只应包含正式 MC 版本"
     );
     assert!(
         versions.iter().any(|v| v.id.as_str() == "1.21.1"),
         "应包含 1.21.1"
+    );
+    assert!(
+        versions.iter().any(|v| v.id.as_str().starts_with("26.")),
+        "应包含年份制 26.x 版本"
+    );
+}
+
+/// 年份制 MC 版本（`26.3`）解析出四段 build 的 installer 与真实 SHA1
+#[tokio::test]
+async fn artifact_resolves_year_scheme_version() {
+    if !enabled() {
+        return;
+    }
+    let source = NeoForgeSource::new().expect("neoforge source");
+    let resolved = source
+        .artifact(&VersionId::new("26.3.0"))
+        .await
+        .expect("artifact");
+    assert_eq!(resolved.install, InstallKind::Installer);
+    assert!(
+        resolved
+            .location
+            .as_str()
+            .contains("/releases/net/neoforged/neoforge/26.3.0."),
+        "{}",
+        resolved.location.as_str()
+    );
+    assert!(
+        resolved.artifact.checksum.is_verified(),
+        "官方提供 .sha1，应强校验"
     );
 }
 

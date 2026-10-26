@@ -15,9 +15,15 @@
 //! | 元数据 | `files.minecraftforge.net/...maven-metadata.json` | `maven.neoforged.net/api/maven/versions/releases/...` |
 //! | 推荐表 | `promotions_slim.json` | 无（取最新 build） |
 //!
-//! `NeoForge` 的 build 串编码了 MC 版本：`21.1.200` 对应 MC `1.21.1`，即
-//! 「`1.` 去掉、前两段作为 MC 次版本、第三段是 build 号」。反向映射
-//! （MC `1.21.1` → `21.1.*`）是纯字符串变换，见 [`mc_to_neoforge_prefix`]。
+//! `NeoForge` 的 build 串编码了 MC 版本，分两代：
+//!
+//! - 旧编码（MC `1.x`）：`21.1.200` 对应 MC `1.21.1`，即「`1.` 去掉、前两段
+//!   作为 MC 次版本、第三段是 build 号」。
+//! - 新编码（MC `26.x` 起，Mojang 从 `1.21.11` 之后改用年份制版本号）：
+//!   `26.3.0.99` 对应 MC `26.3`，即「前段就是 MC 版本、末段是 build 号」。
+//!
+//! 反向映射（MC `1.21.1` → `21.1.*`，MC `26.3` → `26.3.0.*`）是纯字符串变换，
+//! 见 [`mc_to_neoforge_prefix`]。
 //!
 //! 少数版本是快照 MC（如 `0.25w14craftmine.3-beta`），前缀为 `0.` 开头，
 //! 无法映射回正式 MC 版本号，因此**不进入版本列表**（原版快照才需要它们，
@@ -33,7 +39,6 @@
 use crate::http::{build_client, get_json, get_text};
 use crate::shared::{
     Downloads, VersionIntent, normalize_base, parse_https_url, parse_sha1_sidecar,
-    pick_by_version_aliases,
 };
 use async_trait::async_trait;
 use domain::server::version::{ServerVariant, ServerVersion, VersionId, VersionKind};
@@ -237,76 +242,110 @@ fn builds_by_mc(versions: &NeoForgeVersions) -> BuildsByMc {
 
 /// `NeoForge` build 串 → 对应的 MC 版本（`21.1.200` → `1.21.1`）
 ///
-/// 规则：三段数字 `{major}.{minor}.{build}`，其中前两段是 MC 版本去掉 `1.` 前缀
-/// 后的结果。`20.6.x` 是例外——它对应 MC `1.20.6`（`NeoForge` 从 20.2 起改用
-/// 该编码）。带后缀（`-beta`）或首段不是纯数字的串不映射，返回 `None`。
+/// 分两代编码，由首段数字区分：
+///
+/// - **旧编码（MC `1.x`）**：`{mc 次版本}.{build}`，如 `21.1.200` → `1.21.1`，
+///   `20.6.144` → `1.20.6`。首段是 MC 次版本，映射时补回 `1.` 前缀。
+/// - **新编码（MC `26.x` 起）**：Mojang 从 `1.21.11` 之后改用年份制版本号
+///   （`26.1` / `26.1.2` / `26.3`），不再有 `1.` 前缀可去。`NeoForge` 因此改成
+///   `{mc 主版本}.{mc 次版本}.{mc 补丁}.{build}` 四段，如 `26.3.0.99` → MC
+///   `26.3`、`26.1.2.124` → MC `26.1.2`。首段即 MC 主版本，原样使用。
+///
+/// 带后缀（`-beta`）或段内非纯数字的串不映射，返回 `None`。
 #[must_use]
 pub(crate) fn neoforge_to_mc(build: &str) -> Option<String> {
-    let mut parts = build.split('.');
-    let major = parts.next()?;
-    let minor = parts.next()?;
-    let rest = parts.next()?;
-    // build 段必须是纯数字；带 `-beta` 之类的预发布串无法确定 MC 版本
-    if !rest.chars().all(|c| c.is_ascii_digit()) {
+    let parts: Vec<&str> = build.split('.').collect();
+    // 每段都必须非空且纯数字；`-beta`、`+snapshot` 等预发布串据此被排除
+    if !parts
+        .iter()
+        .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+    {
         return None;
     }
-    if !major.chars().all(|c| c.is_ascii_digit()) || !minor.chars().all(|c| c.is_ascii_digit()) {
-        return None;
+    match parts.as_slice() {
+        // 旧编码：`{mc minor}.{mc patch}.{build}` → MC `1.{minor}.{patch}`
+        [major, minor, _build] if *major != "0" => Some(format!("1.{major}.{minor}")),
+        // 新编码：`{mc major}.{mc minor}.{mc patch}.{build}` → MC `{major}.{minor}.{patch}`
+        [major, minor, patch, _build] if *major != "0" => Some(format!("{major}.{minor}.{patch}")),
+        _ => None,
     }
-    // `0.x` 是快照 MC（如 `0.25w14craftmine.3-beta` 的变体），不映射
-    if major == "0" {
-        return None;
-    }
-    Some(format!("1.{major}.{minor}"))
 }
 
-/// MC 版本 → `NeoForge` build 前缀（`1.21.1` → `21.1`）
+/// MC 版本 → `NeoForge` build 前缀（`1.21.1` → `21.1`，`26.3` → `26.3.0`）
 ///
-/// [`neoforge_to_mc`] 的逆变换：`21.1.200` 的 MC 版本 `1.21.1` 反过来给出
-/// `21.1`，取该前缀的 build 就是这条 MC 线的全部候选。非 `1.x.y` 形状的
-/// MC 版本（快照名）返回 `None`。
+/// [`neoforge_to_mc`] 的逆变换，两代编码各自对应：
 ///
-/// 当前 `versions()` / `artifact()` 都直接用 [`neoforge_to_mc`] 分组（索引条目
-/// 有限，一次遍历比「先算前缀再筛」更省），本函数是同一变换的对外口径，供需要
-/// 反向查找的来源 / 诊断代码使用。
+/// - MC `1.x.y`（旧编码）→ 去掉 `1.`，得 `x.y`，匹配三段的 `x.y.*`。
+/// - MC `26.x` / `26.x.y`（新编码）→ 主版本在前，末段是 build 号所以 MC 的
+///   次版本之后补 `0`：`26.3` → `26.3.0`，`26.1.2` → `26.1.2`，匹配四段的
+///   `26.3.0.*` / `26.1.2.*`。
 ///
-/// # 为什么标 `allow(dead_code)`
-///
-/// 它是 [`neoforge_to_mc`] 的逆变换，两者必须保持同步：改了一侧不改另一侧，
-/// 按前缀筛 build 的代码就会静默筛错。保留实现并让它进测试，比删掉后等某个
-/// 调用方各自手写一遍 `strip_prefix("1.")` 更安全。
+/// 其它形状（快照名等）返回 `None`。
 #[allow(
     dead_code,
     reason = "neoforge_to_mc 的逆变换，供按前缀筛 build 的调用方与测试复用"
 )]
 #[must_use]
 pub(crate) fn mc_to_neoforge_prefix(mc: &str) -> Option<String> {
-    let (major, minor) = mc.strip_prefix("1.")?.split_once('.')?;
-    Some(format!("{major}.{minor}"))
+    let digits = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+    if let Some(rest) = mc.strip_prefix("1.") {
+        // 旧编码：`1.{minor}.{patch}` → `{minor}.{patch}`
+        let (minor, patch) = rest.split_once('.')?;
+        return (digits(minor) && digits(patch)).then(|| format!("{minor}.{patch}"));
+    }
+    // 新编码：`{major}.{minor}` → `{major}.{minor}.0`；`{major}.{minor}.{patch}` → 原样
+    let parts: Vec<&str> = mc.split('.').collect();
+    if !parts.iter().all(|p| digits(p)) {
+        return None;
+    }
+    match parts.as_slice() {
+        [major, minor] => Some(format!("{major}.{minor}.0")),
+        [major, minor, patch] => Some(format!("{major}.{minor}.{patch}")),
+        _ => None,
+    }
 }
 
-/// build 串是否为合法形状：三段、前两段数字、第三段数字
+/// build 串是否为合法形状：能映射到 MC 版本即为合法
 fn is_valid_build(build: &str) -> bool {
     neoforge_to_mc(build).is_some()
 }
 
+/// MC 版本比较键，用于 `latest` 取「真实最新」而非字典序最大
+///
+/// `BTreeMap` 的字符串字典序会把 `26.1` 排在 `1.21.11` 之前（`'2' < '1'` 不成立，
+/// 实际是 `'1'` 小于 `'2'`，所以 `1.x` 反而排最后），`latest` 会错取到旧线。
+/// 这里把版本拆成数字元组比较：旧编码 `1.x.y` 与新年份制 `26.x` 统一成
+/// `(major, minor, patch)`，按数值取最大。
+fn mc_sort_key(mc: &str) -> Option<(u64, u64, u64)> {
+    let nums: Vec<u64> = mc
+        .split('.')
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    match nums.as_slice() {
+        [major, minor, patch] => Some((*major, *minor, *patch)),
+        [major, minor] => Some((*major, *minor, 0)),
+        _ => None,
+    }
+}
+
+/// 取数值最大的 MC 版本（快照 / 无法解析的名不参与）
+fn latest_mc(grouped: &BuildsByMc) -> Option<String> {
+    grouped
+        .keys()
+        .filter_map(|mc| mc_sort_key(mc).map(|key| (key, mc)))
+        .max_by(|(a, _), (b, _)| a.cmp(b))
+        .map(|(_, mc)| mc.clone())
+}
+
 /// 版本标识 → 列表里的具体 MC 版本
 fn resolve_mc_id(intent: &VersionId, grouped: &BuildsByMc) -> Option<String> {
-    let keys: Vec<&str> = grouped.keys().map(String::as_str).collect();
-    // `NeoForge` 索引没有 stable 标记，`latest` 与 `latest-snapshot` 同口径：
-    // 取字典序最后的 MC 版本（`BuildsByMc` 是 `BTreeMap`，末项即最大）
-    pick_by_version_aliases(
-        VersionIntent::of(intent),
-        keys.iter().copied(),
-        |_| false,
-        |_| false,
-    )
-    .or_else(|| match VersionIntent::of(intent) {
+    match VersionIntent::of(intent) {
         VersionIntent::Literal(raw) => grouped.contains_key(raw).then(|| raw.to_owned()),
-        VersionIntent::Latest | VersionIntent::LatestSnapshot => {
-            grouped.keys().next_back().cloned()
-        }
-    })
+        // `NeoForge` 索引没有 stable 标记，`latest` 与 `latest-snapshot` 同口径：
+        // 取数值最大的 MC 版本（不能按字符串字典序，见 [`mc_sort_key`]）
+        VersionIntent::Latest | VersionIntent::LatestSnapshot => latest_mc(grouped),
+    }
 }
 
 /// 在某 MC 版本下选 build：取列表末项（上游「旧在前」）
@@ -389,14 +428,22 @@ mod tests {
     /// build 串 ↔ MC 版本双向映射
     #[test]
     fn build_string_maps_to_mc_version() {
+        // 旧编码（MC 1.x）：三段，首段是 MC 次版本
         assert_eq!(neoforge_to_mc("21.1.200").as_deref(), Some("1.21.1"));
         assert_eq!(neoforge_to_mc("20.6.144").as_deref(), Some("1.20.6"));
         assert_eq!(neoforge_to_mc("21.0.167").as_deref(), Some("1.21.0"));
+        // 新编码（MC 26.x 起）：四段，前缀就是 MC 版本本身
+        assert_eq!(neoforge_to_mc("26.3.0.99").as_deref(), Some("26.3.0"));
+        assert_eq!(neoforge_to_mc("26.1.2.124").as_deref(), Some("26.1.2"));
         // 快照 MC / 预发布 build 不映射
         assert_eq!(neoforge_to_mc("0.25w14craftmine.3-beta"), None);
         assert_eq!(neoforge_to_mc("21.1.200-beta"), None);
+        assert_eq!(neoforge_to_mc("26.3.0.1-beta"), None);
+        assert_eq!(neoforge_to_mc("26.1.0.0-alpha.1+snapshot-1"), None);
         assert_eq!(neoforge_to_mc("nonsense"), None);
         assert_eq!(neoforge_to_mc("21"), None);
+        // 段数既不是 3 也不是 4
+        assert_eq!(neoforge_to_mc("26.3.0.1.2"), None);
     }
 
     /// 前缀变换是映射的逆运算
@@ -406,12 +453,22 @@ mod tests {
         let prefix = mc_to_neoforge_prefix("1.21.1").expect("prefix");
         let mc = neoforge_to_mc(&format!("{prefix}.200")).expect("mc");
         assert_eq!(mc, "1.21.1");
-        // 非 1.x.y 形状不映射
-        assert_eq!(mc_to_neoforge_prefix("26.3"), None);
+        // 新编码：`26.3` 的 build 前缀是 `26.3.0`，末段才是 build 号
+        assert_eq!(mc_to_neoforge_prefix("26.3").as_deref(), Some("26.3.0"));
+        let prefix = mc_to_neoforge_prefix("26.3").expect("prefix");
+        assert_eq!(
+            neoforge_to_mc(&format!("{prefix}.99")).as_deref(),
+            Some("26.3.0")
+        );
+        // MC 自身的补丁版本原样保留
+        assert_eq!(mc_to_neoforge_prefix("26.1.2").as_deref(), Some("26.1.2"));
+        assert_eq!(neoforge_to_mc("26.1.2.124").as_deref(), Some("26.1.2"));
+        // 非 MC 版本形状不映射
         assert_eq!(mc_to_neoforge_prefix("1.21"), None);
+        assert_eq!(mc_to_neoforge_prefix("25w14craftmine"), None);
     }
 
-    /// 索引按 MC 分组：快照被剔除，组内保持旧在前的顺序
+    /// 索引按 MC 分组：快照被剔除，组内保持旧在前的顺序（新旧两代编码并存）
     #[test]
     fn groups_builds_by_mc_and_skips_snapshots() {
         let grouped = builds_by_mc(&index());
@@ -426,7 +483,22 @@ mod tests {
                 "21.1.265".to_owned()
             ]
         );
-        assert!(grouped.keys().all(|mc| mc.starts_with("1.")));
+        // 新编码：`26.3.0.99` 归到 MC `26.3.0`，`26.1.2.124` 归到 `26.1.2`
+        assert_eq!(
+            grouped.get("26.3.0").expect("26.3.0"),
+            &vec!["26.3.0.98".to_owned(), "26.3.0.99".to_owned()]
+        );
+        assert_eq!(
+            grouped.get("26.1.2").expect("26.1.2"),
+            &vec![
+                "26.1.2.122".to_owned(),
+                "26.1.2.123".to_owned(),
+                "26.1.2.124".to_owned()
+            ]
+        );
+        // 快照 / 预发布 build 不产生分组
+        assert!(!grouped.contains_key("1.26.3"));
+        assert!(!grouped.keys().any(|mc| mc.starts_with("0.")));
     }
 
     /// 某 MC 下选末项（上游「旧在前」，末项最新）
@@ -437,16 +509,24 @@ mod tests {
             select_build("1.21.1", &grouped).as_deref(),
             Some("21.1.265")
         );
+        assert_eq!(
+            select_build("26.3.0", &grouped).as_deref(),
+            Some("26.3.0.99")
+        );
         assert_eq!(select_build("1.99.9", &grouped), None);
     }
 
-    /// `latest` 取字典序最后的 MC 版本
+    /// `latest` 取数值最大的 MC 版本，而不是字符串字典序
     #[test]
     fn resolve_latest_picks_highest_mc() {
         let grouped = builds_by_mc(&index());
         let latest = resolve_mc_id(&VersionId::new("latest"), &grouped).expect("latest");
-        assert_eq!(latest, grouped.keys().next_back().expect("非空").clone());
-        assert_eq!(latest, "1.21.1");
+        // `1.21.x` 的字典序最大项是 `1.21.1`，但它不是最新；新年份制 `26.3.0` 才是
+        assert_eq!(latest, "26.3.0");
+        assert_eq!(
+            resolve_mc_id(&VersionId::new("latest-snapshot"), &grouped).as_deref(),
+            Some("26.3.0")
+        );
     }
 
     /// 字面版本必须在列表里
