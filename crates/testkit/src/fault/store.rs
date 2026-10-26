@@ -1,9 +1,13 @@
 //! 装饰任意 [`ContentStore`] 并注入失败
 //!
-//! 用法是「包住真实的 CAS」，而不是替换它：
+//! 用法是「包住真实的 CAS」，而不是替换它（示例用 [`InMemoryCas`](crate::InMemoryCas)
+//! 代替真实实现）：
 //!
-//! ```rust,ignore
-//! let store = FailingContentStore::new(Arc::new(CasStore::new(root)))
+//! ```
+//! use std::sync::Arc;
+//! use testkit::{CasOp, FailingContentStore, InMemoryCas};
+//!
+//! let store = FailingContentStore::new(Arc::new(InMemoryCas::default()))
 //!     .failing_on(CasOp::Put, 1);
 //! ```
 //!
