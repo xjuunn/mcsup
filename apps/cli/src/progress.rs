@@ -254,17 +254,22 @@ impl ScanProgress {
     }
 }
 
-/// 安装器输出的实时透传：把安装器日志滚动打印在 spinner 上方
+/// 安装器输出的实时透传：把安装器日志逐行打印出来
 ///
 /// 安装器联网拉取 libraries 可达数分钟，期间只有阶段文案的话用户会以为卡死。
-/// 用 [`ProgressBar::println`] 在不打断当前回显行的前提下逐行打印安装器输出，
-/// 既能看到实时进展，spinner 也还在转。
+///
+/// 进入安装器阶段后**不再保留自己的回显线**：安装器本身就在往终端刷进度
+/// （`\r` 原地刷新），再叠一层 spinner / 进度条会与它抢同一块区域，画面必然
+/// 错乱，而且我们拿不到安装器内部的真实进度，画出来的也只是假进度。
+/// 此时只把它的输出原样逐行打印，进展由安装器自己交代。
 ///
 /// `enable` 为 false（JSON 模式）时静默丢弃，stdout 保持纯数据。
 pub(crate) struct InstallerOutput {
     bar: ProgressBar,
     cancel: CancellationToken,
     enable: bool,
+    /// 安装器阶段是否已收起回显线；收起后直接写行，不经过 bar
+    detached: std::sync::atomic::AtomicBool,
 }
 
 impl InstallerOutput {
@@ -273,7 +278,16 @@ impl InstallerOutput {
             bar,
             cancel,
             enable,
+            detached: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// 收起回显线：此后的安装器输出直接逐行打印
+    ///
+    /// 调用方负责先 `finish` 掉 spinner，否则最后一行会接在 spinner 后面。
+    fn detach(&self) {
+        self.detached
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -287,7 +301,14 @@ impl InstallerOutputSink for InstallerOutput {
         if line.is_empty() {
             return;
         }
-        self.bar.println(line);
+        if self.detached.load(std::sync::atomic::Ordering::Relaxed) {
+            #[allow(clippy::print_stdout)]
+            {
+                println!("{line}");
+            }
+        } else {
+            self.bar.println(line);
+        }
     }
 }
 
@@ -302,6 +323,8 @@ pub(crate) struct InstallSession {
     sink: BarSink,
     cancel: CancellationToken,
     downloading: std::sync::atomic::AtomicBool,
+    /// 是否处于安装器阶段：这段时间回显线收起，只透传安装器输出
+    installing: std::sync::atomic::AtomicBool,
     /// 安装器输出透传：与阶段回显共用同一条线
     installer_output: std::sync::Arc<InstallerOutput>,
 }
@@ -324,6 +347,7 @@ impl InstallSession {
             sink,
             cancel,
             downloading: std::sync::atomic::AtomicBool::new(false),
+            installing: std::sync::atomic::AtomicBool::new(false),
             installer_output,
         }
     }
@@ -380,10 +404,28 @@ impl StageSink for InstallSession {
                 self.downloading.store(true, Ordering::Relaxed);
                 self.sink.start();
             }
+            // 运行安装器：收起自己的回显线，只透传安装器输出
+            //
+            // 安装器自己刷进度，我们既拿不到它的真实进度，叠一条 bar/spinner
+            // 只会两边抢同一行。这里先让出这条线（若刚下载完还要把 bar 交还），
+            // 之后的状态全由安装器自己的输出表达。
+            InstallStage::Installing => {
+                if self.downloading.swap(false, Ordering::Relaxed) {
+                    self.sink.finish();
+                }
+                self.installing.store(true, Ordering::Relaxed);
+                self.spinner.finish();
+                self.installer_output.detach();
+            }
             // 下载之后的阶段（解压等）：进度条交还 spinner，继续画同一条线
             stage if self.downloading.load(Ordering::Relaxed) => {
                 self.downloading.store(false, Ordering::Relaxed);
                 self.sink.finish();
+                self.spinner.set_message(stage.message());
+            }
+            // 安装器之后的阶段：重新挂回 spinner，继续在这一行回显
+            stage if self.installing.swap(false, Ordering::Relaxed) => {
+                self.spinner.restart();
                 self.spinner.set_message(stage.message());
             }
             stage => self.spinner.set_message(stage.message()),
@@ -393,8 +435,13 @@ impl StageSink for InstallSession {
 
 impl ProgressSink for InstallSession {
     fn on_progress(&self, transferred: u64, total: Option<u64>) {
+        use std::sync::atomic::Ordering;
         // 取消后不再回显（同 on_stage：线已收掉，迟到的进度画不上去）
         if self.cancel.is_cancelled() {
+            return;
+        }
+        // 安装器阶段不画自己的进度：那条线已收起，真实进度由安装器输出表达
+        if self.installing.load(Ordering::Relaxed) {
             return;
         }
         self.sink.on_progress(transferred, total);
@@ -482,6 +529,32 @@ mod tests {
         session.on_stage(InstallStage::Extracting);
         assert_eq!(line.message(), InstallStage::Extracting.message());
         assert!(!line.is_finished());
+    }
+
+    /// 运行安装器期间不保留自己的回显线，也不画自己的进度
+    ///
+    /// 安装器自己会往终端刷进度，再叠一条 bar / spinner 就是两边抢同一行；
+    /// 而且我们拿不到它的真实进度，画出来的是假进度。
+    #[test]
+    fn installing_stage_yields_the_line() {
+        let session = InstallSession::new(InstallStage::Probing.message(), false);
+        let line = session.handle_for_test();
+
+        session.on_stage(InstallStage::DownloadingInstaller);
+        assert_eq!(line.message(), InstallStage::DownloadingInstaller.message());
+
+        // 进入安装器阶段：回显线收起
+        session.on_stage(InstallStage::Installing);
+        assert!(line.is_finished());
+
+        // 安装器阶段的进度回调不再画到这条线上
+        session.on_progress(64, Some(100));
+        assert!(line.is_finished());
+
+        // 安装器结束、进入登记核心：重新挂回 spinner
+        session.on_stage(InstallStage::Finalizing);
+        assert!(!line.is_finished());
+        assert_eq!(line.message(), InstallStage::Finalizing.message());
     }
 
     /// 中途 drop（错误提前返回 / Ctrl-C）也要收线并请求取消
