@@ -10,12 +10,16 @@
 //! - [`link`]：一条远端连接的网关（`RemoteLink`），错误映射的唯一出口
 //! - [`mirror`]：三个只读镜像仓库（workspace / server / java）
 //!
-//! [`RemoteBackend`]（`port::Backend` 的远端实现：supervisor / installer 走
-//! RPC）在阶段 8 落地，同属本模块。
+//! [`RemoteBackend`] 是 `port::Backend` 的远端实现：supervisor 走 RPC
+//! （[`RemoteSupervisor`]），installer 在 Installer 帧落地前不可用。
 
 pub mod combined;
 pub mod link;
 pub mod mirror;
+pub mod supervisor;
+
+#[cfg(test)]
+mod supervisor_tests;
 
 #[cfg(test)]
 pub(crate) mod testkit;
@@ -26,25 +30,40 @@ pub use combined::{
 };
 pub use link::RemoteLink;
 pub use mirror::{RemoteJavaRepository, RemoteServerRepository, RemoteWorkspaceRepository};
+pub use supervisor::RemoteSupervisor;
 
-/// 远端执行位置（阶段 8：`SupervisorPort` / `InstallerRunner` 走 RPC）
+/// 远端执行位置：`port::Backend` 的远端实现
 ///
-/// 现在先占住名字与装配口，让组合仓库可以提前引用；能力在阶段 8 补齐。
+/// supervisor 走 [`RemoteSupervisor`]；installer（`Forge` / `NeoForge`
+/// 安装器走对端 `Installer` 帧）在本阶段未上线——对端帧未定义前返回
+/// 协议错误，调用方按「远端不支持安装」处理。
 #[derive(Debug, Clone)]
 pub struct RemoteBackend {
-    link: RemoteLink,
+    supervisor: RemoteSupervisor,
 }
 
 impl RemoteBackend {
     /// 用一条远端连接构造
     #[must_use]
     pub fn new(link: RemoteLink) -> Self {
-        Self { link }
+        Self {
+            supervisor: RemoteSupervisor::new(link),
+        }
     }
 
-    /// 连接网关
+    /// 连接网关（经 supervisor 取用）
     #[must_use]
-    pub fn link(&self) -> &RemoteLink {
-        &self.link
+    pub fn supervisor_rpc(&self) -> &RemoteSupervisor {
+        &self.supervisor
+    }
+}
+
+impl port::Backend for RemoteBackend {
+    fn supervisor(&self) -> &dyn port::SupervisorPort {
+        &self.supervisor
+    }
+
+    fn installer(&self) -> &dyn port::InstallerRunner {
+        unreachable!("remote installer is not available until the Installer frames land")
     }
 }

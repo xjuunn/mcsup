@@ -933,6 +933,12 @@ pub struct SupervisorStartRequest {
     /// 由入口决定：`runtime` 只负责「用什么可执行文件 + 前置参数」，不假设
     /// 它内部有哪些子命令，从而不反向感知 CLI 的入口约定。
     pub supervisor_args: Vec<std::ffi::OsString>,
+    /// 同意 EULA（缺失 / `false` 时由执行位置写入）
+    ///
+    /// 本地 supervisor 不用它（EULA 在 `service::start` 里就已写入）；
+    /// 远端实现要把它带上——远端没有本机的 `service::start` 前置流程，
+    /// EULA 确认必须随请求过线。
+    pub accept_eula: bool,
 }
 
 impl SupervisorStartRequest {

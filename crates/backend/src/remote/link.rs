@@ -67,6 +67,18 @@ impl RemoteLink {
         self.client.hello()
     }
 
+    /// 原始调用：不经过 `RepositoryError` 映射
+    ///
+    /// supervisor / installer 的错误模型是 [`port::SupervisorError`] 而不是
+    /// [`RepositoryError`]，各实现自己做映射；网关只提供未加工的出口。
+    ///
+    /// # Errors
+    ///
+    /// 传输失败或对端拒绝时返回 [`TransportError`]
+    pub fn client_call(&self, request: &Request) -> Result<Response, TransportError> {
+        self.client.call(request)
+    }
+
     /// 执行一个操作，把 `Error` 帧映射成 [`RepositoryError`]
     ///
     /// # Errors

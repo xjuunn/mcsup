@@ -288,6 +288,8 @@ impl ServerLifecycleService {
             ram_mib: Some(opts.ram_mib.or(settings.ram_mib).unwrap_or(DEFAULT_RAM_MIB)),
             supervisor_exe: opts.supervisor_exe.clone(),
             supervisor_args: opts.supervisor_args.clone(),
+            // EULA 已在上方 ensure_eula 写入；带上只是让远端实现拿到一致意图
+            accept_eula: opts.accept_eula,
         };
         let outcome = self
             .backend

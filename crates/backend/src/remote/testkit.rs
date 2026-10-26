@@ -52,6 +52,8 @@ impl PairingHarness {
 pub(crate) mod mcsup_agent_shim {
     use super::*;
     use auth::{ClientId, Role};
+    use port::ServerStatus;
+    use protocol::remote::wire::WireStatusEntry;
     use protocol::remote::{Capabilities, Request, Response};
     use std::sync::Mutex;
     use transport::ServerIdentity;
@@ -118,6 +120,17 @@ pub(crate) mod mcsup_agent_shim {
     struct MemAgent {
         workspaces: Mutex<Vec<protocol::remote::wire::WireWorkspace>>,
         servers: Mutex<Vec<protocol::remote::wire::WireServer>>,
+        /// 服务器身份 → 运行状态（supervisor 垫片）
+        running: Mutex<Vec<RunningServer>>,
+    }
+
+    /// supervisor 垫片里的一台「运行中」服务器
+    #[derive(Clone)]
+    #[allow(dead_code)] // started_at 留给日志/uptime 断言扩展用
+    pub(crate) struct RunningServer {
+        pub id: String,
+        pub status: protocol::remote::wire::WireStatus,
+        pub started_at: std::time::Instant,
     }
 
     impl Handler for MemAgent {
@@ -158,6 +171,7 @@ pub(crate) mod mcsup_agent_shim {
             }
         }
 
+        #[allow(clippy::too_many_lines)] // 垫片按帧族展开，比拆分更可读
         fn handle(&self, _session: &SessionInfo, request: &Request) -> Response {
             match request {
                 Request::WorkspaceList => Response::Workspaces {
@@ -222,6 +236,81 @@ pub(crate) mod mcsup_agent_shim {
                     Response::Removed { disk_purged: false }
                 }
                 Request::JavaList | Request::JavaScan => Response::Javas { items: Vec::new() },
+                // ---- supervisor 垫片：按 RunningServer 表回帧 ----
+                Request::StatusMany { ids } => {
+                    let guard = self.running.lock().expect("lock");
+                    Response::Statuses {
+                        items: ids
+                            .iter()
+                            .map(|id| match guard.iter().find(|srv| srv.id == *id) {
+                                Some(srv) => WireStatusEntry {
+                                    status: Some(srv.status.clone()),
+                                    error: None,
+                                },
+                                None => WireStatusEntry {
+                                    status: None,
+                                    error: None,
+                                },
+                            })
+                            .collect(),
+                    }
+                }
+                Request::Start { server_id, .. } => {
+                    let mut guard = self.running.lock().expect("lock");
+                    if guard.iter().any(|srv| srv.id == *server_id) {
+                        return RemoteFailure::new(
+                            protocol::remote::ErrorKind::BUSY,
+                            "already running",
+                        )
+                        .into_response();
+                    }
+                    let status = WireStatusEntry::ok(Some(&port::SupervisorStatus {
+                        status: ServerStatus::Running,
+                        pid: Some(4242),
+                        uptime: None,
+                        exit_code: None,
+                    }))
+                    .status
+                    .expect("wire status");
+                    guard.push(RunningServer {
+                        id: server_id.clone(),
+                        status,
+                        started_at: std::time::Instant::now(),
+                    });
+                    Response::Started {
+                        outcome: protocol::remote::wire::WireStartOutcome {
+                            supervisor_pid: 4242,
+                        },
+                    }
+                }
+                Request::Stop { server_id, .. } => {
+                    let mut guard = self.running.lock().expect("lock");
+                    let before = guard.len();
+                    guard.retain(|srv| srv.id != *server_id);
+                    if guard.len() == before {
+                        return Response::Stopped {
+                            outcome: protocol::remote::wire::WireStop::AlreadyStopped,
+                        };
+                    }
+                    Response::Stopped {
+                        outcome: protocol::remote::wire::WireStop::Stopped { elapsed_ms: 5 },
+                    }
+                }
+                Request::SendLine { server_id, .. } => {
+                    let guard = self.running.lock().expect("lock");
+                    if guard.iter().any(|srv| srv.id == *server_id) {
+                        Response::Ok
+                    } else {
+                        RemoteFailure::new(
+                            protocol::remote::ErrorKind::NOT_FOUND,
+                            format!("not running: {server_id}"),
+                        )
+                        .into_response()
+                    }
+                }
+                Request::LogsTail { lines, .. } => Response::LogLines {
+                    lines: (0..*lines).map(|i| format!("log line {i}")).collect(),
+                },
                 other => RemoteFailure::invalid(format!("unsupported: {}", other.operation()))
                     .into_response(),
             }
