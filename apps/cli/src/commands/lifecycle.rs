@@ -341,9 +341,19 @@ pub(crate) fn console(name: &str, printer: Printer) -> Result<()> {
         });
     }
 
+    // 服务器自行退出（例如注入 `stop`）也要结束附加：状态判定收敛在 service，
+    // 这里只消费结果，避免控制台停在「服务器已停、console 仍未退出」的状态
+    let mut exited = false;
+    let mut ticks = 0u32;
     while !done.load(std::sync::atomic::Ordering::Relaxed) {
         for line in watch.read_new()? {
             print_raw_line(&line);
+        }
+        // 探活每 5 个轮询（约 500ms）一次：status 走 IPC，不必跟读日志同频
+        ticks += 1;
+        if ticks.is_multiple_of(5) && !server_alive(&service, name)? {
+            exited = true;
+            break;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -351,8 +361,20 @@ pub(crate) fn console(name: &str, printer: Printer) -> Result<()> {
     for line in watch.read_new()? {
         print_raw_line(&line);
     }
-    printer.print_section("已分离（服务器继续运行）");
+    if exited {
+        printer.print_section(&format!("{name} 已停止，控制台已退出"));
+    } else {
+        printer.print_section("已分离（服务器继续运行）");
+    }
     Ok(())
+}
+
+/// 控制台附加期间探活：服务器已消失或进入终态即视为退出
+fn server_alive(service: &ServerLifecycleService, name: &str) -> Result<bool> {
+    Ok(service
+        .describe(name)?
+        .status
+        .is_some_and(|s| !s.status.is_terminal()))
 }
 
 /// `server send`：单条命令注入 stdin
