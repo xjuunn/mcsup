@@ -57,6 +57,18 @@ fi
 # 2 / 3 / 4: 命名与成员覆盖
 
 app_names=''
+inner_pkgs=''
+for manifest in $manifests; do
+	name=$(pkg_name "$manifest")
+	if [ -z "$name" ]; then
+		continue
+	fi
+	# 除门面外的内层包（供 crate 级依赖方向判定）
+	if [ "$name" != mcsup ] && [ "${manifest#crates/}" != "$manifest" ]; then
+		inner_pkgs="$inner_pkgs $name"
+	fi
+done
+
 for manifest in $manifests; do
 	name=$(pkg_name "$manifest")
 	if [ -z "$name" ]; then
@@ -124,6 +136,73 @@ for manifest in $manifests; do
 		if contains "$dep" "$app_names"; then
 			fail "$pkg -> $dep: 禁止依赖 apps/ 下的包，apps 是并行入口"
 		fi
+	done
+done
+
+# 5b: 包级实现层依赖方向（crate 级，与 7 的模块级互补）。
+#
+# 允许的边（只列本仓库内部包）：
+#   domain  -> （无）
+#   port    -> domain
+#   protocol-> domain
+#   service -> domain port
+#   <实现层> -> domain port            （runtime 额外允许 protocol）
+#   backend -> domain port + 实现层     （执行位置聚合器，唯一允许组合具体实现）
+#   mcsup   -> 任意内层（门面）
+#   apps    -> 只允许 mcsup
+# 实现层之间除 backend 外互不依赖。
+impl_layers='runtime java storage file backup provider modkit'
+
+for manifest in $manifests; do
+	pkg=$(pkg_name "$manifest")
+	[ -n "$pkg" ] || continue
+	# mcsup 门面与 apps 不在本表约束内
+	case "$pkg" in
+	mcsup) continue ;;
+	esac
+	if contains "$pkg" "$app_names"; then
+		continue
+	fi
+
+	deps=$(cargo tree -p "$pkg" --depth 1 --prefix none -e normal,build 2>/dev/null | tail -n +2 | cut -d' ' -f1)
+
+	for dep in $deps; do
+		# 只检查本仓库内部包
+		if ! contains "$dep" "$inner_pkgs"; then
+			continue
+		fi
+		case "$pkg" in
+		domain)
+			fail "$pkg -> $dep: domain 不得依赖任何本仓库模块"
+			;;
+		port | protocol)
+			if [ "$dep" != domain ]; then
+				fail "$pkg -> $dep: 只允许依赖 domain"
+			fi
+			;;
+		service)
+			case "$dep" in
+			domain | port) ;;
+			*) fail "service -> $dep: service 只允许依赖 domain / port，实现层须经 port 注入" ;;
+			esac
+			;;
+		backend)
+			case "$dep" in
+			domain | port) ;;
+			*)
+				if ! contains "$dep" "$impl_layers"; then
+					fail "backend -> $dep: 只允许依赖 domain / port 或实现层"
+				fi
+				;;
+			esac
+			;;
+		*)
+			# 其余实现层
+			if contains "$dep" "$impl_layers"; then
+				fail "$pkg -> $dep: 实现层之间禁止互相依赖（只有 backend 可组合实现层）"
+			fi
+			;;
+		esac
 	done
 done
 
@@ -257,15 +336,16 @@ if [ -f "$pkg_manifest" ] && [ -f "$pkg_lib" ]; then
 		domain) printf '%s' 'domain' ;;
 		port) printf '%s' 'domain port' ;;
 		protocol) printf '%s' 'domain protocol' ;;
-		service) printf '%s' 'domain port backup service' ;;
+		service) printf '%s' 'domain port service' ;;
 		file) printf '%s' 'domain port file' ;;
 		java) printf '%s' 'domain port java' ;;
 		provider) printf '%s' 'domain port provider' ;;
 		storage) printf '%s' 'domain port storage' ;;
 		runtime) printf '%s' 'domain port protocol runtime' ;;
 		backup) printf '%s' 'domain port backup' ;;
+		backend) printf '%s' 'domain port protocol backend backup runtime storage' ;;
 		# 组合 feature：一次拉入全部内层（默认组合根）
-		bootstrap) printf '%s' 'domain port protocol service backup file java provider storage runtime' ;;
+		bootstrap) printf '%s' 'domain port protocol service backup backend file java provider storage runtime' ;;
 		*) printf '%s' '' ;;
 		esac
 	}

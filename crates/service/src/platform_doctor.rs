@@ -14,7 +14,7 @@
 use crate::platform_config::{Config, ConfigKey};
 use domain::java::JavaRuntime;
 use port::ServerJarSource;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// 严重程度（与 `workspace doctor` 同一口径，两处不各造一套）
@@ -350,10 +350,31 @@ impl PlatformDoctor {
     /// 单项失败不会被吞成「无问题」：读不出来就各自成为一条发现，
     /// 否则诊断工具会把故障报成通过。
     pub async fn run(&self) -> PlatformReport {
-        let mut findings = Vec::new();
-        self.check_data_dir(&mut findings);
-        self.check_config(&mut findings);
-        self.check_java(&mut findings);
+        // 三项本地检查都是阻塞文件 IO（探写权限、stat Java 路径）：
+        // 放到阻塞线程池，不占 async 执行器。
+        let data_dir = self.data_dir.clone();
+        let config = self.config.clone();
+        let config_path = self.config_path.clone();
+        let config_error = self.config_error.clone();
+        let java = self.java.clone();
+        let java_scanned = self.java_scanned;
+        let available_sources = self.available_sources.clone();
+        let mut findings = tokio::task::spawn_blocking(move || {
+            let mut findings = Vec::new();
+            check_data_dir(&data_dir, &mut findings);
+            check_config(
+                &config,
+                &config_path,
+                config_error.as_deref(),
+                &available_sources,
+                &mut findings,
+            );
+            check_java(java.as_deref(), java_scanned, &mut findings);
+            findings
+        })
+        .await
+        .unwrap_or_default();
+
         self.check_sources(&mut findings).await;
         findings.sort_by(|a, b| {
             a.severity()
@@ -363,94 +384,6 @@ impl PlatformDoctor {
         PlatformReport {
             findings,
             online: self.online,
-        }
-    }
-
-    fn check_data_dir(&self, out: &mut Vec<PlatformFinding>) {
-        let path = &self.data_dir;
-        if !path.exists() {
-            out.push(PlatformFinding {
-                check: PlatformCheck::DataDirMissing { path: path.clone() },
-            });
-            // 不存在就判不了可写：创建由首次写元数据的命令负责，这里不替它建
-            return;
-        }
-        // 实际探一次写权限：只查元数据不足以发现只读挂载 / ACL 拒写
-        let probe = path.join(".mcsup-doctor-write-probe");
-        match std::fs::write(&probe, b"") {
-            Ok(()) => {
-                let _ = std::fs::remove_file(&probe);
-            }
-            Err(err) => out.push(PlatformFinding {
-                check: PlatformCheck::DataDirNotWritable {
-                    path: path.clone(),
-                    reason: err.to_string(),
-                },
-            }),
-        }
-    }
-
-    fn check_config(&self, out: &mut Vec<PlatformFinding>) {
-        if let Some(reason) = &self.config_error {
-            out.push(PlatformFinding {
-                check: PlatformCheck::ConfigInvalid {
-                    path: self.config_path.clone(),
-                    reason: reason.clone(),
-                },
-            });
-            return;
-        }
-        for key in ConfigKey::ALL {
-            if !self.config.is_set(*key) {
-                continue;
-            }
-            // 只有 Java 源有可枚举的注册表；其余键的校验在写入时已完成
-            let ConfigKey::JavaSource = key else {
-                continue;
-            };
-            let value = self.config.effective(*key).display();
-            if !self.available_sources.iter().any(|c| *c == value) {
-                out.push(PlatformFinding {
-                    check: PlatformCheck::ConfigSourceUnknown {
-                        key: key.as_str(),
-                        value,
-                        choices: self
-                            .available_sources
-                            .iter()
-                            .map(|c| (*c).to_owned())
-                            .collect(),
-                    },
-                });
-            }
-        }
-    }
-
-    fn check_java(&self, out: &mut Vec<PlatformFinding>) {
-        let Some(runtimes) = &self.java else {
-            out.push(PlatformFinding {
-                check: PlatformCheck::NoJava,
-            });
-            return;
-        };
-        if runtimes.is_empty() {
-            out.push(PlatformFinding {
-                check: if self.java_scanned {
-                    PlatformCheck::NoJavaScanned
-                } else {
-                    PlatformCheck::NoJava
-                },
-            });
-            return;
-        }
-        for rt in runtimes {
-            if !rt.path.is_dir() {
-                out.push(PlatformFinding {
-                    check: PlatformCheck::JavaMissing {
-                        path: rt.path.clone(),
-                        version: rt.version.clone(),
-                    },
-                });
-            }
         }
     }
 
@@ -479,6 +412,101 @@ impl PlatformDoctor {
                     },
                 }),
             }
+        }
+    }
+}
+
+// 三项本地检查做成自由函数：在 `run()` 里经 `spawn_blocking` 执行，参数显式
+// 传入（不用 `&self`，避免把不可 `'static` 的引用带进阻塞线程）。
+
+fn check_data_dir(data_dir: &Path, out: &mut Vec<PlatformFinding>) {
+    let path = data_dir;
+    if !path.exists() {
+        out.push(PlatformFinding {
+            check: PlatformCheck::DataDirMissing {
+                path: path.to_path_buf(),
+            },
+        });
+        // 不存在就判不了可写：创建由首次写元数据的命令负责，这里不替它建
+        return;
+    }
+    // 实际探一次写权限：只查元数据不足以发现只读挂载 / ACL 拒写
+    let probe = path.join(".mcsup-doctor-write-probe");
+    match std::fs::write(&probe, b"") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+        }
+        Err(err) => out.push(PlatformFinding {
+            check: PlatformCheck::DataDirNotWritable {
+                path: path.to_path_buf(),
+                reason: err.to_string(),
+            },
+        }),
+    }
+}
+
+fn check_config(
+    config: &Config,
+    config_path: &Path,
+    config_error: Option<&str>,
+    available_sources: &[&'static str],
+    out: &mut Vec<PlatformFinding>,
+) {
+    if let Some(reason) = config_error {
+        out.push(PlatformFinding {
+            check: PlatformCheck::ConfigInvalid {
+                path: config_path.to_path_buf(),
+                reason: reason.to_owned(),
+            },
+        });
+        return;
+    }
+    for key in ConfigKey::ALL {
+        if !config.is_set(*key) {
+            continue;
+        }
+        // 只有 Java 源有可枚举的注册表；其余键的校验在写入时已完成
+        let ConfigKey::JavaSource = key else {
+            continue;
+        };
+        let value = config.effective(*key).display();
+        if !available_sources.iter().any(|c| *c == value) {
+            out.push(PlatformFinding {
+                check: PlatformCheck::ConfigSourceUnknown {
+                    key: key.as_str(),
+                    value,
+                    choices: available_sources.iter().map(|c| (*c).to_owned()).collect(),
+                },
+            });
+        }
+    }
+}
+
+fn check_java(java: Option<&[JavaRuntime]>, java_scanned: bool, out: &mut Vec<PlatformFinding>) {
+    let Some(runtimes) = java else {
+        out.push(PlatformFinding {
+            check: PlatformCheck::NoJava,
+        });
+        return;
+    };
+    if runtimes.is_empty() {
+        out.push(PlatformFinding {
+            check: if java_scanned {
+                PlatformCheck::NoJavaScanned
+            } else {
+                PlatformCheck::NoJava
+            },
+        });
+        return;
+    }
+    for rt in runtimes {
+        if !rt.path.is_dir() {
+            out.push(PlatformFinding {
+                check: PlatformCheck::JavaMissing {
+                    path: rt.path.clone(),
+                    version: rt.version.clone(),
+                },
+            });
         }
     }
 }

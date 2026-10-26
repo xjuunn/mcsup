@@ -11,9 +11,9 @@ use domain::server::eula::{EULA_FILE, eula_accepted, render_eula};
 use domain::server::layout::console_log_path;
 use domain::server::version::VersionId;
 use port::{
-    CancellationToken, CoreInspector, ProgressSink, ScannedJava, StopOutcome, StopSpec,
-    SupervisorError, SupervisorPort, SupervisorStartOutcome, SupervisorStartRequest,
-    SupervisorStatus,
+    CancellationToken, CoreInspector, EventSink, NoopEventSink, ProgressSink, ScannedJava,
+    StopOutcome, StopSpec, SupervisorError, SupervisorPort, SupervisorStartOutcome,
+    SupervisorStartRequest, SupervisorStatus,
 };
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
@@ -50,6 +50,10 @@ pub struct StartOptions {
     pub ram_mib: Option<u32>,
     /// 拉起 supervisor 的可执行文件（`mcsup` 本体）
     pub supervisor_exe: PathBuf,
+    /// supervisor 可执行文件的前置子命令（如 `["__supervise"]`）
+    ///
+    /// 由入口填写，service 只透传给 [`SupervisorStartRequest`]，不解释其含义。
+    pub supervisor_args: Vec<std::ffi::OsString>,
 }
 
 /// 生命周期操作失败
@@ -191,6 +195,7 @@ pub struct ServerLifecycleService {
     registry: Arc<ServerRegistry>,
     java: JavaService,
     supervisor: Arc<dyn SupervisorPort>,
+    events: Arc<dyn EventSink>,
 }
 
 impl std::fmt::Debug for ServerLifecycleService {
@@ -204,17 +209,29 @@ impl std::fmt::Debug for ServerLifecycleService {
 }
 
 impl ServerLifecycleService {
-    /// 组合依赖
+    /// 组合依赖（无事件消费者）
     #[must_use]
     pub fn new(
         registry: Arc<ServerRegistry>,
         java: JavaService,
         supervisor: Arc<dyn SupervisorPort>,
     ) -> Self {
+        Self::with_events(registry, java, supervisor, Arc::new(NoopEventSink))
+    }
+
+    /// 组合依赖并注入领域事件出口
+    #[must_use]
+    pub fn with_events(
+        registry: Arc<ServerRegistry>,
+        java: JavaService,
+        supervisor: Arc<dyn SupervisorPort>,
+        events: Arc<dyn EventSink>,
+    ) -> Self {
         Self {
             registry,
             java,
             supervisor,
+            events,
         }
     }
 
@@ -269,11 +286,17 @@ impl ServerLifecycleService {
             // 优先级：显式选项 > 服务属性（server set ram）> 平台默认
             ram_mib: Some(opts.ram_mib.or(settings.ram_mib).unwrap_or(DEFAULT_RAM_MIB)),
             supervisor_exe: opts.supervisor_exe.clone(),
+            supervisor_args: opts.supervisor_args.clone(),
         };
-        self.supervisor.start(request).map_err(|err| match err {
+        let outcome = self.supervisor.start(request).map_err(|err| match err {
             SupervisorError::AlreadyRunning => LifecycleError::AlreadyRunning,
             other => LifecycleError::Supervisor(other),
-        })
+        })?;
+        self.events
+            .publish(domain::server::event::DomainEvent::ServerStarting {
+                name: name.to_owned(),
+            });
+        Ok(outcome)
     }
 
     /// 停机：不在运行视为幂等成功；宽限到期映射为 [`LifecycleError::StopTimedOut`]
@@ -288,7 +311,13 @@ impl ServerLifecycleService {
         }
         match self.supervisor.stop(&server.dir, spec)? {
             StopOutcome::TimedOut { waited } => Err(LifecycleError::StopTimedOut { waited }),
-            other => Ok(other),
+            other => {
+                self.events
+                    .publish(domain::server::event::DomainEvent::ServerStopped {
+                        name: name.to_owned(),
+                    });
+                Ok(other)
+            }
         }
     }
 
@@ -751,9 +780,10 @@ mod tests {
     use domain::workspace::{Workspace, WorkspaceId, WorkspaceName};
     use port::{
         ArchiveExtractor, ArtifactDownloader, CancellationToken, CoreInspector, DownloadError,
-        DownloadRequest, DownloadedArtifact, ExtractError, InspectError, JavaPackageRequest,
-        JavaRuntimeRepository, JavaScanner, JavaSourceRegistryPort, ProgressSink, RepositoryError,
-        ServerJarSource, ServerRepository, SourceError, WorkspaceRepository,
+        DownloadRequest, DownloadedArtifact, EventSink, ExtractError, InspectError,
+        JavaPackageRequest, JavaRuntimeRepository, JavaScanner, JavaSourceRegistryPort,
+        ProgressSink, RepositoryError, ServerJarSource, ServerRepository, SourceError,
+        WorkspaceRepository,
     };
     use std::io::Write as _;
     use std::sync::Mutex;
@@ -1271,6 +1301,7 @@ mod tests {
             accept_eula,
             ram_mib: None,
             supervisor_exe: PathBuf::from("/usr/local/bin/mcsup"),
+            supervisor_args: vec![std::ffi::OsString::from("__supervise")],
         }
     }
 
@@ -1564,6 +1595,7 @@ mod tests {
             accept_eula: true,
             ram_mib: Some(512),
             supervisor_exe: PathBuf::from("/usr/local/bin/mcsup"),
+            supervisor_args: vec![std::ffi::OsString::from("__supervise")],
         };
         let explicit_supervisor = Arc::new(FakeSupervisor::default());
         let explicit_svc = service(
@@ -2152,5 +2184,39 @@ mod tests {
         );
         let err = start(&svc, &fixture.name, true).expect_err("must fail");
         assert!(matches!(err, LifecycleError::Io(_)), "{err:?}");
+    }
+
+    /// 捕获型事件出口：验证 service 在成功路径上确实发布了事实
+    #[derive(Default)]
+    struct RecordingSink {
+        events: Mutex<Vec<domain::server::event::DomainEvent>>,
+    }
+
+    impl EventSink for RecordingSink {
+        fn publish(&self, event: domain::server::event::DomainEvent) {
+            self.events.lock().expect("lock").push(event);
+        }
+    }
+
+    #[test]
+    fn stop_publishes_server_stopped_event() {
+        let fixture = Fixture::new(true);
+        let sink = Arc::new(RecordingSink::default());
+        let svc = ServerLifecycleService::with_events(
+            Arc::clone(&fixture.registry),
+            java_service(MemJavaRepo::new(vec![], true), vec![]),
+            Arc::new(FakeSupervisor::running()),
+            sink.clone(),
+        );
+        svc.stop(&fixture.name, StopSpec::default_grace())
+            .expect("stop");
+        let events = sink.events.lock().expect("lock").clone();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                domain::server::event::DomainEvent::ServerStopped { name } if name == &fixture.name
+            )),
+            "{events:?}"
+        );
     }
 }

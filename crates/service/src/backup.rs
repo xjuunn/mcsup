@@ -27,12 +27,14 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use backup::{CasStore, ScanRules, SnapshotIndex, scan_tree};
 use domain::backup::{
     BackupScope, ContentHash, Page, RelPath, RestoreTarget, RetentionPolicy, Snapshot, SnapshotId,
     SnapshotStatus, ensure_restore_stopped,
 };
-use port::{ContentStore, SnapshotRepository, SnapshotStoreError};
+use port::{
+    Backend, ContentStore, ScanError, ScanRules, SnapshotRepository, SnapshotStoreError,
+    workspace_backups_root,
+};
 use thiserror::Error;
 
 use crate::registry::{RegisteredServer, ServerRegistry, ServerRegistryError};
@@ -75,7 +77,7 @@ pub enum BackupError {
     Cas(#[from] port::CasError),
     /// 目录扫描失败
     #[error(transparent)]
-    Scan(#[from] backup::ScanError),
+    Scan(#[from] ScanError),
     /// 文件系统失败
     #[error(transparent)]
     Fs(#[from] FsError),
@@ -308,22 +310,14 @@ pub struct PruneOutcome {
     pub dry_run: bool,
 }
 
-/// 按备份根目录创建 CAS 的工厂
-///
-/// 抽成别名是为了让 [`BackupService`] 的字段与构造参数读起来是一件事，
-/// 而不是三层泛型嵌套。公开是因为 [`BackupService::with_cas_factory`] 是
-/// 公开 API，调用方需要在签名里写出它。
-pub type CasFactory = Arc<dyn Fn(&Path) -> Arc<dyn ContentStore> + Send + Sync>;
-
 /// 备份编排服务
 ///
 /// 克隆即共享同一套装配（与 `ServerLifecycleService` 口径一致）。
 #[derive(Clone)]
 pub struct BackupService {
     registry: Arc<ServerRegistry>,
-    supervisor: Arc<dyn port::SupervisorPort>,
-    /// 按备份根目录创建 CAS；生产是 `CasStore`，测试可套故障注入
-    cas_factory: CasFactory,
+    backend: Arc<dyn Backend>,
+    events: Arc<dyn port::EventSink>,
 }
 
 impl std::fmt::Debug for BackupService {
@@ -333,38 +327,25 @@ impl std::fmt::Debug for BackupService {
 }
 
 impl BackupService {
-    /// 组合注册表与 supervisor
+    /// 组合注册表与执行位置（无事件消费者）
     ///
-    /// 只依赖「探测状态 + 注入一行」两项能力：备份不需要拉起进程、不需要
-    /// Java，直接依赖 [`port::SupervisorPort`] 比依赖整套生命周期服务更小。
-    ///
-    /// CAS 由内部按工作区布局创建；需要替换实现（故障注入、远程对象存储）
-    /// 时用 [`Self::with_cas_factory`]。
+    /// 只依赖「探测状态 + 注入一行」与备份存储两类能力，全部经
+    /// [`port::Backend`] 取得：`service` 不直接依赖 `runtime` / `backup` /
+    /// `storage` 任何一个实现 crate。
     #[must_use]
-    pub fn new(registry: Arc<ServerRegistry>, supervisor: Arc<dyn port::SupervisorPort>) -> Self {
-        Self::with_cas_factory(
-            registry,
-            supervisor,
-            Arc::new(|root: &Path| Arc::new(CasStore::new(root)) as Arc<dyn ContentStore>),
-        )
-    }
-
-    /// 组合注册表、supervisor 与自定义 CAS 工厂
-    ///
-    /// 工厂每次解析服务器布局时按备份根目录调用一次，返回该布局要用的
-    /// [`ContentStore`]。生产装配用 [`Self::new`]；集成测试用它在真实
-    /// `CasStore` 外面套故障注入，从而验证「存储出错时上层怎么收场」。
-    #[must_use]
-    pub fn with_cas_factory(
-        registry: Arc<ServerRegistry>,
-        supervisor: Arc<dyn port::SupervisorPort>,
-        cas_factory: CasFactory,
-    ) -> Self {
+    pub fn new(registry: Arc<ServerRegistry>, backend: Arc<dyn Backend>) -> Self {
         Self {
             registry,
-            supervisor,
-            cas_factory,
+            backend,
+            events: Arc::new(port::NoopEventSink),
         }
+    }
+
+    /// 注入领域事件出口
+    #[must_use]
+    pub fn with_events(mut self, events: Arc<dyn port::EventSink>) -> Self {
+        self.events = events;
+        self
     }
 
     // ---- 内部装配 ----
@@ -372,15 +353,15 @@ impl BackupService {
     /// 解析服务器并返回（注册信息、CAS、快照索引、备份根目录）
     fn resolve(&self, name: &str) -> Result<BackupLayout, BackupError> {
         let server = self.registry.get(name)?;
-        let mut make = |root: &Path| (self.cas_factory)(root);
-        Ok(BackupLayout::for_server_with(&server, &mut make))
+        Ok(BackupLayout::for_server(&server, self.backend.as_ref()))
     }
 
     /// 服务器是否在运行
     fn is_running(&self, name: &str) -> Result<bool, BackupError> {
         let server = self.registry.get(name)?;
         Ok(self
-            .supervisor
+            .backend
+            .supervisor()
             .status(&server.dir)?
             .is_some_and(|status| status.status.is_alive()))
     }
@@ -388,7 +369,7 @@ impl BackupService {
     /// 向服务器控制台注入一行
     fn send_line(&self, name: &str, line: &str) -> Result<(), BackupError> {
         let server = self.registry.get(name)?;
-        match self.supervisor.send_line(&server.dir, line) {
+        match self.backend.supervisor().send_line(&server.dir, line) {
             Err(port::SupervisorError::Remote { kind, .. }) if kind == "not_running" => {
                 Err(BackupError::Lifecycle(LifecycleError::NotRunning))
             }
@@ -464,55 +445,37 @@ impl BackupService {
         // 占位目录建立之后的任何失败都必须清掉它：否则每失败一次就在
         // `snapshots/` 里留下一个空的 `.partial`，越积越多，且下次 list 会
         // 读到一条永远无法完成的记录。
-        let outcome = match scan_tree(&layout.dir, layout.cas.as_ref(), &rules, &mut |_| {}) {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                let _ = layout.index.remove(&id);
-                return Err(err.into());
-            }
-        };
+        let outcome =
+            match self
+                .backend
+                .scanner()
+                .scan(&layout.dir, layout.cas.as_ref(), &rules, &mut |_| {})
+            {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    let _ = layout.index.remove(&id);
+                    return Err(err.into());
+                }
+            };
         if outcome.entries.is_empty() {
             // 空快照没有恢复价值，删掉占位目录后报错
             let _ = layout.index.remove(&id);
             return Err(BackupError::EmptyScope);
         }
 
-        // 删除墓碑：父快照里有、本次没有的路径
-        let deleted: Vec<RelPath> = parent
-            .as_ref()
-            .map(|parent| {
-                parent
-                    .content
-                    .entries()
-                    .iter()
-                    .filter(|(path, _)| {
-                        scope.contains(path)
-                            && !outcome.entries.iter().any(|(kept, _)| kept == path)
-                    })
-                    .map(|(path, _)| path.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let reused = rules.reuse.len().saturating_sub(outcome.added);
-        let snapshot = Snapshot {
+        let skipped = outcome.skipped.len();
+        let snapshot = build_snapshot(
+            name,
             id,
-            workspace_id: String::new(),
-            server: name.to_owned(),
             label,
-            parent: parent.map(|parent| parent.id),
-            scope,
-            status: SnapshotStatus::Complete,
-            content: domain::backup::SnapshotContent::new(outcome.entries, deleted)?
-                .with_stamps(outcome.stamps),
-            added: outcome.added,
-            reused,
-            total_bytes: outcome.total_bytes,
-            added_bytes: outcome.written_bytes,
-            server_online: online,
-            created_at: now,
-        }
-        .with_workspace(&layout.workspace);
+            parent.as_ref(),
+            &scope,
+            &rules,
+            outcome,
+            online,
+            now,
+            &layout.workspace,
+        )?;
 
         layout.index.complete(&snapshot)?;
         tracing::info!(
@@ -523,10 +486,13 @@ impl BackupService {
             bytes = snapshot.total_bytes,
             "backup snapshot created"
         );
-        Ok(CreateOutcome {
-            snapshot,
-            skipped: outcome.skipped.len(),
-        })
+        self.events
+            .publish(domain::server::event::DomainEvent::BackupCompleted {
+                name: name.to_owned(),
+                snapshot: snapshot.id.as_str().to_owned(),
+                added_bytes: snapshot.added_bytes,
+            });
+        Ok(CreateOutcome { snapshot, skipped })
     }
 
     /// 服务器配置的备份范围；服务器不存在时退回「全部」
@@ -660,9 +626,9 @@ impl BackupService {
             }
             other => other.into(),
         })?;
-        let before = referenced_hashes(&layout.index)?;
+        let before = referenced_hashes(layout.index.as_ref())?;
         layout.index.remove(&id)?;
-        let after = referenced_hashes(&layout.index)?;
+        let after = referenced_hashes(layout.index.as_ref())?;
         let orphaned = before
             .keys()
             .filter(|hash| !after.contains_key(*hash))
@@ -744,7 +710,7 @@ impl BackupService {
             .unwrap_or_default();
 
         // 删掉候选后剩下什么：这才是可以回收的对象集合
-        let mut survivors = referenced_hashes(&layout.index)?;
+        let mut survivors = referenced_hashes(layout.index.as_ref())?;
         for id in &victims {
             if let Ok(snapshot) = layout.index.get(id) {
                 for hash in snapshot.content.referenced_hashes() {
@@ -815,22 +781,19 @@ struct BackupLayout {
     /// CAS
     cas: Arc<dyn ContentStore>,
     /// 快照索引
-    index: SnapshotIndex,
+    index: Arc<dyn SnapshotRepository>,
 }
 
 impl BackupLayout {
     /// 按产品口径装配：CAS 落在工作区的 `backups/`
-    fn for_server_with(
-        server: &RegisteredServer,
-        make_cas: &mut dyn FnMut(&Path) -> Arc<dyn ContentStore>,
-    ) -> Self {
+    fn for_server(server: &RegisteredServer, backend: &dyn Backend) -> Self {
         let workspace = server_workspace(&server.dir, &server.meta.rel_dir);
-        let root = backup::workspace_backups_root(&workspace);
+        let root = workspace_backups_root(&workspace);
         Self {
             dir: server.dir.clone(),
             workspace,
-            cas: make_cas(&root),
-            index: SnapshotIndex::new(&root),
+            cas: backend.content_store(&root),
+            index: backend.snapshot_repository(&root),
         }
     }
 }
@@ -953,6 +916,58 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     )
 }
 
+/// 由扫描结果与父快照构造要落盘的快照对象
+///
+/// 计算删除墓碑（父快照有、本次没有的路径）与复用计数，补齐工作区标识。
+/// 从 [`BackupService::create`] 拆出，保持后者在行数上限内、职责单一。
+#[allow(clippy::too_many_arguments)]
+fn build_snapshot(
+    name: &str,
+    id: SnapshotId,
+    label: Option<String>,
+    parent: Option<&Snapshot>,
+    scope: &BackupScope,
+    rules: &ScanRules,
+    outcome: port::ScanOutcome,
+    online: bool,
+    now: i64,
+    workspace: &Path,
+) -> Result<Snapshot, BackupError> {
+    let deleted: Vec<RelPath> = parent
+        .map(|parent| {
+            parent
+                .content
+                .entries()
+                .iter()
+                .filter(|(path, _)| {
+                    scope.contains(path) && !outcome.entries.iter().any(|(kept, _)| kept == path)
+                })
+                .map(|(path, _)| path.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let reused = rules.reuse.len().saturating_sub(outcome.added);
+    Ok(Snapshot {
+        id,
+        workspace_id: String::new(),
+        server: name.to_owned(),
+        label,
+        parent: parent.map(|parent| parent.id.clone()),
+        scope: scope.clone(),
+        status: SnapshotStatus::Complete,
+        content: domain::backup::SnapshotContent::new(outcome.entries, deleted)?
+            .with_stamps(outcome.stamps),
+        added: outcome.added,
+        reused,
+        total_bytes: outcome.total_bytes,
+        added_bytes: outcome.written_bytes,
+        server_online: online,
+        created_at: now,
+    }
+    .with_workspace(workspace))
+}
+
 /// 父快照的复用提示：`(路径, 哈希, 大小, mtime)`
 ///
 /// 携带的是**父快照记录时的** `(size, mtime)`，扫描侧拿它比当前磁盘：
@@ -980,7 +995,9 @@ fn reuse_hints(parent: Option<&Snapshot>) -> Vec<(RelPath, ContentHash, u64, i64
 ///
 /// 必须看**全部服务器**的快照：CAS 按工作区共享，只统计当前服务器的
 /// 引用会删掉别的服务器正在用的对象。
-fn referenced_hashes(index: &SnapshotIndex) -> Result<BTreeMap<ContentHash, usize>, BackupError> {
+fn referenced_hashes(
+    index: &dyn SnapshotRepository,
+) -> Result<BTreeMap<ContentHash, usize>, BackupError> {
     let mut counts: BTreeMap<ContentHash, usize> = BTreeMap::new();
     for snapshot in index.list_all()? {
         for hash in snapshot.content.referenced_hashes() {
@@ -1216,14 +1233,16 @@ fn remove_untracked(destination: &Path, snapshot: &Snapshot) -> Result<usize, Ba
 mod tests {
     use super::*;
     use crate::registry::ServerRegistry;
+    use backup::CasStore;
     use domain::server::meta::{ServerMeta, ServerName};
     use domain::server::settings::SettingKey;
     use domain::server::status::ServerStatus;
     use domain::server::version::{ServerVariant, VersionId};
     use domain::workspace::{Workspace, WorkspaceId, WorkspaceName};
     use port::{
-        RepositoryError, ServerRepository, StopOutcome, StopSpec, SupervisorError, SupervisorPort,
-        SupervisorStartOutcome, SupervisorStartRequest, SupervisorStatus, WorkspaceRepository,
+        Backend, InstallerRunner, RepositoryError, Scanner, ServerRepository, StopOutcome,
+        StopSpec, SupervisorError, SupervisorPort, SupervisorStartOutcome, SupervisorStartRequest,
+        SupervisorStatus, WorkspaceRepository,
     };
     use std::sync::Mutex;
 
@@ -1415,6 +1434,38 @@ mod tests {
 
     // ---- 夹具 ----
 
+    /// 测试用 `Backend`：真实 CAS / 快照 / 扫描 + 内存仓库 + 假 supervisor
+    struct TestBackend {
+        supervisor: Arc<FakeSupervisor>,
+        servers: Arc<dyn ServerRepository>,
+        workspaces: Arc<dyn WorkspaceRepository>,
+        cas: Arc<dyn ContentStore>,
+    }
+
+    impl Backend for TestBackend {
+        fn supervisor(&self) -> &dyn SupervisorPort {
+            self.supervisor.as_ref()
+        }
+        fn installer(&self) -> &dyn InstallerRunner {
+            unreachable!("not used")
+        }
+        fn servers(&self) -> &dyn ServerRepository {
+            self.servers.as_ref()
+        }
+        fn workspaces(&self) -> &dyn WorkspaceRepository {
+            self.workspaces.as_ref()
+        }
+        fn scanner(&self) -> &dyn Scanner {
+            &backup::DirectoryScanner
+        }
+        fn content_store(&self, _backups_root: &Path) -> Arc<dyn ContentStore> {
+            Arc::clone(&self.cas)
+        }
+        fn snapshot_repository(&self, backups_root: &Path) -> Arc<dyn SnapshotRepository> {
+            Arc::new(backup::SnapshotIndex::new(backups_root))
+        }
+    }
+
     struct Fixture {
         service: BackupService,
         registry: Arc<ServerRegistry>,
@@ -1436,9 +1487,11 @@ mod tests {
                 created_at: 1,
                 updated_at: 1,
             };
+            let servers: Arc<dyn ServerRepository> = Arc::new(MemServers::new());
+            let workspaces: Arc<dyn WorkspaceRepository> = Arc::new(MemWorkspaces { ws });
             let registry = Arc::new(ServerRegistry::new(
-                Arc::new(MemServers::new()),
-                Arc::new(MemWorkspaces { ws }),
+                Arc::clone(&servers),
+                Arc::clone(&workspaces),
             ));
             let server = registry
                 .create(
@@ -1450,7 +1503,13 @@ mod tests {
                 )
                 .expect("create");
             let supervisor = Arc::new(supervisor);
-            let service = BackupService::new(Arc::clone(&registry), supervisor.clone());
+            let backend = Arc::new(TestBackend {
+                supervisor: Arc::clone(&supervisor),
+                servers,
+                workspaces,
+                cas: Arc::new(CasStore::new(&ws_path.join("backups"))),
+            });
+            let service = BackupService::new(Arc::clone(&registry), backend);
             Self {
                 service,
                 registry,

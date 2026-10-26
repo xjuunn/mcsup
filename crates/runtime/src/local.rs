@@ -19,17 +19,19 @@ const GONE_WAIT: Duration = Duration::from_secs(1);
 pub struct LocalSupervisor;
 
 impl LocalSupervisor {
-    /// 组装 `mcsup __supervise ...` 启动命令
+    /// 组装 supervisor 启动命令
     ///
-    /// 启动方式按 [`domain::server::launch::LaunchSpec`] 分流：`Jar` 传
+    /// 前半段（可执行文件 + 入口给定的前置子命令 [`SupervisorStartRequest::supervisor_args`]）
+    /// 由调用方决定，`runtime` 不假设具体子命令名；后半段是按
+    /// [`domain::server::launch::LaunchSpec`] 分流的启动方式：`Jar` 传
     /// `--jar <相对路径>`，`Args` 依次传 `--arg-file <相对路径>`；两者之后都按
     /// [`LaunchSpec::program_args`] 逐项传 `--server-arg`（默认 `nogui`）。路径保持
     /// **相对服务器目录**（supervisor 以 `--dir` 为 cwd，由它拼绝对），与
     /// `MinecraftLaunch` 的约定一致。
     fn supervisor_command(request: &SupervisorStartRequest) -> Command {
         let mut command = Command::new(&request.supervisor_exe);
+        command.args(&request.supervisor_args);
         command
-            .arg("__supervise")
             .arg("--dir")
             .arg(&request.server_dir)
             .arg("--java")
@@ -73,9 +75,9 @@ impl SupervisorPort for LocalSupervisor {
             client::wait_gone(dir, GONE_WAIT);
         }
 
-        // 默认 supervisor 经 `__supervise` 子命令拉起：exe 缺失或不是
-        // mcsup CLI 时，把失败提前到 spawn 前并指名原因，而不是让用户
-        // 5 秒超时后看到一句难懂的 Unreachable
+        // exe 缺失时把失败提前到 spawn 前并指名原因，而不是让用户
+        // 5 秒超时后看到一句难懂的 Unreachable。前置子命令由入口经
+        // `supervisor_args` 给出，runtime 不假设具体名称。
         if !request.supervisor_exe.is_file() {
             return Err(SupervisorError::Spawn(std::io::Error::new(
                 std::io::ErrorKind::NotFound,

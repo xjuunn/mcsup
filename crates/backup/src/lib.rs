@@ -26,9 +26,11 @@ mod scan;
 mod store;
 
 pub use cas::CasStore;
-pub use error::{BackupIoError, ScanError, SkipReason, Skipped};
-pub use scan::{RUNTIME_ENTRIES, ScanOutcome, ScanRules, scan_tree};
-pub use store::{SnapshotIndex, snapshot_dir, workspace_backups_root};
+pub use error::BackupIoError;
+pub use port::workspace_backups_root;
+pub use port::{RUNTIME_ENTRIES, ScanError, ScanOutcome, ScanRules, SkipReason, Skipped};
+pub use scan::{DirectoryScanner, scan_tree};
+pub use store::{SnapshotIndex, snapshot_dir};
 
 /// 快照元数据文件名
 pub const SNAPSHOT_FILE: &str = "snapshot.json";

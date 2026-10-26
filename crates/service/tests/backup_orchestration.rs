@@ -12,7 +12,10 @@
 
 use backup::CasStore;
 use domain::backup::{BackupScope, ContentHash, Page, RelPath, RestoreTarget, RetentionPolicy};
-use port::ContentStore;
+use port::{
+    Backend, ContentStore, InstallerRunner, Scanner, ServerRepository, SnapshotRepository,
+    SupervisorPort, WorkspaceRepository,
+};
 use service::{BackupError, BackupService, CreateOptions, CreateOutcome, ServerRegistry};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -25,6 +28,40 @@ use testkit::{
 const CMD_SAVE_OFF: &str = "save-off";
 const CMD_SAVE_ON: &str = "save-on";
 
+/// 测试用 `Backend`：真实 CAS / 快照 / 扫描 + 夹具仓库 + 假 supervisor
+///
+/// CAS 由调用方给定，便于在真实 `CasStore` 外套故障注入。
+struct TestBackend {
+    supervisor: Arc<FakeSupervisor>,
+    servers: Arc<dyn ServerRepository>,
+    workspaces: Arc<dyn WorkspaceRepository>,
+    cas: Arc<dyn ContentStore>,
+}
+
+impl Backend for TestBackend {
+    fn supervisor(&self) -> &dyn SupervisorPort {
+        self.supervisor.as_ref()
+    }
+    fn installer(&self) -> &dyn InstallerRunner {
+        unreachable!("not used")
+    }
+    fn servers(&self) -> &dyn ServerRepository {
+        self.servers.as_ref()
+    }
+    fn workspaces(&self) -> &dyn WorkspaceRepository {
+        self.workspaces.as_ref()
+    }
+    fn scanner(&self) -> &dyn Scanner {
+        &backup::DirectoryScanner
+    }
+    fn content_store(&self, _backups_root: &Path) -> Arc<dyn ContentStore> {
+        Arc::clone(&self.cas)
+    }
+    fn snapshot_repository(&self, backups_root: &Path) -> Arc<dyn SnapshotRepository> {
+        Arc::new(backup::SnapshotIndex::new(backups_root))
+    }
+}
+
 /// 一台「有内容」的服务器 + 可控的记录器
 fn online_fixture() -> (ServiceFixture, CommandLog) {
     let fixture = ServiceFixture::with_server("alpha");
@@ -35,16 +72,18 @@ fn online_fixture() -> (ServiceFixture, CommandLog) {
 /// 把夹具接上 `BackupService`
 fn service(fixture: &ServiceFixture, log: &CommandLog) -> BackupService {
     let registry = ServerRegistry::new(fixture.server_repo(), fixture.workspace_repo());
-    BackupService::new(
-        Arc::new(registry),
-        Arc::new(FakeSupervisor::new(log.clone())),
-    )
+    let backend: Arc<dyn Backend> = Arc::new(TestBackend {
+        supervisor: Arc::new(FakeSupervisor::new(log.clone())),
+        servers: fixture.server_repo(),
+        workspaces: fixture.workspace_repo(),
+        cas: Arc::new(CasStore::new(&fixture.backups_root())),
+    });
+    BackupService::new(Arc::new(registry), backend)
 }
 
 /// 接上「真实 CAS 外套故障注入」的服务
 ///
-/// 工厂每次 `resolve` 都被调用一次。把真实 `CasStore` 包在注入器里，并让
-/// 工厂只在**首次**装配时创建注入器、之后复用同一实例：这样「第 N 次 put
+/// CAS 只在**首次**装配时创建注入器、之后复用同一实例：这样「第 N 次 put
 /// 失败」的计数在多步操作之间是连续的，而不是每次 resolve 都从 1 重来。
 fn service_with_cas_fault(
     fixture: &ServiceFixture,
@@ -55,19 +94,22 @@ fn service_with_cas_fault(
     let registry = ServerRegistry::new(fixture.server_repo(), fixture.workspace_repo());
     let shared: Arc<Mutex<Option<FailingContentStore>>> = Arc::new(Mutex::new(None));
     let factory_shared = Arc::clone(&shared);
-    let service = BackupService::with_cas_factory(
-        Arc::new(registry),
-        Arc::new(FakeSupervisor::new(log.clone())),
-        Arc::new(move |root: &Path| {
-            let mut slot = factory_shared.lock().expect("lock");
-            let store = slot.get_or_insert_with(|| {
-                FailingContentStore::new(Arc::new(CasStore::new(root)) as Arc<dyn ContentStore>)
-                    .failing_on(on_op, attempt)
-            });
-            Arc::new(store.clone()) as Arc<dyn ContentStore>
-        }),
-    );
-    (service, shared)
+    let mut slot = factory_shared.lock().expect("lock");
+    let store = slot.get_or_insert_with(|| {
+        FailingContentStore::new(
+            Arc::new(CasStore::new(&fixture.backups_root())) as Arc<dyn ContentStore>
+        )
+        .failing_on(on_op, attempt)
+    });
+    let cas: Arc<dyn ContentStore> = Arc::new(store.clone());
+    drop(slot);
+    let backend: Arc<dyn Backend> = Arc::new(TestBackend {
+        supervisor: Arc::new(FakeSupervisor::new(log.clone())),
+        servers: fixture.server_repo(),
+        workspaces: fixture.workspace_repo(),
+        cas,
+    });
+    (BackupService::new(Arc::new(registry), backend), shared)
 }
 
 /// 一次不等待落盘的创建
@@ -185,11 +227,7 @@ fn save_on_failure_does_not_mask_the_original_error() {
 
     // 第 3 次（save-on）失败，前两次成功：备份本身应当已经完成
     let log = CommandLog::running().failing_send_on(3);
-    let registry = ServerRegistry::new(fixture.server_repo(), fixture.workspace_repo());
-    let service = BackupService::new(
-        Arc::new(registry),
-        Arc::new(FakeSupervisor::new(log.clone())),
-    );
+    let service = service(&fixture, &log);
 
     let outcome = create_now(&service).expect("backup itself succeeds");
     assert_invariant(!outcome.snapshot.id.as_str().is_empty(), || {

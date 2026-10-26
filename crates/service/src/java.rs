@@ -17,6 +17,17 @@ use tracing::info;
 /// 上次进程没来得及清的残留。够老才删，避免误删并发安装的进行中产物。
 const STALE_TEMP_AGE: Duration = Duration::from_secs(3600);
 
+/// 阻塞任务（`spawn_blocking`）panic / 取消时的统一错误
+///
+/// 正常文件操作不会 panic；走到这里说明阻塞线程失真，按文件系统失败上报，
+/// 让上层按可重试的 IO 问题处理。
+fn join_error(err: &tokio::task::JoinError) -> JavaError {
+    JavaError::Fs(FsError::io(
+        Path::new("."),
+        std::io::Error::other(format!("blocking task failed: {err}")),
+    ))
+}
+
 /// Java 操作失败
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -308,7 +319,9 @@ impl JavaService {
         let resolved = until_cancelled(registry.resolve_binary(&package), cancel).await??;
 
         // 上次硬中断（断电 / kill -9）残留的临时文件在安装开始时统一回收
-        sweep_stale_temp(&self.java_root);
+        // （目录遍历 + 删除属阻塞 IO）
+        let sweep_root = self.java_root.clone();
+        let _ = tokio::task::spawn_blocking(move || sweep_stale_temp(&sweep_root)).await;
 
         // 目录名用「厂商-大版本」，短且稳定：重装同一大版本就地替换，
         // 不随归档文件名（版本号、平台后缀）膨胀路径
@@ -316,7 +329,11 @@ impl JavaService {
         let install_dir = self.java_root.join(&dir_name);
         // 失败清理只删本次新建的目录：重装失败时旧运行时必须原样保留
         let dir_preexisting = install_dir.exists();
-        std::fs::create_dir_all(&install_dir)
+        // 建目录是阻塞 IO：放到阻塞线程池，不占 async 执行器
+        let mk = install_dir.clone();
+        tokio::task::spawn_blocking(move || std::fs::create_dir_all(&mk))
+            .await
+            .map_err(|e| join_error(&e))?
             .map_err(|source| JavaError::io(&install_dir, source))?;
         let filename = download_filename(&resolved.location);
         let destination = install_dir.join(&filename);
@@ -351,8 +368,17 @@ impl JavaService {
         }
 
         notify(InstallStage::Extracting);
-        // 解压失败时归档（可能数百 MB）与半成品都在 install_dir 里，必须回收
-        let home = match extract_and_swap(&destination, &install_dir, self.extractor.as_ref()) {
+        // 解压失败时归档（可能数百 MB）与半成品都在 install_dir 里，必须回收。
+        // 解压是重活（外部工具链 + 大量文件 IO），放到阻塞线程池。
+        let dest = destination.clone();
+        let dir = install_dir.clone();
+        let extractor = Arc::clone(&self.extractor);
+        let home = match tokio::task::spawn_blocking(move || {
+            extract_and_swap(&dest, &dir, extractor.as_ref())
+        })
+        .await
+        .map_err(|e| join_error(&e))?
+        {
             Ok(home) => home,
             Err(err) => {
                 cleanup_partial_install(&install_dir, &destination, dir_preexisting);

@@ -149,6 +149,8 @@ pub struct McsupBuilder {
     java_registry: Option<Arc<dyn port::JavaSourceRegistryPort>>,
     extractor: Option<Arc<dyn port::ArchiveExtractor>>,
     supervisor: Option<Arc<dyn port::SupervisorPort>>,
+    backend: Option<Arc<dyn port::Backend>>,
+    events: Option<Arc<dyn port::EventSink>>,
     jar_sources: Option<Vec<Arc<dyn ServerJarSource>>>,
 }
 
@@ -164,6 +166,8 @@ impl std::fmt::Debug for McsupBuilder {
             .field("java_registry", &"Option<dyn …>")
             .field("extractor", &"Option<dyn …>")
             .field("supervisor", &"Option<dyn …>")
+            .field("backend", &"Option<dyn …>")
+            .field("events", &"Option<dyn …>")
             .field(
                 "jar_sources",
                 &self.jar_sources.as_ref().map_or(0, Vec::len),
@@ -243,9 +247,31 @@ impl McsupBuilder {
     }
 
     /// 注入自定义 supervisor（接管进程生命周期，宿主启动器常见诉求）
+    ///
+    /// 与 [`Self::backend`] 二选一：给定 `backend` 时优先级更高，`supervisor`
+    /// 只影响默认装配出的 `LocalBackend`。
     #[must_use]
     pub fn supervisor(mut self, supervisor: Arc<dyn port::SupervisorPort>) -> Self {
         self.supervisor = Some(supervisor);
+        self
+    }
+
+    /// 注入自定义执行位置（Local / Remote），整体接管进程、存储与备份
+    ///
+    /// 给定后不再按默认 `LocalBackend` 装配；`supervisor` 忽略。
+    #[must_use]
+    pub fn backend(mut self, backend: Arc<dyn port::Backend>) -> Self {
+        self.backend = Some(backend);
+        self
+    }
+
+    /// 注入领域事件出口（默认丢弃）
+    ///
+    /// CLI / API / MCP / Audit / Notification 通过它订阅 `ServerStarted`、
+    /// `BackupCompleted` 等事实；事件是旁路，发不出去不影响业务。
+    #[must_use]
+    pub fn events(mut self, events: Arc<dyn port::EventSink>) -> Self {
+        self.events = Some(events);
         self
     }
 
@@ -305,16 +331,31 @@ impl McsupBuilder {
             Arc::clone(&servers_repo),
             Arc::clone(&workspaces_repo),
         ));
-        let workspaces = WorkspaceService::new(workspaces_repo, servers_repo);
         let supervisor: Arc<dyn port::SupervisorPort> = self
             .supervisor
             .unwrap_or_else(|| Arc::new(runtime::LocalSupervisor));
-        let lifecycle = ServerLifecycleService::new(
+        // 执行位置：默认 supervisor / installer + 已解析的仓库，交给 Backend 聚合
+        let backend: Arc<dyn port::Backend> = match self.backend {
+            Some(backend) => backend,
+            None => Arc::new(backend::LocalBackend::new(
+                Arc::clone(&supervisor),
+                Arc::new(runtime::LocalInstallerRunner::new()),
+                Arc::clone(&servers_repo),
+                Arc::clone(&workspaces_repo),
+            )),
+        };
+        let workspaces =
+            WorkspaceService::new(Arc::clone(&workspaces_repo), Arc::clone(&servers_repo));
+        let events: Arc<dyn port::EventSink> =
+            self.events.unwrap_or_else(|| Arc::new(port::NoopEventSink));
+        let lifecycle = ServerLifecycleService::with_events(
             Arc::clone(&registry),
             java.clone(),
             Arc::clone(&supervisor),
+            Arc::clone(&events),
         );
-        let backup = service::BackupService::new(Arc::clone(&registry), supervisor);
+        let backup = service::BackupService::new(Arc::clone(&registry), Arc::clone(&backend))
+            .with_events(events);
 
         let jar_sources: Vec<Arc<dyn ServerJarSource>> = match self.jar_sources {
             Some(sources) => sources,

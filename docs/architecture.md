@@ -37,30 +37,30 @@ Auth、Audit、Automation 等能力。目标是在生产环境长期稳定运行
 ```
 mcsup/
 ├── apps/
-│   ├── cli/                 # CLI / TUI 程序入口，bin 名为 mcsup
-│   ├── agent/               # Remote Agent 程序入口，bin 名为 mcsup-agent
-│   ├── server/              # API（HTTP / REST / WebSocket）入口，bin 名为 mcsup-server
-│   ├── mcp/                 # MCP Server 入口，bin 名为 mcsup-mcp
-│   ├── dev/                 # 开发辅助工具
-│   └── bench/               # 性能基准测试程序
+│   ├── cli/                        # [已落地] CLI / TUI 程序入口，bin 名为 mcsup
+│   ├── agent/                      # [目标] Remote Agent 程序入口，bin 名为 mcsup-agent
+│   ├── server/                     # [目标] API（HTTP / REST / WebSocket）入口，bin 名为 mcsup-server
+│   ├── mcp/                        # [目标] MCP Server 入口，bin 名为 mcsup-mcp
+│   ├── dev/                        # [已落地] 开发辅助工具
+│   └── bench/                      # [目标] 性能基准测试程序
 │
 ├── crates/
-│   ├── mcsup/                   # 门面：feature 级联重导出内层，唯一发布单元
-│   ├── domain/                   # 领域模型、领域规则和领域事件
-│   ├── port/                     # 能力 trait / Port 定义
-│   ├── service/                  # 统一业务服务层和业务编排
-│   ├── backend/                  # Local / Remote 执行位置抽象
-│   ├── runtime/                  # Minecraft / Java Runtime 运行管理
-│   ├── provider/                 # 外部资源和第三方 API Provider
-│   ├── storage/                  # 元数据和持久化
-│   ├── file/                     # 文件系统和文件传输
-│   ├── backup/                   # CAS / Snapshot / Restore / GC
-│   ├── modkit/                   # Mod / Modpack 管理
-│   ├── java/                     # Java 检测、安装和版本管理
-│   ├── protocol/                 # RPC 消息和协议定义
-│   ├── transport/                # RPC / gRPC 通信实现
-│   ├── api/                      # REST DTO / API Contract / OpenAPI
-│   └── auth/                     # Authentication / Authorization
+│   ├── mcsup/                      # [已落地] 门面：feature 级联重导出内层，唯一发布单元
+│   ├── domain/                     # [已落地] 领域模型、领域规则和领域事件
+│   ├── port/                       # [已落地] 能力 trait / Port 定义
+│   ├── service/                    # [已落地] 统一业务服务层和业务编排
+│   ├── backend/                    # [已落地] Local / Remote 执行位置抽象
+│   ├── runtime/                    # [已落地] Minecraft / Java Runtime 运行管理
+│   ├── provider/                   # [已落地] 外部资源和第三方 API Provider
+│   ├── storage/                    # [已落地] 元数据和持久化
+│   ├── file/                       # [已落地] 文件系统和文件传输
+│   ├── backup/                     # [已落地] CAS / Snapshot / Restore / GC
+│   ├── modkit/                     # [目标] Mod / Modpack 管理
+│   ├── java/                       # [已落地] Java 检测、安装和版本管理
+│   ├── protocol/                   # [已落地] RPC 消息和协议定义
+│   ├── transport/                  # [目标] RPC / gRPC 通信实现
+│   ├── api/                        # [目标] REST DTO / API Contract / OpenAPI
+│   └── auth/                       # [目标] Authentication / Authorization
 │
 ├── tests/                        # 跨模块集成测试
 ├── docs/                         # 项目文档
@@ -201,6 +201,14 @@ Backend 回答「这个操作在哪里执行」，由 `port::Backend` 定义，�
 `LocalBackend` 与 `RemoteBackend`。Local 本机执行，Remote 经 transport →
 RPC → agent。
 
+`port::Backend` 只返回 `port` 内的契约（`SupervisorPort` / `InstallerRunner` /
+`ServerRepository` / `WorkspaceRepository` / `Scanner` / `ContentStore` /
+`SnapshotRepository`），`service` 只持有 `Arc<dyn Backend>`，不依赖任何实现
+crate。`crates/backend` 的 `LocalBackend` 是本机装配：组合 `runtime`、
+`storage`、`backup` 的具体实现，由门面 `bootstrap` 组合根构造。它也是唯一
+允许组合实现层的 crate（`scripts/check-architecture.sh` 断言其余实现层互不
+依赖）。
+
 Service 里不应出现大量 `if remote { ... } else { ... }`；出现即说明抽象边界
 有问题。
 
@@ -292,6 +300,11 @@ Protocol 定义传输什么（`StartServerRequest` / `StartServerResponse` /
 `LogEvent` / `FileChunk` / `BackupProgress` 等消息类型）；Transport 定义怎么传
 （gRPC / tonic / prost / streaming）。禁止把具体 gRPC 实现污染到 Domain。
 
+`protocol::cli` 承载 CLI `--output json` 的机器契约 DTO：它是 CLI 对第三方的
+稳定承诺，与 REST / WebSocket / 桌面客户端共用同一批类型，因此作为「唯一
+契约来源」放在 `protocol` 是**有意**的，不属于入口逻辑泄漏。渲染（表格、
+着色、进度）不在此层，仍在入口。
+
 # Agent
 
 Agent 是远程执行节点：`mcsup-server / CLI → RemoteBackend → RPC → Agent →
@@ -348,6 +361,13 @@ MCP 是另一种用户入口，Tool 如 `server.start` / `backup.restore` /
 / `ServerCrashed` / `PlayerJoined` / `BackupCompleted` /
 `FileTransferCompleted`。消费者包括 CLI、API、MCP、Scheduler、Monitoring、
 Audit、Notification；Domain / Service 不直接依赖这些 UI。
+
+事件类型定义在 `domain::server::event::DomainEvent`，出口是
+`port::EventSink`（`publish(&DomainEvent)`）。`service` 在关键节点发布事实：
+`start` 成功发 `ServerStarting`、`stop` 成功发 `ServerStopped`、`backup create`
+成功发 `BackupCompleted`。默认装配 `port::NoopEventSink` 丢弃事件；宿主经
+`McsupBuilder::events` 注入自己的订阅实现。事件是旁路——`publish` 不得让
+发不出去影响业务。
 
 # 状态机
 
