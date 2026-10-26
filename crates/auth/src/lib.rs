@@ -5,7 +5,7 @@
 //! - 配对码（[`PairingCode`]）：短时有效、单次使用、限速尝试
 //! - token（[`Token`]）：不透明随机串，服务端只存摘要（[`TokenDigest`]）
 //! - 角色与权限（[`Role`] / [`Permission`]）：Admin / Operator / Viewer
-//! - 客户端身份（[`ClientId`]）与撤销（[`RevocationList`]）
+//! - 客户端身份（[`ClientId`]）与撤销（[`RevocationList`] / [`ClientRegistry`]）
 //! - 凭证落盘形态（[`CredentialStore`] / [`FileCredentialStore`]）：0600 文件
 //!
 //! 放在独立 crate 而不是 `service`，是因为它同时被两侧使用：agent 侧要签发与
@@ -18,8 +18,10 @@
 
 pub mod code;
 pub mod credential;
+pub mod registry;
 pub mod token;
 
 pub use code::{PairingCode, PairingCodeError, PairingCodeStore, PairingWindow};
 pub use credential::{CredentialError, CredentialStore, FileCredentialStore, StoredCredential};
+pub use registry::{ClientRecord, ClientRegistry, RegistryError};
 pub use token::{ClientId, Permission, RevocationList, Role, Token, TokenDigest, TokenError};

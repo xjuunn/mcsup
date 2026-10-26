@@ -134,15 +134,9 @@ impl FileCredentialStore {
 
     /// 读整份文件；不存在时为空表
     fn load(&self) -> Result<CredentialFile, CredentialError> {
-        let text = match std::fs::read_to_string(&self.path) {
-            Ok(text) => text,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(CredentialFile::default());
-            }
-            Err(err) => return Err(CredentialError::io(&self.path, err)),
+        let Some(text) = read_private(&self.path)? else {
+            return Ok(CredentialFile::default());
         };
-        #[cfg(unix)]
-        check_permissions(&self.path)?;
         toml::from_str(&text).map_err(|err| CredentialError::Corrupt {
             path: self.path.clone(),
             reason: err.to_string(),
@@ -155,32 +149,52 @@ impl FileCredentialStore {
             path: self.path.clone(),
             reason: err.to_string(),
         })?;
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).map_err(|err| CredentialError::io(parent, err))?;
-        }
-        let tmp = self.path.with_extension("toml.tmp");
-        {
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create(true).truncate(true);
-            // 创建时就限定 0600：先创建再 chmod 会有一个窗口期文件是可读的
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt as _;
-                options.mode(0o600);
-            }
-            let mut file = options
-                .open(&tmp)
-                .map_err(|err| CredentialError::io(&tmp, err))?;
-            file.write_all(text.as_bytes())
-                .map_err(|err| CredentialError::io(&tmp, err))?;
-            file.sync_all()
-                .map_err(|err| CredentialError::io(&tmp, err))?;
-        }
-        // 已存在的旧文件可能权限更宽，rename 前先收紧临时文件
-        #[cfg(unix)]
-        restrict(&tmp)?;
-        std::fs::rename(&tmp, &self.path).map_err(|err| CredentialError::io(&self.path, err))
+        write_private(&self.path, &text)
     }
+}
+
+/// 读一个受保护的文本文件；不存在时返回 `None`
+///
+/// 「受保护」= Unix 上权限不得比 `0600` 宽。宽了就拒绝读取，而不是静默继续：
+/// 静默继续等于假装保护生效。
+pub(crate) fn read_private(path: &Path) -> Result<Option<String>, CredentialError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(CredentialError::io(path, err)),
+    };
+    #[cfg(unix)]
+    check_permissions(path)?;
+    Ok(Some(text))
+}
+
+/// 原子写入并保证 `0600`（同目录临时文件 + fsync + rename）
+pub(crate) fn write_private(path: &Path, text: &str) -> Result<(), CredentialError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| CredentialError::io(parent, err))?;
+    }
+    let tmp = path.with_extension("toml.tmp");
+    {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        // 创建时就限定 0600：先创建再 chmod 会有一个窗口期文件是可读的
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&tmp)
+            .map_err(|err| CredentialError::io(&tmp, err))?;
+        file.write_all(text.as_bytes())
+            .map_err(|err| CredentialError::io(&tmp, err))?;
+        file.sync_all()
+            .map_err(|err| CredentialError::io(&tmp, err))?;
+    }
+    // 已存在的旧文件可能权限更宽，rename 前先收紧临时文件
+    #[cfg(unix)]
+    restrict(&tmp)?;
+    std::fs::rename(&tmp, path).map_err(|err| CredentialError::io(path, err))
 }
 
 /// 校验文件权限不比 0600 宽
