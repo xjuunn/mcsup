@@ -70,9 +70,102 @@ pub(crate) fn jar_sources() -> Result<Vec<Arc<dyn ServerJarSource>>> {
 }
 
 /// 可创建 / 可安装的变体集合：来源 `variant()` 去重，保持注册顺序
+///
+/// 在此基础上追加「非 JAR 来源」的变体：整合包由 `port::ModpackSource` 承载，
+/// 没有 `ServerJarSource`，但同样应出现在 `server create` 的候选列表里。
 pub(crate) fn available_variants() -> Result<Vec<ServerVariant>> {
     let sources = jar_sources()?;
-    Ok(available_of(&sources))
+    Ok(available_with_modpack(available_of(&sources)))
+}
+
+/// 在可用变体里补上整合包变体，并按「用户需要懂多少」排序
+///
+/// 排序口径（越不需要用户懂，越靠前）：
+///
+/// 1. `vanilla`：不用选加载器
+/// 2. `modrinth-modpack`：加载器由整包决定，同样不用选
+/// 3. 模组加载器（`fabric` / `forge` / `neoforge` / `quilt`）
+/// 4. 服务端分支与代理（`paper` / `purpur` / `folia` / `leaf` / `velocity` …）
+/// 5. 其余第三方变体保持注册顺序
+///
+/// 这样整合包一眼可见，且位置有明确理由，而不是随手提到前面。
+pub(crate) fn available_with_modpack(mut available: Vec<ServerVariant>) -> Vec<ServerVariant> {
+    if !available.contains(&ServerVariant::ModrinthModpack) {
+        available.push(ServerVariant::ModrinthModpack);
+    }
+    sort_by_discovery_order(&mut available);
+    available
+}
+
+/// 变体在「发现顺序」里的档位；越小越靠前
+fn discovery_rank(variant: &ServerVariant) -> u8 {
+    match variant {
+        ServerVariant::Vanilla => 0,
+        ServerVariant::ModrinthModpack => 1,
+        ServerVariant::Fabric
+        | ServerVariant::Forge
+        | ServerVariant::NeoForge
+        | ServerVariant::Quilt => 2,
+        ServerVariant::Paper
+        | ServerVariant::Purpur
+        | ServerVariant::Folia
+        | ServerVariant::Leaf
+        | ServerVariant::Velocity
+        | ServerVariant::Waterfall
+        | ServerVariant::SpongeVanilla => 3,
+        // `Unknown` 是历史数据兜底，不出现在可选列表里；`Custom` 与其余
+        // 内置项保持注册顺序
+        _ => 4,
+    }
+}
+
+/// 按档位稳定排序（同档保持注册顺序）
+fn sort_by_discovery_order(variants: &mut [ServerVariant]) {
+    variants.sort_by_key(discovery_rank);
+}
+
+/// 变体在选择器里的展示标签
+///
+/// 只给「名字本身不足以说明后果」的项加说明。`vanilla` / `fabric` 这类
+/// 用户已认识的短名不加后缀，避免整列变长。
+#[must_use]
+pub(crate) fn variant_label(variant: &ServerVariant) -> String {
+    match variant {
+        ServerVariant::Vanilla => "vanilla（原版，无需加载器）".to_owned(),
+        ServerVariant::ModrinthModpack => "modrinth（从 Modrinth 安装整合包）".to_owned(),
+        ServerVariant::Fabric => "fabric（模组加载器）".to_owned(),
+        ServerVariant::Forge => "forge（模组加载器）".to_owned(),
+        ServerVariant::NeoForge => "neoforge（模组加载器）".to_owned(),
+        ServerVariant::Quilt => "quilt（模组加载器）".to_owned(),
+        ServerVariant::Paper => "paper（高性能服务端）".to_owned(),
+        other => other.as_str().to_owned(),
+    }
+}
+
+/// 展示标签 → 变体
+///
+/// 与 [`variant_label`] 互逆。候选里同一变体只有一种标签，因此按全名匹配即可。
+#[must_use]
+pub(crate) fn variant_from_label(
+    picked: &str,
+    available: &[ServerVariant],
+) -> Option<ServerVariant> {
+    available
+        .iter()
+        .find(|variant| variant_label(variant) == picked)
+        .cloned()
+}
+
+/// 该变体是否由整合包承载（需要走整合包开服流程）
+pub(crate) fn is_modpack(variant: &ServerVariant) -> bool {
+    mcsup::service::is_modpack_variant(variant)
+}
+
+/// 整合包开服服务
+pub(crate) fn modpack_service() -> Result<mcsup::service::ModpackService> {
+    let data_dir = config::platform_data_dir();
+    let mc = Mcsup::open(&data_dir).context("装配整合包服务")?;
+    Ok(mc.modpack)
 }
 
 /// [`available_variants`] 的纯逻辑内核（可注入假来源测试）
@@ -227,6 +320,55 @@ mod tests {
         assert!(msg.contains("vanilla"), "{msg}");
         let empty = unsupported_message(&ServerVariant::Paper, &[], Lang::Zh);
         assert!(empty.contains("无"), "{empty}");
+    }
+
+    #[test]
+    fn modpack_sorts_right_after_vanilla() {
+        let available = available_with_modpack(vec![
+            ServerVariant::Paper,
+            ServerVariant::Fabric,
+            ServerVariant::Vanilla,
+        ]);
+        assert_eq!(
+            available,
+            vec![
+                ServerVariant::Vanilla,
+                ServerVariant::ModrinthModpack,
+                ServerVariant::Fabric,
+                ServerVariant::Paper,
+            ]
+        );
+    }
+
+    #[test]
+    fn modpack_not_duplicated_when_already_available() {
+        let available =
+            available_with_modpack(vec![ServerVariant::Vanilla, ServerVariant::ModrinthModpack]);
+        assert_eq!(
+            available
+                .iter()
+                .filter(|v| **v == ServerVariant::ModrinthModpack)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn variant_label_round_trips_through_lookup() {
+        let available = available_with_modpack(vec![
+            ServerVariant::Vanilla,
+            ServerVariant::Fabric,
+            ServerVariant::Paper,
+        ]);
+        for variant in &available {
+            let label = variant_label(variant);
+            assert_eq!(
+                variant_from_label(&label, &available).as_ref(),
+                Some(variant),
+                "标签 {label} 无法回映"
+            );
+        }
+        assert!(variant_label(&ServerVariant::ModrinthModpack).contains("modrinth"));
     }
 
     #[test]

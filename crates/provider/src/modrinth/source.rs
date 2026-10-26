@@ -253,7 +253,7 @@ fn channel_name(channel: &VersionChannel) -> String {
 ///
 /// 地址必须是 `https`：上游理论上都走 CDN 的 https，但把「非 https」当成
 /// 可下载目标会让校验链出现明文降级，因此在这里拦下。
-fn content_file(file: &VersionFile) -> Result<ContentFile, SourceError> {
+pub(crate) fn content_file(file: &VersionFile) -> Result<ContentFile, SourceError> {
     let location = file
         .url
         .parse::<url::Url>()
@@ -331,6 +331,8 @@ mod tests {
             latest_version: None,
             license: "MIT".to_owned(),
             environment: Vec::new(),
+            client_side: None,
+            server_side: None,
             disclosure_types: Vec::new(),
             gallery: Vec::new(),
             slug: Some("p".to_owned()),

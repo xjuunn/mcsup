@@ -13,12 +13,13 @@ use file::{CommandExtractor, FileDownloader};
 use java::HostJavaScanner;
 use port::ServerJarSource;
 use port::content::{ContentSource, ContentSourceRegistry};
+use port::modpack::{ModpackExtractor, ModpackSource, ModpackSourceRegistry};
 use provider::fabric::FabricSource;
 use provider::forge::ForgeSource;
 use provider::http::HttpByteSource;
 use provider::java::JavaSourceRegistry;
 use provider::leaf::LeafSource;
-use provider::modrinth::ModrinthSource;
+use provider::modrinth::{ModrinthModpackSource, ModrinthSource, MrpackExtractor};
 use provider::mojang::MojangSource;
 use provider::neoforge::NeoForgeSource;
 use provider::papermc::{PaperProject, PaperSource};
@@ -26,7 +27,8 @@ use provider::purpur::PurpurSource;
 use provider::quilt::QuiltSource;
 use provider::sponge::SpongeSource;
 use service::{
-    ContentService, JavaService, ServerLifecycleService, ServerRegistry, WorkspaceService,
+    ContentService, JavaService, ModpackService, ServerLifecycleService, ServerRegistry,
+    WorkspaceService,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -85,8 +87,10 @@ pub struct Mcsup {
     pub backup: service::BackupService,
     /// 已注册的服务端 JAR 来源（能力查询数据源）
     pub jar_sources: Vec<Arc<dyn ServerJarSource>>,
-    /// 内容资源安装（Mod / 整合包 / 资源包 …）
+    /// 内容资源安装（Mod / 资源包 / 数据包 …）
     pub content: ContentService,
+    /// 整合包开服编排（取回清单 → 装加载器 → 铺 overrides → 装文件）
+    pub modpack: ModpackService,
     /// 元数据仓库句柄（Workspace / Server / Java 三个仓库共用）
     ///
     /// 具体存储类型是实现细节，对外只经 [`McsupBuilder::server_repository`]
@@ -160,6 +164,8 @@ pub struct McsupBuilder {
     events: Option<Arc<dyn port::EventSink>>,
     jar_sources: Option<Vec<Arc<dyn ServerJarSource>>>,
     content_sources: Option<Vec<Arc<dyn ContentSource>>>,
+    modpack_sources: Option<Vec<Arc<dyn ModpackSource>>>,
+    modpack_extractor: Option<Arc<dyn ModpackExtractor>>,
 }
 
 impl std::fmt::Debug for McsupBuilder {
@@ -185,6 +191,11 @@ impl std::fmt::Debug for McsupBuilder {
                 "content_sources",
                 &self.content_sources.as_ref().map_or(0, Vec::len),
             )
+            .field(
+                "modpack_sources",
+                &self.modpack_sources.as_ref().map_or(0, Vec::len),
+            )
+            .field("modpack_extractor", &self.modpack_extractor.is_some())
             .finish()
     }
 }
@@ -312,6 +323,22 @@ impl McsupBuilder {
         self
     }
 
+    /// 注入整合包来源集合（默认 Modrinth）
+    ///
+    /// 换源与内容来源同理：Service 只依赖 trait，装配层决定用哪个实现。
+    #[must_use]
+    pub fn modpack_sources(mut self, sources: Vec<Arc<dyn ModpackSource>>) -> Self {
+        self.modpack_sources = Some(sources);
+        self
+    }
+
+    /// 注入整合包归档读取实现（默认 `unzip` 版）
+    #[must_use]
+    pub fn modpack_extractor(mut self, extractor: Arc<dyn ModpackExtractor>) -> Self {
+        self.modpack_extractor = Some(extractor);
+        self
+    }
+
     /// 装配；`data_dir` 为平台数据目录
     ///
     /// # Errors
@@ -404,6 +431,17 @@ impl McsupBuilder {
             Arc::clone(&downloader),
         );
 
+        let modpack_sources = match self.modpack_sources {
+            Some(sources) => sources,
+            None => default_modpack_sources()?,
+        };
+        let modpack = ModpackService::new(
+            Arc::new(ModpackSourceRegistry::new(modpack_sources)),
+            self.modpack_extractor
+                .unwrap_or_else(|| Arc::new(MrpackExtractor::new())),
+            Arc::clone(&downloader),
+        );
+
         Ok(Mcsup {
             workspaces,
             registry,
@@ -412,6 +450,7 @@ impl McsupBuilder {
             backup,
             jar_sources,
             content,
+            modpack,
             store,
         })
     }
@@ -428,6 +467,17 @@ impl McsupBuilder {
 pub fn default_content_sources() -> Result<Vec<Arc<dyn ContentSource>>, BootstrapError> {
     let source = ModrinthSource::new().map_err(|err| BootstrapError::Source(Box::new(err)))?;
     Ok(vec![Arc::new(source) as Arc<dyn ContentSource>])
+}
+
+/// 默认的整合包来源集合：Modrinth 官方
+///
+/// # Errors
+///
+/// 来源构造失败时返回 [`BootstrapError::Source`]
+pub fn default_modpack_sources() -> Result<Vec<Arc<dyn ModpackSource>>, BootstrapError> {
+    let source =
+        ModrinthModpackSource::new().map_err(|err| BootstrapError::Source(Box::new(err)))?;
+    Ok(vec![Arc::new(source) as Arc<dyn ModpackSource>])
 }
 
 /// 默认的来源集合（与 CLI 完全一致）
@@ -527,13 +577,31 @@ mod tests {
         let sources = default_jar_sources().expect("默认来源");
         let registered: Vec<ServerVariant> = sources.iter().map(|s| s.variant()).collect();
 
+        // 两个有意的例外：
+        // - `Unknown` 是历史数据兜底项，不是可安装变体
+        // - `ModrinthModpack` 由整合包来源承载（`default_modpack_sources`），
+        //   没有 `ServerJarSource`——加载器由清单决定，不由变体决定
+        let non_jar = [ServerVariant::Unknown, ServerVariant::ModrinthModpack];
         let mut missing: Vec<&str> = Vec::new();
         for variant in ServerVariant::builtin() {
-            if variant != &ServerVariant::Unknown && !registered.contains(variant) {
+            if !non_jar.contains(variant) && !registered.contains(variant) {
                 missing.push(variant.as_str());
             }
         }
         assert!(missing.is_empty(), "缺少来源的变体：{missing:?}");
+
+        // 整合包变体必须恰好由整合包来源覆盖
+        let modpacks = default_modpack_sources().expect("默认整合包来源");
+        assert!(
+            !modpacks.is_empty(),
+            "整合包变体没有对应来源，server create 会给出一个无法安装的选项"
+        );
+        assert!(
+            sources
+                .iter()
+                .all(|source| source.variant() != ServerVariant::ModrinthModpack),
+            "整合包变体不应注册 JAR 来源"
+        );
 
         // 每种变体只注册一次：重复注册时 `pick_source` 只认第一个，
         // 第二个会变成永远走不到的死代码

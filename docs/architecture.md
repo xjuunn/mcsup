@@ -276,6 +276,35 @@ Provider 对外提供两个互不重叠的端口：
                         └──→ port::ArtifactDownloader   provider::modrinth
 ```
 
+## Modrinth 整合包（开服变体）
+
+整合包不是一种「服务端软件」，而是**一份服务端布置方案**。它作为内置变体
+`ServerVariant::ModrinthModpack`（`modrinth-modpack`）参与 `server create`，
+但**没有** `ServerJarSource`——加载器由清单决定，而不是由变体决定。
+
+| 层 | 职责 |
+| --- | --- |
+| `domain::server::modpack` | `.mrpack` 清单模型、路径安全、`server: unsupported` 过滤、依赖键 → 加载器 |
+| `port::modpack::{ModpackSource, ModpackExtractor}` | 搜索可开服整合包 / 详情 / 版本 / 解析下载目标；读归档清单与铺 overrides |
+| `provider::modrinth::modpack` | Modrinth 实现（`server_side` facet 过滤）+ `unzip` 版归档读取 |
+| `service::ModpackService` | prepare（取回 + 读清单）→ apply（铺 overrides + 下载服务端文件） |
+
+开服顺序由入口编排：`prepare` 拿到 MC 版本与加载器 → 写注册表 → 用**既有**
+`ServerJarSource` 装对应加载器（与 `server install` 同一套流程，Forge /
+NeoForge 的安装器运行与 Java 选择不出现第二份实现）→ `apply` 落文件。
+
+`.mrpack` 是外部格式，解析放在 Provider（领域层不引入 serde）；领域层只做
+校验与判定，因此 `ModpackIndex` 由 Provider 反序列化后经 `ModpackIndex::new`
+构造。
+
+```
+server create --variant modrinth-modpack
+   └─→ ModpackService::prepare ──→ port::ModpackSource / ModpackExtractor
+         ├─→ 注册表写入 MC 版本
+         ├─→ ServerJarSource（Fabric / Forge / NeoForge / Quilt…）
+         └─→ ModpackService::apply ──→ port::ArtifactDownloader
+```
+
 Forge 的下载物是**安装器**而非服务端：Provider 以 `port::InstallKind::Installer`
 声明这一点，并给出安装器产出的参数文件启动规格（`domain::LaunchSpec::Args`）。
 真正运行 `--installServer` 由 `port::InstallerRunner` 承担，本机实现是

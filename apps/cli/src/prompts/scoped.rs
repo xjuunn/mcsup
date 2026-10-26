@@ -77,6 +77,67 @@ enum Scope {
     All,
 }
 
+/// 「可返回」选择的结果
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Backable {
+    /// 选中某一项（候选全名）
+    Picked(String),
+    /// 用户按 Esc 要求返回上一步
+    Back,
+}
+
+/// 可过滤 + 可返回的选择：Esc 返回 [`Backable::Back`]，而不是取消整个命令
+///
+/// 与 [`select_filter_scoped`] 的唯一区别是 Esc 的语义：向导用它实现「返回
+/// 上一步」，Ctrl+C 仍是取消整个命令（由调用方按 `is_cancelled` 处理）。
+/// 单候选免提问直接返回该项——此时没有「上一步」可选，返回与选中等价于
+/// 继续，由调用方的状态机决定是否需要保留返回能力（候选只有一项时通常
+/// 不值得为它多按一次回车）。
+///
+/// # Errors
+///
+/// 无可选项、非交互终端、按键读取 / 终端写入失败，或用户 Ctrl+C 中断时返回错误
+pub(crate) fn select_filter_backable(
+    lang: Lang,
+    label: &str,
+    choices: &[ScopedChoice],
+    hint: ScopeHint,
+) -> Result<Backable> {
+    match choices {
+        [] => return Err(anyhow::anyhow!("没有可选项")),
+        [only] => return Ok(Backable::Picked(only.label.clone())),
+        _ => {}
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err(InquireError::NotTTY.into());
+    }
+    let mut picker = Picker::new(lang, label, choices, hint);
+    picker.esc_help = match lang {
+        Lang::Zh => "返回上一步",
+        Lang::En => "goes back",
+    };
+    let mut frame = Frame::default();
+    let done = {
+        let _raw = input::RawMode::enter()?;
+        loop {
+            let screen = picker.screen();
+            frame.draw(&screen.lines, screen.cursor)?;
+            if let Some(done) = picker.handle(input::read_key()?)? {
+                break done;
+            }
+        }
+    };
+    frame.clear()?;
+    match done {
+        Done::Submitted(value) => {
+            print_answer(label, &value);
+            Ok(Backable::Picked(value))
+        }
+        Done::Cancelled => Ok(Backable::Back),
+        Done::Interrupted => Err(InquireError::OperationInterrupted).context("读取选择"),
+    }
+}
+
 /// 按范围筛出候选标签
 fn pool_of(choices: &[ScopedChoice], scope: Scope) -> Vec<String> {
     choices
@@ -111,6 +172,8 @@ struct Picker<'a> {
     error: Option<String>,
     /// 界面语言：帮助行与校验文案按它渲染
     lang: Lang,
+    /// Esc 的语义说明，只影响底栏提示文案
+    esc_help: &'static str,
 }
 
 impl<'a> Picker<'a> {
@@ -134,6 +197,10 @@ impl<'a> Picker<'a> {
             scroll: 0,
             error: None,
             lang,
+            esc_help: match lang {
+                Lang::Zh => "取消",
+                Lang::En => "cancels",
+            },
         }
     }
 
@@ -402,14 +469,24 @@ impl<'a> Picker<'a> {
         for (index, suggestion) in filtered.iter().enumerate().take(end).skip(start) {
             lines.push(self.suggestion_line(suggestion, index, max));
         }
-        let help = match self.lang {
-            Lang::Zh => format!(
-                "输入关键字过滤；↑↓ 选择，Tab 补全，回车确认，Esc 取消（Ctrl+A {}）",
+        let help = match (self.lang, self.choices.iter().any(|choice| choice.extra)) {
+            (Lang::Zh, true) => format!(
+                "输入关键字过滤；↑↓ 选择，Tab 补全，回车确认，Esc {}（Ctrl+A {}）",
+                self.esc_help,
                 self.scope_hint()
             ),
-            Lang::En => format!(
-                "type to filter; ↑↓ move, Tab completes, Enter confirms, Esc cancels (Ctrl+A {})",
+            (Lang::Zh, false) => format!(
+                "输入关键字过滤；↑↓ 选择，Tab 补全，回车确认，Esc {}",
+                self.esc_help
+            ),
+            (Lang::En, true) => format!(
+                "type to filter; ↑↓ move, Tab completes, Enter confirms, Esc {} (Ctrl+A {})",
+                self.esc_help,
                 self.scope_hint()
+            ),
+            (Lang::En, false) => format!(
+                "type to filter; ↑↓ move, Tab completes, Enter confirms, Esc {}",
+                self.esc_help
             ),
         };
         lines.push(styled(&help, &Style::new().for_stderr().dim(), max));
