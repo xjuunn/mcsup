@@ -11,11 +11,29 @@
 
 use domain::server::status::ServerStatus;
 use port::{
-    StopOutcome, StopSpec, SupervisorError, SupervisorPort, SupervisorStartOutcome,
+    ServerRef, StopOutcome, StopSpec, SupervisorError, SupervisorPort, SupervisorStartOutcome,
     SupervisorStartRequest, SupervisorStatus,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+/// 一次调用记录到的服务器身份
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerCall {
+    /// 服务器身份（跨机器键）
+    pub id: String,
+    /// 本地目录；远端场景为 `None`
+    pub dir: Option<PathBuf>,
+}
+
+impl ServerCall {
+    fn of(server: &ServerRef<'_>) -> Self {
+        Self {
+            id: server.id.as_str().to_owned(),
+            dir: server.dir.map(Path::to_path_buf),
+        }
+    }
+}
 
 /// 命令记录器：与 [`FakeSupervisor`] 共享，测试通过它读记录
 #[derive(Debug, Clone, Default)]
@@ -32,8 +50,8 @@ struct LogInner {
     /// 第 N 次（1 基）`send_line` 失败；`None` = 从不失败
     fail_on: Option<usize>,
     send_attempts: usize,
-    /// 每次调用给出的服务器目录，便于断言「命令发给了对的服务器」
-    dirs: Vec<PathBuf>,
+    /// 每次调用给出的服务器身份，便于断言「命令发给了对的服务器」
+    dirs: Vec<ServerCall>,
     /// 第 N 次（1 基）`status` 失败；`None` = 从不失败
     status_fail_on: Option<usize>,
     status_attempts: usize,
@@ -87,9 +105,9 @@ impl CommandLog {
             .collect()
     }
 
-    /// 每次调用给出的服务器目录
+    /// 每次调用给出的服务器身份
     #[must_use]
-    pub fn dirs(&self) -> Vec<PathBuf> {
+    pub fn calls(&self) -> Vec<ServerCall> {
         self.inner.lock().expect("lock").dirs.clone()
     }
 
@@ -146,13 +164,17 @@ impl SupervisorPort for FakeSupervisor {
         Err(unreachable("start"))
     }
 
-    fn stop(&self, _server_dir: &Path, _spec: StopSpec) -> Result<StopOutcome, SupervisorError> {
+    fn stop(
+        &self,
+        _server: &ServerRef<'_>,
+        _spec: StopSpec,
+    ) -> Result<StopOutcome, SupervisorError> {
         Err(unreachable("stop"))
     }
 
-    fn status(&self, server_dir: &Path) -> Result<Option<SupervisorStatus>, SupervisorError> {
+    fn status(&self, server: &ServerRef<'_>) -> Result<Option<SupervisorStatus>, SupervisorError> {
         let mut inner = self.log.inner.lock().expect("lock");
-        inner.dirs.push(server_dir.to_path_buf());
+        inner.dirs.push(ServerCall::of(server));
         inner.status_attempts += 1;
         let attempt = inner.status_attempts;
         let fail_on = inner.status_fail_on;
@@ -173,9 +195,9 @@ impl SupervisorPort for FakeSupervisor {
         }))
     }
 
-    fn send_line(&self, server_dir: &Path, line: &str) -> Result<(), SupervisorError> {
+    fn send_line(&self, server: &ServerRef<'_>, line: &str) -> Result<(), SupervisorError> {
         let mut inner = self.log.inner.lock().expect("lock");
-        inner.dirs.push(server_dir.to_path_buf());
+        inner.dirs.push(ServerCall::of(server));
         inner.send_attempts += 1;
         let attempt = inner.send_attempts;
         inner.sent.push(line.to_owned());
@@ -190,7 +212,7 @@ impl SupervisorPort for FakeSupervisor {
         Ok(())
     }
 
-    fn shutdown(&self, _server_dir: &Path) -> Result<(), SupervisorError> {
+    fn shutdown(&self, _server: &ServerRef<'_>) -> Result<(), SupervisorError> {
         Err(unreachable("shutdown"))
     }
 }
@@ -200,17 +222,28 @@ mod tests {
     use super::*;
     use crate::assert::{Failure, assert_invariant};
 
+    /// 测试用的本地服务器引用：身份用固定 UUID，目录即给定路径
+    fn local(dir: &Path) -> (domain::server::meta::ServerId, &Path) {
+        (
+            domain::server::meta::ServerId::parse("6f1a1d3e-0b7c-4a51-9c8e-2b0f3a4d5e60")
+                .expect("id"),
+            dir,
+        )
+    }
+
     #[test]
     fn stopped_reports_none_and_running_reports_status() {
         let dir = Path::new("/srv/alpha");
+        let (id, dir) = local(dir);
+        let sref = ServerRef::local(&id, dir);
         let stopped = FakeSupervisor::stopped();
-        assert_invariant(stopped.status(dir).expect("status").is_none(), || {
+        assert_invariant(stopped.status(&sref).expect("status").is_none(), || {
             Failure::invariant("stopped supervisor 必须报 None")
         });
         let running = FakeSupervisor::running();
         assert_invariant(
             running
-                .status(dir)
+                .status(&sref)
                 .expect("status")
                 .is_some_and(|status| status.status.is_alive()),
             || Failure::invariant("running supervisor 必须报存活"),
@@ -220,10 +253,11 @@ mod tests {
     #[test]
     fn sent_preserves_order() {
         let sup = FakeSupervisor::running();
-        let dir = Path::new("/srv/alpha");
-        sup.send_line(dir, "save-off").expect("send");
-        sup.send_line(dir, "save-all flush").expect("send");
-        sup.send_line(dir, "save-on").expect("send");
+        let (id, dir) = local(Path::new("/srv/alpha"));
+        let sref = ServerRef::local(&id, dir);
+        sup.send_line(&sref, "save-off").expect("send");
+        sup.send_line(&sref, "save-all flush").expect("send");
+        sup.send_line(&sref, "save-on").expect("send");
         assert_invariant(
             sup.log().sent() == ["save-off", "save-all flush", "save-on"],
             || Failure::invariant("命令顺序必须原样保留").actual(format!("{:?}", sup.log().sent())),
@@ -234,9 +268,10 @@ mod tests {
     #[test]
     fn injected_failure_is_recorded_but_not_delivered() {
         let sup = FakeSupervisor::new(CommandLog::running().failing_send_on(2));
-        let dir = Path::new("/srv/alpha");
-        sup.send_line(dir, "save-off").expect("first ok");
-        assert_invariant(sup.send_line(dir, "save-all flush").is_err(), || {
+        let (id, dir) = local(Path::new("/srv/alpha"));
+        let sref = ServerRef::local(&id, dir);
+        sup.send_line(&sref, "save-off").expect("first ok");
+        assert_invariant(sup.send_line(&sref, "save-all flush").is_err(), || {
             Failure::invariant("第 2 次 send_line 必须失败")
         });
         assert_invariant(sup.log().sent() == ["save-off", "save-all flush"], || {
@@ -250,11 +285,26 @@ mod tests {
     #[test]
     fn status_failure_is_injectable() {
         let sup = FakeSupervisor::new(CommandLog::stopped().failing_status_on(1));
-        assert_invariant(sup.status(Path::new("/srv/a")).is_err(), || {
+        let (id, dir) = local(Path::new("/srv/a"));
+        let sref = ServerRef::local(&id, dir);
+        assert_invariant(sup.status(&sref).is_err(), || {
             Failure::invariant("第 1 次 status 必须失败")
         });
-        assert_invariant(sup.status(Path::new("/srv/a")).is_ok(), || {
+        assert_invariant(sup.status(&sref).is_ok(), || {
             Failure::invariant("注入只作用于指定次数")
         });
+    }
+
+    /// 调用记录按身份键留存：远端引用（无目录）也能被断言到
+    #[test]
+    fn calls_are_recorded_by_identity() {
+        let sup = FakeSupervisor::running();
+        let (id, _) = local(Path::new("/srv/a"));
+        let remote = ServerRef::remote(&id);
+        sup.status(&remote).expect("status");
+        let calls = sup.log().calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, id.as_str());
+        assert!(calls[0].dir.is_none(), "远端引用不该带目录");
     }
 }

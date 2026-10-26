@@ -75,6 +75,12 @@ impl JavaReleaseSource for AzulSource {
             .filter(|pkg| {
                 !pkg.name.contains("-crac-") && super::is_deployable_archive(&pkg.download_url)
             })
+            // Azul 会静默忽略未知的 `arch` 取值并返回全架构列表，
+            // 响应里也没有架构字段，只能从归档名复核
+            .filter(|pkg| {
+                super::filename_arch_matches(&request.arch, &pkg.name)
+                    && super::filename_arch_matches(&request.arch, &pkg.download_url)
+            })
             .filter_map(|pkg| {
                 let major = pkg
                     .java_version

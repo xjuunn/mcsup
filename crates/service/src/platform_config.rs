@@ -11,7 +11,9 @@
 //! 路径类字段按 `~` 展开与归一化后保存：文件里的值是给人看的，运行时
 //! 才拼成绝对路径；保存前就归一化，避免同一目录因写法不同出现两份。
 
+use port::RemoteName;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -19,12 +21,75 @@ use thiserror::Error;
 ///
 /// 字段全部 `Option`：未设置即「用平台缺省」。`resolved_*` 系列负责
 /// 把缺省填上，写入时仍保留 `None`，避免把缺省值固化进文件。
+///
+/// `remotes` 是唯一不走 [`ConfigKey`] 的一项：它是**集合**而非标量，
+/// 由 `mcsup remote connect` / `disconnect` 增删，`config set` 不接管。
+/// 把它做成 `ConfigKey` 会让「用一行字符串表达一条配对记录」成为必然。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Config {
     /// 平台数据目录（缺省取系统数据目录下的 `mcsup`）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data_dir: Option<PathBuf>,
+    /// 已配对的远端：键是远端名，值是一条配对记录
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub remotes: BTreeMap<String, RemoteRecord>,
+}
+
+/// 一条远端配对记录
+///
+/// **凭证本体不写进配置文件**：`credential` 只是句柄（钥匙串条目名或
+/// `file:<路径>`），token 由它指向的存储保管（`docs/remote.md`「安全」）。
+/// 这样配置文件可以安全地被备份、被 `cat`、被贴进 issue。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RemoteRecord {
+    /// 用户输入的原始 target（`user@host` / `host:port`），原样保存
+    ///
+    /// 不归一化：`reconnect` 要按原样重放同一条接入路径，改写会丢失
+    /// 用户意图（例如 `user@host` 与 `host` 走的是不同认证方式）。
+    pub target: String,
+    /// 接入方式
+    pub via: RemoteVia,
+    /// 以只读权限配对（远端侧角色为 viewer）
+    #[serde(default)]
+    pub read_only: bool,
+    /// 配对时间（Unix 秒）
+    #[serde(default)]
+    pub added_at: i64,
+    /// 服务端证书指纹（TOFU 首次确认后固定；变化必须显式重新配对）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
+    /// 凭证句柄：钥匙串条目名，或 `file:<路径>`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
+}
+
+/// 远端接入方式
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RemoteVia {
+    /// 复用 SSH 信任：连得上就说明有权限
+    Ssh,
+    /// 直连 `host:port`（配合配对码）
+    Direct,
+}
+
+impl RemoteVia {
+    /// 稳定文本（配置值、JSON、提示共用）
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ssh => "ssh",
+            Self::Direct => "direct",
+        }
+    }
+}
+
+impl std::fmt::Display for RemoteVia {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// 可设置的配置键
@@ -186,7 +251,34 @@ impl Config {
                 cfg.set(*key, &raw).map_err(|err| err.describe())?;
             }
         }
+        // 远端名是配置键，手改文件同样要过同一套校验
+        for name in cfg.remotes.keys() {
+            RemoteName::parse(name).map_err(|err| format!("remotes.{name}: {err}"))?;
+        }
         Ok(cfg)
+    }
+
+    /// 已配对远端的名字，按名字升序（`BTreeMap` 天然有序，展示稳定）
+    pub fn remote_names(&self) -> impl Iterator<Item = &str> {
+        self.remotes.keys().map(String::as_str)
+    }
+
+    /// 按名取一条配对记录
+    #[must_use]
+    pub fn remote(&self, name: &RemoteName) -> Option<&RemoteRecord> {
+        self.remotes.get(name.as_str())
+    }
+
+    /// 写入（覆盖）一条配对记录
+    ///
+    /// 覆盖语义是有意的：`connect` 幂等，重复配对等于刷新 token 与指纹。
+    pub fn put_remote(&mut self, name: &RemoteName, record: RemoteRecord) {
+        self.remotes.insert(name.as_str().to_owned(), record);
+    }
+
+    /// 删除一条配对记录，返回被删的那条（`None` = 本来就没有）
+    pub fn remove_remote(&mut self, name: &RemoteName) -> Option<RemoteRecord> {
+        self.remotes.remove(name.as_str())
     }
 
     /// 序列化为文件内容：[`FEATURE_HEADER`] + 已设置的键
@@ -201,7 +293,8 @@ impl Config {
 
 /// 写入文件时置顶的说明：手改的人先看到可用键
 pub const FEATURE_HEADER: &str = "# mcsup 平台配置；键表见 `mcsup config show`\n\
-     # data-dir，删除该项即回到平台缺省\n\n";
+     # data-dir，删除该项即回到平台缺省\n\
+     # remotes.* 由 `mcsup remote connect` / `disconnect` 维护，不要手改\n\n";
 
 /// 校验并归一化路径
 ///
@@ -372,5 +465,69 @@ mod tests {
     fn lexical_normalize_folds_dot_segments() {
         let out = lexical_normalize(Path::new("/a/b/../c/./d"));
         assert_eq!(out, PathBuf::from("/a/c/d"));
+    }
+
+    fn record() -> RemoteRecord {
+        RemoteRecord {
+            target: "user@prod-box".to_owned(),
+            via: RemoteVia::Ssh,
+            read_only: false,
+            added_at: 1_700_000_000,
+            fingerprint: None,
+            credential: None,
+        }
+    }
+
+    /// 配对记录走 kebab-case 落盘，且不含 token 本体
+    #[test]
+    fn remote_records_roundtrip_without_secrets() {
+        let mut cfg = Config::default();
+        let name = RemoteName::parse("prod-box").expect("name");
+        cfg.put_remote(
+            &name,
+            RemoteRecord {
+                credential: Some("keyring:mcsup/prod-box".to_owned()),
+                ..record()
+            },
+        );
+        let text = cfg.to_document().expect("serialize");
+        assert!(text.contains("read-only = false"), "{text}");
+        assert!(text.contains("via = \"ssh\""), "{text}");
+        assert!(!text.to_lowercase().contains("token"), "{text}");
+
+        let again = Config::parse_document(&text).expect("reparse");
+        assert_eq!(again, cfg);
+        assert_eq!(again.remote(&name).expect("record").target, "user@prod-box");
+    }
+
+    /// 手改出来的非法远端名必须在加载时被挡下，而不是留到运行期
+    #[test]
+    fn invalid_remote_names_are_rejected_on_load() {
+        let text = "[remotes.\"a/b\"]\ntarget = \"host\"\nvia = \"ssh\"\n";
+        let err = Config::parse_document(text).expect_err("名字含 / 必须拒绝");
+        assert!(err.contains("remotes.a/b"), "{err}");
+
+        let text = "[remotes.all]\ntarget = \"host\"\nvia = \"ssh\"\n";
+        assert!(Config::parse_document(text).is_err(), "保留字必须拒绝");
+    }
+
+    /// 未知字段被拒绝：手写错键名不该静默失效
+    #[test]
+    fn remote_records_reject_unknown_fields() {
+        let text = "[remotes.prod]\ntarget = \"h\"\nvia = \"ssh\"\nnope = 1\n";
+        assert!(Config::parse_document(text).is_err());
+        let text = "[remotes.prod]\ntarget = \"h\"\nvia = \"carrier-pigeon\"\n";
+        assert!(Config::parse_document(text).is_err());
+    }
+
+    #[test]
+    fn remove_remote_reports_whether_it_existed() {
+        let mut cfg = Config::default();
+        let name = RemoteName::parse("prod-box").expect("name");
+        cfg.put_remote(&name, record());
+        assert_eq!(cfg.remote_names().collect::<Vec<_>>(), vec!["prod-box"]);
+        assert!(cfg.remove_remote(&name).is_some());
+        assert!(cfg.remove_remote(&name).is_none());
+        assert_eq!(cfg.remote_names().count(), 0);
     }
 }

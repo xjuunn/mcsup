@@ -4,6 +4,7 @@ mod doctor;
 mod fs_error;
 mod java;
 mod lifecycle;
+mod origin;
 mod platform_config;
 mod platform_doctor;
 mod props;
@@ -36,7 +37,10 @@ pub use lifecycle::{
     BusyOp, DEFAULT_RAM_MIB, LifecycleError, LifecycleErrorKind, LogWatch, ServerLifecycleService,
     StartOptions, StatusReport,
 };
-pub use platform_config::{Config, ConfigKey, ConfigValueError, FEATURE_HEADER, lexical_normalize};
+pub use origin::{OriginFilter, ResolveError, Selector, resolve_index};
+pub use platform_config::{
+    Config, ConfigKey, ConfigValueError, FEATURE_HEADER, RemoteRecord, RemoteVia, lexical_normalize,
+};
 pub use platform_doctor::{PlatformCheck, PlatformDoctor, PlatformFinding, PlatformReport};
 /// Java 源聚合端口（定义在 `port`，此处转出便于既有调用方）
 pub use port::JavaSourceRegistryPort;
@@ -44,6 +48,8 @@ use port::{
     ArtifactDownloader, CancellationToken, DownloadRequest, DownloadedArtifact, ProgressSink,
     ServerJarSource,
 };
+/// 来源类型定义在 `port`（组合仓库要用），此处转出便于既有调用方
+pub use port::{LOCAL_NAME, MAX_NAME_LEN, Origin, OriginError, RESERVED_NAMES, RemoteName};
 pub use props::{PropsError, PropsReport, ServerPropsService};
 /// 服务器注销的结果（与工作目录的 [`RemoveOutcome`] 同名，用别名区分）
 pub use registry::RemoveOutcome as ServerRemoveOutcome;

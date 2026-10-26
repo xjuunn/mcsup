@@ -348,6 +348,7 @@ Backend 只回答「在哪里执行」，不回答「能不能执行」——后
 | `docs/ai-collaboration.md` | AI 协助开发细则：方案类 / 代码类 / 审查类的对应流程 | 收到用户提问时 |
 | `docs/cli-commands.md` | CLI 子命令设计：`workspace`；`server` 及其 `backup` / `mod`；`modpack` / `java` / `remote` 用法表 | 设计或查询子命令时 |
 | `docs/remote.md` | 远程管理：身份路由、`remote serve` / `connect`、来源过滤、只读镜像缓存、安全与实施阶段 | 设计或实现远程连接、来源过滤、agent 与 transport 时 |
+| `docs/remote-progress.md` | 远程管理实施记录：各阶段完成情况、已确认的设计取舍、逐阶段待办 | 继续做远程功能、确认做到哪一步时 |
 | `docs/workspace.md` | 平台与工作目录布局、命名、身份与移动、init 判空与恢复、统一注册表语义 | 设计存储布局、实现 workspace / init、改动 create 落点、处理路径身份时 |
 
 新增代码时的判断顺序：

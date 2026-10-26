@@ -21,6 +21,10 @@
 #[cfg_attr(docsrs, doc(cfg(feature = "bootstrap")))]
 pub mod bootstrap;
 
+#[cfg(feature = "auth")]
+#[cfg_attr(docsrs, doc(cfg(feature = "auth")))]
+pub use auth;
+
 #[cfg(feature = "domain")]
 #[cfg_attr(docsrs, doc(cfg(feature = "domain")))]
 pub use domain;

@@ -368,14 +368,18 @@ impl BackupService {
         Ok(self
             .backend
             .supervisor()
-            .status(&server.dir)?
+            .status(&server.server_ref())?
             .is_some_and(|status| status.status.is_alive()))
     }
 
     /// 向服务器控制台注入一行
     fn send_line(&self, name: &str, line: &str) -> Result<(), BackupError> {
         let server = self.registry.get(name)?;
-        match self.backend.supervisor().send_line(&server.dir, line) {
+        match self
+            .backend
+            .supervisor()
+            .send_line(&server.server_ref(), line)
+        {
             Err(port::SupervisorError::Remote { kind, .. }) if kind == "not_running" => {
                 Err(BackupError::Lifecycle(LifecycleError::NotRunning))
             }
@@ -1439,20 +1443,31 @@ mod tests {
         ) -> Result<SupervisorStartOutcome, SupervisorError> {
             unreachable!("not used")
         }
-        fn stop(&self, _dir: &Path, _spec: StopSpec) -> Result<StopOutcome, SupervisorError> {
+        fn stop(
+            &self,
+            _server: &port::ServerRef<'_>,
+            _spec: StopSpec,
+        ) -> Result<StopOutcome, SupervisorError> {
             unreachable!("not used")
         }
-        fn status(&self, _dir: &Path) -> Result<Option<SupervisorStatus>, SupervisorError> {
+        fn status(
+            &self,
+            _server: &port::ServerRef<'_>,
+        ) -> Result<Option<SupervisorStatus>, SupervisorError> {
             Ok(self.status.lock().expect("lock").clone())
         }
-        fn send_line(&self, _dir: &Path, line: &str) -> Result<(), SupervisorError> {
+        fn send_line(
+            &self,
+            _server: &port::ServerRef<'_>,
+            line: &str,
+        ) -> Result<(), SupervisorError> {
             if line == CMD_SAVE_ON && *self.fail_save_on.lock().expect("lock") {
                 return Err(SupervisorError::Unreachable("injected".to_owned()));
             }
             self.sent.lock().expect("lock").push(line.to_owned());
             Ok(())
         }
-        fn shutdown(&self, _dir: &Path) -> Result<(), SupervisorError> {
+        fn shutdown(&self, _server: &port::ServerRef<'_>) -> Result<(), SupervisorError> {
             Ok(())
         }
     }
