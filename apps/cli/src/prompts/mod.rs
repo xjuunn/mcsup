@@ -41,6 +41,24 @@ pub(crate) fn confirm_yes(message: &str, default: bool) -> Result<bool> {
         .context("读取确认输入")
 }
 
+/// 带 `--yes` 语义的确认：全局 `--yes` 下直接返回 `true`，否则才提问
+///
+/// `--yes` 只跳过确认式提问（是 / 否），不跳过名称、版本这类必填参数的选择：
+/// 后者由调用方在确认之外单独走补参交互。
+///
+/// # Errors
+///
+/// 读取终端输入失败时返回底层错误
+pub(crate) fn confirm_or_yes(printer: Printer, message: &str, default: bool) -> Result<bool> {
+    if printer.assumes_yes() {
+        return Ok(true);
+    }
+    if !printer.is_interactive() {
+        return Ok(default);
+    }
+    confirm_yes(message, default)
+}
+
 /// 危险操作的第二道闸：逐字输入目标名称确认
 ///
 /// # Errors

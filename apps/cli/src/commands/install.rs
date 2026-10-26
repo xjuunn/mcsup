@@ -35,7 +35,7 @@ pub(crate) async fn run(
         .with_context(|| format!("服务器 {name} 不存在"))?;
     let source = bootstrap::source_for(&srv.meta.variant, printer.lang())?;
     let version_id = match version {
-        Some(raw) => VersionId::new(raw),
+        Some(raw) => VersionId::new(normalize_version_alias(raw).to_owned()),
         None => match default_version_source(srv.meta.jar.is_some(), printer.is_interactive()) {
             VersionSource::Recorded => srv.meta.version.clone(),
             VersionSource::Prompt => {
@@ -47,6 +47,19 @@ pub(crate) async fn run(
     let (size, destination) =
         download_jar(name, &version_id, source, srv.meta.variant, printer).await?;
     printer.print_installed(&version_id, size, &destination)
+}
+
+/// 版本别名归一：`lts` 与 `latest` 同义
+///
+/// 别名只在入口归一到来源已有的保留名，来源侧仍只认 `latest` /
+/// `latest-snapshot` 两个保留名（`port::ServerJarSource::artifact` 的契约）。
+#[must_use]
+pub(crate) fn normalize_version_alias(raw: &str) -> &str {
+    if raw.eq_ignore_ascii_case("lts") {
+        "latest"
+    } else {
+        raw
+    }
 }
 
 /// 未显式传 `--version` 时版本的来源
@@ -264,6 +277,19 @@ mod tests {
         assert!(choices[1].extra);
         assert_eq!(choices[2].label, "1.0（旧版）");
         assert!(choices[2].extra);
+    }
+
+    /// `lts` 与 `latest` 同义；其余（含 `latest-snapshot`）原样保留
+    #[test]
+    fn lts_alias_maps_to_latest() {
+        assert_eq!(normalize_version_alias("lts"), "latest");
+        assert_eq!(normalize_version_alias("LTS"), "latest");
+        assert_eq!(normalize_version_alias("latest"), "latest");
+        assert_eq!(
+            normalize_version_alias("latest-snapshot"),
+            "latest-snapshot"
+        );
+        assert_eq!(normalize_version_alias("1.21.1"), "1.21.1");
     }
 
     /// 缺省版本来源：核心未装成时沿用记录版本（重试不重选），否则按交互性

@@ -73,8 +73,11 @@ async fn run_start(
                     .downcast_ref::<LifecycleError>()
                     .is_some_and(|e| matches!(e, LifecycleError::EulaRequired));
                 if needs_eula && printer.is_interactive() {
-                    if !prompts::confirm_yes("需要同意 Mojang EULA（eula=true），是否同意？", true)?
-                    {
+                    if !prompts::confirm_or_yes(
+                        printer,
+                        "需要同意 Mojang EULA（eula=true），是否同意？",
+                        true,
+                    )? {
                         return Err(anyhow::anyhow!("未同意 EULA，已中止"));
                     }
                     accept_eula = true;
@@ -100,7 +103,7 @@ async fn run_start(
                         Some(major) => format!("本机缺少 Java {major}，是否现在安装？"),
                         None => "本机未发现任何 Java 运行时，是否现在安装？".to_owned(),
                     };
-                    if !prompts::confirm_yes(&prompt_text, true)? {
+                    if !prompts::confirm_or_yes(printer, &prompt_text, true)? {
                         return Err(anyhow::anyhow!("缺少所需 Java 版本，已中止启动"));
                     }
                     // 安装缺的版本；NoJava 无从点名，装当前 LTS 21 作为起步

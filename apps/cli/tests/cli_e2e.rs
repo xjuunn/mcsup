@@ -295,6 +295,95 @@ fn empty_workspace_list_then_remove_missing_exits_3() {
     );
 }
 
+/// `--workspace` 指向不存在的工作区 + `--workspace-dir`：自动新建并落进去
+///
+/// 下载失败（死代理）时服务仍保留注册结果，断言它落在**新建的那条工作区**下。
+#[test]
+fn create_workspace_arg_creates_missing_workspace_and_places_server() {
+    let home = temp_home();
+    // 先有一条当前工作区，确保新落点不是「碰巧选了当前」
+    let _current = init_workspace(&home, "existing");
+    let fresh = home.path().join("fresh");
+
+    let create = run_in_env(
+        home.path(),
+        &[
+            "server",
+            "create",
+            "srv-fresh",
+            "--version",
+            "1.21.1",
+            "--workspace",
+            "fresh",
+            "--workspace-dir",
+            fresh.to_str().expect("utf8"),
+            "--output",
+            "json",
+        ],
+        &[
+            ("HTTPS_PROXY", DEAD_PROXY),
+            ("HTTP_PROXY", DEAD_PROXY),
+            ("ALL_PROXY", DEAD_PROXY),
+        ],
+    );
+    assert_eq!(
+        create.status.code(),
+        Some(5),
+        "下载失败应为 5，stderr: {}",
+        stderr(&create)
+    );
+
+    let list = run(home.path(), &["workspace", "list", "--output", "json"]);
+    ok(&list, "workspace list");
+    let parsed = stdout_json(&list);
+    let rows = parsed.as_array().expect("数组");
+    assert!(
+        rows.iter().any(|row| row["name"] == "fresh"),
+        "--workspace-dir 应新建工作区: {parsed}"
+    );
+
+    let marker = fresh.join("servers").join("srv-fresh").join("mcsup.json");
+    assert!(
+        marker.is_file(),
+        "服务器应落在新建工作区下: {}",
+        marker.display()
+    );
+}
+
+/// 名称命中已有工作区但 `--workspace-dir` 指向别处 → 用法错误 2，不新建也不落库
+#[test]
+fn create_workspace_name_path_mismatch_reports_error() {
+    let home = temp_home();
+    let ws = init_workspace(&home, "ws1");
+    let other = home.path().join("other");
+
+    let create = run(
+        home.path(),
+        &[
+            "server",
+            "create",
+            "srv1",
+            "--version",
+            "1.21.1",
+            "--workspace",
+            "ws1",
+            "--workspace-dir",
+            other.to_str().expect("utf8"),
+            "--output",
+            "json",
+            "--lang",
+            "zh",
+        ],
+    );
+    assert_eq!(create.status.code(), Some(2), "stderr: {}", stderr(&create));
+    let err = stderr(&create);
+    assert!(err.contains("不一致") || err.contains("指向不同"), "{err}");
+    assert!(!other.exists(), "报错时不得创建目录");
+    assert!(
+        !ws.join("servers").join("srv1").exists(),
+        "报错时不得注册服务器"
+    );
+}
 /// 工作区列表与当前标记：init 后当前工作区指向它，标记落在用户路径本身
 #[test]
 fn init_marks_workspace_current_and_writes_ownership_marker() {

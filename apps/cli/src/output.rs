@@ -30,12 +30,31 @@ impl fmt::Display for OutputFormat {
 pub(crate) struct Printer {
     format: OutputFormat,
     lang: Lang,
+    /// 全局 `--yes`：确认式提问一律按「是」处理
+    yes: bool,
 }
 
 impl Printer {
     #[must_use]
     pub(crate) const fn new(format: OutputFormat, lang: Lang) -> Self {
-        Self { format, lang }
+        Self {
+            format,
+            lang,
+            yes: false,
+        }
+    }
+
+    /// 打开全局 `--yes`：只影响确认式提问，不影响补参交互
+    #[must_use]
+    pub(crate) const fn with_yes(mut self, yes: bool) -> Self {
+        self.yes = yes;
+        self
+    }
+
+    /// 是否已用 `--yes` 跳过确认
+    #[must_use]
+    pub(crate) const fn assumes_yes(self) -> bool {
+        self.yes
     }
 
     /// 界面语言：命令自行拼提示文本时用

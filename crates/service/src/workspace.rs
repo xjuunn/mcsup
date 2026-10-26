@@ -516,10 +516,7 @@ fn marker_state(marker: &MarkerToml, expected: &WorkspaceId) -> MarkerState {
 /// # Errors
 ///
 /// 未找到 / 歧义时返回 [`WorkspaceError`]
-pub(crate) fn resolve_selector(
-    all: &[Workspace],
-    selector: &str,
-) -> Result<Workspace, WorkspaceError> {
+pub fn resolve_selector(all: &[Workspace], selector: &str) -> Result<Workspace, WorkspaceError> {
     if let Some(exact) = all.iter().find(|w| w.name.as_str() == selector) {
         return Ok(exact.clone());
     }

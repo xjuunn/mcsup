@@ -24,7 +24,20 @@ pub(crate) fn run(action: WorkspaceAction, printer: Printer) -> Result<()> {
         WorkspaceAction::Init { dir, name } => init(&svc, dir.as_deref(), name.as_deref(), printer),
         WorkspaceAction::List => list(&svc, &reg, printer),
         WorkspaceAction::Use { name } => use_ws(&svc, name.as_deref(), printer),
-        WorkspaceAction::Remove { name, purge } => remove(&svc, &name, purge, printer),
+        WorkspaceAction::Remove { name, purge } => {
+            let name = match name {
+                Some(name) => name,
+                None if printer.is_interactive() => pick_workspace(&svc, printer)?,
+                None => {
+                    return Err(AppDiagnostic::usage(
+                        "workspace remove 缺少工作区名称",
+                        Some("非交互模式：mcsup workspace remove <名称>".to_owned()),
+                    )
+                    .into());
+                }
+            };
+            remove(&svc, &name, purge, printer)
+        }
         WorkspaceAction::Doctor { only, strict } => {
             let doctor = DoctorService::new(store.clone(), store);
             doctor_cmd(&doctor, &only, strict, printer)
@@ -130,7 +143,8 @@ pub(crate) fn init(
     if interactive {
         let abs = absolute_path(&dir);
         let name_display = name.as_deref().unwrap_or("(自动序号)");
-        let confirmed = prompts::confirm_yes(
+        let confirmed = prompts::confirm_or_yes(
+            printer,
             &format!("在 {} 创建并注册工作区 {name_display}?", abs.display()),
             true,
         )?;
@@ -326,7 +340,8 @@ fn remove(svc: &WorkspaceService, name: &str, purge: bool, printer: Printer) -> 
     } else {
         // 普通注销不删目录，先问「是否连磁盘数据一起删」；回答是后再按删盘的前置校验
         // 拦一次，用户此时尚未确认名称
-        let confirmed = prompts::confirm_yes(
+        let confirmed = prompts::confirm_or_yes(
+            printer,
             &format!(
                 "删除 {} ({}) 的磁盘数据?",
                 ws.name.as_str(),
@@ -343,10 +358,12 @@ fn remove(svc: &WorkspaceService, name: &str, purge: bool, printer: Printer) -> 
                 ws.name.as_str(),
                 ws.path.display()
             ));
-            prompts::confirm_by_name(
-                &format!("输入工作区名称 {} 以确认删除", ws.name.as_str()),
-                ws.name.as_str(),
-            )?;
+            if !printer.assumes_yes() {
+                prompts::confirm_by_name(
+                    &format!("输入工作区名称 {} 以确认删除", ws.name.as_str()),
+                    ws.name.as_str(),
+                )?;
+            }
         }
         confirmed
     };

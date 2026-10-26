@@ -45,6 +45,13 @@ pub(crate) struct Cli {
         help = crate::meta::lang_arg()
     )]
     pub(crate) lang: String,
+    #[arg(
+        long,
+        global = true,
+        short = 'y',
+        help = crate::meta::yes_arg()
+    )]
+    pub(crate) yes: bool,
     #[command(subcommand)]
     pub(crate) command: Command,
 }
@@ -148,7 +155,8 @@ pub(crate) enum WorkspaceAction {
     #[command(about = crate::meta::workspace_remove())]
     #[command(visible_alias = "rm")]
     Remove {
-        name: String,
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
         #[arg(long)]
         purge: bool,
     },
@@ -185,27 +193,46 @@ pub(crate) enum ServerAction {
         version: Option<String>,
         #[arg(long, value_name = "VAR")]
         variant: Option<String>,
-        #[arg(long, value_name = "WS")]
+        #[arg(
+            long,
+            value_name = "WS",
+            help = crate::meta::server_workspace_arg()
+        )]
         workspace: Option<String>,
+        #[arg(
+            long = "workspace-name",
+            value_name = "NAME",
+            help = crate::meta::server_workspace_name_arg()
+        )]
+        workspace_name: Option<String>,
+        #[arg(
+            long = "workspace-dir",
+            value_name = "PATH",
+            help = crate::meta::server_workspace_dir_arg()
+        )]
+        workspace_dir: Option<PathBuf>,
     },
     #[command(about = crate::meta::server_install())]
     #[command(visible_alias = "in")]
     Install {
-        name: String,
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
         #[arg(long, value_name = "VER")]
         version: Option<String>,
     },
     #[command(about = crate::meta::server_start())]
     #[command(visible_alias = "up")]
     Start {
-        name: String,
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
         #[arg(long, help = crate::meta::server_accept_eula_arg())]
         accept_eula: bool,
     },
     #[command(about = crate::meta::server_stop())]
     #[command(visible_alias = "down")]
     Stop {
-        name: String,
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
         #[arg(
             long,
             value_name = "SEC",
@@ -219,7 +246,8 @@ pub(crate) enum ServerAction {
     #[command(about = crate::meta::server_restart())]
     #[command(visible_alias = "rs")]
     Restart {
-        name: String,
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
         #[arg(long, help = crate::meta::server_accept_eula_arg())]
         accept_eula: bool,
         #[arg(
@@ -234,17 +262,29 @@ pub(crate) enum ServerAction {
     },
     #[command(about = crate::meta::server_status())]
     #[command(visible_alias = "st")]
-    Status { name: String },
+    Status {
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+    },
     #[command(about = crate::meta::server_console())]
     #[command(visible_alias = "con")]
-    Console { name: String },
+    Console {
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+    },
     #[command(about = crate::meta::server_send())]
     #[command(visible_alias = "snd")]
-    Send { name: String, command: String },
+    Send {
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+        #[arg(value_name = "COMMAND")]
+        command: Option<String>,
+    },
     #[command(about = crate::meta::server_logs())]
     #[command(visible_alias = "log")]
     Logs {
-        name: String,
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
         #[arg(
             long,
             value_name = "N",
@@ -257,11 +297,17 @@ pub(crate) enum ServerAction {
     },
     #[command(about = crate::meta::server_props())]
     #[command(visible_alias = "prop")]
-    Props { name: String, kv: Vec<String> },
+    Props {
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+        #[arg(value_name = "KV")]
+        kv: Vec<String>,
+    },
     #[command(about = crate::meta::server_set())]
     #[command(visible_alias = "cfg")]
     Set {
-        name: String,
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
         #[arg(value_name = "KEY", help = crate::meta::server_set_key_arg())]
         key: Option<String>,
         #[arg(value_name = "VALUE", help = crate::meta::server_set_value_arg())]
@@ -270,7 +316,8 @@ pub(crate) enum ServerAction {
     #[command(about = crate::meta::server_remove())]
     #[command(visible_alias = "rm")]
     Remove {
-        name: String,
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
         #[arg(long)]
         purge: bool,
     },
@@ -294,7 +341,10 @@ pub(crate) enum ServerAction {
     },
     #[command(about = crate::meta::server_version())]
     #[command(visible_alias = "ver")]
-    Version { name: String },
+    Version {
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+    },
     #[command(about = crate::meta::server_backup())]
     #[command(visible_alias = "bak")]
     Backup {
@@ -314,7 +364,8 @@ pub(crate) enum BackupAction {
     #[command(about = crate::meta::backup_create())]
     #[command(visible_alias = "cr")]
     Create {
-        name: String,
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
         #[arg(long, help = crate::meta::backup_label_arg())]
         label: Option<String>,
         #[arg(long, value_name = "ITEMS", help = crate::meta::backup_scope_arg())]
@@ -325,7 +376,8 @@ pub(crate) enum BackupAction {
     #[command(about = crate::meta::backup_list())]
     #[command(visible_alias = "ls")]
     List {
-        name: String,
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
         #[arg(long, value_name = "N", default_value_t = 1, help = crate::meta::backup_page_arg())]
         page: usize,
         #[arg(
@@ -339,7 +391,8 @@ pub(crate) enum BackupAction {
     #[command(about = crate::meta::backup_restore())]
     #[command(visible_alias = "rt")]
     Restore {
-        name: String,
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
         #[arg(help = crate::meta::backup_id_arg())]
         id: Option<String>,
         #[arg(long, value_name = "NAME", help = crate::meta::backup_to_arg())]
@@ -348,21 +401,24 @@ pub(crate) enum BackupAction {
     #[command(about = crate::meta::backup_delete())]
     #[command(visible_alias = "rm")]
     Delete {
-        name: String,
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
         #[arg(help = crate::meta::backup_id_arg())]
         id: Option<String>,
     },
     #[command(about = crate::meta::backup_verify())]
     #[command(visible_alias = "vf")]
     Verify {
-        name: String,
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
         #[arg(help = crate::meta::backup_id_arg())]
         id: Option<String>,
     },
     #[command(about = crate::meta::backup_prune())]
     #[command(visible_alias = "pr")]
     Prune {
-        name: String,
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
         #[arg(long, value_name = "N", help = crate::meta::backup_keep_arg())]
         keep: Option<usize>,
         #[arg(long, value_name = "AGE", help = crate::meta::backup_older_than_arg())]
@@ -375,15 +431,36 @@ pub(crate) enum BackupAction {
 #[derive(Debug, Subcommand)]
 pub(crate) enum ModAction {
     #[command(visible_alias = "ls")]
-    List { name: String },
+    List {
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+    },
     #[command(visible_alias = "in")]
-    Install { name: String, spec: String },
+    Install {
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+        #[arg(value_name = "SPEC")]
+        spec: Option<String>,
+    },
     #[command(visible_alias = "rm")]
-    Remove { name: String, m: String },
+    Remove {
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+        #[arg(value_name = "MOD")]
+        m: Option<String>,
+    },
     #[command(visible_alias = "up")]
-    Update { name: String, m: Option<String> },
+    Update {
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+        #[arg(value_name = "MOD")]
+        m: Option<String>,
+    },
     #[command(visible_alias = "od")]
-    Outdated { name: String },
+    Outdated {
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -459,10 +536,18 @@ pub(crate) enum ConfigAction {
     Show,
     #[command(about = crate::meta::config_set())]
     #[command(visible_alias = "st")]
-    Set { key: String, value: String },
+    Set {
+        #[arg(value_name = "KEY")]
+        key: Option<String>,
+        #[arg(value_name = "VALUE")]
+        value: Option<String>,
+    },
     #[command(about = crate::meta::config_unset())]
     #[command(visible_alias = "us")]
-    Unset { key: String },
+    Unset {
+        #[arg(value_name = "KEY")]
+        key: Option<String>,
+    },
     #[command(about = crate::meta::config_edit())]
     #[command(visible_alias = "ed")]
     Edit,

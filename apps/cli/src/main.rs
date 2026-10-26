@@ -28,7 +28,7 @@ async fn main() -> ExitCode {
     let cli = help::parse();
     // 语言先于一切输出确定：帮助之外的提示都经 Printer 出去
     let lang = locale::detect(locale::LangChoice::parse(&cli.lang));
-    let printer = output::Printer::new(cli.output, lang);
+    let printer = output::Printer::new(cli.output, lang).with_yes(cli.yes);
     init_color(cli.output);
     verbosity::init(cli.verbose);
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "启动");
