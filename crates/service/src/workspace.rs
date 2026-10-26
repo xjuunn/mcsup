@@ -621,14 +621,27 @@ pub fn absolute_path(dir: &Path) -> PathBuf {
 ///
 /// # Errors
 ///
+/// 比较前两侧都要换成物理路径：`current_dir()` 在 macOS 上返回真实路径
+/// （`/private/var/...`），而入库的目录可能是符号链接形式（`/var/...`），
+/// 逻辑路径直接比较会漏判。符号链接无法解析时退回逻辑规范化路径。
+///
+/// # Errors
+///
 /// `cwd` 规范化后位于 `target` 内时返回 [`WorkspaceError::CwdInsideTarget`]
 pub(crate) fn ensure_outside(cwd: &Path, target: &Path) -> Result<(), WorkspaceError> {
     let cwd = normalize_path(&absolute_path(cwd));
     let target = normalize_path(&absolute_path(target));
-    if cwd.starts_with(&target) {
+    let same_space_cwd = physical_path(&cwd);
+    let same_space_target = physical_path(&target);
+    if same_space_cwd.starts_with(&same_space_target) {
         return Err(WorkspaceError::CwdInsideTarget { cwd, target });
     }
     Ok(())
+}
+
+/// 解析符号链接后的物理路径；不存在或不可解析时原样返回
+fn physical_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// 去掉 `.` 组件与多余分隔符
@@ -1150,6 +1163,30 @@ mod tests {
 
         svc.remove("ws01", true, &sibling).expect("remove");
         assert!(!dir.exists());
+    }
+
+    /// 目标经符号链接给出、cwd 是物理路径时同样要拒绝
+    ///
+    /// macOS 的 `/var` 指向 `/private/var`：临时目录登记成 `/var/...` 后，
+    /// 子进程 `current_dir()` 拿到的是 `/private/var/...`。只比逻辑路径会
+    /// 漏判，把正在使用的目录删掉。
+    #[cfg(unix)]
+    #[test]
+    fn purge_rejects_cwd_inside_target_through_symlink() {
+        let (svc, tmp) = svc();
+        let real = tmp.path().join("real");
+        let link = tmp.path().join("link");
+        svc.init(&real, Some("ws01")).expect("init");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        std::fs::create_dir_all(real.join("servers")).expect("mkdir");
+        let physical = std::fs::canonicalize(real.join("servers")).expect("physical");
+        let err = svc.remove("ws01", true, &physical).expect_err("必须拒绝");
+        assert!(
+            matches!(err, WorkspaceError::CwdInsideTarget { .. }),
+            "unexpected error: {err:?}"
+        );
+        assert!(real.join("workspace.toml").is_file(), "目录不能被删");
     }
 
     /// 删盘前置校验与 `remove` 判同一件事，且不改任何状态

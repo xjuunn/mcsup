@@ -165,11 +165,31 @@ impl RelPath {
 
     /// 从已存盘的 POSIX 文本构造并校验（读元数据用）
     ///
+    /// 不能转交 [`Self::from_path`]：`Path::components` 按平台判定分隔符，
+    /// 同一条文本在 Windows 上把 `\` 当分隔符切开、在 unix 上原样保留，
+    /// 导致「回写后不含反斜杠」这条跨平台不变量随平台漂移。文本一律按
+    /// POSIX 规则切分，`\` 在任何平台都是非法字符。
+    ///
     /// # Errors
     ///
     /// 同上
     pub fn parse(raw: &str) -> Result<Self, InvalidRelPath> {
-        Self::from_path(Path::new(raw))
+        let invalid = || InvalidRelPath {
+            raw: raw.to_owned(),
+        };
+        let mut parts = Vec::new();
+        for segment in raw.split('/') {
+            match segment {
+                "." => {}
+                "" | ".." => return Err(invalid()),
+                part if part.contains('\\') => return Err(invalid()),
+                part => parts.push(part),
+            }
+        }
+        if parts.is_empty() {
+            return Err(invalid());
+        }
+        Ok(Self(parts.join("/")))
     }
 
     /// POSIX 文本
@@ -736,6 +756,20 @@ mod tests {
             path.to_platform_path(),
             Path::new("world").join("level.dat")
         );
+    }
+
+    /// 反斜杠在任何平台都是非法字符
+    ///
+    /// `parse` 曾转交 `from_path`，而 `Path::components` 按平台判分隔符：
+    /// Windows 上 `\` 被切开、unix 上原样残留，同一条元数据跨平台读出的
+    /// 路径不一致。快照要在平台间搬运，判定必须与平台无关。
+    #[test]
+    fn rel_path_rejects_backslash_on_every_platform() {
+        assert!(RelPath::parse("world\\level.dat").is_err());
+        assert!(RelPath::parse("-/\\").is_err());
+        assert!(RelPath::parse("a/b\\c").is_err());
+        // 正常路径不受影响
+        assert_eq!(RelPath::parse("a/b").expect("ok").as_str(), "a/b");
     }
 
     #[test]
