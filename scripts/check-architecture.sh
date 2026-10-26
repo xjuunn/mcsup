@@ -144,14 +144,16 @@ done
 # 允许的边（只列本仓库内部包）：
 #   domain  -> （无）
 #   port    -> domain
-#   protocol-> domain
+#   auth    -> （无）                 叶子契约 crate：权限 / 角色 / token 的词汇表
+#   protocol-> domain port auth      契约 crate：帧载荷、结果类型、权限映射
 #   service -> domain port
-#   <实现层> -> domain port            （runtime 额外允许 protocol）
+#   <实现层> -> domain port + 契约 crate（runtime 额外允许 protocol）
+#   transport -> 契约 crate           （transport 只搬字节，不含业务判定）
 #   backend -> domain port + 实现层     （执行位置聚合器，唯一允许组合具体实现）
 #   mcsup   -> 任意内层（门面）
 #   apps    -> 只允许 mcsup
 # 实现层之间除 backend 外互不依赖。
-impl_layers='runtime java storage file backup provider modkit auth'
+impl_layers='runtime java storage file backup provider modkit transport'
 
 for manifest in $manifests; do
 	pkg=$(pkg_name "$manifest")
@@ -175,15 +177,30 @@ for manifest in $manifests; do
 		domain)
 			fail "$pkg -> $dep: domain 不得依赖任何本仓库模块"
 			;;
-		port | protocol)
+		port)
 			if [ "$dep" != domain ]; then
 				fail "$pkg -> $dep: 只允许依赖 domain"
 			fi
+			;;
+		auth)
+			fail "$pkg -> $dep: auth 是叶子契约 crate，不得依赖本仓库模块"
+			;;
+		protocol)
+			case "$dep" in
+			domain | port | auth) ;;
+			*) fail "protocol -> $dep: 契约层只允许依赖 domain / port / auth" ;;
+			esac
 			;;
 		service)
 			case "$dep" in
 			domain | port) ;;
 			*) fail "service -> $dep: service 只允许依赖 domain / port，实现层须经 port 注入" ;;
+			esac
+			;;
+		transport)
+			case "$dep" in
+			domain | port | protocol | auth) ;;
+			*) fail "transport -> $dep: 传输层只允许依赖契约 crate（domain / port / protocol / auth）" ;;
 			esac
 			;;
 		backend)
@@ -265,7 +282,7 @@ for layer in backend runtime java storage file backup provider modkit; do
 	check_module_layer "$layer" "$layer|$core_modules"
 done
 
-# 实现层中可用契约类型的两个
+# 实现层中可用契约类型的
 check_module_layer transport "transport|protocol|$core_modules"
 check_module_layer api "api|protocol|$core_modules"
 check_module_layer auth "auth|$core_modules"
@@ -335,18 +352,19 @@ if [ -f "$pkg_manifest" ] && [ -f "$pkg_lib" ]; then
 		case "$1" in
 		domain) printf '%s' 'domain' ;;
 		port) printf '%s' 'domain port' ;;
-		protocol) printf '%s' 'domain protocol' ;;
+		protocol) printf '%s' 'auth domain port protocol' ;;
 		service) printf '%s' 'domain port service' ;;
 		auth) printf '%s' 'auth' ;;
 		file) printf '%s' 'domain port file' ;;
 		java) printf '%s' 'domain port java' ;;
 		provider) printf '%s' 'domain port provider' ;;
 		storage) printf '%s' 'domain port storage' ;;
-		runtime) printf '%s' 'domain port protocol runtime' ;;
+		runtime) printf '%s' 'auth domain port protocol runtime' ;;
 		backup) printf '%s' 'domain port backup' ;;
-		backend) printf '%s' 'domain port protocol backend backup runtime' ;;
+		transport) printf '%s' 'auth domain port protocol transport' ;;
+		backend) printf '%s' 'auth backend backup domain port protocol runtime' ;;
 		# 组合 feature：一次拉入全部内层（默认组合根）
-		bootstrap) printf '%s' 'domain port protocol service backup backend file java provider storage runtime' ;;
+		bootstrap) printf '%s' 'auth backend backup domain file java port protocol provider runtime service storage transport' ;;
 		*) printf '%s' '' ;;
 		esac
 	}

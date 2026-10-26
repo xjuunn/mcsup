@@ -141,7 +141,8 @@ impl FileCredentialStore {
             }
             Err(err) => return Err(CredentialError::io(&self.path, err)),
         };
-        self.check_permissions()?;
+        #[cfg(unix)]
+        check_permissions(&self.path)?;
         toml::from_str(&text).map_err(|err| CredentialError::Corrupt {
             path: self.path.clone(),
             reason: err.to_string(),
@@ -176,45 +177,36 @@ impl FileCredentialStore {
                 .map_err(|err| CredentialError::io(&tmp, err))?;
         }
         // 已存在的旧文件可能权限更宽，rename 前先收紧临时文件
+        #[cfg(unix)]
         restrict(&tmp)?;
         std::fs::rename(&tmp, &self.path).map_err(|err| CredentialError::io(&self.path, err))
     }
+}
 
-    /// 校验文件权限不比 0600 宽
-    ///
-    /// 只在 Unix 上有意义；Windows 的 ACL 模型与 `mode` 不对应，交给系统默认
-    /// （用户目录本身已受 ACL 保护）。
-    fn check_permissions(&self) -> Result<(), CredentialError> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let meta = std::fs::metadata(&self.path)
-                .map_err(|err| CredentialError::io(&self.path, err))?;
-            let mode = meta.permissions().mode() & 0o777;
-            if mode & 0o077 != 0 {
-                return Err(CredentialError::InsecurePermissions {
-                    path: self.path.clone(),
-                    mode,
-                });
-            }
-        }
-        Ok(())
+/// 校验文件权限不比 0600 宽
+///
+/// 只在 Unix 上有意义；Windows 的 ACL 模型与 `mode` 不对应，交给系统默认
+/// （用户目录本身已受 ACL 保护）。
+#[cfg(unix)]
+fn check_permissions(path: &Path) -> Result<(), CredentialError> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let meta = std::fs::metadata(path).map_err(|err| CredentialError::io(path, err))?;
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(CredentialError::InsecurePermissions {
+            path: path.to_path_buf(),
+            mode,
+        });
     }
+    Ok(())
 }
 
 /// 把权限收紧到 0600（Unix）
+#[cfg(unix)]
 fn restrict(path: &Path) -> Result<(), CredentialError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|err| CredentialError::io(path, err))?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-    Ok(())
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|err| CredentialError::io(path, err))
 }
 
 impl CredentialStore for FileCredentialStore {

@@ -7,7 +7,13 @@ license.workspace = true
 publish = false
 
 [dependencies]
+# 契约 crate：只依赖另外两个契约 crate，不依赖任何实现层。
+# - domain：领域对象是帧载荷的内容（ServerMeta / Workspace / JavaRuntime）
+# - port：帧的结果类型（StopOutcome / SupervisorStatus）与 RepositoryError
+# - auth：权限表是协议的一部分（哪个操作要哪个权限必须两侧一致）
 domain = { version = "0.1.0", path = "../domain" }
+port = { version = "0.1.0", path = "../port" }
+auth = { version = "0.1.0", path = "../auth" }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 

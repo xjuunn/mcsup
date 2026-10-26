@@ -433,10 +433,17 @@ mod tests {
 
     #[test]
     fn document_roundtrips_and_rejects_unknown_keys() {
-        let cfg = Config::parse_document("data-dir = \"/tmp/mcsup-data\"\n").expect("parse");
+        // 用平台自带的绝对路径：`/tmp/...` 在 Windows 上不是绝对路径，
+        // 会被按当前目录展开，断言两边必然不一致
+        let raw = std::env::temp_dir()
+            .join("mcsup-data")
+            .to_string_lossy()
+            .into_owned();
+        let cfg = Config::parse_document(&format!("data-dir = '{raw}'\n")).expect("parse");
         assert_eq!(
             cfg.effective(ConfigKey::DataDir),
-            PathBuf::from("/tmp/mcsup-data")
+            PathBuf::from(&raw),
+            "{raw}"
         );
         let text = cfg.to_document().expect("serialize");
         assert!(text.starts_with(FEATURE_HEADER), "{text}");
