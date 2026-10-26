@@ -222,9 +222,6 @@ RPC → agent。
 Service 里不应出现大量 `if remote { ... } else { ... }`；出现即说明抽象边界
 有问题。
 
-Service 里不应出现大量 `if remote { ... } else { ... }`；出现即说明抽象边界
-有问题。
-
 # Runtime
 
 Runtime 回答「Minecraft Server 应该如何运行」：Server Jar / Loader、启动命令、
