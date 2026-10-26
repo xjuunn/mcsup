@@ -10,9 +10,9 @@
 | 1 | `port` 身份键改造（`ServerRef`、`status_many`） | 完成 |
 | 2 | `service` 来源维度、`[remotes.*]` 配置 | 完成 |
 | 3 | `auth`：配对码 / token / 权限 / 撤销 | 完成 |
-| 4 | `protocol`：远端帧与版本协商 | 待开始 |
-| 5 | `transport`：TLS 帧传输与连接池 | 待开始 |
-| 6 | `apps/agent`：`mcsup remote serve` | 待开始 |
+| 4 | `protocol`：远端帧与版本协商 | 完成 |
+| 5 | `transport`：TLS 帧传输与连接池 | 完成 |
+| 6 | `apps/agent`：`mcsup remote serve` | 完成 |
 | 7 | 远端仓库（workspace / server / java） | 待开始 |
 | 8 | `RemoteBackend`：远端 supervisor | 待开始 |
 | 9 | 流式：日志 / 进度 / 备份 | 待开始 |
@@ -63,6 +63,80 @@
 - `credential.rs`：`CredentialStore` trait + `FileCredentialStore`（权限
   `0600`）。钥匙串后续以同一 trait 的另一实现补上，本次不引入 `keyring`。
 
+### 阶段 4：`protocol` 远端帧
+
+新模块 `protocol::remote`（与本地 IPC 的 `protocol` 平级，互不共用版本号）：
+
+- 独立 `REMOTE_PROTOCOL_VERSION = 1`。不复用 `PROTOCOL_VERSION`：远端两端
+  可以分别升级，把版本绑在一起会让「本地 CLI 与 supervisor 的 IPC 协议」
+  和「跨机器协议」互相拖住。
+- `wire.rs` 定义线格式与双向转换。**线格式单独一层**而不是给 `domain` /
+  `storage` 加 `serde`：`domain` 不依赖 serde 是既有约束，`storage` 的记录是
+  本机口径（带路径、带本地状态），直接序列化会把本机假设发到对端。
+  `TryFrom<&T>` / `TryFrom<Wire>` 成对出现，用测试锁往返一致。
+- `Capabilities` 是位掩码 + `Capability` 枚举（`bit()` / `ALL` / `has()`），
+  不是若干个 `bool` 字段：新增能力不破坏旧客户端，也不触发
+  `struct_excessive_bools`。
+- 帧集按**操作**而不是仓库 CRUD：写操作整条在 agent 侧跑同一套 `service`，
+  客户端只搬参数。`Request::Start` 不带 `LaunchSpec`——启动方式是对端的事实，
+  客户端指定「用哪个文件启动」等于让它选远端要执行的文件。
+- `WireStatusEntry` 用两个可空字段（`status` / `error`）而不是 `Result`：
+  `serde` 的外部标签会把线格式变成 `{"Ok":…}`，与「本来就是 `null`」难区分。
+  不变量（恰好一个为 `Some`）由 `into_result()` 断言。
+- 权限映射在 `Request::required_permission()` 一处：`LogsTail` 要 `Logs`
+  而不是 `Read`（控制台可能含玩家 IP 与管理员操作），`ClientList` /
+  `ClientRevoke` / `Shutdown` 要 `Manage`。
+
+### 阶段 5：`transport`
+
+新 crate `crates/transport`：只搬字节，不含业务判定。依赖收敛在契约 crate
+（`domain` / `port` / `protocol` / `auth`）。
+
+- 自签身份 `ServerIdentity::load_or_create(dir)`（`rcgen` + `pem`），
+  指纹是证书 DER 的 SHA-256，文本 `sha256:<64 hex>`。
+- 客户端信任模型是**固定指纹**（TOFU）而不是 CA：每台被连接端各自自签，
+  没有公共 CA 可依赖；自定义 `ServerCertVerifier` 只比对指纹，不查有效期 /
+  名称 / 链。`Hello` 里 agent 自报的指纹必须与 TLS 层固定的一致，否则按
+  中间人拒绝。
+- `Session` 拆成 `send_request` / `recv_response` / `send_response` /
+  `recv_request`，不用泛型 `send`：两端共用同一个类型，若允许「客户端发
+  响应」，状态机就只能靠运行时断言兜住。
+- 服务端严格三步：`Hello` →（`Enroll` | `Authenticate`）→ 业务帧。
+  `serve_connection` 拆成 `say_hello` / `authenticate` / `dispatch`；
+  `authenticate` 返回 `Option<SessionInfo>` 表示连接是否继续——配对成功后
+  token 已交付，不在同一条连接上继续，让「配对」与「日常」走完全相同的认证
+  路径。
+- `Client` 按需建连、复用连接，断线重试一次（远端重启是常态，把重启表现成
+  失败会让每个脚本都要自己重试）。
+- `Server` 一连接一线程，上限 `MAX_CONNECTIONS = 32`；单条连接的失败只影响
+  它自己。
+- `StopHandle`（`request_stop()` / `is_stopping()`）：置停止标志后自连一次
+  踢醒阻塞的 `accept`。不引入额外线程、不轮询。
+- 刻意保持**同步**：`service` 的编排接口是同步的，CLI 是单命令进程，异步只
+  会在中间多出一层 `block_on`。
+
+### 阶段 6：agent
+
+- `crates/mcsup/src/remote/`：`transport::Handler` 的完整实现。放门面而不是
+  `apps/agent`，因为 `mcsup remote serve` 与 `mcsup-agent` 必须跑**同一份**
+  实现，而 `apps` 之间禁止 Cargo 依赖。
+  - `mod.rs`：`Agent`（装配、身份、名册、配对码、绑定、服务）、`PairingWatch`、
+    `AgentServer`、`AgentError`、`impl Handler for Agent`。
+  - `ops.rs`：一帧 `Request` → 一次 `service` 调用 → 一帧 `Response`，以及
+    `ErrorKind` 映射（按各错误的 `kind()` 而非文案）。
+  - `supervise.rs`：`__supervise` 参数解析与入口，与 `mcsup __supervise`
+    解析同一份参数形状。
+- `apps/agent`（package `agent`，bin `mcsup-agent`）：薄入口，只做参数解析与
+  打印。缺省监听 `0.0.0.0:7681`。
+- 配对码在常驻进程里**过期自动轮换**：`PairingCodeStore::expired()` /
+  `rotate_if_expired()`，只有自然过期才换新。用掉与锁死都保持关闭，否则限速
+  形同虚设。
+- agent 侧 `start` 从注册表读 `meta.launch`，`supervisor_exe` 默认是
+  `current_exe()`（`mcsup-agent` 自己也实现了 `__supervise`，省掉第二个 bin）。
+- 认证与业务都**不缓存**判定结果：名册每次读盘、配对码每次读内存状态。缓存
+  会让「用户刚撤销了客户端」与「agent 还认这个 token」之间出现窗口。
+- 审计：每帧记调用方、角色、操作、结果；参数不进日志。
+
 ### 附带修复：Java 安装下错架构
 
 `mcsup java install` 在 aarch64 机器上装下了 x86-64 的包，`java` 直接
@@ -80,28 +154,6 @@
 - 回归测试锁住归一规则与「aarch64 请求不得接受 x64 归档」。
 
 ## 后续待办
-
-### 阶段 4：`protocol` 远端帧
-
-- 独立 `REMOTE_PROTOCOL_VERSION`，复用 `protocol::Frame` 编解码。
-- 帧集：`Hello`（协议版本 / agent 版本 / 能力）、`Enroll`（配对码换 token）、
-  `Ping`、`StatusMany`、`Start`、`Stop`、`SendLine`、`Shutdown`。
-- 版本不匹配直接拒绝，不做兼容猜测；破坏性变更走新增字段 + 版本递增。
-
-### 阶段 5：`transport`
-
-- TLS（`tokio-rustls` + `ring`，均已在 `Cargo.lock`），不提供明文模式。
-- 自签证书用 `rcgen` 生成（已获批）。
-- 请求-响应、超时、重连、连接池。
-- 幂等键是 transport 层关注点，不进 `port`：`RemoteSupervisor` 每次调用生成
-  UUID，重试复用同一个 UUID，agent 侧按键去重。
-
-### 阶段 6：`apps/agent`
-
-- `mcsup-agent`（bin 名带前缀，package 名 `agent`）。
-- 首次启动生成密钥对与自签证书，打印指纹（TOFU）。
-- 最简支持 `Hello` / `Ping`，再逐步开放能力。
-- 审计：记录调用方、时间、操作、结果。
 
 ### 阶段 7：远端仓库
 

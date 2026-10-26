@@ -21,6 +21,11 @@
 #[cfg_attr(docsrs, doc(cfg(feature = "bootstrap")))]
 pub mod bootstrap;
 
+/// 被连接端：`transport::Handler` 的完整实现（`mcsup remote serve` 与 `mcsup-agent` 共用）
+#[cfg(feature = "remote")]
+#[cfg_attr(docsrs, doc(cfg(feature = "remote")))]
+pub mod remote;
+
 #[cfg(feature = "auth")]
 #[cfg_attr(docsrs, doc(cfg(feature = "auth")))]
 pub use auth;

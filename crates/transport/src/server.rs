@@ -30,6 +30,36 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 /// 变成拒绝服务而不是把线程表打满。
 pub const MAX_CONNECTIONS: usize = 32;
 
+/// 从任意线程请求服务端停止的句柄
+///
+/// `Handler` 在会话线程里跑，业务侧要能「处理完这一帧就退出」（`Shutdown`）。
+/// 把停止能力做成可克隆的独立值，而不是让业务持有 [`Server`]：`Server` 是
+/// `run()` 的消费方，把它交给业务会让所有权关系反向。
+#[derive(Debug, Clone)]
+pub struct StopHandle {
+    stop: Arc<AtomicBool>,
+    addr: SocketAddr,
+}
+
+impl StopHandle {
+    /// 置停止标志并唤醒监听循环
+    ///
+    /// `accept` 是阻塞调用，光置标志要等下一次连接才会被看到。这里置位后
+    /// 自连一次把 `accept` 踢醒：连接建立后循环先看到标志再退出，不会
+    /// 进入会话状态机。相比「另起线程 join」或「给 listener 设超时轮询」，
+    /// 这条路径没有额外线程、也没有轮询延迟。
+    pub fn request_stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect(self.addr);
+    }
+
+    /// 是否已请求停止
+    #[must_use]
+    pub fn is_stopping(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+}
+
 /// 服务端
 pub struct Server {
     listener: TcpListener,
@@ -97,11 +127,25 @@ impl Server {
     /// 自连一次把 `accept` 踢醒：连接建立后循环先看到标志再退出，不会
     /// 进入会话状态机。相比「另起线程 join」或「给 listener 设超时轮询」，
     /// 这条路径没有额外线程、也没有轮询延迟。
-    pub fn request_stop(&self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Ok(addr) = self.listener.local_addr() {
-            let _ = TcpStream::connect(addr);
-        }
+    ///
+    /// # Errors
+    ///
+    /// 取监听地址失败时返回 [`TransportError`]
+    pub fn request_stop(&self) -> Result<(), TransportError> {
+        self.stop_handle()?.request_stop();
+        Ok(())
+    }
+
+    /// 可跨线程持有的停止句柄（业务侧 `Shutdown` 用）
+    ///
+    /// # Errors
+    ///
+    /// 取监听地址失败时返回 [`TransportError`]
+    pub fn stop_handle(&self) -> Result<StopHandle, TransportError> {
+        Ok(StopHandle {
+            stop: Arc::clone(&self.stop),
+            addr: self.local_addr()?,
+        })
     }
 
     /// 当前连接数（诊断用）

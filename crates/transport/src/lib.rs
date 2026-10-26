@@ -40,5 +40,5 @@ pub use error::TransportError;
 pub use fingerprint::Fingerprint;
 pub use handler::{Enrolled, Greeting, Handler, RemoteFailure, SessionInfo};
 pub use identity::ServerIdentity;
-pub use server::Server;
+pub use server::{Server, StopHandle};
 pub use session::Session;

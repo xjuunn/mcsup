@@ -290,6 +290,9 @@ check_module_layer auth "auth|$core_modules"
 # cli 是库侧的「命令语义 + 渲染」，不是入口，不允许碰实现层
 check_module_layer cli "cli|service|protocol|$core_modules"
 
+# agent 侧：认证 + 帧分发 + supervisor 入口，只经组合根访问本机服务
+check_module_layer remote "remote|bootstrap|$core_modules"
+
 # 8: feature 与模块一一对应，第三方才能推断「开哪个 feature 拿到哪个模块」。
 # 双向断言，且没有「待落地」豁免：没模块就不该声明 feature。
 
@@ -365,6 +368,8 @@ if [ -f "$pkg_manifest" ] && [ -f "$pkg_lib" ]; then
 		backend) printf '%s' 'auth backend backup domain port protocol runtime' ;;
 		# 组合 feature：一次拉入全部内层（默认组合根）
 		bootstrap) printf '%s' 'auth backend backup domain file java port protocol provider runtime service storage transport' ;;
+		# 组合 feature：agent 侧要装配整套服务 + 传输 + supervisor 入口
+		remote) printf '%s' 'auth backend backup domain file java port protocol provider runtime service storage transport' ;;
 		*) printf '%s' '' ;;
 		esac
 	}
