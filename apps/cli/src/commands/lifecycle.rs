@@ -53,16 +53,30 @@ async fn run_start(
         supervisor_args: vec![std::ffi::OsString::from("__supervise")],
     };
     let attempt = |accept: bool| {
-        with_spinner(printer, format!("正在启动 {name}…"), |spinner| {
-            service
-                .start(
-                    name,
-                    &opts(accept),
-                    &mut || spinner.set_message("正在扫描本机 Java…"),
-                    &mut |_| {},
-                )
-                .map_err(anyhow::Error::from)
-        })
+        with_spinner(
+            printer,
+            crate::i18n::pick(
+                printer.lang(),
+                format!("正在启动 {name}…"),
+                format!("starting {name}…"),
+            ),
+            |spinner| {
+                service
+                    .start(
+                        name,
+                        &opts(accept),
+                        &mut || {
+                            spinner.set_message(crate::i18n::pick(
+                                printer.lang(),
+                                "正在扫描本机 Java…",
+                                "scanning the host for Java…",
+                            ));
+                        },
+                        &mut |_| {},
+                    )
+                    .map_err(anyhow::Error::from)
+            },
+        )
     };
 
     loop {
@@ -151,13 +165,21 @@ pub(crate) fn stop(name: &str, grace: u64, force: bool, printer: Printer) -> Res
     };
     let outcome = with_spinner(
         printer,
-        format!("正在停止 {name}…（宽限 {grace}s）"),
+        crate::i18n::pick(
+            printer.lang(),
+            format!("正在停止 {name}…（宽限 {grace}s）"),
+            format!("stopping {name}… (grace {grace}s)"),
+        ),
         |_| service.stop(name, spec).map_err(anyhow::Error::from),
     )?;
 
     let (human, payload) = match outcome {
         StopOutcome::Stopped { elapsed } => (
-            format!("已停止 {name}（耗时 {}s）", elapsed.as_secs()),
+            crate::i18n::pick(
+                printer.lang(),
+                format!("已停止 {name}（耗时 {}s）", elapsed.as_secs()),
+                format!("stopped {name} (took {}s)", elapsed.as_secs()),
+            ),
             StopJson {
                 name,
                 outcome: "stopped",
@@ -165,7 +187,11 @@ pub(crate) fn stop(name: &str, grace: u64, force: bool, printer: Printer) -> Res
             },
         ),
         StopOutcome::AlreadyStopped => (
-            format!("{name} 未在运行"),
+            crate::i18n::pick(
+                printer.lang(),
+                format!("{name} 未在运行"),
+                format!("{name} is not running"),
+            ),
             StopJson {
                 name,
                 outcome: "already_stopped",
@@ -173,10 +199,17 @@ pub(crate) fn stop(name: &str, grace: u64, force: bool, printer: Printer) -> Res
             },
         ),
         StopOutcome::TimedOut { waited } => {
-            return Err(anyhow::anyhow!(
-                "停机超时（已等待 {}s），可加 --force 强杀",
-                waited.as_secs()
-            ));
+            return Err(anyhow::anyhow!(crate::i18n::pick(
+                printer.lang(),
+                format!(
+                    "停机超时（已等待 {}s），可加 --force 强杀",
+                    waited.as_secs()
+                ),
+                format!(
+                    "shutdown timed out after {}s; add --force to kill it",
+                    waited.as_secs()
+                ),
+            )));
         }
     };
     printer.print_outcome(&human, &payload)
@@ -199,16 +232,27 @@ pub(crate) async fn restart(
     };
     let stop_outcome = with_spinner(
         printer,
-        format!("正在停止 {name}…（宽限 {grace}s）"),
+        crate::i18n::pick(
+            printer.lang(),
+            format!("正在停止 {name}…（宽限 {grace}s）"),
+            format!("stopping {name}… (grace {grace}s)"),
+        ),
         |_| service.stop(name, spec).map_err(anyhow::Error::from),
     )?;
     match stop_outcome {
         StopOutcome::Stopped { .. } | StopOutcome::AlreadyStopped => {}
         StopOutcome::TimedOut { waited } => {
-            return Err(anyhow::anyhow!(
-                "停机超时（已等待 {}s），重启中止；可加 --force 强杀",
-                waited.as_secs()
-            ));
+            return Err(anyhow::anyhow!(crate::i18n::pick(
+                printer.lang(),
+                format!(
+                    "停机超时（已等待 {}s），重启中止；可加 --force 强杀",
+                    waited.as_secs()
+                ),
+                format!(
+                    "shutdown timed out after {}s; restart aborted; add --force to kill it",
+                    waited.as_secs()
+                ),
+            )));
         }
     }
 
@@ -218,7 +262,14 @@ pub(crate) async fn restart(
         supervisor_pid: outcome.supervisor_pid,
     };
     printer.print_outcome(
-        &format!("已重启 {name}（supervisor PID {}）", payload.supervisor_pid),
+        &crate::i18n::pick(
+            printer.lang(),
+            format!("已重启 {name}（supervisor PID {}）", payload.supervisor_pid),
+            format!(
+                "restarted {name} (supervisor PID {})",
+                payload.supervisor_pid
+            ),
+        ),
         &payload,
     )
 }
@@ -241,15 +292,19 @@ pub(crate) fn status(name: &str, printer: Printer) -> Result<()> {
     };
 
     if printer.is_human() {
+        let l = printer.lang();
         let mut table = Table::new();
         table.set_content_arrangement(comfy_table::ContentArrangement::Dynamic);
-        table.set_header(["项", "值"]);
-        table.add_row(["名称", payload.name]);
-        table.add_row(["版本", payload.version]);
-        table.add_row(["变体", payload.variant]);
-        table.add_row(["状态", payload.status]);
+        table.set_header([
+            crate::i18n::text(l, "项", "field"),
+            crate::i18n::text(l, "值", "value"),
+        ]);
+        table.add_row([crate::i18n::text(l, "名称", "name"), payload.name]);
+        table.add_row([crate::i18n::text(l, "版本", "version"), payload.version]);
+        table.add_row([crate::i18n::text(l, "变体", "variant"), payload.variant]);
+        table.add_row([crate::i18n::text(l, "状态", "status"), payload.status]);
         table.add_row([
-            comfy_table::Cell::new("进程"),
+            comfy_table::Cell::new(crate::i18n::text(l, "进程", "pid")),
             comfy_table::Cell::new(
                 payload
                     .pid
@@ -257,11 +312,11 @@ pub(crate) fn status(name: &str, printer: Printer) -> Result<()> {
             ),
         ]);
         table.add_row([
-            comfy_table::Cell::new("运行时长"),
+            comfy_table::Cell::new(crate::i18n::text(l, "运行时长", "uptime")),
             comfy_table::Cell::new(fmt_uptime(payload.uptime_secs)),
         ]);
         table.add_row([
-            comfy_table::Cell::new("退出码"),
+            comfy_table::Cell::new(crate::i18n::text(l, "退出码", "exit code")),
             comfy_table::Cell::new(
                 payload
                     .exit_code
@@ -285,8 +340,16 @@ pub(crate) fn status(name: &str, printer: Printer) -> Result<()> {
 pub(crate) fn console(name: &str, printer: Printer) -> Result<()> {
     if !printer.is_interactive() {
         return Err(AppDiagnostic::usage(
-            "server console 需要交互终端",
-            Some("非交互下用 server send 注入单条命令、server logs 查看输出".to_owned()),
+            crate::i18n::pick(
+                printer.lang(),
+                "server console 需要交互终端",
+                "server console needs an interactive terminal",
+            ),
+            Some(crate::i18n::pick(
+                printer.lang(),
+                "非交互下用 server send 注入单条命令、server logs 查看输出",
+                "non-interactive: use server send for one command and server logs for output",
+            )),
         )
         .into());
     }
@@ -300,12 +363,18 @@ pub(crate) fn console(name: &str, printer: Printer) -> Result<()> {
 
     // Windows 无 EOF 键：Ctrl+D 随整行到达，必须回车才生效
     let detach_hint = if cfg!(windows) {
-        "Ctrl+D 后回车分离"
+        crate::i18n::pick(
+            printer.lang(),
+            "Ctrl+D 后回车分离",
+            "Ctrl+D then enter to detach",
+        )
     } else {
-        "Ctrl+D 分离"
+        crate::i18n::pick(printer.lang(), "Ctrl+D 分离", "Ctrl+D to detach")
     };
-    printer.print_section(&format!(
-        "已附加 {name} 控制台（{detach_hint}，服务器继续运行）"
+    printer.print_section(&crate::i18n::pick(
+        printer.lang(),
+        format!("已附加 {name} 控制台（{detach_hint}，服务器继续运行）"),
+        format!("attached to {name} console ({detach_hint}; the server keeps running)"),
     ));
     for line in &history {
         print_raw_line(line);
@@ -329,7 +398,14 @@ pub(crate) fn console(name: &str, printer: Printer) -> Result<()> {
                         if !trimmed.is_empty()
                             && let Err(err) = service.send_line(&name, trimmed)
                         {
-                            eprintln!("注入失败: {err}");
+                            eprintln!(
+                                "{}",
+                                crate::i18n::pick(
+                                    crate::locale::current(),
+                                    format!("注入失败: {err}"),
+                                    format!("injection failed: {err}")
+                                )
+                            );
                             if matches!(err, LifecycleError::NotRunning) {
                                 break;
                             }
@@ -345,6 +421,18 @@ pub(crate) fn console(name: &str, printer: Printer) -> Result<()> {
         });
     }
 
+    let exited = wait_console_exit(&service, name, &mut watch, &done)?;
+    report_console_exit(name, exited, printer);
+    Ok(())
+}
+
+/// 控制台附加期间的主循环：等分离或服务器退出，返回是否为「服务器已停」
+fn wait_console_exit(
+    service: &ServerLifecycleService,
+    name: &str,
+    watch: &mut mcsup::service::LogWatch,
+    done: &std::sync::atomic::AtomicBool,
+) -> Result<bool> {
     // 服务器自行退出（例如注入 `stop`）也要结束附加：状态判定收敛在 service，
     // 这里只消费结果，避免控制台停在「服务器已停、console 仍未退出」的状态
     let mut exited = false;
@@ -355,7 +443,7 @@ pub(crate) fn console(name: &str, printer: Printer) -> Result<()> {
         }
         // 探活每 5 个轮询（约 500ms）一次：status 走 IPC，不必跟读日志同频
         ticks += 1;
-        if ticks.is_multiple_of(5) && !server_alive(&service, name)? {
+        if ticks.is_multiple_of(5) && !server_alive(service, name)? {
             exited = true;
             break;
         }
@@ -365,12 +453,24 @@ pub(crate) fn console(name: &str, printer: Printer) -> Result<()> {
     for line in watch.read_new()? {
         print_raw_line(&line);
     }
+    Ok(exited)
+}
+
+/// 控制台收尾提示：服务器停了就说明原因，否则是用户主动分离
+fn report_console_exit(name: &str, exited: bool, printer: Printer) {
     if exited {
-        printer.print_section(&format!("{name} 已停止，控制台已退出"));
+        printer.print_section(&crate::i18n::pick(
+            printer.lang(),
+            format!("{name} 已停止，控制台已退出"),
+            format!("{name} stopped; leaving the console"),
+        ));
     } else {
-        printer.print_section("已分离（服务器继续运行）");
+        printer.print_section(&crate::i18n::pick(
+            printer.lang(),
+            "已分离（服务器继续运行）",
+            "detached (the server keeps running)",
+        ));
     }
-    Ok(())
 }
 
 /// 控制台附加期间探活：服务器已消失或进入终态即视为退出
@@ -385,7 +485,14 @@ fn server_alive(service: &ServerLifecycleService, name: &str) -> Result<bool> {
 pub(crate) fn send(name: &str, command: &str, printer: Printer) -> Result<()> {
     let service = lifecycle_service()?;
     service.send_line(name, command)?;
-    printer.print_outcome(&format!("已注入 {command}"), &SendJson { name, command })
+    printer.print_outcome(
+        &crate::i18n::pick(
+            printer.lang(),
+            format!("已注入 {command}"),
+            format!("sent {command}"),
+        ),
+        &SendJson { name, command },
+    )
 }
 
 /// `server logs`：末尾若干行，`--follow` 持续跟踪（JSON 模式 JSONL）

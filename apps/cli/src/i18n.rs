@@ -25,11 +25,119 @@ pub(crate) const fn text(lang: Lang, zh: &'static str, en: &'static str) -> &'st
 }
 
 /// 二元长文案：两侧已渲染好（含插值）时用这个
+///
+/// 参数用 `impl Into<String>`：`&'static str` 与 `format!` 都在同一处调用，
+/// 调用点不必为纯字面量补 `.to_owned()`。
 #[must_use]
-pub(crate) fn pick(lang: Lang, zh: String, en: String) -> String {
+pub(crate) fn pick(lang: Lang, zh: impl Into<String>, en: impl Into<String>) -> String {
     match lang {
-        Lang::Zh => zh,
-        Lang::En => en,
+        Lang::Zh => zh.into(),
+        Lang::En => en.into(),
+    }
+}
+
+/// 平台自检发现的问题描述（`doctor`）
+#[must_use]
+pub(crate) fn platform_check(check: &mcsup::service::PlatformCheck, lang: Lang) -> String {
+    use mcsup::service::PlatformCheck as C;
+    match (lang, check) {
+        (Lang::Zh, C::DataDirMissing { .. }) => "平台数据目录尚未创建".to_owned(),
+        (Lang::En, C::DataDirMissing { .. }) => {
+            "the platform data directory does not exist yet".to_owned()
+        }
+        (Lang::Zh, C::DataDirNotWritable { reason, .. }) => {
+            format!("平台数据目录不可写（{reason}）")
+        }
+        (Lang::En, C::DataDirNotWritable { reason, .. }) => {
+            format!("the platform data directory is not writable ({reason})")
+        }
+        (Lang::Zh, C::ConfigInvalid { .. }) => "配置文件无法解析".to_owned(),
+        (Lang::En, C::ConfigInvalid { .. }) => "the config file cannot be parsed".to_owned(),
+        (Lang::Zh, C::NoJava) => "没有可用的 Java 运行时".to_owned(),
+        (Lang::En, C::NoJava) => "no usable Java runtime".to_owned(),
+        (Lang::Zh, C::NoJavaScanned) => "已扫描过本机但未发现 Java".to_owned(),
+        (Lang::En, C::NoJavaScanned) => "the host was scanned but no Java was found".to_owned(),
+        (Lang::Zh, C::JavaMissing { .. }) => "登记的 Java 运行时已不在磁盘上".to_owned(),
+        (Lang::En, C::JavaMissing { .. }) => {
+            "a registered Java runtime is missing from disk".to_owned()
+        }
+        (Lang::Zh, C::NoJarSource) => "没有可用的服务端下载源".to_owned(),
+        (Lang::En, C::NoJarSource) => "no usable server jar source".to_owned(),
+        // `PlatformCheck` 是 `#[non_exhaustive]`：新增项回落类型名，至少不 panic
+        (_, other) => other.as_str().to_owned(),
+    }
+}
+
+/// 平台自检问题的定位信息（`doctor` 人类输出第二行）
+#[must_use]
+pub(crate) fn platform_location(check: &mcsup::service::PlatformCheck, lang: Lang) -> String {
+    use mcsup::service::PlatformCheck as C;
+    match check {
+        C::DataDirMissing { path } | C::DataDirNotWritable { path, .. } => {
+            path.display().to_string()
+        }
+        C::ConfigInvalid { path, .. } => path.display().to_string(),
+        C::NoJava => match lang {
+            Lang::Zh => "运行 `mcsup java install` 或安装系统 Java".to_owned(),
+            Lang::En => "run `mcsup java install`, or install a system Java".to_owned(),
+        },
+        C::NoJavaScanned => "`mcsup java scan`".to_owned(),
+        C::JavaMissing { path, version } => format!("{version} → {}", path.display()),
+        C::NoJarSource => match lang {
+            Lang::Zh => "内置来源装配失败".to_owned(),
+            Lang::En => "the built-in sources failed to assemble".to_owned(),
+        },
+        other => other.as_str().to_owned(),
+    }
+}
+
+/// 平台自检问题的修复建议（`doctor`）
+#[must_use]
+pub(crate) fn platform_fix(check: &mcsup::service::PlatformCheck, lang: Lang) -> String {
+    use mcsup::service::PlatformCheck as C;
+    match (lang, check) {
+        (Lang::Zh, C::DataDirMissing { .. }) => {
+            "首次运行任一命令时会自动创建；也可先建好目录".to_owned()
+        }
+        (Lang::En, C::DataDirMissing { .. }) => {
+            "any command creates it on first run; you can also create it now".to_owned()
+        }
+        (Lang::Zh, C::DataDirNotWritable { path, .. }) => format!(
+            "检查 {} 的权限，或 `mcsup config set data-dir <可写目录>`",
+            path.display()
+        ),
+        (Lang::En, C::DataDirNotWritable { path, .. }) => format!(
+            "check the permissions of {}, or `mcsup config set data-dir <writable dir>`",
+            path.display()
+        ),
+        (Lang::Zh, C::ConfigInvalid { path, .. }) => {
+            format!(
+                "`mcsup config edit` 修正 {}，或删除后回到缺省",
+                path.display()
+            )
+        }
+        (Lang::En, C::ConfigInvalid { path, .. }) => format!(
+            "`mcsup config edit` to fix {}, or delete it to fall back to defaults",
+            path.display()
+        ),
+        (Lang::Zh, C::NoJava | C::NoJavaScanned) => {
+            "`mcsup java install 21` 下载一个 JVM".to_owned()
+        }
+        (Lang::En, C::NoJava | C::NoJavaScanned) => {
+            "`mcsup java install 21` to download a JVM".to_owned()
+        }
+        (Lang::Zh, C::JavaMissing { .. }) => {
+            "`mcsup java scan` 重新登记，或 `mcsup java uninstall --dir <路径>` 清理".to_owned()
+        }
+        (Lang::En, C::JavaMissing { .. }) => {
+            "`mcsup java scan` to re-register, or `mcsup java uninstall --dir <path>` to clean up"
+                .to_owned()
+        }
+        (Lang::Zh, C::NoJarSource) => "重新安装 mcsup（内置来源装配失败）".to_owned(),
+        (Lang::En, C::NoJarSource) => {
+            "reinstall mcsup (the built-in sources failed to assemble)".to_owned()
+        }
+        (_, other) => other.as_str().to_owned(),
     }
 }
 

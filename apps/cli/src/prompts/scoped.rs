@@ -19,7 +19,9 @@ use inquire::autocompletion::Replacement;
 use inquire::{Autocomplete, CustomUserError, InquireError};
 use std::io::{IsTerminal, Write};
 
-use super::{ERR_EMPTY_INPUT, ERR_NOT_A_CHOICE, FilterComplete, canonical_choice, filter_choices};
+use crate::locale::Lang;
+
+use super::{FilterComplete, canonical_choice, err_empty_input, err_not_a_choice, filter_choices};
 
 /// 建议列表每页条数（与 `select_filter` 的建议条数一致）
 const PAGE_SIZE: usize = 10;
@@ -107,10 +109,12 @@ struct Picker<'a> {
     scroll: usize,
     /// 上一次提交失败的原因；输入变化即清
     error: Option<String>,
+    /// 界面语言：帮助行与校验文案按它渲染
+    lang: Lang,
 }
 
 impl<'a> Picker<'a> {
-    fn new(label: &'a str, choices: &'a [ScopedChoice], hint: ScopeHint) -> Self {
+    fn new(lang: Lang, label: &'a str, choices: &'a [ScopedChoice], hint: ScopeHint) -> Self {
         // 没有非 extra 候选时直接开在全部，避免默认范围空列表
         let scope = if choices.iter().any(|choice| !choice.extra) {
             Scope::Default
@@ -129,6 +133,7 @@ impl<'a> Picker<'a> {
             highlight: None,
             scroll: 0,
             error: None,
+            lang,
         }
     }
 
@@ -373,11 +378,11 @@ impl<'a> Picker<'a> {
             Some(Done::Submitted(submitted))
         } else {
             let message = if input.is_empty() {
-                ERR_EMPTY_INPUT
+                err_empty_input(self.lang)
             } else {
-                ERR_NOT_A_CHOICE
+                err_not_a_choice(self.lang)
             };
-            self.error = Some(message.to_owned());
+            self.error = Some(message);
             None
         }
     }
@@ -397,10 +402,16 @@ impl<'a> Picker<'a> {
         for (index, suggestion) in filtered.iter().enumerate().take(end).skip(start) {
             lines.push(self.suggestion_line(suggestion, index, max));
         }
-        let help = format!(
-            "输入关键字过滤；↑↓ 选择，Tab 补全，回车确认，Esc 取消（Ctrl+A {}）",
-            self.scope_hint()
-        );
+        let help = match self.lang {
+            Lang::Zh => format!(
+                "输入关键字过滤；↑↓ 选择，Tab 补全，回车确认，Esc 取消（Ctrl+A {}）",
+                self.scope_hint()
+            ),
+            Lang::En => format!(
+                "type to filter; ↑↓ move, Tab completes, Enter confirms, Esc cancels (Ctrl+A {})",
+                self.scope_hint()
+            ),
+        };
         lines.push(styled(&help, &Style::new().for_stderr().dim(), max));
         Screen {
             lines,
@@ -523,19 +534,25 @@ impl Frame {
 /// 无可选项、非交互终端、按键读取 / 终端写入失败，或用户 Esc取消 /
 /// Ctrl+C 中断时返回错误
 pub(crate) fn select_filter_scoped(
+    lang: Lang,
     label: &str,
     choices: &[ScopedChoice],
     hint: ScopeHint,
 ) -> Result<String> {
     match choices {
-        [] => return Err(anyhow::anyhow!("没有可选项")),
+        [] => {
+            return Err(anyhow::anyhow!(match lang {
+                Lang::Zh => "没有可选项",
+                Lang::En => "no options available",
+            }));
+        }
         [only] => return Ok(only.label.clone()),
         _ => {}
     }
     if !std::io::stdin().is_terminal() {
         return Err(InquireError::NotTTY.into());
     }
-    let mut picker = Picker::new(label, choices, hint);
+    let mut picker = Picker::new(lang, label, choices, hint);
     let mut frame = Frame::default();
     let done = {
         // raw mode 覆盖整段交互，作用域结束（含错误路径）即恢复终端
@@ -657,7 +674,7 @@ mod tests {
     }
 
     fn new_picker<'a>(label: &'a str, choices: &'a [ScopedChoice]) -> Picker<'a> {
-        Picker::new(label, choices, hint())
+        Picker::new(Lang::Zh, label, choices, hint())
     }
 
     fn type_chars(picker: &mut Picker<'_>, text: &str) {
@@ -736,7 +753,10 @@ mod tests {
             None,
             "部分匹配不是合法选择"
         );
-        assert_eq!(picker.error.as_deref(), Some(ERR_NOT_A_CHOICE));
+        assert_eq!(
+            picker.error.as_deref(),
+            Some(err_not_a_choice(Lang::Zh).as_str())
+        );
 
         picker.handle(Key::Down).expect("按键不应失败");
         assert_eq!(picker.highlight, Some(0));
@@ -752,7 +772,10 @@ mod tests {
             None,
             "空输入不提交"
         );
-        assert_eq!(picker.error.as_deref(), Some(ERR_EMPTY_INPUT));
+        assert_eq!(
+            picker.error.as_deref(),
+            Some(err_empty_input(Lang::Zh).as_str())
+        );
 
         type_chars(&mut picker, "1.21.2");
         assert_eq!(
@@ -769,7 +792,10 @@ mod tests {
         let mut picker = new_picker("选择版本", &all);
         type_chars(&mut picker, "24w45a（快照）");
         assert_eq!(picker.handle(Key::Enter).expect("回车不应失败"), None);
-        assert_eq!(picker.error.as_deref(), Some(ERR_NOT_A_CHOICE));
+        assert_eq!(
+            picker.error.as_deref(),
+            Some(err_not_a_choice(Lang::Zh).as_str())
+        );
 
         picker
             .handle(Key::Chord(Chord::Ctrl('a')))
@@ -1008,7 +1034,7 @@ mod tests {
         failing.handle(Key::Enter).expect("回车不应失败");
         let screen = failing.screen();
         assert_eq!(screen.cursor.0, 1, "错误行占第 0 行，输入行下移到第 1 行");
-        assert!(screen.lines[0].contains(ERR_NOT_A_CHOICE));
+        assert!(screen.lines[0].contains(&err_not_a_choice(Lang::Zh)));
     }
 
     /// 光标落点：随输入增长右移，且不超出该行可用列
@@ -1063,10 +1089,10 @@ mod tests {
     /// 空候选报错，单候选免提问
     #[test]
     fn empty_and_single_choice_shortcut() {
-        assert!(select_filter_scoped("选择版本", &[], hint()).is_err());
+        assert!(select_filter_scoped(Lang::Zh, "选择版本", &[], hint()).is_err());
         let single = choices(&[("1.21.1", false)]);
         assert_eq!(
-            select_filter_scoped("选择版本", &single, hint()).expect("单候选直接返回"),
+            select_filter_scoped(Lang::Zh, "选择版本", &single, hint()).expect("单候选直接返回"),
             "1.21.1"
         );
     }

@@ -87,8 +87,15 @@ restart / status / console / send / logs / props / set / remove / version`、
 | --- | --- |
 | 命令元数据（`about` / 参数说明） | `apps/cli/src/meta.rs` |
 | 结构化错误提示、doctor 文本 | `apps/cli/src/i18n.rs` |
+| 交互提示（步骤、选择器、校验、确认）标签与帮助行 | 调用方用 `i18n::pick` / `i18n::text` 给出双语，`prompts` 只做渲染 |
+| 结果文案、表格表头、进度回显（`正在…`、`扫描到`） | `apps/cli/src/i18n.rs` 的 `pick` / `text` |
 | clap 硬编码文案（`Usage:` 等） | `apps/cli/src/help.rs` 的替换表 |
 | 语言解析 | `apps/cli/src/locale.rs` |
+
+约定：**用户可见的一切文案都不得在命令里硬编码单一语言**。交互组件本身不知
+道语言，`Lang` 由调用方从 `Printer::lang()` 取；`prompts::*` 的每个入口都显式
+接收 `Lang`，校验错误与帮助行也按它渲染。新增文案时用 `i18n::pick`（带插值）
+或 `i18n::text`（纯字面量），不要写 `if lang == Zh { ... }` 的分叉。
 
 命令元数据不能用 `///` 文档注释写文案：clap 在编译期把它固化成字面量，
 运行时切不了语言。必须写成 `about = crate::meta::xxx()` 形式的表达式。

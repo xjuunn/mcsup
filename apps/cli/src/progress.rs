@@ -208,16 +208,19 @@ pub(crate) struct ScanProgress {
     enabled: bool,
     interactive: bool,
     last_len: usize,
+    /// 界面语言：进度行文案跟随
+    lang: crate::locale::Lang,
 }
 
 impl ScanProgress {
     /// `enable` 通常传 `Printer::is_human`；单行刷新还额外要求 stderr 是 TTY
-    pub(crate) fn new(enable: bool) -> Self {
+    pub(crate) fn new(enable: bool, lang: crate::locale::Lang) -> Self {
         use std::io::IsTerminal;
         Self {
             enabled: enable,
             interactive: enable && std::io::stderr().is_terminal(),
             last_len: 0,
+            lang,
         }
     }
 
@@ -229,15 +232,19 @@ impl ScanProgress {
         }
         #[allow(clippy::print_stderr)]
         {
+            let line = crate::i18n::pick(
+                self.lang,
+                format!("  扫描到: {} ({})", path.display(), version),
+                format!("  found: {} ({})", path.display(), version),
+            );
             if self.interactive {
-                let line = format!("  扫描到: {} ({})", path.display(), version);
                 // 清掉上一行残留（路径长短不一时用空格补齐）
                 let pad = self.last_len.saturating_sub(line.len());
                 eprint!("\r{line}{}", " ".repeat(pad));
                 let _ = std::io::stderr().flush();
                 self.last_len = line.len();
             } else {
-                eprintln!("  扫描到: {} ({})", path.display(), version);
+                eprintln!("{line}");
             }
         }
     }

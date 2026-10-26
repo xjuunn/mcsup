@@ -45,6 +45,8 @@ use port::{
     ServerJarSource,
 };
 pub use props::{PropsError, PropsReport, ServerPropsService};
+/// 服务器注销的结果（与工作目录的 [`RemoveOutcome`] 同名，用别名区分）
+pub use registry::RemoveOutcome as ServerRemoveOutcome;
 pub use registry::{
     InstallJarError, InstallJarErrorKind, InstalledServerJar, RegisteredServer, ServerRegistry,
     ServerRegistryError, ServerRegistryErrorKind,

@@ -6,6 +6,7 @@
 
 use crate::bootstrap;
 use crate::diagnostic::AppDiagnostic;
+use crate::locale::Lang;
 use crate::output::{self, Printer};
 use crate::progress::{ScanProgress, TaskSpinner};
 use crate::prompts;
@@ -38,14 +39,25 @@ pub(crate) fn set(
 
     // 1. 键：显式解析（未知键 → 用法错误并列出全部键）；缺省交互选择
     let key = match key {
-        Some(raw) => parse_key(raw)?,
+        Some(raw) => parse_key(printer.lang(), raw)?,
         None if interactive => prompt_key(printer)?,
         None => {
             return Err(AppDiagnostic::usage(
-                "server set 缺少属性键",
-                Some(format!(
-                    "非交互模式：mcsup server set <name> <key> <value>；可用键：{}",
-                    join_keys()
+                crate::i18n::pick(
+                    printer.lang(),
+                    "server set 缺少属性键",
+                    "server set requires a property key",
+                ),
+                Some(crate::i18n::pick(
+                    printer.lang(),
+                    format!(
+                        "非交互模式：mcsup server set <name> <key> <value>；可用键：{}",
+                        join_keys()
+                    ),
+                    format!(
+                        "non-interactive: mcsup server set <name> <key> <value>; keys: {}",
+                        join_keys()
+                    ),
                 )),
             )
             .into());
@@ -58,27 +70,48 @@ pub(crate) fn set(
         None if interactive => prompt_value(&service, name, key, printer)?,
         None => {
             return Err(AppDiagnostic::usage(
-                format!("server set 缺少 {key} 的值"),
-                Some(value_hint(key)),
+                crate::i18n::pick(
+                    printer.lang(),
+                    format!("server set 缺少 {key} 的值"),
+                    format!("server set requires a value for {key}"),
+                ),
+                Some(value_hint(printer.lang(), key)),
             )
             .into());
         }
     };
 
     // 3. 校验 + 持久化（java-version 可能触发首次 Java 扫描，保持回显）
-    let spinner = TaskSpinner::new(format!("正在设置 {name} {key}…"), printer.is_human());
+    let spinner = TaskSpinner::new(
+        crate::i18n::pick(
+            printer.lang(),
+            format!("正在设置 {name} {key}…"),
+            format!("setting {name} {key}…"),
+        ),
+        printer.is_human(),
+    );
     let result = service.set(
         name,
         key,
         &raw_value,
-        &mut || spinner.set_message("正在扫描本机 Java…"),
+        &mut || {
+            spinner.set_message(crate::i18n::pick(
+                printer.lang(),
+                "正在扫描本机 Java…",
+                "scanning the host for Java…",
+            ));
+        },
         &mut |_| {},
     );
     spinner.finish();
     let change: SettingChange = result?;
 
     printer.print_outcome(
-        &format!("已设置 {name} {key} = {}", change.value),
+        &crate::i18n::pick(
+            printer.lang(),
+            format!("已设置 {name} {key} = {}", change.value),
+            format!("set {name} {key} = {}", change.value),
+        ),
         &SetJson {
             name: name.to_owned(),
             key: key.as_str().to_owned(),
@@ -88,7 +121,11 @@ pub(crate) fn set(
     )?;
     // autostart 目前只持久化、无调度器消费：如实告知，不假装生效
     if key == SettingKey::Autostart {
-        printer.print_section("注意: autostart 已记录但尚未生效（自动拉起调度器待实现）");
+        printer.print_section(&crate::i18n::pick(
+            printer.lang(),
+            "注意: autostart 已记录但尚未生效（自动拉起调度器待实现）",
+            "note: autostart is recorded but not enforced yet (the boot scheduler is not implemented)",
+        ));
     }
     Ok(())
 }
@@ -100,11 +137,16 @@ pub(crate) fn set(
 /// 服务器不存在时返回错误
 pub(crate) fn version(name: &str, printer: Printer) -> Result<()> {
     let reg = bootstrap::open_registry()?;
-    let srv = reg
-        .get(name)
-        .with_context(|| format!("服务器 {name} 不存在"))?;
+    let srv = reg.get(name).with_context(|| {
+        crate::i18n::pick(
+            printer.lang(),
+            format!("服务器 {name} 不存在"),
+            format!("server {name} does not exist"),
+        )
+    })?;
+    let unknown_source = crate::i18n::pick(printer.lang(), "未知", "unknown");
     let source = bootstrap::pick_source(&srv.meta.variant, &bootstrap::jar_sources()?)
-        .map_or("未知", |source| source.name());
+        .map_or(unknown_source.as_str(), |source| source.name());
     let jar = srv.meta.jar.as_ref().map(|jar| JarJson {
         path: jar.path.display().to_string(),
         size: jar.size,
@@ -123,24 +165,41 @@ pub(crate) fn version(name: &str, printer: Printer) -> Result<()> {
     if printer.is_human() {
         let mut table = Table::new();
         table.set_content_arrangement(ContentArrangement::Dynamic);
-        table.set_header(["项", "值"]);
-        table.add_row(["名称", payload.name]);
-        table.add_row(["版本", payload.version]);
-        table.add_row(["变体", payload.variant]);
-        table.add_row(["来源", payload.source]);
+        let l = printer.lang();
+        table.set_header([
+            crate::i18n::text(l, "项", "field"),
+            crate::i18n::text(l, "值", "value"),
+        ]);
+        table.add_row([crate::i18n::text(l, "名称", "name"), payload.name]);
+        table.add_row([crate::i18n::text(l, "版本", "version"), payload.version]);
+        table.add_row([crate::i18n::text(l, "变体", "variant"), payload.variant]);
+        table.add_row([crate::i18n::text(l, "来源", "source"), payload.source]);
         match payload.jar.as_ref() {
             Some(jar) => {
-                table.add_row(["核心", jar.path.as_str()]);
-                table.add_row(["大小", output::human_bytes(jar.size).as_str()]);
-                table.add_row(["校验和", checksum_label(jar).as_str()]);
+                table.add_row([crate::i18n::text(l, "核心", "core"), jar.path.as_str()]);
+                table.add_row([
+                    crate::i18n::text(l, "大小", "size"),
+                    output::human_bytes(jar.size).as_str(),
+                ]);
+                table.add_row([
+                    crate::i18n::text(l, "校验和", "checksum"),
+                    checksum_label(l, jar).as_str(),
+                ]);
             }
             None => {
-                table.add_row(["核心", "尚未安装"]);
+                table.add_row([
+                    crate::i18n::text(l, "核心", "core"),
+                    crate::i18n::text(l, "尚未安装", "not installed"),
+                ]);
             }
         }
         output::print_table(&table);
         if payload.jar.is_none() {
-            printer.print_section(&format!("可执行 mcsup server install {name} 安装核心"));
+            printer.print_section(&crate::i18n::pick(
+                printer.lang(),
+                format!("可执行 mcsup server install {name} 安装核心"),
+                format!("run mcsup server install {name} to install the core"),
+            ));
         }
         Ok(())
     } else {
@@ -154,20 +213,32 @@ pub(crate) fn version(name: &str, printer: Printer) -> Result<()> {
 ///
 /// 上游未提供哈希（如 Fabric 服务端 JAR）时如实说明，不显示残缺的 `sha1:`；
 /// 有哈希时统一为 `算法:十六进制`。
-fn checksum_label(jar: &JarJson) -> String {
+fn checksum_label(lang: Lang, jar: &JarJson) -> String {
     if jar.verified {
         format!("{}:{}", jar.checksum_algo, jar.checksum)
     } else {
-        "未提供（上游无校验和）".to_owned()
+        crate::i18n::pick(
+            lang,
+            "未提供（上游无校验和）",
+            "not provided (upstream has no checksum)",
+        )
     }
 }
 
 /// 键解析：未知键报用法错误（2）并附全部可用键
-fn parse_key(raw: &str) -> Result<SettingKey> {
+fn parse_key(lang: Lang, raw: &str) -> Result<SettingKey> {
     SettingKey::parse(raw).map_err(|err| {
         AppDiagnostic::usage(
-            format!("未知服务属性键: {}", err.raw),
-            Some(format!("可用键：{}", join_keys())),
+            crate::i18n::pick(
+                lang,
+                format!("未知服务属性键: {}", err.raw),
+                format!("unknown server property key: {}", err.raw),
+            ),
+            Some(crate::i18n::pick(
+                lang,
+                format!("可用键：{}", join_keys()),
+                format!("available keys: {}", join_keys()),
+            )),
         )
         .into()
     })
@@ -182,25 +253,52 @@ fn join_keys() -> String {
 }
 
 /// 键的简短说明（交互列表与用法提示共用同一口径）
-fn key_label(key: SettingKey) -> String {
-    format!("{key}（{}）", key_help(key))
+///
+/// 标签是 `key — 说明`：前缀始终是稳定的 `key`，回映不依赖说明的语种。
+fn key_label(lang: Lang, key: SettingKey) -> String {
+    format!("{key} — {}", key_help(lang, key))
 }
 
-fn key_help(key: SettingKey) -> &'static str {
-    match key {
-        SettingKey::JavaVersion => "绑定 JVM 大版本",
-        SettingKey::Ram => "启动内存上限",
-        SettingKey::Autostart => "开机自动拉起",
-        SettingKey::BackupScope => "备份范围（逗号分隔的顶层目录；all 表示全部）",
+fn key_help(lang: Lang, key: SettingKey) -> &'static str {
+    match (lang, key) {
+        (Lang::Zh, SettingKey::JavaVersion) => "绑定 JVM 大版本",
+        (Lang::En, SettingKey::JavaVersion) => "bind a JVM major version",
+        (Lang::Zh, SettingKey::Ram) => "启动内存上限",
+        (Lang::En, SettingKey::Ram) => "startup heap limit",
+        (Lang::Zh, SettingKey::Autostart) => "开机自动拉起",
+        (Lang::En, SettingKey::Autostart) => "start automatically on boot",
+        (Lang::Zh, SettingKey::BackupScope) => "备份范围（逗号分隔的顶层目录；all 表示全部）",
+        (Lang::En, SettingKey::BackupScope) => {
+            "backup scope (comma separated top-level entries; all means everything)"
+        }
     }
 }
 
 /// 交互键选择：标签带说明，按前缀回映到键
 fn prompt_key(printer: Printer) -> Result<SettingKey> {
-    prompts::step(printer, 1, 2, "服务属性");
-    let labels: Vec<String> = SettingKey::ALL.iter().copied().map(key_label).collect();
-    let picked = prompts::select_filter("服务属性", &labels)?;
-    key_from_label(&picked).ok_or_else(|| anyhow!("无效属性键: {picked}"))
+    prompts::step(
+        printer,
+        1,
+        2,
+        &crate::i18n::pick(printer.lang(), "服务属性", "server property"),
+    );
+    let labels: Vec<String> = SettingKey::ALL
+        .iter()
+        .copied()
+        .map(|key| key_label(printer.lang(), key))
+        .collect();
+    let picked = prompts::select_filter(
+        printer.lang(),
+        &crate::i18n::pick(printer.lang(), "服务属性", "server property"),
+        &labels,
+    )?;
+    key_from_label(&picked).ok_or_else(|| {
+        anyhow!(crate::i18n::pick(
+            printer.lang(),
+            format!("无效属性键: {picked}"),
+            format!("invalid property key: {picked}")
+        ))
+    })
 }
 
 /// 标签（`key（说明）`）→ 键；按 `key（` 前缀匹配
@@ -208,7 +306,7 @@ fn key_from_label(label: &str) -> Option<SettingKey> {
     SettingKey::ALL
         .iter()
         .copied()
-        .find(|key| label.starts_with(&format!("{}（", key.as_str())))
+        .find(|key| label.starts_with(&format!("{} — ", key.as_str())))
 }
 
 /// 交互值补齐：java-version 从已注册大版本选择，ram 输入（带当前默认），
@@ -219,7 +317,16 @@ fn prompt_value(
     key: SettingKey,
     printer: Printer,
 ) -> Result<String> {
-    prompts::step(printer, 2, 2, &format!("{key} 的值"));
+    prompts::step(
+        printer,
+        2,
+        2,
+        &crate::i18n::pick(
+            printer.lang(),
+            format!("{key} 的值"),
+            format!("value for {key}"),
+        ),
+    );
     let (_, current) = service.read(name)?;
     match key {
         SettingKey::JavaVersion => prompt_java_major(printer),
@@ -227,11 +334,24 @@ fn prompt_value(
             let default = current
                 .value_of(SettingKey::Ram)
                 .unwrap_or_else(|| format!("{DEFAULT_RAM_MIB}M"));
-            prompts::input_text("启动内存上限", &default, "如 2G / 1024M；回车保持当前值")
+            prompts::input_text(
+                printer.lang(),
+                &crate::i18n::pick(printer.lang(), "启动内存上限", "heap limit"),
+                &default,
+                &crate::i18n::pick(
+                    printer.lang(),
+                    "如 2G / 1024M；回车保持当前值",
+                    "e.g. 2G / 1024M; enter keeps the current value",
+                ),
+            )
         }
         SettingKey::Autostart => {
             let default = current.autostart;
-            let picked = prompts::select_bool("开机自动拉起", default)?;
+            let picked = prompts::select_bool(
+                printer.lang(),
+                &crate::i18n::pick(printer.lang(), "开机自动拉起", "start on boot"),
+                default,
+            )?;
             Ok(picked.to_string())
         }
         SettingKey::BackupScope => {
@@ -239,9 +359,14 @@ fn prompt_value(
                 .value_of(SettingKey::BackupScope)
                 .unwrap_or_else(|| BACKUP_SCOPE_ALL.to_owned());
             prompts::input_text(
-                "备份范围",
+                printer.lang(),
+                &crate::i18n::pick(printer.lang(), "备份范围", "backup scope"),
                 &default,
-                "逗号分隔的顶层目录，如 world,mods；all 表示整个服务器目录",
+                &crate::i18n::pick(
+                    printer.lang(),
+                    "逗号分隔的顶层目录，如 world,mods；all 表示整个服务器目录",
+                    "comma separated top-level entries, e.g. world,mods; all means the whole server directory",
+                ),
             )
         }
     }
@@ -255,10 +380,18 @@ fn prompt_java_major(printer: Printer) -> Result<String> {
     majors.sort_unstable();
     majors.dedup();
     if majors.is_empty() {
-        return Err(anyhow!("未发现本机 Java，可执行 mcsup java install 安装"));
+        return Err(anyhow!(crate::i18n::pick(
+            printer.lang(),
+            "未发现本机 Java，可执行 mcsup java install 安装",
+            "no Java found on this machine; run mcsup java install",
+        )));
     }
     let labels: Vec<String> = majors.iter().map(ToString::to_string).collect();
-    prompts::select_filter("JVM 大版本", &labels)
+    prompts::select_filter(
+        printer.lang(),
+        &crate::i18n::pick(printer.lang(), "JVM 大版本", "JVM major version"),
+        &labels,
+    )
 }
 
 /// 已注册运行时；未扫描过则扫描（与 `java list` 同一套回显口径）
@@ -266,28 +399,42 @@ fn list_runtimes(
     java: &JavaService,
     printer: Printer,
 ) -> Result<Vec<mcsup::domain::java::JavaRuntime>> {
-    let mut progress = ScanProgress::new(printer.is_human());
+    let mut progress = ScanProgress::new(printer.is_human(), printer.lang());
     let runtimes = java
         .list_or_scan(
-            &mut || printer.print_section("正在扫描本机 Java…"),
+            &mut || {
+                printer.print_section(&crate::i18n::pick(
+                    printer.lang(),
+                    "正在扫描本机 Java…",
+                    "scanning the host for Java…",
+                ));
+            },
             &mut |found| {
                 progress.on_found(&found.path, &found.version);
             },
         )
-        .context("列出 Java 失败")?;
+        .context(crate::i18n::pick(
+            printer.lang(),
+            "列出 Java 失败",
+            "failed to list Java runtimes",
+        ))?;
     progress.finish();
     Ok(runtimes)
 }
 
 /// 非交互缺值时的按键用法提示
-fn value_hint(key: SettingKey) -> String {
+fn value_hint(lang: Lang, key: SettingKey) -> String {
     let example = match key {
         SettingKey::JavaVersion => "21".to_owned(),
         SettingKey::Ram => "2G".to_owned(),
         SettingKey::Autostart => "true".to_owned(),
         SettingKey::BackupScope => "world,mods".to_owned(),
     };
-    format!("非交互模式：mcsup server set <name> {key} <value>（如 {example}）")
+    crate::i18n::pick(
+        lang,
+        format!("非交互模式：mcsup server set <name> {key} <value>（如 {example}）"),
+        format!("non-interactive: mcsup server set <name> {key} <value> (e.g. {example})"),
+    )
 }
 
 #[cfg(test)]
@@ -297,19 +444,19 @@ mod tests {
     #[test]
     fn parse_key_accepts_all_documented_keys() {
         assert_eq!(
-            parse_key("java-version").expect("java"),
+            parse_key(Lang::Zh, "java-version").expect("java"),
             SettingKey::JavaVersion
         );
-        assert_eq!(parse_key("ram").expect("ram"), SettingKey::Ram);
+        assert_eq!(parse_key(Lang::Zh, "ram").expect("ram"), SettingKey::Ram);
         assert_eq!(
-            parse_key("autostart").expect("autostart"),
+            parse_key(Lang::Zh, "autostart").expect("autostart"),
             SettingKey::Autostart
         );
     }
 
     #[test]
     fn parse_key_unknown_lists_available_keys() {
-        let err = parse_key("max-players").expect_err("unknown");
+        let err = parse_key(Lang::Zh, "max-players").expect_err("unknown");
         assert_eq!(Printer::exit_code(&err), 2);
         let msg = err.to_string();
         assert!(msg.contains("max-players"), "{msg}");
@@ -324,7 +471,7 @@ mod tests {
     #[test]
     fn key_label_roundtrips_through_prefix() {
         for key in SettingKey::ALL {
-            assert_eq!(key_from_label(&key_label(key)), Some(key));
+            assert_eq!(key_from_label(&key_label(Lang::Zh, key)), Some(key));
         }
         assert_eq!(key_from_label("ram"), None);
         assert_eq!(key_from_label("其他（说明）"), None);
@@ -347,13 +494,13 @@ mod tests {
     /// 有真实哈希时显示 `算法:十六进制`
     #[test]
     fn checksum_label_shows_algo_and_hex_when_verified() {
-        assert_eq!(checksum_label(&jar(true)), "sha1:abc");
+        assert_eq!(checksum_label(Lang::Zh, &jar(true)), "sha1:abc");
     }
 
     /// 上游无哈希（Fabric）时如实说明，不能显示残缺的 `sha1:`
     #[test]
     fn checksum_label_explains_missing_checksum() {
-        let label = checksum_label(&jar(false));
+        let label = checksum_label(Lang::Zh, &jar(false));
         assert_eq!(label, "未提供（上游无校验和）");
         assert!(!label.starts_with("sha1:"), "{label}");
     }

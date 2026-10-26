@@ -26,7 +26,10 @@ pub(crate) async fn run(
     validate_only(only)?;
     let doctor = collect(file);
     // 全程本地检查，正常一瞬即过；spinner 只为极慢磁盘上的探写兜底
-    let spinner = TaskSpinner::new("检查运行环境", printer.is_human());
+    let spinner = TaskSpinner::new(
+        crate::i18n::pick(printer.lang(), "检查运行环境", "checking the environment"),
+        printer.is_human(),
+    );
     let report = doctor.run().await;
     spinner.finish();
 
@@ -58,17 +61,24 @@ pub(crate) async fn run(
                 level: f.severity().as_str(),
                 kind: f.check.as_str(),
                 detail: detail_json(&f.check),
-                message: f.check.describe(),
-                fix: f.check.fix_hint(),
+                message: crate::i18n::platform_check(&f.check, printer.lang()),
+                fix: crate::i18n::platform_fix(&f.check, printer.lang()),
             })
             .collect(),
     };
     let summary = if findings.is_empty() {
-        "检查通过".to_owned()
+        crate::i18n::pick(printer.lang(), "检查通过", "check passed")
     } else {
-        format!(
-            "发现 {} 个问题（{errors} error, {warnings} warning）",
-            findings.len()
+        crate::i18n::pick(
+            printer.lang(),
+            format!(
+                "发现 {} 个问题（{errors} error, {warnings} warning）",
+                findings.len()
+            ),
+            format!(
+                "found {} issue(s) ({errors} error, {warnings} warning)",
+                findings.len()
+            ),
         )
     };
     printer.print_outcome(&summary, &payload)?;
@@ -84,8 +94,16 @@ fn validate_only(only: &[String]) -> Result<()> {
     for kind in only {
         if !KNOWN_KINDS.contains(&kind.as_str()) {
             return Err(AppDiagnostic::usage(
-                format!("未知检查项: {kind}"),
-                Some(format!("可用检查项: {}", KNOWN_KINDS.join(", "))),
+                crate::i18n::pick(
+                    crate::locale::current(),
+                    format!("未知检查项: {kind}"),
+                    format!("unknown check: {kind}"),
+                ),
+                Some(crate::i18n::pick(
+                    crate::locale::current(),
+                    format!("可用检查项: {}", KNOWN_KINDS.join(", ")),
+                    format!("available checks: {}", KNOWN_KINDS.join(", ")),
+                )),
             )
             .into());
         }
@@ -127,18 +145,24 @@ fn collect(file: &ConfigFile) -> PlatformDoctor {
 
 fn render_human(findings: &[&PlatformFinding], printer: Printer) {
     if findings.is_empty() {
-        printer.print_section("检查通过：运行环境可用");
+        printer.print_section(&crate::i18n::pick(
+            printer.lang(),
+            "检查通过：运行环境可用",
+            "check passed: the environment is usable",
+        ));
     } else {
         for f in findings {
             let tag = match f.severity() {
                 Severity::Error => "ERROR",
                 Severity::Warning => "WARN",
             };
+            let l = printer.lang();
             let line = format!(
-                "[{tag}] {}\n        {}\n        修复：{}",
-                f.check.describe(),
-                f.check.locate(),
-                f.check.fix_hint()
+                "[{tag}] {}\n        {}\n        {}: {}",
+                crate::i18n::platform_check(&f.check, l),
+                crate::i18n::platform_location(&f.check, l),
+                crate::i18n::text(l, "修复", "fix"),
+                crate::i18n::platform_fix(&f.check, l)
             );
             match f.severity() {
                 Severity::Error => printer.print_warning(&line),
