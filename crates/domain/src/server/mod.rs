@@ -1,4 +1,5 @@
 pub mod artifact;
+pub mod content;
 pub mod download;
 pub mod error;
 pub mod eula;

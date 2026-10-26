@@ -1,0 +1,68 @@
+[
+  {
+    "name": "Fabulously Optimized 5.0.0",
+    "version_number": "5.0.0",
+    "changelog": "List of changes in this version",
+    "dependencies": [
+      {
+        "version_id": "QQRRSSTT",
+        "project_id": "DEPPROJ1",
+        "file_name": null,
+        "dependency_type": "required"
+      }
+    ],
+    "game_versions": ["1.21.1"],
+    "version_type": "release",
+    "loaders": ["fabric"],
+    "featured": true,
+    "status": "listed",
+    "id": "IIJJKKLL",
+    "project_id": "AABBCCDD",
+    "author_id": "EEFFGGHH",
+    "date_published": "2024-06-01T00:00:00Z",
+    "downloads": 12345,
+    "environment": "client_and_server",
+    "files": [
+      {
+        "hashes": {
+          "sha512": "93ecf5fe02914fb53d94aa3d28c1fb562e23985f8e4d48b9038422798618761fe208a31ca9b723667a4e05de0d91a3f86bcd8d018f6a686c39550e21b198d96f",
+          "sha1": "c84dd4b3580c02b79958a0590afd5783d80ef504"
+        },
+        "url": "https://cdn.modrinth.com/data/AABBCCDD/versions/IIJJKKLL/pack.mrpack",
+        "filename": "pack.mrpack",
+        "primary": true,
+        "size": 1097270,
+        "file_type": null
+      }
+    ]
+  },
+  {
+    "name": "Fabulously Optimized 4.0.0",
+    "version_number": "4.0.0",
+    "changelog": null,
+    "dependencies": [],
+    "game_versions": ["1.20.1"],
+    "version_type": "beta",
+    "loaders": ["fabric"],
+    "featured": false,
+    "status": "listed",
+    "id": "QQRRSSTT",
+    "project_id": "AABBCCDD",
+    "author_id": "EEFFGGHH",
+    "date_published": "2024-01-01T00:00:00Z",
+    "downloads": 54321,
+    "environment": "client_and_server",
+    "files": [
+      {
+        "hashes": {
+          "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "url": "https://cdn.modrinth.com/data/AABBCCDD/versions/QQRRSSTT/pack.mrpack",
+        "filename": "pack.mrpack",
+        "primary": true,
+        "size": 2000000,
+        "file_type": null
+      }
+    ]
+  }
+]

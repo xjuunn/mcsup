@@ -12,18 +12,22 @@
 use file::{CommandExtractor, FileDownloader};
 use java::HostJavaScanner;
 use port::ServerJarSource;
+use port::content::{ContentSource, ContentSourceRegistry};
 use provider::fabric::FabricSource;
 use provider::forge::ForgeSource;
 use provider::http::HttpByteSource;
 use provider::java::JavaSourceRegistry;
 use provider::leaf::LeafSource;
+use provider::modrinth::ModrinthSource;
 use provider::mojang::MojangSource;
 use provider::neoforge::NeoForgeSource;
 use provider::papermc::{PaperProject, PaperSource};
 use provider::purpur::PurpurSource;
 use provider::quilt::QuiltSource;
 use provider::sponge::SpongeSource;
-use service::{JavaService, ServerLifecycleService, ServerRegistry, WorkspaceService};
+use service::{
+    ContentService, JavaService, ServerLifecycleService, ServerRegistry, WorkspaceService,
+};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use storage::JsonStore;
@@ -81,6 +85,8 @@ pub struct Mcsup {
     pub backup: service::BackupService,
     /// 已注册的服务端 JAR 来源（能力查询数据源）
     pub jar_sources: Vec<Arc<dyn ServerJarSource>>,
+    /// 内容资源安装（Mod / 整合包 / 资源包 …）
+    pub content: ContentService,
     /// 元数据仓库句柄（Workspace / Server / Java 三个仓库共用）
     ///
     /// 具体存储类型是实现细节，对外只经 [`McsupBuilder::server_repository`]
@@ -153,6 +159,7 @@ pub struct McsupBuilder {
     backup_store: Option<Arc<dyn port::BackupStore>>,
     events: Option<Arc<dyn port::EventSink>>,
     jar_sources: Option<Vec<Arc<dyn ServerJarSource>>>,
+    content_sources: Option<Vec<Arc<dyn ContentSource>>>,
 }
 
 impl std::fmt::Debug for McsupBuilder {
@@ -173,6 +180,10 @@ impl std::fmt::Debug for McsupBuilder {
             .field(
                 "jar_sources",
                 &self.jar_sources.as_ref().map_or(0, Vec::len),
+            )
+            .field(
+                "content_sources",
+                &self.content_sources.as_ref().map_or(0, Vec::len),
             )
             .finish()
     }
@@ -291,6 +302,16 @@ impl McsupBuilder {
         self
     }
 
+    /// 注入自定义内容来源集合（默认 Modrinth 官方）
+    ///
+    /// 换源（自建 Labrinth / 镜像 / 其他站点）在这里替换，不改 Service。顺序
+    /// 有意义：不指定来源名时用第一个。
+    #[must_use]
+    pub fn content_sources(mut self, sources: Vec<Arc<dyn ContentSource>>) -> Self {
+        self.content_sources = Some(sources);
+        self
+    }
+
     /// 装配；`data_dir` 为平台数据目录
     ///
     /// # Errors
@@ -374,6 +395,15 @@ impl McsupBuilder {
             None => default_jar_sources()?,
         };
 
+        let content_sources = match self.content_sources {
+            Some(sources) => sources,
+            None => default_content_sources()?,
+        };
+        let content = ContentService::new(
+            Arc::new(ContentSourceRegistry::new(content_sources)),
+            Arc::clone(&downloader),
+        );
+
         Ok(Mcsup {
             workspaces,
             registry,
@@ -381,9 +411,23 @@ impl McsupBuilder {
             lifecycle,
             backup,
             jar_sources,
+            content,
             store,
         })
     }
+}
+
+/// 默认的内容来源集合：Modrinth 官方
+///
+/// 只准备 HTTP 客户端，不打网络。换源由 [`McsupBuilder::content_sources`]
+/// 覆盖；自建 / 镜像用 `ModrinthSource::builder().base_url(..)` 构造。
+///
+/// # Errors
+///
+/// 来源构造失败时返回 [`BootstrapError::Source`]
+pub fn default_content_sources() -> Result<Vec<Arc<dyn ContentSource>>, BootstrapError> {
+    let source = ModrinthSource::new().map_err(|err| BootstrapError::Source(Box::new(err)))?;
+    Ok(vec![Arc::new(source) as Arc<dyn ContentSource>])
 }
 
 /// 默认的来源集合（与 CLI 完全一致）

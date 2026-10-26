@@ -169,6 +169,42 @@ where
     })
 }
 
+/// POST 一段 JSON body 并反序列化 JSON 响应
+///
+/// 供 Modrinth 的批量端点使用（`POST /projects`）。错误归类与 [`get_json`]
+/// 一致。`body` 是调用方已序列化好的 JSON 文本，而不是任意 `Serialize`
+/// 值：`reqwest` 的 `.json()` 要求启用它的 `serde` feature，而本 crate 的
+/// `reqwest` 只开了 `json`（响应侧），手工 `serde_json::to_string` 再以
+/// `application/json` 发送既不依赖那层 feature，也让「本地序列化失败」在
+/// 调用方就能处理。
+///
+/// # Errors
+///
+/// 网络失败、非成功状态码或响应非法时返回 [`SourceError`]
+pub(crate) async fn post_json<T>(client: &Client, url: &str, body: &str) -> Result<T, SourceError>
+where
+    T: DeserializeOwned,
+{
+    let response = client
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body.to_owned())
+        .send()
+        .await
+        .map_err(map_transport)?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(rejection(status.as_u16(), extract_message(response).await));
+    }
+    response.json().await.map_err(|err| {
+        if err.is_decode() {
+            SourceError::Decode(Box::new(err))
+        } else {
+            SourceError::Network(Box::new(err))
+        }
+    })
+}
+
 /// GET 并读取为纯文本，用于非 JSON 的小文件（如 Forge 的 `.sha1` 侧车）
 ///
 /// 与 [`get_json`] 共用同一套错误归类：`not_found_id` 非空且状态码为 404 时归

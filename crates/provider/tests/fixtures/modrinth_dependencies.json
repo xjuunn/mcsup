@@ -1,0 +1,63 @@
+{
+  "projects": [
+    {
+      "id": "QQRRSSTT",
+      "team": "MMNNOOPP",
+      "title": "Fabric API",
+      "description": "Lightweight and modular API",
+      "body": "Fabric API body",
+      "status": "approved",
+      "project_type": "mod",
+      "categories": ["library", "fabric"],
+      "additional_categories": [],
+      "environment": ["client_and_server"],
+      "game_versions": ["1.21.1"],
+      "loaders": ["fabric"],
+      "versions": ["IIJJKKLL"],
+      "license": { "id": "Apache-2.0" },
+      "published": "2018-01-01T00:00:00Z",
+      "updated": "2024-06-01T00:00:00Z",
+      "downloads": 99999999,
+      "followers": 10000,
+      "gallery": [],
+      "slug": "fabric-api",
+      "icon_url": null,
+      "raw_icon_url": null,
+      "color": null,
+      "issues_url": null,
+      "source_url": null,
+      "wiki_url": null,
+      "discord_url": null,
+      "donation_urls": null
+    }
+  ],
+  "versions": [
+    {
+      "name": "Fabric API 0.100.0",
+      "version_number": "0.100.0",
+      "changelog": null,
+      "dependencies": [],
+      "game_versions": ["1.21.1"],
+      "version_type": "release",
+      "loaders": ["fabric"],
+      "featured": false,
+      "status": "listed",
+      "id": "IIJJKKLL",
+      "project_id": "QQRRSSTT",
+      "author_id": "EEFFGGHH",
+      "date_published": "2024-06-01T00:00:00Z",
+      "downloads": 100,
+      "environment": "client_and_server",
+      "files": [
+        {
+          "hashes": { "sha1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+          "url": "https://cdn.modrinth.com/data/QQRRSSTT/versions/IIJJKKLL/fabric-api.jar",
+          "filename": "fabric-api.jar",
+          "primary": true,
+          "size": 2000000,
+          "file_type": null
+        }
+      ]
+    }
+  ]
+}

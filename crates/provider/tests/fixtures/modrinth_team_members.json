@@ -1,0 +1,29 @@
+[
+  {
+    "team_id": "MMNNOOPP",
+    "user": {
+      "id": "EEFFGGHH",
+      "username": "robotkoer",
+      "name": "Robotkoer",
+      "avatar_url": "https://avatars.githubusercontent.com/u/1?v=4",
+      "bio": null,
+      "created": "2021-01-01T00:00:00Z"
+    },
+    "role": "Owner",
+    "permissions": null,
+    "accepted": true,
+    "payouts_split": 1,
+    "ordering": 0
+  },
+  {
+    "team_id": "MMNNOOPP",
+    "user": {
+      "id": "IIJJKKLL",
+      "username": "contributor",
+      "name": null,
+      "avatar_url": null
+    },
+    "role": "Member",
+    "accepted": false
+  }
+]

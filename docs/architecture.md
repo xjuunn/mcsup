@@ -238,7 +238,43 @@ Artifact 获取。Provider 不承担核心业务流程。
 
 已实现：Vanilla（Mojang version manifest）、Fabric（meta API）、Forge
 （Maven `maven-metadata.json` + `promotions_slim.json`，下载 installer JAR 并校验
-`.sha1` 侧车）。
+`.sha1` 侧车）、Modrinth（Labrinth v2）。
+
+## 两类 Provider 契约
+
+Provider 对外提供两个互不重叠的端口：
+
+| 端口 | 回答的问题 | 粒度 |
+| --- | --- | --- |
+| `port::ServerJarSource` | 「这个变体的服务端核心从哪拿」 | 一个变体一个实现 |
+| `port::content::ContentSource` | 「给已有服务端装内容，项目 / 版本 / 文件在哪」 | 一个来源可覆盖多种内容类别 |
+
+后者只描述文件（地址、大小、哈希），不执行下载；字节传输统一走
+`port::ArtifactDownloader`，与核心下载共用校验与断点续传设施。
+
+## Modrinth（内容来源）
+
+`provider::modrinth` 封装 Labrinth v2 的查询面：搜索、项目详情与批量、
+版本列表与批量、按文件哈希反查（单个与批量）、依赖图、标签
+（加载器 / 游戏版本 / 分类 / 项目类型）、团队成员。真正的字节下载不在这里。
+
+- 响应模型（`modrinth::manifest`）保留上游字符串，未知字段忽略：上游新增
+  类型不会让整条响应报废
+- 类别映射（`modrinth::source`）收敛在一处：`project_type` 只有 mod /
+  modpack / resourcepack / shader，`datapack` / `plugin` 是同一份 jar 的额外
+  用途，体现在 `all_project_types`
+- 换源：`ModrinthSource::builder().base_url(..)` 指向自建 Labrinth 或镜像，
+  只接受 `https`；装配层用 `McsupBuilder::content_sources` 替换整套来源
+
+内容安装的领域口径在 `domain::server::content`：类别、落点目录、候选排序
+（加载器 → 游戏版本 → 正式版 → 精选 → 发布时间）、客户端资源拒绝安装。
+编排在 `service::ContentService`：搜索、挑版本、下载、落盘、幂等复用。
+
+```
+入口 apps/cli ──→ service::ContentService ──→ port::content::ContentSource
+                        │                              ↑
+                        └──→ port::ArtifactDownloader   provider::modrinth
+```
 
 Forge 的下载物是**安装器**而非服务端：Provider 以 `port::InstallKind::Installer`
 声明这一点，并给出安装器产出的参数文件启动规格（`domain::LaunchSpec::Args`）。

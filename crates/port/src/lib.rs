@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod backup;
+pub mod content;
 
 pub use backend::Backend;
 pub use backup::{
