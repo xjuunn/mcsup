@@ -4,8 +4,10 @@
 
 - **动作总在名字前**：`mcsup server start <name>`、`mcsup server backup create <name>`。
 - **建站只有一个入口**：`server create`。整合包是它的一种变体
-  （`--variant modrinth-modpack`，或 `--modpack <ID>` 隐含该变体）：选定变体后
-  搜索可开服的整合包、展示详情、选版本，再按清单装加载器与 mod。
+  （`--variant modrinth-modpack`，短名 `--variant modrinth`，或 `--modpack <ID>`
+  隐含该变体）：选定变体后搜索可开服的整合包、展示详情、选版本，再按清单装
+  加载器与 mod。变体列表按「用户需要懂多少」排序：`vanilla` 与整合包在前，
+  模组加载器其次，服务端分支与代理在后。
 - **凡属某个服务器的内容，挂在 `server` 下**：备份（`backup`）、Mod（`mod`）。
 - **服务属性统一 `server set`**：JVM 绑定、内存、自启等一律
   `mcsup server set <name> <key> <value>`，不为一类属性单开子命令；
@@ -223,19 +225,37 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 
 ## 整合包（`server create --variant modrinth-modpack`）
 
-整合包不是独立命令，而是 `server create` 的一种变体。选定后：
+整合包不是独立命令，而是 `server create` 的一种变体。选定后进入显式向导：
 
-1. 搜索**能在服务端运行**的整合包（Modrinth `server_side` 过滤掉纯客户端整合包）
-2. 展示所选整合包详情：标题、作者、加载器、游戏版本、下载量、许可证、来源页、简介
-3. 选版本（正式版优先）
-4. 读 `.mrpack` 清单拿到 MC 版本与加载器版本，写入注册表
-5. 装对应加载器核心 → 铺 `overrides/` → 下载清单里服务端需要的文件
+```
+搜索 ──Esc──→ 取消整个建站
+  ↓ 回车（关键词发给上游，offset=0）
+结果 ──Esc──→ 搜索（改关键词即重搜）
+  ↓ 选中          （「下一页 / 上一页」翻页）
+详情 ──Esc──→ 结果
+  ↓ 继续
+版本 ──Esc──→ 详情
+  ↓ 选中
+确认 ──Esc──→ 版本
+  ↓ 开始创建
+读 `.mrpack` 清单 → 装加载器核心 → 铺 `overrides/` → 下载清单文件
+```
+
+- 搜索是**真实的服务端搜索**：关键词直接作为 `ModpackQuery::keyword` 发给
+  Modrinth，不是先拉一页再本地过滤，因此能搜到第一页之外的结果。
+- 每页 20 条；结果页底部按需出现「下一页 / 上一页」。Esc 回搜索即重搜。
+- 搜索框常驻提示：**只显示支持服务端的整合包**（`server_side` facet 过滤纯
+  客户端整合包）。
+- 每一步 Esc 回到上一步，Ctrl+C 取消整个命令。
 
 | 用法 | 说明 |
 | --- | --- |
-| `mcsup server create <name> --variant modrinth-modpack` | 交互搜索、看详情、选版本 |
+| `mcsup server create <name> --variant modrinth` | 交互向导（`modrinth-modpack` 等价） |
 | `mcsup server create <name> --modpack <ID或slug>` | 直接指定整合包（隐含该变体；非交互可用） |
 | `mcsup server create <name> --modpack <ID> --version <版本ID或版本号>` | 固定版本，脚本可复现 |
+
+非交互模式必须用 `--modpack` 指定项目；只用 `--variant modrinth` 且没有
+`--modpack` 会以用法错误退出，而不是静默挑一个包。
 
 清单里 `server: unsupported` 的文件不会装到服务端；`optional` 视为需要安装。
 建好的整合包服务与 `server create` 建的服务是同一种对象，后续运维都走

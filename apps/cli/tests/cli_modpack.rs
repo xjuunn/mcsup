@@ -193,6 +193,38 @@ fn modpack_flag_implies_variant() {
     assert!(!text.contains("unknown variant"), "{text}");
 }
 
+/// `--variant modrinth` 是短名别名，不应被当成未知变体
+#[test]
+fn modrinth_variant_alias_is_accepted() {
+    let home = temp_home();
+    let out = run_full(
+        home.path(),
+        &[
+            "server",
+            "create",
+            "mp-alias",
+            "--variant",
+            "modrinth",
+            "--modpack",
+            "fabulously-optimized",
+            "--output",
+            "json",
+        ],
+        &[
+            ("HTTPS_PROXY", DEAD_PROXY),
+            ("HTTP_PROXY", DEAD_PROXY),
+            ("ALL_PROXY", DEAD_PROXY),
+        ],
+    );
+    let text = stderr(&out);
+    assert!(
+        !text.contains("未知变体")
+            && !text.contains("unknown variant")
+            && !text.contains("暂未支持"),
+        "别名不应被拒绝: {text}"
+    );
+}
+
 /// 真实建整合包服务器：落盘 mods / overrides / 核心，注册表记录 MC 版本
 #[test]
 fn net_modpack_create_installs_server() {

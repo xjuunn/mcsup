@@ -17,6 +17,7 @@
 use crate::bootstrap;
 use crate::output::Printer;
 use crate::progress::{BarSink, TaskSpinner};
+use crate::prompts::{Backable, ScopeHint, ScopedChoice, select_filter_backable};
 use anyhow::{Context, Result};
 use comfy_table::{ContentArrangement, Table};
 use mcsup::port::CancellationToken;
@@ -39,99 +40,299 @@ pub(crate) struct PickedModpack {
     pub minecraft: String,
 }
 
-/// 选择整合包：搜索 → 详情 → 版本
+/// 每页整合包数量
+const PAGE_SIZE: u32 = 20;
+
+/// 结果列表里的翻页项：用不可能出现在标题里的前缀，避免与真实整合包重名
+const NEXT_PAGE: &str = "→ 下一页";
+const PREV_PAGE: &str = "← 上一页";
+
+/// 向导状态
 ///
-/// `version_hint` 来自 `--version`：给出时**只**用它挑版本，跳过搜索与交互
-/// （脚本场景需要可复现）。项目本身仍需交互选择或由 `--version` 隐含？
-/// 不——项目必须由用户给出，因此非交互下用 `--variant modrinth-modpack` 且
-/// 没有指定项目会报用法错误，见 [`pick_modpack`] 的调用方。
+/// 显式状态机而非嵌套循环：每一步只回答「按 Esc 回到哪」，返回路径因此是
+/// 可见的、可测试的，不会因为嵌套层次变深而漏掉某个返回分支。
+#[derive(Debug, Clone)]
+enum Wizard {
+    /// 输入关键词（Esc 取消整个命令）
+    Search,
+    /// 浏览一页搜索结果
+    Results { keyword: Option<String>, page: u32 },
+    /// 查看详情（Esc 回到结果页）
+    Detail {
+        id: String,
+        keyword: Option<String>,
+        page: u32,
+    },
+    /// 选择版本（Esc 回到详情页）
+    Version {
+        id: String,
+        title: String,
+        keyword: Option<String>,
+        page: u32,
+    },
+}
+
+/// 选择整合包：搜索 → 结果 → 详情 → 版本 → 确认
+///
+/// 交互路径由 [`Wizard`] 驱动，Esc 逐级返回；`--modpack` 给出项目时跳过
+/// 搜索与详情，直接选版本。非交互模式必须用 `--modpack` 指定项目，否则
+/// 没有任何可自动选择的信息。
+///
+/// `version_hint` 来自 `--version`：给出时只按它挑版本，不进入交互选择
+/// （脚本场景需要可复现）。
 ///
 /// # Errors
 ///
-/// 上游失败、没有可开服的整合包、没有版本或用户中断时返回错误
+/// 上游失败、没有可开服的整合包、没有版本，或用户在搜索步取消时返回错误
 pub(crate) async fn pick_modpack(
     project_hint: Option<&str>,
     version_hint: Option<&str>,
     printer: Printer,
 ) -> Result<PickedModpack> {
     let service = bootstrap::modpack_service()?;
-    // 显式给了项目（`--modpack`）：跳过搜索，直接取详情
     if let Some(project) = project_hint {
-        let detail = service.select_source(None)?.detail(project).await;
-        print_detail(&detail.context("获取整合包详情失败")?, printer)?;
-        let versions = service.select_source(None)?.versions(project).await?;
-        let version = match version_hint {
-            Some(hint) => versions
-                .into_iter()
-                .find(|version| version.id == hint || version.version_number == hint)
-                .ok_or_else(|| anyhow::anyhow!("整合包 {project} 没有版本 {hint}"))?,
-            None if printer.is_interactive() => pick_version(&versions, printer)?,
-            None => versions
-                .iter()
-                .find(|version| version.is_release())
-                .or_else(|| versions.first())
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("整合包 {project} 没有可用版本"))?,
-        };
-        return finish_pick(&service, project, version).await;
+        return pick_by_project(&service, project, version_hint, printer).await;
     }
-    let spinner = TaskSpinner::new("搜索可开服的整合包", printer.is_human());
-    let search = service
-        .select_source(None)?
-        .search(&ModpackQuery::new().page(0, 30))
-        .await;
-    spinner.finish();
-    let search = search.context("搜索整合包失败")?;
-    if search.hits.is_empty() {
-        anyhow::bail!("没有找到可在服务端运行的整合包");
+    if !printer.is_interactive() {
+        anyhow::bail!(
+            "{}",
+            crate::i18n::pick(
+                printer.lang(),
+                "非交互模式请用 --modpack 指定整合包".to_owned(),
+                "use --modpack to pick a modpack in non-interactive mode".to_owned(),
+            )
+        );
     }
+    run_wizard(&service, version_hint, printer).await
+}
 
-    // 交互：先按关键词过滤出候选，再选择
-    let picked_summary = if let Some(keyword) = prompt_keyword(printer)? {
-        let filtered: Vec<String> = search
-            .hits
-            .iter()
-            .filter(|hit| {
-                hit.title.to_lowercase().contains(&keyword)
-                    || hit
-                        .slug
-                        .as_deref()
-                        .is_some_and(|slug| slug.contains(&keyword))
-            })
-            .map(|hit| format!("{}（{}）", hit.title, hit.id))
-            .collect();
-        if filtered.is_empty() {
-            anyhow::bail!("没有匹配「{keyword}」的整合包");
-        }
-        filtered
-    } else {
-        search
-            .hits
-            .iter()
-            .map(|hit| format!("{}（{}）", hit.title, hit.id))
-            .collect()
-    };
-    let choice = crate::prompts::select_filter("选择整合包", &picked_summary)?;
-    let id = extract_id(&choice).ok_or_else(|| anyhow::anyhow!("无效选择: {choice}"))?;
-
-    // 详情：把「这个包是什么」写给用户看
-    let spinner = TaskSpinner::new(format!("获取 {id} 详情"), printer.is_human());
-    let detail = service.select_source(None)?.detail(&id).await;
-    spinner.finish();
+/// 显式给了 `--modpack`：跳过搜索，直接取详情与版本
+async fn pick_by_project(
+    service: &mcsup::service::ModpackService,
+    project: &str,
+    version_hint: Option<&str>,
+    printer: Printer,
+) -> Result<PickedModpack> {
+    let detail = service.select_source(None)?.detail(project).await;
     let detail = detail.context("获取整合包详情失败")?;
     print_detail(&detail, printer)?;
-
-    // 版本：默认正式版优先，`--version` 直接指定
-    let versions = service.select_source(None)?.versions(&id).await?;
+    let title = detail.summary.title.clone();
+    let versions = service.select_source(None)?.versions(project).await?;
     let version = match version_hint {
         Some(hint) => versions
             .into_iter()
             .find(|version| version.id == hint || version.version_number == hint)
-            .ok_or_else(|| anyhow::anyhow!("整合包 {id} 没有版本 {hint}"))?,
-        None => pick_version(&versions, printer)?,
+            .ok_or_else(|| anyhow::anyhow!("整合包 {project} 没有版本 {hint}"))?,
+        None if printer.is_interactive() => pick_version(&versions, printer)?,
+        None => versions
+            .iter()
+            .find(|version| version.is_release())
+            .or_else(|| versions.first())
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("整合包 {project} 没有可用版本"))?,
     };
+    finish_pick(service, project, &title, version).await
+}
 
-    finish_pick(&service, &id, version).await
+/// 交互向导主循环：状态转移全部集中在这里
+async fn run_wizard(
+    service: &mcsup::service::ModpackService,
+    version_hint: Option<&str>,
+    printer: Printer,
+) -> Result<PickedModpack> {
+    let mut state = Wizard::Search;
+    loop {
+        state = match state {
+            Wizard::Search => {
+                let keyword = prompt_keyword(printer)?;
+                Wizard::Results { keyword, page: 0 }
+            }
+            Wizard::Results { keyword, page } => {
+                match browse_results(service, keyword.as_deref(), page, printer).await? {
+                    Browse::Back => Wizard::Search,
+                    Browse::Page(next) => Wizard::Results {
+                        keyword,
+                        page: next,
+                    },
+                    Browse::Pick(id) => Wizard::Detail { id, keyword, page },
+                }
+            }
+            Wizard::Detail { id, keyword, page } => {
+                let spinner = TaskSpinner::new(format!("获取 {id} 详情"), printer.is_human());
+                let detail = service.select_source(None)?.detail(&id).await;
+                spinner.finish();
+                let detail = detail.context("获取整合包详情失败")?;
+                print_detail(&detail, printer)?;
+                let title = detail.summary.title.clone();
+                if continue_or_back("查看版本")? {
+                    Wizard::Version {
+                        id,
+                        title,
+                        keyword,
+                        page,
+                    }
+                } else {
+                    Wizard::Results { keyword, page }
+                }
+            }
+            Wizard::Version {
+                id,
+                title,
+                keyword,
+                page,
+            } => {
+                let spinner = TaskSpinner::new(format!("获取 {title} 版本"), printer.is_human());
+                let versions = service.select_source(None)?.versions(&id).await;
+                spinner.finish();
+                let versions = versions.context("获取整合包版本失败")?;
+                // `--version` 已指定则直接取，不进入交互；否则逐版选择
+                let picked = if let Some(hint) = version_hint {
+                    versions
+                        .into_iter()
+                        .find(|version| version.id == hint || version.version_number == hint)
+                        .ok_or_else(|| anyhow::anyhow!("整合包 {id} 没有版本 {hint}"))?
+                } else {
+                    let Some(version) = pick_version_backable(&versions)? else {
+                        state = Wizard::Detail { id, keyword, page };
+                        continue;
+                    };
+                    version
+                };
+                if !confirm_build(&title, &picked)? {
+                    // 未指定版本时回到版本列表重选；`--version` 已固定版本，
+                    // 此时「返回」只能回到详情页
+                    state = if version_hint.is_some() {
+                        Wizard::Detail { id, keyword, page }
+                    } else {
+                        Wizard::Version {
+                            id,
+                            title,
+                            keyword,
+                            page,
+                        }
+                    };
+                    continue;
+                }
+                return finish_pick(service, &id, &title, picked).await;
+            }
+        };
+    }
+}
+
+/// 浏览一页结果后用户的去向
+enum Browse {
+    /// Esc：回到搜索
+    Back,
+    /// 翻到第 `page` 页
+    Page(u32),
+    /// 选中某个整合包
+    Pick(String),
+}
+
+/// 拉取并展示一页结果，返回用户去向
+async fn browse_results(
+    service: &mcsup::service::ModpackService,
+    keyword: Option<&str>,
+    page: u32,
+    printer: Printer,
+) -> Result<Browse> {
+    let offset = page.saturating_mul(PAGE_SIZE);
+    let mut query = ModpackQuery::new().page(offset, PAGE_SIZE);
+    if let Some(keyword) = keyword {
+        query = query.keyword(keyword);
+    }
+    let spinner = TaskSpinner::new(
+        match keyword {
+            Some(keyword) => format!("搜索整合包「{keyword}」"),
+            None => "浏览可开服的整合包".to_owned(),
+        },
+        printer.is_human(),
+    );
+    let search = service.select_source(None)?.search(&query).await;
+    spinner.finish();
+    let search = search.context("搜索整合包失败")?;
+    if search.hits.is_empty() {
+        match keyword {
+            Some(keyword) => anyhow::bail!("没有匹配「{keyword}」且支持服务端的整合包"),
+            None => anyhow::bail!("没有找到可在服务端运行的整合包"),
+        }
+    }
+
+    let labels: Vec<String> = search
+        .hits
+        .iter()
+        .map(|hit| format!("{}（{}）", hit.title, hit.id))
+        .collect();
+    let choices = result_choices(&labels, search.offset, search.total, page);
+
+    let label = format!(
+        "选择整合包（第 {} 页，共 {} 个支持服务端）",
+        page + 1,
+        search.total
+    );
+    match select_filter_backable(&label, &choices, no_scope())? {
+        Backable::Back => Ok(Browse::Back),
+        Backable::Picked(picked) if picked == NEXT_PAGE => Ok(Browse::Page(page.saturating_add(1))),
+        Backable::Picked(picked) if picked == PREV_PAGE => Ok(Browse::Page(page.saturating_sub(1))),
+        Backable::Picked(picked) => extract_id(&picked)
+            .map(Browse::Pick)
+            .ok_or_else(|| anyhow::anyhow!("无效选择: {picked}")),
+    }
+}
+
+/// 结果页的可选项：命中项在前，翻页项在后
+///
+/// 翻页项是否出现只由 `offset + len` 与 `total` 决定，与网络无关，因此抽成
+/// 纯函数单独测试。
+fn result_choices(labels: &[String], offset: u32, total: u64, page: u32) -> Vec<ScopedChoice> {
+    let mut choices: Vec<ScopedChoice> = labels
+        .iter()
+        .map(|label| ScopedChoice::new(label.clone(), false))
+        .collect();
+    let more = u64::from(offset) + labels.len() as u64;
+    if more < total {
+        choices.push(ScopedChoice::new(NEXT_PAGE, false));
+    }
+    if page > 0 {
+        choices.push(ScopedChoice::new(PREV_PAGE, false));
+    }
+    choices
+}
+
+/// 继续 / 返回上一步
+///
+/// 用在「详情已展示、要不要进入下一步」这类没有选择项的位置。Esc 与
+/// 选中「返回上一步」等价。
+fn continue_or_back(next: &str) -> Result<bool> {
+    let choices = [
+        ScopedChoice::new(format!("继续（{next}）"), false),
+        ScopedChoice::new("返回上一步", false),
+    ];
+    match select_filter_backable("下一步", &choices, no_scope())? {
+        Backable::Back => Ok(false),
+        Backable::Picked(picked) => Ok(picked != "返回上一步"),
+    }
+}
+
+/// 建站前确认：Esc 返回上一步
+fn confirm_build(title: &str, version: &ModpackVersion) -> Result<bool> {
+    let choices = [
+        ScopedChoice::new("开始创建", false),
+        ScopedChoice::new("返回上一步", false),
+    ];
+    let label = format!("将用 {title} {} 创建服务端", version.version_number);
+    match select_filter_backable(&label, &choices, no_scope())? {
+        Backable::Back => Ok(false),
+        Backable::Picked(picked) => Ok(picked == "开始创建"),
+    }
+}
+
+/// 无范围切换时的占位提示
+const fn no_scope() -> ScopeHint {
+    ScopeHint {
+        show_all: "",
+        show_default: "",
+    }
 }
 
 /// 取回清单拿到 MC 版本，组装 [`PickedModpack`]
@@ -142,6 +343,7 @@ pub(crate) async fn pick_modpack(
 async fn finish_pick(
     service: &mcsup::service::ModpackService,
     project: &str,
+    title: &str,
     version: ModpackVersion,
 ) -> Result<PickedModpack> {
     let prepared = service
@@ -162,7 +364,7 @@ async fn finish_pick(
     }
     Ok(PickedModpack {
         project_id: prepared.resolved.project_id,
-        title: project.to_owned(),
+        title: title.to_owned(),
         version_id: prepared.resolved.version_id,
         version_number: prepared.resolved.version_number,
         minecraft,
@@ -174,7 +376,11 @@ fn prompt_keyword(printer: Printer) -> Result<Option<String>> {
     if !printer.is_interactive() {
         return Ok(None);
     }
-    let keyword = crate::prompts::input_text("搜索整合包（回车浏览全部）", "", "")?;
+    let keyword = crate::prompts::input_text(
+        "搜索整合包（只显示支持服务端的整合包，回车浏览热门）",
+        "",
+        "",
+    )?;
     if keyword.trim().is_empty() {
         Ok(None)
     } else {
@@ -283,32 +489,57 @@ fn pick_version(versions: &[ModpackVersion], _printer: Printer) -> Result<Modpac
     let labels: Vec<String> = pool
         .iter()
         .take(VERSION_SHOW_LIMIT)
-        .map(|version| {
-            format!(
-                "{}（{} · MC {} · {}）",
-                version.version_number,
-                version.channel,
-                join_versions(&version.game_versions),
-                version.loaders.join(",")
-            )
-        })
+        .map(|version| version_label(version))
         .collect();
     if labels.len() == 1 {
         return Ok((*pool[0]).clone());
     }
     let picked = crate::prompts::select_filter("选择整合包版本", &labels)?;
     pool.iter()
-        .find(|version| {
-            format!(
-                "{}（{} · MC {} · {}）",
-                version.version_number,
-                version.channel,
-                join_versions(&version.game_versions),
-                version.loaders.join(",")
-            ) == picked
-        })
+        .find(|version| version_label(version) == picked)
         .map(|version| (*version).clone())
         .ok_or_else(|| anyhow::anyhow!("无效选择: {picked}"))
+}
+
+/// 版本列表里的一行展示
+fn version_label(version: &ModpackVersion) -> String {
+    format!(
+        "{}（{} · MC {} · {}）",
+        version.version_number,
+        version.channel,
+        join_versions(&version.game_versions),
+        version.loaders.join(",")
+    )
+}
+
+/// 交互选版本，Esc 返回 `None` 表示回到详情页
+///
+/// 与 [`pick_version`] 同一套候选口径（优先正式版、最多展示
+/// [`VERSION_SHOW_LIMIT`] 项），区别只在 Esc 的语义。
+fn pick_version_backable(versions: &[ModpackVersion]) -> Result<Option<ModpackVersion>> {
+    if versions.is_empty() {
+        anyhow::bail!("该整合包没有可用版本");
+    }
+    let releases: Vec<&ModpackVersion> = versions.iter().filter(|v| v.is_release()).collect();
+    let pool: Vec<&ModpackVersion> = if releases.is_empty() {
+        versions.iter().collect()
+    } else {
+        releases
+    };
+    let shown: Vec<&ModpackVersion> = pool.iter().take(VERSION_SHOW_LIMIT).copied().collect();
+    let choices: Vec<ScopedChoice> = shown
+        .iter()
+        .map(|version| ScopedChoice::new(version_label(version), false))
+        .collect();
+    match select_filter_backable("选择整合包版本", &choices, no_scope())? {
+        Backable::Back => Ok(None),
+        Backable::Picked(picked) => shown
+            .into_iter()
+            .find(|version| version_label(version) == picked)
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| anyhow::anyhow!("无效选择: {picked}")),
+    }
 }
 
 /// 版本列表压缩展示：超过 6 个用 `…` 收尾
@@ -443,6 +674,26 @@ mod tests {
         );
         assert_eq!(extract_id("no id here"), None);
         assert_eq!(extract_id("bad（）"), None);
+    }
+
+    #[test]
+    fn result_choices_adds_next_only_when_more_remain() {
+        let labels = vec!["A（1）".to_owned(), "B（2）".to_owned()];
+        let first = result_choices(&labels, 0, 3, 0);
+        assert_eq!(first.len(), 3);
+        assert_eq!(first[2].label, NEXT_PAGE);
+        assert!(!first.iter().any(|c| c.label == PREV_PAGE));
+
+        let last = result_choices(&labels, 2, 3, 1);
+        assert!(!last.iter().any(|c| c.label == NEXT_PAGE));
+        assert_eq!(last.last().map(|c| c.label.as_str()), Some(PREV_PAGE));
+    }
+
+    #[test]
+    fn result_choices_has_no_pager_when_everything_fits() {
+        let labels = vec!["A（1）".to_owned()];
+        let choices = result_choices(&labels, 0, 1, 0);
+        assert_eq!(choices.len(), 1);
     }
 
     #[test]

@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 
 mod scoped;
 
-pub(crate) use scoped::{ScopeHint, ScopedChoice, select_filter_scoped};
+pub(crate) use scoped::{
+    Backable, ScopeHint, ScopedChoice, select_filter_backable, select_filter_scoped,
+};
 
 /// 空输入的校验文案（可过滤选择的两个组件共用）
 pub(crate) const ERR_EMPTY_INPUT: &str = "请输入关键字或从建议中选择";

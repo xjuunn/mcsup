@@ -201,6 +201,11 @@ pub(crate) struct CreateArgs<'a> {
     pub(crate) modpack: Option<&'a str>,
 }
 
+/// `--variant` 是否指向整合包变体（含 `modrinth` 短名）
+fn is_modpack_flag(raw: &str) -> bool {
+    raw.eq_ignore_ascii_case("modrinth-modpack") || raw.eq_ignore_ascii_case("modrinth")
+}
+
 /// `server create`：非交互走参数直通（缺必选参数 → 退出码 2），
 /// 交互且缺参进入向导（工作区兜底 → 名称 → 变体 → 版本 → 下载）
 ///
@@ -235,7 +240,7 @@ pub(crate) async fn create(args: CreateArgs<'_>, printer: Printer) -> Result<()>
     }
     // 整合包变体的 `--version` 是整合包版本 ID，可省略（取最新正式版），
     // 因此不套用「非交互必须给版本」的闸门
-    let modpack_mode = variant.is_some_and(|raw| raw.eq_ignore_ascii_case("modrinth-modpack"));
+    let modpack_mode = variant.is_some_and(is_modpack_flag);
     if version.is_none() && !interactive && !modpack_mode {
         return Err(AppDiagnostic::usage(
             "server create 缺少 --version",
@@ -437,6 +442,13 @@ fn resolve_flag_variant(
     available: &[ServerVariant],
     lang: Lang,
 ) -> Result<ServerVariant> {
+    // 用户向的短名：`--variant modrinth` 等价于整合包变体。存储与展示仍用
+    // `modrinth-modpack`，别名只降低输入成本，不改变持久化口径。
+    let raw = if raw.eq_ignore_ascii_case("modrinth") {
+        ServerVariant::ModrinthModpack.as_str()
+    } else {
+        raw
+    };
     let parsed = ServerVariant::from_id(raw).map_err(|_| {
         anyhow::Error::from(AppDiagnostic::usage(
             crate::i18n::pick(
@@ -496,18 +508,13 @@ fn pick_variant(available: &[ServerVariant], printer: Printer) -> Result<ServerV
     if let [only] = available {
         return Ok(only.clone());
     }
-    prompts::step(printer, 2, 3, "服务端变体");
-    let labels: Vec<String> = available.iter().map(|v| v.as_str().to_owned()).collect();
-    let picked = prompts::select_filter("服务端变体", &labels)?;
-    variant_from_label(&picked, available).ok_or_else(|| anyhow::anyhow!("无效变体: {picked}"))
-}
-
-/// 选择标签 → 变体（标签即 `as_str`，按全名回映）
-fn variant_from_label(picked: &str, available: &[ServerVariant]) -> Option<ServerVariant> {
-    available
-        .iter()
-        .find(|variant| variant.as_str() == picked)
-        .cloned()
+    prompts::step(printer, 2, 3, "服务端类型");
+    // 标签由 `bootstrap::variant_label` 统一给出：说明「选它会发生什么」，
+    // 同时保持候选与变体一一对应
+    let labels: Vec<String> = available.iter().map(bootstrap::variant_label).collect();
+    let picked = prompts::select_filter("服务端类型（输入关键字过滤）", &labels)?;
+    bootstrap::variant_from_label(&picked, available)
+        .ok_or_else(|| anyhow::anyhow!("无效变体: {picked}"))
 }
 
 /// 名称重输：语法由 prompts 校验，重复（注册表已有）时警示后重问
@@ -1030,19 +1037,37 @@ mod tests {
         );
     }
 
-    /// 单可用项免提问；标签（`as_str`）回映变体，未命中返回 None
+    /// `--variant modrinth` 是整合包的短名别名，存储仍用 `modrinth-modpack`
     #[test]
-    fn variant_from_label_maps_back_by_full_name() {
+    fn modrinth_alias_resolves_to_modpack_variant() {
+        let available = vec![ServerVariant::Vanilla, ServerVariant::ModrinthModpack];
+        for raw in ["modrinth", "MODRINTH", "modrinth-modpack"] {
+            assert_eq!(
+                resolve_flag_variant(raw, &available, Lang::Zh).expect(raw),
+                ServerVariant::ModrinthModpack
+            );
+        }
+        // 未注册时别名同样走「暂未支持」，不静默失败
+        assert!(resolve_flag_variant("modrinth", &[], Lang::Zh).is_err());
+    }
+
+    /// 展示标签由 `bootstrap::variant_label` 统一给出，并能回映变体
+    #[test]
+    fn variant_label_round_trips_and_unknown_is_none() {
         let available = vec![ServerVariant::Vanilla, ServerVariant::Fabric];
+        let fabric = bootstrap::variant_label(&ServerVariant::Fabric);
         assert_eq!(
-            variant_from_label("fabric", &available),
+            bootstrap::variant_from_label(&fabric, &available),
             Some(ServerVariant::Fabric)
         );
         assert_eq!(
-            variant_from_label("VANILLA", &available),
+            bootstrap::variant_from_label("fabric", &available),
             None,
-            "全名匹配区分大小写，选择器已归一到注册名"
+            "标签带说明后，裸 `as_str` 不再命中，避免两套口径并存"
         );
-        assert_eq!(variant_from_label("paper", &available), None);
+        assert_eq!(
+            bootstrap::variant_from_label("paper（高性能服务端）", &available),
+            None
+        );
     }
 }
