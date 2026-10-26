@@ -227,6 +227,31 @@ impl ServerVariant {
         }
     }
 
+    /// 该变体在内容资源目录里对应的加载器名
+    ///
+    /// Modrinth 用加载器名过滤版本（`fabric` / `forge` / `neoforge` / `quilt` /
+    /// `paper` …）。原版与未知变体没有加载器，返回 `None`——调用方据此不按
+    /// 加载器过滤，而不是拿一个上游不认识的名字去查。
+    ///
+    /// 映射口径收敛在领域层：入口与服务端都从这里取，不各自维护一张表。
+    #[must_use]
+    pub fn content_loader(&self) -> Option<&str> {
+        match self {
+            Self::Vanilla | Self::Unknown => None,
+            Self::Fabric => Some("fabric"),
+            Self::Forge => Some("forge"),
+            Self::NeoForge => Some("neoforge"),
+            Self::Quilt => Some("quilt"),
+            // Paper / Purpur / Folia / Leaf 跑 Bukkit 系插件，上游把它们统一
+            // 归在 `paper` / `bukkit` 加载器下；`paper` 覆盖面最广
+            Self::Paper | Self::Purpur | Self::Folia | Self::Leaf => Some("paper"),
+            Self::Velocity => Some("velocity"),
+            Self::Waterfall => Some("waterfall"),
+            Self::SpongeVanilla => Some("sponge"),
+            Self::Custom(id) => Some(id.as_str()),
+        }
+    }
+
     /// 内置名 → 内置变体；不是内置名时返回 `None`
     pub(crate) fn known(raw: &str) -> Option<Self> {
         Some(match raw {
@@ -257,6 +282,36 @@ impl fmt::Display for ServerVariant {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 加载器映射：模组加载器一对一，原版与未知无加载器
+    #[test]
+    fn content_loader_maps_mod_loaders() {
+        assert_eq!(ServerVariant::Fabric.content_loader(), Some("fabric"));
+        assert_eq!(ServerVariant::Forge.content_loader(), Some("forge"));
+        assert_eq!(ServerVariant::NeoForge.content_loader(), Some("neoforge"));
+        assert_eq!(ServerVariant::Quilt.content_loader(), Some("quilt"));
+        assert_eq!(ServerVariant::Velocity.content_loader(), Some("velocity"));
+        assert_eq!(ServerVariant::Waterfall.content_loader(), Some("waterfall"));
+        assert_eq!(
+            ServerVariant::SpongeVanilla.content_loader(),
+            Some("sponge")
+        );
+        // Bukkit 系服务端统一按 paper 过滤
+        for variant in [
+            ServerVariant::Paper,
+            ServerVariant::Purpur,
+            ServerVariant::Folia,
+            ServerVariant::Leaf,
+        ] {
+            assert_eq!(variant.content_loader(), Some("paper"), "{variant:?}");
+        }
+        // 没有加载器：不能拿一个上游不认识的名字去查
+        assert_eq!(ServerVariant::Vanilla.content_loader(), None);
+        assert_eq!(ServerVariant::Unknown.content_loader(), None);
+        // 第三方变体按自己的名字查
+        let custom = ServerVariant::custom("my-loader").expect("custom");
+        assert_eq!(custom.content_loader(), Some("my-loader"));
+    }
 
     /// 每个内置项的机器名都能往返，且 `builtin()` 与实际枚举项一致
     ///

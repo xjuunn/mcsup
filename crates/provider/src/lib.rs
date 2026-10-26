@@ -3,6 +3,7 @@ pub mod forge;
 pub mod http;
 pub mod java;
 pub mod leaf;
+pub mod modrinth;
 pub mod mojang;
 pub mod neoforge;
 pub mod papermc;

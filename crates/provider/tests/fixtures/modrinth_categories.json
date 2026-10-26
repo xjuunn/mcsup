@@ -1,0 +1,12 @@
+[
+  {
+    "name": "adventure",
+    "project_type": "mod",
+    "icon": "<svg></svg>"
+  },
+  {
+    "name": "optimization",
+    "project_type": "mod",
+    "icon": "<svg></svg>"
+  }
+]

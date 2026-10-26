@@ -1,0 +1,43 @@
+{
+  "id": "AABBCCDD",
+  "team": "MMNNOOPP",
+  "title": "Fabulously Optimized",
+  "description": "A modpack for performance",
+  "body": "# Fabulously Optimized\nA long body describing the modpack.",
+  "status": "approved",
+  "project_type": "modpack",
+  "categories": ["optimization", "quilt"],
+  "additional_categories": ["kitchen-sink"],
+  "environment": ["client_and_server"],
+  "game_versions": ["1.20.1", "1.21.1"],
+  "loaders": ["quilt", "fabric"],
+  "versions": ["IIJJKKLL", "QQRRSSTT"],
+  "license": {
+    "id": "LGPL-3.0-or-later",
+    "name": "GNU Lesser General Public License v3 or later",
+    "url": "https://www.gnu.org/licenses/lgpl-3.0.html"
+  },
+  "published": "2021-01-01T00:00:00Z",
+  "updated": "2024-05-01T00:00:00Z",
+  "downloads": 5000000,
+  "followers": 2000,
+  "gallery": [
+    {
+      "url": "https://cdn.modrinth.com/data/AABBCCDD/images/1.png",
+      "featured": true,
+      "title": "Screenshot",
+      "description": "A screenshot",
+      "created": "2021-02-01T00:00:00Z",
+      "ordering": 0
+    }
+  ],
+  "slug": "fabulously-optimized",
+  "icon_url": "https://cdn.modrinth.com/data/AABBCCDD/icon.png",
+  "raw_icon_url": "https://cdn.modrinth.com/data/AABBCCDD/icon-raw.png",
+  "color": 8703084,
+  "issues_url": "https://github.com/example/issues",
+  "source_url": "https://github.com/example/source",
+  "wiki_url": null,
+  "discord_url": null,
+  "donation_urls": null
+}

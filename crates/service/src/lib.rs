@@ -1,4 +1,5 @@
 mod backup;
+mod content;
 mod doctor;
 mod fs_error;
 mod java;
@@ -17,6 +18,10 @@ pub use backup::{
     BackupError, BackupErrorKind, BackupService, CreateOptions, CreateOutcome,
     DEFAULT_FLUSH_WAIT_MS, DeleteOutcome, MAX_LABEL_LEN, PruneOutcome, RestoreOutcome,
     SnapshotPage, VerifyOutcome,
+};
+pub use content::{
+    ContentError, ContentInstall, ContentService, InstallOptions, ModpackInstall, existing_matches,
+    request_for,
 };
 pub use doctor::{CheckKind, DoctorError, DoctorService, Finding, Report, Severity};
 use domain::server::download::DownloadStatus;
