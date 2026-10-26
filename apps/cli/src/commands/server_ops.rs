@@ -614,16 +614,11 @@ fn pick_variant(available: &[ServerVariant], printer: Printer) -> Result<ServerV
         3,
         &crate::i18n::pick(printer.lang(), "服务端类型", "server type"),
     );
-    // 标签由 `bootstrap::variant_label` 统一给出：说明「选它会发生什么」，
-    // 同时保持候选与变体一一对应
+    // 标签由 `bootstrap::variant_label` 统一给出，候选与变体一一对应
     let labels: Vec<String> = available.iter().map(bootstrap::variant_label).collect();
     let picked = prompts::select_filter(
         printer.lang(),
-        &crate::i18n::pick(
-            printer.lang(),
-            "服务端类型（输入关键字过滤）",
-            "server type (type to filter)",
-        ),
+        &crate::i18n::pick(printer.lang(), "服务端类型", "server type"),
         &labels,
     )?;
     bootstrap::variant_from_label(&picked, available)
@@ -1343,12 +1338,9 @@ mod tests {
         );
         assert_eq!(
             bootstrap::variant_from_label("fabric", &available),
-            None,
-            "标签带说明后，裸 `as_str` 不再命中，避免两套口径并存"
+            Some(ServerVariant::Fabric),
+            "展示标签就是名字本身，`as_str` 直接命中"
         );
-        assert_eq!(
-            bootstrap::variant_from_label("paper（高性能服务端）", &available),
-            None
-        );
+        assert_eq!(bootstrap::variant_from_label("paper", &available), None);
     }
 }

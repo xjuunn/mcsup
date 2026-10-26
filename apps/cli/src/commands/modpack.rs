@@ -261,12 +261,12 @@ async fn browse_results(
     let labels: Vec<String> = search
         .hits
         .iter()
-        .map(|hit| format!("{}（{}）", hit.title, hit.id))
+        .map(|hit| format!("{} · {}", hit.title, hit.id))
         .collect();
     let choices = result_choices(&labels, search.offset, search.total, page);
 
     let label = format!(
-        "选择整合包（第 {} 页，共 {} 个支持服务端）",
+        "选择整合包 · 第 {} 页 · 共 {} 个支持服务端",
         page + 1,
         search.total
     );
@@ -305,7 +305,7 @@ fn result_choices(labels: &[String], offset: u32, total: u64, page: u32) -> Vec<
 /// 选中「返回上一步」等价。
 fn continue_or_back(lang: crate::locale::Lang, next: &str) -> Result<bool> {
     let choices = [
-        ScopedChoice::new(format!("继续（{next}）"), false),
+        ScopedChoice::new(format!("继续{next}"), false),
         ScopedChoice::new("返回上一步", false),
     ];
     match select_filter_backable(lang, "下一步", &choices, no_scope())? {
@@ -378,9 +378,9 @@ fn prompt_keyword(printer: Printer) -> Result<Option<String>> {
     }
     let keyword = crate::prompts::input_text(
         printer.lang(),
-        "搜索整合包（只显示支持服务端的整合包，回车浏览热门）",
+        "搜索整合包",
         "",
-        "",
+        "只显示支持服务端的整合包；回车浏览热门",
     )?;
     if keyword.trim().is_empty() {
         Ok(None)
@@ -389,17 +389,13 @@ fn prompt_keyword(printer: Printer) -> Result<Option<String>> {
     }
 }
 
-/// 从 `标题（ID）` 里取回 ID
+/// 从 `标题 · ID` 里取回 ID
 ///
-/// 标题里可能含全角括号，因此从**最后一个**左括号开始切；拿不到就返回
-/// `None`，由调用方报无效选择。
+/// ID 由本模块拼在最后，因此从**最后一个**分隔符切；标题里出现同样
+/// 分隔符也不会切错。拿不到就返回 `None`，由调用方报无效选择。
 fn extract_id(label: &str) -> Option<String> {
-    let start = label.rfind('（')?;
-    let end = label.rfind('）')?;
-    if end <= start + '（'.len_utf8() {
-        return None;
-    }
-    Some(label[start + '（'.len_utf8()..end].to_owned())
+    let (_, id) = label.rsplit_once(" · ")?;
+    (!id.is_empty()).then(|| id.to_owned())
 }
 
 /// 整合包详情的 JSON 形状
@@ -505,7 +501,7 @@ fn pick_version(versions: &[ModpackVersion], printer: Printer) -> Result<Modpack
 /// 版本列表里的一行展示
 fn version_label(version: &ModpackVersion) -> String {
     format!(
-        "{}（{} · MC {} · {}）",
+        "{} · {} · MC {} · {}",
         version.version_number,
         version.channel,
         join_versions(&version.game_versions),
@@ -673,16 +669,16 @@ mod tests {
     #[test]
     fn extract_id_reads_trailing_id() {
         assert_eq!(
-            extract_id("Fabulously Optimized（1KVo5zza）").as_deref(),
+            extract_id("Fabulously Optimized · 1KVo5zza").as_deref(),
             Some("1KVo5zza")
         );
         assert_eq!(extract_id("no id here"), None);
-        assert_eq!(extract_id("bad（）"), None);
+        assert_eq!(extract_id("bad · "), None);
     }
 
     #[test]
     fn result_choices_adds_next_only_when_more_remain() {
-        let labels = vec!["A（1）".to_owned(), "B（2）".to_owned()];
+        let labels = vec!["A · 1".to_owned(), "B · 2".to_owned()];
         let first = result_choices(&labels, 0, 3, 0);
         assert_eq!(first.len(), 3);
         assert_eq!(first[2].label, NEXT_PAGE);
@@ -695,7 +691,7 @@ mod tests {
 
     #[test]
     fn result_choices_has_no_pager_when_everything_fits() {
-        let labels = vec!["A（1）".to_owned()];
+        let labels = vec!["A · 1".to_owned()];
         let choices = result_choices(&labels, 0, 1, 0);
         assert_eq!(choices.len(), 1);
     }

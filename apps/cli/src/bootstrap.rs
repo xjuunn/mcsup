@@ -126,18 +126,12 @@ fn sort_by_discovery_order(variants: &mut [ServerVariant]) {
 
 /// 变体在选择器里的展示标签
 ///
-/// 只给「名字本身不足以说明后果」的项加说明。`vanilla` / `fabric` 这类
-/// 用户已认识的短名不加后缀，避免整列变长。
+/// 只保留名字本身：列表靠排列顺序表达「需要懂多少」，不靠括号里的解释。
+/// 整合包用短名 `modrinth`，与 `--variant modrinth` 别名一致。
 #[must_use]
 pub(crate) fn variant_label(variant: &ServerVariant) -> String {
     match variant {
-        ServerVariant::Vanilla => "vanilla（原版，无需加载器）".to_owned(),
-        ServerVariant::ModrinthModpack => "modrinth（从 Modrinth 安装整合包）".to_owned(),
-        ServerVariant::Fabric => "fabric（模组加载器）".to_owned(),
-        ServerVariant::Forge => "forge（模组加载器）".to_owned(),
-        ServerVariant::NeoForge => "neoforge（模组加载器）".to_owned(),
-        ServerVariant::Quilt => "quilt（模组加载器）".to_owned(),
-        ServerVariant::Paper => "paper（高性能服务端）".to_owned(),
+        ServerVariant::ModrinthModpack => "modrinth".to_owned(),
         other => other.as_str().to_owned(),
     }
 }
