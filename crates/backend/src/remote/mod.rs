@@ -33,6 +33,7 @@ pub use combined::{
 };
 pub use link::RemoteLink;
 pub use mirror::{RemoteJavaRepository, RemoteServerRepository, RemoteWorkspaceRepository};
+pub use router::RoutingSupervisor;
 pub use supervisor::RemoteSupervisor;
 
 /// 远端执行位置：`port::Backend` 的远端实现

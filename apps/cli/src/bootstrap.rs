@@ -327,16 +327,35 @@ pub(crate) fn open_mcsup_with_remotes() -> Result<Mcsup> {
         return open_mcsup();
     }
     let store = open_store()?;
+    let combined_servers = Arc::new(CombinedServerRepository::new(
+        store.clone(),
+        members.clone(),
+    ));
+    // supervisor 路由：本地走默认 LocalSupervisor，远端走各自的 RPC；
+    // 服务器列表必须用组合仓库（查来源的唯一真相源）
+    let mut remote_supervisors = std::collections::HashMap::new();
+    for member in members.all() {
+        // 镜像仓库不暴露 link；经其 origin 重新构造一条等价连接不可取——
+        // 直接在 RemoteMember 上保留 link。这里用 servers 镜像的 link 字段。
+        remote_supervisors.insert(
+            member.name.clone(),
+            mcsup::backend::remote::RemoteSupervisor::new(member.servers_link()),
+        );
+    }
+    let supervisor: Arc<dyn mcsup::port::SupervisorPort> =
+        Arc::new(mcsup::backend::remote::RoutingSupervisor::new(
+            Arc::new(mcsup::runtime::LocalSupervisor),
+            remote_supervisors,
+            combined_servers.clone(),
+        ));
     let mc = McsupBuilder::new()
         .store(store.clone())
+        .supervisor(supervisor)
         .workspace_repository(Arc::new(CombinedWorkspaceRepository::new(
             store.clone(),
             members.clone(),
         )))
-        .server_repository(Arc::new(CombinedServerRepository::new(
-            store.clone(),
-            members.clone(),
-        )))
+        .server_repository(combined_servers)
         .java_repository(Arc::new(CombinedJavaRepository::new(
             store.clone(),
             members,

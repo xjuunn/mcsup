@@ -51,6 +51,14 @@ pub struct RemoteMember {
 }
 
 impl RemoteMember {
+    /// supervisor 用的连接（远端执行走同一台 agent）
+    ///
+    /// `RemoteLink` 是廉价句柄（内部 `Arc`），克隆共享连接池。
+    #[must_use]
+    pub fn servers_link(&self) -> crate::remote::RemoteLink {
+        self.servers.link()
+    }
+
     /// 用一条连接装配三个镜像
     #[must_use]
     pub fn new(link: crate::remote::RemoteLink, name: RemoteName) -> Self {

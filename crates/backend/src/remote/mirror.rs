@@ -191,6 +191,12 @@ pub struct RemoteServerRepository {
 }
 
 impl RemoteServerRepository {
+    /// 连接网关（supervisor 路由复用同一连接）
+    #[must_use]
+    pub fn link(&self) -> RemoteLink {
+        self.link.clone()
+    }
+
     /// 构造；`origin` 是这台远端的来源标注
     #[must_use]
     pub fn new(link: RemoteLink, origin: Origin) -> Self {
