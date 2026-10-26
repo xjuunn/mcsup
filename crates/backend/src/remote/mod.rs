@@ -13,12 +13,17 @@
 //! [`RemoteBackend`]（`port::Backend` 的远端实现：supervisor / installer 走
 //! RPC）在阶段 8 落地，同属本模块。
 
+pub mod combined;
 pub mod link;
 pub mod mirror;
 
 #[cfg(test)]
 pub(crate) mod testkit;
 
+pub use combined::{
+    CombinedJavaRepository, CombinedServerRepository, CombinedWorkspaceRepository, RemoteMember,
+    RemoteMembers,
+};
 pub use link::RemoteLink;
 pub use mirror::{RemoteJavaRepository, RemoteServerRepository, RemoteWorkspaceRepository};
 
