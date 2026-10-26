@@ -25,11 +25,7 @@ pub(crate) async fn run(cli: Cli, cfg: &ConfigFile, lang: Lang) -> Result<()> {
         Command::Modpack { .. } => err("modpack"),
         Command::Java { action } => java(action, printer).await,
         Command::Remote { .. } => err("remote"),
-        Command::Doctor {
-            only,
-            strict,
-            offline,
-        } => doctor::run(cfg, &only, strict, offline, printer).await,
+        Command::Doctor { only, strict } => doctor::run(cfg, &only, strict, printer).await,
         Command::Config { action } => config::run(action, printer),
         Command::Update => err("update"),
         Command::Supervise {

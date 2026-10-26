@@ -130,7 +130,7 @@ mod tests {
     fn save_then_load_roundtrips() {
         let (_dir, file) = temp_file();
         let mut cfg = Config::default();
-        cfg.set(ConfigKey::JavaSource, "azul").expect("set");
+        cfg.set(ConfigKey::DataDir, "sub/data").expect("set");
         file.save(&cfg).expect("save");
         assert!(file.exists());
         let again = file.load().expect("reload");

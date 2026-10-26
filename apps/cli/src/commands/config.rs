@@ -52,7 +52,7 @@ fn show(file: &ConfigFile, printer: Printer) -> Result<()> {
         .iter()
         .map(|key| ConfigRow {
             key: key.as_str(),
-            value: cfg.effective(*key).display(),
+            value: cfg.effective(*key).display().to_string(),
             source: if cfg.is_set(*key) { "file" } else { "default" },
         })
         .collect();
@@ -106,7 +106,7 @@ fn set(file: &ConfigFile, key: &str, value: &str, printer: Printer) -> Result<()
     })?;
     let previous = file.load().ok().and_then(|before| before.raw(key));
     file.save(&cfg)?;
-    let effective = cfg.effective(key).display();
+    let effective = cfg.effective(key).display().to_string();
     printer.print_outcome(
         &format!("已设置 {} = {}", key.as_str(), effective),
         &ConfigSetJson {
@@ -123,7 +123,7 @@ fn unset(file: &ConfigFile, key: &str, printer: Printer) -> Result<()> {
     let mut cfg = file.load()?;
     if !cfg.is_set(key) {
         // 已是缺省：幂等成功，但仍然回显生效值，不制造「改了什么」的错觉
-        let effective = cfg.effective(key).display();
+        let effective = cfg.effective(key).display().to_string();
         return printer.print_outcome(
             &format!("{} 已是平台缺省: {}", key.as_str(), effective),
             &ConfigSetJson {
@@ -137,7 +137,7 @@ fn unset(file: &ConfigFile, key: &str, printer: Printer) -> Result<()> {
     let previous = cfg.raw(key);
     cfg.unset(key);
     file.save(&cfg)?;
-    let effective = cfg.effective(key).display();
+    let effective = cfg.effective(key).display().to_string();
     printer.print_outcome(
         &format!("已恢复 {} 为平台缺省: {}", key.as_str(), effective),
         &ConfigSetJson {

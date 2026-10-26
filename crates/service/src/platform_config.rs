@@ -1,6 +1,6 @@
 //! 平台配置：`config.toml` 的类型、键表、校验与读显
 //!
-//! 配置是机器级偏好（数据目录位置、下载与 Java 来源），不含工作区列表——
+//! 配置是机器级偏好（数据目录位置），不含工作区列表——
 //! 那在 `db/workspaces/`，双真相源会让两边分叉。
 //!
 //! 键表是唯一真相来源：`config show` / `config set` / `config edit` 的键名、
@@ -25,32 +25,6 @@ pub struct Config {
     /// 平台数据目录（缺省取系统数据目录下的 `mcsup`）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data_dir: Option<PathBuf>,
-    /// 服务端核心下载源；缺省只用内置来源
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub download_mirror: Option<String>,
-    /// Java 运行时下载源；缺省用全部内置来源
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub java_source: Option<String>,
-}
-
-/// 生效后的配置值（缺省已填）
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EffectiveValue {
-    /// 目录路径
-    Path(PathBuf),
-    /// 枚举标识
-    Choice(&'static str),
-}
-
-impl EffectiveValue {
-    /// 展示口径：路径用平台分隔符，枚举用标识
-    #[must_use]
-    pub fn display(&self) -> String {
-        match self {
-            Self::Path(path) => path.display().to_string(),
-            Self::Choice(choice) => (*choice).to_owned(),
-        }
-    }
 }
 
 /// 可设置的配置键
@@ -61,23 +35,17 @@ impl EffectiveValue {
 pub enum ConfigKey {
     /// `data-dir`：平台数据目录
     DataDir,
-    /// `download-mirror`：服务端核心下载源
-    DownloadMirror,
-    /// `java-source`：Java 运行时下载源
-    JavaSource,
 }
 
 impl ConfigKey {
     /// 全部配置键，顺序即 `config show` 与报错文案的稳定顺序
-    pub const ALL: &'static [Self] = &[Self::DataDir, Self::DownloadMirror, Self::JavaSource];
+    pub const ALL: &'static [Self] = &[Self::DataDir];
 
     /// 配置文件里的键名（kebab-case，与 `server set` 同一口径）
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::DataDir => "data-dir",
-            Self::DownloadMirror => "download-mirror",
-            Self::JavaSource => "java-source",
         }
     }
 
@@ -86,8 +54,6 @@ impl ConfigKey {
     pub const fn describe(self) -> &'static str {
         match self {
             Self::DataDir => "平台数据目录（workspaces / java / db 都在其下）",
-            Self::DownloadMirror => "服务端核心下载源",
-            Self::JavaSource => "Java 运行时下载源",
         }
     }
 
@@ -97,23 +63,11 @@ impl ConfigKey {
         Self::ALL.iter().copied().find(|key| key.as_str() == name)
     }
 
-    /// 该键的枚举取值；仅枚举型键有值
-    #[must_use]
-    pub fn choices(self) -> &'static [&'static str] {
-        match self {
-            Self::DataDir => &[],
-            Self::DownloadMirror => DOWNLOAD_MIRRORS,
-            Self::JavaSource => JAVA_SOURCES,
-        }
-    }
-
     /// 该键在未设置时的生效值（人类视图里标「缺省」用）
     #[must_use]
     pub fn default_display(self) -> String {
         match self {
             Self::DataDir => Config::default_data_dir().display().to_string(),
-            Self::DownloadMirror => DOWNLOAD_MIRRORS.first().copied().unwrap_or("").to_owned(),
-            Self::JavaSource => JAVA_SOURCE_ALL.to_owned(),
         }
     }
 }
@@ -123,15 +77,6 @@ impl std::fmt::Display for ConfigKey {
         f.write_str(self.as_str())
     }
 }
-
-/// `download-mirror` 的取值：`mojang`（内置官方源，不写文件即此值）
-const DOWNLOAD_MIRRORS: &[&str] = &["mojang"];
-
-/// `java-source` 的取值：与 provider 注册的 Java 源一一对应，缺省用全部
-const JAVA_SOURCES: &[&str] = &["adoptium", "azul", "foojay"];
-
-/// [`JAVA_SOURCE_ALL`]：`java-source` 未设置时的口径
-pub const JAVA_SOURCE_ALL: &str = "all";
 
 /// 配置值非法
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -146,16 +91,6 @@ pub enum ConfigValueError {
         /// 具体原因
         reason: String,
     },
-    /// 枚举值不在取值表内
-    #[error("{key} 取值非法: {value}")]
-    Choice {
-        /// 键名
-        key: &'static str,
-        /// 原始输入
-        value: String,
-        /// 可用取值
-        choices: &'static [&'static str],
-    },
 }
 
 impl ConfigValueError {
@@ -166,11 +101,6 @@ impl ConfigValueError {
             Self::Path { key, value, reason } => {
                 format!("{key} 不是可用路径: {value}（{reason}）")
             }
-            Self::Choice {
-                key,
-                value,
-                choices,
-            } => format!("{key} 取值非法: {value}；可用: {}", choices.join(", ")),
         }
     }
 }
@@ -194,31 +124,11 @@ impl Config {
         self.data_dir.clone().unwrap_or_else(Self::default_data_dir)
     }
 
-    /// 生效的 `download-mirror`
+    /// 该键的生效值（当前只有 `data-dir`，即规范化后的绝对路径）
     #[must_use]
-    pub fn resolved_download_mirror(&self) -> &'static str {
-        self.download_mirror
-            .as_deref()
-            .and_then(|raw| DOWNLOAD_MIRRORS.iter().copied().find(|c| *c == raw))
-            .unwrap_or(DOWNLOAD_MIRRORS[0])
-    }
-
-    /// 生效的 `java-source`；未设置为 [`JAVA_SOURCE_ALL`]
-    #[must_use]
-    pub fn resolved_java_source(&self) -> &'static str {
-        self.java_source
-            .as_deref()
-            .and_then(|raw| JAVA_SOURCES.iter().copied().find(|c| *c == raw))
-            .unwrap_or(JAVA_SOURCE_ALL)
-    }
-
-    /// 该键的生效值
-    #[must_use]
-    pub fn effective(&self, key: ConfigKey) -> EffectiveValue {
+    pub fn effective(&self, key: ConfigKey) -> PathBuf {
         match key {
-            ConfigKey::DataDir => EffectiveValue::Path(self.resolved_data_dir()),
-            ConfigKey::DownloadMirror => EffectiveValue::Choice(self.resolved_download_mirror()),
-            ConfigKey::JavaSource => EffectiveValue::Choice(self.resolved_java_source()),
+            ConfigKey::DataDir => self.resolved_data_dir(),
         }
     }
 
@@ -227,8 +137,6 @@ impl Config {
     pub fn is_set(&self, key: ConfigKey) -> bool {
         match key {
             ConfigKey::DataDir => self.data_dir.is_some(),
-            ConfigKey::DownloadMirror => self.download_mirror.is_some(),
-            ConfigKey::JavaSource => self.java_source.is_some(),
         }
     }
 
@@ -243,12 +151,6 @@ impl Config {
                 let path = parse_path(key.as_str(), value)?;
                 self.data_dir = Some(path);
             }
-            ConfigKey::DownloadMirror => {
-                self.download_mirror = Some(parse_choice(key, value)?);
-            }
-            ConfigKey::JavaSource => {
-                self.java_source = Some(parse_choice(key, value)?);
-            }
         }
         Ok(())
     }
@@ -257,8 +159,6 @@ impl Config {
     pub fn unset(&mut self, key: ConfigKey) {
         match key {
             ConfigKey::DataDir => self.data_dir = None,
-            ConfigKey::DownloadMirror => self.download_mirror = None,
-            ConfigKey::JavaSource => self.java_source = None,
         }
     }
 
@@ -270,8 +170,6 @@ impl Config {
                 .data_dir
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
-            ConfigKey::DownloadMirror => self.download_mirror.clone(),
-            ConfigKey::JavaSource => self.java_source.clone(),
         }
     }
 
@@ -303,7 +201,7 @@ impl Config {
 
 /// 写入文件时置顶的说明：手改的人先看到可用键
 pub const FEATURE_HEADER: &str = "# mcsup 平台配置；键表见 `mcsup config show`\n\
-     # data-dir / download-mirror / java-source，删除某项即回到平台缺省\n\n";
+     # data-dir，删除该项即回到平台缺省\n\n";
 
 /// 校验并归一化路径
 ///
@@ -376,19 +274,6 @@ pub fn lexical_normalize(path: &Path) -> PathBuf {
     out
 }
 
-fn parse_choice(key: ConfigKey, value: &str) -> Result<String, ConfigValueError> {
-    let trimmed = value.trim();
-    let choices = key.choices();
-    if let Some(found) = choices.iter().find(|c| **c == trimmed) {
-        return Ok((*found).to_owned());
-    }
-    Err(ConfigValueError::Choice {
-        key: key.as_str(),
-        value: value.to_owned(),
-        choices,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,7 +281,7 @@ mod tests {
     #[test]
     fn key_names_are_stable_kebab_case() {
         let names: Vec<&str> = ConfigKey::ALL.iter().map(|k| k.as_str()).collect();
-        assert_eq!(names, vec!["data-dir", "download-mirror", "java-source"]);
+        assert_eq!(names, vec!["data-dir"]);
         assert_eq!(ConfigKey::parse("data-dir"), Some(ConfigKey::DataDir));
         assert_eq!(ConfigKey::parse("Data-Dir"), None);
         assert_eq!(ConfigKey::parse("nope"), None);
@@ -405,8 +290,10 @@ mod tests {
     #[test]
     fn defaults_apply_when_unset() {
         let cfg = Config::default();
-        assert_eq!(cfg.resolved_download_mirror(), "mojang");
-        assert_eq!(cfg.resolved_java_source(), JAVA_SOURCE_ALL);
+        assert_eq!(
+            cfg.effective(ConfigKey::DataDir),
+            Config::default_data_dir()
+        );
         for key in ConfigKey::ALL {
             assert!(!cfg.is_set(*key), "{key} 不应算显式设置");
         }
@@ -415,16 +302,16 @@ mod tests {
     #[test]
     fn set_validates_before_mutating() {
         let mut cfg = Config::default();
-        let err = cfg
-            .set(ConfigKey::JavaSource, "nope")
-            .expect_err("非法取值");
-        assert!(err.describe().contains("adoptium"), "{}", err.describe());
-        assert!(!cfg.is_set(ConfigKey::JavaSource), "失败不得写入");
+        let before = cfg.effective(ConfigKey::DataDir);
+        assert!(cfg.set(ConfigKey::DataDir, "   ").is_err(), "空路径非法");
+        assert!(!cfg.is_set(ConfigKey::DataDir), "失败不得写入");
+        assert_eq!(cfg.effective(ConfigKey::DataDir), before);
 
-        cfg.set(ConfigKey::JavaSource, "azul").expect("合法");
-        assert_eq!(cfg.resolved_java_source(), "azul");
-        cfg.unset(ConfigKey::JavaSource);
-        assert_eq!(cfg.resolved_java_source(), JAVA_SOURCE_ALL);
+        cfg.set(ConfigKey::DataDir, "sub/data").expect("合法");
+        assert!(cfg.is_set(ConfigKey::DataDir));
+        cfg.unset(ConfigKey::DataDir);
+        assert!(!cfg.is_set(ConfigKey::DataDir));
+        assert_eq!(cfg.effective(ConfigKey::DataDir), before);
     }
 
     #[test]
@@ -453,8 +340,11 @@ mod tests {
 
     #[test]
     fn document_roundtrips_and_rejects_unknown_keys() {
-        let cfg = Config::parse_document("java-source = \"azul\"\n").expect("parse");
-        assert_eq!(cfg.resolved_java_source(), "azul");
+        let cfg = Config::parse_document("data-dir = \"/tmp/mcsup-data\"\n").expect("parse");
+        assert_eq!(
+            cfg.effective(ConfigKey::DataDir),
+            PathBuf::from("/tmp/mcsup-data")
+        );
         let text = cfg.to_document().expect("serialize");
         assert!(text.starts_with(FEATURE_HEADER), "{text}");
         let again = Config::parse_document(&text).expect("reparse");
@@ -465,7 +355,15 @@ mod tests {
             "未知键必须拒绝"
         );
         assert!(
-            Config::parse_document("java-source = \"nope\"\n").is_err(),
+            Config::parse_document("download-mirror = \"mojang\"\n").is_err(),
+            "已移除的键必须拒绝"
+        );
+        assert!(
+            Config::parse_document("java-source = \"azul\"\n").is_err(),
+            "已移除的键必须拒绝"
+        );
+        assert!(
+            Config::parse_document("data-dir = \"   \"\n").is_err(),
             "非法取值必须拒绝"
         );
     }

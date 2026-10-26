@@ -21,13 +21,12 @@ pub(crate) async fn run(
     file: &ConfigFile,
     only: &[String],
     strict: bool,
-    offline: bool,
     printer: Printer,
 ) -> Result<()> {
     validate_only(only)?;
-    let doctor = collect(file, offline);
-    // 来源连通性是真请求：没有回显时断网会像卡死
-    let spinner = TaskSpinner::new("检查运行环境", printer.is_human() && !offline);
+    let doctor = collect(file);
+    // 全程本地检查，正常一瞬即过；spinner 只为极慢磁盘上的探写兜底
+    let spinner = TaskSpinner::new("检查运行环境", printer.is_human());
     let report = doctor.run().await;
     spinner.finish();
 
@@ -43,15 +42,13 @@ pub(crate) async fn run(
         .filter(|f| f.severity() == Severity::Error)
         .count();
     let warnings = findings.len() - errors;
-    let online = report.is_online();
 
     if printer.is_human() {
-        render_human(&findings, online, printer);
+        render_human(&findings, printer);
     }
 
     let payload = PlatformDoctorJson {
         schema: 1,
-        online,
         has_errors: errors > 0,
         errors,
         warnings,
@@ -100,7 +97,7 @@ fn validate_only(only: &[String]) -> Result<()> {
 ///
 /// 配置读不出来、组合根装不起来、注册表打不开都不让本命令失败：
 /// 每一处都降级成一条发现，让报告本身说清是哪一层坏了。
-fn collect(file: &ConfigFile, offline: bool) -> PlatformDoctor {
+fn collect(file: &ConfigFile) -> PlatformDoctor {
     let (cfg, config_error) = match file.load() {
         Ok(cfg) => (cfg, None),
         Err(err) => (mcsup::service::Config::default(), Some(format!("{err:#}"))),
@@ -115,29 +112,20 @@ fn collect(file: &ConfigFile, offline: bool) -> PlatformDoctor {
     let sources = mcsup
         .as_ref()
         .map_or_else(Vec::new, |m| m.jar_sources.clone());
-    let available: Vec<&'static str> = mcsup
-        .as_ref()
-        .map_or_else(Vec::new, |m| m.java.source_names());
-
     let mut doctor = PlatformDoctor::new(
-        cfg,
         file.path().to_path_buf(),
         data_dir,
         java,
         java_scanned,
         sources,
-        available,
     );
     if let Some(reason) = config_error {
         doctor = doctor.with_config_error(reason);
     }
-    if offline {
-        doctor = doctor.offline();
-    }
     doctor
 }
 
-fn render_human(findings: &[&PlatformFinding], online: bool, printer: Printer) {
+fn render_human(findings: &[&PlatformFinding], printer: Printer) {
     if findings.is_empty() {
         printer.print_section("检查通过：运行环境可用");
     } else {
@@ -158,9 +146,6 @@ fn render_human(findings: &[&PlatformFinding], online: bool, printer: Printer) {
             }
         }
     }
-    if !online {
-        printer.print_section("已跳过联网检查（--offline）");
-    }
 }
 
 /// 结构化字段：与 `PlatformCheck` 同源，kind 与 detail 不可能不一致
@@ -173,24 +158,8 @@ fn detail_json(check: &PlatformCheck) -> Value {
         | PlatformCheck::ConfigInvalid { path, reason } => {
             serde_json::json!({ "kind": check.as_str(), "path": path, "reason": reason })
         }
-        PlatformCheck::ConfigSourceUnknown {
-            key,
-            value,
-            choices,
-        } => serde_json::json!({
-            "kind": check.as_str(),
-            "key": key,
-            "value": value,
-            "choices": choices,
-        }),
         PlatformCheck::JavaMissing { path, version } => {
             serde_json::json!({ "kind": check.as_str(), "path": path, "version": version })
-        }
-        PlatformCheck::SourceUnreachable { source, reason } => {
-            serde_json::json!({ "kind": check.as_str(), "source": source, "reason": reason })
-        }
-        PlatformCheck::SourceEmpty { source } => {
-            serde_json::json!({ "kind": check.as_str(), "source": source })
         }
         // 无额外字段的类型：保留最小形状
         _ => serde_json::json!({ "kind": check.as_str() }),

@@ -238,7 +238,7 @@ JVM 安装在平台数据目录 `{data_dir}/mcsup/java/`，不属于任何工作
 
 | 子命令 | 用法 | 说明 |
 | --- | --- | --- |
-| `doctor` | `mcsup doctor [--only <kind,...>] [--strict] [--offline]` | 平台环境自检：数据目录可写、配置可解析、Java 可用、来源可达。error 级非零退出；`--only` 按检查项标识过滤（只影响展示与退出码，检查本身全跑），`--strict` 让 warning 也算失败；`--offline` 跳过联网检查并在报告里标注「已跳过」，不伪装成通过 |
+| `doctor` | `mcsup doctor [--only <kind,...>] [--strict]` | 平台环境自检：数据目录可写、配置可解析、Java 可用、来源已装配。完全离线，不发任何网络请求。error 级非零退出；`--only` 按检查项标识过滤（只影响展示与退出码，检查本身全跑），`--strict` 让 warning 也算失败 |
 | `config` | `mcsup config show \| set <key> <value> \| unset <key> \| edit` | 查看/修改/重置/编辑平台配置；`edit` 打开 `$VISUAL` / `$EDITOR`，非交互下退 2 |
 | `update` | `mcsup update [--version <v>]` | 升级 mcsup 自身 |
 | `completions` | `mcsup completions <zsh\|bash\|fish>` | 生成 shell 补全脚本 |
@@ -254,15 +254,14 @@ JVM 安装在平台数据目录 `{data_dir}/mcsup/java/`，不属于任何工作
 | `data-dir-missing` | warning | 数据目录尚未创建（首次写元数据时自动创建） |
 | `data-dir-not-writable` | error | 数据目录存在但写入探测失败 |
 | `config-invalid` | error | `config.toml` 无法解析或取值非法 |
-| `config-source-unknown` | error | 配置里的来源名未在 provider 注册 |
 | `no-java` | error | 没有可用的 Java 运行时 |
 | `no-java-scanned` | warning | 已扫描过本机但未发现 Java |
 | `java-missing` | error | 登记的 Java 路径已不在磁盘上 |
-| `no-jar-source` | error | 没有可用的服务端下载源 |
-| `source-unreachable` | error | 来源不可达（`--offline` 时不出此项） |
-| `source-empty` | error | 来源返回空版本列表（`--offline` 时不出此项） |
+| `no-jar-source` | error | 没有可用的服务端下载源（内置来源装配失败） |
 
 `doctor` 只读：不建目录、不改配置、不写注册表，修复由报告里的 `fix` 提示引导用户执行。
+自检**完全离线**：只读本机状态，不检查来源连通性、不拉取版本列表——上游可达性属于
+「现在能不能下载」而非「环境有没有问题」。
 
 ### config.toml 键表
 
@@ -272,8 +271,6 @@ JVM 安装在平台数据目录 `{data_dir}/mcsup/java/`，不属于任何工作
 | 键 | 类型 | 取值 | 缺省 |
 | --- | --- | --- | --- |
 | `data-dir` | 路径 | 绝对路径；`~` 展开，相对路径按当前目录展开，只做词法规整不解析符号链接 | 系统数据目录下的 `mcsup` |
-| `download-mirror` | 枚举 | `mojang` | `mojang` |
-| `java-source` | 枚举 | `adoptium` / `azul` / `foojay` | `all`（全部内置来源） |
 
 写入走「临时文件 → fsync → rename」，写入失败时旧配置原样保留；校验在落地前完成，
 取值非法时文件不会被创建或改动。

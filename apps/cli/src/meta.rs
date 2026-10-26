@@ -123,14 +123,6 @@ pub(crate) fn doctor_strict_arg() -> &'static str {
 }
 
 #[must_use]
-pub(crate) fn doctor_offline_arg() -> &'static str {
-    t(
-        "跳过联网检查（来源连通性）",
-        "skip network checks (source reachability)",
-    )
-}
-
-#[must_use]
 pub(crate) fn config() -> &'static str {
     t("查看 / 编辑平台配置", "view or edit platform configuration")
 }

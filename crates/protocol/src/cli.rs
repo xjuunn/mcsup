@@ -423,8 +423,6 @@ pub struct PlatformFindingJson<'a> {
 pub struct PlatformDoctorJson<'a> {
     /// 行格式版本
     pub schema: u32,
-    /// 是否跑了联网检查
-    pub online: bool,
     /// 是否存在 error 级发现
     pub has_errors: bool,
     /// error 级数量

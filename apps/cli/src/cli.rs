@@ -93,8 +93,6 @@ pub(crate) enum Command {
         only: Vec<String>,
         #[arg(long, help = crate::meta::doctor_strict_arg())]
         strict: bool,
-        #[arg(long, help = crate::meta::doctor_offline_arg())]
-        offline: bool,
     },
     #[command(about = crate::meta::config())]
     #[command(visible_alias = "cfg")]

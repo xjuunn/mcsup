@@ -787,7 +787,7 @@ fn config_show_without_file_reports_defaults() {
         .iter()
         .map(|i| i["key"].as_str().expect("key"))
         .collect();
-    assert_eq!(keys, ["data-dir", "download-mirror", "java-source"]);
+    assert_eq!(keys, ["data-dir"]);
     assert!(items.iter().all(|i| i["source"] == "default"), "{items:?}");
 }
 
@@ -798,24 +798,19 @@ fn config_set_show_unset_roundtrip() {
     let config = home.path().join("custom").join("config.toml");
     let config = config.to_str().expect("utf8");
 
+    let dir = home.path().join("custom-data");
+    let dir = dir.to_str().expect("utf8");
     let set = run(
         home.path(),
         &[
-            "--config",
-            config,
-            "config",
-            "set",
-            "java-source",
-            "azul",
-            "--output",
-            "json",
+            "--config", config, "config", "set", "data-dir", dir, "--output", "json",
         ],
     );
     assert_eq!(set.status.code(), Some(0), "stderr: {}", stderr(&set));
     let set_payload: serde_json::Value =
         serde_json::from_slice(&set.stdout).expect("config set 单行对象");
-    assert_eq!(set_payload["key"], "java-source");
-    assert_eq!(set_payload["value"], "azul");
+    assert_eq!(set_payload["key"], "data-dir");
+    assert_eq!(set_payload["value"], dir);
     assert_eq!(set_payload["previous"], serde_json::Value::Null);
 
     let show = run(
@@ -825,49 +820,36 @@ fn config_set_show_unset_roundtrip() {
     assert_eq!(show.status.code(), Some(0), "stderr: {}", stderr(&show));
     let show_payload: serde_json::Value = serde_json::from_slice(&show.stdout).expect("show");
     assert_eq!(show_payload["exists"], true);
-    let java = show_payload["items"]
+    let data_dir = show_payload["items"]
         .as_array()
         .expect("items")
         .iter()
-        .find(|i| i["key"] == "java-source")
-        .expect("java-source 行");
-    assert_eq!(java["value"], "azul");
-    assert_eq!(java["source"], "file");
+        .find(|i| i["key"] == "data-dir")
+        .expect("data-dir 行");
+    assert_eq!(data_dir["value"], dir);
+    assert_eq!(data_dir["source"], "file");
 
     let unset = run(
         home.path(),
         &[
-            "--config",
-            config,
-            "config",
-            "unset",
-            "java-source",
-            "--output",
-            "json",
+            "--config", config, "config", "unset", "data-dir", "--output", "json",
         ],
     );
     assert_eq!(unset.status.code(), Some(0), "stderr: {}", stderr(&unset));
     let unset_payload: serde_json::Value = serde_json::from_slice(&unset.stdout).expect("unset");
-    assert_eq!(unset_payload["value"], "all");
-    assert_eq!(unset_payload["previous"], "azul");
+    assert_eq!(unset_payload["previous"], dir);
+    assert_ne!(unset_payload["value"], dir);
 
     // 已是缺省再 unset：幂等成功，不制造「改了什么」的错觉
     let again = run(
         home.path(),
         &[
-            "--config",
-            config,
-            "config",
-            "unset",
-            "java-source",
-            "--output",
-            "json",
+            "--config", config, "config", "unset", "data-dir", "--output", "json",
         ],
     );
     assert_eq!(again.status.code(), Some(0), "stderr: {}", stderr(&again));
     let again_payload: serde_json::Value = serde_json::from_slice(&again.stdout).expect("unset2");
     assert_eq!(again_payload["previous"], serde_json::Value::Null);
-    assert_eq!(again_payload["value"], "all");
 }
 
 /// 键名拼错 → 用法错误 2，并列出可用键
@@ -891,19 +873,12 @@ fn config_set_invalid_value_exits_2_and_writes_nothing() {
     let out = run(
         home.path(),
         &[
-            "--config",
-            config,
-            "config",
-            "set",
-            "java-source",
-            "nope",
-            "--lang",
-            "zh",
+            "--config", config, "config", "set", "data-dir", "   ", "--lang", "zh",
         ],
     );
     assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
     let err = stderr(&out);
-    assert!(err.contains("adoptium"), "{err}");
+    assert!(err.contains("不是可用路径"), "{err}");
     assert!(!Path::new(config).exists(), "校验失败不得写文件");
 }
 
@@ -917,17 +892,15 @@ fn config_edit_without_tty_exits_2() {
     assert!(stderr(&out).contains("交互终端"), "{}", stderr(&out));
 }
 
-/// `doctor --offline` 跳过联网检查：payload 明说 `online: false`，不伪装成通过
+/// `doctor` 完全离线：不再有联网检查项，也不暴露 `online` 字段
 #[test]
-fn doctor_offline_json_reports_online_false() {
+fn doctor_is_offline_and_reports_no_network_checks() {
     let home = temp_home();
-    let out = run(home.path(), &["doctor", "--offline", "--output", "json"]);
+    let out = run(home.path(), &["doctor", "--output", "json"]);
     let payload: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("doctor 必须输出单个 JSON 对象");
-    assert_eq!(payload["online"], false, "{payload}");
     assert_eq!(payload["schema"], 1);
-    assert!(payload["findings"].is_array(), "{payload}");
-    // 离线时不能出现联网检查项的结论
+    assert!(payload.get("online").is_none(), "{payload}");
     let findings = payload["findings"].as_array().expect("findings");
     assert!(
         findings
@@ -935,6 +908,14 @@ fn doctor_offline_json_reports_online_false() {
             .all(|f| f["kind"] != "source-unreachable" && f["kind"] != "source-empty"),
         "{findings:?}"
     );
+}
+
+/// `--offline` 已移除：再传应按用法错误退 2
+#[test]
+fn doctor_rejects_removed_offline_flag() {
+    let home = temp_home();
+    let out = run(home.path(), &["doctor", "--offline"]);
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
 }
 
 /// `doctor --only` 拼错 → 用法错误 2，列出可用检查项
@@ -959,7 +940,6 @@ fn doctor_reports_invalid_config() {
             "--config",
             config.to_str().expect("utf8"),
             "doctor",
-            "--offline",
             "--output",
             "json",
         ],

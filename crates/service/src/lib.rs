@@ -31,10 +31,7 @@ pub use lifecycle::{
     BusyOp, DEFAULT_RAM_MIB, LifecycleError, LifecycleErrorKind, LogWatch, ServerLifecycleService,
     StartOptions, StatusReport,
 };
-pub use platform_config::{
-    Config, ConfigKey, ConfigValueError, EffectiveValue, FEATURE_HEADER, JAVA_SOURCE_ALL,
-    lexical_normalize,
-};
+pub use platform_config::{Config, ConfigKey, ConfigValueError, FEATURE_HEADER, lexical_normalize};
 pub use platform_doctor::{PlatformCheck, PlatformDoctor, PlatformFinding, PlatformReport};
 /// Java 源聚合端口（定义在 `port`，此处转出便于既有调用方）
 pub use port::JavaSourceRegistryPort;

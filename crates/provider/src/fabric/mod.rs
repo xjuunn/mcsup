@@ -10,7 +10,7 @@
 //! CLI 与库侧组合根都只用 [`FabricSource::new`]，即官方 Meta。要改镜像地址或
 //! 固定 loader / installer，用 [`FabricSource::builder`] 自行构造后注入
 //! `McsupBuilder::jar_sources`——宿主接管来源装配时才会走到这条路径。
-//! 该构造器目前没有配置项驱动（`download-mirror` 只有 `mojang`），属于宿主侧的
+//! 该构造器目前没有配置项驱动，属于宿主侧的
 //! 扩展点而非 CLI 可达能力。
 
 mod client;
