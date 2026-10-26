@@ -10,7 +10,7 @@
 - **服务属性统一 `server set`**：JVM 绑定、内存、自启等一律
   `mcsup server set <name> <key> <value>`，不为一类属性单开子命令；
   TTY 下缺 key / value 交互补齐。
-- **机器级命令**：`java`（本机 JVM 运行时）、`remote`（远端执行位置）。
+- **机器级命令**：`java`（本机 JVM 运行时）、`remote`（远端接入与管理）。
 - **平台级命令直接动作**：`doctor` / `config` / `update` 等；工作目录经
   `workspace` 子命令管理。
 - **服务器只能建在已注册工作目录下**：`--workspace <名>` 按名选择，
@@ -123,7 +123,7 @@ restart / status / console / send / logs / props / set / remove / version`、
 | `server mod` | `ls` list · `in` install · `rm` remove · `up` update · `od` outdated |
 | `modpack` | `ls` list · `in` install |
 | `java` | `ls` list · `sc` scan · `in` install · `un` / `rm` uninstall |
-| `remote` | `ls` list · `dp` deploy · `pg` ping · `rm` remove |
+| `remote` | `ls` list · `sv` serve · `con` connect · `st` status · `pg` ping · `dc` disconnect · `rv` revoke |
 | `config` | `ls` show · `st` set · `us` unset · `ed` edit |
 
 ## 命令层级
@@ -131,10 +131,10 @@ restart / status / console / send / logs / props / set / remove / version`、
 ```
 mcsup
 ├── workspace (ws)            # 工作区：创建 / 注册表 / 当前切换
-│   ├── init (in|new) [--dir <path>] [--name <name>]
-│   ├── list (ls) / use (sw) [<name>] / remove (rm) <name> [--purge] / doctor (doc)
+│   ├── init (in|new) [--dir <path>] [--name <name>] [--origin <名字>]
+│   ├── list (ls) [--origin <o>] / use (sw) [<name>] / remove (rm) <name> [--purge] / doctor (doc)
 ├── server (srv)              # 单台服务：生命周期 + 属主内容
-│   ├── list (ls) / create (cr) / link (ln) / install (in)
+│   ├── list (ls) [--origin <o>] / create (cr) [--origin <名字>] / link (ln) / install (in)
 │   ├── start (up) / stop (down) / restart (rs)
 │   ├── status (st) / console (con) / send (snd) / logs (log)
 │   ├── props (prop) / set (cfg) / remove (rm) / version (ver)
@@ -144,9 +144,11 @@ mcsup
 │   ├── install (in) <pack> [--name <name>] [--workspace <ws>]
 │   └── list (ls) [<query>]
 ├── java (jv)                 # 机器级 JVM 运行时
-│   └── list (ls) / scan (sc) / install (in) / uninstall (un|rm)
+│   └── list (ls) [--origin <o>] / scan (sc) / install (in) / uninstall (un|rm)
 ├── remote (rmt)              # 远端执行位置（Backend）
-│   └── list (ls) / deploy (dp) / ping (pg) / remove (rm)
+│   ├── serve (sv) [--listen <addr>] [--name <n>] / serve --stop / serve --status
+│   ├── connect (con) [<user@host> | <host[:port]>] [--name <n>] [--read-only]
+│   └── list (ls) / status (st) / ping (pg) / disconnect (dc) / revoke (rv)
 └── doctor (doc) / config (cfg) / update (up)
     / completions (comp) / version (ver) / help
 ```
@@ -164,8 +166,8 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 
 | 子命令 | 用法 | 说明 |
 | --- | --- | --- |
-| `list` | `mcsup server list` | 列出所有服务与状态 |
-| `create` | `mcsup server create [<name>] [--version <ver>] [--variant <v>] [--workspace <名或路径>] [--workspace-name <名>] [--workspace-dir <路径>]` | 建站并下载核心 JAR（变体从可用能力列选，缺省 vanilla；版本交互从列表选，也接受 `latest` / `lts` / `latest-snapshot` 别名，`lts` 等价 `latest`）。`--workspace` 命中已有工作区直接使用，未命中时配合 `--workspace-name` / `--workspace-dir` 新建；名称与路径不一致 → 退出码 2。TTY 缺名/缺版本进向导（名称重输直到唯一，步骤回显 `[n/3]`，参数给定则跳过对应步）；无工作区且可交互时先复用 `workspace init` 向导再继续；非 TTY 缺 `--version` 或缺名 → 退出码 2；显式变体未知/未支持 → 2 并列出可用变体；下载失败保留已注册结果，提示 `mcsup server install <name>` 重试。`--variant forge` 走「下载安装器 + 运行 `--installServer`」两步；`neoforge` 同理 |
+| `list` | `mcsup server list [--origin <all\|local\|remote\|名字>]` | 列出所有服务与状态；`--origin` 按来源过滤（缺省 `all`），见 `docs/remote.md` |
+| `create` | `mcsup server create [<name>] [--version <ver>] [--variant <v>] [--workspace <名或路径>] [--workspace-name <名>] [--workspace-dir <路径>] [--origin <名字>]` | 建站并下载核心 JAR；`--origin` 选择远端落点，缺省跟随当前工作区的来源（变体从可用能力列选，缺省 vanilla；版本交互从列表选，也接受 `latest` / `lts` / `latest-snapshot` 别名，`lts` 等价 `latest`）。`--workspace` 命中已有工作区直接使用，未命中时配合 `--workspace-name` / `--workspace-dir` 新建；名称与路径不一致 → 退出码 2。TTY 缺名/缺版本进向导（名称重输直到唯一，步骤回显 `[n/3]`，参数给定则跳过对应步）；无工作区且可交互时先复用 `workspace init` 向导再继续；非 TTY 缺 `--version` 或缺名 → 退出码 2；显式变体未知/未支持 → 2 并列出可用变体；下载失败保留已注册结果，提示 `mcsup server install <name>` 重试。`--variant forge` 走「下载安装器 + 运行 `--installServer`」两步；`neoforge` 同理 |
 | `install` | `mcsup server install [<name>] [--version <ver>]` | 给既有服务安装/更换服务端核心（JAR），校验后落盘；交互无 `--version` 从版本列表选择（Release/Snapshot/旧版标注），非 TTY 缺省 `latest` 解析为 manifest 当前稳定版；服务器不存在 → 退出码 3。变体为 `forge` / `neoforge` 时要先运行安装器，缺可用 Java → 退出码 3 并提示先装 Java |
 | `start` | `mcsup server start [<name>] [--accept-eula]` | 经后台 supervisor 拉起 JVM（`server set java-version` 绑定了大版本则用该版本，否则取已注册 Java 最高大版本；核心 JAR 取已安装项；堆上限 `server set ram` 优先、缺省 2048 MiB），返回 supervisor PID；EULA 未同意时 TTY 询问，非交互缺 `--accept-eula` → 退出码 2；已在运行 → 4；无核心 / 无 Java / 绑定大版本无运行时 → 3；spawn / IPC 失败 → 5 |
 | `stop` | `mcsup server stop [<name>] [--grace <sec>] [--force]` | 先优雅停机（默认宽限 30s），宽限后 `--force` 强杀；未在运行幂等成功（exit 0）；超时未 `--force` → 退出码 1 并提示 `--force` |
@@ -226,9 +228,9 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 
 | 子命令 | 用法 | 说明 |
 | --- | --- | --- |
-| `init` | `mcsup workspace init [--dir <path>] [--name <name>]` | 创建并注册工作目录；无 `--dir` 进入交互（默认当前目录），目录必须为空 |
-| `list` | `mcsup workspace list` | 已注册工作目录：名称、路径、服务器数、是否当前 |
-| `use` | `mcsup workspace use [<name>]` | 切换当前工作区；不带名字在 TTY 下交互选择；只影响 `create` / `link` 缺省落点，不隐藏其他目录的服务器 |
+| `init` | `mcsup workspace init [--dir <path>] [--name <name>] [--origin <名字>]` | 创建并注册工作目录；无 `--dir` 进入交互（默认当前目录），目录必须为空；`--dir` 是目标机器上的路径，`--origin` 选择远端，缺省本地 |
+| `list` | `mcsup workspace list [--origin <all\|local\|remote\|名字>]` | 已注册工作目录：名称、来源、路径、服务器数、是否当前；`--origin` 按来源过滤（缺省 `all`） |
+| `use` | `mcsup workspace use [<name>]` | 切换当前工作区；接受 `origin/name` 限定名；不带名字在 TTY 下交互选择；只影响 `create` / `link` 缺省落点，不隐藏其他目录的服务器 |
 | `remove` | `mcsup workspace remove [<name>] [--purge]` | 注销工作目录，同时清除该工作目录下的服务器登记；交互下询问是否删除磁盘数据（默认不删），同意后红色警示并要求输入工作区名称确认，`--purge` 跳过询问直接删除；删盘的前置条件（终端工作目录不在该工作区内、目录里的 `workspace.toml` 属于该记录）在确认框之前就校验，不满足立刻报错；终端工作目录就在该工作区内时拒绝（退出码 4，cd 出去后重试）；删除失败（目录被占用）保留注册，退出占用后重试即可；JSON 同时输出 `purged`（请求了删盘）与 `disk_purged`（磁盘真的删了），目录本就不存在时后者为 `false`；删除当前工作区时当前标记移交给剩余中按名称排序的第一个 |
 | `doctor` | `mcsup workspace doctor [--only <kind,...>] [--strict]` | 只读体检工作区与注册表一致性：10 项检查（见 `docs/workspace.md` 的表），error 级非零退出；`--only` 按检查项标识过滤，`--strict` 让 warning 也算失败 |
 
@@ -246,7 +248,7 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 
 | 子命令 | 用法 | 说明 |
 | --- | --- | --- |
-| `list` | `mcsup java list` | 已注册运行时；未扫描过则自动扫描本机 |
+| `list` | `mcsup java list [--origin <all\|local\|remote\|名字>]` | 已注册运行时；未扫描过则自动扫描本机；`--origin` 按来源过滤（缺省 `all`） |
 | `scan` | `mcsup java scan` | 重新扫描本机已安装的 Java |
 | `install` | `mcsup java install [<version>] [--jre] [--vendor <name>]` | 从远端下载安装 JDK（默认）或 JRE；缺省版本时交互选择 |
 | `uninstall` | `mcsup java uninstall [<version或路径>] [--dir <路径>]` | 卸载；系统 Java 仅移除注册记录，文件保留。缺目标时 TTY 下从已注册运行时中交互选择（无注册运行时提示先 `java scan`）；同一 major 多个运行时且在 TTY 下交互选择；非 TTY 须用 `--dir` 显式指定路径 |
@@ -257,14 +259,44 @@ JVM 安装在平台数据目录 `{data_dir}/mcsup/java/`，不属于任何工作
 
 ## mcsup remote（远端执行位置 = Backend）
 
+接入只需两侧各一条命令：被连接端 `mcsup remote serve`，连接端
+`mcsup remote connect`。之后 `workspace` / `server` / `java` / `backup`
+命令完全不变，远端资源以 `ORIGIN` 列出现在原有列表中。完整设计见
+`docs/remote.md`。
+
 | 子命令 | 用法 | 说明 |
 | --- | --- | --- |
-| `list` | `mcsup remote list` | 已注册远端与连接状态 |
-| `deploy` | `mcsup remote deploy <name> <host> [--token <t>]` | 在远端安装/注册代理 |
-| `ping` | `mcsup remote ping <name>` | 连通性与版本握手 |
-| `remove` | `mcsup remote remove <name>` | 注销远端（远端进程需另停） |
+| `serve` | `mcsup remote serve [--listen <addr>] [--name <n>]` | 本机作为被连接端：启动 agent、注册为系统服务、打印名称 / 地址 / 配对码 |
+| `serve --stop` | `mcsup remote serve --stop` | 停止并移除本机系统服务 |
+| `serve --status` | `mcsup remote serve --status` | 本机服务状态、监听地址、已配对客户端 |
+| `connect` | `mcsup remote connect [<user@host> \| <host[:port]>] [--name <n>] [--read-only]` | 配对远端；无参数时局域网发现 + 配对码；`user@host` 复用 SSH 信任 |
+| `list` | `mcsup remote list` | 已配对远端、连接状态、权限、agent 版本 |
+| `status` | `mcsup remote status [<name>]` | 单个远端详情 |
+| `ping` | `mcsup remote ping <name>` | 连通性 / 版本 / 能力，供脚本使用 |
+| `disconnect` | `mcsup remote disconnect <name>` | 删除本地配对与缓存，远端不受影响 |
+| `revoke` | `mcsup remote revoke <client>` | 在 serve 端撤销某个客户端，token 立即失效 |
 
-远端与本地共享同一套 `server` 命令，差异只体现在 Backend 执行位置上。
+不带子命令的 `mcsup remote` 显示本机服务状态与已配对远端。
+
+### 来源（origin）与过滤
+
+每个资源带一个来源：`local` 或远端名。名字在本地与所有远端之间可能重名，
+解析顺序为「`origin/name` 限定名 → 全局唯一 → 报错并列出候选」。
+
+列表命令统一支持 `--origin`：
+
+| 取值 | 含义 |
+| --- | --- |
+| `all`（缺省） | 本地 + 全部已配对远端 |
+| `local` | 仅本地 |
+| `remote` | 全部远端，不含本地 |
+| `<name>` | 指定远端 |
+
+- 缺省值可由环境变量 `MCSUP_ORIGIN` 覆盖，优先级 `flag > 环境变量 > all`。
+- `all` / `local` / `remote` 是保留字，不能用作远端名；远端名禁止包含 `/`。
+- 过滤只影响展示与返回集合，不改变命令语义；过滤后为空是成功（退出码 0）。
+- 人类输出增加 `ORIGIN` 列；JSON 每项增加 `origin` 字段。
+- 远端不可达时保留缓存条目，标记 `(offline)`；JSON 用 `available: false`。
 
 ## 平台级
 
