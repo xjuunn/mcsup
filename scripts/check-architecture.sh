@@ -343,7 +343,7 @@ if [ -f "$pkg_manifest" ] && [ -f "$pkg_lib" ]; then
 		storage) printf '%s' 'domain port storage' ;;
 		runtime) printf '%s' 'domain port protocol runtime' ;;
 		backup) printf '%s' 'domain port backup' ;;
-		backend) printf '%s' 'domain port protocol backend backup runtime storage' ;;
+		backend) printf '%s' 'domain port protocol backend backup runtime' ;;
 		# 组合 feature：一次拉入全部内层（默认组合根）
 		bootstrap) printf '%s' 'domain port protocol service backup backend file java provider storage runtime' ;;
 		*) printf '%s' '' ;;

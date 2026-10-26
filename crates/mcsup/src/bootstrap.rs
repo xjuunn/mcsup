@@ -150,6 +150,7 @@ pub struct McsupBuilder {
     extractor: Option<Arc<dyn port::ArchiveExtractor>>,
     supervisor: Option<Arc<dyn port::SupervisorPort>>,
     backend: Option<Arc<dyn port::Backend>>,
+    backup_store: Option<Arc<dyn port::BackupStore>>,
     events: Option<Arc<dyn port::EventSink>>,
     jar_sources: Option<Vec<Arc<dyn ServerJarSource>>>,
 }
@@ -167,6 +168,7 @@ impl std::fmt::Debug for McsupBuilder {
             .field("extractor", &"Option<dyn …>")
             .field("supervisor", &"Option<dyn …>")
             .field("backend", &"Option<dyn …>")
+            .field("backup_store", &"Option<dyn …>")
             .field("events", &"Option<dyn …>")
             .field(
                 "jar_sources",
@@ -265,6 +267,13 @@ impl McsupBuilder {
         self
     }
 
+    /// 注入自定义备份数据能力（扫描 / CAS / 快照；默认本地文件系统）
+    #[must_use]
+    pub fn backup_store(mut self, store: Arc<dyn port::BackupStore>) -> Self {
+        self.backup_store = Some(store);
+        self
+    }
+
     /// 注入领域事件出口（默认丢弃）
     ///
     /// CLI / API / MCP / Audit / Notification 通过它订阅 `ServerStarted`、
@@ -334,15 +343,17 @@ impl McsupBuilder {
         let supervisor: Arc<dyn port::SupervisorPort> = self
             .supervisor
             .unwrap_or_else(|| Arc::new(runtime::LocalSupervisor));
-        // 执行位置：默认 supervisor / installer + 已解析的仓库，交给 Backend 聚合
+        // 执行位置：只聚合进程生命周期与安装器；存储/备份是另一个能力轴
         let backend: Arc<dyn port::Backend> = match self.backend {
             Some(backend) => backend,
             None => Arc::new(backend::LocalBackend::new(
                 Arc::clone(&supervisor),
                 Arc::new(runtime::LocalInstallerRunner::new()),
-                Arc::clone(&servers_repo),
-                Arc::clone(&workspaces_repo),
             )),
+        };
+        let backup_store: Arc<dyn port::BackupStore> = match self.backup_store {
+            Some(store) => store,
+            None => Arc::new(backend::LocalBackupStore),
         };
         let workspaces =
             WorkspaceService::new(Arc::clone(&workspaces_repo), Arc::clone(&servers_repo));
@@ -351,11 +362,12 @@ impl McsupBuilder {
         let lifecycle = ServerLifecycleService::with_events(
             Arc::clone(&registry),
             java.clone(),
-            Arc::clone(&supervisor),
+            Arc::clone(&backend),
             Arc::clone(&events),
         );
-        let backup = service::BackupService::new(Arc::clone(&registry), Arc::clone(&backend))
-            .with_events(events);
+        let backup =
+            service::BackupService::new(Arc::clone(&registry), Arc::clone(&backend), backup_store)
+                .with_events(events);
 
         let jar_sources: Vec<Arc<dyn ServerJarSource>> = match self.jar_sources {
             Some(sources) => sources,

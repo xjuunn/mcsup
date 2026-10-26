@@ -341,7 +341,7 @@ impl JavaService {
         // 取消落在解析完成与下载发起之间：下载器入口也会查，这里兜底让任何
         // ArtifactDownloader 实现（含不查取消的）都受控，且目录尚未被使用
         if cancel.is_cancelled() {
-            cleanup_partial_install(&install_dir, &destination, dir_preexisting);
+            cleanup_blocking(&install_dir, &destination, dir_preexisting).await;
             return Err(JavaError::Download(port::DownloadError::Cancelled));
         }
 
@@ -356,14 +356,14 @@ impl JavaService {
             Ok(artifact) => artifact,
             Err(err) => {
                 // 下载器已清自己的 .tmp，这里回收目录本身；取消同走此路径
-                cleanup_partial_install(&install_dir, &destination, dir_preexisting);
+                cleanup_blocking(&install_dir, &destination, dir_preexisting).await;
                 return Err(err.into());
             }
         };
 
         // Ctrl-C 落在下载完成与解压之间：不启动耗时的解压，直接回收
         if cancel.is_cancelled() {
-            cleanup_partial_install(&install_dir, &destination, dir_preexisting);
+            cleanup_blocking(&install_dir, &destination, dir_preexisting).await;
             return Err(JavaError::Download(port::DownloadError::Cancelled));
         }
 
@@ -381,7 +381,8 @@ impl JavaService {
         {
             Ok(home) => home,
             Err(err) => {
-                cleanup_partial_install(&install_dir, &destination, dir_preexisting);
+                // 清理可能删数百 MB：放到阻塞线程池
+                cleanup_blocking(&install_dir, &destination, dir_preexisting).await;
                 return Err(err);
             }
         };
@@ -390,7 +391,8 @@ impl JavaService {
         // 回收，不留未注册的目录；重装场景旧目录已被替换，删除只会两头落空，
         // 照常注册（入口层见取消后静默退出，不打印成功）
         if cancel.is_cancelled() && !dir_preexisting {
-            let _ = std::fs::remove_dir_all(&install_dir);
+            let dir = install_dir.clone();
+            let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&dir)).await;
             return Err(JavaError::Download(port::DownloadError::Cancelled));
         }
 
@@ -510,6 +512,15 @@ fn cleanup_partial_install(install_dir: &Path, archive: &Path, dir_preexisting: 
     if !dir_preexisting {
         let _ = std::fs::remove_dir_all(install_dir);
     }
+}
+
+/// 回收放到阻塞线程池（清理可能删数百 MB，不能在 async 执行器上做）
+async fn cleanup_blocking(install_dir: &Path, archive: &Path, dir_preexisting: bool) {
+    let (dir, arch) = (install_dir.to_path_buf(), archive.to_path_buf());
+    let _ = tokio::task::spawn_blocking(move || {
+        cleanup_partial_install(&dir, &arch, dir_preexisting);
+    })
+    .await;
 }
 
 /// 取消可打断的阶段等待（轮询令牌，粒度 [`CANCEL_POLL`]）

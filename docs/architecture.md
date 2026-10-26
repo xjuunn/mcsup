@@ -195,19 +195,32 @@ Domain 不涉及 CLI、HTTP、REST、TUI、MCP、数据库、RPC / gRPC，必须
 
 Service 不负责 CLI 输出、HTTP Router、HTML、TUI 渲染、MCP 协议细节。
 
+**同步 / 异步契约**：`service` 的编排接口是同步的（文件 IO、进程探测）。
+纯异步入口（`java::install`、平台自检）内部已用 `spawn_blocking` 把重
+文件 IO 移出执行器。**同步接口不得在长驻异步运行时（`apps/server` 等）的
+请求任务里直接调用**，调用方须自行 `spawn_blocking`；CLI 是单命令进程，
+阻塞即本任务的全部工作，可直接调用。这是入口的职责，不把 `service`
+改造成 async。
+
 # Backend
 
 Backend 回答「这个操作在哪里执行」，由 `port::Backend` 定义，抽象为
 `LocalBackend` 与 `RemoteBackend`。Local 本机执行，Remote 经 transport →
 RPC → agent。
 
-`port::Backend` 只返回 `port` 内的契约（`SupervisorPort` / `InstallerRunner` /
-`ServerRepository` / `WorkspaceRepository` / `Scanner` / `ContentStore` /
-`SnapshotRepository`），`service` 只持有 `Arc<dyn Backend>`，不依赖任何实现
-crate。`crates/backend` 的 `LocalBackend` 是本机装配：组合 `runtime`、
-`storage`、`backup` 的具体实现，由门面 `bootstrap` 组合根构造。它也是唯一
-允许组合实现层的 crate（`scripts/check-architecture.sh` 断言其余实现层互不
-依赖）。
+`port::Backend` 刻意保持**窄**，只收拢真正的执行位置能力：`SupervisorPort`
+与 `InstallerRunner`。它不把存储 / 备份塞进来——那是「存到哪里」，与「在哪里
+跑」是两个不同的轴，混在一起会变成 God Trait。数据能力是独立的
+`port::BackupStore`（`Scanner` + `ContentStore` + `SnapshotRepository`）。
+
+`service` 分别持有 `Arc<dyn Backend>` 与 `Arc<dyn BackupStore>`，不依赖任何
+实现 crate。`crates/backend` 提供 `LocalBackend`（本机进程 / 安装器）与
+`LocalBackupStore`（本地文件系统 CAS / 快照），由门面 `bootstrap` 组合根构造。
+`backend` 是唯一允许组合实现层的 crate（`scripts/check-architecture.sh` 断言
+其余实现层互不依赖）。
+
+Service 里不应出现大量 `if remote { ... } else { ... }`；出现即说明抽象边界
+有问题。
 
 Service 里不应出现大量 `if remote { ... } else { ... }`；出现即说明抽象边界
 有问题。

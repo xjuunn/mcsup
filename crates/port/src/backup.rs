@@ -314,6 +314,22 @@ pub trait Scanner: Send + Sync {
     ) -> Result<ScanOutcome, ScanError>;
 }
 
+/// 备份数据能力：扫描器 + 内容寻址存储 + 快照索引
+///
+/// 与 [`crate::Backend`] 分开：这是「数据存在哪里 / 怎么存」，不是「在哪
+/// 台机器执行」。Local 用本地文件系统实现，Remote 将来可换成远端对象存储，
+/// 二者互不影响。按工作区备份根目录给出实例，让一次编排内复用。
+pub trait BackupStore: Send + Sync {
+    /// 目录扫描器
+    fn scanner(&self) -> &dyn Scanner;
+
+    /// 按工作区备份根目录给出内容寻址存储
+    fn content_store(&self, backups_root: &Path) -> std::sync::Arc<dyn ContentStore>;
+
+    /// 按工作区备份根目录给出快照索引
+    fn snapshot_repository(&self, backups_root: &Path) -> std::sync::Arc<dyn SnapshotRepository>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

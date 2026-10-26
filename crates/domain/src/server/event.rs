@@ -7,6 +7,14 @@ use crate::server::version::VersionId;
 ///
 /// 事件是「已经发生的事实」，命名用过去时；破坏性变更只加变体 / 加字段，
 /// 不改已有语义。
+///
+/// **当前由 `service` 发布的变体**：`ServerStarting`（start 返回）、
+/// `ServerStopped`（stop 成功）、`BackupCompleted`（备份完成）、
+/// `BackupFailed`（备份失败）。
+///
+/// 其余变体（`ServerStarted` / `ServerCrashed` / `JarDownload*`）是既定
+/// 词汇表，由后续的 supervision / 下载编排闭环节点发布——它们是**边沿**
+/// 事件，不能从请求路径上的无状态 `status()` 轮询里产生（否则每次轮询都重发）。
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DomainEvent {

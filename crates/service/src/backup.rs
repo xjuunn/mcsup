@@ -317,6 +317,7 @@ pub struct PruneOutcome {
 pub struct BackupService {
     registry: Arc<ServerRegistry>,
     backend: Arc<dyn Backend>,
+    store: Arc<dyn port::BackupStore>,
     events: Arc<dyn port::EventSink>,
 }
 
@@ -327,16 +328,21 @@ impl std::fmt::Debug for BackupService {
 }
 
 impl BackupService {
-    /// 组合注册表与执行位置（无事件消费者）
+    /// 组合注册表、执行位置与备份数据能力（无事件消费者）
     ///
-    /// 只依赖「探测状态 + 注入一行」与备份存储两类能力，全部经
-    /// [`port::Backend`] 取得：`service` 不直接依赖 `runtime` / `backup` /
+    /// supervisor 经 [`Backend`] 取得（探测状态 / 注入控制台命令），存储经
+    /// [`port::BackupStore`] 取得。`service` 不直接依赖 `runtime` / `backup` /
     /// `storage` 任何一个实现 crate。
     #[must_use]
-    pub fn new(registry: Arc<ServerRegistry>, backend: Arc<dyn Backend>) -> Self {
+    pub fn new(
+        registry: Arc<ServerRegistry>,
+        backend: Arc<dyn Backend>,
+        store: Arc<dyn port::BackupStore>,
+    ) -> Self {
         Self {
             registry,
             backend,
+            store,
             events: Arc::new(port::NoopEventSink),
         }
     }
@@ -353,7 +359,7 @@ impl BackupService {
     /// 解析服务器并返回（注册信息、CAS、快照索引、备份根目录）
     fn resolve(&self, name: &str) -> Result<BackupLayout, BackupError> {
         let server = self.registry.get(name)?;
-        Ok(BackupLayout::for_server(&server, self.backend.as_ref()))
+        Ok(BackupLayout::for_server(&server, self.store.as_ref()))
     }
 
     /// 服务器是否在运行
@@ -393,6 +399,25 @@ impl BackupService {
     /// 服务器不存在、范围为空、CAS / 扫描 / 记录写入失败，或注入控制台
     /// 命令失败时返回 [`BackupError`]
     pub fn create(
+        &self,
+        name: &str,
+        options: &CreateOptions,
+    ) -> Result<CreateOutcome, BackupError> {
+        match self.create_inner(name, options) {
+            Ok(outcome) => Ok(outcome),
+            Err(err) => {
+                // 失败也是事实：让消费者能统计失败率 / 告警
+                self.events
+                    .publish(domain::server::event::DomainEvent::BackupFailed {
+                        name: name.to_owned(),
+                        reason: err.to_string(),
+                    });
+                Err(err)
+            }
+        }
+    }
+
+    fn create_inner(
         &self,
         name: &str,
         options: &CreateOptions,
@@ -447,7 +472,7 @@ impl BackupService {
         // 读到一条永远无法完成的记录。
         let outcome =
             match self
-                .backend
+                .store
                 .scanner()
                 .scan(&layout.dir, layout.cas.as_ref(), &rules, &mut |_| {})
             {
@@ -786,14 +811,14 @@ struct BackupLayout {
 
 impl BackupLayout {
     /// 按产品口径装配：CAS 落在工作区的 `backups/`
-    fn for_server(server: &RegisteredServer, backend: &dyn Backend) -> Self {
+    fn for_server(server: &RegisteredServer, store: &dyn port::BackupStore) -> Self {
         let workspace = server_workspace(&server.dir, &server.meta.rel_dir);
         let root = workspace_backups_root(&workspace);
         Self {
             dir: server.dir.clone(),
             workspace,
-            cas: backend.content_store(&root),
-            index: backend.snapshot_repository(&root),
+            cas: store.content_store(&root),
+            index: store.snapshot_repository(&root),
         }
     }
 }
@@ -1434,12 +1459,22 @@ mod tests {
 
     // ---- 夹具 ----
 
-    /// 测试用 `Backend`：真实 CAS / 快照 / 扫描 + 内存仓库 + 假 supervisor
+    /// 测试用执行位置：只承载假 supervisor
     struct TestBackend {
         supervisor: Arc<FakeSupervisor>,
-        servers: Arc<dyn ServerRepository>,
-        workspaces: Arc<dyn WorkspaceRepository>,
-        cas: Arc<dyn ContentStore>,
+    }
+
+    struct NoopInstaller;
+    impl InstallerRunner for NoopInstaller {
+        fn run_installer(
+            &self,
+            _java_bin: &Path,
+            _installer: &Path,
+            _dir: &Path,
+            _cancel: &port::CancellationToken,
+        ) -> Result<(), port::InstallerError> {
+            unreachable!("not used")
+        }
     }
 
     impl Backend for TestBackend {
@@ -1447,14 +1482,16 @@ mod tests {
             self.supervisor.as_ref()
         }
         fn installer(&self) -> &dyn InstallerRunner {
-            unreachable!("not used")
+            &NoopInstaller
         }
-        fn servers(&self) -> &dyn ServerRepository {
-            self.servers.as_ref()
-        }
-        fn workspaces(&self) -> &dyn WorkspaceRepository {
-            self.workspaces.as_ref()
-        }
+    }
+
+    /// 测试用备份数据：真实 CAS / 快照 / 扫描
+    struct TestStore {
+        cas: Arc<dyn ContentStore>,
+    }
+
+    impl port::BackupStore for TestStore {
         fn scanner(&self) -> &dyn Scanner {
             &backup::DirectoryScanner
         }
@@ -1503,13 +1540,13 @@ mod tests {
                 )
                 .expect("create");
             let supervisor = Arc::new(supervisor);
-            let backend = Arc::new(TestBackend {
+            let backend: Arc<dyn Backend> = Arc::new(TestBackend {
                 supervisor: Arc::clone(&supervisor),
-                servers,
-                workspaces,
+            });
+            let store: Arc<dyn port::BackupStore> = Arc::new(TestStore {
                 cas: Arc::new(CasStore::new(&ws_path.join("backups"))),
             });
-            let service = BackupService::new(Arc::clone(&registry), backend);
+            let service = BackupService::new(Arc::clone(&registry), backend, store);
             Self {
                 service,
                 registry,
@@ -2286,5 +2323,76 @@ mod tests {
         let scope = fx.service.scope_of("alpha").expect("scope");
         assert_eq!(scope.entries(), ["mods".to_owned(), "world".to_owned()]);
         assert!(fx.service.scope_of("nope").is_none());
+    }
+
+    /// 失败也是事实：create 失败必须发 `BackupFailed`
+    #[test]
+    fn failed_create_publishes_backup_failed_event() {
+        #[derive(Default)]
+        struct Sink {
+            events: Mutex<Vec<domain::server::event::DomainEvent>>,
+        }
+        impl port::EventSink for Sink {
+            fn publish(&self, event: domain::server::event::DomainEvent) {
+                self.events.lock().expect("lock").push(event);
+            }
+        }
+
+        let supervisor = Arc::new(FakeSupervisor::stopped());
+        let tmp = Box::leak(Box::new(tempfile::tempdir().expect("tmp")));
+        let ws_path = tmp.path().join("ws");
+        std::fs::create_dir_all(ws_path.join("servers")).expect("mkdir");
+        let ws = Workspace {
+            id: WorkspaceId::parse("550e8400-e29b-41d4-a716-446655440001").expect("uuid"),
+            name: WorkspaceName::parse("ws01").expect("name"),
+            path: ws_path.clone(),
+            is_current: true,
+            created_at: 1,
+            updated_at: 1,
+        };
+        let servers: Arc<dyn ServerRepository> = Arc::new(MemServers::new());
+        let workspaces: Arc<dyn WorkspaceRepository> = Arc::new(MemWorkspaces { ws });
+        let registry = Arc::new(ServerRegistry::new(
+            Arc::clone(&servers),
+            Arc::clone(&workspaces),
+        ));
+        registry
+            .create(
+                None,
+                "alpha",
+                &VersionId::new("1.21.1"),
+                ServerVariant::Vanilla,
+                None,
+            )
+            .expect("create server");
+        let backend: Arc<dyn Backend> = Arc::new(TestBackend {
+            supervisor: Arc::clone(&supervisor),
+        });
+        let store: Arc<dyn port::BackupStore> = Arc::new(TestStore {
+            cas: Arc::new(CasStore::new(&ws_path.join("backups"))),
+        });
+        let sink = Arc::new(Sink::default());
+        let service =
+            BackupService::new(Arc::clone(&registry), backend, store).with_events(sink.clone());
+
+        // 范围指向不存在的顶层项 → EmptyScope
+        let err = service
+            .create(
+                "alpha",
+                &CreateOptions {
+                    scope: Some(BackupScope::from_entries(["nonexistent"]).expect("scope")),
+                    ..CreateOptions::default()
+                },
+            )
+            .expect_err("empty");
+        assert!(matches!(err, BackupError::EmptyScope), "{err}");
+        let events = sink.events.lock().expect("lock").clone();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                domain::server::event::DomainEvent::BackupFailed { name, .. } if name == "alpha"
+            )),
+            "{events:?}"
+        );
     }
 }

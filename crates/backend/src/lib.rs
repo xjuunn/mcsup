@@ -1,29 +1,29 @@
 //! Local / Remote 执行位置抽象
 //!
-//! [`LocalBackend`] 把本机实现（runtime / storage / backup）聚合成一个
-//! [`port::Backend`]；`service` 只依赖 trait，不依赖任何具体实现 crate。
+//! 两个独立的能力对象：
+//! - [`LocalBackend`]：执行位置（`port::Backend`）——进程生命周期 / 安装器
+//! - [`LocalBackupStore`]：备份数据（`port::BackupStore`）——扫描 / CAS / 快照
 //!
-//! Remote 将来经 transport → RPC → agent 提供同一 trait 的实现，业务判定
-//! 不受影响（`Local / Remote 共享同一套业务逻辑`）。
+//! 分开是因为二者是不同的轴：「在哪里跑」与「存到哪里」。`service` 分别
+//! 注入，互不牵连；任一可独立替换（Remote 执行 / 远端对象存储）。
+//!
+//! Remote 将来经 transport → RPC → agent 提供同一组 trait 的实现，业务
+//! 判定不受影响（`Local / Remote 共享同一套业务逻辑`）。
 
 use port::{
-    Backend, ContentStore, InstallerRunner, Scanner, ServerRepository, SnapshotRepository,
-    SupervisorPort, WorkspaceRepository,
+    Backend, BackupStore, ContentStore, InstallerRunner, Scanner, SnapshotRepository,
+    SupervisorPort,
 };
 use std::path::Path;
 use std::sync::Arc;
-use storage::JsonStore;
 
 /// 本机执行位置
 ///
-/// 由组合根（`mcsup::bootstrap`）装配：三个仓库默认共用同一个 [`JsonStore`]，
-/// supervisor / installer 默认是 `runtime` 的实现。任一项都可被替换，便于
-/// 宿主启动器接管进程或改用自定义存储。
+/// supervisor / installer 默认是 `runtime` 的实现，也可被宿主启动器替换
+/// 以接管进程。
 pub struct LocalBackend {
     supervisor: Arc<dyn SupervisorPort>,
     installer: Arc<dyn InstallerRunner>,
-    servers: Arc<dyn ServerRepository>,
-    workspaces: Arc<dyn WorkspaceRepository>,
 }
 
 impl std::fmt::Debug for LocalBackend {
@@ -33,30 +33,21 @@ impl std::fmt::Debug for LocalBackend {
 }
 
 impl LocalBackend {
-    /// 用给定仓库 / supervisor / installer 装配
+    /// 用给定 supervisor / installer 装配
     #[must_use]
-    pub fn new(
-        supervisor: Arc<dyn SupervisorPort>,
-        installer: Arc<dyn InstallerRunner>,
-        servers: Arc<dyn ServerRepository>,
-        workspaces: Arc<dyn WorkspaceRepository>,
-    ) -> Self {
+    pub fn new(supervisor: Arc<dyn SupervisorPort>, installer: Arc<dyn InstallerRunner>) -> Self {
         Self {
             supervisor,
             installer,
-            servers,
-            workspaces,
         }
     }
 
-    /// 默认本机装配：`runtime` 的 supervisor / installer，仓库取 `store`
+    /// 默认本机装配：`runtime` 的 supervisor / installer
     #[must_use]
-    pub fn with_store(store: Arc<JsonStore>) -> Self {
+    pub fn default_local() -> Self {
         Self::new(
             Arc::new(runtime::LocalSupervisor),
             Arc::new(runtime::LocalInstallerRunner::new()),
-            store.clone(),
-            store,
         )
     }
 }
@@ -69,15 +60,13 @@ impl Backend for LocalBackend {
     fn installer(&self) -> &dyn InstallerRunner {
         self.installer.as_ref()
     }
+}
 
-    fn servers(&self) -> &dyn ServerRepository {
-        self.servers.as_ref()
-    }
+/// 本机备份数据：本地文件系统上的 CAS + 快照 + 扫描
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LocalBackupStore;
 
-    fn workspaces(&self) -> &dyn WorkspaceRepository {
-        self.workspaces.as_ref()
-    }
-
+impl BackupStore for LocalBackupStore {
     fn scanner(&self) -> &dyn Scanner {
         &backup::DirectoryScanner
     }
@@ -96,19 +85,16 @@ mod tests {
     use super::*;
     use port::workspace_backups_root;
 
-    /// 默认本机装配能给出可用的 CAS / 快照 / 扫描，且三者按同一 root 落地
+    /// 默认本机装配能给出可用的 CAS / 快照 / 扫描
     #[test]
-    fn with_store_builds_working_capabilities() {
-        let store = Arc::new(JsonStore::open_in_memory().expect("memory store"));
-        let backend = LocalBackend::with_store(store);
+    fn backup_store_builds_working_capabilities() {
+        let store = LocalBackupStore;
         let root = Path::new("/tmp/ws");
-        let cas = backend.content_store(&workspace_backups_root(root));
-        let repo = backend.snapshot_repository(&workspace_backups_root(root));
-        // 空索引可列出（无快照）
+        let cas = store.content_store(&workspace_backups_root(root));
+        let repo = store.snapshot_repository(&workspace_backups_root(root));
         assert!(repo.list_all().expect("list").is_empty());
-        // 扫描空目录得到空结果
         let dir = tempfile::tempdir().expect("tmp");
-        let outcome = backend
+        let outcome = store
             .scanner()
             .scan(
                 dir.path(),

@@ -3,8 +3,8 @@ pub mod backup;
 
 pub use backend::Backend;
 pub use backup::{
-    CasError, ContentStore, RUNTIME_ENTRIES, ScanError, ScanOutcome, ScanRules, Scanner,
-    SkipReason, Skipped, SnapshotRepository, SnapshotStoreError, workspace_backups_root,
+    BackupStore, CasError, ContentStore, RUNTIME_ENTRIES, ScanError, ScanOutcome, ScanRules,
+    Scanner, SkipReason, Skipped, SnapshotRepository, SnapshotStoreError, workspace_backups_root,
 };
 use domain::java::{JavaMajor, JavaPackageType, JavaRuntime, JavaVendor};
 use domain::server::artifact::{Checksum, JarArtifact};

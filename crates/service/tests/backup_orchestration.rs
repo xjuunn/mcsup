@@ -12,10 +12,7 @@
 
 use backup::CasStore;
 use domain::backup::{BackupScope, ContentHash, Page, RelPath, RestoreTarget, RetentionPolicy};
-use port::{
-    Backend, ContentStore, InstallerRunner, Scanner, ServerRepository, SnapshotRepository,
-    SupervisorPort, WorkspaceRepository,
-};
+use port::{Backend, ContentStore, InstallerRunner, Scanner, SnapshotRepository, SupervisorPort};
 use service::{BackupError, BackupService, CreateOptions, CreateOutcome, ServerRegistry};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -28,14 +25,22 @@ use testkit::{
 const CMD_SAVE_OFF: &str = "save-off";
 const CMD_SAVE_ON: &str = "save-on";
 
-/// 测试用 `Backend`：真实 CAS / 快照 / 扫描 + 夹具仓库 + 假 supervisor
-///
-/// CAS 由调用方给定，便于在真实 `CasStore` 外套故障注入。
+/// 测试用执行位置：只承载假 supervisor
 struct TestBackend {
     supervisor: Arc<FakeSupervisor>,
-    servers: Arc<dyn ServerRepository>,
-    workspaces: Arc<dyn WorkspaceRepository>,
-    cas: Arc<dyn ContentStore>,
+}
+
+struct NoopInstaller;
+impl InstallerRunner for NoopInstaller {
+    fn run_installer(
+        &self,
+        _java_bin: &Path,
+        _installer: &Path,
+        _dir: &Path,
+        _cancel: &port::CancellationToken,
+    ) -> Result<(), port::InstallerError> {
+        unreachable!("not used")
+    }
 }
 
 impl Backend for TestBackend {
@@ -43,14 +48,16 @@ impl Backend for TestBackend {
         self.supervisor.as_ref()
     }
     fn installer(&self) -> &dyn InstallerRunner {
-        unreachable!("not used")
+        &NoopInstaller
     }
-    fn servers(&self) -> &dyn ServerRepository {
-        self.servers.as_ref()
-    }
-    fn workspaces(&self) -> &dyn WorkspaceRepository {
-        self.workspaces.as_ref()
-    }
+}
+
+/// 测试用备份数据：真实 CAS / 快照 / 扫描（CAS 可套故障注入）
+struct TestStore {
+    cas: Arc<dyn ContentStore>,
+}
+
+impl port::BackupStore for TestStore {
     fn scanner(&self) -> &dyn Scanner {
         &backup::DirectoryScanner
     }
@@ -74,11 +81,11 @@ fn service(fixture: &ServiceFixture, log: &CommandLog) -> BackupService {
     let registry = ServerRegistry::new(fixture.server_repo(), fixture.workspace_repo());
     let backend: Arc<dyn Backend> = Arc::new(TestBackend {
         supervisor: Arc::new(FakeSupervisor::new(log.clone())),
-        servers: fixture.server_repo(),
-        workspaces: fixture.workspace_repo(),
+    });
+    let store: Arc<dyn port::BackupStore> = Arc::new(TestStore {
         cas: Arc::new(CasStore::new(&fixture.backups_root())),
     });
-    BackupService::new(Arc::new(registry), backend)
+    BackupService::new(Arc::new(registry), backend, store)
 }
 
 /// 接上「真实 CAS 外套故障注入」的服务
@@ -105,11 +112,12 @@ fn service_with_cas_fault(
     drop(slot);
     let backend: Arc<dyn Backend> = Arc::new(TestBackend {
         supervisor: Arc::new(FakeSupervisor::new(log.clone())),
-        servers: fixture.server_repo(),
-        workspaces: fixture.workspace_repo(),
-        cas,
     });
-    (BackupService::new(Arc::new(registry), backend), shared)
+    let backup_store: Arc<dyn port::BackupStore> = Arc::new(TestStore { cas });
+    (
+        BackupService::new(Arc::new(registry), backend, backup_store),
+        shared,
+    )
 }
 
 /// 一次不等待落盘的创建
