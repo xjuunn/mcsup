@@ -339,7 +339,7 @@ mod tests {
     fn symlinks_are_skipped_not_followed() {
         let (server, _store_dir, store) = fixture();
         let outside = tempfile::tempdir().expect("outside");
-        std::fs::write(outside.path().join("secret"), b"secret").expect("write");
+        fs::write(outside.path().join("secret"), b"secret").expect("write");
         write(server.path(), "world/level.dat", b"level");
         std::os::unix::fs::symlink(outside.path(), server.path().join("escape")).expect("symlink");
 

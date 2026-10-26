@@ -263,6 +263,17 @@ fn console_log_keeps_non_utf8_bytes() {
         "日志不应出现 U+FFFD 替换符"
     );
 
+    // 脚本的 `read line` 会一直等 stdin，进程不会自己退出：显式停机后
+    // 才能进终态。少了这一步 `wait_terminal` 必然超时。
+    client::rpc(
+        dir,
+        Request::Stop {
+            grace_secs: 5,
+            force: false,
+        },
+        Duration::from_secs(10),
+    )
+    .expect("stop rpc");
     wait_terminal(dir);
     assert_eq!(shutdown_and_join(dir, handle), 0);
 }
