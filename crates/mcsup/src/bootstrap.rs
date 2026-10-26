@@ -332,7 +332,7 @@ impl McsupBuilder {
         self
     }
 
-    /// 注入整合包归档读取实现（默认 `unzip` 版）
+    /// 注入整合包归档读取实现（默认 zip 解析版）
     #[must_use]
     pub fn modpack_extractor(mut self, extractor: Arc<dyn ModpackExtractor>) -> Self {
         self.modpack_extractor = Some(extractor);

@@ -35,8 +35,11 @@ use port::modpack::{
     ModpackSource, ModpackSummary, ModpackVersion, ResolvedModpack,
 };
 use serde::Deserialize;
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use zip::ZipArchive;
+use zip::result::ZipError;
 
 /// 搜索分页上限（上游约束）
 const SEARCH_LIMIT_MAX: u32 = 100;
@@ -246,9 +249,8 @@ fn version_from_upstream(version: &Version) -> ModpackVersion {
 
 /// `.mrpack` 读取实现
 ///
-/// 解压依赖系统 `unzip`（与 `file::CommandExtractor` 同一套工具假设）：只读
-/// `modrinth.index.json` 时用 `unzip -p`，铺 overrides 用 `unzip -o`。不引入
-/// zip 解析库，保持依赖面不变。
+/// 直接解析 zip（不调用系统 `unzip`）：归档里的非 ASCII 文件名不会被系统
+/// locale 改写，解压失败也不会停在 `unzip` 的交互式提问上。
 #[derive(Debug, Default)]
 pub struct MrpackExtractor;
 
@@ -262,7 +264,29 @@ impl MrpackExtractor {
 
 impl ModpackExtractor for MrpackExtractor {
     fn read_index(&self, archive: &Path) -> Result<ModpackIndex, ModpackExtractError> {
-        let text = unzip_print(archive, domain::server::modpack::INDEX_FILE)?;
+        let mut zip = open_archive(archive)?;
+        let mut text = String::new();
+        match zip.by_name(domain::server::modpack::INDEX_FILE) {
+            Ok(mut entry) => {
+                entry.read_to_string(&mut text).map_err(|err| {
+                    ModpackExtractError::Extract(format!(
+                        "read {}: {err}",
+                        domain::server::modpack::INDEX_FILE
+                    ))
+                })?;
+            }
+            Err(ZipError::FileNotFound) => {
+                return Err(ModpackExtractError::MissingIndex(
+                    domain::server::modpack::INDEX_FILE,
+                ));
+            }
+            Err(err) => {
+                return Err(ModpackExtractError::Extract(format!(
+                    "read {}: {err}",
+                    domain::server::modpack::INDEX_FILE
+                )));
+            }
+        }
         let raw: RawIndex = serde_json::from_str(&text)
             .map_err(|err| ModpackExtractError::Index(serde_err(&err)))?;
         let mut files = Vec::with_capacity(raw.files.len());
@@ -300,39 +324,94 @@ impl ModpackExtractor for MrpackExtractor {
         // `server-overrides/` 优先：它专门描述服务端侧文件。没有时退回
         // `overrides/`（格式规范里两者都可能有；`client-overrides/` 只给
         // 客户端，从不铺到服务端）。
-        //
-        // `unzip <pattern> -d dir` 会保留 `overrides/` 这层前缀，因此先解到
-        // 临时目录，再把内容上提一层合并进 `dest`。
         std::fs::create_dir_all(dest)
             .map_err(|err| ModpackExtractError::Extract(err.to_string()))?;
-        let staging_root = dest.join(".modpack-overrides");
-        // 上次中断可能留下残骸：先清掉
-        let _ = std::fs::remove_dir_all(&staging_root);
-        // `unzip -d` 不创建多级父目录，先把 staging 子目录建好
-        for name in ["server", "plain"] {
-            std::fs::create_dir_all(staging_root.join(name))
-                .map_err(|err| ModpackExtractError::Extract(err.to_string()))?;
+        let mut zip = open_archive(archive)?;
+        let (server, plain) = override_entries(&mut zip)?;
+        let has_server = !server.is_empty();
+        for index in server {
+            extract_entry(&mut zip, index, dest, "server-overrides/", false)?;
         }
-
-        let mut merged = false;
-        if archive_has_prefix(archive, "server-overrides/")? {
-            unzip_into(archive, "server-overrides/*", &staging_root.join("server"))?;
-            merge_from(&staging_root.join("server").join("server-overrides"), dest)?;
-            merged = true;
+        for index in plain {
+            // server-overrides 已经写过的文件不覆盖
+            extract_entry(&mut zip, index, dest, "overrides/", has_server)?;
         }
-        if archive_has_prefix(archive, "overrides/")? {
-            unzip_into(archive, "overrides/*", &staging_root.join("plain"))?;
-            let plain = staging_root.join("plain").join("overrides");
-            if merged {
-                // server-overrides 已经写过的文件不覆盖
-                merge_missing(&plain, dest)?;
-            } else {
-                merge_from(&plain, dest)?;
-            }
-        }
-        let _ = std::fs::remove_dir_all(&staging_root);
         Ok(())
     }
+}
+
+/// 打开归档并给出统一的错误文本
+fn open_archive(archive: &Path) -> Result<ZipArchive<File>, ModpackExtractError> {
+    let file = File::open(archive)
+        .map_err(|err| ModpackExtractError::Extract(format!("open archive: {err}")))?;
+    ZipArchive::new(file)
+        .map_err(|err| ModpackExtractError::Extract(format!("read archive: {err}")))
+}
+
+/// 归档里 overrides 两类前缀的成员下标
+fn override_entries(
+    zip: &mut ZipArchive<File>,
+) -> Result<(Vec<usize>, Vec<usize>), ModpackExtractError> {
+    let mut server = Vec::new();
+    let mut plain = Vec::new();
+    for index in 0..zip.len() {
+        let name = zip
+            .by_index_raw(index)
+            .map_err(|err| ModpackExtractError::Extract(format!("read archive entry: {err}")))?
+            .name()
+            .map_err(|err| ModpackExtractError::Extract(format!("read archive entry name: {err}")))?
+            .into_owned();
+        if name.starts_with("server-overrides/") {
+            server.push(index);
+        } else if name.starts_with("overrides/") {
+            plain.push(index);
+        }
+    }
+    Ok((server, plain))
+}
+
+/// 解开一个成员到 `dest`，去掉 `prefix` 这一层
+///
+/// `skip_existing` 用于「server-overrides 优先」的第二遍：同名文件已由
+/// 服务端专属覆盖写好后不再改写。
+fn extract_entry(
+    zip: &mut ZipArchive<File>,
+    index: usize,
+    dest: &Path,
+    prefix: &str,
+    skip_existing: bool,
+) -> Result<(), ModpackExtractError> {
+    let mut entry = zip
+        .by_index(index)
+        .map_err(|err| ModpackExtractError::Extract(format!("read archive entry: {err}")))?;
+    let name = entry
+        .name()
+        .map_err(|err| ModpackExtractError::Extract(format!("read archive entry name: {err}")))?
+        .into_owned();
+    let Some(relative) = name.strip_prefix(prefix) else {
+        return Ok(());
+    };
+    if relative.is_empty() || entry.is_dir() {
+        return Ok(());
+    }
+    // 外部归档的成员名：与清单路径用同一套安全规则
+    domain::server::modpack::validate_relative_path(relative)
+        .map_err(ModpackExtractError::Index)?;
+    let target = dest.join(relative);
+    if skip_existing && target.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| ModpackExtractError::Extract(err.to_string()))?;
+    }
+    let mut out = File::create(&target).map_err(|err| {
+        ModpackExtractError::Extract(format!("create {}: {err}", target.display()))
+    })?;
+    std::io::copy(&mut entry, &mut out).map_err(|err| {
+        ModpackExtractError::Extract(format!("write {}: {err}", target.display()))
+    })?;
+    Ok(())
 }
 
 /// 清单原始形状（只做反序列化）
@@ -411,111 +490,6 @@ struct RawHashes {
 /// 原始 message（含行号列号），足够排查。
 fn serde_err(err: &serde_json::Error) -> domain::server::modpack::ModpackError {
     domain::server::modpack::ModpackError::Parse(err.to_string())
-}
-
-/// `unzip -p` 读出某个成员的内容
-fn unzip_print(archive: &Path, member: &str) -> Result<String, ModpackExtractError> {
-    let output = Command::new("unzip")
-        .arg("-p")
-        .arg(archive)
-        .arg(member)
-        .output()
-        .map_err(|err| ModpackExtractError::Extract(format!("unzip not available: {err}")))?;
-    if !output.status.success() {
-        return Err(ModpackExtractError::MissingIndex(
-            domain::server::modpack::INDEX_FILE,
-        ));
-    }
-    String::from_utf8(output.stdout)
-        .map_err(|err| ModpackExtractError::Extract(format!("index is not utf-8: {err}")))
-}
-
-/// 归档里是否有某个前缀的成员
-fn archive_has_prefix(archive: &Path, prefix: &str) -> Result<bool, ModpackExtractError> {
-    let output = Command::new("unzip")
-        .arg("-Z1")
-        .arg(archive)
-        .output()
-        .map_err(|err| ModpackExtractError::Extract(format!("unzip not available: {err}")))?;
-    if !output.status.success() {
-        return Err(ModpackExtractError::Extract(
-            "failed to list modpack archive".to_owned(),
-        ));
-    }
-    let listing = String::from_utf8_lossy(&output.stdout);
-    Ok(listing.lines().any(|line| line.starts_with(prefix)))
-}
-
-/// `unzip` 指定模式的内容到目录
-fn unzip_into(archive: &Path, pattern: &str, dest: &Path) -> Result<(), ModpackExtractError> {
-    let output = Command::new("unzip")
-        .arg("-o")
-        .arg("-q")
-        .arg(archive)
-        .arg(pattern)
-        .arg("-d")
-        .arg(dest)
-        .output()
-        .map_err(|err| ModpackExtractError::Extract(format!("unzip not available: {err}")))?;
-    if !output.status.success() {
-        return Err(ModpackExtractError::Extract(format!(
-            "unzip failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    Ok(())
-}
-
-/// 把 `from` 目录的内容整体合并到 `to`（同名覆盖）
-fn merge_from(from: &Path, to: &Path) -> Result<(), ModpackExtractError> {
-    let entries = match std::fs::read_dir(from) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(ModpackExtractError::Extract(err.to_string())),
-    };
-    for entry in entries {
-        let entry = entry.map_err(|err| ModpackExtractError::Extract(err.to_string()))?;
-        let source = entry.path();
-        let target = to.join(entry.file_name());
-        if source.is_dir() {
-            std::fs::create_dir_all(&target)
-                .map_err(|err| ModpackExtractError::Extract(err.to_string()))?;
-            merge_from(&source, &target)?;
-        } else {
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|err| ModpackExtractError::Extract(err.to_string()))?;
-            }
-            std::fs::copy(&source, &target)
-                .map_err(|err| ModpackExtractError::Extract(err.to_string()))?;
-        }
-    }
-    Ok(())
-}
-
-/// 把 `from` 目录里 `to` 尚未存在的文件补过去
-///
-/// `server-overrides/` 优先：同名文件以它为准。
-fn merge_missing(from: &Path, to: &Path) -> Result<(), ModpackExtractError> {
-    let entries = match std::fs::read_dir(from) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(ModpackExtractError::Extract(err.to_string())),
-    };
-    for entry in entries {
-        let entry = entry.map_err(|err| ModpackExtractError::Extract(err.to_string()))?;
-        let source = entry.path();
-        let target = to.join(entry.file_name());
-        if source.is_dir() {
-            std::fs::create_dir_all(&target)
-                .map_err(|err| ModpackExtractError::Extract(err.to_string()))?;
-            merge_missing(&source, &target)?;
-        } else if !target.exists() {
-            std::fs::copy(&source, &target)
-                .map_err(|err| ModpackExtractError::Extract(err.to_string()))?;
-        }
-    }
-    Ok(())
 }
 
 /// 供测试：构造一个只含清单的 mrpack 目录路径占位
@@ -646,35 +620,6 @@ mod tests {
         };
         assert!(mapped.sha1_checksum().is_some());
         assert_eq!(mapped.sha512, hashes.sha512);
-    }
-
-    #[test]
-    fn merge_missing_prefers_existing_files() {
-        let root = std::env::temp_dir().join(format!(
-            "mcsup-merge-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        let from = root.join("from");
-        let to = root.join("to");
-        std::fs::create_dir_all(from.join("config")).expect("mkdir from");
-        std::fs::create_dir_all(to.join("config")).expect("mkdir to");
-        std::fs::write(from.join("config/a.toml"), b"from-a").expect("write a");
-        std::fs::write(from.join("config/b.toml"), b"from-b").expect("write b");
-        std::fs::write(to.join("config/a.toml"), b"to-a").expect("write existing a");
-
-        merge_missing(&from, &to).expect("merge");
-
-        // 已存在的保持原值，缺失的补上
-        assert_eq!(std::fs::read(to.join("config/a.toml")).expect("a"), b"to-a");
-        assert_eq!(
-            std::fs::read(to.join("config/b.toml")).expect("b"),
-            b"from-b"
-        );
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

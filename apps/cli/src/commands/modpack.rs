@@ -19,6 +19,7 @@ use crate::output::Printer;
 use crate::progress::{BarSink, TaskSpinner};
 use crate::prompts::{Backable, ScopeHint, ScopedChoice, select_filter_backable};
 use anyhow::{Context, Result};
+use mcsup::domain::server::variant::ServerVariant;
 use mcsup::port::CancellationToken;
 use mcsup::port::modpack::{ModpackDetail, ModpackQuery, ModpackVersion};
 use mcsup::service::ModpackInstallOptions;
@@ -37,6 +38,11 @@ pub(crate) struct PickedModpack {
     pub version_number: String,
     /// 清单声明的 MC 版本
     pub minecraft: String,
+    /// 清单加载器对应的服务端变体
+    ///
+    /// 注册表存这个而不是 `modrinth-modpack`：之后 `server install` 要按变体
+    /// 找核心来源，`modrinth-modpack` 本身没有可下载的核心。
+    pub variant: ServerVariant,
 }
 
 /// 每页整合包数量
@@ -300,6 +306,9 @@ async fn finish_pick(
         .minecraft_version()
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
         .to_owned();
+    let variant = prepared
+        .require_loader()
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
     // 暂存目录用后就删：真正的产物在 server create 之后由 install_modpack 重新取回
     if let Some(staging) = prepared.archive_path.parent() {
         let _ = std::fs::remove_dir_all(staging);
@@ -310,6 +319,7 @@ async fn finish_pick(
         version_id: prepared.resolved.version_id,
         version_number: prepared.resolved.version_number,
         minecraft,
+        variant,
     })
 }
 

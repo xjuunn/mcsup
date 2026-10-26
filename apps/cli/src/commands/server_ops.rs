@@ -460,7 +460,9 @@ async fn finish_create_inputs(
         let picked = super::modpack::pick_modpack(modpack, version, printer).await?;
         return Ok(CreateInputs {
             name,
-            variant,
+            // 落库用清单加载器对应的变体（fabric / forge / ...），而不是
+            // `modrinth-modpack`：后者只是「走整合包流程」的标记，没有核心来源
+            variant: picked.variant.clone(),
             version_id: VersionId::new(picked.minecraft.clone()),
             source: None,
             modpack: Some(picked),

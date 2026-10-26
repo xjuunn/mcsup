@@ -33,6 +33,12 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["time"] }
 tracing.workspace = true
 url.workspace = true
+# zip 的 deflate-flate2 需要具体 zlib 后端；与 file 一样取 flate2 默认的
+# rust_backend（纯 Rust），不额外引入 C 依赖
+flate2 = "1.1.10"
+# 与 file 保持同一版本与特性：解 `.mrpack` 不再依赖系统 unzip，归档内的
+# 非 ASCII 文件名按 UTF-8 解码，避免系统 unzip 受 locale 影响产生乱码
+zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2"] }
 
 [lints]
 workspace = true

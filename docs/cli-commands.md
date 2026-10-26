@@ -263,7 +263,14 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 非交互模式必须用 `--modpack` 指定项目；只用 `--variant modrinth` 且没有
 `--modpack` 会以用法错误退出，而不是静默挑一个包。
 
+注册表记录的是清单加载器对应的真实变体（`fabric` / `forge` / `neoforge` /
+`quilt` / `vanilla`），因此建站后 `server install` 能按变体找到核心来源；
+`modrinth-modpack` 只作为「走整合包流程」的入口标记。
+
 清单里 `server: unsupported` 的文件不会装到服务端；`optional` 视为需要安装。
+`.mrpack` 由内置 zip 解析直接解开，不调用系统 `unzip`，归档内的 UTF-8
+文件名按原样落盘。
+
 建好的整合包服务与 `server create` 建的服务是同一种对象，后续运维都走
 `mcsup server ...`。
 
