@@ -248,8 +248,9 @@ fn builds_by_mc(versions: &NeoForgeVersions) -> BuildsByMc {
 ///   `20.6.144` → `1.20.6`。首段是 MC 次版本，映射时补回 `1.` 前缀。
 /// - **新编码（MC `26.x` 起）**：Mojang 从 `1.21.11` 之后改用年份制版本号
 ///   （`26.1` / `26.1.2` / `26.3`），不再有 `1.` 前缀可去。`NeoForge` 因此改成
-///   `{mc 主版本}.{mc 次版本}.{mc 补丁}.{build}` 四段，如 `26.3.0.99` → MC
-///   `26.3`、`26.1.2.124` → MC `26.1.2`。首段即 MC 主版本，原样使用。
+///   `{mc 主版本}.{mc 次版本}.{mc 补丁}.{build}` 四段。MC 自身没有补丁时该位补
+///   `0`，映射时要去掉：`26.3.0.99` → MC `26.3`；有补丁的 `26.1.2.124` → MC
+///   `26.1.2`。首段即 MC 主版本，原样使用。
 ///
 /// 带后缀（`-beta`）或段内非纯数字的串不映射，返回 `None`。
 #[must_use]
@@ -265,7 +266,8 @@ pub(crate) fn neoforge_to_mc(build: &str) -> Option<String> {
     match parts.as_slice() {
         // 旧编码：`{mc minor}.{mc patch}.{build}` → MC `1.{minor}.{patch}`
         [major, minor, _build] if *major != "0" => Some(format!("1.{major}.{minor}")),
-        // 新编码：`{mc major}.{mc minor}.{mc patch}.{build}` → MC `{major}.{minor}.{patch}`
+        // 新编码：末段是 build 号；补丁位为 `0` 时 MC 没有补丁，不能带出去
+        [major, minor, "0", _build] if *major != "0" => Some(format!("{major}.{minor}")),
         [major, minor, patch, _build] if *major != "0" => Some(format!("{major}.{minor}.{patch}")),
         _ => None,
     }
@@ -432,8 +434,8 @@ mod tests {
         assert_eq!(neoforge_to_mc("21.1.200").as_deref(), Some("1.21.1"));
         assert_eq!(neoforge_to_mc("20.6.144").as_deref(), Some("1.20.6"));
         assert_eq!(neoforge_to_mc("21.0.167").as_deref(), Some("1.21.0"));
-        // 新编码（MC 26.x 起）：四段，前缀就是 MC 版本本身
-        assert_eq!(neoforge_to_mc("26.3.0.99").as_deref(), Some("26.3.0"));
+        // 新编码（MC 26.x 起）：四段，末尾是 build 号；补丁位为 0 表示 MC 无补丁
+        assert_eq!(neoforge_to_mc("26.3.0.99").as_deref(), Some("26.3"));
         assert_eq!(neoforge_to_mc("26.1.2.124").as_deref(), Some("26.1.2"));
         // 快照 MC / 预发布 build 不映射
         assert_eq!(neoforge_to_mc("0.25w14craftmine.3-beta"), None);
@@ -458,7 +460,7 @@ mod tests {
         let prefix = mc_to_neoforge_prefix("26.3").expect("prefix");
         assert_eq!(
             neoforge_to_mc(&format!("{prefix}.99")).as_deref(),
-            Some("26.3.0")
+            Some("26.3")
         );
         // MC 自身的补丁版本原样保留
         assert_eq!(mc_to_neoforge_prefix("26.1.2").as_deref(), Some("26.1.2"));
@@ -483,9 +485,9 @@ mod tests {
                 "21.1.265".to_owned()
             ]
         );
-        // 新编码：`26.3.0.99` 归到 MC `26.3.0`，`26.1.2.124` 归到 `26.1.2`
+        // 新编码：`26.3.0.99` 归到 MC `26.3`，`26.1.2.124` 归到 `26.1.2`
         assert_eq!(
-            grouped.get("26.3.0").expect("26.3.0"),
+            grouped.get("26.3").expect("26.3"),
             &vec!["26.3.0.98".to_owned(), "26.3.0.99".to_owned()]
         );
         assert_eq!(
@@ -509,10 +511,7 @@ mod tests {
             select_build("1.21.1", &grouped).as_deref(),
             Some("21.1.265")
         );
-        assert_eq!(
-            select_build("26.3.0", &grouped).as_deref(),
-            Some("26.3.0.99")
-        );
+        assert_eq!(select_build("26.3", &grouped).as_deref(), Some("26.3.0.99"));
         assert_eq!(select_build("1.99.9", &grouped), None);
     }
 
@@ -521,11 +520,11 @@ mod tests {
     fn resolve_latest_picks_highest_mc() {
         let grouped = builds_by_mc(&index());
         let latest = resolve_mc_id(&VersionId::new("latest"), &grouped).expect("latest");
-        // `1.21.x` 的字典序最大项是 `1.21.1`，但它不是最新；新年份制 `26.3.0` 才是
-        assert_eq!(latest, "26.3.0");
+        // `1.21.x` 的字典序最大项是 `1.21.1`，但它不是最新；新年份制 `26.3` 才是
+        assert_eq!(latest, "26.3");
         assert_eq!(
             resolve_mc_id(&VersionId::new("latest-snapshot"), &grouped).as_deref(),
-            Some("26.3.0")
+            Some("26.3")
         );
     }
 

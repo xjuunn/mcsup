@@ -1471,6 +1471,7 @@ mod tests {
             _java_bin: &Path,
             _installer: &Path,
             _dir: &Path,
+            _output: Option<&dyn port::InstallerOutputSink>,
             _cancel: &port::CancellationToken,
         ) -> Result<(), port::InstallerError> {
             unreachable!("not used")

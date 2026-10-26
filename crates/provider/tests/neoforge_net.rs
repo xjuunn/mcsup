@@ -53,7 +53,7 @@ async fn artifact_resolves_year_scheme_version() {
     }
     let source = NeoForgeSource::new().expect("neoforge source");
     let resolved = source
-        .artifact(&VersionId::new("26.3.0"))
+        .artifact(&VersionId::new("26.3"))
         .await
         .expect("artifact");
     assert_eq!(resolved.install, InstallKind::Installer);
