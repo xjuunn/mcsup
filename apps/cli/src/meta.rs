@@ -71,6 +71,14 @@ pub(crate) fn lang_arg() -> &'static str {
     )
 }
 
+#[must_use]
+pub(crate) fn yes_arg() -> &'static str {
+    t(
+        "对所有确认式提问回答「是」（不跳过名称 / 版本等补参交互）",
+        "answer yes to every confirmation prompt (does not skip name/version prompts)",
+    )
+}
+
 // ---- 顶层子命令 ----
 
 #[must_use]
@@ -390,6 +398,22 @@ pub(crate) fn server_link_name_arg() -> &'static str {
     t(
         "注册名，缺省取目录名或 marker 名",
         "registered name; defaults to the directory or marker name",
+    )
+}
+
+#[must_use]
+pub(crate) fn server_workspace_name_arg() -> &'static str {
+    t(
+        "与 --workspace / --workspace-dir 配合：指定要新建或使用的工作区名称",
+        "used with --workspace / --workspace-dir: name of the workspace to create or use",
+    )
+}
+
+#[must_use]
+pub(crate) fn server_workspace_dir_arg() -> &'static str {
+    t(
+        "工作区目录；与 --workspace-name 一起时不存在就新建，缺名则取目录名",
+        "workspace directory; created when missing (name defaults to the directory name)",
     )
 }
 

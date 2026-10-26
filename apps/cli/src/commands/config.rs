@@ -18,10 +18,63 @@ pub(crate) fn run(action: ConfigAction, printer: Printer) -> Result<()> {
     let file = ConfigFile::locate(None);
     match action {
         ConfigAction::Show => show(&file, printer),
-        ConfigAction::Set { key, value } => set(&file, &key, &value, printer),
-        ConfigAction::Unset { key } => unset(&file, &key, printer),
+        ConfigAction::Set { key, value } => {
+            let key = resolve_key(key.as_deref(), "config set", printer)?;
+            let value = resolve_value(value, &key, "config set", printer)?;
+            set(&file, &key, &value, printer)
+        }
+        ConfigAction::Unset { key } => {
+            let key = resolve_key(key.as_deref(), "config unset", printer)?;
+            unset(&file, &key, printer)
+        }
         ConfigAction::Edit => edit(&file, printer),
     }
+}
+
+/// 缺 key：交互下从全部配置键中选择；非交互报用法错误（2）
+fn resolve_key(key: Option<&str>, command: &str, printer: Printer) -> Result<String> {
+    if let Some(key) = key {
+        return Ok(key.to_owned());
+    }
+    if !printer.is_interactive() {
+        return Err(AppDiagnostic::usage(
+            format!("{command} 缺少配置键"),
+            Some(format!(
+                "非交互模式：mcsup {command} <键>；可用键: {}",
+                ConfigKey::ALL
+                    .iter()
+                    .map(|k| k.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        )
+        .into());
+    }
+    let keys: Vec<String> = ConfigKey::ALL
+        .iter()
+        .map(|k| k.as_str().to_owned())
+        .collect();
+    crate::prompts::select_filter("选择配置键", &keys)
+}
+
+/// 缺 value：交互下按当前生效值作默认输入；非交互报用法错误（2）
+fn resolve_value(
+    value: Option<String>,
+    key: &str,
+    command: &str,
+    printer: Printer,
+) -> Result<String> {
+    if let Some(value) = value {
+        return Ok(value);
+    }
+    if !printer.is_interactive() {
+        return Err(AppDiagnostic::usage(
+            format!("{command} 缺少 {key} 的值"),
+            Some(format!("非交互模式：mcsup {command} {key} <值>")),
+        )
+        .into());
+    }
+    crate::prompts::input_text(key, "", "输入新值；回车提交")
 }
 
 /// 键名解析：拼错时报用法错误（2）并列出全部键

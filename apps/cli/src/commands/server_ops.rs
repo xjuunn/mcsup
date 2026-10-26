@@ -7,12 +7,15 @@ use anyhow::{Context, Result};
 use comfy_table::{Cell, Color, Table};
 use mcsup::domain::server::status::ServerStatus;
 use mcsup::domain::server::version::{ServerVariant, VersionId};
-use mcsup::domain::workspace::WorkspaceId;
+use mcsup::domain::workspace::{WorkspaceId, WorkspaceName};
 use mcsup::protocol::cli::{CreateRow, RemoveJson, ServerRow};
-use mcsup::service::{ServerRegistry, ServerRegistryError, WorkspaceError, WorkspaceService};
+use mcsup::service::{
+    InitOutcome, ServerRegistry, ServerRegistryError, WorkspaceError, WorkspaceService,
+    absolute_path, resolve_selector,
+};
 use serde::Serialize;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::install::{download_jar, pick_version};
 
@@ -50,6 +53,56 @@ fn workspace_names() -> Result<HashMap<WorkspaceId, String>> {
         .into_iter()
         .map(|w| (w.id, w.name.as_str().to_owned()))
         .collect())
+}
+
+/// 缺必填服务器名：交互下从已注册服务器中选择；否则报用法错误（退出码 2）
+///
+/// 全局交互约定：必填参数缺失只在 human + TTY 下补参，非交互 / JSON 下不等待
+/// 输入。`--yes` 不跳过这里——它只跳过确认式提问。
+pub(crate) fn require_server_name(
+    name: Option<&str>,
+    command: &str,
+    printer: Printer,
+) -> Result<String> {
+    if let Some(name) = name {
+        return Ok(name.to_owned());
+    }
+    if !printer.is_interactive() {
+        return Err(AppDiagnostic::usage(
+            format!("{command} 缺少服务器名称"),
+            Some(format!("非交互模式：mcsup {command} <名称>")),
+        )
+        .into());
+    }
+    let reg = open_registry()?;
+    let servers = reg.list().context("列出服务器失败")?;
+    if servers.is_empty() {
+        return Err(anyhow::anyhow!(
+            "尚无服务器，先运行 mcsup server create 创建"
+        ));
+    }
+    let names: Vec<String> = servers
+        .iter()
+        .map(|srv| srv.meta.name.as_str().to_owned())
+        .collect();
+    let picked = prompts::select_filter("选择服务器", &names)?;
+    Ok(picked)
+}
+
+/// 缺必填文本参数（如 `server send` 的命令体）：交互下输入，否则用法错误
+pub(crate) fn require_text(
+    value: Option<String>,
+    missing_message: &str,
+    usage_hint: &str,
+    printer: Printer,
+) -> Result<String> {
+    if let Some(value) = value {
+        return Ok(value);
+    }
+    if !printer.is_interactive() {
+        return Err(AppDiagnostic::usage(missing_message, Some(usage_hint.to_owned())).into());
+    }
+    prompts::input_text("输入内容", "", "回车提交；Ctrl+C 取消")
 }
 
 pub(crate) fn list(printer: Printer) -> Result<()> {
@@ -127,19 +180,38 @@ pub(crate) fn list(printer: Printer) -> Result<()> {
     )
 }
 
+/// `server create` 的入参：必填项都是 `Option`，缺哪项补哪项
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CreateArgs<'a> {
+    /// 服务器名（位置参数）
+    pub(crate) name: Option<&'a str>,
+    /// 服务端版本（`--version`，接受 `latest` / `lts` / `latest-snapshot`）
+    pub(crate) version: Option<&'a str>,
+    /// 服务端变体（`--variant`）
+    pub(crate) variant: Option<&'a str>,
+    /// 目标工作区（`--workspace`，名称或路径都接受）
+    pub(crate) workspace: Option<&'a str>,
+    /// 与 `--workspace` 配合：要新建的工作区名称
+    pub(crate) workspace_name: Option<&'a str>,
+    /// 与 `--workspace` 配合：要新建的工作区目录
+    pub(crate) workspace_dir: Option<&'a Path>,
+}
+
 /// `server create`：非交互走参数直通（缺必选参数 → 退出码 2），
 /// 交互且缺参进入向导（工作区兜底 → 名称 → 变体 → 版本 → 下载）
 ///
 /// # Errors
 ///
 /// 用法错误（2）、工作区 / 服务器冲突（3 / 4）、来源未支持、下载失败时返回错误
-pub(crate) async fn create(
-    name: Option<&str>,
-    version: Option<&str>,
-    variant: Option<&str>,
-    workspace: Option<&str>,
-    printer: Printer,
-) -> Result<()> {
+pub(crate) async fn create(args: CreateArgs<'_>, printer: Printer) -> Result<()> {
+    let CreateArgs {
+        name,
+        version,
+        variant,
+        workspace,
+        workspace_name,
+        workspace_dir,
+    } = args;
     let interactive = printer.is_interactive();
 
     // 1. 用法闸（先于落库与联网，快速失败）
@@ -158,6 +230,9 @@ pub(crate) async fn create(
         .into());
     }
 
+    // 版本别名：`lts` 等价于 `latest`；显式版本原样保留（含 `latest-snapshot`）
+    let version = version.map(crate::commands::install::normalize_version_alias);
+
     // 2. 变体能力：flag / 非交互默认先解析（显式未支持 → 退出码 2）
     let available = bootstrap::available_variants()?;
     let variant = match variant {
@@ -166,11 +241,24 @@ pub(crate) async fn create(
         None => None,
     };
 
-    // 3. 工作区：flag > 环境变量 > 当前；无当前且交互 → 复用 init 向导
-    let selector = workspace_selector(workspace);
-    if !ensure_workspace(selector.as_deref(), interactive, printer)? {
+    // 3. 工作区：--workspace 接受名称或路径；配合 --workspace-name / --workspace-dir
+    //    时不存在就新建。无当前且交互 → 复用 init 向导
+    // 向导被取消 / 未就绪时返回 `None`：已给出提示，静默中止
+    let Some(selector) = pick_create_workspace(
+        workspace,
+        workspace_name,
+        workspace_dir,
+        interactive,
+        printer,
+    )?
+    else {
         return Ok(());
-    }
+    };
+    let selector = if selector.is_empty() {
+        None
+    } else {
+        Some(selector)
+    };
 
     let reg = open_registry()?;
 
@@ -221,6 +309,11 @@ pub(crate) async fn create(
         return Err(err);
     }
 
+    report_created(&srv, printer)
+}
+
+/// `server create` 的结果输出：human 一行 + 后续提示，JSON 单个对象
+fn report_created(srv: &mcsup::service::RegisteredServer, printer: Printer) -> Result<()> {
     printer.print_outcome(
         &crate::i18n::pick(
             printer.lang(),
@@ -247,8 +340,11 @@ pub(crate) async fn create(
     )?;
     printer.print_section(&crate::i18n::pick(
         printer.lang(),
-        format!("完成。运行 mcsup server start {name} 启动"),
-        format!("done. run `mcsup server start {name}` to start it"),
+        format!("完成。运行 mcsup server start {} 启动", srv.meta.name),
+        format!(
+            "done. run `mcsup server start {}` to start it",
+            srv.meta.name
+        ),
     ));
     Ok(())
 }
@@ -383,6 +479,255 @@ fn ensure_workspace(selector: Option<&str>, interactive: bool, printer: Printer)
     }
 }
 
+/// `server create` 的工作区就绪：返回 `None` 表示已提示并中止
+fn pick_create_workspace(
+    workspace: Option<&str>,
+    workspace_name: Option<&str>,
+    workspace_dir: Option<&Path>,
+    interactive: bool,
+    printer: Printer,
+) -> Result<Option<String>> {
+    match resolve_create_workspace(
+        workspace,
+        workspace_name,
+        workspace_dir,
+        interactive,
+        printer,
+    )? {
+        Some(CreateWorkspace::Aborted) => Ok(None),
+        Some(CreateWorkspace::Ready { selector, created }) => {
+            if created && !ensure_workspace(selector.as_deref(), interactive, printer)? {
+                return Ok(None);
+            }
+            Ok(Some(selector.unwrap_or_default()))
+        }
+        None => {
+            if !ensure_workspace(None, interactive, printer)? {
+                return Ok(None);
+            }
+            // 空串代表「按当前工作区落点」，避免再包一层 Option
+            Ok(Some(String::new()))
+        }
+    }
+}
+
+/// `server create` 的工作区解析结果
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CreateWorkspace {
+    /// 解析完成：`selector` 为空时按当前工作区落点
+    Ready {
+        /// 传给注册表的选择器（工作区名称）
+        selector: Option<String>,
+        /// 是否本次新建的（需要再做一次就绪校验）
+        created: bool,
+    },
+    /// 交互向导被取消 / 工作区未就绪
+    Aborted,
+}
+
+/// `server create` 的工作区解析：名称 / 路径都能定位，不存在就新建
+///
+/// 规则（用户口径）：
+///
+/// - `--workspace <名或路径>` 命中已有工作区 → 直接用
+/// - 没命中，但给了 `--workspace-dir` / `--workspace-name` → 新建并落进去
+/// - 名称命中但路径不一致（或路径命中但名称不一致）→ 用法错误，不静默接管
+/// - 非交互下既没命中也没有目录参数 → 用法错误（2），不等待输入
+///
+/// 返回 `Ok(None)` 表示没给 `--workspace`，按当前工作区处理；
+/// [`CreateWorkspace::Ready`] 给出选择器（工作区名称）。
+fn resolve_create_workspace(
+    workspace: Option<&str>,
+    workspace_name: Option<&str>,
+    workspace_dir: Option<&Path>,
+    interactive: bool,
+    printer: Printer,
+) -> Result<Option<CreateWorkspace>> {
+    // 没给 --workspace 也没给新建参数：完全走既有口径（环境变量 > 当前工作区）
+    if workspace.is_none() && workspace_name.is_none() && workspace_dir.is_none() {
+        return Ok(None);
+    }
+    let store = bootstrap::open_store()?;
+    let svc = WorkspaceService::new(store.clone(), store);
+    let all = svc.list()?;
+
+    let by_name = match workspace {
+        Some(sel) => match resolve_selector(&all, sel) {
+            Ok(ws) => Some(ws),
+            Err(WorkspaceError::NotFound(_)) => None,
+            Err(err) => return Err(err.into()),
+        },
+        None => None,
+    };
+    let by_dir = match workspace_dir {
+        Some(dir) => {
+            let dir = absolute_path(dir);
+            all.iter().find(|ws| ws.path == dir).cloned()
+        }
+        None => None,
+    };
+
+    check_workspace_identity(by_name.as_ref(), by_dir.as_ref(), workspace_dir)?;
+
+    if let Some(ws) = by_name.or(by_dir) {
+        if let Some(name) = workspace_name
+            && name != ws.name.as_str()
+        {
+            return Err(AppDiagnostic::usage(
+                format!(
+                    "工作区 {} 已存在，与 --workspace-name {name} 不一致",
+                    ws.name.as_str()
+                ),
+                Some(
+                    "要用已有工作区就只传 --workspace / --workspace-dir；要新建就换一个名称"
+                        .to_owned(),
+                ),
+            )
+            .into());
+        }
+        return Ok(Some(CreateWorkspace::Ready {
+            selector: Some(ws.name.as_str().to_owned()),
+            created: false,
+        }));
+    }
+
+    // `--workspace <名> --workspace-dir <路径>` 未命中时，把 `--workspace` 当作名称
+    let name = if workspace_name.is_some() {
+        workspace_name
+    } else if workspace_dir.is_some() {
+        workspace.filter(|sel| !sel.contains(['/', '\\']))
+    } else {
+        None
+    };
+
+    // 未命中已有工作区：没有目录 / 名称只能交互建，否则按显式参数新建
+    if workspace_dir.is_none() && name.is_none() {
+        if !interactive {
+            return Err(AppDiagnostic::usage(
+                format!("工作区 {} 不存在", workspace.unwrap_or("(未指定)")),
+                Some(
+                    "非交互模式：带 --workspace-dir <路径> 新建，或先运行 mcsup workspace init"
+                        .to_owned(),
+                ),
+            )
+            .into());
+        }
+        printer.print_section("尚未有可用的工作区，先创建工作区");
+        super::workspace::init(&svc, None, None, printer)?;
+        return Ok(if let Ok(ws) = svc.current_workspace() {
+            Some(CreateWorkspace::Ready {
+                selector: Some(ws.name.as_str().to_owned()),
+                created: true,
+            })
+        } else {
+            printer.print_section(
+                "工作区未就绪，创建中止（可重新执行 mcsup workspace init / use 后再创建）",
+            );
+            Some(CreateWorkspace::Aborted)
+        });
+    }
+
+    create_workspace(&svc, workspace_dir, workspace, name, printer)
+}
+
+/// 新建并注册工作区，返回按名称定位的选择器
+fn create_workspace(
+    svc: &WorkspaceService,
+    workspace_dir: Option<&Path>,
+    workspace: Option<&str>,
+    name: Option<&str>,
+    printer: Printer,
+) -> Result<Option<CreateWorkspace>> {
+    let dir = resolve_new_workspace_dir(workspace_dir, workspace, name)?;
+    let ws = match svc.init(&dir, name)? {
+        InitOutcome::Created(ws)
+        | InitOutcome::Recovered(ws)
+        | InitOutcome::MarkerRestored(ws)
+        | InitOutcome::AlreadyRegistered(ws) => ws,
+    };
+    printer.print_section(&format!(
+        "已就绪工作区 {} ({})",
+        ws.name.as_str(),
+        ws.path.display()
+    ));
+    Ok(Some(CreateWorkspace::Ready {
+        selector: Some(ws.name.as_str().to_owned()),
+        created: true,
+    }))
+}
+
+/// 名称与路径必须指向同一个已注册工作区，否则是用户笔误，直接报用法错误
+fn check_workspace_identity(
+    by_name: Option<&mcsup::domain::workspace::Workspace>,
+    by_dir: Option<&mcsup::domain::workspace::Workspace>,
+    workspace_dir: Option<&Path>,
+) -> Result<()> {
+    if let Some(name_hit) = by_name
+        && let Some(dir) = workspace_dir
+        && !same_path(&name_hit.path, dir)
+    {
+        return Err(AppDiagnostic::usage(
+            format!(
+                "工作区 {} 已注册在 {}，与 --workspace-dir {} 不一致",
+                name_hit.name.as_str(),
+                name_hit.path.display(),
+                absolute_path(dir).display()
+            ),
+            Some("名称与路径必须指向同一个工作区；只保留其中一个再重试".to_owned()),
+        )
+        .into());
+    }
+    if let (Some(name_hit), Some(dir_hit)) = (by_name, by_dir)
+        && name_hit.id != dir_hit.id
+    {
+        return Err(AppDiagnostic::usage(
+            format!(
+                "工作区名称与路径指向不同工作区：{} 在 {}，而 --workspace-dir 指向 {}",
+                name_hit.name.as_str(),
+                name_hit.path.display(),
+                dir_hit.path.display()
+            ),
+            Some("名称与路径必须指向同一个工作区；只保留其中一个再重试".to_owned()),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// 两个目录是否指向同一位置（都尽量取物理路径比较）
+fn same_path(left: &Path, right: &Path) -> bool {
+    let normalize =
+        |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| absolute_path(path));
+    normalize(left) == normalize(right)
+}
+
+/// 新建工作区的目录：`--workspace-dir` > `--workspace` 本身是路径 > 数据目录/名称
+fn resolve_new_workspace_dir(
+    workspace_dir: Option<&Path>,
+    workspace: Option<&str>,
+    workspace_name: Option<&str>,
+) -> Result<PathBuf> {
+    if let Some(dir) = workspace_dir {
+        return Ok(absolute_path(dir));
+    }
+    if let Some(sel) = workspace
+        && sel.contains(['/', '\\'])
+    {
+        return Ok(absolute_path(Path::new(sel)));
+    }
+    let name = workspace_name.or(workspace).ok_or_else(|| {
+        AppDiagnostic::usage(
+            "新建工作区缺少名称或目录",
+            Some("用 --workspace-dir <路径> 或 --workspace-name <名称> 指定".to_owned()),
+        )
+    })?;
+    // 名称非法时交给 service 的 WorkspaceName::parse 报错，口径只留一份
+    let _ = WorkspaceName::parse(name)?;
+    Ok(crate::config::platform_data_dir()
+        .join("workspaces")
+        .join(name))
+}
+
 pub(crate) fn link(
     path: &Path,
     name: Option<&str>,
@@ -432,13 +777,15 @@ pub(crate) fn remove(name: &str, purge: bool, printer: Printer) -> Result<()> {
         ));
         // 仍传给 service，由其拒绝并给出统一错误
     }
-    // 删了不可恢复：可交互时问一句，默认不删；`--purge` 是显式指令，不再问
+    // 删了不可恢复：可交互时问一句，默认不删；`--purge` 是显式指令，不再问；
+    // `--yes` 对「是否删盘」「手输名称」两个确认都答「是」
     let purge = if purge || !printer.is_interactive() {
         purge
     } else {
         // 普通注销不删目录，先问「是否连磁盘数据一起删」；回答是后再按删盘的前置校验
         // 拦一次（与 --purge 同一道闸），用户此时尚未确认名称
-        let confirmed = prompts::confirm_yes(
+        let confirmed = prompts::confirm_or_yes(
+            printer,
             &format!("删除 {name} ({}) 的磁盘数据?", srv.dir.display()),
             false,
         )
@@ -451,7 +798,9 @@ pub(crate) fn remove(name: &str, purge: bool, printer: Printer) -> Result<()> {
                 "警告: 将永久删除 {name} ({}) 中的所有存档、备份等文件，此操作无法恢复",
                 srv.dir.display()
             ));
-            prompts::confirm_by_name(&format!("输入服务器名称 {name} 以确认删除"), name)?;
+            if !printer.assumes_yes() {
+                prompts::confirm_by_name(&format!("输入服务器名称 {name} 以确认删除"), name)?;
+            }
         }
         confirmed
     };
@@ -495,6 +844,35 @@ pub(crate) fn remove(name: &str, purge: bool, printer: Printer) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 新建工作区目录：显式目录优先；`--workspace` 是路径时按路径；
+    /// 否则落在数据目录下的 workspaces/<名称>
+    #[test]
+    fn new_workspace_dir_prefers_explicit_dir_then_path_then_name() {
+        let explicit = Path::new("/tmp/ws-explicit");
+        assert_eq!(
+            resolve_new_workspace_dir(Some(explicit), Some("other"), Some("named"))
+                .expect("explicit"),
+            absolute_path(explicit)
+        );
+        assert_eq!(
+            resolve_new_workspace_dir(None, Some("/tmp/ws-path"), None).expect("path"),
+            absolute_path(Path::new("/tmp/ws-path"))
+        );
+        assert_eq!(
+            resolve_new_workspace_dir(None, None, Some("named")).expect("name"),
+            crate::config::platform_data_dir()
+                .join("workspaces")
+                .join("named")
+        );
+    }
+
+    /// 无目录、无名称时无法推导新建位置，必须报用法错误（2）
+    #[test]
+    fn new_workspace_dir_without_input_is_usage_error() {
+        let err = resolve_new_workspace_dir(None, None, None).expect_err("缺名称/目录");
+        assert_eq!(Printer::exit_code(&err), 2);
+    }
 
     #[test]
     fn resolve_flag_variant_gates_by_capability_with_usage_exit() {

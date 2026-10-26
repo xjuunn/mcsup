@@ -9,7 +9,7 @@ mod server_ops;
 mod settings;
 mod workspace;
 
-use crate::cli::{BackupAction, Cli, Command, JavaAction, ServerAction};
+use crate::cli::{BackupAction, Cli, Command, JavaAction, ModpackAction, ServerAction};
 use crate::config::ConfigFile;
 use crate::diagnostic::AppDiagnostic;
 use crate::locale::Lang;
@@ -22,7 +22,7 @@ pub(crate) async fn run(cli: Cli, cfg: &ConfigFile, lang: Lang) -> Result<()> {
     match cli.command {
         Command::Workspace { action } => workspace::run(action, printer),
         Command::Server { action } => server(action, cfg, printer).await,
-        Command::Modpack { .. } => err("modpack"),
+        Command::Modpack { action } => modpack(&action, cfg, printer),
         Command::Java { action } => java(action, printer).await,
         Command::Remote { .. } => err("remote"),
         Command::Doctor {
@@ -141,44 +141,86 @@ async fn server(action: ServerAction, cfg: &ConfigFile, printer: Printer) -> Res
             version,
             variant,
             workspace,
+            workspace_name,
+            workspace_dir,
         } => {
             server_ops::create(
-                name.as_deref(),
-                version.as_deref(),
-                variant.as_deref(),
-                workspace.as_deref(),
+                server_ops::CreateArgs {
+                    name: name.as_deref(),
+                    version: version.as_deref(),
+                    variant: variant.as_deref(),
+                    workspace: workspace.as_deref(),
+                    workspace_name: workspace_name.as_deref(),
+                    workspace_dir: workspace_dir.as_deref(),
+                },
                 printer,
             )
             .await
         }
         ServerAction::Install { name, version } => {
+            let name = server_ops::require_server_name(name.as_deref(), "server install", printer)?;
             install::run(&name, version.as_deref(), cfg, printer).await
         }
         ServerAction::Start { name, accept_eula } => {
+            let name = server_ops::require_server_name(name.as_deref(), "server start", printer)?;
             lifecycle::start(&name, accept_eula, printer).await
         }
-        ServerAction::Stop { name, grace, force } => lifecycle::stop(&name, grace, force, printer),
+        ServerAction::Stop { name, grace, force } => {
+            let name = server_ops::require_server_name(name.as_deref(), "server stop", printer)?;
+            lifecycle::stop(&name, grace, force, printer)
+        }
         ServerAction::Restart {
             name,
             accept_eula,
             grace,
             force,
-        } => lifecycle::restart(&name, accept_eula, grace, force, printer).await,
-        ServerAction::Status { name } => lifecycle::status(&name, printer),
-        ServerAction::Console { name } => lifecycle::console(&name, printer),
-        ServerAction::Send { name, command } => lifecycle::send(&name, &command, printer),
-        ServerAction::Logs { name, tail, follow } => lifecycle::logs(&name, tail, follow, printer),
-        ServerAction::Props { name, kv } => props::run(&name, &kv, printer),
+        } => {
+            let name = server_ops::require_server_name(name.as_deref(), "server restart", printer)?;
+            lifecycle::restart(&name, accept_eula, grace, force, printer).await
+        }
+        ServerAction::Status { name } => {
+            let name = server_ops::require_server_name(name.as_deref(), "server status", printer)?;
+            lifecycle::status(&name, printer)
+        }
+        ServerAction::Console { name } => {
+            let name = server_ops::require_server_name(name.as_deref(), "server console", printer)?;
+            lifecycle::console(&name, printer)
+        }
+        ServerAction::Send { name, command } => {
+            let name = server_ops::require_server_name(name.as_deref(), "server send", printer)?;
+            let command = server_ops::require_text(
+                command,
+                "server send 缺少要注入的命令",
+                "非交互模式：mcsup server send <name> \"<命令>\"",
+                printer,
+            )?;
+            lifecycle::send(&name, &command, printer)
+        }
+        ServerAction::Logs { name, tail, follow } => {
+            let name = server_ops::require_server_name(name.as_deref(), "server logs", printer)?;
+            lifecycle::logs(&name, tail, follow, printer)
+        }
+        ServerAction::Props { name, kv } => {
+            let name = server_ops::require_server_name(name.as_deref(), "server props", printer)?;
+            props::run(&name, &kv, printer)
+        }
         ServerAction::Set { name, key, value } => {
+            let name = server_ops::require_server_name(name.as_deref(), "server set", printer)?;
             settings::set(&name, key.as_deref(), value.as_deref(), printer)
         }
-        ServerAction::Remove { name, purge } => server_ops::remove(&name, purge, printer),
+        ServerAction::Remove { name, purge } => {
+            let name = server_ops::require_server_name(name.as_deref(), "server remove", printer)?;
+            server_ops::remove(&name, purge, printer)
+        }
         ServerAction::Link {
             ref path,
             ref name,
             ref workspace,
         } => server_ops::link(path, name.as_deref(), workspace.as_deref(), printer),
-        ServerAction::Version { name } => settings::version(&name, printer),
+        ServerAction::Version { name } => {
+            let name = server_ops::require_server_name(name.as_deref(), "server version", printer)?;
+            settings::version(&name, printer)
+        }
         ServerAction::Backup { action } => backup(action, printer).await,
         ServerAction::Mod { .. } => err("mod"),
     }
@@ -204,6 +246,12 @@ fn domain_launch_args(
     mcsup::domain::server::launch::LaunchSpec::args(files).with_program_args(server_args)
 }
 
+fn modpack(action: &ModpackAction, _cfg: &ConfigFile, _printer: Printer) -> Result<()> {
+    match action {
+        ModpackAction::List { .. } | ModpackAction::Install { .. } => err("modpack"),
+    }
+}
+
 async fn backup(action: BackupAction, printer: Printer) -> Result<()> {
     match action {
         BackupAction::Create {
@@ -211,23 +259,45 @@ async fn backup(action: BackupAction, printer: Printer) -> Result<()> {
             label,
             scope,
             no_reuse,
-        } => backup::create(&name, label.as_deref(), scope.as_deref(), no_reuse, printer).await,
+        } => {
+            let name =
+                server_ops::require_server_name(name.as_deref(), "server backup create", printer)?;
+            backup::create(&name, label.as_deref(), scope.as_deref(), no_reuse, printer).await
+        }
         BackupAction::List {
             name,
             page,
             page_size,
-        } => backup::list(&name, page, page_size, printer),
+        } => {
+            let name =
+                server_ops::require_server_name(name.as_deref(), "server backup list", printer)?;
+            backup::list(&name, page, page_size, printer)
+        }
         BackupAction::Restore { name, id, to } => {
+            let name =
+                server_ops::require_server_name(name.as_deref(), "server backup restore", printer)?;
             backup::restore(&name, id.as_deref(), to.as_deref(), printer).await
         }
-        BackupAction::Delete { name, id } => backup::delete(&name, id.as_deref(), printer),
-        BackupAction::Verify { name, id } => backup::verify(&name, id.as_deref(), printer),
+        BackupAction::Delete { name, id } => {
+            let name =
+                server_ops::require_server_name(name.as_deref(), "server backup delete", printer)?;
+            backup::delete(&name, id.as_deref(), printer)
+        }
+        BackupAction::Verify { name, id } => {
+            let name =
+                server_ops::require_server_name(name.as_deref(), "server backup verify", printer)?;
+            backup::verify(&name, id.as_deref(), printer)
+        }
         BackupAction::Prune {
             name,
             keep,
             older_than,
             dry_run,
-        } => backup::prune(&name, keep, older_than.as_deref(), dry_run, printer),
+        } => {
+            let name =
+                server_ops::require_server_name(name.as_deref(), "server backup prune", printer)?;
+            backup::prune(&name, keep, older_than.as_deref(), dry_run, printer)
+        }
     }
 }
 

@@ -177,6 +177,118 @@ fn create_malformed_variant_name_exits_2() {
     assert!(err.contains("未知变体"), "{err}");
 }
 
+/// 非交互缺服务器名 → 用法错误 2（交互下才进入选择）
+#[test]
+fn server_status_without_name_exits_2() {
+    let home = temp_home();
+    let out = run(
+        home.path(),
+        &["server", "status", "--output", "json", "--lang", "zh"],
+    );
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(out.stdout.is_empty());
+    assert!(stderr(&out).contains("缺少服务器名称"), "{}", stderr(&out));
+}
+
+/// 非交互缺服务器名 → 删除同样退出 2，且 `--yes` 不会跳过补参
+#[test]
+fn server_remove_without_name_exits_2_even_with_yes() {
+    let home = temp_home();
+    let out = run(
+        home.path(),
+        &[
+            "server", "remove", "--yes", "--output", "json", "--lang", "zh",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("缺少服务器名称"), "{}", stderr(&out));
+}
+
+/// `server send` 缺命令体同样走补参规则，非交互退出 2
+#[test]
+fn server_send_without_command_exits_2() {
+    let home = temp_home();
+    let out = run(
+        home.path(),
+        &["server", "send", "srv1", "--output", "json", "--lang", "zh"],
+    );
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("缺少"), "{}", stderr(&out));
+}
+
+/// `server create --workspace` 指向不存在的工作区、又没有目录参数 → 用法错误 2
+#[test]
+fn create_with_unknown_workspace_without_dir_exits_2() {
+    let home = temp_home();
+    let out = run(
+        home.path(),
+        &[
+            "server",
+            "create",
+            "srv1",
+            "--version",
+            "1.21.1",
+            "--workspace",
+            "ghost",
+            "--output",
+            "json",
+            "--lang",
+            "zh",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("工作区 ghost 不存在"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// 名称与路径不一致：名称命中已有工作区、`--workspace-dir` 指向另一条 → 2
+#[test]
+fn create_with_workspace_name_path_mismatch_exits_2() {
+    let home = temp_home();
+    let a = home.path().join("wsa");
+    let b = home.path().join("wsb");
+    for (dir, name) in [(&a, "wsa"), (&b, "wsb")] {
+        let init = run(
+            home.path(),
+            &[
+                "workspace",
+                "init",
+                "--dir",
+                dir.to_str().expect("utf8"),
+                "--name",
+                name,
+                "--output",
+                "json",
+            ],
+        );
+        assert_eq!(init.status.code(), Some(0), "{}", stderr(&init));
+    }
+    let out = run(
+        home.path(),
+        &[
+            "server",
+            "create",
+            "srv1",
+            "--version",
+            "1.21.1",
+            "--workspace",
+            "wsa",
+            "--workspace-dir",
+            b.to_str().expect("utf8"),
+            "--output",
+            "json",
+            "--lang",
+            "zh",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("wsa") && err.contains("wsb"), "{err}");
+}
+
 /// 无参 `workspace use` 非交互 → 用法错误 2（不提问）
 #[test]
 fn workspace_use_without_name_exits_2() {
@@ -868,6 +980,58 @@ fn config_set_show_unset_roundtrip() {
     let again_payload: serde_json::Value = serde_json::from_slice(&again.stdout).expect("unset2");
     assert_eq!(again_payload["previous"], serde_json::Value::Null);
     assert_eq!(again_payload["value"], "all");
+}
+
+/// 非交互缺配置键 → 用法错误 2（交互下才进入键选择）
+#[test]
+fn config_set_without_key_exits_2() {
+    let home = temp_home();
+    let out = run(
+        home.path(),
+        &["config", "set", "--output", "json", "--lang", "zh"],
+    );
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(out.stdout.is_empty());
+    assert!(stderr(&out).contains("缺少配置键"), "{}", stderr(&out));
+}
+
+/// 非交互缺配置键（unset）同样退出 2
+#[test]
+fn config_unset_without_key_exits_2() {
+    let home = temp_home();
+    let out = run(
+        home.path(),
+        &["config", "unset", "--output", "json", "--lang", "zh"],
+    );
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("缺少配置键"), "{}", stderr(&out));
+}
+
+/// 非交互缺配置值 → 用法错误 2
+#[test]
+fn config_set_without_value_exits_2() {
+    let home = temp_home();
+    let out = run(
+        home.path(),
+        &[
+            "config", "set", "data-dir", "--output", "json", "--lang", "zh",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("缺少"), "{}", stderr(&out));
+}
+
+/// 非交互 `java uninstall` 缺目标 → 不提问，直接报错退出
+#[test]
+fn java_uninstall_without_target_exits_nonzero() {
+    let home = temp_home();
+    let out = run(
+        home.path(),
+        &["java", "uninstall", "--output", "json", "--lang", "zh"],
+    );
+    assert_ne!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(out.stdout.is_empty());
+    assert!(stderr(&out).contains("请指定"), "{}", stderr(&out));
 }
 
 /// 键名拼错 → 用法错误 2，并列出可用键

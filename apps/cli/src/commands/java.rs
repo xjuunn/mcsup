@@ -223,6 +223,10 @@ fn resolve_target(
         return Ok(dir.to_path_buf());
     }
     let Some(target) = target else {
+        // 缺必填目标：交互下从已注册运行时中选一个；非交互报用法错误（2）
+        if printer.is_interactive() {
+            return prompt_registered_runtime(service);
+        }
         return Err(anyhow!(
             "请指定大版本号或 --dir <路径>，如 mcsup java uninstall 17 或 mcsup java uninstall --dir \"…/Contents/Home\""
         ));
@@ -244,6 +248,37 @@ fn resolve_target(
         return Ok(as_path.to_path_buf());
     }
     Err(anyhow!("无法识别的目标: {target}（大版本号或 --dir 路径）"))
+}
+
+/// 缺目标时：列出已注册运行时供选择，返回其路径
+fn prompt_registered_runtime(service: &JavaService) -> Result<PathBuf> {
+    let runtimes = service.list().context("列出 Java 失败")?;
+    if runtimes.is_empty() {
+        return Err(anyhow!(
+            "尚无已注册的 Java 运行时，可先运行 mcsup java scan"
+        ));
+    }
+    let choices: Vec<String> = runtimes
+        .iter()
+        .map(|rt| {
+            format!(
+                "{} · {} · {} ({})",
+                rt.major,
+                rt.version,
+                rt.path.display(),
+                if rt.managed { "mcsup" } else { "系统" }
+            )
+        })
+        .collect();
+    let selected = Select::new("选择要卸载的 Java 运行时", choices)
+        .with_page_size(12)
+        .prompt()
+        .context("选择取消")?;
+    runtimes
+        .iter()
+        .find(|rt| selected.starts_with(&format!("{} · ", rt.major)))
+        .map(|rt| rt.path.clone())
+        .ok_or_else(|| anyhow!("未匹配到所选运行时"))
 }
 
 /// 多个运行时命中大版本时，TTY 下交互选择
