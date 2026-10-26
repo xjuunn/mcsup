@@ -95,11 +95,6 @@ pub(crate) fn server() -> &'static str {
 }
 
 #[must_use]
-pub(crate) fn modpack() -> &'static str {
-    t("整合包", "modpacks")
-}
-
-#[must_use]
 pub(crate) fn java() -> &'static str {
     t("JVM 运行时", "JVM runtimes")
 }
@@ -543,6 +538,14 @@ pub(crate) fn backup_dry_run_arg() -> &'static str {
     t(
         "只预览将删除的内容，不实际修改",
         "preview what would be removed without changing anything",
+    )
+}
+
+#[must_use]
+pub(crate) fn server_create_modpack_arg() -> &'static str {
+    t(
+        "整合包项目 ID / slug（选定 --variant modrinth-modpack，缺省时交互搜索）",
+        "modpack project ID or slug (implies --variant modrinth-modpack, searched interactively when omitted)",
     )
 }
 

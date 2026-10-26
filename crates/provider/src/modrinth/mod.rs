@@ -29,6 +29,7 @@
 mod client;
 pub mod facets;
 pub mod manifest;
+pub mod modpack;
 mod source;
 
 pub use client::{
@@ -36,3 +37,4 @@ pub use client::{
     VersionChannel, VersionFilter, file_checksum, primary_file,
 };
 pub use facets::{Facet, FacetOp, FacetTree};
+pub use modpack::{ModrinthModpackSource, MrpackExtractor};

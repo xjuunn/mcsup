@@ -82,6 +82,12 @@ pub struct SearchHit {
     /// 支持的环境（`client_and_server` 等）
     #[serde(default)]
     pub environment: Vec<String>,
+    /// 客户端侧支持情况（`required` / `optional` / `unsupported`）
+    #[serde(default)]
+    pub client_side: Option<String>,
+    /// 服务端侧支持情况（`required` / `optional` / `unsupported`）
+    #[serde(default)]
+    pub server_side: Option<String>,
     /// 展示的披露类型
     #[serde(default)]
     pub disclosure_types: Vec<String>,

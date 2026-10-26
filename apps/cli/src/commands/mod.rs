@@ -4,12 +4,13 @@ mod doctor;
 mod install;
 mod java;
 mod lifecycle;
+mod modpack;
 mod props;
 mod server_ops;
 mod settings;
 mod workspace;
 
-use crate::cli::{BackupAction, Cli, Command, JavaAction, ModpackAction, ServerAction};
+use crate::cli::{BackupAction, Cli, Command, JavaAction, ServerAction};
 use crate::config::ConfigFile;
 use crate::diagnostic::AppDiagnostic;
 use crate::locale::Lang;
@@ -22,7 +23,6 @@ pub(crate) async fn run(cli: Cli, cfg: &ConfigFile, lang: Lang) -> Result<()> {
     match cli.command {
         Command::Workspace { action } => workspace::run(action, printer),
         Command::Server { action } => server(action, cfg, printer).await,
-        Command::Modpack { action } => modpack(&action, cfg, printer),
         Command::Java { action } => java(action, printer).await,
         Command::Remote { .. } => err("remote"),
         Command::Doctor { only, strict } => doctor::run(cfg, &only, strict, printer).await,
@@ -139,6 +139,7 @@ async fn server(action: ServerAction, cfg: &ConfigFile, printer: Printer) -> Res
             workspace,
             workspace_name,
             workspace_dir,
+            modpack,
         } => {
             server_ops::create(
                 server_ops::CreateArgs {
@@ -148,6 +149,7 @@ async fn server(action: ServerAction, cfg: &ConfigFile, printer: Printer) -> Res
                     workspace: workspace.as_deref(),
                     workspace_name: workspace_name.as_deref(),
                     workspace_dir: workspace_dir.as_deref(),
+                    modpack: modpack.as_deref(),
                 },
                 printer,
             )
@@ -240,12 +242,6 @@ fn domain_launch_args(
     server_args: Vec<String>,
 ) -> mcsup::domain::server::launch::LaunchSpec {
     mcsup::domain::server::launch::LaunchSpec::args(files).with_program_args(server_args)
-}
-
-fn modpack(action: &ModpackAction, _cfg: &ConfigFile, _printer: Printer) -> Result<()> {
-    match action {
-        ModpackAction::List { .. } | ModpackAction::Install { .. } => err("modpack"),
-    }
 }
 
 async fn backup(action: BackupAction, printer: Printer) -> Result<()> {

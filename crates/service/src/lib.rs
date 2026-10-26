@@ -4,6 +4,7 @@ mod doctor;
 mod fs_error;
 mod java;
 mod lifecycle;
+mod modpack;
 mod origin;
 mod platform_config;
 mod platform_doctor;
@@ -21,8 +22,7 @@ pub use backup::{
     SnapshotPage, VerifyOutcome,
 };
 pub use content::{
-    ContentError, ContentInstall, ContentService, InstallOptions, ModpackInstall, existing_matches,
-    request_for,
+    ContentError, ContentInstall, ContentService, InstallOptions, existing_matches, request_for,
 };
 pub use doctor::{CheckKind, DoctorError, DoctorService, Finding, Report, Severity};
 use domain::server::download::DownloadStatus;
@@ -36,6 +36,10 @@ pub use java::{
 pub use lifecycle::{
     BusyOp, DEFAULT_RAM_MIB, LifecycleError, LifecycleErrorKind, LogWatch, ServerLifecycleService,
     StartOptions, StatusReport,
+};
+pub use modpack::{
+    ModpackApplied, ModpackError, ModpackInstallOptions, ModpackInstalled, ModpackPrepared,
+    ModpackService, is_modpack_variant, loader_pin, variant_for_loader,
 };
 pub use origin::{OriginFilter, ResolveError, Selector, resolve_index};
 pub use platform_config::{

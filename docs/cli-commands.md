@@ -3,9 +3,11 @@
 `mcsup` 命令采用统一的 `<对象> <动作> <名字> ...` 结构，关键约定：
 
 - **动作总在名字前**：`mcsup server start <name>`、`mcsup server backup create <name>`。
-- **建站只有两个入口**：`server create`（向导或全参数直通建站并下载核心，
-  自配 Mod）；`modpack install <pack>`（整包一键建站，version/variant/loader/Mod
-  全部来自整包）。
+- **建站只有一个入口**：`server create`。整合包是它的一种变体
+  （`--variant modrinth-modpack`，短名 `--variant modrinth`，或 `--modpack <ID>`
+  隐含该变体）：选定变体后搜索可开服的整合包、展示详情、选版本，再按清单装
+  加载器与 mod。变体列表按「用户需要懂多少」排序：`vanilla` 与整合包在前，
+  模组加载器其次，服务端分支与代理在后。
 - **凡属某个服务器的内容，挂在 `server` 下**：备份（`backup`）、Mod（`mod`）。
 - **服务属性统一 `server set`**：JVM 绑定、内存、自启等一律
   `mcsup server set <name> <key> <value>`，不为一类属性单开子命令；
@@ -39,8 +41,8 @@
   单行回显，JSON 模式隐藏进度。
 - 交互组件集中在 `apps/cli/src/prompts/`：步骤回显、目录三选项、名称输入、
   可过滤选择、输入名称确认；`workspace init` / `server create` /
-  `modpack install` / `server remove` / `server set` 共用。组件只做 UI，
-  业务判定仍在 service / domain。
+  `server remove` / `server set` 共用。组件只做 UI，业务判定仍在
+  service / domain。
 - `workspace init` 无 `--dir` 且可交互时：目录三选项（数据目录 =
   `{data_dir}/mcsup/workspaces/<名称>`；当前目录；自定义目录，输入时校验、
   非法重输）→ 名称（默认=目录名，不合法退回序号 `workspaceNN`）→ 确认。
@@ -54,7 +56,7 @@ restart / status / console / send / logs / props / set / remove / version`、
 `workspace init / use / remove`、`java install / uninstall`、
 `config set / unset`。
 
-尚未实现的命令（`server mod`、`modpack`、`remote`）参数声明已按规则改为可选，
+尚未实现的命令（`server mod`、`remote`）参数声明已按规则改为可选，
 但入口在 service 能力落地前直接返回「尚未实现」，因此缺失必填参数时给的是
 未实现错误而非补参交互。service 层实现后，入口只需接上已有的
 `require_server_name` / 补参组件即可。
@@ -116,12 +118,11 @@ restart / status / console / send / logs / props / set / remove / version`、
 
 | 层级 | 简写 |
 | --- | --- |
-| 顶层 | `ws` workspace · `srv` server · `mp` modpack · `jv` java · `rmt` remote · `doc` doctor · `cfg` config · `up` update · `comp` completions · `ver` version |
+| 顶层 | `ws` workspace · `srv` server · `jv` java · `rmt` remote · `doc` doctor · `cfg` config · `up` update · `comp` completions · `ver` version |
 | `workspace` | `in` / `new` init · `ls` list · `sw` use · `rm` remove · `doc` doctor |
 | `server` | `ls` list · `cr` create · `in` install · `up` start · `down` stop · `rs` restart · `st` status · `con` console · `snd` send · `log` logs · `prop` props · `cfg` set · `rm` remove · `ln` link · `ver` version · `bak` backup · `md` mod |
 | `server backup` | `cr` create · `ls` list · `rt` restore · `rm` delete · `vf` verify · `pr` prune |
 | `server mod` | `ls` list · `in` install · `rm` remove · `up` update · `od` outdated |
-| `modpack` | `ls` list · `in` install |
 | `java` | `ls` list · `sc` scan · `in` install · `un` / `rm` uninstall |
 | `remote` | `ls` list · `sv` serve · `con` connect · `st` status · `pg` ping · `dc` disconnect · `rv` revoke |
 | `config` | `ls` show · `st` set · `us` unset · `ed` edit |
@@ -140,9 +141,6 @@ mcsup
 │   ├── props (prop) / set (cfg) / remove (rm) / version (ver)
 │   ├── backup (bak)  create (cr) · list (ls) · restore (rt) · delete (rm) · verify (vf) · prune (pr)
 │   └── mod (md)      list (ls) · install (in) · remove (rm) · update (up) · outdated (od)
-├── modpack (mp)              # 整合包：一键建整包服务器
-│   ├── install (in) <pack> [--name <name>] [--workspace <ws>]
-│   └── list (ls) [<query>]
 ├── java (jv)                 # 机器级 JVM 运行时
 │   └── list (ls) [--origin <o>] / scan (sc) / install (in) / uninstall (un|rm)
 ├── remote (rmt)              # 远端执行位置（Backend）
@@ -234,15 +232,43 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | `remove` | `mcsup workspace remove [<name>] [--purge]` | 注销工作目录，同时清除该工作目录下的服务器登记；交互下询问是否删除磁盘数据（默认不删），同意后红色警示并要求输入工作区名称确认，`--purge` 跳过询问直接删除；删盘的前置条件（终端工作目录不在该工作区内、目录里的 `workspace.toml` 属于该记录）在确认框之前就校验，不满足立刻报错；终端工作目录就在该工作区内时拒绝（退出码 4，cd 出去后重试）；删除失败（目录被占用）保留注册，退出占用后重试即可；JSON 同时输出 `purged`（请求了删盘）与 `disk_purged`（磁盘真的删了），目录本就不存在时后者为 `false`；删除当前工作区时当前标记移交给剩余中按名称排序的第一个 |
 | `doctor` | `mcsup workspace doctor [--only <kind,...>] [--strict]` | 只读体检工作区与注册表一致性：10 项检查（见 `docs/workspace.md` 的表），error 级非零退出；`--only` 按检查项标识过滤，`--strict` 让 warning 也算失败 |
 
-## mcsup modpack（整合包：一键建整包服务器）
+## 整合包（`server create --variant modrinth-modpack`）
 
-| 子命令 | 用法 | 说明 |
-| --- | --- | --- |
-| `install` | `mcsup modpack install <pack> [--name <name>] [--workspace <ws>]` | 一键建整包服务器；缺省 `--name` 时用整包名 |
-| `update` | `mcsup modpack update <name>` | 把已安装整包升级到新版本（先 dry-run 列出变更） |
+整合包不是独立命令，而是 `server create` 的一种变体。选定后进入显式向导：
 
-建好的整包服务与 `server create` 建的服务是同一种对象，后续运维都走
-`mcsup server ...`；`modpack` 只负责「按整包生根」与「整包升级」。
+```
+搜索 ──Esc──→ 取消整个建站
+  ↓ 回车（关键词发给上游，offset=0）
+结果 ──Esc──→ 搜索（改关键词即重搜）
+  ↓ 选中          （「下一页 / 上一页」翻页）
+详情 ──Esc──→ 结果
+  ↓ 继续
+版本 ──Esc──→ 详情
+  ↓ 选中
+确认 ──Esc──→ 版本
+  ↓ 开始创建
+读 `.mrpack` 清单 → 装加载器核心 → 铺 `overrides/` → 下载清单文件
+```
+
+- 搜索是**真实的服务端搜索**：关键词直接作为 `ModpackQuery::keyword` 发给
+  Modrinth，不是先拉一页再本地过滤，因此能搜到第一页之外的结果。
+- 每页 20 条；结果页底部按需出现「下一页 / 上一页」。Esc 回搜索即重搜。
+- 搜索框常驻提示：**只显示支持服务端的整合包**（`server_side` facet 过滤纯
+  客户端整合包）。
+- 每一步 Esc 回到上一步，Ctrl+C 取消整个命令。
+
+| 用法 | 说明 |
+| --- | --- |
+| `mcsup server create <name> --variant modrinth` | 交互向导（`modrinth-modpack` 等价） |
+| `mcsup server create <name> --modpack <ID或slug>` | 直接指定整合包（隐含该变体；非交互可用） |
+| `mcsup server create <name> --modpack <ID> --version <版本ID或版本号>` | 固定版本，脚本可复现 |
+
+非交互模式必须用 `--modpack` 指定项目；只用 `--variant modrinth` 且没有
+`--modpack` 会以用法错误退出，而不是静默挑一个包。
+
+清单里 `server: unsupported` 的文件不会装到服务端；`optional` 视为需要安装。
+建好的整合包服务与 `server create` 建的服务是同一种对象，后续运维都走
+`mcsup server ...`。
 
 ## mcsup java（机器级 JVM 运行时）
 

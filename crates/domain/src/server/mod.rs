@@ -7,6 +7,7 @@ pub mod event;
 pub mod launch;
 pub mod layout;
 pub mod meta;
+pub mod modpack;
 pub mod props;
 pub mod settings;
 pub mod status;

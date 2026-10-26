@@ -8,6 +8,7 @@ use comfy_table::{Cell, Color, Table};
 use mcsup::domain::server::status::ServerStatus;
 use mcsup::domain::server::version::{ServerVariant, VersionId};
 use mcsup::domain::workspace::{WorkspaceId, WorkspaceName};
+use mcsup::port::ServerJarSource;
 use mcsup::protocol::cli::{CreateRow, RemoveJson, ServerRow};
 use mcsup::service::{
     InitOutcome, ServerRegistry, ServerRegistryError, WorkspaceError, WorkspaceService,
@@ -16,6 +17,7 @@ use mcsup::service::{
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::install::{download_jar, pick_version};
 
@@ -29,7 +31,7 @@ struct ServerRowView<'a> {
     running: bool,
 }
 
-pub(crate) fn open_registry() -> Result<std::sync::Arc<ServerRegistry>> {
+pub(crate) fn open_registry() -> Result<Arc<ServerRegistry>> {
     bootstrap::open_registry()
 }
 
@@ -226,6 +228,18 @@ pub(crate) struct CreateArgs<'a> {
     pub(crate) workspace_name: Option<&'a str>,
     /// 与 `--workspace` 配合：要新建的工作区目录
     pub(crate) workspace_dir: Option<&'a Path>,
+    /// 整合包项目 ID / slug（`--modpack`，隐含 `--variant modrinth-modpack`）
+    pub(crate) modpack: Option<&'a str>,
+}
+
+/// 空选择器等价于「未指定工作区」
+fn non_empty_selector(selector: String) -> Option<String> {
+    (!selector.is_empty()).then_some(selector)
+}
+
+/// `--variant` 是否指向整合包变体（含 `modrinth` 短名）
+fn is_modpack_flag(raw: &str) -> bool {
+    raw.eq_ignore_ascii_case("modrinth-modpack") || raw.eq_ignore_ascii_case("modrinth")
 }
 
 /// `server create`：非交互走参数直通（缺必选参数 → 退出码 2），
@@ -242,8 +256,11 @@ pub(crate) async fn create(args: CreateArgs<'_>, printer: Printer) -> Result<()>
         workspace,
         workspace_name,
         workspace_dir,
+        modpack,
     } = args;
     let interactive = printer.is_interactive();
+    // `--modpack` 隐含整合包变体，避免用户同时写两个参数还写错
+    let variant = modpack.is_some().then_some("modrinth-modpack").or(variant);
 
     // 1. 用法闸（先于落库与联网，快速失败）
     if name.is_none() && !interactive {
@@ -261,7 +278,10 @@ pub(crate) async fn create(args: CreateArgs<'_>, printer: Printer) -> Result<()>
         )
         .into());
     }
-    if version.is_none() && !interactive {
+    // 整合包变体的 `--version` 是整合包版本 ID，可省略（取最新正式版），
+    // 因此不套用「非交互必须给版本」的闸门
+    let modpack_mode = variant.is_some_and(is_modpack_flag);
+    if version.is_none() && !interactive && !modpack_mode {
         return Err(AppDiagnostic::usage(
             crate::i18n::pick(
                 printer.lang(),
@@ -301,17 +321,20 @@ pub(crate) async fn create(args: CreateArgs<'_>, printer: Printer) -> Result<()>
     else {
         return Ok(());
     };
-    let selector = if selector.is_empty() {
-        None
-    } else {
-        Some(selector)
-    };
+    let selector = non_empty_selector(selector);
 
     let reg = open_registry()?;
 
     // 4-6. 名称 / 变体 / 版本：给定即用，缺哪项补哪项
-    let (name, variant, version_id, source) =
-        finish_create_inputs(&reg, &available, name, variant, version, printer).await?;
+    let inputs =
+        finish_create_inputs(&reg, &available, name, variant, version, modpack, printer).await?;
+    let CreateInputs {
+        name,
+        variant,
+        version_id,
+        source,
+        modpack,
+    } = inputs;
 
     // Java 版本要求不在此预取：下载核心时 `install_jar` 会随元数据一并回写，
     // 预取会重复打一遍 manifest/details 网络请求
@@ -331,35 +354,90 @@ pub(crate) async fn create(args: CreateArgs<'_>, printer: Printer) -> Result<()>
             )
         })?;
 
-    // 7. 下载核心：失败保留已注册结果，提示用 install 重试
-    if let Err(err) = download_jar(&name, &version_id, source, variant, printer).await {
+    // 7. 布置服务端（核心 / 整合包），失败保留已注册结果
+    setup_server(
+        &name,
+        &srv.dir,
+        &version_id,
+        source,
+        &variant,
+        modpack,
+        printer,
+    )
+    .await?;
+    report_created(&srv, printer)
+}
+
+/// 创建服务器之后的服务端布置
+///
+/// - 整合包：装加载器核心 → 铺 overrides → 下载清单文件
+/// - 其余变体：下载核心 JAR
+///
+/// 失败时给出一条「已创建、可重试」的提示并把错误原样返回：服务器已经落库，
+/// 不存在「回滚到没创建」的语义，重试入口是 `server install`。
+///
+/// # Errors
+///
+/// 核心下载失败、整合包取回 / 布置失败，或变体既非整合包又没有核心来源时返回错误
+async fn setup_server(
+    name: &str,
+    dir: &Path,
+    version_id: &VersionId,
+    source: Option<Arc<dyn ServerJarSource>>,
+    variant: &ServerVariant,
+    modpack: Option<super::modpack::PickedModpack>,
+    printer: Printer,
+) -> Result<()> {
+    let outcome = match (modpack, source) {
+        (Some(modpack), _) => super::modpack::install_modpack(name, dir, &modpack, printer).await,
+        (None, Some(source)) => download_jar(name, version_id, source, variant.clone(), printer)
+            .await
+            .map(|_| ()),
+        // 变体既不是整合包、又没有核心来源：前面已按能力校验过，走到这里说明
+        // 注册表与变体集合不一致，如实报错而不是静默成功
+        (None, None) => Err(anyhow::anyhow!(
+            "{}",
+            crate::i18n::pick(
+                printer.lang(),
+                format!("变体 {} 没有可用的服务端来源", variant.as_str()),
+                format!("variant {} has no server source", variant.as_str()),
+            )
+        )),
+    };
+    if let Err(err) = outcome {
         printer.print_warning(&crate::i18n::pick(
             printer.lang(),
-            format!("服务器已创建但核心下载失败，可执行 mcsup server install {name} 重试"),
+            format!("服务器已创建但服务端布置失败，可执行 mcsup server install {name} 重试"),
             format!(
-                "server created but the core download failed; run `mcsup server install {name}` to retry"
+                "server created but the server setup failed; run `mcsup server install {name}` to retry"
             ),
         ));
         return Err(err);
     }
-
-    report_created(&srv, printer)
+    Ok(())
 }
 
 /// `server create` 的名称 / 变体 / 版本补齐：参数给定则跳过对应步骤
+/// `server create` 补齐后的输入
+struct CreateInputs {
+    name: String,
+    variant: ServerVariant,
+    version_id: VersionId,
+    /// 核心来源；整合包由清单自行装加载器，因此为 `None`
+    source: Option<Arc<dyn ServerJarSource>>,
+    /// 已选整合包；非整合包变体为 `None`
+    modpack: Option<super::modpack::PickedModpack>,
+}
+
 async fn finish_create_inputs(
     reg: &ServerRegistry,
     available: &[ServerVariant],
     name: Option<&str>,
     variant: Option<ServerVariant>,
     version: Option<&str>,
+    modpack: Option<&str>,
     printer: Printer,
-) -> Result<(
-    String,
-    ServerVariant,
-    VersionId,
-    std::sync::Arc<dyn mcsup::port::ServerJarSource>,
-)> {
+) -> Result<CreateInputs> {
     let name = if let Some(name) = name {
         name.to_owned()
     } else {
@@ -377,6 +455,18 @@ async fn finish_create_inputs(
         None => pick_variant(available, printer)?,
     };
 
+    // 整合包：MC 版本由清单声明，`pick_modpack` 先读清单再返回可落库的版本
+    if bootstrap::is_modpack(&variant) {
+        let picked = super::modpack::pick_modpack(modpack, version, printer).await?;
+        return Ok(CreateInputs {
+            name,
+            variant,
+            version_id: VersionId::new(picked.minecraft.clone()),
+            source: None,
+            modpack: Some(picked),
+        });
+    }
+
     let source = bootstrap::source_for(&variant, printer.lang())?;
     let version_id = if let Some(version) = version {
         VersionId::new(version)
@@ -389,7 +479,13 @@ async fn finish_create_inputs(
         );
         pick_version(source.as_ref(), &variant, printer).await?
     };
-    Ok((name, variant, version_id, source))
+    Ok(CreateInputs {
+        name,
+        variant,
+        version_id,
+        source: Some(source),
+        modpack: None,
+    })
 }
 
 /// `server create` 的结果输出：human 一行 + 后续提示，JSON 单个对象
@@ -446,6 +542,13 @@ fn resolve_flag_variant(
     available: &[ServerVariant],
     lang: Lang,
 ) -> Result<ServerVariant> {
+    // 用户向的短名：`--variant modrinth` 等价于整合包变体。存储与展示仍用
+    // `modrinth-modpack`，别名只降低输入成本，不改变持久化口径。
+    let raw = if raw.eq_ignore_ascii_case("modrinth") {
+        ServerVariant::ModrinthModpack.as_str()
+    } else {
+        raw
+    };
     let parsed = ServerVariant::from_id(raw).map_err(|_| {
         anyhow::Error::from(AppDiagnostic::usage(
             crate::i18n::pick(
@@ -509,23 +612,22 @@ fn pick_variant(available: &[ServerVariant], printer: Printer) -> Result<ServerV
         printer,
         2,
         3,
-        &crate::i18n::pick(printer.lang(), "服务端变体", "server variant"),
+        &crate::i18n::pick(printer.lang(), "服务端类型", "server type"),
     );
-    let labels: Vec<String> = available.iter().map(|v| v.as_str().to_owned()).collect();
+    // 标签由 `bootstrap::variant_label` 统一给出：说明「选它会发生什么」，
+    // 同时保持候选与变体一一对应
+    let labels: Vec<String> = available.iter().map(bootstrap::variant_label).collect();
     let picked = prompts::select_filter(
         printer.lang(),
-        &crate::i18n::pick(printer.lang(), "服务端变体", "server variant"),
+        &crate::i18n::pick(
+            printer.lang(),
+            "服务端类型（输入关键字过滤）",
+            "server type (type to filter)",
+        ),
         &labels,
     )?;
-    variant_from_label(&picked, available).ok_or_else(|| anyhow::anyhow!("无效变体: {picked}"))
-}
-
-/// 选择标签 → 变体（标签即 `as_str`，按全名回映）
-fn variant_from_label(picked: &str, available: &[ServerVariant]) -> Option<ServerVariant> {
-    available
-        .iter()
-        .find(|variant| variant.as_str() == picked)
-        .cloned()
+    bootstrap::variant_from_label(&picked, available)
+        .ok_or_else(|| anyhow::anyhow!("无效变体: {picked}"))
 }
 
 /// 名称重输：语法由 prompts 校验，重复（注册表已有）时警示后重问
@@ -1216,19 +1318,37 @@ mod tests {
         );
     }
 
-    /// 单可用项免提问；标签（`as_str`）回映变体，未命中返回 None
+    /// `--variant modrinth` 是整合包的短名别名，存储仍用 `modrinth-modpack`
     #[test]
-    fn variant_from_label_maps_back_by_full_name() {
+    fn modrinth_alias_resolves_to_modpack_variant() {
+        let available = vec![ServerVariant::Vanilla, ServerVariant::ModrinthModpack];
+        for raw in ["modrinth", "MODRINTH", "modrinth-modpack"] {
+            assert_eq!(
+                resolve_flag_variant(raw, &available, Lang::Zh).expect(raw),
+                ServerVariant::ModrinthModpack
+            );
+        }
+        // 未注册时别名同样走「暂未支持」，不静默失败
+        assert!(resolve_flag_variant("modrinth", &[], Lang::Zh).is_err());
+    }
+
+    /// 展示标签由 `bootstrap::variant_label` 统一给出，并能回映变体
+    #[test]
+    fn variant_label_round_trips_and_unknown_is_none() {
         let available = vec![ServerVariant::Vanilla, ServerVariant::Fabric];
+        let fabric = bootstrap::variant_label(&ServerVariant::Fabric);
         assert_eq!(
-            variant_from_label("fabric", &available),
+            bootstrap::variant_from_label(&fabric, &available),
             Some(ServerVariant::Fabric)
         );
         assert_eq!(
-            variant_from_label("VANILLA", &available),
+            bootstrap::variant_from_label("fabric", &available),
             None,
-            "全名匹配区分大小写，选择器已归一到注册名"
+            "标签带说明后，裸 `as_str` 不再命中，避免两套口径并存"
         );
-        assert_eq!(variant_from_label("paper", &available), None);
+        assert_eq!(
+            bootstrap::variant_from_label("paper（高性能服务端）", &available),
+            None
+        );
     }
 }

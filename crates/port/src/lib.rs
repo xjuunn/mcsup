@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod backup;
 pub mod content;
+pub mod modpack;
 pub mod origin;
 
 pub use backend::Backend;
