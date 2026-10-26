@@ -83,9 +83,25 @@ impl Server {
     }
 
     /// 停止标志：置位后 [`Self::run`] 退出（`remote serve --stop` 用）
+    ///
+    /// 只置位不会唤醒阻塞在 `accept` 上的 [`Self::run`]；要真正停下来用
+    /// [`Self::request_stop`]。
     #[must_use]
     pub fn stop_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.stop)
+    }
+
+    /// 请求停止并唤醒监听循环
+    ///
+    /// `accept` 是阻塞调用，光置标志要等下一次连接才会被看到。这里置位后
+    /// 自连一次把 `accept` 踢醒：连接建立后循环先看到标志再退出，不会
+    /// 进入会话状态机。相比「另起线程 join」或「给 listener 设超时轮询」，
+    /// 这条路径没有额外线程、也没有轮询延迟。
+    pub fn request_stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Ok(addr) = self.listener.local_addr() {
+            let _ = TcpStream::connect(addr);
+        }
     }
 
     /// 当前连接数（诊断用）
@@ -238,8 +254,9 @@ fn authenticate<S: std::io::Read + std::io::Write>(
         Request::Enroll {
             pairing_code,
             client_name,
+            read_only,
         } => {
-            let enrolled = match handler.enroll(&pairing_code, &client_name) {
+            let enrolled = match handler.enroll(&pairing_code, &client_name, read_only) {
                 Ok(enrolled) => enrolled,
                 Err(failure) => {
                     let _ = session.send_response(&failure.into_response());
@@ -358,12 +375,21 @@ mod tests {
             }
         }
 
-        fn enroll(&self, code: &str, _client_name: &str) -> Result<Enrolled, RemoteFailure> {
+        fn enroll(
+            &self,
+            code: &str,
+            _client_name: &str,
+            read_only: bool,
+        ) -> Result<Enrolled, RemoteFailure> {
             if code == "1234-5678" {
                 Ok(Enrolled {
                     token: self.token.clone(),
                     client_id: ClientId::generate(),
-                    role: Role::Operator,
+                    role: if read_only {
+                        Role::Viewer
+                    } else {
+                        Role::Operator
+                    },
                 })
             } else {
                 Err(RemoteFailure::unauthorized("bad pairing code"))
@@ -430,11 +456,13 @@ mod tests {
         assert_eq!(greeting.fingerprint, fingerprint);
 
         // 错码被拒
-        let err = client.enroll("0000-0000", "laptop").expect_err("bad code");
+        let err = client
+            .enroll("0000-0000", "laptop", false)
+            .expect_err("bad code");
         assert!(matches!(err, TransportError::Remote { .. }), "{err:?}");
 
         // 正确配对
-        let enrolled = client.enroll("1234-5678", "laptop").expect("enroll");
+        let enrolled = client.enroll("1234-5678", "laptop", false).expect("enroll");
         assert_eq!(enrolled.role, Role::Operator);
 
         // 用 token 建新连接做业务

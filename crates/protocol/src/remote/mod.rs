@@ -29,7 +29,9 @@ use auth::{ClientId, Permission, Role};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Write};
-use wire::{WireJava, WireServer, WireStartOutcome, WireStatusEntry, WireStop, WireWorkspace};
+use wire::{
+    WireClient, WireJava, WireServer, WireStartOutcome, WireStatusEntry, WireStop, WireWorkspace,
+};
 
 /// 远端协议版本；不匹配直接拒绝，禁止猜测兼容
 pub const REMOTE_PROTOCOL_VERSION: u32 = 1;
@@ -145,6 +147,9 @@ pub enum Request {
         pairing_code: String,
         /// 客户端自称（展示在 agent 的已配对列表里）
         client_name: String,
+        /// 以只读角色配对（`viewer`）；缺省 `false` = `operator`
+        #[serde(default)]
+        read_only: bool,
     },
     /// 出示 token 认证本连接
     Authenticate {
@@ -206,17 +211,27 @@ pub enum Request {
     /// 扫描本机 JVM 并登记
     JavaScan,
 
+    /// 列出已配对客户端（`remote status` / `remote revoke` 的候选来源）
+    ClientList,
+    /// 撤销一个客户端（立即失效其 token）
+    ClientRevoke {
+        /// 客户端身份（UUID 文本）或名称
+        selector: String,
+    },
+
     /// 批量实时状态
     StatusMany {
         /// 服务器身份（UUID 文本）
         ids: Vec<String>,
     },
     /// 拉起 supervisor
+    ///
+    /// 刻意不带启动方式：`LaunchSpec` 是对端的事实，客户端的副本只是缓存。
+    /// 让客户端指定「用哪个文件启动」等于让它选远端执行的文件，与「路径由
+    /// 对端按自身规则解析」冲突。
     Start {
         /// 服务器身份
         server_id: String,
-        /// 启动方式（相对服务器目录）
-        launch: wire::WireLaunch,
         /// 堆上限（MiB）
         ram_mib: Option<u32>,
         /// 同意 EULA（缺失 / `false` 时由对端写入）
@@ -273,7 +288,10 @@ impl Request {
             Self::Start { .. } | Self::Stop { .. } | Self::SendLine { .. } => {
                 Some(Permission::Control)
             }
-            Self::Shutdown => Some(Permission::Manage),
+            // 客户端名册是访问控制数据：能看就能做社会工程，按 Manage 处理
+            Self::Shutdown | Self::ClientList | Self::ClientRevoke { .. } => {
+                Some(Permission::Manage)
+            }
         }
     }
 
@@ -295,6 +313,8 @@ impl Request {
             Self::ServerRemove { .. } => "server.remove",
             Self::JavaList => "java.list",
             Self::JavaScan => "java.scan",
+            Self::ClientList => "client.list",
+            Self::ClientRevoke { .. } => "client.revoke",
             Self::StatusMany { .. } => "status.many",
             Self::Start { .. } => "server.start",
             Self::Stop { .. } => "server.stop",
@@ -362,6 +382,11 @@ pub enum Response {
     Javas {
         /// 运行时
         items: Vec<WireJava>,
+    },
+    /// 已配对客户端列表
+    Clients {
+        /// 客户端
+        items: Vec<WireClient>,
     },
     /// 批量状态（顺序与请求一致）
     Statuses {
@@ -585,6 +610,7 @@ mod tests {
             Request::Enroll {
                 pairing_code: "4821-9375".to_owned(),
                 client_name: "laptop".to_owned(),
+                read_only: true,
             },
             Request::Authenticate {
                 token: "a".repeat(64),
@@ -617,14 +643,15 @@ mod tests {
             },
             Request::JavaList,
             Request::JavaScan,
+            Request::ClientList,
+            Request::ClientRevoke {
+                selector: "laptop".to_owned(),
+            },
             Request::StatusMany {
                 ids: vec!["550e8400-e29b-41d4-a716-446655440000".to_owned()],
             },
             Request::Start {
                 server_id: "550e8400-e29b-41d4-a716-446655440000".to_owned(),
-                launch: wire::WireLaunch::Jar {
-                    path: "server.jar".to_owned(),
-                },
                 ram_mib: Some(2048),
                 accept_eula: true,
             },
@@ -681,6 +708,7 @@ mod tests {
             Response::Workspaces { items: Vec::new() },
             Response::Servers { items: Vec::new() },
             Response::Javas { items: Vec::new() },
+            Response::Clients { items: Vec::new() },
             Response::Statuses { items: Vec::new() },
             Response::Started {
                 outcome: WireStartOutcome { supervisor_pid: 7 },
@@ -751,9 +779,6 @@ mod tests {
         assert_eq!(
             Request::Start {
                 server_id: "id".to_owned(),
-                launch: wire::WireLaunch::Jar {
-                    path: "server.jar".to_owned()
-                },
                 ram_mib: None,
                 accept_eula: false
             }
@@ -800,9 +825,6 @@ mod tests {
         assert!(operator.permits(&Request::JavaScan));
         assert!(operator.permits(&Request::Start {
             server_id: "id".to_owned(),
-            launch: wire::WireLaunch::Jar {
-                path: "server.jar".to_owned()
-            },
             ram_mib: None,
             accept_eula: false
         }));

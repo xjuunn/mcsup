@@ -32,6 +32,45 @@ pub fn corrupt(
     RepositoryError::Corrupt(format!("{label} {value}: {err}"))
 }
 
+/// 已配对客户端的线格式
+///
+/// 刻意不含 `digest`：客户端列表是给管理员看的，摘要对展示无用，多传一次就
+/// 多一处泄漏面（摘要足以在本地做离线比对，不需要跨网络流动）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireClient {
+    /// 服务端分配的身份
+    pub client_id: String,
+    /// 客户端自称
+    pub name: String,
+    /// 角色
+    pub role: auth::Role,
+    /// 配对时间（Unix 秒）
+    pub paired_at: i64,
+}
+
+impl From<&auth::ClientRecord> for WireClient {
+    fn from(record: &auth::ClientRecord) -> Self {
+        Self {
+            client_id: record.client_id.as_str().to_owned(),
+            name: record.name.clone(),
+            role: record.role,
+            paired_at: record.paired_at,
+        }
+    }
+}
+
+impl WireClient {
+    /// 客户端身份
+    ///
+    /// # Errors
+    ///
+    /// 对端发来的 id 不是合法 UUID 时返回 [`RepositoryError::Corrupt`]
+    pub fn client_id(&self) -> Result<auth::ClientId, RepositoryError> {
+        auth::ClientId::parse(&self.client_id)
+            .map_err(|err| corrupt("client id", &self.client_id, err))
+    }
+}
+
 /// 工作目录的线格式
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireWorkspace {
