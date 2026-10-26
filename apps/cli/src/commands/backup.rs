@@ -42,16 +42,25 @@ pub(crate) async fn create(
 ) -> Result<()> {
     let service = backup_service()?;
     let scope = match scope {
-        Some(raw) => Some(parse_scope(raw)?),
+        Some(raw) => Some(parse_scope(printer.lang(), raw)?),
         None => None,
     };
     // 标签缺省且交互时询问（允许留空 = 无标签）
     let label = match label {
         Some(raw) => Some(raw.to_owned()),
         None if printer.is_interactive() => Some(prompts::input_text(
-            "快照标签（可留空）",
+            printer.lang(),
+            &crate::i18n::pick(
+                printer.lang(),
+                "快照标签（可留空）",
+                "snapshot label (optional)",
+            ),
             "",
-            "如 before-upgrade；回车留空",
+            &crate::i18n::pick(
+                printer.lang(),
+                "如 before-upgrade；回车留空",
+                "e.g. before-upgrade; enter for none",
+            ),
         )?),
         None => None,
     };
@@ -62,22 +71,39 @@ pub(crate) async fn create(
         no_reuse,
         flush_wait_ms: None,
     };
-    let spinner = TaskSpinner::new(format!("正在备份 {name}…"), printer.is_human());
+    let spinner = TaskSpinner::new(
+        crate::i18n::pick(
+            printer.lang(),
+            format!("正在备份 {name}…"),
+            format!("backing up {name}…"),
+        ),
+        printer.is_human(),
+    );
     let owned = name.to_owned();
     let result = tokio::task::spawn_blocking(move || service.create(&owned, &options))
         .await
-        .context("备份任务")?;
+        .context(crate::i18n::pick(printer.lang(), "备份任务", "backup task"))?;
     spinner.finish();
     let outcome = result?;
 
     let row = row_of(&outcome.snapshot);
     printer.print_outcome(
-        &format!(
-            "已创建备份 {}（{} 个文件，新增 {}，复用 {}）",
-            outcome.snapshot.id.as_str(),
-            outcome.snapshot.content.len(),
-            outcome.snapshot.added,
-            outcome.snapshot.reused
+        &crate::i18n::pick(
+            printer.lang(),
+            format!(
+                "已创建备份 {}（{} 个文件，新增 {}，复用 {}）",
+                outcome.snapshot.id.as_str(),
+                outcome.snapshot.content.len(),
+                outcome.snapshot.added,
+                outcome.snapshot.reused
+            ),
+            format!(
+                "created backup {} ({} files, {} added, {} reused)",
+                outcome.snapshot.id.as_str(),
+                outcome.snapshot.content.len(),
+                outcome.snapshot.added,
+                outcome.snapshot.reused
+            ),
         ),
         &BackupCreateJson {
             snapshot: row,
@@ -108,12 +134,23 @@ pub(crate) fn list(name: &str, page: usize, page_size: usize, printer: Printer) 
 
     if printer.is_human() {
         if window.items.is_empty() {
-            printer.print_section(&format!("{name} 暂无备份"));
+            printer.print_section(&crate::i18n::pick(
+                printer.lang(),
+                format!("{name} 暂无备份"),
+                format!("{name} has no backups"),
+            ));
             return Ok(());
         }
         let mut table = Table::new();
         table.set_content_arrangement(ContentArrangement::Dynamic);
-        table.set_header(["ID", "时间", "状态", "文件", "大小", "标签"]);
+        table.set_header([
+            "ID",
+            crate::i18n::text(printer.lang(), "时间", "time"),
+            crate::i18n::text(printer.lang(), "状态", "status"),
+            crate::i18n::text(printer.lang(), "文件", "files"),
+            crate::i18n::text(printer.lang(), "大小", "size"),
+            crate::i18n::text(printer.lang(), "标签", "label"),
+        ]);
         for snapshot in &window.items {
             table.add_row([
                 snapshot.id.as_str(),
@@ -125,11 +162,20 @@ pub(crate) fn list(name: &str, page: usize, page_size: usize, printer: Printer) 
             ]);
         }
         output::print_table(&table);
-        printer.print_section(&format!(
-            "第 {}/{} 页，共 {} 份备份",
-            payload.page,
-            payload.pages.max(1),
-            payload.total
+        printer.print_section(&crate::i18n::pick(
+            printer.lang(),
+            format!(
+                "第 {}/{} 页，共 {} 份备份",
+                payload.page,
+                payload.pages.max(1),
+                payload.total
+            ),
+            format!(
+                "page {}/{} of {} backups",
+                payload.page,
+                payload.pages.max(1),
+                payload.total
+            ),
         ));
         return Ok(());
     }
@@ -156,10 +202,16 @@ pub(crate) async fn restore(
         None if printer.is_interactive() => prompt_snapshot(&service, name, printer)?,
         None => {
             return Err(AppDiagnostic::usage(
-                "server backup restore 缺少快照 id",
-                Some(
-                    "非交互模式：mcsup server backup restore <name> <id>；可用 ls 查看".to_owned(),
+                crate::i18n::pick(
+                    printer.lang(),
+                    "server backup restore 缺少快照 id",
+                    "server backup restore requires a snapshot id",
                 ),
+                Some(crate::i18n::pick(
+                    printer.lang(),
+                    "非交互模式：mcsup server backup restore <name> <id>；可用 ls 查看",
+                    "non-interactive: mcsup server backup restore <name> <id>; see ls",
+                )),
             )
             .into());
         }
@@ -171,21 +223,42 @@ pub(crate) async fn restore(
         None => RestoreTarget::InPlace,
     };
 
-    let spinner = TaskSpinner::new(format!("正在恢复 {name}…"), printer.is_human());
+    let spinner = TaskSpinner::new(
+        crate::i18n::pick(
+            printer.lang(),
+            format!("正在恢复 {name}…"),
+            format!("restoring {name}…"),
+        ),
+        printer.is_human(),
+    );
     let owned = name.to_owned();
     let result = tokio::task::spawn_blocking(move || service.restore(&owned, &id, &target))
         .await
-        .context("恢复任务")?;
+        .context(crate::i18n::pick(
+            printer.lang(),
+            "恢复任务",
+            "restore task",
+        ))?;
     spinner.finish();
     let outcome = result?;
 
     printer.print_outcome(
-        &format!(
-            "已从 {} 恢复到 {}（{} 个文件，{}）",
-            outcome.snapshot.id.as_str(),
-            outcome.destination.display(),
-            outcome.files,
-            output::human_bytes(outcome.bytes)
+        &crate::i18n::pick(
+            printer.lang(),
+            format!(
+                "已从 {} 恢复到 {}（{} 个文件，{}）",
+                outcome.snapshot.id.as_str(),
+                outcome.destination.display(),
+                outcome.files,
+                output::human_bytes(outcome.bytes)
+            ),
+            format!(
+                "restored {} into {} ({} files, {})",
+                outcome.snapshot.id.as_str(),
+                outcome.destination.display(),
+                outcome.files,
+                output::human_bytes(outcome.bytes)
+            ),
         ),
         &BackupRestoreJson {
             snapshot: outcome.snapshot.id.as_str(),
@@ -197,10 +270,18 @@ pub(crate) async fn restore(
         },
     )?;
     if let Some(safety) = outcome.safety_snapshot.as_ref() {
-        printer.print_section(&format!(
-            "恢复前的现场已备份为 {}，如需回退可 mcsup server backup restore {name} {}",
-            safety.as_str(),
-            safety.as_str()
+        printer.print_section(&crate::i18n::pick(
+            printer.lang(),
+            format!(
+                "恢复前的现场已备份为 {}，如需回退可 mcsup server backup restore {name} {}",
+                safety.as_str(),
+                safety.as_str()
+            ),
+            format!(
+                "the pre-restore state was backed up as {}; to roll back run mcsup server backup restore {name} {}",
+                safety.as_str(),
+                safety.as_str()
+            ),
         ));
     }
     Ok(())
@@ -218,18 +299,34 @@ pub(crate) fn delete(name: &str, id: Option<&str>, printer: Printer) -> Result<(
         None if printer.is_interactive() => prompt_snapshot(&service, name, printer)?,
         None => {
             return Err(AppDiagnostic::usage(
-                "server backup delete 缺少快照 id",
-                Some("非交互模式：mcsup server backup delete <name> <id>；可用 ls 查看".to_owned()),
+                crate::i18n::pick(
+                    printer.lang(),
+                    "server backup delete 缺少快照 id",
+                    "server backup delete requires a snapshot id",
+                ),
+                Some(crate::i18n::pick(
+                    printer.lang(),
+                    "非交互模式：mcsup server backup delete <name> <id>；可用 ls 查看",
+                    "non-interactive: mcsup server backup delete <name> <id>; see ls",
+                )),
             )
             .into());
         }
     };
     let outcome = service.delete(name, &id)?;
     printer.print_outcome(
-        &format!(
-            "已删除备份 {}（释放 {} 个对象，可执行 prune 回收）",
-            outcome.snapshot.id.as_str(),
-            outcome.orphaned
+        &crate::i18n::pick(
+            printer.lang(),
+            format!(
+                "已删除备份 {}（释放 {} 个对象，可执行 prune 回收）",
+                outcome.snapshot.id.as_str(),
+                outcome.orphaned
+            ),
+            format!(
+                "deleted backup {} ({} objects orphaned; run prune to reclaim)",
+                outcome.snapshot.id.as_str(),
+                outcome.orphaned
+            ),
         ),
         &BackupDeleteJson {
             id: outcome.snapshot.id.as_str(),
@@ -251,13 +348,28 @@ pub(crate) fn verify(name: &str, id: Option<&str>, printer: Printer) -> Result<(
         None if printer.is_interactive() => prompt_snapshot(&service, name, printer)?,
         None => {
             return Err(AppDiagnostic::usage(
-                "server backup verify 缺少快照 id",
-                Some("非交互模式：mcsup server backup verify <name> <id>；可用 ls 查看".to_owned()),
+                crate::i18n::pick(
+                    printer.lang(),
+                    "server backup verify 缺少快照 id",
+                    "server backup verify requires a snapshot id",
+                ),
+                Some(crate::i18n::pick(
+                    printer.lang(),
+                    "非交互模式：mcsup server backup verify <name> <id>；可用 ls 查看",
+                    "non-interactive: mcsup server backup verify <name> <id>; see ls",
+                )),
             )
             .into());
         }
     };
-    let spinner = TaskSpinner::new(format!("正在校验 {id}…"), printer.is_human());
+    let spinner = TaskSpinner::new(
+        crate::i18n::pick(
+            printer.lang(),
+            format!("正在校验 {id}…"),
+            format!("verifying {id}…"),
+        ),
+        printer.is_human(),
+    );
     let outcome = service.verify(name, &id, &mut |_, _| {});
     spinner.finish();
     let outcome = outcome?;
@@ -272,17 +384,34 @@ pub(crate) fn verify(name: &str, id: Option<&str>, printer: Printer) -> Result<(
     };
     if printer.is_human() {
         if outcome.is_healthy() {
-            printer.print_section(&format!(
-                "{} 完好：{} 个对象，{}",
-                outcome.snapshot.id.as_str(),
-                outcome.objects,
-                output::human_bytes(outcome.bytes)
+            printer.print_section(&crate::i18n::pick(
+                printer.lang(),
+                format!(
+                    "{} 完好：{} 个对象，{}",
+                    outcome.snapshot.id.as_str(),
+                    outcome.objects,
+                    output::human_bytes(outcome.bytes)
+                ),
+                format!(
+                    "{} is intact: {} objects, {}",
+                    outcome.snapshot.id.as_str(),
+                    outcome.objects,
+                    output::human_bytes(outcome.bytes)
+                ),
             ));
         } else {
-            printer.print_warning(&format!(
-                "{} 有 {} 个对象损坏或缺失",
-                outcome.snapshot.id.as_str(),
-                broken.len()
+            printer.print_warning(&crate::i18n::pick(
+                printer.lang(),
+                format!(
+                    "{} 有 {} 个对象损坏或缺失",
+                    outcome.snapshot.id.as_str(),
+                    broken.len()
+                ),
+                format!(
+                    "{} has {} broken or missing objects",
+                    outcome.snapshot.id.as_str(),
+                    broken.len()
+                ),
             ));
             for hash in &broken {
                 printer.print_section(&format!("  - {hash}"));
@@ -316,7 +445,7 @@ pub(crate) fn prune(
     printer: Printer,
 ) -> Result<()> {
     let service = backup_service()?;
-    let policy = parse_policy(keep, older_than)?;
+    let policy = parse_policy(printer.lang(), keep, older_than)?;
     let outcome = service.prune(name, policy, dry_run)?;
 
     let removed: Vec<&str> = outcome.removed.iter().map(|s| s.id.as_str()).collect();
@@ -327,12 +456,31 @@ pub(crate) fn prune(
         dry_run: outcome.dry_run,
     };
     if printer.is_human() {
-        let prefix = if dry_run { "将" } else { "已" };
-        printer.print_section(&format!(
-            "{prefix}删除 {} 份备份，{prefix}回收 {} 个对象（{}）",
-            removed.len(),
-            outcome.objects_reclaimed,
-            output::human_bytes(outcome.bytes_reclaimed)
+        printer.print_section(&crate::i18n::pick(
+            printer.lang(),
+            {
+                let prefix = if dry_run { "将" } else { "已" };
+                format!(
+                    "{prefix}删除 {} 份备份，{prefix}回收 {} 个对象（{}）",
+                    removed.len(),
+                    outcome.objects_reclaimed,
+                    output::human_bytes(outcome.bytes_reclaimed)
+                )
+            },
+            {
+                let verb = if dry_run { "would delete" } else { "deleted" };
+                let reclaim = if dry_run {
+                    "would reclaim"
+                } else {
+                    "reclaimed"
+                };
+                format!(
+                    "{verb} {} backups and {reclaim} {} objects ({})",
+                    removed.len(),
+                    outcome.objects_reclaimed,
+                    output::human_bytes(outcome.bytes_reclaimed)
+                )
+            },
         ));
         if !removed.is_empty() {
             for id in &removed {
@@ -340,7 +488,11 @@ pub(crate) fn prune(
             }
         }
         if dry_run {
-            printer.print_section("这是试运行，未实际修改；去掉 --dry-run 生效");
+            printer.print_section(&crate::i18n::pick(
+                printer.lang(),
+                "这是试运行，未实际修改；去掉 --dry-run 生效",
+                "dry run: nothing was changed; drop --dry-run to apply",
+            ));
         }
         return Ok(());
     }
@@ -371,13 +523,21 @@ fn row_of(snapshot: &Snapshot) -> BackupRow<'_> {
 }
 
 /// `--scope` 解析：逗号分隔的顶层项
-fn parse_scope(raw: &str) -> Result<BackupScope> {
+fn parse_scope(lang: crate::locale::Lang, raw: &str) -> Result<BackupScope> {
     let entries = raw.split(',').map(str::trim).filter(|s| !s.is_empty());
     BackupScope::from_entries(entries).map_err(|err| {
         AppDiagnostic::usage(
-            format!("备份范围非法：{raw}"),
-            Some(format!(
-                "每个项须是顶层目录 / 文件名（不含路径分隔符）：{err}"
+            crate::i18n::pick(
+                lang,
+                format!("备份范围非法：{raw}"),
+                format!("invalid backup scope: {raw}"),
+            ),
+            Some(crate::i18n::pick(
+                lang,
+                format!("每个项须是顶层目录 / 文件名（不含路径分隔符）：{err}"),
+                format!(
+                    "each entry must be a top-level directory or file name (no path separators): {err}"
+                ),
             )),
         )
         .into()
@@ -385,20 +545,40 @@ fn parse_scope(raw: &str) -> Result<BackupScope> {
 }
 
 /// `--keep` / `--older-than` → 保留策略；都不给时为 `None`（只做 GC）
-fn parse_policy(keep: Option<usize>, older_than: Option<&str>) -> Result<Option<RetentionPolicy>> {
+fn parse_policy(
+    lang: crate::locale::Lang,
+    keep: Option<usize>,
+    older_than: Option<&str>,
+) -> Result<Option<RetentionPolicy>> {
     match (keep, older_than) {
         (Some(_), Some(_)) => Err(AppDiagnostic::usage(
-            "--keep 与 --older-than 不能同时使用",
-            Some("二选一：--keep N 保留最近 N 份，或 --older-than 7d 删除更早的".to_owned()),
+            crate::i18n::pick(
+                lang,
+                "--keep 与 --older-than 不能同时使用",
+                "--keep and --older-than cannot be used together",
+            ),
+            Some(crate::i18n::pick(
+                lang,
+                "二选一：--keep N 保留最近 N 份，或 --older-than 7d 删除更早的",
+                "pick one: --keep N keeps the newest N, or --older-than 7d drops older ones",
+            )),
         )
         .into()),
         (Some(n), None) => Ok(Some(RetentionPolicy::Keep(n))),
         (None, Some(raw)) => {
             let secs = parse_age(raw).map_err(|err| {
                 AppDiagnostic::usage(
-                    format!("时长非法：{raw}"),
-                    Some(format!(
-                        "用带单位的时长，如 30s / 15m / 12h / 7d / 4w（{err}）"
+                    crate::i18n::pick(
+                        lang,
+                        format!("时长非法：{raw}"),
+                        format!("invalid age: {raw}"),
+                    ),
+                    Some(crate::i18n::pick(
+                        lang,
+                        format!("用带单位的时长，如 30s / 15m / 12h / 7d / 4w（{err}）"),
+                        format!(
+                            "use a duration with a unit, e.g. 30s / 15m / 12h / 7d / 4w ({err})"
+                        ),
                     )),
                 )
             })?;
@@ -412,11 +592,18 @@ fn parse_policy(keep: Option<usize>, older_than: Option<&str>) -> Result<Option<
 fn prompt_snapshot(service: &BackupService, name: &str, printer: Printer) -> Result<String> {
     let page = service.list(name, Page::new(1, 100))?;
     if page.items.is_empty() {
-        return Err(anyhow::anyhow!(
-            "{name} 暂无备份，可先 mcsup server backup create {name}"
-        ));
+        return Err(anyhow::anyhow!(crate::i18n::pick(
+            printer.lang(),
+            format!("{name} 暂无备份，可先 mcsup server backup create {name}"),
+            format!("{name} has no backups; run mcsup server backup create {name} first"),
+        )));
     }
-    prompts::step(printer, 1, 1, "选择备份");
+    prompts::step(
+        printer,
+        1,
+        1,
+        &crate::i18n::pick(printer.lang(), "选择备份", "select a backup"),
+    );
     let labels: Vec<String> = page
         .items
         .iter()
@@ -430,13 +617,23 @@ fn prompt_snapshot(service: &BackupService, name: &str, printer: Printer) -> Res
             )
         })
         .collect();
-    let picked = prompts::select_filter("备份", &labels)?;
+    let picked = prompts::select_filter(
+        printer.lang(),
+        &crate::i18n::pick(printer.lang(), "备份", "backup"),
+        &labels,
+    )?;
     page.items
         .iter()
         .zip(labels.iter())
         .find(|(_, label)| **label == picked)
         .map(|(snapshot, _)| snapshot.id.as_str().to_owned())
-        .ok_or_else(|| anyhow::anyhow!("无效备份选择: {picked}"))
+        .ok_or_else(|| {
+            anyhow::anyhow!(crate::i18n::pick(
+                printer.lang(),
+                format!("无效备份选择: {picked}"),
+                format!("invalid backup choice: {picked}")
+            ))
+        })
 }
 
 /// Unix 秒 → `YYYY-MM-DD HH:MM:SS`（UTC）
@@ -481,34 +678,37 @@ mod tests {
 
     #[test]
     fn parse_scope_accepts_comma_separated_entries() {
-        let scope = parse_scope("world, mods").expect("scope");
+        let scope = parse_scope(crate::locale::Lang::Zh, "world, mods").expect("scope");
         assert_eq!(scope.entries(), ["mods".to_owned(), "world".to_owned()]);
     }
 
     #[test]
     fn parse_scope_rejects_path_separators() {
-        let err = parse_scope("world/region").expect_err("invalid");
+        let err = parse_scope(crate::locale::Lang::Zh, "world/region").expect_err("invalid");
         assert_eq!(Printer::exit_code(&err), 2);
     }
 
     #[test]
     fn parse_policy_requires_one_of_keep_or_older_than() {
         assert_eq!(
-            parse_policy(Some(3), None).expect("keep"),
+            parse_policy(crate::locale::Lang::Zh, Some(3), None).expect("keep"),
             Some(RetentionPolicy::Keep(3))
         );
         assert_eq!(
-            parse_policy(None, Some("7d")).expect("age"),
+            parse_policy(crate::locale::Lang::Zh, None, Some("7d")).expect("age"),
             Some(RetentionPolicy::OlderThan(7 * 24 * 3600))
         );
-        assert_eq!(parse_policy(None, None).expect("none"), None);
-        let err = parse_policy(Some(1), Some("7d")).expect_err("both");
+        assert_eq!(
+            parse_policy(crate::locale::Lang::Zh, None, None).expect("none"),
+            None
+        );
+        let err = parse_policy(crate::locale::Lang::Zh, Some(1), Some("7d")).expect_err("both");
         assert_eq!(Printer::exit_code(&err), 2);
     }
 
     #[test]
     fn parse_policy_rejects_age_without_unit() {
-        let err = parse_policy(None, Some("7")).expect_err("bad age");
+        let err = parse_policy(crate::locale::Lang::Zh, None, Some("7")).expect_err("bad age");
         assert_eq!(Printer::exit_code(&err), 2);
     }
 

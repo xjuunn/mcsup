@@ -8,6 +8,7 @@ use crate::cli::ConfigAction;
 use crate::config::ConfigFile;
 use crate::diagnostic::AppDiagnostic;
 use crate::output::Printer;
+use crate::prompts;
 use anyhow::{Context, Result};
 use comfy_table::Table;
 use mcsup::protocol::cli::{ConfigRow, ConfigSetJson, ConfigShowJson};
@@ -38,14 +39,29 @@ fn resolve_key(key: Option<&str>, command: &str, printer: Printer) -> Result<Str
     }
     if !printer.is_interactive() {
         return Err(AppDiagnostic::usage(
-            format!("{command} 缺少配置键"),
-            Some(format!(
-                "非交互模式：mcsup {command} <键>；可用键: {}",
-                ConfigKey::ALL
-                    .iter()
-                    .map(|k| k.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+            crate::i18n::pick(
+                printer.lang(),
+                format!("{command} 缺少配置键"),
+                format!("{command} requires a config key"),
+            ),
+            Some(crate::i18n::pick(
+                printer.lang(),
+                format!(
+                    "非交互模式：mcsup {command} <键>；可用键: {}",
+                    ConfigKey::ALL
+                        .iter()
+                        .map(|k| k.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                format!(
+                    "non-interactive: mcsup {command} <key>; keys: {}",
+                    ConfigKey::ALL
+                        .iter()
+                        .map(|k| k.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
             )),
         )
         .into());
@@ -54,7 +70,11 @@ fn resolve_key(key: Option<&str>, command: &str, printer: Printer) -> Result<Str
         .iter()
         .map(|k| k.as_str().to_owned())
         .collect();
-    crate::prompts::select_filter("选择配置键", &keys)
+    prompts::select_filter(
+        printer.lang(),
+        &crate::i18n::pick(printer.lang(), "选择配置键", "select a config key"),
+        &keys,
+    )
 }
 
 /// 缺 value：交互下按当前生效值作默认输入；非交互报用法错误（2）
@@ -69,12 +89,29 @@ fn resolve_value(
     }
     if !printer.is_interactive() {
         return Err(AppDiagnostic::usage(
-            format!("{command} 缺少 {key} 的值"),
-            Some(format!("非交互模式：mcsup {command} {key} <值>")),
+            crate::i18n::pick(
+                printer.lang(),
+                format!("{command} 缺少 {key} 的值"),
+                format!("{command} requires a value for {key}"),
+            ),
+            Some(crate::i18n::pick(
+                printer.lang(),
+                format!("非交互模式：mcsup {command} {key} <值>"),
+                format!("non-interactive: mcsup {command} {key} <value>"),
+            )),
         )
         .into());
     }
-    crate::prompts::input_text(key, "", "输入新值；回车提交")
+    prompts::input_text(
+        printer.lang(),
+        key,
+        "",
+        &crate::i18n::pick(
+            printer.lang(),
+            "输入新值；回车提交",
+            "enter the new value; enter submits",
+        ),
+    )
 }
 
 /// 键名解析：拼错时报用法错误（2）并列出全部键
@@ -82,17 +119,32 @@ fn resolve_value(
 /// # Errors
 ///
 /// 键名不在 [`ConfigKey::ALL`] 内时返回用法错误
-fn parse_key(name: &str) -> Result<ConfigKey> {
+fn parse_key(lang: crate::locale::Lang, name: &str) -> Result<ConfigKey> {
     ConfigKey::parse(name).ok_or_else(|| {
         AppDiagnostic::usage(
-            format!("未知配置键: {name}"),
-            Some(format!(
-                "可用键: {}",
-                ConfigKey::ALL
-                    .iter()
-                    .map(|k| k.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+            crate::i18n::pick(
+                lang,
+                format!("未知配置键: {name}"),
+                format!("unknown config key: {name}"),
+            ),
+            Some(crate::i18n::pick(
+                lang,
+                format!(
+                    "可用键: {}",
+                    ConfigKey::ALL
+                        .iter()
+                        .map(|k| k.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                format!(
+                    "available keys: {}",
+                    ConfigKey::ALL
+                        .iter()
+                        .map(|k| k.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
             )),
         )
         .into()
@@ -125,15 +177,19 @@ fn show(file: &ConfigFile, printer: Printer) -> Result<()> {
     }
 
     let mut table = Table::new();
-    table.set_header(["键", "值", "来源"]);
+    table.set_header([
+        crate::i18n::text(printer.lang(), "键", "key"),
+        crate::i18n::text(printer.lang(), "值", "value"),
+        crate::i18n::text(printer.lang(), "来源", "source"),
+    ]);
     for (key, row) in ConfigKey::ALL.iter().zip(&items) {
         table.add_row([
             key.as_str().to_owned(),
             row.value.clone(),
             if row.source == "file" {
-                "配置文件".to_owned()
+                crate::i18n::pick(printer.lang(), "配置文件", "file")
             } else {
-                "缺省".to_owned()
+                crate::i18n::pick(printer.lang(), "缺省", "default")
             },
         ]);
     }
@@ -142,26 +198,42 @@ fn show(file: &ConfigFile, printer: Printer) -> Result<()> {
     let state = if file.exists() {
         String::new()
     } else {
-        "（尚未创建，config set 时会创建）".to_owned()
+        crate::i18n::pick(
+            printer.lang(),
+            "（尚未创建，config set 时会创建）",
+            " (not created yet; `config set` creates it)",
+        )
     };
-    printer.print_section(&format!("配置文件: {path}{state}"));
+    printer.print_section(&crate::i18n::pick(
+        printer.lang(),
+        format!("配置文件: {path}{state}"),
+        format!("config file: {path}{state}"),
+    ));
     Ok(())
 }
 
 fn set(file: &ConfigFile, key: &str, value: &str, printer: Printer) -> Result<()> {
-    let key = parse_key(key)?;
+    let key = parse_key(printer.lang(), key)?;
     let mut cfg = file.load()?;
     cfg.set(key, value).map_err(|err| {
         AppDiagnostic::usage(
             err.describe(),
-            Some(format!("`mcsup config set {} <值>`", key.as_str())),
+            Some(crate::i18n::pick(
+                printer.lang(),
+                format!("`mcsup config set {} <值>`", key.as_str()),
+                format!("`mcsup config set {} <value>`", key.as_str()),
+            )),
         )
     })?;
     let previous = file.load().ok().and_then(|before| before.raw(key));
     file.save(&cfg)?;
     let effective = cfg.effective(key).display().to_string();
     printer.print_outcome(
-        &format!("已设置 {} = {}", key.as_str(), effective),
+        &crate::i18n::pick(
+            printer.lang(),
+            format!("已设置 {} = {}", key.as_str(), effective),
+            format!("set {} = {}", key.as_str(), effective),
+        ),
         &ConfigSetJson {
             key: key.as_str(),
             value: effective,
@@ -172,13 +244,21 @@ fn set(file: &ConfigFile, key: &str, value: &str, printer: Printer) -> Result<()
 }
 
 fn unset(file: &ConfigFile, key: &str, printer: Printer) -> Result<()> {
-    let key = parse_key(key)?;
+    let key = parse_key(printer.lang(), key)?;
     let mut cfg = file.load()?;
     if !cfg.is_set(key) {
         // 已是缺省：幂等成功，但仍然回显生效值，不制造「改了什么」的错觉
         let effective = cfg.effective(key).display().to_string();
         return printer.print_outcome(
-            &format!("{} 已是平台缺省: {}", key.as_str(), effective),
+            &crate::i18n::pick(
+                printer.lang(),
+                format!("{} 已是平台缺省: {}", key.as_str(), effective),
+                format!(
+                    "{} already uses the platform default: {}",
+                    key.as_str(),
+                    effective
+                ),
+            ),
             &ConfigSetJson {
                 key: key.as_str(),
                 value: effective,
@@ -192,7 +272,15 @@ fn unset(file: &ConfigFile, key: &str, printer: Printer) -> Result<()> {
     file.save(&cfg)?;
     let effective = cfg.effective(key).display().to_string();
     printer.print_outcome(
-        &format!("已恢复 {} 为平台缺省: {}", key.as_str(), effective),
+        &crate::i18n::pick(
+            printer.lang(),
+            format!("已恢复 {} 为平台缺省: {}", key.as_str(), effective),
+            format!(
+                "restored {} to the platform default: {}",
+                key.as_str(),
+                effective
+            ),
+        ),
         &ConfigSetJson {
             key: key.as_str(),
             value: effective,
@@ -208,18 +296,33 @@ fn unset(file: &ConfigFile, key: &str, printer: Printer) -> Result<()> {
 fn edit(file: &ConfigFile, printer: Printer) -> Result<()> {
     if !printer.is_interactive() {
         return Err(AppDiagnostic::usage(
-            "config edit 需要交互终端",
-            Some(format!(
-                "非交互模式请用 mcsup config set <键> <值>；文件: {}",
-                file.path().display()
+            crate::i18n::pick(
+                printer.lang(),
+                "config edit 需要交互终端",
+                "config edit needs an interactive terminal",
+            ),
+            Some(crate::i18n::pick(
+                printer.lang(),
+                format!(
+                    "非交互模式请用 mcsup config set <键> <值>；文件: {}",
+                    file.path().display()
+                ),
+                format!(
+                    "non-interactive: use mcsup config set <key> <value>; file: {}",
+                    file.path().display()
+                ),
             )),
         )
         .into());
     }
     let editor = editor_command().ok_or_else(|| {
         AppDiagnostic::usage(
-            "未设置编辑器",
-            Some("设置环境变量 EDITOR 或 VISUAL，如 `set EDITOR=notepad`".to_owned()),
+            crate::i18n::pick(printer.lang(), "未设置编辑器", "no editor configured"),
+            Some(crate::i18n::pick(
+                printer.lang(),
+                "设置环境变量 EDITOR 或 VISUAL，如 `set EDITOR=notepad`",
+                "set the EDITOR or VISUAL environment variable, e.g. `set EDITOR=notepad`",
+            )),
         )
     })?;
 
@@ -227,27 +330,50 @@ fn edit(file: &ConfigFile, printer: Printer) -> Result<()> {
     if !file.exists() {
         file.save(&file.load()?)?;
     }
-    printer.print_section(&format!(
-        "打开 {}（编辑器: {}）",
-        file.path().display(),
-        editor.join(" ")
+    printer.print_section(&crate::i18n::pick(
+        printer.lang(),
+        format!(
+            "打开 {}（编辑器: {}）",
+            file.path().display(),
+            editor.join(" ")
+        ),
+        format!(
+            "opening {} (editor: {})",
+            file.path().display(),
+            editor.join(" ")
+        ),
     ));
-    let status = run_editor(&editor, file.path())?;
+    let status = run_editor(printer.lang(), &editor, file.path())?;
     if !status {
         // 编辑器非零退出：用户可能只是没保存就关掉，不能当作「已保存」报成功
-        return Err(anyhow::anyhow!(
-            "编辑器以非零状态退出，配置未确认保存: {}",
-            file.path().display()
-        ));
+        return Err(anyhow::anyhow!(crate::i18n::pick(
+            printer.lang(),
+            format!(
+                "编辑器以非零状态退出，配置未确认保存: {}",
+                file.path().display()
+            ),
+            format!(
+                "the editor exited non-zero; the config is not confirmed saved: {}",
+                file.path().display()
+            ),
+        )));
     }
 
     // 编辑器写坏了文件时保留原文并报错：回滚由用户决定，不静默覆盖
     let cfg = file.load().map_err(|err| {
         AppDiagnostic::usage(
-            format!("编辑后的配置无法解析: {err:#}"),
-            Some(format!(
-                "请重新运行 mcsup config edit 修正 {}",
-                file.path().display()
+            crate::i18n::pick(
+                printer.lang(),
+                format!("编辑后的配置无法解析: {err:#}"),
+                format!("the edited config cannot be parsed: {err:#}"),
+            ),
+            Some(crate::i18n::pick(
+                printer.lang(),
+                format!(
+                    "请重新运行 mcsup config edit 修正 {}",
+                    file.path().display()
+                ),
+                format!("rerun mcsup config edit to fix {}", file.path().display()),
             )),
         )
     })?;
@@ -278,15 +404,25 @@ fn editor_command() -> Option<Vec<String>> {
 }
 
 /// 运行编辑器；返回是否以成功状态退出
-fn run_editor(editor: &[String], path: &Path) -> Result<bool> {
+fn run_editor(lang: crate::locale::Lang, editor: &[String], path: &Path) -> Result<bool> {
     let Some((program, args)) = editor.split_first() else {
-        return Err(anyhow::anyhow!("编辑器命令为空"));
+        return Err(anyhow::anyhow!(crate::i18n::pick(
+            lang,
+            "编辑器命令为空",
+            "the editor command is empty",
+        )));
     };
     let status = std::process::Command::new(program)
         .args(args)
         .arg(path)
         .status()
-        .with_context(|| format!("启动编辑器 {program} 失败"))?;
+        .with_context(|| {
+            crate::i18n::pick(
+                lang,
+                format!("启动编辑器 {program} 失败"),
+                format!("failed to launch the editor {program}"),
+            )
+        })?;
     Ok(status.success())
 }
 
@@ -296,7 +432,7 @@ mod tests {
 
     #[test]
     fn unknown_key_lists_all_keys() {
-        let err = parse_key("nope").expect_err("unknown");
+        let err = parse_key(crate::locale::Lang::Zh, "nope").expect_err("unknown");
         let text = format!("{err:#}");
         assert!(text.contains("未知配置键"), "{text}");
         let diag = err
@@ -308,7 +444,10 @@ mod tests {
     #[test]
     fn known_keys_parse() {
         for key in ConfigKey::ALL {
-            assert_eq!(parse_key(key.as_str()).expect("known"), *key);
+            assert_eq!(
+                parse_key(crate::locale::Lang::Zh, key.as_str()).expect("known"),
+                *key
+            );
         }
     }
 

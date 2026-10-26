@@ -5,6 +5,7 @@
 //! 业务判定仍在 service / domain；调用方必须先经
 //! `printer.is_interactive()` 守卫，非交互（JSON / 非 TTY）绝不进入提示分支。
 
+use crate::locale::Lang;
 use crate::output::Printer;
 use anyhow::{Context, Result};
 use inquire::autocompletion::Replacement;
@@ -18,11 +19,37 @@ mod scoped;
 
 pub(crate) use scoped::{ScopeHint, ScopedChoice, select_filter_scoped};
 
+/// 交互文案的二元取用：`zh` / `en` 都是已渲染好的字符串
+///
+/// 交互组件自己不知道语言，统一由调用方把 [`Printer::lang`] 传进来。
+/// 校验错误、帮助行、选项标签都必须走这里，否则 `--lang en` 只翻译了
+/// clap 帮助和错误，提示框仍是中文。
+fn l(lang: Lang, zh: impl Into<String>, en: impl Into<String>) -> String {
+    match lang {
+        Lang::Zh => zh.into(),
+        Lang::En => en.into(),
+    }
+}
+
 /// 空输入的校验文案（可过滤选择的两个组件共用）
-pub(crate) const ERR_EMPTY_INPUT: &str = "请输入关键字或从建议中选择";
+#[must_use]
+pub(crate) fn err_empty_input(lang: Lang) -> String {
+    l(
+        lang,
+        "请输入关键字或从建议中选择",
+        "type a keyword or pick a suggestion",
+    )
+}
 
 /// 非候选全名的校验文案（同上）
-pub(crate) const ERR_NOT_A_CHOICE: &str = "请从建议中选择一个选项";
+#[must_use]
+pub(crate) fn err_not_a_choice(lang: Lang) -> String {
+    l(
+        lang,
+        "请从建议中选择一个选项",
+        "pick one of the suggestions",
+    )
+}
 
 /// 步骤标题：`[n/N] 标题`（多阶段任务的统一回显风格）
 pub(crate) fn step(printer: Printer, step: usize, total: usize, title: &str) {
@@ -34,11 +61,11 @@ pub(crate) fn step(printer: Printer, step: usize, total: usize, title: &str) {
 /// # Errors
 ///
 /// 读取终端输入失败时返回底层错误
-pub(crate) fn confirm_yes(message: &str, default: bool) -> Result<bool> {
+pub(crate) fn confirm_yes(lang: Lang, message: &str, default: bool) -> Result<bool> {
     Confirm::new(message)
         .with_default(default)
         .prompt()
-        .context("读取确认输入")
+        .context(l(lang, "读取确认输入", "reading confirmation"))
 }
 
 /// 带 `--yes` 语义的确认：全局 `--yes` 下直接返回 `true`，否则才提问
@@ -56,7 +83,7 @@ pub(crate) fn confirm_or_yes(printer: Printer, message: &str, default: bool) -> 
     if !printer.is_interactive() {
         return Ok(default);
     }
-    confirm_yes(message, default)
+    confirm_yes(printer.lang(), message, default)
 }
 
 /// 危险操作的第二道闸：逐字输入目标名称确认
@@ -64,24 +91,26 @@ pub(crate) fn confirm_or_yes(printer: Printer, message: &str, default: bool) -> 
 /// # Errors
 ///
 /// 读取终端输入失败时返回底层错误
-pub(crate) fn confirm_by_name(message: &str, expected: &str) -> Result<()> {
+pub(crate) fn confirm_by_name(lang: Lang, message: &str, expected: &str) -> Result<()> {
     let expected = expected.to_owned();
     let _: String = Text::new(message)
-        .with_validator(move |input: &str| Ok(name_matches(input, &expected)))
+        .with_validator(move |input: &str| Ok(name_matches(lang, input, &expected)))
         .prompt()
-        .context("已取消")?;
+        .context(l(lang, "已取消", "cancelled"))?;
     Ok(())
 }
 
 /// 名称逐字匹配（`confirm_by_name` 的校验内核）
 #[must_use]
-pub(crate) fn name_matches(input: &str, expected: &str) -> Validation {
+pub(crate) fn name_matches(lang: Lang, input: &str, expected: &str) -> Validation {
     if input.trim() == expected {
         Validation::Valid
     } else {
-        Validation::Invalid(ErrorMessage::Custom(
-            "名称不匹配，请重新输入（Ctrl+C 取消）".to_owned(),
-        ))
+        Validation::Invalid(ErrorMessage::Custom(l(
+            lang,
+            "名称不匹配，请重新输入（Ctrl+C 取消）",
+            "name does not match; try again (Ctrl+C to cancel)",
+        )))
     }
 }
 
@@ -120,48 +149,64 @@ impl std::fmt::Display for LocationChoice {
 /// # Errors
 ///
 /// 读取终端输入失败时返回底层错误
-pub(crate) fn pick_workspace_location() -> Result<WorkspaceLocation> {
+pub(crate) fn pick_workspace_location(lang: Lang) -> Result<WorkspaceLocation> {
     let data_root = crate::config::platform_data_dir().join("workspaces");
-    let cwd = std::env::current_dir().context("获取当前工作目录失败")?;
+    let cwd = std::env::current_dir().context(l(
+        lang,
+        "获取当前工作目录失败",
+        "cannot read the current directory",
+    ))?;
     let choices = vec![
         LocationChoice {
-            label: format!("mcsup 数据目录 ({}/<名称>)", data_root.display()),
+            label: l(
+                lang,
+                format!("mcsup 数据目录 ({}/<名称>)", data_root.display()),
+                format!("mcsup data directory ({}/<name>)", data_root.display()),
+            ),
             kind: LocationKind::Data,
         },
         LocationChoice {
-            label: format!("当前目录 ({})", cwd.display()),
+            label: l(
+                lang,
+                format!("当前目录 ({})", cwd.display()),
+                format!("current directory ({})", cwd.display()),
+            ),
             kind: LocationKind::Current,
         },
         LocationChoice {
-            label: "自定义目录".to_owned(),
+            label: l(lang, "自定义目录", "custom directory"),
             kind: LocationKind::Custom,
         },
     ];
-    let picked = Select::new("工作区目录", choices)
+    let picked = Select::new(&l(lang, "工作区目录", "workspace location"), choices)
         .prompt()
-        .context("读取目录选择")?;
+        .context(l(lang, "读取目录选择", "reading the location choice"))?;
     match picked.kind {
         LocationKind::Data => Ok(WorkspaceLocation::DataDir),
         LocationKind::Current => Ok(WorkspaceLocation::CurrentDir),
-        LocationKind::Custom => Ok(WorkspaceLocation::Custom(input_custom_path()?)),
+        LocationKind::Custom => Ok(WorkspaceLocation::Custom(input_custom_path(lang)?)),
     }
 }
 
-fn input_custom_path() -> Result<PathBuf> {
-    let input: String = Text::new("自定义目录")
+fn input_custom_path(lang: Lang) -> Result<PathBuf> {
+    let input: String = Text::new(&l(lang, "自定义目录", "custom directory"))
         .with_default(".")
-        .with_help_message("回车接受默认值；不存在的目录会自动创建")
-        .with_validator(|input: &str| Ok(validate_dir_input(input)))
+        .with_help_message(&l(
+            lang,
+            "回车接受默认值；不存在的目录会自动创建",
+            "enter accepts the default; a missing directory is created",
+        ))
+        .with_validator(move |input: &str| Ok(validate_dir_input(lang, input)))
         .prompt()
-        .context("读取自定义目录")?;
+        .context(l(lang, "读取自定义目录", "reading the custom directory"))?;
     Ok(absolute_path(Path::new(input.trim())))
 }
 
 /// 目录输入校验：`dir_issue` 判据映射为 inquire 校验（非空且非工作区 /
 /// 指向文件 / 最近存在的祖先不是目录 → 重输）
 #[must_use]
-pub(crate) fn validate_dir_input(input: &str) -> Validation {
-    match dir_issue(Path::new(input.trim())) {
+pub(crate) fn validate_dir_input(lang: Lang, input: &str) -> Validation {
+    match dir_issue(lang, Path::new(input.trim())) {
         None => Validation::Valid,
         Some(message) => Validation::Invalid(ErrorMessage::Custom(message)),
     }
@@ -175,20 +220,32 @@ pub(crate) fn validate_dir_input(input: &str) -> Validation {
 /// - 非空但有 marker：中断恢复场景，放行（由 service 补注册）
 /// - 仅噪声文件（`.DS_Store` 等）：按空目录放行，口径与 service 判空一致
 #[must_use]
-pub(crate) fn dir_issue(raw: &Path) -> Option<String> {
+pub(crate) fn dir_issue(lang: Lang, raw: &Path) -> Option<String> {
     let abs = absolute_path(raw);
     if !abs.exists() {
         return match nearest_existing(&abs) {
             Some(existing) if existing.is_dir() => None,
-            Some(existing) => Some(format!("{} 不是目录", existing.display())),
+            Some(existing) => Some(l(
+                lang,
+                format!("{} 不是目录", existing.display()),
+                format!("{} is not a directory", existing.display()),
+            )),
             None => None,
         };
     }
     if !abs.is_dir() {
-        return Some(format!("{} 是一个文件", abs.display()));
+        return Some(l(
+            lang,
+            format!("{} 是一个文件", abs.display()),
+            format!("{} is a file", abs.display()),
+        ));
     }
     match std::fs::read_dir(&abs) {
-        Err(err) => Some(format!("无法读取 {}: {err}", abs.display())),
+        Err(err) => Some(l(
+            lang,
+            format!("无法读取 {}: {err}", abs.display()),
+            format!("cannot read {}: {err}", abs.display()),
+        )),
         Ok(entries) => {
             let foreign = entries.flatten().any(|entry| {
                 let name = entry.file_name();
@@ -196,9 +253,13 @@ pub(crate) fn dir_issue(raw: &Path) -> Option<String> {
                 !NOISE_ENTRIES.contains(&name.as_ref())
             });
             if foreign && !abs.join(MARKER_FILE).exists() {
-                return Some(format!(
-                    "{} 非空且不是工作区（缺少 {MARKER_FILE}）",
-                    abs.display()
+                return Some(l(
+                    lang,
+                    format!("{} 非空且不是工作区（缺少 {MARKER_FILE}）", abs.display()),
+                    format!(
+                        "{} is not empty and is not a workspace (missing {MARKER_FILE})",
+                        abs.display()
+                    ),
                 ));
             }
             None
@@ -222,13 +283,17 @@ fn nearest_existing(path: &Path) -> Option<PathBuf> {
 /// # Errors
 ///
 /// 读取终端输入失败时返回底层错误
-pub(crate) fn input_name(label: &str, default: &str) -> Result<String> {
+pub(crate) fn input_name(lang: Lang, label: &str, default: &str) -> Result<String> {
     let input: String = Text::new(label)
         .with_default(default)
-        .with_help_message("字母、数字、-、_，最长 64；回车取默认值")
-        .with_validator(|input: &str| Ok(validate_name(input)))
+        .with_help_message(&l(
+            lang,
+            "字母、数字、-、_，最长 64；回车取默认值",
+            "letters, digits, - or _, up to 64; enter keeps the default",
+        ))
+        .with_validator(move |input: &str| Ok(validate_name(lang, input)))
         .prompt()
-        .context("读取名称输入")?;
+        .context(l(lang, "读取名称输入", "reading the name"))?;
     let trimmed = input.trim();
     if trimmed.is_empty() {
         Ok(default.to_owned())
@@ -239,16 +304,18 @@ pub(crate) fn input_name(label: &str, default: &str) -> Result<String> {
 
 /// 名称校验：空 = 取默认；其余按 domain 规则
 #[must_use]
-pub(crate) fn validate_name(input: &str) -> Validation {
+pub(crate) fn validate_name(lang: Lang, input: &str) -> Validation {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Validation::Valid;
     }
     match WorkspaceName::parse(trimmed) {
         Ok(_) => Validation::Valid,
-        Err(_) => Validation::Invalid(ErrorMessage::Custom(
-            "名称只能包含字母、数字、-、_，最长 64 字符".to_owned(),
-        )),
+        Err(_) => Validation::Invalid(ErrorMessage::Custom(l(
+            lang,
+            "名称只能包含字母、数字、-、_，最长 64 字符",
+            "names may only contain letters, digits, - or _, up to 64 characters",
+        ))),
     }
 }
 
@@ -257,12 +324,12 @@ pub(crate) fn validate_name(input: &str) -> Validation {
 /// # Errors
 ///
 /// 读取终端输入失败时返回底层错误
-pub(crate) fn input_text(label: &str, default: &str, help: &str) -> Result<String> {
+pub(crate) fn input_text(lang: Lang, label: &str, default: &str, help: &str) -> Result<String> {
     let input: String = Text::new(label)
         .with_default(default)
         .with_help_message(help)
         .prompt()
-        .context("读取输入")?;
+        .context(l(lang, "读取输入", "reading input"))?;
     let trimmed = input.trim();
     if trimmed.is_empty() {
         Ok(default.to_owned())
@@ -276,12 +343,12 @@ pub(crate) fn input_text(label: &str, default: &str, help: &str) -> Result<Strin
 /// # Errors
 ///
 /// 读取终端输入失败时返回底层错误
-pub(crate) fn select_bool(label: &str, default: bool) -> Result<bool> {
+pub(crate) fn select_bool(lang: Lang, label: &str, default: bool) -> Result<bool> {
     let choices = vec!["true", "false"];
     let picked = Select::new(label, choices)
         .with_starting_cursor(usize::from(!default))
         .prompt()
-        .context("读取选择")?;
+        .context(l(lang, "读取选择", "reading the choice"))?;
     Ok(picked == "true")
 }
 
@@ -309,23 +376,39 @@ pub(crate) fn default_name_for_dir(dir: &Path) -> Option<String> {
 /// # Errors
 ///
 /// 无可选项、读取终端输入失败或结果无法归一到候选名时返回错误
-pub(crate) fn select_filter(label: &str, options: &[String]) -> Result<String> {
+pub(crate) fn select_filter(lang: Lang, label: &str, options: &[String]) -> Result<String> {
     match options {
-        [] => return Err(anyhow::anyhow!("没有可选项")),
+        [] => {
+            return Err(anyhow::anyhow!(l(
+                lang,
+                "没有可选项",
+                "no options available"
+            )));
+        }
         [only] => return Ok((*only).clone()),
         _ => {}
     }
     let choices = options.to_vec();
     let validator_choices = choices.clone();
     let input: String = Text::new(label)
-        .with_help_message("输入关键字过滤；从建议中选择后回车")
+        .with_help_message(&l(
+            lang,
+            "输入关键字过滤；从建议中选择后回车",
+            "type to filter; pick a suggestion and press enter",
+        ))
         .with_autocomplete(FilterComplete { choices })
-        .with_validator(move |input: &str| Ok(validate_choice(input, &validator_choices)))
+        .with_validator(move |input: &str| Ok(validate_choice(lang, input, &validator_choices)))
         .prompt()
-        .context("读取选择")?;
+        .context(l(lang, "读取选择", "reading the choice"))?;
     canonical_choice(input.trim(), options)
         .cloned()
-        .ok_or_else(|| anyhow::anyhow!("无效选择: {input}"))
+        .ok_or_else(|| {
+            anyhow::anyhow!(l(
+                lang,
+                format!("无效选择: {input}"),
+                format!("invalid choice: {input}")
+            ))
+        })
 }
 
 /// 大小写不敏感的关键字过滤（空关键字 = 全部候选）
@@ -349,15 +432,15 @@ pub(crate) fn canonical_choice<'a>(input: &str, choices: &'a [String]) -> Option
 
 /// 选择校验：必须是某个候选的全名（大小写不敏感），空输入无效
 #[must_use]
-pub(crate) fn validate_choice(input: &str, choices: &[String]) -> Validation {
+pub(crate) fn validate_choice(lang: Lang, input: &str, choices: &[String]) -> Validation {
     let input = input.trim();
     if input.is_empty() {
-        return Validation::Invalid(ErrorMessage::Custom(ERR_EMPTY_INPUT.to_owned()));
+        return Validation::Invalid(ErrorMessage::Custom(err_empty_input(lang)));
     }
     if canonical_choice(input, choices).is_some() {
         Validation::Valid
     } else {
-        Validation::Invalid(ErrorMessage::Custom(ERR_NOT_A_CHOICE.to_owned()))
+        Validation::Invalid(ErrorMessage::Custom(err_not_a_choice(lang)))
     }
 }
 
@@ -432,14 +515,26 @@ mod tests {
 
     #[test]
     fn name_validation_follows_domain_rules() {
-        assert!(matches!(validate_name("ws-01"), Validation::Valid));
-        assert!(matches!(validate_name("ws_1"), Validation::Valid));
-        assert!(matches!(validate_name("  "), Validation::Valid));
-        assert!(matches!(validate_name("bad name"), Validation::Invalid(_)));
-        assert!(matches!(validate_name("a/b"), Validation::Invalid(_)));
-        assert!(matches!(validate_name(&"x".repeat(64)), Validation::Valid));
         assert!(matches!(
-            validate_name(&"x".repeat(65)),
+            validate_name(Lang::Zh, "ws-01"),
+            Validation::Valid
+        ));
+        assert!(matches!(validate_name(Lang::Zh, "ws_1"), Validation::Valid));
+        assert!(matches!(validate_name(Lang::Zh, "  "), Validation::Valid));
+        assert!(matches!(
+            validate_name(Lang::Zh, "bad name"),
+            Validation::Invalid(_)
+        ));
+        assert!(matches!(
+            validate_name(Lang::Zh, "a/b"),
+            Validation::Invalid(_)
+        ));
+        assert!(matches!(
+            validate_name(Lang::Zh, &"x".repeat(64)),
+            Validation::Valid
+        ));
+        assert!(matches!(
+            validate_name(Lang::Zh, &"x".repeat(65)),
             Validation::Invalid(_)
         ));
     }
@@ -448,19 +543,22 @@ mod tests {
     fn dir_issue_accepts_fresh_noise_and_workspace_dirs() {
         let tmp = tempdir().expect("tempdir");
         let fresh = tmp.path().join("fresh");
-        assert!(dir_issue(&fresh).is_none(), "不存在的目录可创建");
+        assert!(dir_issue(Lang::Zh, &fresh).is_none(), "不存在的目录可创建");
 
         fs::create_dir(&fresh).expect("mkdir");
-        assert!(dir_issue(&fresh).is_none(), "空目录可作工作区");
+        assert!(dir_issue(Lang::Zh, &fresh).is_none(), "空目录可作工作区");
 
         fs::write(fresh.join(".DS_Store"), "").expect("noise");
-        assert!(dir_issue(&fresh).is_none(), "噪声文件按空处理");
+        assert!(dir_issue(Lang::Zh, &fresh).is_none(), "噪声文件按空处理");
 
         fs::write(fresh.join(MARKER_FILE), "schema = 1").expect("marker");
         fs::write(fresh.join("world"), "data").expect("content");
-        assert!(dir_issue(&fresh).is_none(), "有 marker 走中断恢复");
+        assert!(
+            dir_issue(Lang::Zh, &fresh).is_none(),
+            "有 marker 走中断恢复"
+        );
 
-        assert!(dir_issue(&tmp.path().join("new/deep")).is_none());
+        assert!(dir_issue(Lang::Zh, &tmp.path().join("new/deep")).is_none());
     }
 
     #[test]
@@ -468,17 +566,17 @@ mod tests {
         let tmp = tempdir().expect("tempdir");
         let file = tmp.path().join("f.txt");
         fs::write(&file, "x").expect("file");
-        let issue = dir_issue(&file).expect("文件应不可用");
+        let issue = dir_issue(Lang::Zh, &file).expect("文件应不可用");
         assert!(issue.contains("文件"), "{issue}");
 
         let under_file = file.join("sub");
-        let issue = dir_issue(&under_file).expect("文件之下应不可用");
+        let issue = dir_issue(Lang::Zh, &under_file).expect("文件之下应不可用");
         assert!(issue.contains("不是目录"), "{issue}");
 
         let foreign = tmp.path().join("foreign");
         fs::create_dir(&foreign).expect("mkdir");
         fs::write(foreign.join("data.txt"), "x").expect("content");
-        let issue = dir_issue(&foreign).expect("非空目录应不可用");
+        let issue = dir_issue(Lang::Zh, &foreign).expect("非空目录应不可用");
         assert!(issue.contains("非空"), "{issue}");
     }
 
@@ -488,28 +586,34 @@ mod tests {
         let file = tmp.path().join("f.txt");
         fs::write(&file, "x").expect("file");
         assert!(matches!(
-            validate_dir_input(file.to_str().expect("utf8")),
+            validate_dir_input(Lang::Zh, file.to_str().expect("utf8")),
             Validation::Invalid(_)
         ));
         let fresh = tmp.path().join("fresh-ok");
         assert!(matches!(
-            validate_dir_input(fresh.to_str().expect("utf8")),
+            validate_dir_input(Lang::Zh, fresh.to_str().expect("utf8")),
             Validation::Valid
         ));
     }
 
     #[test]
     fn name_matches_requires_exact_trimmed_input() {
-        assert!(matches!(name_matches("ws-01", "ws-01"), Validation::Valid));
         assert!(matches!(
-            name_matches("  ws-01  ", "ws-01"),
+            name_matches(Lang::Zh, "ws-01", "ws-01"),
             Validation::Valid
         ));
         assert!(matches!(
-            name_matches("ws-02", "ws-01"),
+            name_matches(Lang::Zh, "  ws-01  ", "ws-01"),
+            Validation::Valid
+        ));
+        assert!(matches!(
+            name_matches(Lang::Zh, "ws-02", "ws-01"),
             Validation::Invalid(_)
         ));
-        assert!(matches!(name_matches("", "ws-01"), Validation::Invalid(_)));
+        assert!(matches!(
+            name_matches(Lang::Zh, "", "ws-01"),
+            Validation::Invalid(_)
+        ));
     }
 
     fn owned(items: &[&str]) -> Vec<String> {
@@ -532,15 +636,24 @@ mod tests {
     #[test]
     fn choice_validation_requires_full_name() {
         let opts = owned(&["a", "b"]);
-        assert!(matches!(validate_choice("a", &opts), Validation::Valid));
-        assert!(matches!(validate_choice("A", &opts), Validation::Valid));
-        assert!(matches!(validate_choice("", &opts), Validation::Invalid(_)));
         assert!(matches!(
-            validate_choice("  ", &opts),
+            validate_choice(Lang::Zh, "a", &opts),
+            Validation::Valid
+        ));
+        assert!(matches!(
+            validate_choice(Lang::Zh, "A", &opts),
+            Validation::Valid
+        ));
+        assert!(matches!(
+            validate_choice(Lang::Zh, "", &opts),
             Validation::Invalid(_)
         ));
         assert!(matches!(
-            validate_choice("ab", &opts),
+            validate_choice(Lang::Zh, "  ", &opts),
+            Validation::Invalid(_)
+        ));
+        assert!(matches!(
+            validate_choice(Lang::Zh, "ab", &opts),
             Validation::Invalid(_)
         ));
     }

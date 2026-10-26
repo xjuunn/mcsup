@@ -30,9 +30,13 @@ pub(crate) async fn run(
     printer: Printer,
 ) -> Result<()> {
     let registry = bootstrap::open_registry()?;
-    let srv = registry
-        .get(name)
-        .with_context(|| format!("服务器 {name} 不存在"))?;
+    let srv = registry.get(name).with_context(|| {
+        crate::i18n::pick(
+            printer.lang(),
+            format!("服务器 {name} 不存在"),
+            format!("server {name} does not exist"),
+        )
+    })?;
     let source = bootstrap::source_for(&srv.meta.variant, printer.lang())?;
     let version_id = match version {
         Some(raw) => VersionId::new(normalize_version_alias(raw).to_owned()),
@@ -127,7 +131,11 @@ pub(crate) async fn download_jar(
     // 首个进度到达后由 session 内的 BarSink 接手同一条线，切换成进度显示。
     // 下载结束后还有运行安装器（几分钟）与登记核心：安装器的输出经
     // `installer_output` 逐行滚动显示，进度条不会停在 100% 冻住。
-    let message = format!("解析并下载 {version_id}");
+    let message = crate::i18n::pick(
+        printer.lang(),
+        format!("解析并下载 {version_id}"),
+        format!("resolving and downloading {version_id}"),
+    );
     let session = InstallSession::new(message, printer.is_human());
 
     // 安装器类来源才需要 java。这里**不能**把失败吞成 `None`：service 会把
@@ -140,7 +148,13 @@ pub(crate) async fn download_jar(
         let java_bin = lifecycle
             .installer_java_bin(name, &mut || {}, &mut |_| {})
             .with_context(|| {
-                format!("{variant_name} 需要先运行安装器，但找不到可用的 Java 运行时")
+                crate::i18n::pick(
+                    printer.lang(),
+                    format!("{variant_name} 需要先运行安装器，但找不到可用的 Java 运行时"),
+                    format!(
+                        "{variant_name} needs to run its installer first, but no usable Java runtime was found"
+                    ),
+                )
             })?;
         Some(mcsup::service::InstallerContext {
             java_bin,
@@ -164,7 +178,13 @@ pub(crate) async fn download_jar(
             session.cancel(),
         )
         .await
-        .with_context(|| format!("安装服务端 {name} 失败"))?;
+        .with_context(|| {
+            crate::i18n::pick(
+                printer.lang(),
+                format!("安装服务端 {name} 失败"),
+                format!("failed to install the server core for {name}"),
+            )
+        })?;
     session.finish();
     Ok((outcome.jar.size, outcome.destination))
 }
@@ -180,24 +200,37 @@ pub(crate) async fn pick_version(
     printer: Printer,
 ) -> Result<VersionId> {
     let spinner = TaskSpinner::new(
-        format!("获取 {} 版本列表", variant.as_str()),
+        crate::i18n::pick(
+            printer.lang(),
+            format!("获取 {} 版本列表", variant.as_str()),
+            format!("fetching the {} version list", variant.as_str()),
+        ),
         printer.is_human(),
     );
-    let mut versions = source.versions().await.context("获取版本列表失败")?;
+    let mut versions = source.versions().await.context(crate::i18n::pick(
+        printer.lang(),
+        "获取版本列表失败",
+        "failed to fetch the version list",
+    ))?;
     spinner.finish();
     if versions.is_empty() {
-        anyhow::bail!("{} 暂无可用版本", variant.as_str());
+        anyhow::bail!(crate::i18n::pick(
+            printer.lang(),
+            format!("{} 暂无可用版本", variant.as_str()),
+            format!("no versions available for {}", variant.as_str())
+        ));
     }
     // 顺序由领域层统一：各来源给出的顺序不一致（Forge 的 BTreeMap 是串字典序，
     // `1.10` 会落在 `1.1` 之后），入口不再各自排序
     ServerVersion::sort_display_order(&mut versions);
-    let choices = version_choices(&versions);
+    let choices = version_choices(printer.lang(), &versions);
     let picked = prompts::select_filter_scoped(
-        "选择版本",
+        printer.lang(),
+        &crate::i18n::pick(printer.lang(), "选择版本", "select a version"),
         &choices,
         prompts::ScopeHint {
-            show_all: "显示所有版本",
-            show_default: "只显示正式版",
+            show_all: crate::i18n::pick(printer.lang(), "显示所有版本", "show all versions").leak(),
+            show_default: crate::i18n::pick(printer.lang(), "只显示正式版", "releases only").leak(),
         },
     )?;
     versions
@@ -205,29 +238,46 @@ pub(crate) async fn pick_version(
         .zip(choices)
         .find(|(_, choice)| choice.label == picked)
         .map(|(v, _)| v.id)
-        .ok_or_else(|| anyhow::anyhow!("无效选择: {picked}"))
+        .ok_or_else(|| {
+            anyhow::anyhow!(crate::i18n::pick(
+                printer.lang(),
+                format!("无效选择: {picked}"),
+                format!("invalid choice: {picked}"),
+            ))
+        })
 }
 
 /// 版本候选：默认只列正式版，快照 / 旧版标为扩展候选（由 Ctrl+A 切换显示）
-fn version_choices(versions: &[ServerVersion]) -> Vec<prompts::ScopedChoice> {
+fn version_choices(
+    lang: crate::locale::Lang,
+    versions: &[ServerVersion],
+) -> Vec<prompts::ScopedChoice> {
     versions
         .iter()
         .map(|version| {
             let extra = !matches!(version.kind, VersionKind::Release);
-            prompts::ScopedChoice::new(version_label(version), extra)
+            prompts::ScopedChoice::new(version_label(lang, version), extra)
         })
         .collect()
 }
 
 /// 版本候选的展示标签（含版本 id，映射回 id 时按标签全名匹配）
 #[must_use]
-pub(crate) fn version_label(version: &ServerVersion) -> String {
+pub(crate) fn version_label(lang: crate::locale::Lang, version: &ServerVersion) -> String {
     match version.kind {
         VersionKind::Release => version.id.to_string(),
-        VersionKind::Snapshot => format!("{}（快照）", version.id),
+        VersionKind::Snapshot => crate::i18n::pick(
+            lang,
+            format!("{}（快照）", version.id),
+            format!("{} (snapshot)", version.id),
+        ),
         // `VersionKind` 是 `#[non_exhaustive]`：`Historical` 与将来新增的种类
         // 都按旧版展示，不 panic
-        _ => format!("{}（旧版）", version.id),
+        _ => crate::i18n::pick(
+            lang,
+            format!("{}（旧版）", version.id),
+            format!("{} (legacy)", version.id),
+        ),
     }
 }
 
@@ -248,15 +298,24 @@ mod tests {
     #[test]
     fn version_label_marks_kind_but_keeps_id_intact() {
         assert_eq!(
-            version_label(&version(VersionKind::Release, "1.21.1")),
+            version_label(
+                crate::locale::Lang::Zh,
+                &version(VersionKind::Release, "1.21.1")
+            ),
             "1.21.1"
         );
         assert_eq!(
-            version_label(&version(VersionKind::Snapshot, "24w33a")),
+            version_label(
+                crate::locale::Lang::Zh,
+                &version(VersionKind::Snapshot, "24w33a")
+            ),
             "24w33a（快照）"
         );
         assert_eq!(
-            version_label(&version(VersionKind::Historical, "1.0")),
+            version_label(
+                crate::locale::Lang::Zh,
+                &version(VersionKind::Historical, "1.0")
+            ),
             "1.0（旧版）"
         );
     }
@@ -269,7 +328,7 @@ mod tests {
             version(VersionKind::Snapshot, "24w33a"),
             version(VersionKind::Historical, "1.0"),
         ];
-        let choices = version_choices(&versions);
+        let choices = version_choices(crate::locale::Lang::Zh, &versions);
         assert_eq!(choices.len(), 3);
         assert_eq!(choices[0].label, "1.21.1");
         assert!(!choices[0].extra, "正式版是默认候选");

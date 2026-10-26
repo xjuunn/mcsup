@@ -30,8 +30,16 @@ pub(crate) fn run(action: WorkspaceAction, printer: Printer) -> Result<()> {
                 None if printer.is_interactive() => pick_workspace(&svc, printer)?,
                 None => {
                     return Err(AppDiagnostic::usage(
-                        "workspace remove 缺少工作区名称",
-                        Some("非交互模式：mcsup workspace remove <名称>".to_owned()),
+                        crate::i18n::pick(
+                            printer.lang(),
+                            "workspace remove 缺少工作区名称",
+                            "workspace remove requires a workspace name",
+                        ),
+                        Some(crate::i18n::pick(
+                            printer.lang(),
+                            "非交互模式：mcsup workspace remove <名称>".to_owned(),
+                            "non-interactive: mcsup workspace remove <name>".to_owned(),
+                        )),
                     )
                     .into());
                 }
@@ -75,10 +83,17 @@ fn resolve_dir(
     name: Option<&str>,
     cwd: &Path,
     data_root: &Path,
+    lang: crate::locale::Lang,
 ) -> Result<PathBuf> {
     match loc {
         Some(WorkspaceLocation::DataDir) => {
-            let name = name.ok_or_else(|| anyhow::anyhow!("数据目录模式缺少工作区名称"))?;
+            let name = name.ok_or_else(|| {
+                anyhow::anyhow!(crate::i18n::pick(
+                    lang,
+                    "数据目录模式缺少工作区名称".to_owned(),
+                    "the data-dir mode needs a workspace name".to_owned(),
+                ))
+            })?;
             Ok(data_root.join("workspaces").join(name))
         }
         Some(WorkspaceLocation::CurrentDir) => Ok(cwd.to_path_buf()),
@@ -96,19 +111,32 @@ pub(crate) fn init(
     let interactive = printer.is_interactive();
     let wizard = interactive && dir_flag.is_none();
     let seq = svc.next_default_name()?.as_str().to_owned();
-    let cwd = std::env::current_dir().context("获取当前工作目录失败")?;
+    let cwd = std::env::current_dir().context(crate::i18n::pick(
+        printer.lang(),
+        "获取当前工作目录失败".to_owned(),
+        "cannot read the current directory".to_owned(),
+    ))?;
     let data_root = crate::config::platform_data_dir();
     // 1/3 位置：--dir / 非交互直接给定；完整向导走三选项
     let loc = if wizard {
-        prompts::step(printer, 1, 3, "选择目录");
-        let loc = prompts::pick_workspace_location()?;
+        prompts::step(
+            printer,
+            1,
+            3,
+            &crate::i18n::pick(printer.lang(), "选择目录", "choose a location"),
+        );
+        let loc = prompts::pick_workspace_location(printer.lang())?;
         // 当前目录在进名称步骤前先判可用，免得白填两步
         if matches!(loc, WorkspaceLocation::CurrentDir)
-            && let Some(issue) = prompts::dir_issue(&cwd)
+            && let Some(issue) = prompts::dir_issue(printer.lang(), &cwd)
         {
-            return Err(anyhow::anyhow!(
-                "当前目录不可用：{issue}；重新运行并选择其他位置"
-            ));
+            return Err(anyhow::anyhow!(crate::i18n::pick(
+                printer.lang(),
+                format!("当前目录不可用：{issue}；重新运行并选择其他位置"),
+                format!(
+                    "the current directory is unusable: {issue}; rerun and pick another location"
+                )
+            )));
         }
         Some(loc)
     } else {
@@ -120,36 +148,66 @@ pub(crate) fn init(
         Some(name) => Some(name.to_owned()),
         None if interactive => {
             if wizard {
-                prompts::step(printer, 2, 3, "工作区名称");
+                prompts::step(
+                    printer,
+                    2,
+                    3,
+                    &crate::i18n::pick(printer.lang(), "工作区名称", "workspace name"),
+                );
             }
             let default = name_default(loc.as_ref(), dir_flag, &cwd, &seq);
-            Some(prompts::input_name("工作区名称", &default)?)
+            Some(prompts::input_name(
+                printer.lang(),
+                &crate::i18n::pick(printer.lang(), "工作区名称", "workspace name"),
+                &default,
+            )?)
         }
         None => None,
     };
 
-    let dir = resolve_dir(loc.as_ref(), dir_flag, name.as_deref(), &cwd, &data_root)?;
+    let dir = resolve_dir(
+        loc.as_ref(),
+        dir_flag,
+        name.as_deref(),
+        &cwd,
+        &data_root,
+        printer.lang(),
+    )?;
 
     // 数据目录路径由名称合成，选不到可用目录时在这里亮出来
     if matches!(loc, Some(WorkspaceLocation::DataDir))
-        && let Some(issue) = prompts::dir_issue(&dir)
+        && let Some(issue) = prompts::dir_issue(printer.lang(), &dir)
     {
-        return Err(anyhow::anyhow!("数据目录不可用：{issue}"));
+        return Err(anyhow::anyhow!(crate::i18n::pick(
+            printer.lang(),
+            format!("数据目录不可用：{issue}"),
+            format!("the data directory is unusable: {issue}")
+        )));
     }
 
     if wizard {
-        prompts::step(printer, 3, 3, "确认创建");
+        prompts::step(
+            printer,
+            3,
+            3,
+            &crate::i18n::pick(printer.lang(), "确认创建", "confirm creation"),
+        );
     }
     if interactive {
         let abs = absolute_path(&dir);
-        let name_display = name.as_deref().unwrap_or("(自动序号)");
-        let confirmed = prompts::confirm_or_yes(
-            printer,
-            &format!("在 {} 创建并注册工作区 {name_display}?", abs.display()),
-            true,
-        )?;
+        let auto_name = crate::i18n::pick(printer.lang(), "(自动序号)", "(auto number)");
+        let name_display = name.as_deref().unwrap_or(&auto_name);
+        let message = crate::i18n::pick(
+            printer.lang(),
+            format!("在 {} 创建并注册工作区 {name_display}?", abs.display()),
+            format!(
+                "create and register workspace {name_display} at {}?",
+                abs.display()
+            ),
+        );
+        let confirmed = prompts::confirm_or_yes(printer, &message, true)?;
         if !confirmed {
-            printer.print_section("已取消");
+            printer.print_section(&crate::i18n::pick(printer.lang(), "已取消", "cancelled"));
             return Ok(());
         }
     }
@@ -194,10 +252,18 @@ fn report_init(outcome: InitOutcome, printer: Printer) -> Result<()> {
             },
         )?,
         InitOutcome::MarkerRestored(ws) => printer.print_outcome(
-            &format!(
-                "已按注册记录重建 workspace.toml: {} ({})",
-                ws.name,
-                ws.path.display()
+            &crate::i18n::pick(
+                lang,
+                format!(
+                    "已按注册记录重建 workspace.toml: {} ({})",
+                    ws.name,
+                    ws.path.display()
+                ),
+                format!(
+                    "rebuilt workspace.toml from the registry record: {} ({})",
+                    ws.name,
+                    ws.path.display()
+                ),
             ),
             &WorkspaceInitRow {
                 name: ws.name.as_str(),
@@ -280,7 +346,15 @@ fn use_ws(svc: &WorkspaceService, name: Option<&str>, printer: Printer) -> Resul
     };
     let ws = svc.set_current(&selector)?;
     printer.print_outcome(
-        &format!("当前工作区已切换为 {} ({})", ws.name, ws.path.display()),
+        &crate::i18n::pick(
+            printer.lang(),
+            format!("当前工作区已切换为 {} ({})", ws.name, ws.path.display()),
+            format!(
+                "current workspace switched to {} ({})",
+                ws.name,
+                ws.path.display()
+            ),
+        ),
         &WorkspaceUseJson {
             name: ws.name.as_str(),
             path: ws.path.display().to_string(),
@@ -293,31 +367,64 @@ fn pick_workspace(svc: &WorkspaceService, printer: Printer) -> Result<String> {
     // 缺必选参数：非交互 / JSON 下不提问、不落库，直接用法错误（退出码 2）
     if !printer.is_interactive() {
         return Err(AppDiagnostic::usage(
-            "workspace use 缺少工作区名称",
-            Some("非交互模式：mcsup workspace use <名称>".to_owned()),
+            crate::i18n::pick(
+                printer.lang(),
+                "workspace use 缺少工作区名称",
+                "workspace use requires a workspace name",
+            ),
+            Some(crate::i18n::pick(
+                printer.lang(),
+                "非交互模式：mcsup workspace use <名称>".to_owned(),
+                "non-interactive: mcsup workspace use <name>".to_owned(),
+            )),
         )
         .into());
     }
     let all = svc.list()?;
     if all.is_empty() {
-        anyhow::bail!("尚无工作目录，先运行 mcsup workspace init");
+        anyhow::bail!(crate::i18n::pick(
+            printer.lang(),
+            "尚无工作目录，先运行 mcsup workspace init".to_owned(),
+            "no workspaces yet; run `mcsup workspace init` first".to_owned(),
+        ));
     }
     let current = svc.current_workspace().ok();
     let options: Vec<String> = all
         .iter()
         .map(|w| {
             let mark = if current.as_ref().is_some_and(|c| c.id == w.id) {
-                " (当前)"
+                crate::i18n::pick(
+                    printer.lang(),
+                    " (当前)".to_owned(),
+                    " (current)".to_owned(),
+                )
             } else {
-                ""
+                String::new()
             };
             format!("{}{mark}", w.name.as_str())
         })
         .collect();
-    let choice = inquire::Select::new("选择工作区", options)
+    let current_marker = crate::i18n::pick(
+        printer.lang(),
+        " (当前)".to_owned(),
+        " (current)".to_owned(),
+    );
+    let label = crate::i18n::pick(
+        printer.lang(),
+        "选择工作区".to_owned(),
+        "select a workspace".to_owned(),
+    );
+    let choice = inquire::Select::new(&label, options)
         .prompt()
-        .context("读取工作区选择")?;
-    let name = choice.split(" (当前)").next().unwrap_or(&choice);
+        .context(crate::i18n::pick(
+            printer.lang(),
+            "读取工作区选择".to_owned(),
+            "reading the workspace choice".to_owned(),
+        ))?;
+    let name = choice
+        .split(current_marker.as_str())
+        .next()
+        .unwrap_or(&choice);
     Ok(name.to_owned())
 }
 
@@ -328,7 +435,11 @@ fn remove(svc: &WorkspaceService, name: &str, purge: bool, printer: Printer) -> 
     // 判定收敛在 lifecycle service，入口不各自补检查
     super::lifecycle::lifecycle_service()?.ensure_workspace_stopped(&ws.id)?;
     // 终端的工作目录：service 据此拒绝「删掉调用方所在目录」
-    let cwd = std::env::current_dir().context("获取当前工作目录失败")?;
+    let cwd = std::env::current_dir().context(crate::i18n::pick(
+        printer.lang(),
+        "获取当前工作目录失败".to_owned(),
+        "cannot read the current directory".to_owned(),
+    ))?;
     // 删盘的前置条件先过一次：目录不是一个合法工作区、或终端就站在待删目录里时
     // 直接报出来，不让用户先答完两个确认框、最后一步才被拒
     if purge {
@@ -342,25 +453,53 @@ fn remove(svc: &WorkspaceService, name: &str, purge: bool, printer: Printer) -> 
         // 拦一次，用户此时尚未确认名称
         let confirmed = prompts::confirm_or_yes(
             printer,
-            &format!(
-                "删除 {} ({}) 的磁盘数据?",
-                ws.name.as_str(),
-                ws.path.display()
+            &crate::i18n::pick(
+                printer.lang(),
+                format!(
+                    "删除 {} ({}) 的磁盘数据?",
+                    ws.name.as_str(),
+                    ws.path.display()
+                ),
+                format!(
+                    "also delete the on-disk data of {} ({})?",
+                    ws.name.as_str(),
+                    ws.path.display()
+                ),
             ),
             false,
         )
-        .context("已取消注销")?;
+        .context(crate::i18n::pick(
+            printer.lang(),
+            "已取消注销",
+            "unregister cancelled",
+        ))?;
         if confirmed {
             svc.ensure_purgeable(name, &cwd)?;
             // 同意删盘后再上一道闸：红色警示 + 手输工作区名称，防误删存档与备份
-            printer.print_warning(&format!(
-                "警告: 将永久删除 {} ({}) 中的所有存档、备份等文件，此操作无法恢复",
-                ws.name.as_str(),
-                ws.path.display()
+            printer.print_warning(&crate::i18n::pick(
+                printer.lang(),
+                format!(
+                    "警告: 将永久删除 {} ({}) 中的所有存档、备份等文件，此操作无法恢复",
+                    ws.name.as_str(),
+                    ws.path.display()
+                ),
+                format!(
+                    "warning: this permanently deletes every world, backup and file under {} ({}); it cannot be undone",
+                    ws.name.as_str(),
+                    ws.path.display()
+                ),
             ));
             if !printer.assumes_yes() {
                 prompts::confirm_by_name(
-                    &format!("输入工作区名称 {} 以确认删除", ws.name.as_str()),
+                    printer.lang(),
+                    &crate::i18n::pick(
+                        printer.lang(),
+                        format!("输入工作区名称 {} 以确认删除", ws.name.as_str()),
+                        format!(
+                            "type the workspace name {} to confirm deletion",
+                            ws.name.as_str()
+                        ),
+                    ),
                     ws.name.as_str(),
                 )?;
             }
@@ -373,17 +512,40 @@ fn remove(svc: &WorkspaceService, name: &str, purge: bool, printer: Printer) -> 
         super::chdir_out_of(&ws.path);
     }
     let out = svc.remove(name, purge, &cwd)?;
+    report_removed(svc, &out, purge, printer)
+}
+
+/// `workspace remove` 的结果输出与「当前工作区移交给谁」
+fn report_removed(
+    svc: &WorkspaceService,
+    out: &mcsup::service::RemoveOutcome,
+    purge: bool,
+    printer: Printer,
+) -> Result<()> {
     let ws = &out.workspace;
     let disk_purged = out.disk_purged();
+    let human = if disk_purged {
+        crate::i18n::pick(
+            printer.lang(),
+            format!("已注销并删除磁盘数据: {}", ws.name),
+            format!("unregistered and deleted on-disk data: {}", ws.name),
+        )
+    } else if purge {
+        // 请求了删盘但目录本就不在：不能说「已删除」，用户会以为删掉了内容
+        crate::i18n::pick(
+            printer.lang(),
+            format!("已注销（磁盘数据本就不存在）: {}", ws.name),
+            format!("unregistered (no on-disk data existed): {}", ws.name),
+        )
+    } else {
+        crate::i18n::pick(
+            printer.lang(),
+            format!("已注销（磁盘数据保留）: {}", ws.name),
+            format!("unregistered (on-disk data kept): {}", ws.name),
+        )
+    };
     printer.print_outcome(
-        &if disk_purged {
-            format!("已注销并删除磁盘数据: {}", ws.name)
-        } else if purge {
-            // 请求了删盘但目录本就不在：不能说「已删除」，用户会以为删掉了内容
-            format!("已注销（磁盘数据本就不存在）: {}", ws.name)
-        } else {
-            format!("已注销（磁盘数据保留）: {}", ws.name)
-        },
+        &human,
         &WorkspaceRemoveJson {
             name: ws.name.as_str(),
             path: ws.path.display().to_string(),
@@ -395,7 +557,11 @@ fn remove(svc: &WorkspaceService, name: &str, purge: bool, printer: Printer) -> 
     if ws.is_current
         && let Ok(cur) = svc.current_workspace()
     {
-        printer.print_section(&format!("当前工作区已移交给 {}", cur.name));
+        printer.print_section(&crate::i18n::pick(
+            printer.lang(),
+            format!("当前工作区已移交给 {}", cur.name),
+            format!("current workspace handed over to {}", cur.name),
+        ));
     }
     Ok(())
 }
@@ -412,8 +578,16 @@ fn doctor_cmd(
     for kind in only {
         if !KNOWN_KINDS.contains(&kind.as_str()) {
             return Err(AppDiagnostic::usage(
-                format!("未知检查项: {kind}"),
-                Some(format!("可用检查项: {}", KNOWN_KINDS.join(", "))),
+                crate::i18n::pick(
+                    printer.lang(),
+                    format!("未知检查项: {kind}"),
+                    format!("unknown check: {kind}"),
+                ),
+                Some(crate::i18n::pick(
+                    printer.lang(),
+                    format!("可用检查项: {}", KNOWN_KINDS.join(", ")),
+                    format!("available checks: {}", KNOWN_KINDS.join(", ")),
+                )),
             )
             .into());
         }
@@ -484,11 +658,22 @@ fn doctor_cmd(
             .collect(),
     };
     let summary = if findings.is_empty() {
-        "检查通过".to_owned()
+        crate::i18n::pick(
+            printer.lang(),
+            "检查通过".to_owned(),
+            "check passed".to_owned(),
+        )
     } else {
-        format!(
-            "发现 {} 个问题（{errors} error, {warnings} warning）",
-            findings.len()
+        crate::i18n::pick(
+            printer.lang(),
+            format!(
+                "发现 {} 个问题（{errors} error, {warnings} warning）",
+                findings.len()
+            ),
+            format!(
+                "found {} issue(s) ({errors} error, {warnings} warning)",
+                findings.len()
+            ),
         )
     };
     printer.print_outcome(&summary, &payload)?;
@@ -609,6 +794,7 @@ mod tests {
             Some("ws1"),
             cwd,
             data_root,
+            crate::locale::Lang::Zh,
         )
         .expect("数据目录");
         assert_eq!(dir, data_root.join("workspaces").join("ws1"));
@@ -619,7 +805,8 @@ mod tests {
                 None,
                 None,
                 cwd,
-                data_root
+                data_root,
+                crate::locale::Lang::Zh
             )
             .is_err(),
             "缺名称必须报错"
@@ -632,7 +819,8 @@ mod tests {
                 None,
                 None,
                 cwd,
-                data_root
+                data_root,
+                crate::locale::Lang::Zh
             )
             .expect("当前目录"),
             cwd
@@ -646,7 +834,8 @@ mod tests {
                 None,
                 None,
                 cwd,
-                data_root
+                data_root,
+                crate::locale::Lang::Zh
             )
             .expect("自定义"),
             custom
@@ -654,12 +843,20 @@ mod tests {
 
         // --dir 优先（未进向导）
         assert_eq!(
-            resolve_dir(None, Some(Path::new("/flag/dir")), None, cwd, data_root).expect("--dir"),
+            resolve_dir(
+                None,
+                Some(Path::new("/flag/dir")),
+                None,
+                cwd,
+                data_root,
+                crate::locale::Lang::Zh,
+            )
+            .expect("--dir"),
             PathBuf::from("/flag/dir")
         );
         // 非交互回退当前目录（保持既有机器行为）
         assert_eq!(
-            resolve_dir(None, None, None, cwd, data_root).expect("cwd"),
+            resolve_dir(None, None, None, cwd, data_root, crate::locale::Lang::Zh).expect("cwd"),
             cwd
         );
     }

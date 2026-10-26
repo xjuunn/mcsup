@@ -69,23 +69,41 @@ pub(crate) fn require_server_name(
     }
     if !printer.is_interactive() {
         return Err(AppDiagnostic::usage(
-            format!("{command} 缺少服务器名称"),
-            Some(format!("非交互模式：mcsup {command} <名称>")),
+            crate::i18n::pick(
+                printer.lang(),
+                format!("{command} 缺少服务器名称"),
+                format!("{command} requires a server name"),
+            ),
+            Some(crate::i18n::pick(
+                printer.lang(),
+                format!("非交互模式：mcsup {command} <名称>"),
+                format!("non-interactive: mcsup {command} <name>"),
+            )),
         )
         .into());
     }
     let reg = open_registry()?;
-    let servers = reg.list().context("列出服务器失败")?;
+    let servers = reg.list().context(crate::i18n::pick(
+        printer.lang(),
+        "列出服务器失败",
+        "failed to list servers",
+    ))?;
     if servers.is_empty() {
-        return Err(anyhow::anyhow!(
-            "尚无服务器，先运行 mcsup server create 创建"
-        ));
+        return Err(anyhow::anyhow!(crate::i18n::pick(
+            printer.lang(),
+            "尚无服务器，先运行 mcsup server create 创建",
+            "no servers yet; run `mcsup server create` first"
+        )));
     }
     let names: Vec<String> = servers
         .iter()
         .map(|srv| srv.meta.name.as_str().to_owned())
         .collect();
-    let picked = prompts::select_filter("选择服务器", &names)?;
+    let picked = prompts::select_filter(
+        printer.lang(),
+        &crate::i18n::pick(printer.lang(), "选择服务器", "select a server"),
+        &names,
+    )?;
     Ok(picked)
 }
 
@@ -102,12 +120,25 @@ pub(crate) fn require_text(
     if !printer.is_interactive() {
         return Err(AppDiagnostic::usage(missing_message, Some(usage_hint.to_owned())).into());
     }
-    prompts::input_text("输入内容", "", "回车提交；Ctrl+C 取消")
+    prompts::input_text(
+        printer.lang(),
+        &crate::i18n::pick(printer.lang(), "输入内容", "input"),
+        "",
+        &crate::i18n::pick(
+            printer.lang(),
+            "回车提交；Ctrl+C 取消",
+            "enter submits; Ctrl+C cancels",
+        ),
+    )
 }
 
 pub(crate) fn list(printer: Printer) -> Result<()> {
     let reg = open_registry()?;
-    let all = reg.list().context("列出服务器失败")?;
+    let all = reg.list().context(crate::i18n::pick(
+        printer.lang(),
+        "列出服务器失败",
+        "failed to list servers",
+    ))?;
     let ws_names = workspace_names()?;
     let statuses = super::lifecycle::lifecycle_service()?.statuses()?;
     let rows: Vec<ServerRowView<'_>> = all
@@ -217,15 +248,31 @@ pub(crate) async fn create(args: CreateArgs<'_>, printer: Printer) -> Result<()>
     // 1. 用法闸（先于落库与联网，快速失败）
     if name.is_none() && !interactive {
         return Err(AppDiagnostic::usage(
-            "server create 缺少服务器名称",
-            Some("非交互模式：mcsup server create <name> --version <VER>".to_owned()),
+            crate::i18n::pick(
+                printer.lang(),
+                "server create 缺少服务器名称",
+                "server create requires a server name",
+            ),
+            Some(crate::i18n::pick(
+                printer.lang(),
+                "非交互模式：mcsup server create <name> --version <VER>",
+                "non-interactive: mcsup server create <name> --version <VER>",
+            )),
         )
         .into());
     }
     if version.is_none() && !interactive {
         return Err(AppDiagnostic::usage(
-            "server create 缺少 --version",
-            Some("非交互模式必填；交互终端下可省略后从版本列表选择".to_owned()),
+            crate::i18n::pick(
+                printer.lang(),
+                "server create 缺少 --version",
+                "server create requires --version",
+            ),
+            Some(crate::i18n::pick(
+                printer.lang(),
+                "非交互模式必填；交互终端下可省略后从版本列表选择",
+                "required when non-interactive; in a terminal it is picked from a list",
+            )),
         )
         .into());
     }
@@ -262,28 +309,9 @@ pub(crate) async fn create(args: CreateArgs<'_>, printer: Printer) -> Result<()>
 
     let reg = open_registry()?;
 
-    // 4. 名称（交互重输直到不重复）
-    let name = if let Some(name) = name {
-        (*name).to_owned()
-    } else {
-        prompts::step(printer, 1, 3, "服务器名称");
-        prompt_unique_name(&reg, printer)?
-    };
-
-    // 5. 变体（交互只列可用；单可用项直接采纳）
-    let variant = match variant {
-        Some(variant) => variant,
-        None => pick_variant(&available, printer)?,
-    };
-
-    // 6. 版本（交互拉列表选择；来源随变体能力匹配）
-    let source = bootstrap::source_for(&variant, printer.lang())?;
-    let version_id = if let Some(version) = version {
-        VersionId::new(version)
-    } else {
-        prompts::step(printer, 3, 3, "服务端版本");
-        pick_version(source.as_ref(), &variant, printer).await?
-    };
+    // 4-6. 名称 / 变体 / 版本：给定即用，缺哪项补哪项
+    let (name, variant, version_id, source) =
+        finish_create_inputs(&reg, &available, name, variant, version, printer).await?;
 
     // Java 版本要求不在此预取：下载核心时 `install_jar` 会随元数据一并回写，
     // 预取会重复打一遍 manifest/details 网络请求
@@ -295,7 +323,13 @@ pub(crate) async fn create(args: CreateArgs<'_>, printer: Printer) -> Result<()>
             variant.clone(),
             None,
         )
-        .with_context(|| format!("创建服务器 {name} 失败"))?;
+        .with_context(|| {
+            crate::i18n::pick(
+                printer.lang(),
+                format!("创建服务器 {name} 失败"),
+                format!("failed to create server {name}"),
+            )
+        })?;
 
     // 7. 下载核心：失败保留已注册结果，提示用 install 重试
     if let Err(err) = download_jar(&name, &version_id, source, variant, printer).await {
@@ -310,6 +344,52 @@ pub(crate) async fn create(args: CreateArgs<'_>, printer: Printer) -> Result<()>
     }
 
     report_created(&srv, printer)
+}
+
+/// `server create` 的名称 / 变体 / 版本补齐：参数给定则跳过对应步骤
+async fn finish_create_inputs(
+    reg: &ServerRegistry,
+    available: &[ServerVariant],
+    name: Option<&str>,
+    variant: Option<ServerVariant>,
+    version: Option<&str>,
+    printer: Printer,
+) -> Result<(
+    String,
+    ServerVariant,
+    VersionId,
+    std::sync::Arc<dyn mcsup::port::ServerJarSource>,
+)> {
+    let name = if let Some(name) = name {
+        name.to_owned()
+    } else {
+        prompts::step(
+            printer,
+            1,
+            3,
+            &crate::i18n::pick(printer.lang(), "服务器名称", "server name"),
+        );
+        prompt_unique_name(reg, printer)?
+    };
+
+    let variant = match variant {
+        Some(variant) => variant,
+        None => pick_variant(available, printer)?,
+    };
+
+    let source = bootstrap::source_for(&variant, printer.lang())?;
+    let version_id = if let Some(version) = version {
+        VersionId::new(version)
+    } else {
+        prompts::step(
+            printer,
+            3,
+            3,
+            &crate::i18n::pick(printer.lang(), "服务端版本", "server version"),
+        );
+        pick_version(source.as_ref(), &variant, printer).await?
+    };
+    Ok((name, variant, version_id, source))
 }
 
 /// `server create` 的结果输出：human 一行 + 后续提示，JSON 单个对象
@@ -425,9 +505,18 @@ fn pick_variant(available: &[ServerVariant], printer: Printer) -> Result<ServerV
     if let [only] = available {
         return Ok(only.clone());
     }
-    prompts::step(printer, 2, 3, "服务端变体");
+    prompts::step(
+        printer,
+        2,
+        3,
+        &crate::i18n::pick(printer.lang(), "服务端变体", "server variant"),
+    );
     let labels: Vec<String> = available.iter().map(|v| v.as_str().to_owned()).collect();
-    let picked = prompts::select_filter("服务端变体", &labels)?;
+    let picked = prompts::select_filter(
+        printer.lang(),
+        &crate::i18n::pick(printer.lang(), "服务端变体", "server variant"),
+        &labels,
+    )?;
     variant_from_label(&picked, available).ok_or_else(|| anyhow::anyhow!("无效变体: {picked}"))
 }
 
@@ -442,11 +531,19 @@ fn variant_from_label(picked: &str, available: &[ServerVariant]) -> Option<Serve
 /// 名称重输：语法由 prompts 校验，重复（注册表已有）时警示后重问
 fn prompt_unique_name(reg: &ServerRegistry, printer: Printer) -> Result<String> {
     loop {
-        let candidate = prompts::input_name("服务器名称", "server")?;
+        let candidate = prompts::input_name(
+            printer.lang(),
+            &crate::i18n::pick(printer.lang(), "服务器名称", "server name"),
+            "server",
+        )?;
         match reg.get(&candidate) {
             Err(ServerRegistryError::NotFound(_)) => return Ok(candidate),
             Err(err) => return Err(err.into()),
-            Ok(_) => printer.print_warning(&format!("名称 {candidate} 已存在，换一个")),
+            Ok(_) => printer.print_warning(&crate::i18n::pick(
+                printer.lang(),
+                format!("名称 {candidate} 已存在，换一个"),
+                format!("name {candidate} is taken; pick another"),
+            )),
         }
     }
 }
@@ -464,14 +561,20 @@ fn ensure_workspace(selector: Option<&str>, interactive: bool, printer: Printer)
     match svc.current_workspace() {
         Ok(_) => Ok(true),
         Err(WorkspaceError::NoCurrent) if interactive => {
-            printer.print_section("尚未有工作区，先创建工作区");
+            printer.print_section(&crate::i18n::pick(
+                printer.lang(),
+                "尚未有工作区，先创建工作区",
+                "no workspace yet; create one first",
+            ));
             super::workspace::init(&svc, None, None, printer)?;
             if svc.current_workspace().is_ok() {
                 Ok(true)
             } else {
-                printer.print_section(
+                printer.print_section(&crate::i18n::pick(
+                    printer.lang(),
                     "工作区未就绪，创建中止（可重新执行 mcsup workspace init / use 后再创建）",
-                );
+                    "workspace is not ready; aborting (rerun mcsup workspace init / use and retry)",
+                ));
                 Ok(false)
             }
         }
@@ -567,21 +670,29 @@ fn resolve_create_workspace(
         None => None,
     };
 
-    check_workspace_identity(by_name.as_ref(), by_dir.as_ref(), workspace_dir)?;
+    check_workspace_identity(by_name.as_ref(), by_dir.as_ref(), workspace_dir, printer)?;
 
     if let Some(ws) = by_name.or(by_dir) {
         if let Some(name) = workspace_name
             && name != ws.name.as_str()
         {
             return Err(AppDiagnostic::usage(
-                format!(
-                    "工作区 {} 已存在，与 --workspace-name {name} 不一致",
-                    ws.name.as_str()
+                crate::i18n::pick(
+                    printer.lang(),
+                    format!(
+                        "工作区 {} 已存在，与 --workspace-name {name} 不一致",
+                        ws.name.as_str()
+                    ),
+                    format!(
+                        "workspace {} already exists and does not match --workspace-name {name}",
+                        ws.name.as_str()
+                    ),
                 ),
-                Some(
-                    "要用已有工作区就只传 --workspace / --workspace-dir；要新建就换一个名称"
-                        .to_owned(),
-                ),
+                Some(crate::i18n::pick(
+                    printer.lang(),
+                    "要用已有工作区就只传 --workspace / --workspace-dir；要新建就换一个名称",
+                    "to reuse a workspace pass only --workspace / --workspace-dir; to create one pick another name",
+                )),
             )
             .into());
         }
@@ -604,15 +715,27 @@ fn resolve_create_workspace(
     if workspace_dir.is_none() && name.is_none() {
         if !interactive {
             return Err(AppDiagnostic::usage(
-                format!("工作区 {} 不存在", workspace.unwrap_or("(未指定)")),
-                Some(
-                    "非交互模式：带 --workspace-dir <路径> 新建，或先运行 mcsup workspace init"
-                        .to_owned(),
+                crate::i18n::pick(
+                    printer.lang(),
+                    format!("工作区 {} 不存在", workspace.unwrap_or("(未指定)")),
+                    format!(
+                        "workspace {} does not exist",
+                        workspace.unwrap_or("(unspecified)")
+                    ),
                 ),
+                Some(crate::i18n::pick(
+                    printer.lang(),
+                    "非交互模式：带 --workspace-dir <路径> 新建，或先运行 mcsup workspace init",
+                    "non-interactive: pass --workspace-dir <path> to create it, or run mcsup workspace init first",
+                )),
             )
             .into());
         }
-        printer.print_section("尚未有可用的工作区，先创建工作区");
+        printer.print_section(&crate::i18n::pick(
+            printer.lang(),
+            "尚未有可用的工作区，先创建工作区",
+            "no workspace yet; create one first",
+        ));
         super::workspace::init(&svc, None, None, printer)?;
         return Ok(if let Ok(ws) = svc.current_workspace() {
             Some(CreateWorkspace::Ready {
@@ -620,9 +743,11 @@ fn resolve_create_workspace(
                 created: true,
             })
         } else {
-            printer.print_section(
+            printer.print_section(&crate::i18n::pick(
+                printer.lang(),
                 "工作区未就绪，创建中止（可重新执行 mcsup workspace init / use 后再创建）",
-            );
+                "workspace is not ready; aborting (rerun mcsup workspace init / use and retry)",
+            ));
             Some(CreateWorkspace::Aborted)
         });
     }
@@ -638,17 +763,21 @@ fn create_workspace(
     name: Option<&str>,
     printer: Printer,
 ) -> Result<Option<CreateWorkspace>> {
-    let dir = resolve_new_workspace_dir(workspace_dir, workspace, name)?;
+    let dir = resolve_new_workspace_dir(printer.lang(), workspace_dir, workspace, name)?;
     let ws = match svc.init(&dir, name)? {
         InitOutcome::Created(ws)
         | InitOutcome::Recovered(ws)
         | InitOutcome::MarkerRestored(ws)
         | InitOutcome::AlreadyRegistered(ws) => ws,
     };
-    printer.print_section(&format!(
-        "已就绪工作区 {} ({})",
-        ws.name.as_str(),
-        ws.path.display()
+    printer.print_section(&crate::i18n::pick(
+        printer.lang(),
+        format!("已就绪工作区 {} ({})", ws.name.as_str(), ws.path.display()),
+        format!(
+            "workspace ready: {} ({})",
+            ws.name.as_str(),
+            ws.path.display()
+        ),
     ));
     Ok(Some(CreateWorkspace::Ready {
         selector: Some(ws.name.as_str().to_owned()),
@@ -661,19 +790,33 @@ fn check_workspace_identity(
     by_name: Option<&mcsup::domain::workspace::Workspace>,
     by_dir: Option<&mcsup::domain::workspace::Workspace>,
     workspace_dir: Option<&Path>,
+    printer: Printer,
 ) -> Result<()> {
     if let Some(name_hit) = by_name
         && let Some(dir) = workspace_dir
         && !same_path(&name_hit.path, dir)
     {
         return Err(AppDiagnostic::usage(
-            format!(
-                "工作区 {} 已注册在 {}，与 --workspace-dir {} 不一致",
-                name_hit.name.as_str(),
-                name_hit.path.display(),
-                absolute_path(dir).display()
+            crate::i18n::pick(
+                printer.lang(),
+                format!(
+                    "工作区 {} 已注册在 {}，与 --workspace-dir {} 不一致",
+                    name_hit.name.as_str(),
+                    name_hit.path.display(),
+                    absolute_path(dir).display()
+                ),
+                format!(
+                    "workspace {} is registered at {}, which does not match --workspace-dir {}",
+                    name_hit.name.as_str(),
+                    name_hit.path.display(),
+                    absolute_path(dir).display()
+                ),
             ),
-            Some("名称与路径必须指向同一个工作区；只保留其中一个再重试".to_owned()),
+            Some(crate::i18n::pick(
+                printer.lang(),
+                "名称与路径必须指向同一个工作区；只保留其中一个再重试",
+                "the name and the path must point to the same workspace; keep only one and retry",
+            )),
         )
         .into());
     }
@@ -681,13 +824,26 @@ fn check_workspace_identity(
         && name_hit.id != dir_hit.id
     {
         return Err(AppDiagnostic::usage(
-            format!(
-                "工作区名称与路径指向不同工作区：{} 在 {}，而 --workspace-dir 指向 {}",
-                name_hit.name.as_str(),
-                name_hit.path.display(),
-                dir_hit.path.display()
+            crate::i18n::pick(
+                printer.lang(),
+                format!(
+                    "工作区名称与路径指向不同工作区：{} 在 {}，而 --workspace-dir 指向 {}",
+                    name_hit.name.as_str(),
+                    name_hit.path.display(),
+                    dir_hit.path.display()
+                ),
+                format!(
+                    "the workspace name and --workspace-dir point to different workspaces: {} at {}, but --workspace-dir is {}",
+                    name_hit.name.as_str(),
+                    name_hit.path.display(),
+                    dir_hit.path.display()
+                ),
             ),
-            Some("名称与路径必须指向同一个工作区；只保留其中一个再重试".to_owned()),
+            Some(crate::i18n::pick(
+                printer.lang(),
+                "名称与路径必须指向同一个工作区；只保留其中一个再重试",
+                "the name and the path must point to the same workspace; keep only one and retry",
+            )),
         )
         .into());
     }
@@ -703,6 +859,7 @@ fn same_path(left: &Path, right: &Path) -> bool {
 
 /// 新建工作区的目录：`--workspace-dir` > `--workspace` 本身是路径 > 数据目录/名称
 fn resolve_new_workspace_dir(
+    lang: Lang,
     workspace_dir: Option<&Path>,
     workspace: Option<&str>,
     workspace_name: Option<&str>,
@@ -717,8 +874,16 @@ fn resolve_new_workspace_dir(
     }
     let name = workspace_name.or(workspace).ok_or_else(|| {
         AppDiagnostic::usage(
-            "新建工作区缺少名称或目录",
-            Some("用 --workspace-dir <路径> 或 --workspace-name <名称> 指定".to_owned()),
+            crate::i18n::pick(
+                lang,
+                "新建工作区缺少名称或目录",
+                "creating a workspace needs a name or a directory",
+            ),
+            Some(crate::i18n::pick(
+                lang,
+                "用 --workspace-dir <路径> 或 --workspace-name <名称> 指定",
+                "pass --workspace-dir <path> or --workspace-name <name>",
+            )),
         )
     })?;
     // 名称非法时交给 service 的 WorkspaceName::parse 报错，口径只留一份
@@ -736,23 +901,44 @@ pub(crate) fn link(
 ) -> Result<()> {
     let reg = open_registry()?;
     let selector = workspace_selector(workspace);
-    let out = reg
-        .link(path, name, selector.as_deref())
-        .with_context(|| format!("注册服务器目录 {} 失败", path.display()))?;
+    let out = reg.link(path, name, selector.as_deref()).with_context(|| {
+        crate::i18n::pick(
+            printer.lang(),
+            format!("注册服务器目录 {} 失败", path.display()),
+            format!("failed to register server directory {}", path.display()),
+        )
+    })?;
     // 工作区内目录走就地注册（linked=false），外部目录才建符号链接
     printer.print_outcome(
         &if out.server.linked {
-            format!(
-                "已链接: {} → {}（目标 {}）",
-                out.server.meta.name,
-                out.server.dir.display(),
-                out.target.display()
+            crate::i18n::pick(
+                printer.lang(),
+                format!(
+                    "已链接: {} → {}（目标 {}）",
+                    out.server.meta.name,
+                    out.server.dir.display(),
+                    out.target.display()
+                ),
+                format!(
+                    "linked: {} → {} (target {})",
+                    out.server.meta.name,
+                    out.server.dir.display(),
+                    out.target.display()
+                ),
             )
         } else {
-            format!(
-                "已注册工作区内目录: {} → {}（未建符号链接）",
-                out.server.meta.name,
-                out.server.dir.display()
+            crate::i18n::pick(
+                printer.lang(),
+                format!(
+                    "已注册工作区内目录: {} → {}（未建符号链接）",
+                    out.server.meta.name,
+                    out.server.dir.display()
+                ),
+                format!(
+                    "registered an in-workspace directory: {} → {} (no symlink)",
+                    out.server.meta.name,
+                    out.server.dir.display()
+                ),
             )
         },
         &CreateRow {
@@ -768,12 +954,20 @@ pub(crate) fn link(
 pub(crate) fn remove(name: &str, purge: bool, printer: Printer) -> Result<()> {
     let reg = open_registry()?;
     // 先看一眼：链接服务器 + purge 会被 service 拒绝，这里提前给出更友好的确认
-    let srv = reg
-        .get(name)
-        .with_context(|| format!("服务器 {name} 不存在"))?;
+    let srv = reg.get(name).with_context(|| {
+        crate::i18n::pick(
+            printer.lang(),
+            format!("服务器 {name} 不存在"),
+            format!("server {name} does not exist"),
+        )
+    })?;
     if purge && srv.linked {
-        printer.print_warning(&format!(
-            "{name} 是链接服务器，--purge 会拒绝执行（目标在工作区外，无法安全删除）"
+        printer.print_warning(&crate::i18n::pick(
+            printer.lang(),
+            format!("{name} 是链接服务器，--purge 会拒绝执行（目标在工作区外，无法安全删除）"),
+            format!(
+                "{name} is a linked server; --purge will be refused (its target is outside the workspace and cannot be deleted safely)"
+            ),
         ));
         // 仍传给 service，由其拒绝并给出统一错误
     }
@@ -786,26 +980,60 @@ pub(crate) fn remove(name: &str, purge: bool, printer: Printer) -> Result<()> {
         // 拦一次（与 --purge 同一道闸），用户此时尚未确认名称
         let confirmed = prompts::confirm_or_yes(
             printer,
-            &format!("删除 {name} ({}) 的磁盘数据?", srv.dir.display()),
+            &crate::i18n::pick(
+                printer.lang(),
+                format!("删除 {name} ({}) 的磁盘数据?", srv.dir.display()),
+                format!(
+                    "also delete the on-disk data of {name} ({})?",
+                    srv.dir.display()
+                ),
+            ),
             false,
         )
-        .context("已取消注销")?;
+        .context(crate::i18n::pick(
+            printer.lang(),
+            "已取消注销",
+            "unregister cancelled",
+        ))?;
         if confirmed {
-            let cwd = std::env::current_dir().context("获取当前工作目录失败")?;
+            let cwd = std::env::current_dir().context(crate::i18n::pick(
+                printer.lang(),
+                "获取当前工作目录失败",
+                "cannot read the current directory",
+            ))?;
             super::lifecycle::lifecycle_service()?.ensure_server_purgeable(name, &cwd)?;
             // 同意删盘后再上一道闸：红色警示 + 手输服务器名称，防误删存档与备份
-            printer.print_warning(&format!(
-                "警告: 将永久删除 {name} ({}) 中的所有存档、备份等文件，此操作无法恢复",
-                srv.dir.display()
+            printer.print_warning(&crate::i18n::pick(
+                printer.lang(),
+                format!(
+                    "警告: 将永久删除 {name} ({}) 中的所有存档、备份等文件，此操作无法恢复",
+                    srv.dir.display()
+                ),
+                format!(
+                    "warning: this permanently deletes every world, backup and file under {name} ({}); it cannot be undone",
+                    srv.dir.display()
+                ),
             ));
             if !printer.assumes_yes() {
-                prompts::confirm_by_name(&format!("输入服务器名称 {name} 以确认删除"), name)?;
+                prompts::confirm_by_name(
+                    printer.lang(),
+                    &crate::i18n::pick(
+                        printer.lang(),
+                        format!("输入服务器名称 {name} 以确认删除"),
+                        format!("type the server name {name} to confirm deletion"),
+                    ),
+                    name,
+                )?;
             }
         }
         confirmed
     };
     // 终端的工作目录：service 据此拒绝「删掉调用方所在目录」
-    let cwd = std::env::current_dir().context("获取当前工作目录失败")?;
+    let cwd = std::env::current_dir().context(crate::i18n::pick(
+        printer.lang(),
+        "获取当前工作目录失败",
+        "cannot read the current directory",
+    ))?;
     if purge {
         // 删盘前置条件先过一次：`--purge` 是显式指令，条件不满足直接报错，
         // 不必等 service 在删除那一刻才拒
@@ -818,19 +1046,48 @@ pub(crate) fn remove(name: &str, purge: bool, printer: Printer) -> Result<()> {
     // 删除经 lifecycle 编排：运行中拒绝（存档保护）、cwd 在目录内拒绝，
     // 判定收敛在 service
     let out = super::lifecycle::lifecycle_service()?.remove_server(name, purge, &cwd)?;
+    report_removed(&out, purge, printer)
+}
+
+/// `server remove` 的结果输出：按「删盘 / 链接 / 请求删盘但目录不在 / 仅注销」分文案
+fn report_removed(
+    out: &mcsup::service::ServerRemoveOutcome,
+    purge: bool,
+    printer: Printer,
+) -> Result<()> {
     let srv = &out.server;
     let disk_purged = out.disk_purged();
+    let human = if disk_purged {
+        crate::i18n::pick(
+            printer.lang(),
+            format!("已删除并注销: {}", srv.meta.name),
+            format!("deleted and unregistered: {}", srv.meta.name),
+        )
+    } else if srv.linked {
+        crate::i18n::pick(
+            printer.lang(),
+            format!("已移除链接并注销: {}（目标目录保留）", srv.meta.name),
+            format!(
+                "link removed and unregistered: {} (target directory kept)",
+                srv.meta.name
+            ),
+        )
+    } else if purge {
+        // 请求了删盘但目录本就不在：不能说「已删除」，用户会以为删掉了存档
+        crate::i18n::pick(
+            printer.lang(),
+            format!("已注销（磁盘数据本就不存在）: {}", srv.meta.name),
+            format!("unregistered (no on-disk data existed): {}", srv.meta.name),
+        )
+    } else {
+        crate::i18n::pick(
+            printer.lang(),
+            format!("已注销（磁盘数据保留）: {}", srv.meta.name),
+            format!("unregistered (on-disk data kept): {}", srv.meta.name),
+        )
+    };
     printer.print_outcome(
-        &if disk_purged {
-            format!("已删除并注销: {}", srv.meta.name)
-        } else if srv.linked {
-            format!("已移除链接并注销: {}（目标目录保留）", srv.meta.name)
-        } else if purge {
-            // 请求了删盘但目录本就不在：不能说「已删除」，用户会以为删掉了存档
-            format!("已注销（磁盘数据本就不存在）: {}", srv.meta.name)
-        } else {
-            format!("已注销（磁盘数据保留）: {}", srv.meta.name)
-        },
+        &human,
         &RemoveJson {
             name: srv.meta.name.as_str().to_owned(),
             path: srv.dir.display().to_string(),
@@ -851,16 +1108,16 @@ mod tests {
     fn new_workspace_dir_prefers_explicit_dir_then_path_then_name() {
         let explicit = Path::new("/tmp/ws-explicit");
         assert_eq!(
-            resolve_new_workspace_dir(Some(explicit), Some("other"), Some("named"))
+            resolve_new_workspace_dir(Lang::Zh, Some(explicit), Some("other"), Some("named"))
                 .expect("explicit"),
             absolute_path(explicit)
         );
         assert_eq!(
-            resolve_new_workspace_dir(None, Some("/tmp/ws-path"), None).expect("path"),
+            resolve_new_workspace_dir(Lang::Zh, None, Some("/tmp/ws-path"), None).expect("path"),
             absolute_path(Path::new("/tmp/ws-path"))
         );
         assert_eq!(
-            resolve_new_workspace_dir(None, None, Some("named")).expect("name"),
+            resolve_new_workspace_dir(Lang::Zh, None, None, Some("named")).expect("name"),
             crate::config::platform_data_dir()
                 .join("workspaces")
                 .join("named")
@@ -870,7 +1127,7 @@ mod tests {
     /// 无目录、无名称时无法推导新建位置，必须报用法错误（2）
     #[test]
     fn new_workspace_dir_without_input_is_usage_error() {
-        let err = resolve_new_workspace_dir(None, None, None).expect_err("缺名称/目录");
+        let err = resolve_new_workspace_dir(Lang::Zh, None, None, None).expect_err("缺名称/目录");
         assert_eq!(Printer::exit_code(&err), 2);
     }
 

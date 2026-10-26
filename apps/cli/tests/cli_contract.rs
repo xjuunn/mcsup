@@ -587,6 +587,78 @@ fn workspace_doctor_only_filters_report_and_exit() {
     );
 }
 
+/// `--lang en` 下人类可见的输出不得残留中文（交互提示之外的结果 / 表头 / 进度都算）
+///
+/// 这是回归护栏：交互组件与结果文案各自硬编码过中文，`--lang en` 只翻译了
+/// clap 帮助，用户实际看到的提示框仍是中文。
+#[test]
+fn english_output_has_no_chinese() {
+    let home = temp_home();
+    let ws = home.path().join("ws1");
+    let init = run(
+        home.path(),
+        &[
+            "workspace",
+            "init",
+            "--dir",
+            ws.to_str().expect("utf8"),
+            "--name",
+            "ws1",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(init.status.code(), Some(0), "{}", stderr(&init));
+
+    // 只看人类输出路径；JSON 是机器契约，字段名本来就是英文
+    let cases: [&[&str]; 8] = [
+        &["workspace", "list", "--lang", "en"],
+        &["server", "list", "--lang", "en"],
+        &["java", "list", "--lang", "en"],
+        &["config", "show", "--lang", "en"],
+        &["doctor", "--lang", "en"],
+        &["workspace", "doctor", "--lang", "en"],
+        &["server", "status", "nope", "--lang", "en"],
+        &["server", "remove", "nope", "--lang", "en"],
+    ];
+    for args in cases {
+        let out = run(home.path(), args);
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), stderr(&out));
+        assert!(!has_cjk(&text), "{args:?} 的英文输出里残留中文:\n{text}");
+    }
+}
+
+/// 结果文案（非 JSON）也要跟随 `--lang`：init / remove 各一条
+#[test]
+fn english_result_messages_have_no_chinese() {
+    let home = temp_home();
+    let ws = home.path().join("wsen");
+    let init = run(
+        home.path(),
+        &[
+            "workspace",
+            "init",
+            "--dir",
+            ws.to_str().expect("utf8"),
+            "--name",
+            "wsen",
+            "--lang",
+            "en",
+        ],
+    );
+    assert_eq!(init.status.code(), Some(0), "{}", stderr(&init));
+    let init_text = String::from_utf8_lossy(&init.stdout).into_owned();
+    assert!(!has_cjk(&init_text), "workspace init: {init_text}");
+
+    let rm = run(
+        home.path(),
+        &["workspace", "remove", "wsen", "--lang", "en"],
+    );
+    assert_eq!(rm.status.code(), Some(0), "{}", stderr(&rm));
+    let rm_text = String::from_utf8_lossy(&rm.stdout).into_owned();
+    assert!(!has_cjk(&rm_text), "workspace remove: {rm_text}");
+}
+
 /// clap 硬编码的英文标题 / 内置 flag 说明 / 内置 help 子命令说明必须全部中文化
 #[test]
 fn help_output_is_chinese() {
