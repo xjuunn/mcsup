@@ -1,10 +1,16 @@
-use crate::config;
+use crate::config::{self, ConfigFile};
 use crate::locale::Lang;
 use anyhow::{Context, Result, anyhow};
-use mcsup::bootstrap::Mcsup;
+use mcsup::auth::FileCredentialStore;
+use mcsup::backend::remote::{
+    CombinedJavaRepository, CombinedServerRepository, CombinedWorkspaceRepository, RemoteLink,
+    RemoteMember, RemoteMembers,
+};
+use mcsup::bootstrap::{Mcsup, McsupBuilder};
 use mcsup::domain::server::version::ServerVariant;
-use mcsup::port::ServerJarSource;
-use mcsup::service::JavaService;
+use mcsup::port::{RemoteName, ServerJarSource};
+use mcsup::service::{JavaService, RemoteVia};
+use mcsup::transport::Fingerprint;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -43,8 +49,17 @@ pub(crate) fn open_java_service() -> Result<JavaService> {
     let registry = Arc::new(mcsup::provider::java::JavaSourceRegistry::all_sources());
     let downloader = Arc::new(build_downloader()?);
     let extractor = Arc::new(mcsup::file::CommandExtractor::new());
+    let store = open_store()?;
+    // Java 注册表用组合仓库：远端 JVM 出现在 `java list` 里（离线降级为本地）
+    let cfg = ConfigFile::locate(None).load()?;
+    let members = remote_members(&cfg)?;
+    let repo: Arc<dyn mcsup::port::JavaRuntimeRepository> = if members.is_empty() {
+        store.clone()
+    } else {
+        Arc::new(CombinedJavaRepository::new(store.clone(), members))
+    };
     Ok(JavaService::new(
-        open_store()?,
+        repo,
         scanner,
         registry,
         downloader,
@@ -241,6 +256,119 @@ pub(crate) fn join_variants(available: &[ServerVariant], lang: Lang) -> String {
         .join(sep)
 }
 
+/// 读 `[remotes.*]` + 凭证存储，装配全部可达远端的成员表
+///
+/// 任何一台远端连不上都只是跳过（warn），不阻塞本地命令——离线是常态而非
+/// 异常（`docs/remote.md`「设计原则 4」）。配置记录缺凭证同样跳过：可能是
+/// 配对到一半被中断，入口命令会在用到该远端时报「未认证」。
+pub(crate) fn remote_members(cfg: &mcsup::service::Config) -> Result<RemoteMembers> {
+    let credentials = credential_store();
+    let mut members = RemoteMembers::empty();
+    for (name, record) in &cfg.remotes {
+        if let Some(member) = build_member(name, record, &credentials)? {
+            members.push(member);
+        }
+    }
+    Ok(members)
+}
+
+/// 单台远端 → 成员；任何一步不满足都返回 `None`（跳过该台，不阻塞其余）
+///
+/// 过滤顺序：名字合法 → 直连接入 → 有指纹 → 有凭证。拆出来是为了可测——
+/// 过滤规则不碰文件系统，凭证经 trait 注入。
+fn build_member(
+    name: &str,
+    record: &mcsup::service::RemoteRecord,
+    credentials: &dyn mcsup::auth::CredentialStore,
+) -> Result<Option<RemoteMember>> {
+    let remote_name = match RemoteName::parse(name) {
+        Ok(name) => name,
+        Err(err) => {
+            tracing::warn!(remote = %name, %err, "invalid remote name in config; skipping");
+            return Ok(None);
+        }
+    };
+    // 直连是当前唯一已实现的接入方式；ssh 隧道记录暂跳过
+    if record.via != RemoteVia::Direct {
+        tracing::warn!(remote = %name, via = record.via.as_str(), "unsupported remote via; skipping");
+        return Ok(None);
+    }
+    let Some(fingerprint_hex) = record.fingerprint.as_deref() else {
+        tracing::warn!(remote = %name, "remote has no pinned fingerprint; skipping");
+        return Ok(None);
+    };
+    let fingerprint = Fingerprint::parse(fingerprint_hex)
+        .with_context(|| format!("解析远端 {name} 的证书指纹"))?;
+    let credential = match credentials.get(name) {
+        Ok(cred) => cred,
+        Err(err) => {
+            tracing::warn!(remote = %name, %err, "no usable credential; skipping");
+            return Ok(None);
+        }
+    };
+    let link = RemoteLink::new(record.target.as_str(), fingerprint, &credential.token);
+    Ok(Some(RemoteMember::new(link, remote_name)))
+}
+
+/// 客户端凭证存储（`{data_dir}/credentials.toml`）
+fn credential_store() -> FileCredentialStore {
+    FileCredentialStore::new(config::platform_data_dir().join("credentials.toml"))
+}
+
+/// `open_mcsup` 的带远端版本：有已配对远端时注入组合仓库
+///
+/// 供 `McsupBuilder` 的三个仓库注入口使用；无远端时与 [`open_mcsup`]
+/// 完全等价（组合仓库空远端透传，但省掉配置读取更干净）。
+pub(crate) fn open_mcsup_with_remotes() -> Result<Mcsup> {
+    let data_dir = config::platform_data_dir();
+    let cfg = ConfigFile::locate(None).load()?;
+    let members = remote_members(&cfg)?;
+    if members.is_empty() {
+        return open_mcsup();
+    }
+    let store = open_store()?;
+    let mc = McsupBuilder::new()
+        .store(store.clone())
+        .workspace_repository(Arc::new(CombinedWorkspaceRepository::new(
+            store.clone(),
+            members.clone(),
+        )))
+        .server_repository(Arc::new(CombinedServerRepository::new(
+            store.clone(),
+            members.clone(),
+        )))
+        .java_repository(Arc::new(CombinedJavaRepository::new(
+            store.clone(),
+            members,
+        )))
+        .build(&data_dir)
+        .context("装配 mcsup 组合根（含远端）")?;
+    Ok(mc)
+}
+
+/// 装配 `ServerRegistry`（组合仓库版：本地 + 已配对远端）
+pub(crate) fn open_registry_with_remotes() -> Result<Arc<mcsup::service::ServerRegistry>> {
+    let store = open_store()?;
+    let cfg = ConfigFile::locate(None).load()?;
+    let members = remote_members(&cfg)?;
+    let servers: Arc<dyn mcsup::port::ServerRepository> = if members.is_empty() {
+        store.clone()
+    } else {
+        Arc::new(CombinedServerRepository::new(
+            store.clone(),
+            members.clone(),
+        ))
+    };
+    let workspaces: Arc<dyn mcsup::port::WorkspaceRepository> = if members.is_empty() {
+        store.clone()
+    } else {
+        Arc::new(CombinedWorkspaceRepository::new(store.clone(), members))
+    };
+    Ok(Arc::new(mcsup::service::ServerRegistry::new(
+        servers, workspaces,
+    )))
+}
+
 /// 库侧默认组合根（`mcsup::bootstrap`）：CLI 全部命令的统一装配口径。
 ///
 /// 单一入口：路径来自 `config`，网络能力与默认实现全部来自库侧组合根，
@@ -249,6 +377,122 @@ pub(crate) fn join_variants(available: &[ServerVariant], lang: Lang) -> String {
 pub(crate) fn open_mcsup() -> Result<Mcsup> {
     let data_dir = config::platform_data_dir();
     Mcsup::open(&data_dir).context("装配 mcsup 组合根")
+}
+
+#[cfg(test)]
+mod remote_tests {
+    use super::*;
+    use mcsup::auth::StoredCredential;
+    use mcsup::service::RemoteRecord;
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    /// 内存凭证存储：键值固定，避免测试碰真实数据目录
+    struct MemCredentials(BTreeMap<String, StoredCredential>);
+
+    impl mcsup::auth::CredentialStore for MemCredentials {
+        fn put(
+            &self,
+            _name: &str,
+            _cred: &StoredCredential,
+        ) -> Result<(), mcsup::auth::CredentialError> {
+            unimplemented!()
+        }
+        fn get(&self, name: &str) -> Result<StoredCredential, mcsup::auth::CredentialError> {
+            self.0
+                .get(name)
+                .cloned()
+                .ok_or_else(|| mcsup::auth::CredentialError::NotFound(name.to_owned()))
+        }
+        fn remove(&self, _name: &str) -> Result<(), mcsup::auth::CredentialError> {
+            unimplemented!()
+        }
+        fn names(&self) -> Result<Vec<String>, mcsup::auth::CredentialError> {
+            Ok(self.0.keys().cloned().collect())
+        }
+    }
+
+    fn credential(token: &str) -> StoredCredential {
+        StoredCredential {
+            token: token.to_owned(),
+            client_id: "0f0e0d0c-0b0a-49d8-a716-446655440000".to_owned(),
+            role: "operator".to_owned(),
+        }
+    }
+
+    fn record(target: &str, fingerprint: Option<&str>) -> RemoteRecord {
+        RemoteRecord {
+            target: target.to_owned(),
+            via: RemoteVia::Direct,
+            read_only: false,
+            added_at: 1,
+            fingerprint: fingerprint.map(str::to_owned),
+            credential: None,
+        }
+    }
+
+    const FPR: &str = "sha256:aaaaaaaabbbbbbbbccccccccddddddddeeeeeeeeffffffff0000111122223333";
+
+    /// 正常记录 + 有凭证 → 一名成员
+    #[test]
+    fn valid_record_builds_member() {
+        let creds = MemCredentials(BTreeMap::from([("box".to_owned(), credential("a"))]));
+        let cfg = mcsup::service::Config {
+            data_dir: None,
+            remotes: BTreeMap::from([("box".to_owned(), record("127.0.0.1:7681", Some(FPR)))]),
+        };
+        let member = build_member("box", cfg.remotes.get("box").expect("rec"), &creds)
+            .expect("build")
+            .expect("member");
+        assert_eq!(member.name.as_str(), "box");
+    }
+
+    /// 缺指纹 → 跳过（TOFU 未完成配对）
+    #[test]
+    fn missing_fingerprint_skips() {
+        let creds = MemCredentials(BTreeMap::from([("box".to_owned(), credential("a"))]));
+        let rec = record("127.0.0.1:7681", None);
+        assert!(build_member("box", &rec, &creds).expect("build").is_none());
+    }
+
+    /// 缺凭证 → 跳过（配对到一半）
+    #[test]
+    fn missing_credential_skips() {
+        let creds = MemCredentials(BTreeMap::new());
+        let rec = record("127.0.0.1:7681", Some(FPR));
+        assert!(build_member("box", &rec, &creds).expect("build").is_none());
+    }
+
+    /// ssh 接入暂不支持 → 跳过
+    #[test]
+    fn ssh_via_skips() {
+        let creds = MemCredentials(BTreeMap::from([("box".to_owned(), credential("a"))]));
+        let mut rec = record("user@host", Some(FPR));
+        rec.via = RemoteVia::Ssh;
+        assert!(build_member("box", &rec, &creds).expect("build").is_none());
+    }
+
+    /// 非法远端名 → 跳过
+    #[test]
+    fn invalid_name_skips() {
+        let creds = MemCredentials(BTreeMap::from([("b/ad".to_owned(), credential("a"))]));
+        let rec = record("127.0.0.1:7681", Some(FPR));
+        assert!(build_member("b/ad", &rec, &creds).expect("build").is_none());
+    }
+
+    /// 成员表空判定：过滤后一台不剩时走纯本地路径
+    #[test]
+    fn all_filtered_out_yields_empty_members() {
+        let creds = Mutex::new(());
+        let _ = creds; // 静默 unused：仅确认过滤逻辑组合
+        let mut cfg = mcsup::service::Config::default();
+        cfg.remotes.insert(
+            "box".to_owned(),
+            record("127.0.0.1:7681", None), // 缺指纹
+        );
+        let members = remote_members(&cfg).expect("members");
+        assert!(members.is_empty());
+    }
 }
 
 #[cfg(test)]

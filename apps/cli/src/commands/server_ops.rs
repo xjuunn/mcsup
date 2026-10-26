@@ -32,7 +32,7 @@ struct ServerRowView<'a> {
 }
 
 pub(crate) fn open_registry() -> Result<Arc<ServerRegistry>> {
-    bootstrap::open_registry()
+    bootstrap::open_registry_with_remotes()
 }
 
 /// 缺省工作区选择器：flag > `MCSUP_WORKSPACE` 环境变量 > 当前工作区

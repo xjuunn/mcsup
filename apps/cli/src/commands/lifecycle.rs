@@ -21,7 +21,7 @@ use std::time::Duration;
 /// 装配生命周期服务：经库侧组合根（`mcsup::bootstrap`）统一装配，
 /// CLI 不再手工拼注册表 + Java + supervisor
 pub(crate) fn lifecycle_service() -> Result<Arc<ServerLifecycleService>> {
-    let mcsup = bootstrap::open_mcsup()?;
+    let mcsup = bootstrap::open_mcsup_with_remotes()?;
     Ok(Arc::new(mcsup.lifecycle.clone()))
 }
 

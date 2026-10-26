@@ -17,9 +17,21 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub(crate) fn run(action: WorkspaceAction, printer: Printer) -> Result<()> {
-    let store = bootstrap::open_store()?;
-    let reg = Arc::new(ServerRegistry::new(store.clone(), store.clone()));
-    let svc = WorkspaceService::new(store.clone(), store.clone());
+    let reg = bootstrap::open_registry_with_remotes()?;
+    let local = bootstrap::open_store()?;
+    // 组合仓库版工作区服务：远端工作区出现在 list，本地 init / use / remove
+    // 语义不变（service 的写落组合仓库的本地臂）
+    let cfg = crate::config::ConfigFile::locate(None).load()?;
+    let members = bootstrap::remote_members(&cfg)?;
+    let workspaces: Arc<dyn mcsup::port::WorkspaceRepository> = if members.is_empty() {
+        local.clone()
+    } else {
+        Arc::new(mcsup::backend::remote::CombinedWorkspaceRepository::new(
+            local.clone(),
+            members,
+        ))
+    };
+    let svc = WorkspaceService::new(workspaces, local.clone());
     match action {
         WorkspaceAction::Init { dir, name } => init(&svc, dir.as_deref(), name.as_deref(), printer),
         WorkspaceAction::List => list(&svc, &reg, printer),
@@ -47,7 +59,7 @@ pub(crate) fn run(action: WorkspaceAction, printer: Printer) -> Result<()> {
             remove(&svc, &name, purge, printer)
         }
         WorkspaceAction::Doctor { only, strict } => {
-            let doctor = DoctorService::new(store.clone(), store);
+            let doctor = DoctorService::new(local.clone(), local);
             doctor_cmd(&doctor, &only, strict, printer)
         }
     }
