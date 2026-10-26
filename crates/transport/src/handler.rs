@@ -107,10 +107,18 @@ pub trait Handler: Send + Sync {
 
     /// 用配对码换 token
     ///
+    /// `read_only` 为真时服务端按 `viewer` 角色登记（`docs/remote.md`「安全」：
+    /// 默认 operator，可 `--read-only`）。
+    ///
     /// # Errors
     ///
     /// 码不对、已过期、已用尽尝试次数或客户端名非法时返回 [`RemoteFailure`]
-    fn enroll(&self, pairing_code: &str, client_name: &str) -> Result<Enrolled, RemoteFailure>;
+    fn enroll(
+        &self,
+        pairing_code: &str,
+        client_name: &str,
+        read_only: bool,
+    ) -> Result<Enrolled, RemoteFailure>;
 
     /// 校验 token
     ///
@@ -166,6 +174,7 @@ mod tests {
             Request::Enroll {
                 pairing_code: "1234-5678".to_owned(),
                 client_name: "laptop".to_owned(),
+                read_only: false,
             },
             Request::Authenticate {
                 token: "a".repeat(64),
@@ -203,9 +212,6 @@ mod tests {
             },
             Request::Start {
                 server_id: "id".to_owned(),
-                launch: protocol::remote::wire::WireLaunch::Jar {
-                    path: "server.jar".to_owned(),
-                },
                 ram_mib: None,
                 accept_eula: false,
             },

@@ -211,6 +211,33 @@ impl PairingCodeStore {
         self.active = None;
     }
 
+    /// 当前码是否只是**自然过期**（不是用掉、也不是猜错锁死）
+    ///
+    /// 三种失效原因对外的错误相同（都报 [`PairingCodeError::Unusable`]，避免
+    /// 告诉猜码的人离成功有多近），但对内必须分开：过期可以轮换出新码继续
+    /// 服务，而「已用掉」与「锁死」必须保持失效，否则限速就形同虚设。
+    #[must_use]
+    pub fn expired(&self, now: u64) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|active| !self.is_live(active, now))
+    }
+
+    /// 过期则轮换：发一枚新码并返回，未过期返回 `None`
+    ///
+    /// 只在自然过期时轮换（见 [`Self::expired`]）。常驻 agent 靠它维持
+    /// 「屏幕上总有当前有效码」，同时不削弱单码的限速与单次使用。
+    ///
+    /// # Errors
+    ///
+    /// 系统随机源不可用时返回 [`PairingCodeError::Random`]
+    pub fn rotate_if_expired(&mut self, now: u64) -> Result<Option<PairingCode>, PairingCodeError> {
+        if !self.expired(now) {
+            return Ok(None);
+        }
+        self.issue(now).map(Some)
+    }
+
     /// 窗口参数
     #[must_use]
     pub fn window(&self) -> PairingWindow {
@@ -364,5 +391,69 @@ mod tests {
         let window = PairingWindow::default();
         assert_eq!(window.ttl_secs, 600, "10 分钟");
         assert_eq!(window.max_attempts, 5);
+    }
+
+    /// 只有自然过期才算「可轮换」：用掉与锁死都必须保持关闭
+    #[test]
+    fn only_natural_expiry_counts_as_expired() {
+        let mut store = store();
+        let code = store.issue(T0).expect("issue");
+        assert!(!store.expired(T0), "有效期内不算过期");
+
+        store.redeem(&code.display_form(), T0).expect("兑换");
+        assert!(!store.expired(T0 + DEFAULT_TTL_SECS), "用掉不是过期");
+
+        let mut locked = store_with_attempts();
+        for _ in 0..DEFAULT_MAX_ATTEMPTS {
+            let _ = locked.redeem("00000000", T0);
+        }
+        assert!(!locked.expired(T0 + DEFAULT_TTL_SECS), "锁死不是过期");
+    }
+
+    fn store_with_attempts() -> PairingCodeStore {
+        let mut store = store();
+        store.issue(T0).expect("issue");
+        store
+    }
+
+    #[test]
+    fn rotate_reissues_only_after_expiry() {
+        let mut store = store();
+        let first = store.issue(T0).expect("issue");
+        assert_eq!(
+            store.rotate_if_expired(T0).expect("rotate"),
+            None,
+            "未过期不轮换"
+        );
+        assert_eq!(store.current(T0).expect("still live"), &first);
+
+        let fresh = store
+            .rotate_if_expired(T0 + DEFAULT_TTL_SECS)
+            .expect("rotate")
+            .expect("issued");
+        assert_ne!(fresh, first, "轮换必须给出新码");
+        assert_eq!(
+            store.redeem(&first.display_form(), T0 + DEFAULT_TTL_SECS),
+            Err(PairingCodeError::Mismatch),
+            "旧码轮换后作废"
+        );
+        store
+            .redeem(&fresh.display_form(), T0 + DEFAULT_TTL_SECS)
+            .expect("新码可用");
+    }
+
+    #[test]
+    fn rotate_does_not_revive_a_used_code() {
+        let mut store = store();
+        let code = store.issue(T0).expect("issue");
+        store.redeem(&code.display_form(), T0).expect("兑换");
+        assert_eq!(
+            store
+                .rotate_if_expired(T0 + DEFAULT_TTL_SECS)
+                .expect("rotate"),
+            None,
+            "用掉之后不得自动重开配对窗口"
+        );
+        assert!(store.current(T0 + DEFAULT_TTL_SECS).is_none());
     }
 }

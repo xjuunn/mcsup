@@ -1,0 +1,21 @@
+[package]
+name = "agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "mcsup-agent"
+path = "src/main.rs"
+doc = false
+
+[dependencies]
+anyhow = "1.0.104"
+mcsup = { path = "../../crates/mcsup", features = ["remote"] }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[lints]
+workspace = true

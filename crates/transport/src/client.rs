@@ -148,12 +148,14 @@ impl Client {
         &self,
         pairing_code: &str,
         client_name: &str,
+        read_only: bool,
     ) -> Result<Enrolled, TransportError> {
         let mut conn = self.connect()?;
         expect_hello(conn.exchange(&hello_request())?)?;
         let response = conn.exchange(&Request::Enroll {
             pairing_code: pairing_code.to_owned(),
             client_name: client_name.to_owned(),
+            read_only,
         })?;
         match response {
             Response::Enrolled {
@@ -330,6 +332,7 @@ fn response_name(response: &Response) -> &'static str {
         Response::Workspaces { .. } => "workspaces",
         Response::Servers { .. } => "servers",
         Response::Javas { .. } => "javas",
+        Response::Clients { .. } => "clients",
         Response::Statuses { .. } => "statuses",
         Response::Started { .. } => "started",
         Response::Stopped { .. } => "stopped",
