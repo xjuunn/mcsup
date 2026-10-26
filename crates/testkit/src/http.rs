@@ -4,7 +4,9 @@
 //! CI 里永远不跑——等于长期静默失效。真实网络探测应保留为**手动**手段；
 //! 协议层（状态码映射、JSON 解析、404 归类）必须能离线测。
 //!
-//! ```rust,ignore
+//! ```
+//! use testkit::{HttpServer, Response};
+//!
 //! let server = HttpServer::start();
 //! server.route("/meta.json", Response::json(r#"{"v":1}"#));
 //! let url = server.url("/meta.json"); // http://127.0.0.1:<port>/meta.json

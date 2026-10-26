@@ -4,10 +4,13 @@
 //! 存储、将来换成远端对象存储），契约不动，实现方必须自己满足；反过来，
 //! 如果有人改了实现又把测试跟着改，契约测试会立刻发现语义已经漂移。
 //!
-//! 调用方式（实现 crate 的 `tests/` 里）：
+//! 调用方式（实现 crate 的 `tests/` 里换成自己的实现，这里用 [`InMemoryCas`]）：
 //!
-//! ```rust,ignore
-//! testkit::cas_contract::run(|root| Arc::new(CasStore::new(root)));
+//! ```
+//! use std::sync::Arc;
+//! use testkit::{cas_contract, InMemoryCas};
+//!
+//! cas_contract::run(|_root| Arc::new(InMemoryCas::default()));
 //! ```
 //!
 //! 每一条契约都对应 `port::backup::ContentStore` 文档里的一句话。
