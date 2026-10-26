@@ -13,12 +13,37 @@
 | 4 | `protocol`：远端帧与版本协商 | 完成 |
 | 5 | `transport`：TLS 帧传输与连接池 | 完成 |
 | 6 | `apps/agent`：`mcsup remote serve` | 完成 |
-| 7 | 远端仓库（workspace / server / java） | 待开始 |
+| 7 | 远端仓库（workspace / server / java） | 完成 |
 | 8 | `RemoteBackend`：远端 supervisor | 待开始 |
 | 9 | 流式：日志 / 进度 / 备份 | 待开始 |
 | 10 | CLI `remote` 命令与 `--origin` | 待开始 |
 
 ## 已完成
+
+### 阶段 7：远端仓库与 CLI 装配接入
+
+代码在 `crates/backend/src/remote/`（客户端侧）与 `apps/cli/src/bootstrap.rs`
+（装配）：
+
+- `RemoteLink`：一条远端连接的网关，`call` / `expect`（要求特定载荷）；
+  `ErrorKind → RepositoryError` 映射的唯一出口。
+- 三个只读镜像仓库 `RemoteWorkspaceRepository` / `RemoteServerRepository` /
+  `RemoteJavaRepository`：读走 list 帧；写暴露与帧一一对应的显式方法
+  （`init` / `set_current` / `remove` / `create` / `scan`），trait 写方法
+  显式报错——客户端不伪装本地仓库，目录与 marker 动作必须发生在对端。
+  `list_sourced()` 覆写为远端来源标注。
+- 组合仓库 `Combined*Repository` + `RemoteMembers`：读路径本地 + 逐台远端
+  串行合并，远端不可达降级为本地条目并记 warn（离线不阻塞）；写路径**委托
+  本地仓库**——能到达组合仓库的写只有 service 的本地操作（`init` /
+  `set_current` / `create` / `upsert` / `update_core` …），远端写由路由层
+  分派给镜像显式方法，不经组合仓库。
+- CLI 装配：`remote_members` 读 `config.toml [remotes.*]` +
+  `FileCredentialStore` 构造成员表，过滤非法名 / 非 `direct` / 缺指纹 /
+  缺凭证（逐台跳过不阻塞）；`open_mcsup_with_remotes` 经 `McsupBuilder`
+  注入三个组合仓库，`open_registry_with_remotes` / `open_java_service` /
+  `workspace` 命令同口径。无已配对远端时与原装配完全等价。
+- 测试：backend 侧 9 个（真 TLS 垫片 agent + 组合层行为），CLI 侧 6 个
+  （成员装配过滤规则）。
 
 ### 阶段 1：`port` 身份键改造
 
@@ -155,15 +180,7 @@
 
 ## 后续待办
 
-### 阶段 7：远端仓库
-
-- `RemoteWorkspaceRepository` / `RemoteServerRepository` /
-  `RemoteJavaRepository`，实现 `port` 的对应 trait 并覆写
-  `list_sourced()`。
-- 打通 `workspace ls` / `init` / `use`、`server create`、`java ls` / `scan` /
-  `install`。
-- `ServerRegistry::list()` 里的 `symlink_metadata()` 是本地 syscall，远端会
-  静默错——远端条目走 `list_sourced()` 分支跳过。
+### 阶段 7：远端仓库（已完成，见「已完成」节）
 
 ### 阶段 8：`RemoteBackend`
 
