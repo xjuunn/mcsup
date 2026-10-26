@@ -16,8 +16,11 @@
 pub mod combined;
 pub mod link;
 pub mod mirror;
+pub mod router;
 pub mod supervisor;
 
+#[cfg(test)]
+mod router_tests;
 #[cfg(test)]
 mod supervisor_tests;
 
