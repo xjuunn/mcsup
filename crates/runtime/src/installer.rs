@@ -651,9 +651,12 @@ mod tests {
         )
         .expect("should run");
         let lines = sink.0.into_inner().expect("lock");
-        assert!(lines.iter().any(|l| l == "one"), "{lines:?}");
-        assert!(lines.iter().any(|l| l == "two"), "{lines:?}");
-        assert!(lines.iter().any(|l| l == "three"), "{lines:?}");
+        // `cmd` 的 echo 会带尾随空格（Windows 下实测），断言前先规整：
+        // 本测试关心的是「逐行、stderr 合流、末尾无换行」，不是 echo 的排版
+        let lines: Vec<&str> = lines.iter().map(|line| line.trim()).collect();
+        assert!(lines.contains(&"one"), "{lines:?}");
+        assert!(lines.contains(&"two"), "{lines:?}");
+        assert!(lines.contains(&"three"), "{lines:?}");
     }
 
     /// 半行跨分块必须拼成一行；进程结束仍未换行的尾巴也要吐出

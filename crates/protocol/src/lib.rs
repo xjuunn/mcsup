@@ -15,6 +15,12 @@ use std::io::{self, BufRead, Write};
 /// CLI `--output json` 的行类型（唯一真相来源，禁止各入口自行定义 DTO）
 pub mod cli;
 
+/// 远端 RPC：帧集、版本协商、线格式
+///
+/// 与本地 IPC 共用 [`Frame`] 的编解码纪律，但版本号独立（
+/// [`remote::REMOTE_PROTOCOL_VERSION`]）。
+pub mod remote;
+
 /// IPC 协议版本；不匹配直接报错，禁止猜测兼容
 pub const PROTOCOL_VERSION: u32 = 1;
 

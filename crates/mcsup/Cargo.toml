@@ -21,6 +21,7 @@ protocol = { path = "../protocol", version = "0.1.0", optional = true }
 service = { path = "../service", version = "0.1.0", optional = true }
 backup = { path = "../backup", version = "0.1.0", optional = true }
 backend = { path = "../backend", version = "0.1.0", optional = true }
+transport = { path = "../transport", version = "0.1.0", optional = true }
 file = { path = "../file", version = "0.1.0", optional = true }
 java = { path = "../java", version = "0.1.0", optional = true }
 provider = { path = "../provider", version = "0.1.0", optional = true }
@@ -32,7 +33,7 @@ thiserror = { workspace = true, optional = true }
 default = []
 domain = ["dep:domain"]
 port = ["dep:port", "domain"]
-protocol = ["dep:protocol", "domain"]
+protocol = ["dep:protocol", "auth", "port"]
 service = ["dep:service", "port"]
 backup = ["dep:backup", "port"]
 backend = ["dep:backend", "port"]
@@ -41,6 +42,8 @@ java = ["dep:java", "port"]
 provider = ["dep:provider", "port"]
 storage = ["dep:storage", "port"]
 runtime = ["dep:runtime", "port", "protocol"]
+# 远端传输：TLS + 自签身份 + 帧收发（客户端与 agent 共用）
+transport = ["dep:transport", "protocol"]
 # 认证与授权：配对码 / token / 角色 / 凭证存储（纯逻辑，无网络）
 auth = ["dep:auth"]
 # 默认组合根：一次装配全部默认实现（storage/service/file/java/provider/runtime）
@@ -55,6 +58,7 @@ bootstrap = [
     "dep:runtime",
     "port",
     "protocol",
+    "transport",
     "dep:thiserror",
 ]
 

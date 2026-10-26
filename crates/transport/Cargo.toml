@@ -1,0 +1,28 @@
+[package]
+name = "transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# 契约层：帧类型与权限表都在 protocol，transport 只做「怎么把帧送过去」
+protocol = { version = "0.1.0", path = "../protocol" }
+auth = { version = "0.1.0", path = "../auth" }
+pem = "3.0"
+# TLS：与 provider 同一套后端（rustls + ring），不引入 C 工具链
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
+ring = "0.17"
+rustls = { version = "0.23.46", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+] }
+rustls-pki-types = "1.15"
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
