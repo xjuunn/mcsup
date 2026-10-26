@@ -5,7 +5,7 @@ use domain::server::version::{ServerVariant, VersionId};
 use domain::server::world::{DataVersion, ensure_world_readable};
 use domain::workspace::{Workspace, WorkspaceId};
 use port::{
-    CancellationToken, CoreInspector, ProgressSink, RepositoryError, ServerRepository,
+    CancellationToken, CoreInspector, ProgressSink, RepositoryError, ServerRepository, Sourced,
     WorkspaceRepository,
 };
 use serde::{Deserialize, Serialize};
@@ -208,6 +208,17 @@ pub struct RegisteredServer {
     pub dir: PathBuf,
     /// 目录是符号链接（`server link` 引入的外部服务器）
     pub linked: bool,
+}
+
+impl RegisteredServer {
+    /// 定位这台服务器的身份键：身份 + 已解析目录
+    ///
+    /// supervisor 类 port 一律按身份键寻址，调用点统一走这里，避免各处手拼
+    /// `ServerRef` 时漏填目录或拿错 id。
+    #[must_use]
+    pub fn server_ref(&self) -> port::ServerRef<'_> {
+        port::ServerRef::local(&self.meta.id, &self.dir)
+    }
 }
 
 /// `server remove` 结果
@@ -580,6 +591,34 @@ impl ServerRegistry {
                 .symlink_metadata()
                 .is_ok_and(|m| m.file_type().is_symlink());
             out.push(RegisteredServer { meta, dir, linked });
+        }
+        Ok(out)
+    }
+
+    /// 列出全部服务并标注来源
+    ///
+    /// 组合仓库（本地 + 远端）下每条都带真实来源；纯本地实现全部是
+    /// [`port::Origin::Local`]。`linked` 是本地文件系统探测，远端条目恒为 `false`
+    /// ——符号链接是客户端侧的展示细节，对端无从得知。
+    ///
+    /// # Errors
+    ///
+    /// 底层失败返回 [`ServerRegistryError`]
+    pub fn list_sourced(&self) -> Result<Vec<Sourced<RegisteredServer>>, ServerRegistryError> {
+        let mut out = Vec::new();
+        for sourced in self.servers.list_sourced()? {
+            let origin = sourced.origin;
+            let meta = sourced.value;
+            let (dir, linked) = if origin.is_local() {
+                let dir = self.absolute_dir(&meta)?;
+                let linked = dir
+                    .symlink_metadata()
+                    .is_ok_and(|m| m.file_type().is_symlink());
+                (dir, linked)
+            } else {
+                (PathBuf::new(), false)
+            };
+            out.push(Sourced::new(origin, RegisteredServer { meta, dir, linked }));
         }
         Ok(out)
     }

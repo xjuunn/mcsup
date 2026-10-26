@@ -1,0 +1,22 @@
+[package]
+name = "auth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# 随机源与摘要：ring 已在依赖树内（rustls 的密码学后端），此处提升为直接依赖
+ring = "0.17"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

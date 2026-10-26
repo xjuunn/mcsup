@@ -43,6 +43,12 @@ struct PackageDto {
     java_version: String,
     filename: String,
     directly_downloadable: bool,
+    /// 上游架构标识（`x64` / `aarch64` / `arm64` …）
+    #[serde(default)]
+    architecture: String,
+    /// 上游操作系统标识
+    #[serde(default)]
+    operating_system: String,
     #[serde(default)]
     size: i64,
     links: Links,
@@ -69,14 +75,16 @@ impl JavaReleaseSource for FoojaySource {
                 ("version", request.major.as_i64().to_string()),
                 ("include_versions", "false".into()),
                 ("include_downloads", "false".into()),
-                ("arch", request.arch.clone()),
+                // 参数名是 `architecture`；写成 `arch` 会被上游静默忽略，
+                // 返回全架构的包，进而把 x64 的 JVM 装到 aarch64 上
+                ("architecture", request.arch.clone()),
                 ("operating_system", request.os.clone()),
                 ("package_type", request.package_type.as_str().into()),
                 ("latest", "available".into()),
                 ("directly_downloadable", "true".into()),
                 ("free_use_in_production", "true".into()),
                 ("release_status", "ga".into()),
-                ("limit", "20".into()),
+                ("limit", "200".into()),
             ],
         )
         .map_err(|err| SourceError::Decode(Box::new(err)))?;
@@ -88,6 +96,16 @@ impl JavaReleaseSource for FoojaySource {
                 pkg.directly_downloadable
                     && !pkg.filename.is_empty()
                     && super::is_deployable_archive(&pkg.filename)
+            })
+            // 上游过滤不可全信：同一 id 回查、镜像差异都可能带出别的架构，
+            // 这里按声明的架构与文件名双重复核
+            .filter(|pkg| {
+                super::arch_matches(&request.arch, &pkg.architecture)
+                    && super::filename_arch_matches(&request.arch, &pkg.filename)
+            })
+            .filter(|pkg| {
+                pkg.operating_system.is_empty()
+                    || super::os_matches(&request.os, &pkg.operating_system)
             })
             .filter_map(|pkg| {
                 Some(JavaPackage {

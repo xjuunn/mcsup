@@ -38,6 +38,11 @@ struct Asset {
 
 #[derive(Debug, Deserialize)]
 struct Binary {
+    /// 上游回填的架构标识
+    #[serde(default)]
+    architecture: String,
+    #[serde(default)]
+    os: String,
     #[serde(default)]
     package: Option<PackageInfo>,
 }
@@ -45,6 +50,9 @@ struct Binary {
 #[derive(Debug, Deserialize)]
 struct PackageInfo {
     link: String,
+    /// 归档文件名（用于架构复核；缺失时回退到链接尾段）
+    #[serde(default)]
+    name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,6 +94,27 @@ impl JavaReleaseSource for AdoptiumSource {
             .filter_map(|asset| {
                 let package = asset.binary.package?;
                 if !super::is_deployable_archive(&package.link) {
+                    return None;
+                }
+                // 上游过滤不可全信：声明架构与文件名都要复核，否则会把
+                // 别的架构的 JVM 当成可安装包
+                if !asset.binary.architecture.is_empty()
+                    && !super::arch_matches(&request.arch, &asset.binary.architecture)
+                {
+                    return None;
+                }
+                let filename = if package.name.is_empty() {
+                    package.link.as_str()
+                } else {
+                    package.name.as_str()
+                };
+                if !super::filename_arch_matches(&request.arch, filename)
+                    || !super::filename_arch_matches(&request.arch, &package.link)
+                {
+                    return None;
+                }
+                if !asset.binary.os.is_empty() && !super::os_matches(&request.os, &asset.binary.os)
+                {
                     return None;
                 }
                 let major = asset

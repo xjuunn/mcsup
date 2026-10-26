@@ -252,7 +252,7 @@ impl ServerLifecycleService {
         on_found: &mut dyn FnMut(&ScannedJava),
     ) -> Result<SupervisorStartOutcome, LifecycleError> {
         let server = self.registry.get(name)?;
-        if let Some(status) = self.backend.supervisor().status(&server.dir)?
+        if let Some(status) = self.backend.supervisor().status(&server.server_ref())?
             && status.status.is_alive()
         {
             return Err(LifecycleError::AlreadyRunning);
@@ -280,6 +280,7 @@ impl ServerLifecycleService {
         let runtime = pick_runtime(&runtimes, settings.java_major, server.meta.java_major, name)?;
 
         let request = SupervisorStartRequest {
+            server_id: server.meta.id.clone(),
             server_dir: server.dir.clone(),
             java_bin: java_bin_under(&runtime.path),
             launch,
@@ -310,10 +311,15 @@ impl ServerLifecycleService {
     /// supervisor 无响应、协议失败或宽限超时
     pub fn stop(&self, name: &str, spec: StopSpec) -> Result<StopOutcome, LifecycleError> {
         let server = self.registry.get(name)?;
-        if self.backend.supervisor().status(&server.dir)?.is_none() {
+        if self
+            .backend
+            .supervisor()
+            .status(&server.server_ref())?
+            .is_none()
+        {
             return Ok(StopOutcome::AlreadyStopped);
         }
-        match self.backend.supervisor().stop(&server.dir, spec)? {
+        match self.backend.supervisor().stop(&server.server_ref(), spec)? {
             StopOutcome::TimedOut { waited } => Err(LifecycleError::StopTimedOut { waited }),
             other => {
                 self.events
@@ -450,7 +456,7 @@ impl ServerLifecycleService {
         if self
             .backend
             .supervisor()
-            .status(&server.dir)?
+            .status(&server.server_ref())?
             .is_some_and(|s| s.status.is_alive())
         {
             return Err(LifecycleError::Busy {
@@ -480,7 +486,7 @@ impl ServerLifecycleService {
             if self
                 .backend
                 .supervisor()
-                .status(&srv.dir)?
+                .status(&srv.server_ref())?
                 .is_some_and(|s| s.status.is_alive())
             {
                 return Err(LifecycleError::Busy {
@@ -499,14 +505,14 @@ impl ServerLifecycleService {
     /// 注册表或 supervisor 协议失败
     pub fn status(&self, name: &str) -> Result<Option<SupervisorStatus>, LifecycleError> {
         let server = self.registry.get(name)?;
-        Ok(self.backend.supervisor().status(&server.dir)?)
+        Ok(self.backend.supervisor().status(&server.server_ref())?)
     }
 
     /// 全量服务器的实时状态（`server list` 状态列用）
     ///
-    /// 逐台探测，单台协议失败不拖死整个列表：失败记为该键的 `Err`，
-    /// 由调用方决定渲染为 `unknown` 还是上抛。`Ok(None)` = 未在运行。
-    /// 按键取值，顺序不保证。
+    /// 一次批量探测：本地实现逐台，远端实现一次往返——列表页不该是 N+1 串行
+    /// RPC。单台协议失败不拖死整个列表：失败记为该键的 `Err`，由调用方决定
+    /// 渲染为 `unknown` 还是上抛。`Ok(None)` = 未在运行。按键取值，顺序不保证。
     ///
     /// # Errors
     ///
@@ -516,12 +522,12 @@ impl ServerLifecycleService {
     ) -> Result<HashMap<String, Result<Option<SupervisorStatus>, SupervisorError>>, LifecycleError>
     {
         let servers = self.registry.list()?;
+        let refs: Vec<_> = servers.iter().map(|srv| srv.server_ref()).collect();
+        let results = self.backend.supervisor().status_many(&refs);
+        debug_assert_eq!(results.len(), servers.len(), "status_many 必须保持入参顺序");
         let mut out = HashMap::with_capacity(servers.len());
-        for srv in servers {
-            out.insert(
-                srv.meta.name.as_str().to_owned(),
-                self.backend.supervisor().status(&srv.dir),
-            );
+        for (srv, result) in servers.iter().zip(results) {
+            out.insert(srv.meta.name.as_str().to_owned(), result);
         }
         Ok(out)
     }
@@ -533,10 +539,19 @@ impl ServerLifecycleService {
     /// 未在运行返回 [`LifecycleError::NotRunning`]；其余见 [`LifecycleError`]
     pub fn send_line(&self, name: &str, line: &str) -> Result<(), LifecycleError> {
         let server = self.registry.get(name)?;
-        if self.backend.supervisor().status(&server.dir)?.is_none() {
+        if self
+            .backend
+            .supervisor()
+            .status(&server.server_ref())?
+            .is_none()
+        {
             return Err(LifecycleError::NotRunning);
         }
-        match self.backend.supervisor().send_line(&server.dir, line) {
+        match self
+            .backend
+            .supervisor()
+            .send_line(&server.server_ref(), line)
+        {
             Err(SupervisorError::Remote { kind, .. }) if kind == "not_running" => {
                 Err(LifecycleError::NotRunning)
             }
@@ -594,7 +609,7 @@ impl ServerLifecycleService {
             name: server.meta.name.as_str().to_owned(),
             version: server.meta.version.to_string(),
             variant: server.meta.variant.as_str().to_owned(),
-            status: self.backend.supervisor().status(&server.dir)?,
+            status: self.backend.supervisor().status(&server.server_ref())?,
         })
     }
 }
@@ -1197,7 +1212,7 @@ mod tests {
 
         fn stop(
             &self,
-            _server_dir: &Path,
+            _server: &port::ServerRef<'_>,
             _spec: StopSpec,
         ) -> Result<StopOutcome, SupervisorError> {
             *self.stop_calls.lock().expect("lock") += 1;
@@ -1215,11 +1230,18 @@ mod tests {
             Ok(outcome)
         }
 
-        fn status(&self, _server_dir: &Path) -> Result<Option<SupervisorStatus>, SupervisorError> {
+        fn status(
+            &self,
+            _server: &port::ServerRef<'_>,
+        ) -> Result<Option<SupervisorStatus>, SupervisorError> {
             Ok(self.status.lock().expect("lock").clone())
         }
 
-        fn send_line(&self, _server_dir: &Path, line: &str) -> Result<(), SupervisorError> {
+        fn send_line(
+            &self,
+            _server: &port::ServerRef<'_>,
+            line: &str,
+        ) -> Result<(), SupervisorError> {
             if let Some(err) = self.send_error.lock().expect("lock").take() {
                 return Err(err);
             }
@@ -1227,7 +1249,7 @@ mod tests {
             Ok(())
         }
 
-        fn shutdown(&self, _server_dir: &Path) -> Result<(), SupervisorError> {
+        fn shutdown(&self, _server: &port::ServerRef<'_>) -> Result<(), SupervisorError> {
             Ok(())
         }
     }
@@ -2052,18 +2074,25 @@ mod tests {
         }
         fn stop(
             &self,
-            _server_dir: &Path,
+            _server: &port::ServerRef<'_>,
             _spec: StopSpec,
         ) -> Result<StopOutcome, SupervisorError> {
             Err(SupervisorError::Unreachable("probe fail".to_owned()))
         }
-        fn status(&self, _server_dir: &Path) -> Result<Option<SupervisorStatus>, SupervisorError> {
+        fn status(
+            &self,
+            _server: &port::ServerRef<'_>,
+        ) -> Result<Option<SupervisorStatus>, SupervisorError> {
             Err(SupervisorError::Protocol("version mismatch".to_owned()))
         }
-        fn send_line(&self, _server_dir: &Path, _line: &str) -> Result<(), SupervisorError> {
+        fn send_line(
+            &self,
+            _server: &port::ServerRef<'_>,
+            _line: &str,
+        ) -> Result<(), SupervisorError> {
             Err(SupervisorError::Unreachable("probe fail".to_owned()))
         }
-        fn shutdown(&self, _server_dir: &Path) -> Result<(), SupervisorError> {
+        fn shutdown(&self, _server: &port::ServerRef<'_>) -> Result<(), SupervisorError> {
             Ok(())
         }
     }

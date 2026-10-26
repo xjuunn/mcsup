@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 # crates/mcsup 是唯一发布单元。第一个 app 落地时在这里补上 "apps/*"：
-members = ["apps/cli","apps/dev","crates/backend","crates/backup","crates/domain", "crates/file","crates/java", "crates/mcsup", "crates/port", "crates/protocol", "crates/provider", "crates/runtime", "crates/service", "crates/storage", "crates/testkit"]
+members = ["apps/cli","apps/dev","crates/auth","crates/backend","crates/backup","crates/domain", "crates/file","crates/java", "crates/mcsup", "crates/port", "crates/protocol", "crates/provider", "crates/runtime", "crates/service", "crates/storage", "crates/testkit"]
 
 [workspace.package]
 version = "0.1.0"

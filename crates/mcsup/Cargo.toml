@@ -14,6 +14,7 @@ categories = ["command-line-utilities", "database", "network-programming"]
 workspace = true
 
 [dependencies]
+auth = { path = "../auth", version = "0.1.0", optional = true }
 domain = { path = "../domain", version = "0.1.0", optional = true }
 port = { path = "../port", version = "0.1.0", optional = true }
 protocol = { path = "../protocol", version = "0.1.0", optional = true }
@@ -40,6 +41,8 @@ java = ["dep:java", "port"]
 provider = ["dep:provider", "port"]
 storage = ["dep:storage", "port"]
 runtime = ["dep:runtime", "port", "protocol"]
+# 认证与授权：配对码 / token / 角色 / 凭证存储（纯逻辑，无网络）
+auth = ["dep:auth"]
 # 默认组合根：一次装配全部默认实现（storage/service/file/java/provider/runtime）
 bootstrap = [
     "dep:storage",

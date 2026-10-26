@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod backup;
 pub mod content;
+pub mod origin;
 
 pub use backend::Backend;
 pub use backup::{
@@ -9,12 +10,15 @@ pub use backup::{
 };
 use domain::java::{JavaMajor, JavaPackageType, JavaRuntime, JavaVendor};
 use domain::server::artifact::{Checksum, JarArtifact};
-use domain::server::meta::{InstalledJar, ServerMeta, ServerName};
+use domain::server::meta::{InstalledJar, ServerId, ServerMeta, ServerName};
 use domain::server::settings::ServerSettings;
 pub use domain::server::status::ServerStatus;
 use domain::server::version::{ServerVariant, ServerVersion, VersionId};
 use domain::server::world::{DataVersion, WorldInfo};
 use domain::workspace::{Workspace, WorkspaceId, WorkspaceName};
+pub use origin::{
+    LOCAL_NAME, MAX_NAME_LEN, Origin, OriginError, RESERVED_NAMES, RemoteName, Sourced,
+};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -551,6 +555,18 @@ pub trait ServerRepository: Send + Sync {
         rel_dir: &Path,
         updated_at: i64,
     ) -> Result<ServerMeta, RepositoryError>;
+
+    /// 列出全部服务并标注来源
+    ///
+    /// 组合仓库（本地 + 多台远端合成一个列表）覆写本方法给每条打上真实来源；
+    /// 单来源实现不必覆写，默认全部标 [`Origin::Local`]。
+    ///
+    /// # Errors
+    ///
+    /// 底层失败返回 [`RepositoryError::Storage`]
+    fn list_sourced(&self) -> Result<Vec<Sourced<ServerMeta>>, RepositoryError> {
+        Ok(self.list()?.into_iter().map(Sourced::local).collect())
+    }
 }
 
 /// 工作目录注册表存储
@@ -616,6 +632,17 @@ pub trait WorkspaceRepository: Send + Sync {
         path: &Path,
         updated_at: i64,
     ) -> Result<(), RepositoryError>;
+
+    /// 列出全部工作目录并标注来源
+    ///
+    /// 组合仓库覆写本方法标注真实来源；单来源实现默认全部标 [`Origin::Local`]。
+    ///
+    /// # Errors
+    ///
+    /// 底层失败返回 [`RepositoryError::Storage`]
+    fn list_sourced(&self) -> Result<Vec<Sourced<Workspace>>, RepositoryError> {
+        Ok(self.list()?.into_iter().map(Sourced::local).collect())
+    }
 }
 
 /// Java 发行包查询条件
@@ -656,11 +683,26 @@ const fn current_os() -> &'static str {
 }
 
 /// 当前平台的 API 架构标识
+///
+/// 取值与上游 API 的写法对齐（`x64` / `aarch64` / `x86` / `arm` …）；provider 侧
+/// 还会归一别名再比对，所以这里只需选一个通用写法。
 const fn current_arch() -> &'static str {
     if cfg!(target_arch = "aarch64") {
         "aarch64"
-    } else {
+    } else if cfg!(target_arch = "x86_64") {
         "x64"
+    } else if cfg!(target_arch = "x86") {
+        "x86"
+    } else if cfg!(target_arch = "arm") {
+        "arm"
+    } else if cfg!(target_arch = "riscv64") {
+        "riscv64"
+    } else if cfg!(target_arch = "powerpc64") {
+        "ppc64le"
+    } else if cfg!(target_arch = "s390x") {
+        "s390x"
+    } else {
+        "unknown"
     }
 }
 
@@ -809,11 +851,72 @@ pub trait JavaRuntimeRepository: Send + Sync {
     ///
     /// 底层失败返回 [`RepositoryError::Storage`]
     fn mark_scanned(&self, at: i64) -> Result<(), RepositoryError>;
+
+    /// 列出全部运行时并标注来源
+    ///
+    /// 组合仓库覆写本方法标注真实来源；单来源实现默认全部标 [`Origin::Local`]。
+    ///
+    /// # Errors
+    ///
+    /// 底层失败返回 [`RepositoryError::Storage`]
+    fn list_sourced(&self) -> Result<Vec<Sourced<JavaRuntime>>, RepositoryError> {
+        Ok(self.list()?.into_iter().map(Sourced::local).collect())
+    }
 }
 
-/// supervisor 启动请求（全部路径已由调用方解析）
+/// 定位一台服务器：身份键 + 可选本地目录
+///
+/// 远端实现只认 [`id`](Self::id)——路径是客户端概念，跨机器无意义；本地实现
+/// 需要 [`dir`](Self::dir) 省去再查一次注册表。把两者收进同一个结构，避免
+/// 「本地用路径、远端用 id」把 trait 签名撕成两套。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerRef<'a> {
+    /// 服务器稳定身份（跨机器唯一）
+    pub id: &'a ServerId,
+    /// 服务器目录；远端实现忽略
+    pub dir: Option<&'a Path>,
+}
+
+impl<'a> ServerRef<'a> {
+    /// 本地实现用：身份 + 已解析的目录
+    #[must_use]
+    pub fn local(id: &'a ServerId, dir: &'a Path) -> Self {
+        Self { id, dir: Some(dir) }
+    }
+
+    /// 远端实现用：只有身份，目录由对端自行解析
+    #[must_use]
+    pub fn remote(id: &'a ServerId) -> Self {
+        Self { id, dir: None }
+    }
+
+    /// 取目录；只有本地实现该调用它
+    ///
+    /// # Errors
+    ///
+    /// 构造时未带目录（远端场景）返回 [`SupervisorError::Unreachable`]
+    pub fn dir(&self) -> Result<&'a Path, SupervisorError> {
+        self.dir.ok_or_else(|| {
+            SupervisorError::Unreachable(
+                "server dir is required by the local supervisor".to_owned(),
+            )
+        })
+    }
+}
+
+/// supervisor 启动请求
+///
+/// 字段分两类，实现层按自己那一类取值：
+///
+/// - **可移植的意图**：`server_id` / `launch` / `ram_mib`。远端实现只认这三个，
+///   路径一律由对端按自身规则解析——客户端给的路径不跨机器传递，避免「客户端
+///   指定远端路径」变成任意路径执行。
+/// - **本地执行细节**：`server_dir` / `java_bin` / `supervisor_exe` /
+///   `supervisor_args`。只有本地实现用；远端实现忽略它们。
 #[derive(Debug, Clone)]
 pub struct SupervisorStartRequest {
+    /// 目标服务器身份（远端实现据此定位；本地实现用 `server_dir`）
+    pub server_id: ServerId,
     /// 服务器目录：运行期文件（`run/` / `console.log`）都落在其下
     pub server_dir: PathBuf,
     /// `java` 可执行文件
@@ -829,6 +932,14 @@ pub struct SupervisorStartRequest {
     /// 由入口决定：`runtime` 只负责「用什么可执行文件 + 前置参数」，不假设
     /// 它内部有哪些子命令，从而不反向感知 CLI 的入口约定。
     pub supervisor_args: Vec<std::ffi::OsString>,
+}
+
+impl SupervisorStartRequest {
+    /// 服务器目录
+    #[must_use]
+    pub fn server_dir(&self) -> &Path {
+        &self.server_dir
+    }
 }
 
 /// 一次运行的实时视图
@@ -915,8 +1026,12 @@ pub enum SupervisorError {
 /// 服务器 supervisor：拉起 / 停机 / 查询 / 控制台注入
 ///
 /// 回答「这个服务器现在跑没跑、怎么让它停下来」。Local 由 `runtime` 实现
-/// （本地进程 + IPC），Remote 将来经 transport 代理同一 trait——业务判定
-/// 仍在 `domain` / `service`，实现层只回答「在哪里执行」。
+/// （本地进程 + IPC），Remote 经 transport 代理同一 trait——业务判定仍在
+/// `domain` / `service`，实现层只回答「在哪里执行」。
+///
+/// 方法一律按 [`ServerRef`]（身份键）寻址，不按路径：路径是本地概念，远端
+/// 实现拿不到、也不该采信客户端给的路径。本地实现用 `ServerRef::dir()` 取
+/// 已解析的目录，远端实现用 `ServerRef::id` 拼请求。
 pub trait SupervisorPort: Send + Sync {
     /// 拉起 supervisor（已运行时拒绝重复启动）
     ///
@@ -934,28 +1049,44 @@ pub trait SupervisorPort: Send + Sync {
     /// # Errors
     ///
     /// supervisor 无响应或协议失败时返回错误
-    fn stop(&self, server_dir: &Path, spec: StopSpec) -> Result<StopOutcome, SupervisorError>;
+    fn stop(&self, server: &ServerRef<'_>, spec: StopSpec) -> Result<StopOutcome, SupervisorError>;
 
     /// 实时状态；`Ok(None)` 表示没有 supervisor（未运行）
     ///
     /// # Errors
     ///
     /// 协议失败时返回错误（连接失败按「不在」处理）
-    fn status(&self, server_dir: &Path) -> Result<Option<SupervisorStatus>, SupervisorError>;
+    fn status(&self, server: &ServerRef<'_>) -> Result<Option<SupervisorStatus>, SupervisorError>;
+
+    /// 批量实时状态：一次往返取多台
+    ///
+    /// 默认实现逐台调用 [`Self::status`]，对本地实现是零成本；远端实现应覆写
+    /// 成**一次** RPC，避免列表页 N+1 串行往返。返回顺序与入参一致。
+    ///
+    /// # Errors
+    ///
+    /// 仅当整批都无法完成时返回错误；单台失败记在该位置的 `Err` 里，
+    /// 不拖死整批——列表页要把失败的那台渲染成 `unknown` 而不是整体报错。
+    fn status_many(
+        &self,
+        servers: &[ServerRef<'_>],
+    ) -> Vec<Result<Option<SupervisorStatus>, SupervisorError>> {
+        servers.iter().map(|server| self.status(server)).collect()
+    }
 
     /// 向服务端 stdin 注入一行
     ///
     /// # Errors
     ///
     /// 未运行返回 [`SupervisorError::Unreachable`]；其余同上
-    fn send_line(&self, server_dir: &Path, line: &str) -> Result<(), SupervisorError>;
+    fn send_line(&self, server: &ServerRef<'_>, line: &str) -> Result<(), SupervisorError>;
 
     /// 通知空载（进程已退出）的 supervisor 尽快退出
     ///
     /// # Errors
     ///
     /// 协议失败时返回错误
-    fn shutdown(&self, server_dir: &Path) -> Result<(), SupervisorError>;
+    fn shutdown(&self, server: &ServerRef<'_>) -> Result<(), SupervisorError>;
 }
 
 /// 领域事件出口：`service` 在关键节点发布事实，消费者（CLI / API / MCP /

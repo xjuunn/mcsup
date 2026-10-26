@@ -151,7 +151,7 @@ done
 #   mcsup   -> 任意内层（门面）
 #   apps    -> 只允许 mcsup
 # 实现层之间除 backend 外互不依赖。
-impl_layers='runtime java storage file backup provider modkit'
+impl_layers='runtime java storage file backup provider modkit auth'
 
 for manifest in $manifests; do
 	pkg=$(pkg_name "$manifest")
@@ -337,6 +337,7 @@ if [ -f "$pkg_manifest" ] && [ -f "$pkg_lib" ]; then
 		port) printf '%s' 'domain port' ;;
 		protocol) printf '%s' 'domain protocol' ;;
 		service) printf '%s' 'domain port service' ;;
+		auth) printf '%s' 'auth' ;;
 		file) printf '%s' 'domain port file' ;;
 		java) printf '%s' 'domain port java' ;;
 		provider) printf '%s' 'domain port provider' ;;

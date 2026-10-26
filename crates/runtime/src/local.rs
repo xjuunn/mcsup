@@ -2,10 +2,9 @@
 use crate::client;
 use crate::endpoint;
 use domain::server::layout::run_dir;
-use port::{StopOutcome, StopSpec, SupervisorError, SupervisorPort};
+use port::{ServerRef, StopOutcome, StopSpec, SupervisorError, SupervisorPort};
 use port::{SupervisorStartOutcome, SupervisorStartRequest, SupervisorStatus};
 use protocol::{Request, Response, StopResult};
-use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -116,10 +115,10 @@ impl SupervisorPort for LocalSupervisor {
         Ok(SupervisorStartOutcome { supervisor_pid })
     }
 
-    fn stop(&self, server_dir: &Path, spec: StopSpec) -> Result<StopOutcome, SupervisorError> {
+    fn stop(&self, server: &ServerRef<'_>, spec: StopSpec) -> Result<StopOutcome, SupervisorError> {
         let timeout = spec.grace + Duration::from_secs(10);
         let response = client::rpc(
-            server_dir,
+            server.dir()?,
             Request::Stop {
                 grace_secs: spec.grace.as_secs(),
                 force: spec.force,
@@ -147,13 +146,13 @@ impl SupervisorPort for LocalSupervisor {
         }
     }
 
-    fn status(&self, server_dir: &Path) -> Result<Option<SupervisorStatus>, SupervisorError> {
-        client::probe_status(server_dir)
+    fn status(&self, server: &ServerRef<'_>) -> Result<Option<SupervisorStatus>, SupervisorError> {
+        client::probe_status(server.dir()?)
     }
 
-    fn send_line(&self, server_dir: &Path, line: &str) -> Result<(), SupervisorError> {
+    fn send_line(&self, server: &ServerRef<'_>, line: &str) -> Result<(), SupervisorError> {
         let response = client::rpc(
-            server_dir,
+            server.dir()?,
             Request::Send {
                 line: line.to_owned(),
             },
@@ -163,8 +162,8 @@ impl SupervisorPort for LocalSupervisor {
         Ok(())
     }
 
-    fn shutdown(&self, server_dir: &Path) -> Result<(), SupervisorError> {
-        let response = client::rpc(server_dir, Request::Shutdown, Duration::from_secs(3))?;
+    fn shutdown(&self, server: &ServerRef<'_>) -> Result<(), SupervisorError> {
+        let response = client::rpc(server.dir()?, Request::Shutdown, Duration::from_secs(3))?;
         client::unwrap_ok(response)?;
         Ok(())
     }
