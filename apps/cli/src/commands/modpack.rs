@@ -19,7 +19,6 @@ use crate::output::Printer;
 use crate::progress::{BarSink, TaskSpinner};
 use crate::prompts::{Backable, ScopeHint, ScopedChoice, select_filter_backable};
 use anyhow::{Context, Result};
-use comfy_table::{ContentArrangement, Table};
 use mcsup::port::CancellationToken;
 use mcsup::port::modpack::{ModpackDetail, ModpackQuery, ModpackVersion};
 use mcsup::service::ModpackInstallOptions;
@@ -57,22 +56,15 @@ enum Wizard {
     Search,
     /// 浏览一页搜索结果
     Results { keyword: Option<String>, page: u32 },
-    /// 查看详情（Esc 回到结果页）
-    Detail {
+    /// 已选定整合包：详情与版本列表在同一屏（Esc 回到结果页）
+    Modpack {
         id: String,
-        keyword: Option<String>,
-        page: u32,
-    },
-    /// 选择版本（Esc 回到详情页）
-    Version {
-        id: String,
-        title: String,
         keyword: Option<String>,
         page: u32,
     },
 }
 
-/// 选择整合包：搜索 → 结果 → 详情 → 版本 → 确认
+/// 选择整合包：搜索 → 结果 → 详情并选版本
 ///
 /// 交互路径由 [`Wizard`] 驱动，Esc 逐级返回；`--modpack` 给出项目时跳过
 /// 搜索与详情，直接选版本。非交互模式必须用 `--modpack` 指定项目，否则
@@ -154,38 +146,25 @@ async fn run_wizard(
                         keyword,
                         page: next,
                     },
-                    Browse::Pick(id) => Wizard::Detail { id, keyword, page },
+                    Browse::Pick(id) => Wizard::Modpack { id, keyword, page },
                 }
             }
-            Wizard::Detail { id, keyword, page } => {
+            Wizard::Modpack { id, keyword, page } => {
+                // 详情与版本同屏：先打印数据行，紧接着进入版本选择，不再多问
+                // 一次「下一步」
                 let spinner = TaskSpinner::new(format!("获取 {id} 详情"), printer.is_human());
                 let detail = service.select_source(None)?.detail(&id).await;
                 spinner.finish();
                 let detail = detail.context("获取整合包详情失败")?;
                 print_detail(&detail, printer)?;
                 let title = detail.summary.title.clone();
-                if continue_or_back(printer.lang(), "查看版本")? {
-                    Wizard::Version {
-                        id,
-                        title,
-                        keyword,
-                        page,
-                    }
-                } else {
-                    Wizard::Results { keyword, page }
-                }
-            }
-            Wizard::Version {
-                id,
-                title,
-                keyword,
-                page,
-            } => {
+
                 let spinner = TaskSpinner::new(format!("获取 {title} 版本"), printer.is_human());
                 let versions = service.select_source(None)?.versions(&id).await;
                 spinner.finish();
                 let versions = versions.context("获取整合包版本失败")?;
-                // `--version` 已指定则直接取，不进入交互；否则逐版选择
+
+                // `--version` 已指定则直接取；否则逐版选择（Esc 回结果页）
                 let picked = if let Some(hint) = version_hint {
                     versions
                         .into_iter()
@@ -193,26 +172,12 @@ async fn run_wizard(
                         .ok_or_else(|| anyhow::anyhow!("整合包 {id} 没有版本 {hint}"))?
                 } else {
                     let Some(version) = pick_version_backable(printer.lang(), &versions)? else {
-                        state = Wizard::Detail { id, keyword, page };
+                        state = Wizard::Results { keyword, page };
                         continue;
                     };
                     version
                 };
-                if !confirm_build(printer.lang(), &title, &picked)? {
-                    // 未指定版本时回到版本列表重选；`--version` 已固定版本，
-                    // 此时「返回」只能回到详情页
-                    state = if version_hint.is_some() {
-                        Wizard::Detail { id, keyword, page }
-                    } else {
-                        Wizard::Version {
-                            id,
-                            title,
-                            keyword,
-                            page,
-                        }
-                    };
-                    continue;
-                }
+                // 选中版本即开始创建，不再额外确认
                 return finish_pick(service, &id, &title, picked).await;
             }
         };
@@ -258,12 +223,16 @@ async fn browse_results(
         }
     }
 
-    let labels: Vec<String> = search
+    let hits: Vec<ScopedChoice> = search
         .hits
         .iter()
-        .map(|hit| format!("{} · {}", hit.title, hit.id))
+        .map(|hit| {
+            ScopedChoice::new(format!("{} · {}", hit.title, hit.id), false)
+                .with_prefix(hit.id.clone())
+                .with_display(hit.title.clone())
+        })
         .collect();
-    let choices = result_choices(&labels, search.offset, search.total, page);
+    let choices = result_choices(hits, search.offset, search.total, page);
 
     let label = format!(
         "选择整合包 · 第 {} 页 · 共 {} 个支持服务端",
@@ -284,12 +253,13 @@ async fn browse_results(
 ///
 /// 翻页项是否出现只由 `offset + len` 与 `total` 决定，与网络无关，因此抽成
 /// 纯函数单独测试。
-fn result_choices(labels: &[String], offset: u32, total: u64, page: u32) -> Vec<ScopedChoice> {
-    let mut choices: Vec<ScopedChoice> = labels
-        .iter()
-        .map(|label| ScopedChoice::new(label.clone(), false))
-        .collect();
-    let more = u64::from(offset) + labels.len() as u64;
+fn result_choices(
+    mut choices: Vec<ScopedChoice>,
+    offset: u32,
+    total: u64,
+    page: u32,
+) -> Vec<ScopedChoice> {
+    let more = u64::from(offset) + choices.len() as u64;
     if more < total {
         choices.push(ScopedChoice::new(NEXT_PAGE, false));
     }
@@ -297,34 +267,6 @@ fn result_choices(labels: &[String], offset: u32, total: u64, page: u32) -> Vec<
         choices.push(ScopedChoice::new(PREV_PAGE, false));
     }
     choices
-}
-
-/// 继续 / 返回上一步
-///
-/// 用在「详情已展示、要不要进入下一步」这类没有选择项的位置。Esc 与
-/// 选中「返回上一步」等价。
-fn continue_or_back(lang: crate::locale::Lang, next: &str) -> Result<bool> {
-    let choices = [
-        ScopedChoice::new(format!("继续{next}"), false),
-        ScopedChoice::new("返回上一步", false),
-    ];
-    match select_filter_backable(lang, "下一步", &choices, no_scope())? {
-        Backable::Back => Ok(false),
-        Backable::Picked(picked) => Ok(picked != "返回上一步"),
-    }
-}
-
-/// 建站前确认：Esc 返回上一步
-fn confirm_build(lang: crate::locale::Lang, title: &str, version: &ModpackVersion) -> Result<bool> {
-    let choices = [
-        ScopedChoice::new("开始创建", false),
-        ScopedChoice::new("返回上一步", false),
-    ];
-    let label = format!("将用 {title} {} 创建服务端", version.version_number);
-    match select_filter_backable(lang, &label, &choices, no_scope())? {
-        Backable::Back => Ok(false),
-        Backable::Picked(picked) => Ok(picked == "开始创建"),
-    }
 }
 
 /// 无范围切换时的占位提示
@@ -376,12 +318,7 @@ fn prompt_keyword(printer: Printer) -> Result<Option<String>> {
     if !printer.is_interactive() {
         return Ok(None);
     }
-    let keyword = crate::prompts::input_text(
-        printer.lang(),
-        "搜索整合包",
-        "",
-        "只显示支持服务端的整合包；回车浏览热门",
-    )?;
+    let keyword = crate::prompts::input_text(printer.lang(), "搜索整合包", "", "")?;
     if keyword.trim().is_empty() {
         Ok(None)
     } else {
@@ -414,42 +351,36 @@ struct DetailJson<'a> {
 }
 
 /// 展示整合包详情
+///
+/// 人类可读模式每行一个字段，不使用表格：版本选择会紧接在同一屏出现，
+/// 表格边框只会挤占宽度。
 fn print_detail(detail: &ModpackDetail, printer: Printer) -> Result<()> {
     let summary = &detail.summary;
-    let mut table = Table::new();
-    table.set_content_arrangement(ContentArrangement::Dynamic);
-    table.set_header(["项", "值"]);
-    table.add_row(["标题", summary.title.as_str()]);
-    table.add_row(["ID", summary.id.as_str()]);
-    if let Some(slug) = summary.slug.as_deref() {
-        table.add_row(["slug", slug]);
-    }
-    if let Some(author) = summary.author.as_deref() {
-        table.add_row(["作者", author]);
-    }
-    table.add_row(["加载器", &summary.loaders.join(", ")]);
-    table.add_row(["游戏版本", &join_versions(&summary.game_versions)]);
-    table.add_row(["下载量", &summary.downloads.to_string()]);
-    if let Some(license) = summary.license.as_deref() {
-        table.add_row(["许可证", license]);
-    }
-    table.add_row(["来源", detail.source_name]);
-    table.add_row(["页面", detail.page_url.as_str()]);
-    table.add_row(["简介", summary.description.as_str()]);
 
     if printer.is_human() {
-        crate::output::print_table(&table);
-        // 长描述只取前几行：终端里刷几百行 Markdown 没有意义
-        let excerpt: String = detail
-            .body
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .take(6)
-            .collect::<Vec<_>>()
-            .join("\n");
-        if !excerpt.is_empty() {
-            printer.print_section(&excerpt);
+        let mut lines = vec![
+            format!("标题: {}", summary.title),
+            format!("ID: {}", summary.id),
+        ];
+        if let Some(slug) = summary.slug.as_deref() {
+            lines.push(format!("slug: {slug}"));
         }
+        if let Some(author) = summary.author.as_deref() {
+            lines.push(format!("作者: {author}"));
+        }
+        lines.push(format!("加载器: {}", summary.loaders.join(", ")));
+        lines.push(format!(
+            "游戏版本: {}",
+            join_versions(&summary.game_versions)
+        ));
+        lines.push(format!("下载量: {}", summary.downloads));
+        if let Some(license) = summary.license.as_deref() {
+            lines.push(format!("许可证: {license}"));
+        }
+        lines.push(format!("来源: {}", detail.source_name));
+        lines.push(format!("页面: {}", detail.page_url));
+        lines.push(format!("简介: {}", summary.description));
+        printer.print_section(&lines.join("\n"));
         return Ok(());
     }
     // JSON：输出详情对象，供脚本读取
@@ -676,24 +607,37 @@ mod tests {
         assert_eq!(extract_id("bad · "), None);
     }
 
+    fn hit(id: &str, title: &str) -> ScopedChoice {
+        ScopedChoice::new(format!("{title} · {id}"), false)
+            .with_prefix(id)
+            .with_display(title)
+    }
+
     #[test]
     fn result_choices_adds_next_only_when_more_remain() {
-        let labels = vec!["A · 1".to_owned(), "B · 2".to_owned()];
-        let first = result_choices(&labels, 0, 3, 0);
+        let hits = vec![hit("1", "A"), hit("2", "B")];
+        let first = result_choices(hits.clone(), 0, 3, 0);
         assert_eq!(first.len(), 3);
         assert_eq!(first[2].label, NEXT_PAGE);
         assert!(!first.iter().any(|c| c.label == PREV_PAGE));
 
-        let last = result_choices(&labels, 2, 3, 1);
+        let last = result_choices(hits, 2, 3, 1);
         assert!(!last.iter().any(|c| c.label == NEXT_PAGE));
         assert_eq!(last.last().map(|c| c.label.as_str()), Some(PREV_PAGE));
     }
 
     #[test]
     fn result_choices_has_no_pager_when_everything_fits() {
-        let labels = vec!["A · 1".to_owned()];
-        let choices = result_choices(&labels, 0, 1, 0);
+        let choices = result_choices(vec![hit("1", "A")], 0, 1, 0);
         assert_eq!(choices.len(), 1);
+    }
+
+    #[test]
+    fn hit_choice_renders_id_first_and_submits_full_label() {
+        let choice = hit("l9m9tuPN", "Zombie Invade 100 Days");
+        assert_eq!(choice.prefix.as_deref(), Some("l9m9tuPN"));
+        assert_eq!(choice.display.as_deref(), Some("Zombie Invade 100 Days"));
+        assert_eq!(extract_id(&choice.label).as_deref(), Some("l9m9tuPN"));
     }
 
     #[test]
