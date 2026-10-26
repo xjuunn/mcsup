@@ -12,11 +12,12 @@
 //! 本地操作（`docs/remote.md`「设计原则 4」），离线缓存的 `(offline)` 标记
 //! 由入口渲染层负责。
 //!
-//! 写：**只落本地**。远端写走镜像仓库的显式方法（`init` / `create` /
-//! `remove` …），由入口的路由层按「目标资源的来源」决定调用方——组合仓库
-//! 拒绝所有远端写入而不是静默吞掉，宁可报错也不产生「写成功了但写错机器」
-//! 的中间态。名字解析（含 `origin/name` 限定名）在入口的 `Selector` 层完成，
-//! 这里不重复一套判定。
+//! 写：**委托本地**。能到达组合仓库的写调用只有两类：service 的本地操作
+//! （`WorkspaceService::init`、`JavaService` 扫描登记……）与本地注册表维护，
+//! 二者目标都是本机，直接委托本地仓库；远端写**不会**经过这里——入口的
+//! 路由层按目标来源把它分派给镜像仓库的显式方法（`init` / `create` /
+//! `remove` …）。这条约定不靠组合仓库强制（拒绝会误伤本地写），而由路由层
+//! 的分派保证：镜像方法是远端写的唯一通道。
 //!
 //! # 线程模型
 //!
@@ -137,10 +138,15 @@ impl CombinedWorkspaceRepository {
 }
 
 impl WorkspaceRepository for CombinedWorkspaceRepository {
-    fn create(&self, _ws: &Workspace) -> Result<(), RepositoryError> {
-        Err(RepositoryError::Storage(Box::new(std::io::Error::other(
-            "workspace creation must go through the routing layer (local service or remote mirror)",
-        ))))
+    /// 经由本仓库的创建就是本地创建
+    ///
+    /// 路由规则：service（`WorkspaceService::init` 等）到达这里时目标必然是
+    /// 本机——远端写由入口的路由层截走，走镜像仓库的显式方法（`init` /
+    /// `set_current` / `remove`），根本不会到达组合仓库。因此这里把写**委托
+    /// 给本地仓库**而不是拒绝：拒绝会把「有远端接入」变成「本地不能建工作区」，
+    /// 这不是任何人想要的行为。
+    fn create(&self, ws: &Workspace) -> Result<(), RepositoryError> {
+        self.local.create(ws)
     }
 
     fn get(&self, id: &WorkspaceId) -> Result<Workspace, RepositoryError> {
@@ -188,16 +194,16 @@ impl WorkspaceRepository for CombinedWorkspaceRepository {
         Ok(None)
     }
 
-    fn set_current(&self, _id: &WorkspaceId) -> Result<(), RepositoryError> {
-        Err(RepositoryError::Storage(Box::new(std::io::Error::other(
-            "set_current must go through the routing layer (local service or remote mirror)",
-        ))))
+    /// 本地优先：远端的「当前工作区」是对端状态，不由本机写路径切换
+    ///
+    /// service（`WorkspaceService::set_current`）到达这里的调用目标是本机
+    /// 当前工作区（同 [`Self::create`] 的路由规则），委托本地。
+    fn set_current(&self, id: &WorkspaceId) -> Result<(), RepositoryError> {
+        self.local.set_current(id)
     }
 
-    fn remove(&self, _id: &WorkspaceId) -> Result<(), RepositoryError> {
-        Err(RepositoryError::Storage(Box::new(std::io::Error::other(
-            "workspace removal must go through the routing layer",
-        ))))
+    fn remove(&self, id: &WorkspaceId) -> Result<(), RepositoryError> {
+        self.local.remove(id)
     }
 
     fn relink_path(
@@ -249,10 +255,9 @@ impl CombinedServerRepository {
 }
 
 impl ServerRepository for CombinedServerRepository {
-    fn create(&self, _meta: &ServerMeta) -> Result<(), RepositoryError> {
-        Err(RepositoryError::Storage(Box::new(std::io::Error::other(
-            "server creation must go through the routing layer (local service or remote mirror)",
-        ))))
+    /// 经由本仓库的创建就是本地创建（路由规则见 [`CombinedWorkspaceRepository::create`]）
+    fn create(&self, meta: &ServerMeta) -> Result<(), RepositoryError> {
+        self.local.create(meta)
     }
 
     fn get(&self, name: &ServerName) -> Result<ServerMeta, RepositoryError> {
@@ -277,39 +282,38 @@ impl ServerRepository for CombinedServerRepository {
 
     fn update_core(
         &self,
-        _name: &ServerName,
-        _version: &VersionId,
-        _jar: &InstalledJar,
-        _launch: Option<&LaunchSpec>,
-        _required_java_major: Option<JavaMajor>,
-        _updated_at: i64,
+        name: &ServerName,
+        version: &VersionId,
+        jar: &InstalledJar,
+        launch: Option<&LaunchSpec>,
+        required_java_major: Option<JavaMajor>,
+        updated_at: i64,
     ) -> Result<ServerMeta, RepositoryError> {
-        Err(RepositoryError::Storage(Box::new(std::io::Error::other(
-            "core installation must go through the routing layer",
-        ))))
+        // 注册表先 get 再 update_core：get 命中远端条目时 update 也属于远端，
+        // 但远端核心安装走 agent 的 service（阶段 8 的路由层），这里只可能
+        // 收到本地服务器的更新——get 已确认本地存在则委托，否则透传错误
+        self.local.get(name)?;
+        self.local
+            .update_core(name, version, jar, launch, required_java_major, updated_at)
     }
 
     fn update_settings(
         &self,
-        _name: &ServerName,
-        _settings: &ServerSettings,
-        _updated_at: i64,
+        name: &ServerName,
+        settings: &ServerSettings,
+        updated_at: i64,
     ) -> Result<ServerMeta, RepositoryError> {
-        Err(RepositoryError::Storage(Box::new(std::io::Error::other(
-            "settings updates must go through the routing layer",
-        ))))
+        self.local.get(name)?;
+        self.local.update_settings(name, settings, updated_at)
     }
 
-    fn remove(&self, _name: &ServerName) -> Result<(), RepositoryError> {
-        Err(RepositoryError::Storage(Box::new(std::io::Error::other(
-            "server removal must go through the routing layer",
-        ))))
+    fn remove(&self, name: &ServerName) -> Result<(), RepositoryError> {
+        self.local.get(name)?;
+        self.local.remove(name)
     }
 
-    fn remove_by_workspace(&self, _workspace_id: &WorkspaceId) -> Result<(), RepositoryError> {
-        Err(RepositoryError::Storage(Box::new(std::io::Error::other(
-            "workspace removal must go through the routing layer",
-        ))))
+    fn remove_by_workspace(&self, workspace_id: &WorkspaceId) -> Result<(), RepositoryError> {
+        self.local.remove_by_workspace(workspace_id)
     }
 
     fn relink(
@@ -362,10 +366,9 @@ impl CombinedJavaRepository {
 }
 
 impl JavaRuntimeRepository for CombinedJavaRepository {
-    fn upsert(&self, _runtime: &JavaRuntime) -> Result<(), RepositoryError> {
-        Err(RepositoryError::Storage(Box::new(std::io::Error::other(
-            "JVM registration must go through the routing layer",
-        ))))
+    /// 经由本仓库的登记就是本地登记（JavaService 的扫描 / 安装在本机发生）
+    fn upsert(&self, runtime: &JavaRuntime) -> Result<(), RepositoryError> {
+        self.local.upsert(runtime)
     }
 
     fn list(&self) -> Result<Vec<JavaRuntime>, RepositoryError> {
@@ -388,10 +391,8 @@ impl JavaRuntimeRepository for CombinedJavaRepository {
             .ok_or_else(|| RepositoryError::NotFound(path.display().to_string()))
     }
 
-    fn remove(&self, _path: &std::path::Path) -> Result<(), RepositoryError> {
-        Err(RepositoryError::Storage(Box::new(std::io::Error::other(
-            "JVM removal must go through the routing layer",
-        ))))
+    fn remove(&self, path: &std::path::Path) -> Result<(), RepositoryError> {
+        self.local.remove(path)
     }
 
     fn scan_state(&self) -> Result<Option<i64>, RepositoryError> {
@@ -508,6 +509,26 @@ mod tests {
                 .map(|ws| ws.name.as_str().to_owned()),
             Some("w1".to_owned())
         );
+    }
+
+    /// service 的本地写（`create` / `set_current` / `remove`）委托给本地仓库：
+    /// 有远端接入时本地命令语义不变
+    #[test]
+    fn local_writes_delegate_to_local_repo() {
+        let mem = Arc::new(MemWorkspaces(Mutex::new(Vec::new())));
+        let combined = CombinedWorkspaceRepository::new(mem.clone(), RemoteMembers::empty());
+
+        let ws = workspace("w1", false);
+        combined.create(&ws).expect("create delegates");
+        assert_eq!(mem.list().expect("mem").len(), 1);
+
+        let id = ws.id.clone();
+        combined.set_current(&id).expect("set_current delegates");
+        let current = combined.current().expect("current");
+        assert_eq!(current.map(|ws| ws.id), Some(id.clone()));
+
+        combined.remove(&id).expect("remove delegates");
+        assert!(mem.list().expect("mem").is_empty());
     }
 
     /// 远端不可达时不拖垮列表：本地条目照常返回
