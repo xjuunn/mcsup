@@ -19,16 +19,10 @@ use crate::{PARTIAL_FILE, SNAPSHOT_FILE, SNAPSHOTS_DIR};
 /// 快照记录格式版本
 const SNAPSHOT_SCHEMA: u32 = 1;
 
-/// `{workspace}/backups`
-#[must_use]
-pub fn workspace_backups_root(workspace_path: &Path) -> PathBuf {
-    workspace_path.join("backups")
-}
-
 /// `{workspace}/backups/snapshots/<id>`
 #[must_use]
 pub fn snapshot_dir(workspace_path: &Path, id: &SnapshotId) -> PathBuf {
-    workspace_backups_root(workspace_path)
+    port::workspace_backups_root(workspace_path)
         .join(SNAPSHOTS_DIR)
         .join(id.as_str())
 }
@@ -324,6 +318,14 @@ fn placeholder(id: &SnapshotId) -> Snapshot {
 }
 
 impl SnapshotRepository for SnapshotIndex {
+    fn begin(&self, id: &SnapshotId) -> Result<(), SnapshotStoreError> {
+        Self::begin(self, id)
+    }
+
+    fn complete(&self, snapshot: &Snapshot) -> Result<(), SnapshotStoreError> {
+        Self::complete(self, snapshot)
+    }
+
     fn save(&self, snapshot: &Snapshot) -> Result<(), SnapshotStoreError> {
         let dir = self.dir_of(&snapshot.id);
         fs::create_dir_all(&dir).map_err(|err| storage(&dir, err))?;
@@ -406,6 +408,7 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), SnapshotStoreError>
 mod tests {
     use super::*;
     use domain::backup::SnapshotContent;
+    use port::workspace_backups_root;
 
     fn index() -> (tempfile::TempDir, SnapshotIndex) {
         let dir = tempfile::tempdir().expect("tempdir");

@@ -8,14 +8,13 @@ publish = false
 
 [dependencies]
 async-trait.workspace = true
-backup = { version = "0.1.0", path = "../backup" }
 dirs.workspace = true
 domain = { version = "0.1.0", path = "../domain" }
 port = { version = "0.1.0", path = "../port" }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["time", "macros"] }
+tokio = { workspace = true, features = ["time", "macros", "rt"] }
 toml.workspace = true
 tracing.workspace = true
 url.workspace = true
@@ -25,6 +24,7 @@ uuid.workspace = true
 workspace = true
 
 [dev-dependencies]
+backup = { version = "0.1.0", path = "../backup" }
 service = { version = "0.1.0", path = "." }
 storage = { version = "0.1.0", path = "../storage" }
 tempfile.workspace = true

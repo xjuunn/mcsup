@@ -1,4 +1,4 @@
-use domain::backup::{ContentHash, RelPath, Snapshot, SnapshotId};
+use domain::backup::{BackupScope, ContentHash, RelPath, Snapshot, SnapshotId};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -125,6 +125,23 @@ pub enum SnapshotStoreError {
 /// 「写入中的快照」先以「写入中」状态落盘，写完再改状态，
 /// 这样进程中断后索引里留下的是一条可识别的失败记录，而不是消失的幽灵。
 pub trait SnapshotRepository: Send + Sync {
+    /// 标记一次快照写入开始（建占位目录 / 「写入中」标记）
+    ///
+    /// 与 [`Self::complete`] 成对使用：`begin` 之后到 `complete` 之前崩溃，
+    /// 索引里留下的是可识别的失败记录。实现保证两标记幂等。
+    ///
+    /// # Errors
+    ///
+    /// 底层失败返回 [`SnapshotStoreError::Storage`]
+    fn begin(&self, id: &SnapshotId) -> Result<(), SnapshotStoreError>;
+
+    /// 标记一次快照写入完成（写记录并清除「写入中」标记）
+    ///
+    /// # Errors
+    ///
+    /// 底层失败返回 [`SnapshotStoreError::Storage`]
+    fn complete(&self, snapshot: &Snapshot) -> Result<(), SnapshotStoreError>;
+
     /// 写入（覆盖）一条快照记录
     ///
     /// # Errors
@@ -160,6 +177,157 @@ pub trait SnapshotRepository: Send + Sync {
     ///
     /// 底层失败返回 [`SnapshotStoreError::Storage`]
     fn remove(&self, id: &SnapshotId) -> Result<(), SnapshotStoreError>;
+}
+
+/// `{workspace}/backups`：工作区共享的备份根目录
+///
+/// 布局是产品口径（CAS 与快照按工作区共享），与实现无关，因此由契约层
+/// 给出；实现层只按此根装配 `cas/` 与 `snapshots/`。
+#[must_use]
+pub fn workspace_backups_root(workspace_path: &Path) -> PathBuf {
+    workspace_path.join("backups")
+}
+
+/// 运行期文件 / 目录：不进备份
+///
+/// `console.log` 与 `run/` 由 supervisor 在服务器运行期间持续写入，复制它们
+/// 既不稳定也没有恢复价值。
+pub const RUNTIME_ENTRIES: &[&str] = &["run", "console.log"];
+
+/// 扫描规则
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScanRules {
+    /// 备份范围；缺省 = 整个目录
+    pub scope: BackupScope,
+    /// 扫描时优先信任 `(size, mtime)` 而跳过重算的条目
+    ///
+    /// 增量备份的优化：父快照里同路径、同大小、同 mtime 的文件直接复用
+    /// 哈希，省掉一次完整读取。内容被原地改写但大小与 mtime 都不变的情况
+    /// 在 MC 世界里不会发生（Region 文件追加写会改 mtime）。
+    pub reuse: Vec<(RelPath, ContentHash, u64, i64)>,
+}
+
+/// 跳过原因
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SkipReason {
+    /// 符号链接（不跟随）
+    Symlink,
+    /// 非常规文件（设备 / 管道 / 套接字）
+    NotRegularFile,
+    /// 运行期条目（`run/` / `console.log`）
+    Runtime,
+    /// 不在备份范围内
+    OutOfScope,
+}
+
+impl SkipReason {
+    /// 稳定文本口径（日志 / 统计用）
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Symlink => "symlink",
+            Self::NotRegularFile => "not_regular_file",
+            Self::Runtime => "runtime",
+            Self::OutOfScope => "out_of_scope",
+        }
+    }
+}
+
+/// 被跳过的一项
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Skipped {
+    /// 相对路径
+    pub path: RelPath,
+    /// 跳过原因
+    pub reason: SkipReason,
+}
+
+/// 扫描结果
+#[derive(Debug, Clone, Default)]
+pub struct ScanOutcome {
+    /// 条目（按路径升序）
+    pub entries: Vec<(RelPath, ContentHash)>,
+    /// 每个文件的 `(路径, 大小, mtime 秒)`：下次备份的复用提示来源
+    pub stamps: Vec<(RelPath, u64, i64)>,
+    /// 被跳过的条目
+    pub skipped: Vec<Skipped>,
+    /// 内容总字节数
+    pub total_bytes: u64,
+    /// 本次真正读盘并写入 CAS 的字节数
+    pub written_bytes: u64,
+    /// 新写入的 CAS 对象数
+    pub added: usize,
+}
+
+/// 目录扫描失败
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum ScanError {
+    /// 目录不可读
+    #[error("cannot read directory {path}: {source}")]
+    Unreadable {
+        /// 目录
+        path: PathBuf,
+        /// 底层错误
+        #[source]
+        source: std::io::Error,
+    },
+    /// 路径无法转为相对路径（非法文件名 / 越界）
+    #[error(transparent)]
+    InvalidPath(#[from] domain::backup::InvalidRelPath),
+    /// 文件不可读
+    #[error("cannot read file {path}: {source}")]
+    UnreadableFile {
+        /// 文件
+        path: PathBuf,
+        /// 底层错误
+        #[source]
+        source: std::io::Error,
+    },
+    /// CAS 写入失败
+    #[error(transparent)]
+    Cas(#[from] CasError),
+}
+
+/// 目录扫描器：把服务器目录转成「相对路径 → 内容哈希」并写入 CAS
+///
+/// 扫描是备份的热路径，实现必须满足的口径（不止一处实现要一致）：
+/// - 不跟随符号链接
+/// - 跳过运行期条目（[`RUNTIME_ENTRIES`]）
+/// - 按 [`ScanRules::scope`] 过滤，且过滤发生在读取文件之前
+/// - [`ScanRules::reuse`] 命中时跳过读盘，仅当 `(路径, 大小, mtime)` 全等
+pub trait Scanner: Send + Sync {
+    /// 扫描 `root` 并把每个文件的字节写进 `store`
+    ///
+    /// `on_file` 在每个文件处理完时回调（已处理文件数），供入口画进度。
+    ///
+    /// # Errors
+    ///
+    /// 目录不可读、路径非法或 CAS 写入失败时返回 [`ScanError`]
+    fn scan(
+        &self,
+        root: &Path,
+        store: &dyn ContentStore,
+        rules: &ScanRules,
+        on_file: &mut dyn FnMut(usize),
+    ) -> Result<ScanOutcome, ScanError>;
+}
+
+/// 备份数据能力：扫描器 + 内容寻址存储 + 快照索引
+///
+/// 与 [`crate::Backend`] 分开：这是「数据存在哪里 / 怎么存」，不是「在哪
+/// 台机器执行」。Local 用本地文件系统实现，Remote 将来可换成远端对象存储，
+/// 二者互不影响。按工作区备份根目录给出实例，让一次编排内复用。
+pub trait BackupStore: Send + Sync {
+    /// 目录扫描器
+    fn scanner(&self) -> &dyn Scanner;
+
+    /// 按工作区备份根目录给出内容寻址存储
+    fn content_store(&self, backups_root: &Path) -> std::sync::Arc<dyn ContentStore>;
+
+    /// 按工作区备份根目录给出快照索引
+    fn snapshot_repository(&self, backups_root: &Path) -> std::sync::Arc<dyn SnapshotRepository>;
 }
 
 #[cfg(test)]

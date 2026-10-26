@@ -11,8 +11,8 @@ use domain::server::eula::{EULA_FILE, eula_accepted, render_eula};
 use domain::server::layout::console_log_path;
 use domain::server::version::VersionId;
 use port::{
-    CancellationToken, CoreInspector, ProgressSink, ScannedJava, StopOutcome, StopSpec,
-    SupervisorError, SupervisorPort, SupervisorStartOutcome, SupervisorStartRequest,
+    Backend, CancellationToken, CoreInspector, EventSink, NoopEventSink, ProgressSink, ScannedJava,
+    StopOutcome, StopSpec, SupervisorError, SupervisorStartOutcome, SupervisorStartRequest,
     SupervisorStatus,
 };
 use std::collections::HashMap;
@@ -50,6 +50,10 @@ pub struct StartOptions {
     pub ram_mib: Option<u32>,
     /// 拉起 supervisor 的可执行文件（`mcsup` 本体）
     pub supervisor_exe: PathBuf,
+    /// supervisor 可执行文件的前置子命令（如 `["__supervise"]`）
+    ///
+    /// 由入口填写，service 只透传给 [`SupervisorStartRequest`]，不解释其含义。
+    pub supervisor_args: Vec<std::ffi::OsString>,
 }
 
 /// 生命周期操作失败
@@ -190,7 +194,8 @@ pub enum LifecycleErrorKind<'a> {
 pub struct ServerLifecycleService {
     registry: Arc<ServerRegistry>,
     java: JavaService,
-    supervisor: Arc<dyn SupervisorPort>,
+    backend: Arc<dyn Backend>,
+    events: Arc<dyn EventSink>,
 }
 
 impl std::fmt::Debug for ServerLifecycleService {
@@ -204,17 +209,29 @@ impl std::fmt::Debug for ServerLifecycleService {
 }
 
 impl ServerLifecycleService {
-    /// 组合依赖
+    /// 组合依赖（无事件消费者）
     #[must_use]
     pub fn new(
         registry: Arc<ServerRegistry>,
         java: JavaService,
-        supervisor: Arc<dyn SupervisorPort>,
+        backend: Arc<dyn Backend>,
+    ) -> Self {
+        Self::with_events(registry, java, backend, Arc::new(NoopEventSink))
+    }
+
+    /// 组合依赖并注入领域事件出口
+    #[must_use]
+    pub fn with_events(
+        registry: Arc<ServerRegistry>,
+        java: JavaService,
+        backend: Arc<dyn Backend>,
+        events: Arc<dyn EventSink>,
     ) -> Self {
         Self {
             registry,
             java,
-            supervisor,
+            backend,
+            events,
         }
     }
 
@@ -235,7 +252,7 @@ impl ServerLifecycleService {
         on_found: &mut dyn FnMut(&ScannedJava),
     ) -> Result<SupervisorStartOutcome, LifecycleError> {
         let server = self.registry.get(name)?;
-        if let Some(status) = self.supervisor.status(&server.dir)?
+        if let Some(status) = self.backend.supervisor().status(&server.dir)?
             && status.status.is_alive()
         {
             return Err(LifecycleError::AlreadyRunning);
@@ -269,11 +286,21 @@ impl ServerLifecycleService {
             // 优先级：显式选项 > 服务属性（server set ram）> 平台默认
             ram_mib: Some(opts.ram_mib.or(settings.ram_mib).unwrap_or(DEFAULT_RAM_MIB)),
             supervisor_exe: opts.supervisor_exe.clone(),
+            supervisor_args: opts.supervisor_args.clone(),
         };
-        self.supervisor.start(request).map_err(|err| match err {
-            SupervisorError::AlreadyRunning => LifecycleError::AlreadyRunning,
-            other => LifecycleError::Supervisor(other),
-        })
+        let outcome = self
+            .backend
+            .supervisor()
+            .start(request)
+            .map_err(|err| match err {
+                SupervisorError::AlreadyRunning => LifecycleError::AlreadyRunning,
+                other => LifecycleError::Supervisor(other),
+            })?;
+        self.events
+            .publish(domain::server::event::DomainEvent::ServerStarting {
+                name: name.to_owned(),
+            });
+        Ok(outcome)
     }
 
     /// 停机：不在运行视为幂等成功；宽限到期映射为 [`LifecycleError::StopTimedOut`]
@@ -283,12 +310,18 @@ impl ServerLifecycleService {
     /// supervisor 无响应、协议失败或宽限超时
     pub fn stop(&self, name: &str, spec: StopSpec) -> Result<StopOutcome, LifecycleError> {
         let server = self.registry.get(name)?;
-        if self.supervisor.status(&server.dir)?.is_none() {
+        if self.backend.supervisor().status(&server.dir)?.is_none() {
             return Ok(StopOutcome::AlreadyStopped);
         }
-        match self.supervisor.stop(&server.dir, spec)? {
+        match self.backend.supervisor().stop(&server.dir, spec)? {
             StopOutcome::TimedOut { waited } => Err(LifecycleError::StopTimedOut { waited }),
-            other => Ok(other),
+            other => {
+                self.events
+                    .publish(domain::server::event::DomainEvent::ServerStopped {
+                        name: name.to_owned(),
+                    });
+                Ok(other)
+            }
         }
     }
 
@@ -415,7 +448,8 @@ impl ServerLifecycleService {
     fn ensure_stopped(&self, name: &str, op: BusyOp) -> Result<(), LifecycleError> {
         let server = self.registry.get(name)?;
         if self
-            .supervisor
+            .backend
+            .supervisor()
             .status(&server.dir)?
             .is_some_and(|s| s.status.is_alive())
         {
@@ -444,7 +478,8 @@ impl ServerLifecycleService {
                 continue;
             }
             if self
-                .supervisor
+                .backend
+                .supervisor()
                 .status(&srv.dir)?
                 .is_some_and(|s| s.status.is_alive())
             {
@@ -464,7 +499,7 @@ impl ServerLifecycleService {
     /// 注册表或 supervisor 协议失败
     pub fn status(&self, name: &str) -> Result<Option<SupervisorStatus>, LifecycleError> {
         let server = self.registry.get(name)?;
-        Ok(self.supervisor.status(&server.dir)?)
+        Ok(self.backend.supervisor().status(&server.dir)?)
     }
 
     /// 全量服务器的实时状态（`server list` 状态列用）
@@ -485,7 +520,7 @@ impl ServerLifecycleService {
         for srv in servers {
             out.insert(
                 srv.meta.name.as_str().to_owned(),
-                self.supervisor.status(&srv.dir),
+                self.backend.supervisor().status(&srv.dir),
             );
         }
         Ok(out)
@@ -498,10 +533,10 @@ impl ServerLifecycleService {
     /// 未在运行返回 [`LifecycleError::NotRunning`]；其余见 [`LifecycleError`]
     pub fn send_line(&self, name: &str, line: &str) -> Result<(), LifecycleError> {
         let server = self.registry.get(name)?;
-        if self.supervisor.status(&server.dir)?.is_none() {
+        if self.backend.supervisor().status(&server.dir)?.is_none() {
             return Err(LifecycleError::NotRunning);
         }
-        match self.supervisor.send_line(&server.dir, line) {
+        match self.backend.supervisor().send_line(&server.dir, line) {
             Err(SupervisorError::Remote { kind, .. }) if kind == "not_running" => {
                 Err(LifecycleError::NotRunning)
             }
@@ -559,7 +594,7 @@ impl ServerLifecycleService {
             name: server.meta.name.as_str().to_owned(),
             version: server.meta.version.to_string(),
             variant: server.meta.variant.as_str().to_owned(),
-            status: self.supervisor.status(&server.dir)?,
+            status: self.backend.supervisor().status(&server.dir)?,
         })
     }
 }
@@ -750,10 +785,11 @@ mod tests {
     use domain::server::world::{DataVersion, WorldInfo};
     use domain::workspace::{Workspace, WorkspaceId, WorkspaceName};
     use port::{
-        ArchiveExtractor, ArtifactDownloader, CancellationToken, CoreInspector, DownloadError,
-        DownloadRequest, DownloadedArtifact, ExtractError, InspectError, JavaPackageRequest,
-        JavaRuntimeRepository, JavaScanner, JavaSourceRegistryPort, ProgressSink, RepositoryError,
-        ServerJarSource, ServerRepository, SourceError, WorkspaceRepository,
+        ArchiveExtractor, ArtifactDownloader, Backend, CancellationToken, CoreInspector,
+        DownloadError, DownloadRequest, DownloadedArtifact, EventSink, ExtractError, InspectError,
+        InstallerRunner, JavaPackageRequest, JavaRuntimeRepository, JavaScanner,
+        JavaSourceRegistryPort, ProgressSink, RepositoryError, ServerJarSource, ServerRepository,
+        SourceError, SupervisorPort, WorkspaceRepository,
     };
     use std::io::Write as _;
     use std::sync::Mutex;
@@ -1076,6 +1112,34 @@ mod tests {
         }
     }
 
+    /// 只承载 supervisor 的测试 `Backend`；installer 在生命周期用例中不用
+    struct SupBackend {
+        supervisor: Arc<dyn SupervisorPort>,
+    }
+
+    struct NoopInstaller;
+
+    impl InstallerRunner for NoopInstaller {
+        fn run_installer(
+            &self,
+            _java_bin: &Path,
+            _installer: &Path,
+            _dir: &Path,
+            _cancel: &CancellationToken,
+        ) -> Result<(), port::InstallerError> {
+            unreachable!("not used")
+        }
+    }
+
+    impl Backend for SupBackend {
+        fn supervisor(&self) -> &dyn SupervisorPort {
+            self.supervisor.as_ref()
+        }
+        fn installer(&self) -> &dyn InstallerRunner {
+            &NoopInstaller
+        }
+    }
+
     /// 可编排的 supervisor 替身
     #[derive(Default)]
     struct FakeSupervisor {
@@ -1263,7 +1327,13 @@ mod tests {
         java: JavaService,
         supervisor: Arc<FakeSupervisor>,
     ) -> ServerLifecycleService {
-        ServerLifecycleService::new(Arc::clone(&fixture.registry), java, supervisor)
+        ServerLifecycleService::new(
+            Arc::clone(&fixture.registry),
+            java,
+            Arc::new(SupBackend {
+                supervisor: supervisor as Arc<dyn SupervisorPort>,
+            }),
+        )
     }
 
     fn opts(accept_eula: bool) -> StartOptions {
@@ -1271,6 +1341,7 @@ mod tests {
             accept_eula,
             ram_mib: None,
             supervisor_exe: PathBuf::from("/usr/local/bin/mcsup"),
+            supervisor_args: vec![std::ffi::OsString::from("__supervise")],
         }
     }
 
@@ -1564,6 +1635,7 @@ mod tests {
             accept_eula: true,
             ram_mib: Some(512),
             supervisor_exe: PathBuf::from("/usr/local/bin/mcsup"),
+            supervisor_args: vec![std::ffi::OsString::from("__supervise")],
         };
         let explicit_supervisor = Arc::new(FakeSupervisor::default());
         let explicit_svc = service(
@@ -1958,7 +2030,9 @@ mod tests {
         let svc = ServerLifecycleService::new(
             Arc::clone(&fixture.registry),
             java_service(MemJavaRepo::new(vec![], true), vec![]),
-            Arc::new(ProbeFailSupervisor),
+            Arc::new(SupBackend {
+                supervisor: Arc::new(ProbeFailSupervisor),
+            }),
         );
         let map = svc.statuses().expect("statuses");
         assert_eq!(map.len(), 1);
@@ -2152,5 +2226,41 @@ mod tests {
         );
         let err = start(&svc, &fixture.name, true).expect_err("must fail");
         assert!(matches!(err, LifecycleError::Io(_)), "{err:?}");
+    }
+
+    /// 捕获型事件出口：验证 service 在成功路径上确实发布了事实
+    #[derive(Default)]
+    struct RecordingSink {
+        events: Mutex<Vec<domain::server::event::DomainEvent>>,
+    }
+
+    impl EventSink for RecordingSink {
+        fn publish(&self, event: domain::server::event::DomainEvent) {
+            self.events.lock().expect("lock").push(event);
+        }
+    }
+
+    #[test]
+    fn stop_publishes_server_stopped_event() {
+        let fixture = Fixture::new(true);
+        let sink = Arc::new(RecordingSink::default());
+        let svc = ServerLifecycleService::with_events(
+            Arc::clone(&fixture.registry),
+            java_service(MemJavaRepo::new(vec![], true), vec![]),
+            Arc::new(SupBackend {
+                supervisor: Arc::new(FakeSupervisor::running()),
+            }),
+            sink.clone(),
+        );
+        svc.stop(&fixture.name, StopSpec::default_grace())
+            .expect("stop");
+        let events = sink.events.lock().expect("lock").clone();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                domain::server::event::DomainEvent::ServerStopped { name } if name == &fixture.name
+            )),
+            "{events:?}"
+        );
     }
 }

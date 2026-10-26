@@ -41,6 +41,10 @@ pub use service;
 #[cfg_attr(docsrs, doc(cfg(feature = "backup")))]
 pub use backup;
 
+#[cfg(feature = "backend")]
+#[cfg_attr(docsrs, doc(cfg(feature = "backend")))]
+pub use backend;
+
 #[cfg(feature = "file")]
 #[cfg_attr(docsrs, doc(cfg(feature = "file")))]
 pub use file;

@@ -50,6 +50,7 @@ async fn run_start(
         accept_eula: accept,
         ram_mib: None,
         supervisor_exe: supervisor_exe.to_path_buf(),
+        supervisor_args: vec![std::ffi::OsString::from("__supervise")],
     };
     let attempt = |accept: bool| {
         with_spinner(printer, format!("正在启动 {name}…"), |spinner| {

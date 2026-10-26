@@ -1,0 +1,18 @@
+[package]
+name = "backend"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+backup = { version = "0.1.0", path = "../backup" }
+port = { version = "0.1.0", path = "../port" }
+runtime = { version = "0.1.0", path = "../runtime" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

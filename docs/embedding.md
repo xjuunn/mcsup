@@ -46,11 +46,12 @@ crates/mcsup/               门面 package mcsup（唯一入口与发布主体�
 │   ├── java/               Java 检测与版本管理（实现 port）
 │   ├── provider/           外部资源和第三方 API
 │   ├── storage/            元数据持久化（实现 port::ServerRepository）
-│   └── runtime/            Minecraft / JVM 进程运行（实现 port，依赖 protocol）
+│   ├── runtime/            Minecraft / JVM 进程运行（实现 port，依赖 protocol）
+│   ├── backup/             CAS / Snapshot / Restore（实现 port::ContentStore 等）
+│   └── backend/            Local 执行位置与备份数据（实现 port::Backend 与
+│                           port::BackupStore；唯一允许组合实现层的 crate）
 └── 待建（同样建 crate 并在门面加 feature；cli 为门面内模块）：
     ├── cli/                CLI 命令语义和渲染（feature = "cli"，门面内模块）
-    ├── backend/            Local / Remote 执行位置选择（实现 port::Backend）
-    ├── backup/             CAS / Snapshot / Restore
     ├── modkit/             Mod / Modpack
     ├── transport/          RPC 通信（RemoteBackend 使用）
     ├── api/                REST DTO / OpenAPI（apps/server 使用）

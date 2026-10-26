@@ -1,6 +1,11 @@
+pub mod backend;
 pub mod backup;
 
-pub use backup::{CasError, ContentStore, SnapshotRepository, SnapshotStoreError};
+pub use backend::Backend;
+pub use backup::{
+    BackupStore, CasError, ContentStore, RUNTIME_ENTRIES, ScanError, ScanOutcome, ScanRules,
+    Scanner, SkipReason, Skipped, SnapshotRepository, SnapshotStoreError, workspace_backups_root,
+};
 use domain::java::{JavaMajor, JavaPackageType, JavaRuntime, JavaVendor};
 use domain::server::artifact::{Checksum, JarArtifact};
 use domain::server::meta::{InstalledJar, ServerMeta, ServerName};
@@ -818,6 +823,11 @@ pub struct SupervisorStartRequest {
     pub ram_mib: Option<u32>,
     /// 用于再拉起 supervisor 的可执行文件（`mcsup` 本体）
     pub supervisor_exe: PathBuf,
+    /// 传给 supervisor 可执行文件的**前置子命令**（如 `["__supervise"]`）
+    ///
+    /// 由入口决定：`runtime` 只负责「用什么可执行文件 + 前置参数」，不假设
+    /// 它内部有哪些子命令，从而不反向感知 CLI 的入口约定。
+    pub supervisor_args: Vec<std::ffi::OsString>,
 }
 
 /// 一次运行的实时视图
@@ -945,6 +955,26 @@ pub trait SupervisorPort: Send + Sync {
     ///
     /// 协议失败时返回错误
     fn shutdown(&self, server_dir: &Path) -> Result<(), SupervisorError>;
+}
+
+/// 领域事件出口：`service` 在关键节点发布事实，消费者（CLI / API / MCP /
+/// Audit / Notification / Scheduler）订阅
+///
+/// 实现约定：`emit` 必须**不阻塞、不失败**到影响调用方业务——事件是旁路，
+/// 不能让「通知发不出去」导致备份或启动失败。默认实现丢弃全部事件。
+pub trait EventSink: Send + Sync {
+    /// 发布一条领域事件
+    fn publish(&self, event: domain::server::event::DomainEvent);
+}
+
+/// 丢弃全部事件的默认出口
+///
+/// 没有订阅者时用它占位，避免 `Option<Arc<dyn EventSink>>` 到处判断。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopEventSink;
+
+impl EventSink for NoopEventSink {
+    fn publish(&self, _event: domain::server::event::DomainEvent) {}
 }
 
 #[cfg(test)]

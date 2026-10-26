@@ -8,48 +8,12 @@
 //!   仍在被 JVM 写入，复制它们只会得到截断内容，且对恢复毫无意义。
 //! - **按范围过滤**：范围判定在进入目录前做，避免白扫一棵大树。
 
-use domain::backup::{BackupScope, ContentHash, RelPath};
-use port::ContentStore;
+use domain::backup::RelPath;
+use port::{
+    ContentStore, RUNTIME_ENTRIES, ScanError, ScanOutcome, ScanRules, Scanner, SkipReason, Skipped,
+};
 use std::fs;
 use std::path::Path;
-
-use crate::error::{BackupIoError, ScanError, SkipReason, Skipped};
-
-/// 运行期文件 / 目录：不进备份
-///
-/// `console.log` 与 `run/` 由 supervisor 在服务器运行期间持续写入，
-/// 复制它们既不稳定也没有恢复价值。
-pub const RUNTIME_ENTRIES: &[&str] = &["run", "console.log"];
-
-/// 扫描规则
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ScanRules {
-    /// 备份范围；缺省 = 整个目录
-    pub scope: BackupScope,
-    /// 扫描时优先信任 `(size, mtime)` 而跳过重算的条目
-    ///
-    /// 增量备份的优化：父快照里同路径、同大小、同 mtime 的文件直接复用
-    /// 哈希，省掉一次完整读取。内容被原地改写但大小与 mtime 都不变的情况
-    /// 在 MC 世界里不会发生（Region 文件追加写会改 mtime）。
-    pub reuse: Vec<(RelPath, ContentHash, u64, i64)>,
-}
-
-/// 扫描结果
-#[derive(Debug, Clone, Default)]
-pub struct ScanOutcome {
-    /// 条目（按路径升序）
-    pub entries: Vec<(RelPath, ContentHash)>,
-    /// 每个文件的 `(路径, 大小, mtime 秒)`：下次备份的复用提示来源
-    pub stamps: Vec<(RelPath, u64, i64)>,
-    /// 被跳过的条目
-    pub skipped: Vec<Skipped>,
-    /// 内容总字节数
-    pub total_bytes: u64,
-    /// 本次真正读盘并写入 CAS 的字节数
-    pub written_bytes: u64,
-    /// 新写入的 CAS 对象数
-    pub added: usize,
-}
 
 /// 扫描 `root` 并把每个文件的字节写进 `store`
 ///
@@ -118,7 +82,9 @@ pub fn scan_tree(
             let meta = match fs::symlink_metadata(&path) {
                 Ok(meta) => meta,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => return Err(BackupIoError::io(&path, err).into()),
+                Err(err) => {
+                    return Err(ScanError::UnreadableFile { path, source: err });
+                }
             };
             let file_type = meta.file_type();
             if file_type.is_symlink() {
@@ -142,14 +108,7 @@ pub fn scan_tree(
 
             let size = meta.len();
             let mtime = mtime_secs(&meta);
-            // 复用提示只信任「同路径 + 同大小 + 同 mtime」：任一不同都必须重算
-            let reused = rules
-                .reuse
-                .iter()
-                .find(|(known, _, known_size, known_mtime)| {
-                    known == &rel_path && *known_size == size && *known_mtime == mtime
-                })
-                .map(|(_, hash, _, _)| hash.clone());
+            let reused = find_reuse(&rules.reuse, &rel_path, size, mtime);
 
             let (hash, written) = if let Some(hash) = reused {
                 (hash, 0)
@@ -171,10 +130,30 @@ pub fn scan_tree(
             on_file(outcome.entries.len());
         }
     }
+    sort_outcome(&mut outcome);
+    Ok(outcome)
+}
+
+/// 复用提示只信任「同路径 + 同大小 + 同 mtime」：任一不同都必须重算
+fn find_reuse(
+    reuse: &[(RelPath, domain::backup::ContentHash, u64, i64)],
+    rel_path: &RelPath,
+    size: u64,
+    mtime: i64,
+) -> Option<domain::backup::ContentHash> {
+    reuse
+        .iter()
+        .find(|(known, _, known_size, known_mtime)| {
+            known == rel_path && *known_size == size && *known_mtime == mtime
+        })
+        .map(|(_, hash, _, _)| hash.clone())
+}
+
+/// 输出按路径升序稳定排序：快照可比对、diff 不抖动
+fn sort_outcome(outcome: &mut ScanOutcome) {
     outcome.entries.sort_by(|a, b| a.0.cmp(&b.0));
     outcome.stamps.sort_by(|a, b| a.0.cmp(&b.0));
     outcome.skipped.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(outcome)
 }
 
 /// 是否运行期条目（仅顶层，`run/` 与 `console.log` 都在服务器根下）
@@ -193,10 +172,30 @@ fn mtime_secs(meta: &fs::Metadata) -> i64 {
         .map_or(0, |since| i64::try_from(since.as_secs()).unwrap_or(0))
 }
 
+/// 基于本地文件系统的目录扫描器（实现 [`port::Scanner`]）
+///
+/// 语义与自由函数 [`scan_tree`] 完全一致；后者保留供 `backup` 内部与测试
+/// 直接使用，service 侧只经 `port::Scanner` 访问。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DirectoryScanner;
+
+impl Scanner for DirectoryScanner {
+    fn scan(
+        &self,
+        root: &Path,
+        store: &dyn ContentStore,
+        rules: &ScanRules,
+        on_file: &mut dyn FnMut(usize),
+    ) -> Result<ScanOutcome, ScanError> {
+        scan_tree(root, store, rules, on_file)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::CasStore;
+    use domain::backup::{BackupScope, ContentHash};
 
     fn rel(path: &str) -> RelPath {
         RelPath::parse(path).expect("rel")
