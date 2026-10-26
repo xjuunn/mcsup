@@ -30,6 +30,18 @@ worktree 的建立与复用：
 5. 任务结束时调用 `dev-tools` 的 `send_notification` 通知用户。title 写当前
    worktree 的功能名，内容写为什么通知（已完成 / 需要用户确认 / 受阻待决策），
    title 与内容都简短。调用失败时在回复中说明。
+6. 用户同意合入后：在主工作区执行合入，合入成功后立即删除该 worktree 与已合入
+   分支，不要把它留作「下次接着用」。
+
+```
+git -C <主工作区> merge <分支>
+git worktree remove <worktree 路径>
+git branch -d <分支>
+```
+
+删除是合入的必要收尾：每个 worktree 自带一份 `target`，单个 1–4 GB，不删会持续
+占用磁盘。顺序不可颠倒——合入成功之后才删，合入失败或有冲突时先解决冲突；
+删除前确认 `git status` 无未提交改动，有则如实报告，不强行删除。
 
 ## 为什么主工作区不是开工的地方
 
@@ -101,6 +113,8 @@ sh scripts/clean-worktrees.sh --yes  # 真正删除（拒绝删有未跟踪文�
 ```
 
 判定与上面「worktree 的建立与复用」一致：无未提交改动且已全部合入 = 应删。
+交付流程的第 6 步已要求合入后立即删除，这里的脚本用于兜底清理历史遗留的
+worktree，不能代替合入后的即时删除。
 
 需要跨 worktree 复用依赖编译结果时，用 `sccache`（`RUSTC_WRAPPER=sccache`）
 而不是共享 target 目录：它只共享编译结果，不共享构建状态与锁。
