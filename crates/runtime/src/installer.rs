@@ -14,7 +14,7 @@
 //!   子进程不 `.output()` 一次性等待，而是轮询 `try_wait` 并在超时 / 取消时
 //!   主动 kill。
 
-use port::{CancellationToken, InstallerError, InstallerRunner};
+use port::{CancellationToken, InstallerError, InstallerOutputSink, InstallerRunner};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -75,6 +75,7 @@ impl InstallerRunner for LocalInstallerRunner {
         java_bin: &Path,
         installer: &Path,
         dir: &Path,
+        output: Option<&dyn InstallerOutputSink>,
         cancel: &CancellationToken,
     ) -> Result<(), InstallerError> {
         // 已取消就不必拉起进程
@@ -83,7 +84,7 @@ impl InstallerRunner for LocalInstallerRunner {
         }
 
         let command = build_installer_command(java_bin, installer, dir);
-        let (status, stdout, stderr) = run_and_capture(command, self.timeout, cancel)?;
+        let (status, stdout, stderr) = run_and_capture(command, self.timeout, cancel, output)?;
 
         if !status.success() {
             return Err(InstallerError::Failed {
@@ -132,11 +133,15 @@ const READER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// 关键点是**不能**用 `Command::output()`：它会一直阻塞到进程退出，安装器联网
 /// 卡住时用户既看不到进展也取消不了。这里用 `try_wait` 轮询，由调用方给上限。
 ///
+/// `output` 为 `Some` 时把 stdout/stderr 的每个完整行实时交出（去行尾换行），
+/// 让漫长的联网下载阶段有可见进展；原始字节仍完整累积，供失败时拼尾部。
+///
 /// 返回 `(退出状态, stdout, stderr)`；被取消或超时时子进程已被 kill 并 wait。
 fn run_and_capture(
     mut command: Command,
     timeout: Duration,
     cancel: &CancellationToken,
+    output: Option<&dyn InstallerOutputSink>,
 ) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), InstallerError> {
     // 调用方可以不设管道；不设就没有输出可收集，这里兜底成 piped
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -156,8 +161,10 @@ fn run_and_capture(
     let deadline = Instant::now() + timeout;
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
+    // 尚未成行的尾巴：跨分块拼到换行再交给 sink，避免把半行当行发出
+    let mut pending = LineBuffer::default();
     let status = loop {
-        drain(&rx, &mut stdout, &mut stderr);
+        drain(&rx, &mut stdout, &mut stderr, output, &mut pending);
 
         match child.try_wait() {
             Ok(Some(done)) => break done,
@@ -188,7 +195,7 @@ fn run_and_capture(
     // 进程已退出：正常情况下读线程会因管道 EOF 结束，join 后取全尾部输出。
     // 但管道可能被子 JVM 持有（见 [`READER_JOIN_TIMEOUT`]），所以只等有限时间，
     // 超时就带着已收到的输出返回，不把用户吊死在这里。
-    join_readers(readers, &rx, &mut stdout, &mut stderr);
+    join_readers(readers, &rx, &mut stdout, &mut stderr, output, &mut pending);
     Ok((status, stdout, stderr))
 }
 
@@ -202,18 +209,20 @@ fn join_readers(
     rx: &mpsc::Receiver<(bool, Vec<u8>)>,
     stdout: &mut Vec<u8>,
     stderr: &mut Vec<u8>,
+    output: Option<&dyn InstallerOutputSink>,
+    pending: &mut LineBuffer,
 ) {
     let deadline = Instant::now() + READER_JOIN_TIMEOUT;
-    let mut pending = readers;
-    while !pending.is_empty() {
-        pending.retain(|reader| !reader.is_finished());
-        drain(rx, stdout, stderr);
-        if pending.is_empty() {
+    let mut pending_readers = readers;
+    while !pending_readers.is_empty() {
+        pending_readers.retain(|reader| !reader.is_finished());
+        drain(rx, stdout, stderr, output, pending);
+        if pending_readers.is_empty() {
             break;
         }
         if Instant::now() >= deadline {
             tracing::debug!(
-                remaining = pending.len(),
+                remaining = pending_readers.len(),
                 "installer output pipes did not close, \
                  likely held by a grandchild JVM; stop waiting"
             );
@@ -221,17 +230,76 @@ fn join_readers(
         }
         std::thread::sleep(POLL_INTERVAL);
     }
-    // 读线程已结束（或确定不再等）：把通道里剩下的分块收干净
-    drain(rx, stdout, stderr);
+    // 读线程已结束（或确定不再等）：把通道里剩下的分块收干净，并吐出未完行的尾巴
+    drain(rx, stdout, stderr, output, pending);
+    pending.flush(output);
 }
 
 /// 把通道里已到达的分块全部收下
-fn drain(rx: &mpsc::Receiver<(bool, Vec<u8>)>, stdout: &mut Vec<u8>, stderr: &mut Vec<u8>) {
+///
+/// 原始字节照旧累积（失败时要拼尾部），同时把完整行实时交给 `output`。
+fn drain(
+    rx: &mpsc::Receiver<(bool, Vec<u8>)>,
+    stdout: &mut Vec<u8>,
+    stderr: &mut Vec<u8>,
+    output: Option<&dyn InstallerOutputSink>,
+    pending: &mut LineBuffer,
+) {
     while let Ok((is_stdout, chunk)) = rx.try_recv() {
         if is_stdout {
             stdout.extend_from_slice(&chunk);
         } else {
             stderr.extend_from_slice(&chunk);
+        }
+        pending.push(&chunk, output);
+    }
+}
+
+/// 把分块字节切成完整行：跨分块的半行暂存，凑齐换行再交付
+///
+/// stdout 与 stderr 共用同一个缓冲：安装器两者都是纯文本进展，合流显示更
+/// 自然；万一交错拼接出问题，也只是显示层面，不影响失败时的原始尾部。
+#[derive(Default)]
+struct LineBuffer {
+    /// 尚未遇到换行的尾巴
+    partial: Vec<u8>,
+}
+
+impl LineBuffer {
+    /// 追加分块，把其中的完整行逐条交给 `output`
+    fn push(&mut self, chunk: &[u8], output: Option<&dyn InstallerOutputSink>) {
+        let Some(sink) = output else {
+            return;
+        };
+        self.partial.extend_from_slice(chunk);
+        // 逐行消费：找到换行就把前面的内容作为一行交出，剩余留作下一轮
+        while let Some(index) = self.partial.iter().position(|byte| *byte == b'\n') {
+            let mut line: Vec<u8> = self.partial.drain(..=index).collect();
+            // 去掉行尾 `\n` 与 `\r`（Windows 换行）
+            while matches!(line.last(), Some(b'\n' | b'\r')) {
+                line.pop();
+            }
+            if !line.is_empty() {
+                sink.on_output(&String::from_utf8_lossy(&line));
+            }
+        }
+    }
+
+    /// 进程结束后吐出最后一条没有换行结尾的输出
+    fn flush(&mut self, output: Option<&dyn InstallerOutputSink>) {
+        let Some(sink) = output else {
+            self.partial.clear();
+            return;
+        };
+        if self.partial.is_empty() {
+            return;
+        }
+        let mut line = std::mem::take(&mut self.partial);
+        while matches!(line.last(), Some(b'\n' | b'\r')) {
+            line.pop();
+        }
+        if !line.is_empty() {
+            sink.on_output(&String::from_utf8_lossy(&line));
         }
     }
 }
@@ -436,6 +504,7 @@ mod tests {
                 Path::new("definitely-not-a-java"),
                 Path::new("installer.jar"),
                 dir.path(),
+                None,
                 &cancel,
             )
             .expect_err("must be cancelled");
@@ -479,8 +548,13 @@ mod tests {
         let mut cmd = shell_command("sleep 30");
         cmd.current_dir(dir.path());
         let started = Instant::now();
-        let err = run_and_capture(cmd, Duration::from_millis(300), &CancellationToken::new())
-            .expect_err("must time out");
+        let err = run_and_capture(
+            cmd,
+            Duration::from_millis(300),
+            &CancellationToken::new(),
+            None,
+        )
+        .expect_err("must time out");
         assert!(matches!(err, InstallerError::TimedOut { .. }), "{err:?}");
         assert!(
             started.elapsed() < Duration::from_secs(20),
@@ -504,7 +578,7 @@ mod tests {
         });
 
         let started = Instant::now();
-        let err = run_and_capture(cmd, DEFAULT_INSTALLER_TIMEOUT, &cancel)
+        let err = run_and_capture(cmd, DEFAULT_INSTALLER_TIMEOUT, &cancel, None)
             .expect_err("must be cancelled");
         assert!(matches!(err, InstallerError::Cancelled), "{err:?}");
         assert!(
@@ -533,9 +607,13 @@ mod tests {
             shell_command("echo boom; exit 3")
         };
         cmd.current_dir(dir.path());
-        let (status, stdout, stderr) =
-            run_and_capture(cmd, DEFAULT_INSTALLER_TIMEOUT, &CancellationToken::new())
-                .expect("should run");
+        let (status, stdout, stderr) = run_and_capture(
+            cmd,
+            DEFAULT_INSTALLER_TIMEOUT,
+            &CancellationToken::new(),
+            None,
+        )
+        .expect("should run");
         assert_eq!(status.code(), Some(3));
         let combined = format!(
             "{}{}",
@@ -545,6 +623,61 @@ mod tests {
         assert!(combined.contains("boom"), "输出: {combined:?}");
     }
 
+    /// 安装器输出逐行实时交出：多行、stderr 合流、末尾无换行都要覆盖
+    #[test]
+    fn streams_each_output_line() {
+        struct Collector(std::sync::Mutex<Vec<String>>);
+        impl InstallerOutputSink for Collector {
+            fn on_output(&self, line: &str) {
+                self.0.lock().expect("lock").push(line.to_owned());
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut cmd = if cfg!(windows) {
+            let mut cmd = Command::new("cmd");
+            cmd.args(["/C", "echo one && echo two 1>&2 && echo three"]);
+            cmd
+        } else {
+            shell_command("echo one; echo two 1>&2; echo three")
+        };
+        cmd.current_dir(dir.path());
+        let sink = Collector(std::sync::Mutex::new(Vec::new()));
+        run_and_capture(
+            cmd,
+            DEFAULT_INSTALLER_TIMEOUT,
+            &CancellationToken::new(),
+            Some(&sink),
+        )
+        .expect("should run");
+        let lines = sink.0.into_inner().expect("lock");
+        assert!(lines.iter().any(|l| l == "one"), "{lines:?}");
+        assert!(lines.iter().any(|l| l == "two"), "{lines:?}");
+        assert!(lines.iter().any(|l| l == "three"), "{lines:?}");
+    }
+
+    /// 半行跨分块必须拼成一行；进程结束仍未换行的尾巴也要吐出
+    #[test]
+    fn line_buffer_joins_split_lines() {
+        struct Collector(std::sync::Mutex<Vec<String>>);
+        impl InstallerOutputSink for Collector {
+            fn on_output(&self, line: &str) {
+                self.0.lock().expect("lock").push(line.to_owned());
+            }
+        }
+
+        let sink = Collector(std::sync::Mutex::new(Vec::new()));
+        let mut buffer = LineBuffer::default();
+        buffer.push(b"downlo", Some(&sink));
+        assert!(sink.0.lock().expect("lock").is_empty(), "半行不能先发");
+        buffer.push(b"ading\r\nsecond", Some(&sink));
+        buffer.flush(Some(&sink));
+        assert_eq!(
+            sink.0.into_inner().expect("lock"),
+            vec!["downloading".to_owned(), "second".to_owned()]
+        );
+    }
+
     /// 退出码 0 但没有产物 → NoOutput（退出码 0 不等于装好了）
     #[test]
     fn zero_exit_without_marker_is_no_output() {
@@ -552,9 +685,13 @@ mod tests {
         // 用必然成功的命令充当 java：只 exit 0，不写任何产物
         let mut cmd = shell_command("exit 0");
         cmd.current_dir(dir.path());
-        let (status, _, _) =
-            run_and_capture(cmd, DEFAULT_INSTALLER_TIMEOUT, &CancellationToken::new())
-                .expect("should run");
+        let (status, _, _) = run_and_capture(
+            cmd,
+            DEFAULT_INSTALLER_TIMEOUT,
+            &CancellationToken::new(),
+            None,
+        )
+        .expect("should run");
         assert!(status.success());
         assert!(
             !has_expected_marker(dir.path()),
@@ -586,8 +723,13 @@ mod tests {
             .stderr(Stdio::piped());
 
         let started = Instant::now();
-        run_and_capture(cmd, DEFAULT_INSTALLER_TIMEOUT, &CancellationToken::new())
-            .expect("should not hang");
+        run_and_capture(
+            cmd,
+            DEFAULT_INSTALLER_TIMEOUT,
+            &CancellationToken::new(),
+            None,
+        )
+        .expect("should not hang");
         let elapsed = started.elapsed();
 
         // 父进程先退出，最坏也要在 join 上限内返回，而不是等子进程的 60 秒

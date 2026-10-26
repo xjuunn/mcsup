@@ -110,6 +110,13 @@ pub(crate) async fn download_jar(
     let inspector = FileCoreInspector::new();
     let lifecycle = super::lifecycle::lifecycle_service()?;
 
+    // 解析版本到首字节之间没有任何进度回调，先挂 spinner 保证整段有回显；
+    // 首个进度到达后由 session 内的 BarSink 接手同一条线，切换成进度显示。
+    // 下载结束后还有运行安装器（几分钟）与登记核心：安装器的输出经
+    // `installer_output` 逐行滚动显示，进度条不会停在 100% 冻住。
+    let message = format!("解析并下载 {version_id}");
+    let session = InstallSession::new(message, printer.is_human());
+
     // 安装器类来源才需要 java。这里**不能**把失败吞成 `None`：service 会把
     // 「没给上下文」报成笼统的 `NoJavaForInstaller`，用户永远看不到真正原因
     // 是「本机没装 Java」还是「装的 Java 与大版本要求不符」。
@@ -125,17 +132,12 @@ pub(crate) async fn download_jar(
         Some(mcsup::service::InstallerContext {
             java_bin,
             runner: Arc::new(mcsup::runtime::LocalInstallerRunner::new()),
+            output: Some(session.installer_output()),
         })
     } else {
         None
     };
 
-    // 解析版本到首字节之间没有任何进度回调，先挂 spinner 保证整段有回显；
-    // 首个进度到达后由 session 内的 BarSink 接手同一条线，切换成进度显示。
-    // 下载结束后还有运行安装器（几分钟）与登记核心，两者只经阶段回显——不给
-    // 阶段回调，进度条会停在 100% 冻结，看起来就是卡死。
-    let message = format!("解析并下载 {version_id}");
-    let session = InstallSession::new(message, printer.is_human());
     info!(version = %version_id, server = name, "开始安装");
     let outcome = lifecycle
         .install_jar_checked(

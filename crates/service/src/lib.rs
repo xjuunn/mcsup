@@ -110,6 +110,8 @@ pub struct InstallerContext {
     pub java_bin: PathBuf,
     /// 安装器执行器
     pub runner: Arc<dyn port::InstallerRunner>,
+    /// 安装器输出的实时观察者：联网拉 libraries 可达数分钟，逐行透传给用户
+    pub output: Option<Arc<dyn port::InstallerOutputSink>>,
 }
 
 impl std::fmt::Debug for InstallerContext {
@@ -211,11 +213,16 @@ impl ServerInstaller {
                     destination.display()
                 ))
             })?;
-            // 从这里到返回之间是纯阻塞执行（几分钟量级），阶段文案让用户知道
-            // 进度条停在 100% 之后还在干活
+            // 从这里到返回之间是纯阻塞执行（几分钟量级），安装器的输出会逐行
+            // 透传给用户，让他们看到正在联机下载 libraries 而不是卡死
             notify(InstallStage::Installing);
-            ctx.runner
-                .run_installer(&ctx.java_bin, &destination, dir, cancel)?;
+            ctx.runner.run_installer(
+                &ctx.java_bin,
+                &destination,
+                dir,
+                ctx.output.as_deref(),
+                cancel,
+            )?;
             notify(InstallStage::Finalizing);
         }
 
@@ -527,6 +534,7 @@ mod tests {
             _java_bin: &Path,
             _installer: &Path,
             dir: &Path,
+            _output: Option<&dyn port::InstallerOutputSink>,
             _cancel: &CancellationToken,
         ) -> Result<(), port::InstallerError> {
             *self.calls.lock().expect("lock") += 1;
@@ -564,6 +572,7 @@ mod tests {
             runner: Arc::new(FakeRunner {
                 calls: Arc::clone(&calls),
             }),
+            output: None,
         };
 
         let out = installer

@@ -138,6 +138,15 @@ pub trait ProgressSink: Send + Sync {
     fn on_progress(&self, transferred: u64, total: Option<u64>);
 }
 
+/// 安装器输出观察者
+///
+/// 安装器联网拉取 libraries 可达数分钟，期间整段都是在「下载」——只有把它的
+/// 输出实时透传出来，用户才知道它在干活而不是卡死。
+pub trait InstallerOutputSink: Send + Sync {
+    /// 收到一行安装器输出（已去掉行尾换行）
+    fn on_output(&self, line: &str);
+}
+
 /// 协作式取消令牌
 #[derive(Debug, Clone, Default)]
 pub struct CancellationToken {
@@ -331,12 +340,16 @@ pub enum InstallerError {
 /// 实现要求：
 /// - 在 `dir` 内以它为工作目录运行，产出（`libraries/`、参数文件）落在 `dir`
 /// - 返回前确认预期的启动参数文件已生成，否则报 [`InstallerError::NoOutput`]
+/// - 运行期间逐行把输出交给 [`InstallerOutputSink`]，让用户在漫长的联网下载
+///   阶段看到实时进展，而不是盯着冻结的进度条
 /// - **必须响应取消**：安装器联网拉取 libraries 可达数分钟，用户按 Ctrl+C
 ///   不能只等它跑完。取消时终止子进程并返回 [`InstallerError::Cancelled`]
 /// - 必须有上限：超过实现自定的超时同样终止子进程并返回
 ///   [`InstallerError::TimedOut`]，否则网络卡住会让安装永久挂起
 pub trait InstallerRunner: Send + Sync {
     /// 运行安装器，产出服务端目录
+    ///
+    /// `output` 为 `None` 时丢弃输出（仅保留失败排查用的尾部）
     ///
     /// # Errors
     ///
@@ -346,6 +359,7 @@ pub trait InstallerRunner: Send + Sync {
         java_bin: &Path,
         installer: &Path,
         dir: &Path,
+        output: Option<&dyn InstallerOutputSink>,
         cancel: &CancellationToken,
     ) -> Result<(), InstallerError>;
 }

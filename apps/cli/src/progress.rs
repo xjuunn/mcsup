@@ -1,5 +1,5 @@
 use indicatif::{ProgressBar, ProgressStyle};
-use mcsup::port::{CancellationToken, ProgressSink};
+use mcsup::port::{CancellationToken, InstallerOutputSink, ProgressSink};
 use mcsup::service::{InstallStage, StageSink};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -254,6 +254,43 @@ impl ScanProgress {
     }
 }
 
+/// 安装器输出的实时透传：把安装器日志滚动打印在 spinner 上方
+///
+/// 安装器联网拉取 libraries 可达数分钟，期间只有阶段文案的话用户会以为卡死。
+/// 用 [`ProgressBar::println`] 在不打断当前回显行的前提下逐行打印安装器输出，
+/// 既能看到实时进展，spinner 也还在转。
+///
+/// `enable` 为 false（JSON 模式）时静默丢弃，stdout 保持纯数据。
+pub(crate) struct InstallerOutput {
+    bar: ProgressBar,
+    cancel: CancellationToken,
+    enable: bool,
+}
+
+impl InstallerOutput {
+    fn new(bar: ProgressBar, cancel: CancellationToken, enable: bool) -> Self {
+        Self {
+            bar,
+            cancel,
+            enable,
+        }
+    }
+}
+
+impl InstallerOutputSink for InstallerOutput {
+    fn on_output(&self, line: &str) {
+        // 取消后回显线已收掉，迟到的输出不再打印
+        if !self.enable || self.cancel.is_cancelled() {
+            return;
+        }
+        let line = line.trim_end();
+        if line.is_empty() {
+            return;
+        }
+        self.bar.println(line);
+    }
+}
+
 /// 一次安装的回显与取消装配：spinner + 下载进度条 + 取消令牌
 ///
 /// 三者同生同灭，装错一次就整段安装只有半截回显或转不停的 spinner：
@@ -265,6 +302,8 @@ pub(crate) struct InstallSession {
     sink: BarSink,
     cancel: CancellationToken,
     downloading: std::sync::atomic::AtomicBool,
+    /// 安装器输出透传：与阶段回显共用同一条线
+    installer_output: std::sync::Arc<InstallerOutput>,
 }
 
 impl InstallSession {
@@ -275,12 +314,25 @@ impl InstallSession {
         let sink = BarSink::new(spinner.handle(), message);
         let cancel = CancellationToken::new();
         install_ctrl_c_handler(cancel.clone(), spinner.handle());
+        let installer_output = std::sync::Arc::new(InstallerOutput::new(
+            spinner.handle(),
+            cancel.clone(),
+            enable,
+        ));
         Self {
             spinner,
             sink,
             cancel,
             downloading: std::sync::atomic::AtomicBool::new(false),
+            installer_output,
         }
+    }
+
+    /// 安装器输出的实时透传句柄：交给 [`InstallerContext::output`]
+    ///
+    /// [`InstallerContext::output`]: mcsup::service::InstallerContext::output
+    pub(crate) fn installer_output(&self) -> std::sync::Arc<InstallerOutput> {
+        self.installer_output.clone()
     }
 
     /// 下载阶段文案：须在进入下载前设置（下载开始后会被进度条占用）
@@ -462,5 +514,20 @@ mod tests {
 
         sink.finish();
         assert!(!handle.is_finished());
+    }
+
+    /// 安装器输出透传：session 提供同一令牌的句柄；取消 / 静默模式下不打印、不 panic
+    #[test]
+    fn installer_output_skips_when_cancelled_or_disabled() {
+        let session = InstallSession::new("step", false);
+        let output = session.installer_output();
+        let cancel = session.cancel().clone();
+
+        // 静默模式（JSON）：直接丢弃
+        output.on_output("下载 libraries");
+
+        // Ctrl-C 之后回显线已收掉，迟到的安装器输出不再打印
+        cancel.cancel();
+        output.on_output("after cancel");
     }
 }
