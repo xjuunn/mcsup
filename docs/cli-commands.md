@@ -59,8 +59,8 @@ restart / status / console / send / logs / props / set / remove / version`、
 尚未实现的命令（`server mod`）参数声明已按规则改为可选，但入口在 service
 能力落地前直接返回「尚未实现」，因此缺失必填参数时给的是未实现错误而非
 补参交互。service 层实现后，入口只需接上已有的 `require_server_name` /
-补参组件即可。`remote` 已全部接入（SSH 接入与局域网发现除外，二者显式报
-「尚未实现」）。
+补参组件即可。`remote` 已全部接入（无参数局域网发现除外，显式报「尚未
+实现」）。
 
 ### 界面语言
 
@@ -299,8 +299,10 @@ JVM 安装在平台数据目录 `{data_dir}/mcsup/java/`，不属于任何工作
 接入只需两侧各一条命令：被连接端 `mcsup remote serve`（前台进程，系统服务
 注册未实现），连接端 `mcsup remote connect <host[:port]> --code <配对码>`。
 之后 `workspace` / `server` / `java` / `backup` 命令不变，远端资源以
-`ORIGIN` 列出现在原有列表中。SSH 接入（`user@host`）与无参数局域网发现
-**尚未实现**。完整设计见 `docs/remote.md`。
+`ORIGIN` 列出现在原有列表中。接入有两条路：`user@host` 走 SSH 引导（经
+SSH 起远端 agent + 本地 `ssh -L` 隧道，每条命令临时建立），
+`host[:port]` 直连（远端 `remote serve` 常驻）。无参数局域网发现**尚未
+实现**。完整设计见 `docs/remote.md`。
 
 | 子命令 | 用法 | 说明 |
 | --- | --- | --- |

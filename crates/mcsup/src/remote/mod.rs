@@ -72,6 +72,7 @@ pub fn serve_ssh_main(data_dir: &Path, server_name: &str) -> Result<(), AgentErr
     let code = agent.issue_pairing_code()?;
     let server = agent.bind("127.0.0.1:0")?;
     let addr = server.local_addr()?;
+    let stop = server.stop_handle()?;
     let handshake = SshHandshake {
         addr: addr.to_string(),
         fingerprint: agent.fingerprint().as_str().to_owned(),
@@ -80,10 +81,37 @@ pub fn serve_ssh_main(data_dir: &Path, server_name: &str) -> Result<(), AgentErr
     };
     write_ssh_line(&handshake)?;
 
+    // 会话寿命由两条线索决定，任一条断掉就收摊，不留孤儿 agent：
+    //
+    // - stdin EOF：本地 CLI 退出 → 它持有的管道关闭 → SSH 把 EOF 送到这里。
+    //   这是**主要**线索，客户端没有任何「我要走了」的帧可发（无会话状态）。
+    // - stdout 写失败：SSH 传输层已断（`EPIPE`），rotate 线程下次写就会撞上。
+    //
+    // 两处都只 `request_stop`，不 `exit`：监听线程要正常收尾、连接线程要能退出。
+    {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            use std::io::Read as _;
+            let mut stdin = std::io::stdin();
+            let mut buf = [0u8; 64];
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            stop.request_stop();
+        });
+    }
+
     // 配对码轮换：新码也打一行 JSONL，让配对失败重试的用户总能拿到当前码
-    let watch = Agent::watch_pairing_code(&agent, |code| {
+    let rotate_stop = stop.clone();
+    let watch = Agent::watch_pairing_code(&agent, move |code| {
         let rotation = serde_json::json!({ "pairing_code": code.display_form() });
-        let _ = write_ssh_line(&rotation);
+        if write_ssh_line(&rotation).is_err() {
+            // 写不出去说明对端已经走了，交给监听线程收尾
+            rotate_stop.request_stop();
+        }
     });
     let result = server.run();
     drop(watch);

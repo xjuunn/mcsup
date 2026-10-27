@@ -268,8 +268,12 @@ pub(crate) fn remote_members(cfg: &mcsup::service::Config) -> Result<RemoteMembe
 
 /// 单台远端 → 成员；任何一步不满足都返回 `None`（跳过该台，不阻塞其余）
 ///
-/// 过滤顺序：名字合法 → 直连接入 → 有指纹 → 有凭证。拆出来是为了可测——
+/// 过滤顺序：名字合法 → 接入方式已实现 → 有指纹 → 有凭证。拆出来是为了可测——
 /// 过滤规则不碰文件系统，凭证经 trait 注入。
+///
+/// SSH 记录连的是**隧道地址**，而隧道每次命令才建：这里只装一个延迟解析器，
+/// 不在这里起 ssh 子进程。装配发生在每个命令的开头，本地命令不该为远端付
+/// 连接代价，离线远端也不该把本地命令卡在 SSH 超时上。
 fn build_member(
     name: &str,
     record: &mcsup::service::RemoteRecord,
@@ -282,11 +286,6 @@ fn build_member(
             return Ok(None);
         }
     };
-    // 直连是当前唯一已实现的接入方式；ssh 隧道记录暂跳过
-    if record.via != RemoteVia::Direct {
-        tracing::warn!(remote = %name, via = record.via.as_str(), "unsupported remote via; skipping");
-        return Ok(None);
-    }
     let Some(fingerprint_hex) = record.fingerprint.as_deref() else {
         tracing::warn!(remote = %name, "remote has no pinned fingerprint; skipping");
         return Ok(None);
@@ -300,7 +299,28 @@ fn build_member(
             return Ok(None);
         }
     };
-    let link = RemoteLink::new(record.target.as_str(), fingerprint, &credential.token);
+    let link = match record.via {
+        RemoteVia::Direct => {
+            RemoteLink::new(record.target.as_str(), fingerprint, &credential.token)
+        }
+        RemoteVia::Ssh => {
+            let target = record.target.clone();
+            RemoteLink::lazy(
+                target.clone(),
+                fingerprint,
+                &credential.token,
+                // 隧道在第一次真正发帧时才建；失败信息进传输层错误链
+                move || {
+                    crate::ssh::endpoint_for(&target).map_err(|err| {
+                        mcsup::transport::TransportError::Io {
+                            context: format!("open the ssh tunnel to {target}"),
+                            source: std::io::Error::other(format!("{err:#}")),
+                        }
+                    })
+                },
+            )
+        }
+    };
     Ok(Some(RemoteMember::new(link, remote_name)))
 }
 
@@ -459,7 +479,6 @@ mod remote_tests {
             added_at: 1,
             fingerprint: fingerprint.map(str::to_owned),
             credential: None,
-            remote_addr: None,
         }
     }
 
@@ -495,13 +514,18 @@ mod remote_tests {
         assert!(build_member("box", &rec, &creds).expect("build").is_none());
     }
 
-    /// ssh 接入暂不支持 → 跳过
+    /// ssh 接入也装配成成员：地址延迟解析，装配期不起 ssh 子进程
     #[test]
-    fn ssh_via_skips() {
+    fn ssh_via_builds_member_without_connecting() {
         let creds = MemCredentials(BTreeMap::from([("box".to_owned(), credential("a"))]));
         let mut rec = record("user@host", Some(FPR));
         rec.via = RemoteVia::Ssh;
-        assert!(build_member("box", &rec, &creds).expect("build").is_none());
+        let member = build_member("box", &rec, &creds)
+            .expect("build")
+            .expect("member");
+        assert_eq!(member.name.as_str(), "box");
+        // 日志与错误信息里指代的是原始 SSH 目标，不是隧道端口
+        assert_eq!(member.servers_link().target(), "user@host");
     }
 
     /// 非法远端名 → 跳过

@@ -16,7 +16,7 @@
 | 7 | 远端仓库（workspace / server / java） | 完成 |
 | 8 | `RemoteBackend`：远端 supervisor（`RemoteSupervisor` + `RoutingSupervisor`） | 完成 |
 | 9 | 远端备份（元数据帧路由）+ 远端日志尾部 | 完成（流式进度未做） |
-| 10 | CLI `remote` 命令与 `--origin` | 完成（SSH / 局域网发现待实现） |
+| 10 | CLI `remote` 命令与 `--origin`（含 SSH 接入） | 完成（局域网发现待实现） |
 
 ## 已完成
 
@@ -300,6 +300,41 @@ roundtrip 全量权限覆盖补 `BackupList` 样例（`Permission::Backup` 豁�
 - 修复：`commands::run` 重建 `Printer` 时丢失全局 `-y`，导致 `-y` 对确认
   式提问完全失效。
 
+### 阶段 10：SSH 接入
+
+`mcsup remote connect user@host` 与直连共用同一条配对 / 落盘路径，差别只在
+「地址从哪来」：
+
+- `apps/cli/src/ssh.rs`：`user@host` 解析、SSH 引导握手读取、`ssh -L` 隧道、
+  进程内**会话**登记（引导进程 + 隧道进程成对持有，Drop 时一起收）。
+- 远端入口 `mcsup::remote::serve_ssh_main`（隐藏子命令 `remote __serve-ssh`）：
+  绑定 `127.0.0.1:0`，stdout 首行握手 JSON（`SshHandshake`：地址 / 指纹 /
+  配对码 / 主机名），之后每行是配对码轮换。stdout 是唯一的机器通道，
+  stderr 留给日志。
+- 会话寿命由两条线索决定，任一断掉即收摊，不留孤儿 agent：**stdin EOF**
+  （本地进程一退出，它持有的管道关闭）与 **stdout 写失败**（`EPIPE`）。
+  两条都只 `request_stop`，让监听线程正常收尾。
+- 每条需要远端的命令都重新引导一次：远端 agent 监听随机端口且随上一条 SSH
+  会话结束，记录里存上次的端口没有意义。稳定的是 `user@host`。
+- 装配层不建隧道：`build_member` 对 `via = ssh` 构造**延迟解析**的
+  `RemoteLink`（`RemoteLink::lazy`），第一次真正发帧时才调 `ssh::endpoint_for`。
+  纯本地命令因此不为远端付连接代价，离线远端也不会把本地命令卡在 SSH 超时上。
+- `remote reconnect` / `list` / `status` / `ping` 全部经 `ssh::endpoint()`
+  取实际可连地址；`list` 里隧道建不起来按 `unreachable` 降级，与直连远端
+  不可达同一语义。
+- 入口在 `main` 持 `ssh::SessionGuard`：静态登记表不会在进程退出时 drop，
+  守卫负责把 `ssh` 子进程收掉（否则 `ssh -N -L` 会活到系统重启）。
+- 修复 WIP 里的地址错误：SSH 配对成功后的同步摘要原先拿 `user@host` 当 TCP
+  地址去连，现在走本次会话的隧道地址。
+- 记录里不再有 `remote_addr`：它只对「同一条命令内的那条 agent」有意义，
+  对下一条命令是过期信息，留着会诱导按陈旧端口建隧道。
+
+测试：`apps/cli/tests/cli_remote_ssh.rs` 用**假 ssh**（`examples/fake_ssh.rs`，
+实现 CLI 用到的两条命令契约：引导读握手、`-L` 真 TCP 转发）+ 真 agent + 真
+CLI 二进制，覆盖 `connect user@host → list → ping → reconnect →
+workspace init/ls --origin → disconnect`，以及 SSH 失败时的握手错误与 `list`
+降级。示例只在测试时按需编译，不进 `cargo install` 的产物。
+
 测试：`apps/cli/tests/cli_remote.rs` 用真 agent + 真 CLI 覆盖
 `connect → list → workspace init --origin → workspace ls --origin → ping →
 disconnect`、`server create/list/status/remove --origin`、`java scan --origin`，
@@ -307,14 +342,14 @@ disconnect`、`server create/list/status/remove --origin`、`java scan --origin`
 
 ## 后续待办
 
-### SSH 接入与局域网发现（未做）
+### 局域网发现与系统服务注册（未做）
 
-- `connect user@host` 目前明确报「SSH 接入尚未实现」；`RemoteVia::Ssh` 在
-  装配层被跳过。实现方式：用 SSH 执行远端 `mcsup remote serve` 引导、把
-  配对码经 SSH 回传，复用已有 SSH 信任，不新增凭证。
 - `connect` 无参数目前报用法错误；局域网发现需要 mDNS/SSDP 或端口扫描，
   并处理多网卡、防火墙与同名冲突。
 - 系统服务注册（systemd unit / launchd plist）未做，`serve` 仍是前台进程。
+  SSH 接入不需要它（每条命令临时起 agent），直连接入才需要常驻。
+- SSH 接入已落地，见「阶段 10：SSH 接入」；跨机器真机验证（两台物理机 +
+  局域网地址）仍待手工执行。
 
 ### 阶段 9 剩余：流式（未做）
 
@@ -337,8 +372,8 @@ disconnect`、`server create/list/status/remove --origin`、`java scan --origin`
 
 ### 阶段 10 收尾
 
-- 阶段 10 已完成；剩余项见「SSH 接入与局域网发现」与「阶段 9 剩余：流式」。
-- `docs/remote.md` 的用户接入一节已按实际能力收敛（SSH / 局域网发现 /
+- 阶段 10 已完成；剩余项见「局域网发现与系统服务注册」与「阶段 9 剩余：流式」。
+- `docs/remote.md` 的用户接入一节已按实际能力收敛（SSH 已接入；局域网发现 /
   系统服务注册明确标为未实现）。
 
 ## 已确认的设计取舍
@@ -355,6 +390,18 @@ disconnect`、`server create/list/status/remove --origin`、`java scan --origin`
   `--origin all` 合并展示的矛盾。
 - 判定逻辑收敛：`Origin` / `RemoteName` / `Sourced` 在 `port`（实现层要用），
   `OriginFilter` / `Selector` / `resolve_index` 在 `service`（入口语义）。
+- SSH 接入**每条命令重新引导**，记录里不存远端端口：远端 agent 监听随机端口
+  且随 SSH 会话结束，存下来的端口对下一条命令必然是过期信息。稳定的是
+  `user@host`，重放它就够了。
+- 远端 agent 的寿命绑在 SSH 会话上（stdin EOF + stdout 写失败），而不是靠
+  常驻守护或 pid 文件：SSH 没有「会话结束」通知，只有流关闭，这是唯一可靠的
+  信号，也让「无会话状态」的协议纪律保持不变。
+- 装配层用**延迟解析地址**（`RemoteLink::lazy`）而不是装配期建隧道：装配发生
+  在每个命令的开头，本地命令不该为远端付连接代价，离线远端也不该把本地命令
+  卡在 SSH 超时上。解析失败不缓存，远端恢复后下一次命令即可重试。
+- 假 ssh 由测试用 `rustc` 现场编译（`apps/cli/tests/support/fake_ssh.rs`），
+  不做成 `examples/`：`cargo test` 不构建 examples，而测试里再跑 `cargo build`
+  会按另一套 feature 组合重建整棵依赖树。假 ssh 只用标准库，与 cargo 决议无关。
 
 ## 测试环境
 

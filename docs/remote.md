@@ -91,23 +91,42 @@ mcsup 已开始接受连接
 
 ### 连接端（本地主机）
 
-一条命令，三选一，按推荐程度排列：
+一条命令，两种接入方式：
 
-**当前可用：直连 + 配对码**
+**推荐：SSH 引导（复用已有 SSH 信任）**
+
+```
+$ mcsup remote connect user@host
+```
+
+本地经 SSH 在远端执行 `mcsup remote __serve-ssh`，从 stdout 读回 agent 的
+地址、证书指纹与配对码，再起一条 `ssh -N -L` 隧道把本地回环端口转到该地址。
+用户不需要在远端开端口、不需要抄配对码，也不需要额外分发凭证——能登上这台
+机器的 SSH 就是授权。首次连接仍需确认证书指纹（TOFU），SSH 只证明「能连上」，
+不证明「agent 是同一台机器上的那个」。
+
+隧道与远端 agent 都是**按命令临时起、随命令结束**：
+
+- 每条需要远端的命令（`remote ping`、`server ls`、`backup create` …）各自
+  引导一次，同一进程内的多处使用共用一条会话；
+- 远端 agent 监听随机端口，随 SSH 会话结束而退出（本地进程一退出，它持有的
+  管道关闭，远端读到 EOF 即收摊），不留常驻进程与孤儿端口；
+- 本地 `ssh -N -L` 子进程由入口的退出守卫收掉，不会残留。
+
+**直连 + 配对码**
 
 ```
 $ mcsup remote connect host:port --code 4821-9375
 ```
 
 交互终端下省略 `--code` 会提示输入；首次连接会展示证书指纹并要求确认，
-非交互（脚本 / 管道）下必须加 `-y` 才接受该指纹。
+非交互（脚本 / 管道）下必须加 `-y` 才接受该指纹。直连接入要求远端
+`remote serve` 常驻并可达（自管端口 / 防火墙自行处理）。
 
 **尚未实现**
 
-- `mcsup remote connect user@host`（复用 SSH 信任自动引导）会明确报
-  「SSH 接入尚未实现」。
 - `mcsup remote connect`（无参数局域网发现）会报用法错误，提示改用
-  `host[:port]`。
+  `host[:port]` 或 `user@host`。
 
 成功后输出同步摘要：
 
@@ -290,7 +309,8 @@ server create/remove、java scan、生命周期与备份。`server install`、`p
 10. 流式日志 follow 与备份进度（未做）；此时再评估 `transport` 是否切换为
     tonic。
 
-第 1–9 步已完成；SSH 接入、局域网发现、系统服务注册与流式仍未做。
+第 1–9 步已完成；SSH 接入已落地（`remote connect user@host`，见「用户视角」）。
+局域网发现、系统服务注册与流式仍未做。
 
 实施进度、已完成内容与逐阶段待办记在 `docs/remote-progress.md`。
 

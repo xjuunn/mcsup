@@ -10,6 +10,7 @@
 use crate::cli::RemoteAction;
 use crate::config::ConfigFile;
 use crate::diagnostic::AppDiagnostic;
+use crate::locale::Lang;
 use crate::output::Printer;
 use crate::prompts;
 use anyhow::{Context, Result};
@@ -375,13 +376,13 @@ fn connect(
             added_at: unix_now(),
             fingerprint: Some(fingerprint.as_str().to_owned()),
             credential: Some(format!("file:{}", credentials.path().display())),
-            remote_addr: None,
         },
     );
     file.save(&cfg)?;
 
     report_connected(
         &remote_name,
+        &target,
         &target,
         &fingerprint,
         &enrolled.role.to_string(),
@@ -408,13 +409,11 @@ fn connect_ssh(
     let lang = printer.lang();
     let (user, host) = crate::ssh::parse_user_host(target, lang)?;
     let ssh_target = format!("{user}@{host}");
-    let (handshake, mut child) = crate::ssh::bootstrap(&ssh_target, lang)?;
-    let tunnel = crate::ssh::open_tunnel(&ssh_target, &handshake.addr, lang)?;
-    // 隧道就绪后远端 agent 必须继续活着：`__serve-ssh` 进程由 SSH 会话承载，
-    // 这里不 kill，交给它继续服务；CLI 退出时 SSH 连接断开、远端进程随之结束。
-    let _ = &mut child;
+    // 建立会话（引导 + 隧道）后，握手里的配对码直接用来配对：用户不必再从
+    // 对端屏幕上抄一次。会话登记在进程内，后面 report_connected 复用同一条。
+    let (local, handshake) = crate::ssh::session(&ssh_target, lang)?;
 
-    let probe = Client::probe(&tunnel.local).with_context(|| {
+    let probe = Client::probe(&local).with_context(|| {
         crate::i18n::pick(
             lang,
             format!("通过 SSH 隧道连接 {ssh_target} 失败"),
@@ -429,7 +428,7 @@ fn connect_ssh(
         None => resolve_remote_name(None, &probe, printer)?,
     };
     let client_name = client_display_name();
-    let client = Client::new(&tunnel.local, fingerprint.clone());
+    let client = Client::new(&local, fingerprint.clone());
     let enrolled = client
         .enroll(&handshake.pairing_code, &client_name, read_only)
         .with_context(|| crate::i18n::pick(lang, "SSH 配对失败", "ssh pairing failed"))?;
@@ -449,22 +448,22 @@ fn connect_ssh(
     cfg.put_remote(
         &remote_name,
         RemoteRecord {
-            // 原始 user@host：reconnect 要按原样重放 SSH 路径
+            // 原始 user@host：后续每条命令都按原样重放这条接入路径
             target: ssh_target.clone(),
             via: RemoteVia::Ssh,
             read_only,
             added_at: unix_now(),
             fingerprint: Some(fingerprint.as_str().to_owned()),
             credential: Some(format!("file:{}", credentials.path().display())),
-            // 远端 agent 的监听地址：隧道重建时需要它（`__serve-ssh` 用随机端口）
-            remote_addr: Some(handshake.addr.clone()),
         },
     );
     file.save(&cfg)?;
 
+    // 摘要走隧道地址：此时的 agent 还在本次会话里，不能用 user@host 当 TCP 地址
     report_connected(
         &remote_name,
         &ssh_target,
+        &local,
         &fingerprint,
         &enrolled.role.to_string(),
         printer,
@@ -510,8 +509,10 @@ fn reconnect(file: &ConfigFile, name: &str, printer: Printer) -> Result<()> {
             "reading the credential",
         ))?;
 
-    // 先 probe 确认对端仍是同一张证书，再认证：指纹变化必须显式重新配对
-    let probe = Client::probe(&record.target)?;
+    // 先解析实际可连地址（SSH 记录要先建隧道），再 probe 确认对端仍是同一张
+    // 证书，最后认证：指纹变化必须显式重新配对
+    let endpoint = crate::ssh::endpoint(record, lang)?;
+    let probe = Client::probe(&endpoint)?;
     if probe.fingerprint != fingerprint {
         return Err(AppDiagnostic::unauthorized(
             crate::i18n::pick(
@@ -529,7 +530,7 @@ fn reconnect(file: &ConfigFile, name: &str, printer: Printer) -> Result<()> {
         )
         .into());
     }
-    let client = Client::new(&record.target, fingerprint.clone()).with_token(credential.token);
+    let client = Client::new(&endpoint, fingerprint.clone()).with_token(credential.token);
     client.call(&Request::Ping).context(crate::i18n::pick(
         lang,
         "认证失败",
@@ -539,6 +540,7 @@ fn reconnect(file: &ConfigFile, name: &str, printer: Printer) -> Result<()> {
     report_connected(
         &remote_name,
         &record.target,
+        &endpoint,
         &fingerprint,
         &credential.role,
         printer,
@@ -547,14 +549,14 @@ fn reconnect(file: &ConfigFile, name: &str, printer: Printer) -> Result<()> {
 
 /// `remote list`：每台远端做一次短探测
 fn list(file: &ConfigFile, printer: Printer) -> Result<()> {
+    let lang = printer.lang();
     let cfg = file.load()?;
     let credentials = credential_store();
     let rows: Vec<RemoteRow> = cfg
         .remotes
         .iter()
-        .map(|(name, record)| probe_row(name, record, &credentials))
+        .map(|(name, record)| probe_row(name, record, &credentials, lang))
         .collect();
-    let lang = printer.lang();
     if !printer.is_human() {
         return printer.print_outcome("", &RemoteListJson { items: rows });
     }
@@ -606,7 +608,7 @@ fn status(file: &ConfigFile, name: Option<&str>, printer: Printer) -> Result<()>
             None,
         )
     })?;
-    let row = probe_row(remote_name.as_str(), record, &credential_store());
+    let row = probe_row(remote_name.as_str(), record, &credential_store(), lang);
     if printer.is_human() {
         printer.print_section(&crate::i18n::pick(
             lang,
@@ -675,8 +677,9 @@ fn ping(file: &ConfigFile, name: &str, printer: Printer) -> Result<()> {
             "reading the credential",
         ))?;
 
-    let probe = Client::probe(&record.target)?;
-    let client = Client::new(&record.target, fingerprint).with_token(credential.token);
+    let endpoint = crate::ssh::endpoint(record, lang)?;
+    let probe = Client::probe(&endpoint)?;
+    let client = Client::new(&endpoint, fingerprint).with_token(credential.token);
     let pong =
         client
             .call(&Request::Ping)
@@ -809,16 +812,21 @@ fn revoke(client: &str, listen: &str, printer: Printer) -> Result<()> {
 }
 
 /// 连接成功后的摘要：同步远端元数据并报数
+///
+/// `target` 是**用户看到的**目标（`host:port` 或 `user@host`），`endpoint` 是
+/// 本次实际可连的地址。两者对 SSH 接入不同：隧道端口是临时分配的实现细节，
+/// 写进输出会让人以为下次还能用。
 fn report_connected(
     name: &RemoteName,
     target: &str,
+    endpoint: &str,
     fingerprint: &Fingerprint,
     role: &str,
     printer: Printer,
 ) -> Result<()> {
     let lang = printer.lang();
     let credential = credential_store().get(name.as_str())?;
-    let client = Client::new(target, fingerprint.clone()).with_token(credential.token);
+    let client = Client::new(endpoint, fingerprint.clone()).with_token(credential.token);
     let workspaces = count(&client, &Request::WorkspaceList)?;
     let servers = count(&client, &Request::ServerList)?;
     let java = count(&client, &Request::JavaList)?;
@@ -866,9 +874,14 @@ fn count(client: &Client, request: &Request) -> Result<usize> {
 }
 
 /// 一台远端的探测结果
-fn probe_row(name: &str, record: &RemoteRecord, credentials: &dyn CredentialStore) -> RemoteRow {
+fn probe_row(
+    name: &str,
+    record: &RemoteRecord,
+    credentials: &dyn CredentialStore,
+    lang: Lang,
+) -> RemoteRow {
     let credential = credentials.get(name).ok();
-    let (state, agent_version) = probe_state(record, credential.as_ref());
+    let (state, agent_version) = probe_state(record, credential.as_ref(), lang);
     RemoteRow {
         name: name.to_owned(),
         target: record.target.clone(),
@@ -882,9 +895,13 @@ fn probe_row(name: &str, record: &RemoteRecord, credentials: &dyn CredentialStor
 }
 
 /// 状态探测：`ok` / `unreachable` / `unauthorized`
+///
+/// SSH 记录的 `unreachable` 包含「隧道建不起来」（SSH 不可用、远端没装
+/// mcsup）：对列表来说两者是同一件事——这台远端现在用不了。
 fn probe_state(
     record: &RemoteRecord,
     credential: Option<&StoredCredential>,
+    lang: Lang,
 ) -> (&'static str, Option<String>) {
     let Some(fingerprint_text) = record.fingerprint.as_deref() else {
         return ("unauthorized", None);
@@ -895,7 +912,14 @@ fn probe_state(
     let Some(credential) = credential else {
         return ("unauthorized", None);
     };
-    let client = Client::new(&record.target, fingerprint).with_token(credential.token.clone());
+    let endpoint = match crate::ssh::endpoint(record, lang) {
+        Ok(endpoint) => endpoint,
+        Err(err) => {
+            tracing::warn!(remote = %record.target, %err, "ssh session failed; reporting unreachable");
+            return ("unreachable", None);
+        }
+    };
+    let client = Client::new(&endpoint, fingerprint).with_token(credential.token.clone());
     match client.call(&Request::Ping) {
         Ok(Response::Pong { agent_version, .. }) => ("ok", Some(agent_version)),
         Ok(_) => ("ok", None),
@@ -1237,17 +1261,16 @@ mod tests {
             added_at: 1,
             fingerprint: fingerprint.map(str::to_owned),
             credential: None,
-            remote_addr: None,
         }
     }
 
     #[test]
     fn probe_state_is_unauthorized_without_fingerprint_or_credential() {
         let no_fp = record("127.0.0.1:1", None);
-        assert_eq!(probe_state(&no_fp, None).0, "unauthorized");
+        assert_eq!(probe_state(&no_fp, None, Lang::Zh).0, "unauthorized");
 
         let with_fp = record("127.0.0.1:1", Some(&Fingerprint::of_der(b"x").to_string()));
-        assert_eq!(probe_state(&with_fp, None).0, "unauthorized");
+        assert_eq!(probe_state(&with_fp, None, Lang::Zh).0, "unauthorized");
     }
 
     #[test]
@@ -1259,7 +1282,7 @@ mod tests {
             client_id: "0f0e0d0c-0b0a-49d8-a716-446655440000".to_owned(),
             role: "operator".to_owned(),
         };
-        assert_eq!(probe_state(&rec, Some(&cred)).0, "unreachable");
+        assert_eq!(probe_state(&rec, Some(&cred), Lang::Zh).0, "unreachable");
     }
 
     #[test]
@@ -1272,7 +1295,7 @@ mod tests {
             role: "viewer".to_owned(),
         };
         let store = MemCreds(Some(cred));
-        let row = probe_row("prod-box", &rec, &store);
+        let row = probe_row("prod-box", &rec, &store, Lang::Zh);
         assert_eq!(row.name, "prod-box");
         assert_eq!(row.target, "10.0.0.5:7681");
         assert_eq!(row.via, "direct");

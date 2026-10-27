@@ -22,6 +22,9 @@ use std::{env, process::ExitCode};
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // SSH 会话（引导进程 + 隧道）由静态登记表保管，进程退出不会自动 drop，
+    // 这里持一个守卫把它们收掉，避免留下没人认领的 ssh 子进程
+    let _ssh_sessions = ssh::SessionGuard::install();
     install_panic_hook();
     let _ = miette::set_hook(Box::new(
         |_| Box::new(miette::GraphicalReportHandler::new()),
