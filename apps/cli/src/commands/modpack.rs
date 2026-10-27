@@ -412,7 +412,10 @@ fn detail_rows(detail: &ModpackDetail) -> Vec<(&'static str, String)> {
     rows
 }
 
-/// 标签列按最宽标签右补空格，值列起点对齐；不画表格边框
+/// 标签列与值列之间的固定间隔
+const LABEL_GAP: usize = 2;
+
+/// 标签列按最宽标签右补空格，值列起点对齐；不画表格边框，也不加冒号
 ///
 /// 中文标签是双宽字符，补空格按显示宽度而不是字符数算，否则「ID」和
 /// 「游戏版本」后面的值会错开。
@@ -424,8 +427,10 @@ fn render_detail(rows: &[(&str, String)]) -> String {
         .unwrap_or(0);
     rows.iter()
         .map(|(label, value)| {
-            let pad = width.saturating_sub(measure_text_width(label));
-            format!("{label}{}: {value}", " ".repeat(pad))
+            let pad = width
+                .saturating_sub(measure_text_width(label))
+                .saturating_add(LABEL_GAP);
+            format!("{label}{}{value}", " ".repeat(pad))
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -833,7 +838,7 @@ mod tests {
         }
     }
 
-    /// 标签按显示宽度补空格，值列起点一致；不画边框
+    /// 标签按显示宽度补空格，值列起点一致；不画边框，也不加冒号
     #[test]
     fn render_detail_aligns_values_by_display_width() {
         let rows = detail_rows(&modpack_detail(true));
@@ -844,13 +849,15 @@ mod tests {
             .max()
             .expect("详情至少有一行");
         assert_eq!(width, measure_text_width("游戏版本"), "最宽标签决定列宽");
-        for line in rendered.lines() {
-            let split = line.find(": ").expect("每行都是「标签: 值」");
-            assert_eq!(
-                measure_text_width(&line[..split]),
-                width,
-                "标签列宽度不一致: {line}"
+        for ((label, value), line) in rows.iter().zip(rendered.lines()) {
+            let prefix = format!(
+                "{label}{}",
+                " ".repeat(width + LABEL_GAP - measure_text_width(label))
             );
+            let rest = line
+                .strip_prefix(&prefix)
+                .unwrap_or_else(|| panic!("值列起点不一致: {line}"));
+            assert_eq!(rest, value.as_str(), "标签后直接是值，不加冒号");
             assert!(!line.contains('│') && !line.contains('|'), "不画表格边框");
         }
     }
@@ -869,11 +876,14 @@ mod tests {
 
         let rendered = render_detail(&rows);
         assert_eq!(rendered.lines().count(), rows.len());
-        for line in rendered.lines() {
-            let split = line.find(": ").expect("每行都是「标签: 值」");
+        for ((label, value), line) in rows.iter().zip(rendered.lines()) {
+            let prefix = format!(
+                "{label}{}",
+                " ".repeat(8 + LABEL_GAP - measure_text_width(label))
+            );
             assert_eq!(
-                measure_text_width(&line[..split]),
-                8,
+                line.strip_prefix(&prefix),
+                Some(value.as_str()),
                 "列宽仍然是 8: {line}"
             );
         }
