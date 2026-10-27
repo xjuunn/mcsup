@@ -268,6 +268,12 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 `quilt` / `vanilla`），因此建站后 `server install` 能按变体找到核心来源；
 `modrinth-modpack` 只作为「走整合包流程」的入口标记。
 
+同一版本同时提供客户端与服务端文件时，优先下载文件名带 `[server]` 的
+`.mrpack`；没有服务端归档才退回主文件。不指定版本时，默认跳过没有服务端
+归档的最新正式版。版本列表里带服务端归档的版本会标记「服务端」并排在前面。
+客户端包里仅客户端模组可能被错误标记为 `server: required`，用服务端归档可
+避免启动崩溃。
+
 清单里 `server: unsupported` 的文件不会装到服务端；`optional` 视为需要安装。
 `.mrpack` 由内置 zip 解析直接解开，不调用系统 `unzip`，归档内的 UTF-8
 文件名按原样落盘。

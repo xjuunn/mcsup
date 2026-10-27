@@ -12,7 +12,8 @@
 //! - [`FacetTree`] / [`Facet`] / [`FacetOp`]：搜索过滤条件构造
 //! - [`ProjectType`] / [`VersionChannel`] / [`HashAlgorithm`]：受控枚举（带未知兜底）
 //! - [`manifest`]：全部响应模型（[`Project`](manifest::Project)、[`Version`](manifest::Version) 等）
-//! - [`primary_file`] / [`file_checksum`]：从版本取主文件 / 取可校验哈希
+//! - [`primary_file`] / [`server_archive`] / [`server_file`] / [`file_checksum`]：
+//!   从版本取主文件 / 服务端归档 / 下载目标 / 取可校验哈希
 //!
 //! # 内置实例与扩展点
 //!
@@ -34,7 +35,7 @@ mod source;
 
 pub use client::{
     HashAlgorithm, ModrinthSource, ModrinthSourceBuilder, ProjectType, SearchIndex, SearchQuery,
-    VersionChannel, VersionFilter, file_checksum, primary_file,
+    VersionChannel, VersionFilter, file_checksum, primary_file, server_archive, server_file,
 };
 pub use facets::{Facet, FacetOp, FacetTree};
 pub use modpack::{ModrinthModpackSource, MrpackExtractor};

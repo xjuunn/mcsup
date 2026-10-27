@@ -299,6 +299,12 @@ NeoForge 的安装器运行与 Java 选择不出现第二份实现）→ `apply`
 校验与判定，因此 `ModpackIndex` 由 Provider 反序列化后经 `ModpackIndex::new`
 构造。
 
+Modrinth 同一版本可以同时提供客户端与服务端文件，服务端文件通常不是
+`primary`，只在文件名里带 `[server]` 标记。服务端安装优先取该文件；没有时
+退回主文件。不指定版本时也优先选带服务端归档的正式版，避免最新版只上传了
+客户端包。客户端包常把仅客户端模组标成 `server: required`，直接装到服务端
+会在启动阶段崩溃。
+
 ```
 server create --variant modrinth-modpack
    └─→ ModpackService::prepare ──→ port::ModpackSource / ModpackExtractor
