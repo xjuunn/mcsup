@@ -723,6 +723,40 @@ pub fn primary_file(version: &Version) -> Option<&VersionFile> {
         .or_else(|| version.files.first())
 }
 
+/// 从版本中选服务端归档
+///
+/// Modrinth 允许同一版本同时上传客户端与服务端文件，服务端文件通常不是
+/// `primary`，只在文件名里带标记（官方常见写法 `[server]`）。服务端安装
+/// 必须优先取它：客户端包会把仅客户端模组标成 `server: required`，直接
+/// 装到服务端会在启动时崩。没有服务端标记时退回 [`primary_file`]。
+#[must_use]
+pub fn server_file(version: &Version) -> Option<&VersionFile> {
+    server_archive(version).or_else(|| primary_file(version))
+}
+
+/// 版本是否提供了服务端归档（只认带标记的 `.mrpack`）
+#[must_use]
+pub fn server_archive(version: &Version) -> Option<&VersionFile> {
+    version
+        .files
+        .iter()
+        .find(|file| is_server_archive(&file.filename))
+}
+
+/// 文件名是否标记为服务端归档
+///
+/// 只认 `.mrpack`：服务端 `.zip` 包没有 `modrinth.index.json`，本项目的
+/// 安装流程无法消费，退回主文件并交由上层按清单处理。
+fn is_server_archive(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".mrpack")
+        && (lower.contains("[server]")
+            || lower.contains("(server)")
+            || lower.contains("-server")
+            || lower.contains("_server")
+            || lower.contains(" server"))
+}
+
 /// 供 `SearchHit` 便捷取项目类型
 impl SearchHit {
     /// 解析 `project_type`
@@ -915,6 +949,45 @@ mod tests {
 
         let empty = version_with(Vec::new());
         assert!(primary_file(&empty).is_none());
+    }
+
+    /// 服务端安装优先取文件名带 server 标记的归档
+    #[test]
+    fn server_file_prefers_server_archive() {
+        let version = version_with(vec![
+            file("client.mrpack", true, None),
+            file("pack [server].mrpack", false, None),
+        ]);
+        assert_eq!(
+            server_file(&version).map(|f| f.filename.as_str()),
+            Some("pack [server].mrpack")
+        );
+
+        let dashed = version_with(vec![
+            file("client.mrpack", true, None),
+            file("pack-server.MRPACK", false, None),
+        ]);
+        assert_eq!(
+            server_file(&dashed).map(|f| f.filename.as_str()),
+            Some("pack-server.MRPACK")
+        );
+
+        // 没有服务端归档时退回主文件
+        let client_only = version_with(vec![file("client.mrpack", true, None)]);
+        assert_eq!(
+            server_file(&client_only).map(|f| f.filename.as_str()),
+            Some("client.mrpack")
+        );
+
+        // `.zip` 服务端包没有清单，不能选
+        let zipped = version_with(vec![
+            file("client.mrpack", true, None),
+            file("pack [server].zip", false, None),
+        ]);
+        assert_eq!(
+            server_file(&zipped).map(|f| f.filename.as_str()),
+            Some("client.mrpack")
+        );
     }
 
     /// sha1 合法时返回校验和；缺失或格式错时返回 None

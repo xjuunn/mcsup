@@ -10,9 +10,10 @@
 
 #![allow(clippy::expect_used, reason = "测试夹具，失败直接 panic 才有用")]
 
+use port::modpack::ModpackSource;
 use provider::modrinth::{
-    Facet, FacetTree, HashAlgorithm, ModrinthSource, ProjectType, SearchIndex, SearchQuery,
-    VersionChannel, VersionFilter, primary_file,
+    Facet, FacetTree, HashAlgorithm, ModrinthModpackSource, ModrinthSource, ProjectType,
+    SearchIndex, SearchQuery, VersionChannel, VersionFilter, primary_file,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -529,6 +530,81 @@ async fn primary_file_on_fixture() {
         .expect("versions");
     let file = primary_file(&versions[0]).expect("主文件");
     assert_eq!(file.filename, "pack.mrpack");
+}
+
+/// 解析下载目标时优先取服务端归档，而不是 primary 的客户端包
+#[tokio::test]
+async fn resolve_prefers_server_archive() {
+    if !enabled() {
+        return;
+    }
+    let mut versions: Vec<serde_json::Value> =
+        serde_json::from_str(VERSIONS).expect("versions fixture");
+    let mut server = versions[0]["files"][0].clone();
+    server["filename"] = serde_json::json!("pack [server].mrpack");
+    server["url"] = serde_json::json!(
+        "https://cdn.modrinth.com/data/AABBCCDD/versions/IIJJKKLL/pack%20%5Bserver%5D.mrpack"
+    );
+    server["primary"] = serde_json::json!(false);
+    server["size"] = serde_json::json!(42);
+    versions[0]["files"]
+        .as_array_mut()
+        .expect("files")
+        .push(server);
+    let body = serde_json::to_string(&versions[0]).expect("json");
+    let mock = Mock::start(vec![("GET", "/v2/version/IIJJKKLL", 200, body)]).await;
+    let source = ModrinthModpackSource::from_source(source_for(&mock));
+
+    let resolved = source
+        .resolve("AABBCCDD", Some("IIJJKKLL"))
+        .await
+        .expect("resolve");
+
+    assert_eq!(resolved.file.filename, "pack [server].mrpack");
+    assert_eq!(resolved.file.size, 42);
+}
+
+/// 不指定版本时，默认跳过没有服务端归档的最新正式版
+#[tokio::test]
+async fn resolve_defaults_to_version_with_server_archive() {
+    if !enabled() {
+        return;
+    }
+    let versions: Vec<serde_json::Value> =
+        serde_json::from_str(VERSIONS).expect("versions fixture");
+    let newest = versions[0].clone();
+    let mut older = newest.clone();
+    older["id"] = serde_json::json!("AABBCC11");
+    older["version_number"] = serde_json::json!("4.9.0");
+    older["date_published"] = serde_json::json!("2024-01-01T00:00:00Z");
+    let mut server = older["files"][0].clone();
+    server["filename"] = serde_json::json!("pack [server].mrpack");
+    server["url"] = serde_json::json!(
+        "https://cdn.modrinth.com/data/AABBCCDD/versions/AABBCC11/pack%20%5Bserver%5D.mrpack"
+    );
+    server["primary"] = serde_json::json!(false);
+    server["size"] = serde_json::json!(42);
+    older["files"].as_array_mut().expect("files").push(server);
+    let list = serde_json::to_string(&vec![newest, older.clone()]).expect("list json");
+    let older_body = serde_json::to_string(&older).expect("version json");
+    let mock = Mock::start(vec![
+        ("GET", "/v2/project/AABBCCDD/version", 200, list),
+        ("GET", "/v2/version/AABBCC11", 200, older_body),
+    ])
+    .await;
+    let source = ModrinthModpackSource::from_source(source_for(&mock));
+
+    let resolved = source.resolve("AABBCCDD", None).await.expect("resolve");
+
+    assert_eq!(resolved.version_id, "AABBCC11");
+    assert_eq!(resolved.file.filename, "pack [server].mrpack");
+    assert_eq!(resolved.file.size, 42);
+    assert!(
+        mock.requests()
+            .iter()
+            .all(|request| request.target != "/v2/version/IIJJKKLL"),
+        "不应再去取没有服务端归档的最新版"
+    );
 }
 
 /// mock 自身自检：没收到请求时断言用的辅助会失败

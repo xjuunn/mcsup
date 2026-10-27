@@ -23,7 +23,7 @@
 use super::client::{ModrinthSource, SearchIndex, SearchQuery, VersionFilter};
 use super::facets::{Facet, FacetTree};
 use super::manifest::{Project, SearchHit, Version};
-use super::primary_file;
+use super::{server_archive, server_file};
 use async_trait::async_trait;
 use domain::server::modpack::{
     FileEnv, ModpackDependencies, ModpackFile, ModpackHashes, ModpackIndex,
@@ -169,9 +169,14 @@ impl ModpackSource for ModrinthModpackSource {
             self.inner.version(id).await?
         } else {
             let all = self.versions(id_or_slug).await?;
+            // 默认版本优先选带服务端归档的正式版：最新正式版可能只上传了
+            // 客户端包（仅客户端模组被标成 server: required，装到服务端会崩）
             let picked = all
                 .iter()
-                .find(|version| version.is_release())
+                .filter(|version| version.is_release())
+                .find(|version| version.has_server_file)
+                .or_else(|| all.iter().find(|version| version.is_release()))
+                .or_else(|| all.iter().find(|version| version.has_server_file))
                 .or_else(|| all.first())
                 .ok_or_else(|| SourceError::Upstream {
                     status: 404,
@@ -179,7 +184,7 @@ impl ModpackSource for ModrinthModpackSource {
                 })?;
             self.inner.version(&picked.id).await?
         };
-        let file = primary_file(&version).ok_or_else(|| SourceError::Upstream {
+        let file = server_file(&version).ok_or_else(|| SourceError::Upstream {
             status: 404,
             message: format!("modpack version {} has no files", version.id),
         })?;
@@ -240,6 +245,7 @@ fn version_from_upstream(version: &Version) -> ModpackVersion {
         published: version.date_published.clone(),
         downloads: u64::try_from(version.downloads).unwrap_or_default(),
         changelog: version.changelog.clone(),
+        has_server_file: server_archive(version).is_some(),
     }
 }
 

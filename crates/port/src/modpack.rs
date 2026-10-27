@@ -144,6 +144,11 @@ pub struct ModpackVersion {
     pub downloads: u64,
     /// 更新日志（可能为空）
     pub changelog: Option<String>,
+    /// 该版本是否提供了服务端归档（带 `[server]` 标记的 `.mrpack`）
+    ///
+    /// 服务端安装默认优先选有该标记的版本；客户端包把仅客户端模组标成
+    /// `server: required` 是常见情况，直接装会启动崩溃。
+    pub has_server_file: bool,
 }
 
 impl ModpackVersion {
@@ -351,6 +356,7 @@ mod tests {
             published: "2024-01-01T00:00:00Z".to_owned(),
             downloads: 0,
             changelog: None,
+            has_server_file: false,
         }
     }
 

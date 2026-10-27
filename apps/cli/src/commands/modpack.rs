@@ -412,18 +412,27 @@ fn print_detail(detail: &ModpackDetail, printer: Printer) -> Result<()> {
 /// 版本列表里展示的版本号上限（防止终端刷屏）
 const VERSION_SHOW_LIMIT: usize = 60;
 
+/// 候选版本：正式版优先，正式版不存在时用全部；带服务端归档的排前面
+///
+/// 顺序会直接影响默认选中项：最新正式版可能只有客户端包，排到有服务端
+/// 归档的版本之后，避免非交互建站默认装错。
+fn version_pool(versions: &[ModpackVersion]) -> Vec<&ModpackVersion> {
+    let releases: Vec<&ModpackVersion> = versions.iter().filter(|v| v.is_release()).collect();
+    let mut pool: Vec<&ModpackVersion> = if releases.is_empty() {
+        versions.iter().collect()
+    } else {
+        releases
+    };
+    pool.sort_by_key(|version| !version.has_server_file);
+    pool
+}
+
 /// 选版本：默认只列正式版，选不到再放开测试版
 fn pick_version(versions: &[ModpackVersion], printer: Printer) -> Result<ModpackVersion> {
     if versions.is_empty() {
         anyhow::bail!("该整合包没有可用版本");
     }
-    let releases: Vec<&ModpackVersion> = versions.iter().filter(|v| v.is_release()).collect();
-    // 没有正式版时才退回全部版本（含测试版）
-    let pool: Vec<&ModpackVersion> = if releases.is_empty() {
-        versions.iter().collect()
-    } else {
-        releases
-    };
+    let pool = version_pool(versions);
     let labels: Vec<String> = pool
         .iter()
         .take(VERSION_SHOW_LIMIT)
@@ -441,13 +450,17 @@ fn pick_version(versions: &[ModpackVersion], printer: Printer) -> Result<Modpack
 
 /// 版本列表里的一行展示
 fn version_label(version: &ModpackVersion) -> String {
-    format!(
+    let mut label = format!(
         "{} · {} · MC {} · {}",
         version.version_number,
         version.channel,
         join_versions(&version.game_versions),
         version.loaders.join(",")
-    )
+    );
+    if version.has_server_file {
+        label.push_str(" · 服务端");
+    }
+    label
 }
 
 /// 交互选版本，Esc 返回 `None` 表示回到详情页
@@ -461,12 +474,7 @@ fn pick_version_backable(
     if versions.is_empty() {
         anyhow::bail!("该整合包没有可用版本");
     }
-    let releases: Vec<&ModpackVersion> = versions.iter().filter(|v| v.is_release()).collect();
-    let pool: Vec<&ModpackVersion> = if releases.is_empty() {
-        versions.iter().collect()
-    } else {
-        releases
-    };
+    let pool = version_pool(versions);
     let shown: Vec<&ModpackVersion> = pool.iter().take(VERSION_SHOW_LIMIT).copied().collect();
     let choices: Vec<ScopedChoice> = shown
         .iter()
@@ -648,6 +656,34 @@ mod tests {
         assert_eq!(choice.prefix.as_deref(), Some("l9m9tuPN"));
         assert_eq!(choice.display.as_deref(), Some("Zombie Invade 100 Days"));
         assert_eq!(extract_id(&choice.label).as_deref(), Some("l9m9tuPN"));
+    }
+
+    fn modpack_version(id: &str, release: bool, server: bool) -> ModpackVersion {
+        ModpackVersion {
+            id: id.to_owned(),
+            version_number: id.to_owned(),
+            name: id.to_owned(),
+            channel: if release { "release" } else { "beta" }.to_owned(),
+            loaders: vec!["forge".to_owned()],
+            game_versions: vec!["1.20.1".to_owned()],
+            published: String::new(),
+            downloads: 0,
+            changelog: None,
+            has_server_file: server,
+        }
+    }
+
+    #[test]
+    fn version_pool_prefers_server_capable_release() {
+        let versions = vec![
+            modpack_version("2.3-Fix", true, false),
+            modpack_version("2.3", true, true),
+            modpack_version("2.2", true, true),
+        ];
+        let pool = version_pool(&versions);
+        assert_eq!(pool[0].version_number, "2.3");
+        assert!(version_label(pool[0]).contains("服务端"));
+        assert!(!version_label(pool[2]).contains("服务端"));
     }
 
     #[test]
