@@ -126,7 +126,9 @@ impl SupervisorPort for RoutingSupervisor {
 
         // 桶键即来源：本地 / 某台远端
         let mut buckets: Vec<(Origin, Vec<usize>)> = Vec::new();
-        let mut resolve_err: Option<(usize, SupervisorError)> = None;
+        // 解析失败的位置可能不止一个：每个槽都要拿到「不存在」而不是
+        // 兜底的 `Protocol("missing slot")`
+        let mut resolve_errs: Vec<(usize, SupervisorError)> = Vec::new();
         for (index, server) in servers.iter().enumerate() {
             let origin = sourced
                 .iter()
@@ -150,7 +152,7 @@ impl SupervisorPort for RoutingSupervisor {
                     }
                 }
                 None => {
-                    resolve_err = Some((
+                    resolve_errs.push((
                         index,
                         SupervisorError::Unreachable(format!(
                             "no such server: {}",
@@ -184,7 +186,7 @@ impl SupervisorPort for RoutingSupervisor {
                 out[indexes[position]] = Some(result);
             }
         }
-        if let Some((index, err)) = resolve_err {
+        for (index, err) in resolve_errs {
             out[index] = Some(Err(err));
         }
         out.into_iter()

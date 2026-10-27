@@ -254,6 +254,24 @@ fn unknown_id_is_unreachable() {
 }
 
 #[test]
+fn status_many_reports_every_unknown_id_as_unreachable() {
+    let fixture = RouterFixture::spawn();
+    let first = ServerId::parse("990e8400-e29b-41d4-a716-446655440090").expect("id");
+    let second = ServerId::parse("990e8400-e29b-41d4-a716-446655440091").expect("id");
+    let results = fixture
+        .router
+        .status_many(&[ServerRef::remote(&first), ServerRef::remote(&second)]);
+    assert_eq!(results.len(), 2);
+    for result in results {
+        let err = result.expect_err("unknown id");
+        assert!(
+            matches!(err, SupervisorError::Unreachable(ref text) if text.contains("no such server")),
+            "{err:?}"
+        );
+    }
+}
+
+#[test]
 fn status_many_buckets_and_preserves_order() {
     let fixture = RouterFixture::spawn();
     let local = ServerRef::remote(&fixture.local_id);
