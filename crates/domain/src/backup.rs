@@ -145,6 +145,13 @@ impl RelPath {
                     let part = part.to_str().ok_or_else(|| InvalidRelPath {
                         raw: path.to_string_lossy().into_owned(),
                     })?;
+                    // 盘符 / NTFS ADS 的 `:` 在 Unix 上只是普通字符，却会在
+                    // Windows 上把路径变成盘符相对路径；跨平台快照必须拒绝。
+                    if part.contains(':') {
+                        return Err(InvalidRelPath {
+                            raw: path.to_string_lossy().into_owned(),
+                        });
+                    }
                     parts.push(part.to_owned());
                 }
                 Component::CurDir => {}
@@ -182,7 +189,7 @@ impl RelPath {
             match segment {
                 "." => {}
                 "" | ".." => return Err(invalid()),
-                part if part.contains('\\') => return Err(invalid()),
+                part if part.contains('\\') || part.contains(':') => return Err(invalid()),
                 part => parts.push(part),
             }
         }
@@ -770,6 +777,14 @@ mod tests {
         assert!(RelPath::parse("a/b\\c").is_err());
         // 正常路径不受影响
         assert_eq!(RelPath::parse("a/b").expect("ok").as_str(), "a/b");
+    }
+
+    /// 盘符 / NTFS ADS 的 `:` 在 Unix 上是普通字符，必须按跨平台口径拒绝
+    #[test]
+    fn rel_path_rejects_colon_on_every_platform() {
+        assert!(RelPath::parse("C:/evil").is_err());
+        assert!(RelPath::parse("a/C:evil").is_err());
+        assert!(RelPath::from_path(Path::new("a/C:evil")).is_err());
     }
 
     #[test]
