@@ -36,7 +36,9 @@ pub use combined::{
     RemoteMembers,
 };
 pub use link::RemoteLink;
-pub use mirror::{RemoteJavaRepository, RemoteServerRepository, RemoteWorkspaceRepository};
+pub use mirror::{
+    RemoteJavaRepository, RemoteModpackResult, RemoteServerRepository, RemoteWorkspaceRepository,
+};
 pub use router::RoutingSupervisor;
 pub use supervisor::RemoteSupervisor;
 

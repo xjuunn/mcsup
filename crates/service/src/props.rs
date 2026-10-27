@@ -36,6 +36,12 @@ pub struct PropsReport {
     pub server: RegisteredServer,
     /// `server.properties` 绝对路径
     pub path: PathBuf,
+    /// 文件原文；文件不存在时为空串
+    ///
+    /// 保留原文而不只留解析结果：注释、顺序与空行属于用户文件内容，键值
+    /// 表无法无损表达。远端返回同一份原文，两端各自用 [`Properties::parse`]
+    /// 得到相同的键值视图。
+    pub text: String,
     /// 当前内容；文件不存在时为空视图
     pub properties: Properties,
 }
@@ -77,6 +83,7 @@ impl ServerPropsService {
             server,
             path,
             properties: Properties::parse(&text),
+            text,
         })
     }
 
@@ -93,7 +100,9 @@ impl ServerPropsService {
         for (key, value) in updates {
             report.properties.set(key, value)?;
         }
-        write_atomic(&report.path, &report.properties.render())?;
+        let rendered = report.properties.render();
+        write_atomic(&report.path, &rendered)?;
+        report.text = rendered;
         Ok(report)
     }
 }

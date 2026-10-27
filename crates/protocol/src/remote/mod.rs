@@ -30,8 +30,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Write};
 use wire::{
-    WireClient, WireJava, WireServer, WireSnapshot, WireStartOutcome, WireStatusEntry, WireStop,
-    WireWorkspace,
+    WireClient, WireJava, WirePropUpdate, WireServer, WireSettings, WireSnapshot, WireStartOutcome,
+    WireStatusEntry, WireStop, WireWorkspace,
 };
 
 /// 远端协议版本；不匹配直接拒绝，禁止猜测兼容
@@ -216,11 +216,63 @@ pub enum Request {
         /// 服务端版本（接受 `latest` 别名）
         version: String,
     },
+    /// 在对端按整合包创建服务器并完成布置
+    ///
+    /// 一次帧涵盖本地的「选版本 → 登记 → 装加载器 → 铺 overrides → 装文件」：
+    /// 整合包清单要在对端读，客户端无法预先知道 MC 版本与加载器变体。
+    ServerCreateModpack {
+        /// 工作目录选择器；`None` = 当前工作区
+        workspace: Option<String>,
+        /// 服务器名
+        name: String,
+        /// 整合包项目 ID / slug
+        project: String,
+        /// 精确版本 ID；`None` = 最新正式版
+        version: Option<String>,
+    },
+    /// 读取 `server.properties` 原文
+    ///
+    /// 传原文而不是解析后的键值：注释、顺序与空行都属于用户文件内容，
+    /// 键值表无法无损表达；两端复用同一份 `Properties::parse`。
+    PropsGet {
+        /// 服务器身份
+        server_id: String,
+    },
+    /// 写入若干 `server.properties` 键值
+    PropsSet {
+        /// 服务器身份
+        server_id: String,
+        /// 要写入的项
+        updates: Vec<WirePropUpdate>,
+    },
+    /// 设置一项服务属性（内存 / Java / 开机自启 / 备份范围）
+    SettingsSet {
+        /// 服务器身份
+        server_id: String,
+        /// 属性键
+        key: String,
+        /// 原值（解析与校验在对端）
+        value: String,
+    },
 
     /// 列出 Java 运行时
     JavaList,
     /// 扫描本机 JVM 并登记
     JavaScan,
+    /// 在对端安装 Java
+    JavaInstall {
+        /// 大版本
+        major: i64,
+        /// 安装 JRE（缺省 JDK）
+        jre: bool,
+        /// 厂商（模糊匹配，缺省由对端来源排序决定）
+        vendor: Option<String>,
+    },
+    /// 在对端卸载 Java
+    JavaUninstall {
+        /// 对端上的运行时路径（`--dir` 或按大版本解析后的路径）
+        path: String,
+    },
 
     /// 列出已配对客户端（`remote status` / `remote revoke` 的候选来源）
     ClientList,
@@ -357,6 +409,7 @@ impl Request {
             | Self::WorkspaceList
             | Self::ServerList
             | Self::JavaList
+            | Self::PropsGet { .. }
             | Self::StatusMany { .. } => Some(Permission::Read),
             // 控制台输出可能含玩家名、IP、管理员敲下的命令，比元数据更敏感，
             // 单列 `Logs` 而不是并进 `Read`
@@ -365,9 +418,14 @@ impl Request {
             | Self::WorkspaceUse { .. }
             | Self::WorkspaceRemove { .. }
             | Self::ServerCreate { .. }
+            | Self::ServerCreateModpack { .. }
             | Self::ServerRemove { .. }
             | Self::ServerInstall { .. }
-            | Self::JavaScan => Some(Permission::Write),
+            | Self::PropsSet { .. }
+            | Self::SettingsSet { .. }
+            | Self::JavaScan
+            | Self::JavaInstall { .. }
+            | Self::JavaUninstall { .. } => Some(Permission::Write),
             Self::Start { .. } | Self::Stop { .. } | Self::SendLine { .. } => {
                 Some(Permission::Control)
             }
@@ -400,10 +458,16 @@ impl Request {
             Self::WorkspaceRemove { .. } => "workspace.remove",
             Self::ServerList => "server.list",
             Self::ServerCreate { .. } => "server.create",
+            Self::ServerCreateModpack { .. } => "server.create_modpack",
             Self::ServerRemove { .. } => "server.remove",
             Self::ServerInstall { .. } => "server.install",
+            Self::PropsGet { .. } => "server.props.get",
+            Self::PropsSet { .. } => "server.props.set",
+            Self::SettingsSet { .. } => "server.set",
             Self::JavaList => "java.list",
             Self::JavaScan => "java.scan",
+            Self::JavaInstall { .. } => "java.install",
+            Self::JavaUninstall { .. } => "java.uninstall",
             Self::ClientList => "client.list",
             Self::ClientRevoke { .. } => "client.revoke",
             Self::StatusMany { .. } => "status.many",
@@ -509,6 +573,50 @@ pub enum Response {
     Removed {
         /// 磁盘目录是否被本次调用实际删除
         disk_purged: bool,
+    },
+    /// `server.properties` 原文
+    Props {
+        /// 对端上的绝对路径
+        path: String,
+        /// 文件原文；不存在时为空串
+        text: String,
+    },
+    /// 服务属性写入结果
+    SettingsChanged {
+        /// 规范化后的展示值（如 `2G` → `2048M`）
+        value: String,
+        /// 设置后的完整属性集
+        settings: WireSettings,
+    },
+    /// 整合包创建 + 布置结果
+    ModpackApplied {
+        /// 新建的服务器记录（已装好加载器核心）
+        server: WireServer,
+        /// 整合包项目 ID
+        project_id: String,
+        /// 版本 ID
+        version_id: String,
+        /// 版本号
+        version_number: String,
+        /// 清单声明的 Minecraft 版本
+        minecraft: String,
+        /// 加载器展示文本（如 `fabric 0.16.9`）
+        loader: Option<String>,
+        /// 实际安装的服务端文件数
+        files: usize,
+        /// 本次下载的字节数
+        downloaded_bytes: u64,
+        /// 已存在而复用的文件数
+        reused: usize,
+        /// 按上游元数据判定为仅客户端、已跳过的文件数
+        skipped_client_only: usize,
+    },
+    /// Java 卸载结果
+    JavaUninstalled {
+        /// 对端上的运行时路径
+        path: String,
+        /// 是否删除了磁盘文件（`false` = 只移除登记）
+        managed: bool,
     },
 
     // ---- backup（阶段 9） ----
@@ -783,6 +891,29 @@ mod tests {
         }
     }
 
+    /// 一条最小合法的 `WireServer`（只用于响应往返，不经过领域解码）
+    fn server_wire() -> WireServer {
+        WireServer {
+            id: "550e8400-e29b-41d4-a716-446655440000".to_owned(),
+            name: "web".to_owned(),
+            workspace_id: "550e8400-e29b-41d4-a716-446655440001".to_owned(),
+            rel_dir: "web".to_owned(),
+            version: "1.21.1".to_owned(),
+            variant: "paper".to_owned(),
+            jar: None,
+            launch: None,
+            settings: WireSettings {
+                java_major: Some(21),
+                ram_mib: Some(2048),
+                autostart: true,
+                backup_scope: vec!["world".to_owned()],
+            },
+            java_major: Some(21),
+            created_at: 1,
+            updated_at: 2,
+        }
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)] // 帧样本清单本身就是长列表，拆分反而难对账
     fn every_request_roundtrips_with_version() {
@@ -825,8 +956,37 @@ mod tests {
                 name: "web".to_owned(),
                 purge: false,
             },
+            Request::ServerCreateModpack {
+                workspace: Some("w1".to_owned()),
+                name: "modded".to_owned(),
+                project: "adrenaserver".to_owned(),
+                version: Some("abc123".to_owned()),
+            },
+            Request::PropsGet {
+                server_id: "550e8400-e29b-41d4-a716-446655440000".to_owned(),
+            },
+            Request::PropsSet {
+                server_id: "550e8400-e29b-41d4-a716-446655440000".to_owned(),
+                updates: vec![WirePropUpdate {
+                    key: "motd".to_owned(),
+                    value: "hello".to_owned(),
+                }],
+            },
+            Request::SettingsSet {
+                server_id: "550e8400-e29b-41d4-a716-446655440000".to_owned(),
+                key: "ram".to_owned(),
+                value: "2G".to_owned(),
+            },
             Request::JavaList,
             Request::JavaScan,
+            Request::JavaInstall {
+                major: 21,
+                jre: true,
+                vendor: Some("temurin".to_owned()),
+            },
+            Request::JavaUninstall {
+                path: "/opt/java/temurin-21".to_owned(),
+            },
             Request::ClientList,
             Request::ClientRevoke {
                 selector: "laptop".to_owned(),
@@ -935,6 +1095,43 @@ mod tests {
                 lines: vec!["[12:00:00] done".to_owned()],
             },
             Response::Removed { disk_purged: true },
+            Response::Props {
+                path: "/srv/mc/web/server.properties".to_owned(),
+                text: "motd=hello\npvp=true\n".to_owned(),
+            },
+            Response::SettingsChanged {
+                value: "2048M".to_owned(),
+                settings: server_wire().settings,
+            },
+            Response::ModpackApplied {
+                server: server_wire(),
+                project_id: "adrenaserver".to_owned(),
+                version_id: "abc123".to_owned(),
+                version_number: "1.2.3".to_owned(),
+                minecraft: "1.21.1".to_owned(),
+                loader: Some("fabric 0.16.9".to_owned()),
+                files: 120,
+                downloaded_bytes: 4_096,
+                reused: 30,
+                skipped_client_only: 2,
+            },
+            Response::JavaUninstalled {
+                path: "/opt/java/temurin-21".to_owned(),
+                managed: true,
+            },
+        ];
+        for response in responses {
+            let back = roundtrip_response(&response);
+            assert_eq!(
+                serde_json::to_value(&back).expect("json"),
+                serde_json::to_value(&response).expect("json")
+            );
+        }
+    }
+
+    #[test]
+    fn backup_responses_roundtrip() {
+        let responses = [
             Response::SnapshotCreated {
                 snapshot: snapshot_wire(),
                 skipped: 2,
@@ -1038,6 +1235,46 @@ mod tests {
             Request::Shutdown.required_permission(),
             Some(Permission::Manage)
         );
+        // 属性读取仍是读；写入与安装属于 Write
+        assert_eq!(
+            Request::PropsGet {
+                server_id: "id".to_owned()
+            }
+            .required_permission(),
+            Some(Permission::Read)
+        );
+        for request in [
+            Request::PropsSet {
+                server_id: "id".to_owned(),
+                updates: Vec::new(),
+            },
+            Request::SettingsSet {
+                server_id: "id".to_owned(),
+                key: "ram".to_owned(),
+                value: "2G".to_owned(),
+            },
+            Request::JavaInstall {
+                major: 21,
+                jre: false,
+                vendor: None,
+            },
+            Request::JavaUninstall {
+                path: "/opt/java".to_owned(),
+            },
+            Request::ServerCreateModpack {
+                workspace: None,
+                name: "web".to_owned(),
+                project: "pack".to_owned(),
+                version: None,
+            },
+        ] {
+            assert_eq!(
+                request.required_permission(),
+                Some(Permission::Write),
+                "{}",
+                request.operation()
+            );
+        }
         // 握手与认证本身不需要权限（否则永远无法完成认证）
         assert_eq!(
             Request::Hello {

@@ -124,7 +124,12 @@ pub(crate) mod mcsup_agent_shim {
         running: Mutex<Vec<RunningServer>>,
         /// 备份垫片的快照索引
         snapshots: Mutex<Vec<protocol::remote::wire::WireSnapshot>>,
+        /// `server.properties` 垫片：键值表（保持写入顺序）
+        props: Mutex<Vec<(String, String)>>,
     }
+
+    /// 垫片里的 `server.properties` 路径
+    const PROPS_PATH: &str = "/srv/mc/server.properties";
 
     impl MemAgent {
         /// 一条固定内容的快照（id 随机后缀避免同秒撞名）
@@ -147,6 +152,18 @@ pub(crate) mod mcsup_agent_shim {
                 server_online: false,
                 created_at: 1,
             }
+        }
+        /// `server.properties` 垫片的原文（每行 `key=value`）
+        fn props_text(&self) -> String {
+            let guard = self.props.lock().expect("lock");
+            let mut text = String::new();
+            for (key, value) in guard.iter() {
+                text.push_str(key);
+                text.push('=');
+                text.push_str(value);
+                text.push('\n');
+            }
+            text
         }
     }
 
@@ -262,6 +279,83 @@ pub(crate) mod mcsup_agent_shim {
                     Response::Removed { disk_purged: false }
                 }
                 Request::JavaList | Request::JavaScan => Response::Javas { items: Vec::new() },
+                // ---- 写入类帧：内存垫片按最小语义回帧 ----
+                Request::ServerInstall { name, version } => {
+                    let mut guard = self.servers.lock().expect("lock");
+                    let Some(srv) = guard.iter_mut().find(|srv| srv.name == *name) else {
+                        return RemoteFailure::new(
+                            protocol::remote::ErrorKind::NOT_FOUND,
+                            format!("no such server: {name}"),
+                        )
+                        .into_response();
+                    };
+                    srv.version = version.clone();
+                    srv.updated_at = 2;
+                    let wire = srv.clone();
+                    drop(guard);
+                    Response::Servers { items: vec![wire] }
+                }
+                Request::ServerCreateModpack {
+                    name,
+                    project,
+                    version,
+                    ..
+                } => {
+                    let wire = encoding::wire_server(name, "1.21.1", "fabric", None);
+                    self.servers.lock().expect("lock").push(wire.clone());
+                    Response::ModpackApplied {
+                        server: wire,
+                        project_id: project.clone(),
+                        version_id: version.clone().unwrap_or_else(|| "v1".to_owned()),
+                        version_number: "1.0.0".to_owned(),
+                        minecraft: "1.21.1".to_owned(),
+                        loader: Some("fabric 0.16.9".to_owned()),
+                        files: 3,
+                        downloaded_bytes: 1024,
+                        reused: 1,
+                        skipped_client_only: 0,
+                    }
+                }
+                Request::PropsGet { .. } => Response::Props {
+                    path: PROPS_PATH.to_owned(),
+                    text: self.props_text(),
+                },
+                Request::PropsSet { updates, .. } => {
+                    let mut guard = self.props.lock().expect("lock");
+                    for update in updates {
+                        match guard.iter_mut().find(|(key, _)| *key == update.key) {
+                            Some(slot) => slot.1.clone_from(&update.value),
+                            None => guard.push((update.key.clone(), update.value.clone())),
+                        }
+                    }
+                    drop(guard);
+                    Response::Props {
+                        path: PROPS_PATH.to_owned(),
+                        text: self.props_text(),
+                    }
+                }
+                Request::SettingsSet { value, .. } => Response::SettingsChanged {
+                    value: value.clone(),
+                    settings: protocol::remote::wire::WireSettings::from(
+                        &domain::server::settings::ServerSettings::default(),
+                    ),
+                },
+                Request::JavaInstall { major, .. } => Response::Javas {
+                    items: vec![protocol::remote::wire::WireJava {
+                        id: format!("rt-{major}"),
+                        path: format!("/opt/java/{major}"),
+                        major: *major,
+                        version: format!("{major}.0.1"),
+                        vendor: "temurin".to_owned(),
+                        managed: true,
+                        created_at: 1,
+                        updated_at: 1,
+                    }],
+                },
+                Request::JavaUninstall { path } => Response::JavaUninstalled {
+                    path: path.clone(),
+                    managed: true,
+                },
                 // ---- supervisor 垫片：按 RunningServer 表回帧 ----
                 Request::StatusMany { ids } => {
                     let guard = self.running.lock().expect("lock");

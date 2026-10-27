@@ -271,6 +271,27 @@ impl TryFrom<WireSettings> for ServerSettings {
     }
 }
 
+/// 一次 `server.properties` 写入的一项
+///
+/// 用结构体而不是二元组：帧是 JSON，`[["motd","hi"]]` 读起来要靠位置记忆，
+/// 字段名让审计日志与抓包都能直接看懂。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WirePropUpdate {
+    /// 键
+    pub key: String,
+    /// 新值
+    pub value: String,
+}
+
+impl From<&(String, String)> for WirePropUpdate {
+    fn from(update: &(String, String)) -> Self {
+        Self {
+            key: update.0.clone(),
+            value: update.1.clone(),
+        }
+    }
+}
+
 /// 服务元数据的线格式
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireServer {

@@ -8,15 +8,19 @@
 //! 不解析 `message`。因此映射按**领域判定**（各 `kind()`）来做，不看错误文案。
 
 use super::Agent;
-use domain::java::JavaMajor;
+use domain::java::{JavaMajor, JavaPackageType, JavaVendor};
+use domain::server::settings::SettingKey;
 use domain::server::version::{ServerVariant, VersionId};
 use file::FileCoreInspector;
-use protocol::remote::wire::{WireServer, WireSnapshot, WireStatusEntry};
+use protocol::remote::wire::{
+    WirePropUpdate, WireServer, WireSettings, WireSnapshot, WireStatusEntry,
+};
 use protocol::remote::{ErrorKind, Request, Response};
 use service::{
     InitOutcome, InstallJarError, InstallerContext, JavaError, LifecycleError, LifecycleErrorKind,
-    ServerInstaller, ServerRegistryError, ServerRegistryErrorKind, StartOptions, WorkspaceError,
-    WorkspaceErrorKind,
+    ModpackError, ModpackInstallOptions, PropsError, ServerInstaller, ServerPropsService,
+    ServerRegistryError, ServerRegistryErrorKind, ServerSettingsService, SettingsError,
+    StartOptions, UninstallOutcome, WorkspaceError, WorkspaceErrorKind,
 };
 use transport::RemoteFailure;
 
@@ -36,9 +40,16 @@ impl Agent {
             | Request::WorkspaceRemove { .. } => self.workspace_op(request),
             Request::ServerList
             | Request::ServerCreate { .. }
+            | Request::ServerCreateModpack { .. }
             | Request::ServerRemove { .. }
-            | Request::ServerInstall { .. } => self.server_op(request),
-            Request::JavaList | Request::JavaScan => self.java_op(request),
+            | Request::ServerInstall { .. }
+            | Request::PropsGet { .. }
+            | Request::PropsSet { .. }
+            | Request::SettingsSet { .. } => self.server_op(request),
+            Request::JavaList
+            | Request::JavaScan
+            | Request::JavaInstall { .. }
+            | Request::JavaUninstall { .. } => self.java_op(request),
 
             Request::ClientList => match self.clients.load() {
                 Ok(records) => Response::Clients {
@@ -211,6 +222,21 @@ impl Agent {
                 }
             }
             Request::ServerInstall { name, version } => self.server_install(name, version),
+            Request::ServerCreateModpack {
+                workspace,
+                name,
+                project,
+                version,
+            } => {
+                self.server_create_modpack(workspace.as_deref(), name, project, version.as_deref())
+            }
+            Request::PropsGet { server_id } => self.props_get(server_id),
+            Request::PropsSet { server_id, updates } => self.props_set(server_id, updates),
+            Request::SettingsSet {
+                server_id,
+                key,
+                value,
+            } => self.settings_set(server_id, key, value),
             other => unreachable_frame(other),
         }
     }
@@ -225,6 +251,10 @@ impl Agent {
                 Ok(_) => self.java_list(),
                 Err(err) => java_failure(&err),
             },
+            Request::JavaInstall { major, jre, vendor } => {
+                self.java_install(*major, *jre, vendor.as_deref())
+            }
+            Request::JavaUninstall { path } => self.java_uninstall(path),
             other => unreachable_frame(other),
         }
     }
@@ -433,53 +463,256 @@ impl Agent {
     ///
     /// 编排与本地 CLI 走同一份 `install_jar_checked`：下载、校验、（安装器类
     /// 变体的）安装器执行都在对端，客户端只拿到更新后的注册记录。
-    ///
-    /// `install_jar_checked` 是 async（下载走 HTTP），而分发线程是同步的。
-    /// 远端命令本就是「一请求一连接一线程」，在当前线程上建一个
-    /// current-thread runtime 阻塞执行即可；transport 的 600s 读写超时与
-    /// 下载时长同一量级，不构成额外约束。
     fn server_install(&self, name: &str, version: &str) -> Response {
         let variant = match self.core.registry.get(name) {
             Ok(srv) => srv.meta.variant,
             Err(err) => return registry_failure(&err),
         };
-        let Some(source) = pick_source(&self.core.jar_sources, &variant) else {
-            return RemoteFailure::new(
-                ErrorKind::INVALID,
-                format!("no server jar source for variant {}", variant.as_str()),
-            )
-            .into_response();
-        };
-        let installer = ServerInstaller::new(source, self.core.downloader.clone());
-        let runtime = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
+        let runtime = match current_thread_runtime() {
             Ok(runtime) => runtime,
             Err(err) => return failure(ErrorKind::IO, err),
         };
-        let outcome = runtime.block_on(async {
-            self.core
-                .lifecycle
-                .install_jar_checked(
-                    name,
-                    &VersionId::new(version.to_owned()),
-                    &installer,
-                    &FileCoreInspector,
-                    installer_ctx(self, name, &variant).as_ref(),
-                    None,
-                    None,
-                    &port::CancellationToken::new(),
+        match runtime.block_on(self.install_core_async(name, version, &variant)) {
+            Ok(item) => Response::Servers { items: vec![item] },
+            Err(response) => *response,
+        }
+    }
+
+    /// 安装 / 更换对端核心（async：下载走 HTTP）
+    ///
+    /// `server install` 与 `server create --modpack` 共用；失败直接返回错误帧，
+    /// 调用方不需要再翻译一次。
+    async fn install_core_async(
+        &self,
+        name: &str,
+        version: &str,
+        variant: &ServerVariant,
+    ) -> Result<WireServer, Box<Response>> {
+        let Some(source) = pick_source(&self.core.jar_sources, variant) else {
+            return Err(Box::new(
+                RemoteFailure::new(
+                    ErrorKind::INVALID,
+                    format!("no server jar source for variant {}", variant.as_str()),
                 )
+                .into_response(),
+            ));
+        };
+        let installer = ServerInstaller::new(source, self.core.downloader.clone());
+        match self
+            .core
+            .lifecycle
+            .install_jar_checked(
+                name,
+                &VersionId::new(version.to_owned()),
+                &installer,
+                &FileCoreInspector,
+                installer_ctx(self, name, variant).as_ref(),
+                None,
+                None,
+                &port::CancellationToken::new(),
+            )
+            .await
+        {
+            Ok(outcome) => WireServer::try_from(&outcome.server.meta)
+                .map_err(|err| Box::new(failure(ErrorKind::IO, err))),
+            Err(LifecycleError::InstallJar(err)) => Err(Box::new(install_failure(&err))),
+            Err(err) => Err(Box::new(lifecycle_failure(&err))),
+        }
+    }
+
+    /// `server create --modpack`：对端读清单 → 登记 → 装加载器核心 → 布置
+    ///
+    /// 与本地 `server create` 的整合包路径同一条编排（`prepare` → 登记 →
+    /// 装加载器 → `apply`）。清单必须在对端读：MC 版本与加载器变体由整合包
+    /// 元数据决定，客户端拿不到。暂存目录用系统临时目录：登记前还不知道
+    /// 服务器目录，而清单下载只需要一个可写落点。
+    fn server_create_modpack(
+        &self,
+        workspace: Option<&str>,
+        name: &str,
+        project: &str,
+        version: Option<&str>,
+    ) -> Response {
+        let runtime = match current_thread_runtime() {
+            Ok(runtime) => runtime,
+            Err(err) => return failure(ErrorKind::IO, err),
+        };
+        runtime.block_on(async {
+            let staging = std::env::temp_dir();
+            let mut options = ModpackInstallOptions::new(&staging);
+            if let Some(version) = version {
+                options = options.version(version);
+            }
+            let cancel = port::CancellationToken::new();
+            let prepared = match self.core.modpack.prepare(project, options, &cancel).await {
+                Ok(prepared) => prepared,
+                Err(err) => return modpack_failure(&err),
+            };
+            // 加载器与 MC 版本必须在登记前确定：注册表存加载器对应的变体，
+            // 而不是 `modrinth-modpack`（后者只是「走整合包流程」的标记，
+            // 没有可下载的核心来源）
+            let variant = match prepared.require_loader() {
+                Ok(variant) => variant,
+                Err(err) => return modpack_failure(&err),
+            };
+            let minecraft = match prepared.minecraft_version() {
+                Ok(version) => version.to_owned(),
+                Err(err) => return modpack_failure(&err),
+            };
+            let dir = match self.core.registry.create(
+                workspace,
+                name,
+                &VersionId::new(minecraft.clone()),
+                variant.clone(),
+                None,
+            ) {
+                Ok(srv) => srv.dir,
+                Err(err) => return registry_failure(&err),
+            };
+            // 先装核心再铺文件：失败留在「已登记」状态，重试入口是 `server install`
+            if let Err(response) = self.install_core_async(name, &minecraft, &variant).await {
+                return *response;
+            }
+            let applied = match self
+                .core
+                .modpack
+                .apply(&prepared, &dir, None, &cancel)
                 .await
-        });
-        match outcome {
-            Ok(outcome) => match WireServer::try_from(&outcome.server.meta) {
-                Ok(item) => Response::Servers { items: vec![item] },
+            {
+                Ok(applied) => applied,
+                Err(err) => return modpack_failure(&err),
+            };
+            // `.mrpack` 暂存目录用完即删
+            if let Some(parent) = prepared.archive_path.parent() {
+                let _ = std::fs::remove_dir_all(parent);
+            }
+            let updated = match self.core.registry.get(name) {
+                Ok(srv) => srv,
+                Err(err) => return registry_failure(&err),
+            };
+            match WireServer::try_from(&updated.meta) {
+                Ok(server) => Response::ModpackApplied {
+                    server,
+                    project_id: prepared.resolved.project_id.clone(),
+                    version_id: prepared.resolved.version_id.clone(),
+                    version_number: prepared.resolved.version_number.clone(),
+                    minecraft,
+                    loader: prepared
+                        .index
+                        .loader()
+                        .map(|(loader, version)| format!("{loader} {version}")),
+                    files: applied.file_count,
+                    downloaded_bytes: applied.downloaded_bytes,
+                    reused: applied.reused,
+                    skipped_client_only: applied.skipped_client_only,
+                },
                 Err(err) => failure(ErrorKind::IO, err),
+            }
+        })
+    }
+
+    /// 读取对端 `server.properties` 原文
+    ///
+    /// 传原文而不是键值表：注释与顺序属于用户文件内容，两端用同一份
+    /// `Properties::parse` 得到一致的视图。
+    fn props_get(&self, server_id: &str) -> Response {
+        let name = match self.name_of(server_id) {
+            Ok(name) => name,
+            Err(response) => return response,
+        };
+        let service = ServerPropsService::new(self.core.registry.clone());
+        match service.read(&name) {
+            Ok(report) => Response::Props {
+                path: report.path.display().to_string(),
+                text: report.text,
             },
-            Err(LifecycleError::InstallJar(err)) => install_failure(&err),
-            Err(err) => lifecycle_failure(&err),
+            Err(err) => props_failure(&err),
+        }
+    }
+
+    /// 写入对端 `server.properties` 的若干键值
+    fn props_set(&self, server_id: &str, updates: &[WirePropUpdate]) -> Response {
+        let name = match self.name_of(server_id) {
+            Ok(name) => name,
+            Err(response) => return response,
+        };
+        let updates: Vec<(String, String)> = updates
+            .iter()
+            .map(|update| (update.key.clone(), update.value.clone()))
+            .collect();
+        let service = ServerPropsService::new(self.core.registry.clone());
+        match service.set(&name, &updates) {
+            Ok(report) => Response::Props {
+                path: report.path.display().to_string(),
+                text: report.text,
+            },
+            Err(err) => props_failure(&err),
+        }
+    }
+
+    /// 设置对端服务器的一项服务属性（内存 / Java / 开机自启 / 备份范围）
+    fn settings_set(&self, server_id: &str, key: &str, value: &str) -> Response {
+        let name = match self.name_of(server_id) {
+            Ok(name) => name,
+            Err(response) => return response,
+        };
+        let key = match SettingKey::parse(key) {
+            Ok(key) => key,
+            Err(err) => return failure(ErrorKind::INVALID, err),
+        };
+        let service =
+            ServerSettingsService::new(self.core.registry.clone(), self.core.java.clone());
+        match service.set(&name, key, value, &mut || {}, &mut |_| {}) {
+            Ok(change) => Response::SettingsChanged {
+                value: change.value,
+                settings: WireSettings::from(&change.settings),
+            },
+            Err(err) => settings_failure(&err),
+        }
+    }
+
+    /// 在对端安装 Java；返回对端登记的全部运行时
+    fn java_install(&self, major: i64, jre: bool, vendor: Option<&str>) -> Response {
+        let major = match JavaMajor::parse(major) {
+            Ok(major) => major,
+            Err(err) => return failure(ErrorKind::INVALID, err),
+        };
+        let package = if jre {
+            JavaPackageType::Jre
+        } else {
+            JavaPackageType::Jdk
+        };
+        let vendor = vendor.map(JavaVendor::parse_fuzzy);
+        let runtime = match current_thread_runtime() {
+            Ok(runtime) => runtime,
+            Err(err) => return failure(ErrorKind::IO, err),
+        };
+        let outcome = runtime.block_on(self.core.java.install(
+            major,
+            package,
+            vendor,
+            None,
+            None,
+            &port::CancellationToken::new(),
+        ));
+        match outcome {
+            Ok(_) => self.java_list(),
+            Err(err) => java_failure(&err),
+        }
+    }
+
+    /// 在对端卸载 Java（`path` 已由客户端按对端列表解析）
+    fn java_uninstall(&self, path: &str) -> Response {
+        match self.core.java.uninstall(std::path::Path::new(path)) {
+            Ok(UninstallOutcome::RemovedManaged { path }) => Response::JavaUninstalled {
+                path: path.display().to_string(),
+                managed: true,
+            },
+            Ok(UninstallOutcome::UnregisteredSystem { path }) => Response::JavaUninstalled {
+                path: path.display().to_string(),
+                managed: false,
+            },
+            Err(err) => java_failure(&err),
         }
     }
 
@@ -704,6 +937,18 @@ fn failure(kind: &'static str, err: impl std::fmt::Display) -> Response {
     RemoteFailure::new(kind, err.to_string()).into_response()
 }
 
+/// 同步分发线程上跑 async 安装 / 整合包编排
+///
+/// `install_jar_checked` 与整合包取回都走 HTTP（async），而分发线程是同步的。
+/// 远端命令本就是「一请求一连接一线程」，在当前线程上建一个 current-thread
+/// runtime 阻塞执行即可；transport 的 600s 读写超时与下载时长同一量级，
+/// 不构成额外约束。
+fn current_thread_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+}
+
 fn workspace_failure(err: &WorkspaceError) -> Response {
     let kind = match err.kind() {
         Some(WorkspaceErrorKind::NotFound { .. } | WorkspaceErrorKind::NoCurrent) => {
@@ -738,6 +983,47 @@ fn registry_failure(err: &ServerRegistryError) -> Response {
 fn java_failure(err: &JavaError) -> Response {
     let kind = match err {
         JavaError::NotFound(_) => ErrorKind::NOT_FOUND,
+        _ => ErrorKind::IO,
+    };
+    failure(kind, err)
+}
+
+/// 属性读写失败 → 错误帧（按领域判定分类，不解析文案）
+fn props_failure(err: &PropsError) -> Response {
+    let kind = match err {
+        PropsError::Registry(inner) => return registry_failure(inner),
+        PropsError::InvalidSet(_) => ErrorKind::INVALID,
+        // #[non_exhaustive]：IO 与未来新增变体都按通用失败处理
+        _ => ErrorKind::IO,
+    };
+    failure(kind, err)
+}
+
+/// 服务属性写入失败 → 错误帧
+fn settings_failure(err: &SettingsError) -> Response {
+    let kind = match err {
+        SettingsError::Registry(inner) => return registry_failure(inner),
+        SettingsError::InvalidValue(_) => ErrorKind::INVALID,
+        // 绑定的大版本没有已登记运行时：客户端提示先在对端 `java install`
+        SettingsError::UnknownJavaMajor { .. } => ErrorKind::NOT_FOUND,
+        // #[non_exhaustive]：Java 查询失败与未来新增变体按通用失败处理
+        _ => ErrorKind::IO,
+    };
+    failure(kind, err)
+}
+
+/// 整合包取回 / 布置失败 → 错误帧
+fn modpack_failure(err: &ModpackError) -> Response {
+    let kind = match err {
+        ModpackError::Source(port::SourceError::NotFound(_)) => ErrorKind::NOT_FOUND,
+        ModpackError::UnknownSource(_)
+        | ModpackError::NoSource
+        | ModpackError::MissingMinecraft(_)
+        | ModpackError::UnsupportedLoader(_)
+        | ModpackError::Escapes { .. } => ErrorKind::INVALID,
+        // 核心安装失败沿用生命周期分类（含 Java 选择 / 注册表判定）
+        ModpackError::Lifecycle(inner) => return lifecycle_failure(inner),
+        // #[non_exhaustive]：来源 / 下载 / 解压 / 文件系统失败按通用失败处理
         _ => ErrorKind::IO,
     };
     failure(kind, err)
