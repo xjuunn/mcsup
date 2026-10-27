@@ -31,6 +31,7 @@ use domain::backup::{
     BackupScope, ContentHash, Page, RelPath, RestoreTarget, RetentionPolicy, Snapshot, SnapshotId,
     SnapshotStatus, ensure_restore_stopped,
 };
+use domain::server::meta::ServerName;
 use port::{
     Backend, ContentStore, ScanError, ScanRules, SnapshotRepository, SnapshotStoreError,
     workspace_backups_root,
@@ -732,10 +733,18 @@ impl BackupService {
         let destination = match target {
             RestoreTarget::InPlace => layout.dir.clone(),
             RestoreTarget::NewServer { name: new_name } => {
-                if self.registry.get(new_name).is_ok() {
+                // 名字必须先过领域校验：`../x` / `/abs` / `C:\x` 会让 join
+                // 直接逃出 `<workspace>/servers`，把快照写到任意目录。
+                let parsed = ServerName::parse(new_name).map_err(ServerRegistryError::from)?;
+                if self.registry.get(parsed.as_str()).is_ok() {
                     return Err(BackupError::TargetExists(new_name.clone()));
                 }
-                layout.workspace.join("servers").join(new_name.as_str())
+                let dir = layout.workspace.join("servers").join(parsed.as_str());
+                // 磁盘上已存在但未注册的目录同样拒绝：否则会把旧文件混进恢复结果
+                if dir.exists() {
+                    return Err(BackupError::TargetExists(new_name.clone()));
+                }
+                dir
             }
         };
         let outcome = materialize(&layout, &snapshot, &destination, target)?;
@@ -2176,6 +2185,56 @@ mod tests {
             )
             .expect_err("exists");
         assert!(matches!(err, BackupError::TargetExists { .. }), "{err}");
+    }
+
+    #[test]
+    fn restore_to_traversal_name_is_rejected_before_writing() {
+        let fx = Fixture::new(FakeSupervisor::stopped());
+        fx.write("a", b"1");
+        let outcome = fx.create();
+        for name in ["../escape", "..\\escape", "/abs", "C:\\abs", "a/b", ""] {
+            let err = fx
+                .service
+                .restore(
+                    "alpha",
+                    outcome.snapshot.id.as_str(),
+                    &RestoreTarget::NewServer {
+                        name: name.to_owned(),
+                    },
+                )
+                .expect_err("invalid name");
+            assert!(
+                matches!(
+                    err,
+                    BackupError::Registry(ServerRegistryError::InvalidName(_))
+                ),
+                "{name}: {err}"
+            );
+        }
+        assert!(
+            !fx.ws_path.join("escape").exists(),
+            "恢复目标逃出 servers/ 目录"
+        );
+    }
+
+    /// 磁盘上已有但未注册的目录同样不能作为恢复目标：否则旧文件会混进恢复结果
+    #[test]
+    fn restore_to_existing_unregistered_dir_is_rejected() {
+        let fx = Fixture::new(FakeSupervisor::stopped());
+        fx.write("a", b"1");
+        let outcome = fx.create();
+        std::fs::create_dir(fx.ws_path.join("servers").join("copy")).expect("mkdir");
+        let err = fx
+            .service
+            .restore(
+                "alpha",
+                outcome.snapshot.id.as_str(),
+                &RestoreTarget::NewServer {
+                    name: "copy".to_owned(),
+                },
+            )
+            .expect_err("dir exists");
+        assert!(matches!(err, BackupError::TargetExists(_)), "{err}");
     }
 
     #[test]
