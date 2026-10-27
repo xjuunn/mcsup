@@ -12,7 +12,8 @@ use crate::progress::{ScanProgress, TaskSpinner};
 use crate::prompts;
 use anyhow::{Context, Result, anyhow};
 use comfy_table::{ContentArrangement, Table};
-use mcsup::domain::server::settings::{BACKUP_SCOPE_ALL, SettingKey};
+use mcsup::domain::server::settings::{BACKUP_SCOPE_ALL, ServerSettings, SettingKey};
+use mcsup::port::JavaRuntimeRepository as _;
 use mcsup::protocol::cli::{JarJson, SetJson, VersionJson};
 use mcsup::service::{DEFAULT_RAM_MIB, JavaService, ServerSettingsService, SettingChange};
 
@@ -21,6 +22,108 @@ fn settings_service() -> Result<ServerSettingsService> {
         bootstrap::open_registry()?,
         bootstrap::open_java_service()?,
     ))
+}
+
+/// 设置目标：本地走 service，远端走帧
+///
+/// 远端交互默认值直接取对端注册记录里的属性；判定与持久化仍在对端 service，
+/// 客户端只搬键值。
+enum Target {
+    /// 本机：service 直接持久化
+    Local(ServerSettingsService),
+    /// 远端：属性在对端
+    ///
+    /// `RemoteTarget` 带着整条注册记录，直接内联会让枚举按最大变体分配
+    /// （每次栈上 ~400 字节）；装箱后两个变体都只有一个指针大小。
+    Remote(Box<super::origin::RemoteTarget>),
+}
+
+impl Target {
+    fn open(name: &str, lang: Lang) -> Result<Self> {
+        if let Some(remote) = super::origin::remote_target(name, lang)? {
+            return Ok(Self::Remote(Box::new(remote)));
+        }
+        Ok(Self::Local(settings_service()?))
+    }
+
+    /// 当前属性（交互默认值）
+    fn current(&self, name: &str) -> Result<ServerSettings> {
+        match self {
+            Self::Local(service) => Ok(service.read(name)?.1),
+            Self::Remote(remote) => Ok(remote.meta.settings.clone()),
+        }
+    }
+
+    /// 写入并返回规范化后的结果
+    fn set(
+        &self,
+        name: &str,
+        key: SettingKey,
+        value: &str,
+        printer: Printer,
+    ) -> Result<SettingChange> {
+        let spinner = TaskSpinner::new(
+            crate::i18n::pick(
+                printer.lang(),
+                format!("正在设置 {name} {key}…"),
+                format!("setting {name} {key}…"),
+            ),
+            printer.is_human(),
+        );
+        match self {
+            Self::Local(service) => {
+                let result = service.set(
+                    name,
+                    key,
+                    value,
+                    &mut || {
+                        spinner.set_message(crate::i18n::pick(
+                            printer.lang(),
+                            "正在扫描本机 Java…",
+                            "scanning the host for Java…",
+                        ));
+                    },
+                    &mut |_| {},
+                );
+                spinner.finish();
+                Ok(result?)
+            }
+            Self::Remote(remote) => {
+                let result =
+                    remote
+                        .member
+                        .servers
+                        .set_setting(&remote.server_id, key.as_str(), value);
+                spinner.finish();
+                let (settings, value) = result.with_context(|| {
+                    crate::i18n::pick(
+                        printer.lang(),
+                        format!("在 {} 设置 {name} {key} 失败", remote.member.name),
+                        format!("failed to set {name} {key} on {}", remote.member.name),
+                    )
+                })?;
+                Ok(SettingChange {
+                    key,
+                    value,
+                    settings,
+                })
+            }
+        }
+    }
+
+    /// 已注册 Java 运行时（`java-version` 交互选择用）
+    fn runtimes(&self, printer: Printer) -> Result<Vec<mcsup::domain::java::JavaRuntime>> {
+        match self {
+            Self::Local(_) => list_runtimes(&bootstrap::open_java_service()?, printer),
+            Self::Remote(remote) => remote.member.java.list().with_context(|| {
+                crate::i18n::pick(
+                    printer.lang(),
+                    format!("列出 {} 上的 Java 失败", remote.member.name),
+                    format!("failed to list Java runtimes on {}", remote.member.name),
+                )
+            }),
+        }
+    }
 }
 
 /// `server set`：键 / 值缺失时交互补齐（非交互 → 退出码 2），校验后持久化
@@ -34,7 +137,7 @@ pub(crate) fn set(
     value: Option<&str>,
     printer: Printer,
 ) -> Result<()> {
-    let service = settings_service()?;
+    let target = Target::open(name, printer.lang())?;
     let interactive = printer.is_interactive();
 
     // 1. 键：显式解析（未知键 → 用法错误并列出全部键）；缺省交互选择
@@ -67,7 +170,7 @@ pub(crate) fn set(
     // 2. 值：显式直通；缺省按键类型交互补齐
     let raw_value = match value {
         Some(raw) => raw.to_owned(),
-        None if interactive => prompt_value(&service, name, key, printer)?,
+        None if interactive => prompt_value(&target, name, key, printer)?,
         None => {
             return Err(AppDiagnostic::usage(
                 crate::i18n::pick(
@@ -82,29 +185,7 @@ pub(crate) fn set(
     };
 
     // 3. 校验 + 持久化（java-version 可能触发首次 Java 扫描，保持回显）
-    let spinner = TaskSpinner::new(
-        crate::i18n::pick(
-            printer.lang(),
-            format!("正在设置 {name} {key}…"),
-            format!("setting {name} {key}…"),
-        ),
-        printer.is_human(),
-    );
-    let result = service.set(
-        name,
-        key,
-        &raw_value,
-        &mut || {
-            spinner.set_message(crate::i18n::pick(
-                printer.lang(),
-                "正在扫描本机 Java…",
-                "scanning the host for Java…",
-            ));
-        },
-        &mut |_| {},
-    );
-    spinner.finish();
-    let change: SettingChange = result?;
+    let change: SettingChange = target.set(name, key, &raw_value, printer)?;
 
     printer.print_outcome(
         &crate::i18n::pick(
@@ -136,7 +217,7 @@ pub(crate) fn set(
 ///
 /// 服务器不存在时返回错误
 pub(crate) fn version(name: &str, printer: Printer) -> Result<()> {
-    let reg = bootstrap::open_registry()?;
+    let reg = bootstrap::open_registry_with_remotes()?;
     let srv = reg.get(name).with_context(|| {
         crate::i18n::pick(
             printer.lang(),
@@ -311,12 +392,7 @@ fn key_from_label(label: &str) -> Option<SettingKey> {
 
 /// 交互值补齐：java-version 从已注册大版本选择，ram 输入（带当前默认），
 /// autostart 二选一
-fn prompt_value(
-    service: &ServerSettingsService,
-    name: &str,
-    key: SettingKey,
-    printer: Printer,
-) -> Result<String> {
+fn prompt_value(target: &Target, name: &str, key: SettingKey, printer: Printer) -> Result<String> {
     prompts::step(
         printer,
         2,
@@ -327,9 +403,9 @@ fn prompt_value(
             format!("value for {key}"),
         ),
     );
-    let (_, current) = service.read(name)?;
+    let current = target.current(name)?;
     match key {
-        SettingKey::JavaVersion => prompt_java_major(printer),
+        SettingKey::JavaVersion => prompt_java_major(target, printer),
         SettingKey::Ram => {
             let default = current
                 .value_of(SettingKey::Ram)
@@ -373,17 +449,16 @@ fn prompt_value(
 }
 
 /// 从已注册 Java 运行时的大版本里选择（首次扫描带回显）
-fn prompt_java_major(printer: Printer) -> Result<String> {
-    let java = bootstrap::open_java_service()?;
-    let runtimes = list_runtimes(&java, printer)?;
+fn prompt_java_major(target: &Target, printer: Printer) -> Result<String> {
+    let runtimes = target.runtimes(printer)?;
     let mut majors: Vec<i64> = runtimes.iter().map(|rt| rt.major.as_i64()).collect();
     majors.sort_unstable();
     majors.dedup();
     if majors.is_empty() {
         return Err(anyhow!(crate::i18n::pick(
             printer.lang(),
-            "未发现本机 Java，可执行 mcsup java install 安装",
-            "no Java found on this machine; run mcsup java install",
+            "未发现已登记的 Java，可先运行 mcsup java install（远端加 --origin）",
+            "no registered Java found; run `mcsup java install` first (add --origin for a remote)",
         )));
     }
     let labels: Vec<String> = majors.iter().map(ToString::to_string).collect();

@@ -1,12 +1,13 @@
 use crate::diagnostic::AppDiagnostic;
 use crate::output::Printer;
-use crate::progress::{InstallSession, ScanProgress};
+use crate::progress::{InstallSession, ScanProgress, TaskSpinner};
 use anyhow::{Context, Result, anyhow};
 use comfy_table::{ContentArrangement, Table};
 use inquire::Select;
 use mcsup::domain::java::{JavaMajor, JavaPackageType, JavaRuntime, JavaVendor};
+use mcsup::port::JavaRuntimeRepository as _;
 use mcsup::protocol::cli::{JavaInstallJson, JavaRow, JavaScanJson, JavaUninstallJson};
-use mcsup::service::{InstallStage, JavaService, UninstallOutcome};
+use mcsup::service::{InstallStage, UninstallOutcome};
 use std::path::{Path, PathBuf};
 use tracing::info;
 
@@ -260,24 +261,251 @@ pub(crate) async fn install(
     version: Option<&str>,
     jre: bool,
     vendor: Option<&str>,
+    origin: Option<&str>,
     printer: Printer,
 ) -> Result<()> {
+    if let Some(origin) = remote_origin(origin, printer.lang())? {
+        return install_on(&origin, version, jre, vendor, printer);
+    }
     install_with_outcome(version, jre, vendor, printer).await?;
     Ok(())
 }
 
-pub(crate) fn uninstall(target: Option<&str>, dir: Option<&Path>, printer: Printer) -> Result<()> {
+/// 解析 `--origin`：本地来源（或没给）返回 `None`
+fn remote_origin(raw: Option<&str>, lang: Lang) -> Result<Option<mcsup::port::Origin>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let origin = mcsup::port::Origin::parse(raw).map_err(|err| {
+        AppDiagnostic::usage(
+            crate::i18n::pick(
+                lang,
+                format!("--origin 取值非法: {raw}"),
+                format!("invalid --origin value: {raw}"),
+            ),
+            Some(err.to_string()),
+        )
+    })?;
+    Ok((!origin.is_local()).then_some(origin))
+}
+
+/// 在对端安装 Java：查询来源、下载、解压、登记全部发生在对端
+///
+/// 客户端只搬大版本 / 包类型 / 厂商，结果取对端回来列表里刚登记的那一项。
+pub(crate) fn install_on(
+    origin: &mcsup::port::Origin,
+    version: Option<&str>,
+    jre: bool,
+    vendor: Option<&str>,
+    printer: Printer,
+) -> Result<()> {
+    let lang = printer.lang();
+    let cfg = crate::config::ConfigFile::locate(None).load()?;
+    let members = bootstrap::remote_members(&cfg)?;
+    let member = super::origin::member(&members, origin, lang)?.ok_or_else(|| {
+        AppDiagnostic::usage(
+            crate::i18n::pick(
+                lang,
+                format!("远端 {} 未就绪（缺凭证或指纹）", origin.as_str()),
+                format!(
+                    "remote {} is not ready (missing credential or fingerprint)",
+                    origin.as_str()
+                ),
+            ),
+            None,
+        )
+    })?;
+    // 大版本列表是领域知识，两端共用；交互选择在本机完成，无需对端往返
+    let major = if let Some(raw) = version {
+        parse_major(lang, raw)?
+    } else {
+        prompt_major(printer)?
+    };
+    let spinner = TaskSpinner::new(
+        crate::i18n::pick(
+            lang,
+            format!("在 {} 安装 Java {major}…", member.name),
+            format!("installing Java {major} on {}…", member.name),
+        ),
+        printer.is_human(),
+    );
+    let result = member.java.install(major.as_i64(), jre, vendor);
+    spinner.finish();
+    let runtimes = result.with_context(|| {
+        crate::i18n::pick(
+            lang,
+            format!("在 {} 安装 Java 失败", member.name),
+            format!("failed to install Java on {}", member.name),
+        )
+    })?;
+    let installed = pick_installed(&runtimes, major).ok_or_else(|| {
+        anyhow!(crate::i18n::pick(
+            lang,
+            format!("{} 报告安装成功但没有 Java {major} 的登记记录", member.name),
+            format!(
+                "{} reported success but has no Java {major} registration",
+                member.name
+            ),
+        ))
+    })?;
+    printer.print_outcome(
+        &crate::i18n::pick(
+            lang,
+            format!(
+                "已在 {} 安装: Java {} ({}) → {}",
+                member.name,
+                installed.version,
+                installed.vendor,
+                installed.path.display()
+            ),
+            format!(
+                "installed on {}: Java {} ({}) → {}",
+                member.name,
+                installed.version,
+                installed.vendor,
+                installed.path.display()
+            ),
+        ),
+        &JavaInstallJson {
+            major: installed.major.as_i64(),
+            version: installed.version.as_str(),
+            vendor: installed.vendor.as_str(),
+            path: installed.path.display().to_string(),
+        },
+    )
+}
+
+/// 安装结果里挑刚登记的那项：managed 优先，其次同大版本的第一项
+fn pick_installed(runtimes: &[JavaRuntime], major: JavaMajor) -> Option<&JavaRuntime> {
+    runtimes
+        .iter()
+        .find(|rt| rt.major == major && rt.managed)
+        .or_else(|| runtimes.iter().find(|rt| rt.major == major))
+}
+
+pub(crate) fn uninstall(
+    target: Option<&str>,
+    dir: Option<&Path>,
+    origin: Option<&str>,
+    printer: Printer,
+) -> Result<()> {
+    if let Some(origin) = remote_origin(origin, printer.lang())? {
+        return uninstall_on(&origin, target, dir, printer);
+    }
     let service = bootstrap::open_java_service()?;
-    let path = resolve_target(&service, target, dir, printer)?;
+    let runtimes = service.list().context(crate::i18n::pick(
+        printer.lang(),
+        "列出 Java 失败",
+        "failed to list Java runtimes",
+    ))?;
+    let path = resolve_target(&runtimes, target, dir, printer)?;
     let outcome = service.uninstall(&path).context(crate::i18n::pick(
         printer.lang(),
         "卸载失败",
         "uninstall failed",
     ))?;
-    let (message, row) = match outcome {
+    let (message, row) = report_uninstall(&outcome, printer.lang());
+    printer.print_outcome(&message, &row)
+}
+
+/// 在对端卸载 Java：登记表与文件都在对端，客户端只搬目标路径
+///
+/// 目标解析用对端返回的运行时列表（同一份 [`resolve_target`]），因此
+/// `--dir`、大版本、裸路径三种写法在本地与远端行为一致。
+fn uninstall_on(
+    origin: &mcsup::port::Origin,
+    target: Option<&str>,
+    dir: Option<&Path>,
+    printer: Printer,
+) -> Result<()> {
+    let lang = printer.lang();
+    let cfg = crate::config::ConfigFile::locate(None).load()?;
+    let members = bootstrap::remote_members(&cfg)?;
+    let member = super::origin::member(&members, origin, lang)?.ok_or_else(|| {
+        AppDiagnostic::usage(
+            crate::i18n::pick(
+                lang,
+                "本地来源不需要远端卸载",
+                "local origin does not need a remote uninstall",
+            ),
+            None,
+        )
+    })?;
+    let runtimes = member.java.list().with_context(|| {
+        crate::i18n::pick(
+            lang,
+            format!("列出 {} 上的 Java 失败", member.name),
+            format!("failed to list Java runtimes on {}", member.name),
+        )
+    })?;
+    let path = resolve_target(&runtimes, target, dir, printer)?;
+    let spinner = TaskSpinner::new(
+        crate::i18n::pick(
+            lang,
+            format!("正在从 {} 卸载 {}…", member.name, path.display()),
+            format!("uninstalling {} from {}…", path.display(), member.name),
+        ),
+        printer.is_human(),
+    );
+    let result = member.java.uninstall(&path);
+    spinner.finish();
+    let (path, managed) = result.with_context(|| {
+        crate::i18n::pick(
+            lang,
+            format!("在 {} 卸载 Java 失败", member.name),
+            format!("failed to uninstall Java on {}", member.name),
+        )
+    })?;
+    let (message, row) = if managed {
+        (
+            crate::i18n::pick(
+                lang,
+                format!(
+                    "已在 {} 删除 mcsup 管理的 Java: {}",
+                    member.name,
+                    path.display()
+                ),
+                format!(
+                    "deleted the mcsup-managed Java on {}: {}",
+                    member.name,
+                    path.display()
+                ),
+            ),
+            JavaUninstallJson {
+                path: path.display().to_string(),
+                kind: "managed",
+            },
+        )
+    } else {
+        (
+            crate::i18n::pick(
+                lang,
+                format!(
+                    "已在 {} 从注册表移除（文件保留）: {}",
+                    member.name,
+                    path.display()
+                ),
+                format!(
+                    "unregistered on {} (files kept): {}",
+                    member.name,
+                    path.display()
+                ),
+            ),
+            JavaUninstallJson {
+                path: path.display().to_string(),
+                kind: "system",
+            },
+        )
+    };
+    printer.print_outcome(&message, &row)
+}
+
+/// 卸载结果 → 文案与 JSON（本地 / 远端共用同一套措辞）
+fn report_uninstall(outcome: &UninstallOutcome, lang: Lang) -> (String, JavaUninstallJson) {
+    match outcome {
         UninstallOutcome::RemovedManaged { path } => (
             crate::i18n::pick(
-                printer.lang(),
+                lang,
                 format!("已删除 mcsup 管理的 Java: {}", path.display()),
                 format!("deleted the mcsup-managed Java: {}", path.display()),
             ),
@@ -288,7 +516,7 @@ pub(crate) fn uninstall(target: Option<&str>, dir: Option<&Path>, printer: Print
         ),
         UninstallOutcome::UnregisteredSystem { path } => (
             crate::i18n::pick(
-                printer.lang(),
+                lang,
                 format!("已从注册表移除（文件保留）: {}", path.display()),
                 format!("unregistered (files kept): {}", path.display()),
             ),
@@ -297,8 +525,7 @@ pub(crate) fn uninstall(target: Option<&str>, dir: Option<&Path>, printer: Print
                 kind: "system",
             },
         ),
-    };
-    printer.print_outcome(&message, &row)
+    }
 }
 
 fn parse_major(lang: Lang, raw: &str) -> Result<JavaMajor> {
@@ -352,7 +579,7 @@ fn prompt_major(printer: Printer) -> Result<JavaMajor> {
 }
 
 fn resolve_target(
-    service: &JavaService,
+    runtimes: &[JavaRuntime],
     target: Option<&str>,
     dir: Option<&Path>,
     printer: Printer,
@@ -364,20 +591,24 @@ fn resolve_target(
     let Some(target) = target else {
         // 缺必填目标：交互下从已注册运行时中选一个；非交互报用法错误（2）
         if printer.is_interactive() {
-            return prompt_registered_runtime(service, printer.lang());
+            return prompt_registered_runtime(runtimes, printer.lang());
         }
-        return Err(anyhow!(crate::i18n::pick(
-            printer.lang(),
-            "请指定大版本号或 --dir <路径>，如 mcsup java uninstall 17 或 mcsup java uninstall --dir \"…/Contents/Home\"",
-            "pass a major version or --dir <path>, e.g. mcsup java uninstall 17 or mcsup java uninstall --dir \"…/Contents/Home\"",
-        )));
+        return Err(AppDiagnostic::usage(
+            crate::i18n::pick(
+                printer.lang(),
+                "java uninstall 缺少目标，请指定大版本号或 --dir <路径>",
+                "java uninstall requires a target: pass a major version or --dir <path>",
+            ),
+            Some(crate::i18n::pick(
+                printer.lang(),
+                "例如：mcsup java uninstall 17 或 mcsup java uninstall --dir \"…/Contents/Home\"",
+                "e.g. mcsup java uninstall 17 or mcsup java uninstall --dir \"…/Contents/Home\"",
+            )),
+        )
+        .into());
     };
     if let Ok(major) = parse_major(printer.lang(), target) {
-        let matches = service.find_by_major(major).context(crate::i18n::pick(
-            printer.lang(),
-            "查询运行时失败",
-            "failed to query runtimes",
-        ))?;
+        let matches: Vec<_> = runtimes.iter().filter(|rt| rt.major == major).collect();
         return match matches.len() {
             0 => Err(anyhow!(crate::i18n::pick(
                 printer.lang(),
@@ -411,12 +642,7 @@ fn resolve_target(
 }
 
 /// 缺目标时：列出已注册运行时供选择，返回其路径
-fn prompt_registered_runtime(service: &JavaService, lang: Lang) -> Result<PathBuf> {
-    let runtimes = service.list().context(crate::i18n::pick(
-        lang,
-        "列出 Java 失败",
-        "failed to list Java runtimes",
-    ))?;
+fn prompt_registered_runtime(runtimes: &[JavaRuntime], lang: Lang) -> Result<PathBuf> {
     if runtimes.is_empty() {
         return Err(anyhow!(crate::i18n::pick(
             lang,
@@ -465,7 +691,7 @@ fn prompt_registered_runtime(service: &JavaService, lang: Lang) -> Result<PathBu
 }
 
 /// 多个运行时命中大版本时，TTY 下交互选择
-fn prompt_runtime(lang: Lang, major: JavaMajor, matches: &[JavaRuntime]) -> Result<PathBuf> {
+fn prompt_runtime(lang: Lang, major: JavaMajor, matches: &[&JavaRuntime]) -> Result<PathBuf> {
     let choices: Vec<String> = matches
         .iter()
         .map(|rt| {

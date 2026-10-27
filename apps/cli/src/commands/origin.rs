@@ -142,6 +142,122 @@ pub(crate) fn resolve_server_name(raw: &str, printer: crate::output::Printer) ->
     .into())
 }
 
+/// 解析到远端的服务器目标
+///
+/// 入口需要「这台服务器现在在哪」才能选通道：`service` 的写路径只认裸名，
+/// 远端写要走帧并带对端身份。这里一次解析出三样，避免各命令各查一遍。
+#[derive(Debug, Clone)]
+pub(crate) struct RemoteTarget {
+    /// 该服务器所属的远端
+    pub member: mcsup::backend::remote::RemoteMember,
+    /// 对端上的稳定身份（帧按 id 寻址，不按名字）
+    pub server_id: String,
+    /// 对端此刻的注册记录（含服务属性，交互默认值直接用它）
+    pub meta: mcsup::domain::server::meta::ServerMeta,
+}
+
+/// 组合列表里的目标判定结果
+///
+/// 纯判定、不做 IO：`remote_target` 只负责取列表与装配 [`RemoteTarget`]，
+/// 「本地优先 / 唯一远端 / 重名歧义」这三条口径因此可以单测。
+enum TargetPick<'a, T> {
+    /// 本地命中（含显式 `local/name`）：交给本地路径
+    Local,
+    /// 唯一远端命中
+    Remote(&'a T),
+    /// 该名字不存在（由随后的 service / 镜像调用统一报）
+    Missing,
+    /// 多台远端重名，不替用户猜
+    Ambiguous,
+}
+
+/// 在已按名字过滤前的完整列表里挑目标（本地优先）
+fn pick_hit<'a, T>(
+    items: &'a [T],
+    bare: &str,
+    selector: &mcsup::service::Selector,
+    name_of: impl Fn(&T) -> &str,
+    origin_of: impl Fn(&T) -> &Origin,
+) -> TargetPick<'a, T> {
+    let named: Vec<&T> = items.iter().filter(|item| name_of(item) == bare).collect();
+    let hits: Vec<&T> = match selector.origin() {
+        // 限定来源：只看该来源
+        Some(origin) => named
+            .into_iter()
+            .filter(|item| origin_of(item) == origin)
+            .collect(),
+        // 未限定：本地命中即交给本地路径，不再考虑同名远端
+        None if named.iter().any(|item| origin_of(item).is_local()) => {
+            return TargetPick::Local;
+        }
+        None => named,
+    };
+    match hits.as_slice() {
+        [] => TargetPick::Missing,
+        [one] if origin_of(one).is_local() => TargetPick::Local,
+        [one] => TargetPick::Remote(one),
+        _ => TargetPick::Ambiguous,
+    }
+}
+
+/// 目标服务器是否落在远端
+///
+/// `Some` = 该名字解析到远端服务器；`None` = 本地，或本地根本没有这个名字
+/// （「不存在」由随后的 service / 镜像调用统一报，退出码一致）。
+///
+/// 解析口径与 `server list --origin` 同一份组合注册表：
+///
+/// - 未限定：本地有同名服务器就返回 `None`（本地优先，既有语义）；
+/// - 未限定且只有一台远端有这个裸名：返回那台；
+/// - 未限定而多台远端重名：报歧义，不替用户猜；
+/// - 限定远端：只看该来源。
+///
+/// # Errors
+///
+/// 远端读取失败，或该远端在配置里有记录但凭证 / 指纹不可用时返回错误
+pub(crate) fn remote_target(raw: &str, lang: crate::locale::Lang) -> Result<Option<RemoteTarget>> {
+    let cfg = crate::config::ConfigFile::locate(None).load()?;
+    let members = crate::bootstrap::remote_members(&cfg)?;
+    if members.is_empty() {
+        return Ok(None);
+    }
+    let selector = mcsup::service::Selector::parse(raw);
+    let reg = crate::bootstrap::open_registry_with_remotes()?;
+    let all = reg.list_sourced()?;
+    let picked = pick_hit(
+        &all,
+        selector.name(),
+        &selector,
+        |sourced| sourced.value.meta.name.as_str(),
+        |sourced| &sourced.origin,
+    );
+    let sourced = match picked {
+        TargetPick::Local | TargetPick::Missing => return Ok(None),
+        TargetPick::Ambiguous => {
+            return Err(AppDiagnostic::usage(
+                crate::i18n::pick(
+                    lang,
+                    format!("服务器名在多个远端重复，无法确定目标: {raw}；请用 <远端>/<名称> 限定"),
+                    format!(
+                        "the server name exists on more than one remote: {raw}; qualify it as <remote>/<name>"
+                    ),
+                ),
+                None,
+            )
+            .into());
+        }
+        TargetPick::Remote(sourced) => sourced,
+    };
+    let Some(member) = member(&members, &sourced.origin, lang)? else {
+        return Ok(None);
+    };
+    Ok(Some(RemoteTarget {
+        member: member.clone(),
+        server_id: sourced.value.meta.id.as_str().to_owned(),
+        meta: sourced.value.meta.clone(),
+    }))
+}
+
 /// 解析远端名（供 `remote` 子命令复用）
 ///
 /// # Errors
@@ -237,5 +353,79 @@ mod tests {
     fn bare_server_name_is_passed_through() {
         let printer = crate::output::Printer::new(crate::output::OutputFormat::Human, Lang::Zh);
         assert_eq!(resolve_server_name("web", printer).expect("bare"), "web");
+    }
+
+    /// 组合列表的最小条目：只保留判定关心的两列
+    struct Hit {
+        name: &'static str,
+        origin: Origin,
+    }
+
+    fn hits() -> Vec<Hit> {
+        vec![
+            Hit {
+                name: "web",
+                origin: Origin::Local,
+            },
+            Hit {
+                name: "web",
+                origin: Origin::Remote(name("prod-box")),
+            },
+            Hit {
+                name: "survival",
+                origin: Origin::Remote(name("prod-box")),
+            },
+            Hit {
+                name: "survival",
+                origin: Origin::Remote(name("lab")),
+            },
+        ]
+    }
+
+    fn pick<'a>(items: &'a [Hit], raw: &str) -> TargetPick<'a, Hit> {
+        let selector = mcsup::service::Selector::parse(raw);
+        pick_hit(
+            items,
+            selector.name(),
+            &selector,
+            |hit| hit.name,
+            |hit| &hit.origin,
+        )
+    }
+
+    #[test]
+    fn pick_prefers_local_when_name_is_unqualified() {
+        // web 本地有、prod-box 也有：未限定就是本地优先
+        assert!(matches!(pick(&hits(), "web"), TargetPick::Local));
+        // 显式 local/ 同样归本地
+        assert!(matches!(pick(&hits(), "local/web"), TargetPick::Local));
+    }
+
+    #[test]
+    fn pick_resolves_unique_remote_hit() {
+        let items = hits();
+        let TargetPick::Remote(found) = pick(&items, "prod-box/survival") else {
+            panic!("expected a remote hit");
+        };
+        assert_eq!(found.origin, Origin::Remote(name("prod-box")));
+
+        // 未限定且本地没有同名：唯一远端命中
+        let only_remote = vec![Hit {
+            name: "atm",
+            origin: Origin::Remote(name("lab")),
+        }];
+        assert!(matches!(pick(&only_remote, "atm"), TargetPick::Remote(_)));
+    }
+
+    #[test]
+    fn pick_reports_ambiguity_across_remotes() {
+        assert!(matches!(pick(&hits(), "survival"), TargetPick::Ambiguous));
+    }
+
+    #[test]
+    fn pick_reports_missing_for_unknown_or_wrong_origin() {
+        assert!(matches!(pick(&hits(), "nope"), TargetPick::Missing));
+        // 限定到没有这台服务器的远端：不回落、不猜
+        assert!(matches!(pick(&hits(), "lab/web"), TargetPick::Missing));
     }
 }

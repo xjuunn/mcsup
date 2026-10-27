@@ -11,8 +11,86 @@ use crate::output::Printer;
 use crate::prompts;
 use anyhow::{Context, Result};
 use comfy_table::Table;
+use mcsup::domain::server::props::Properties;
 use mcsup::protocol::cli::{PropRow, PropsWriteJson};
-use mcsup::service::{PropsReport, ServerPropsService};
+use mcsup::service::ServerPropsService;
+
+/// 属性文件的一份快照
+///
+/// 本地与远端都归一到同一形态：路径用于回显，`Properties` 供交互与渲染。
+struct PropsSnapshot {
+    path: String,
+    properties: Properties,
+}
+
+/// 属性读写后端：本地走 service，远端走帧
+///
+/// 远端帧传原文、两端各自解析：注释与顺序属于用户文件内容，键值表无法
+/// 无损表达。入口只关心「读到了什么、写成功没有」，不感知传输。
+enum Backend {
+    /// 本机：service 直接读写磁盘
+    Local(ServerPropsService),
+    /// 远端：文件在对端，只能经帧读写
+    Remote {
+        member: mcsup::backend::remote::RemoteMember,
+        server_id: String,
+    },
+}
+
+impl Backend {
+    /// 按名字选后端：来源判定统一走 [`super::origin::remote_target`]
+    fn open(name: &str, lang: crate::locale::Lang) -> Result<Self> {
+        if let Some(target) = super::origin::remote_target(name, lang)? {
+            return Ok(Self::Remote {
+                member: target.member,
+                server_id: target.server_id,
+            });
+        }
+        Ok(Self::Local(ServerPropsService::new(
+            bootstrap::open_registry()?,
+        )))
+    }
+
+    /// 读当前内容
+    fn read(&self, name: &str) -> Result<PropsSnapshot> {
+        match self {
+            Self::Local(service) => {
+                let report = service.read(name)?;
+                Ok(PropsSnapshot {
+                    path: report.path.display().to_string(),
+                    properties: report.properties,
+                })
+            }
+            Self::Remote { member, server_id } => {
+                let (path, text) = member.servers.props(server_id)?;
+                Ok(PropsSnapshot {
+                    path,
+                    properties: Properties::parse(&text),
+                })
+            }
+        }
+    }
+
+    /// 写入若干键值，返回写入后的快照
+    fn set(&self, name: &str, updates: &[(String, String)]) -> Result<PropsSnapshot> {
+        match self {
+            Self::Local(service) => {
+                let report = service.set(name, updates)?;
+                Ok(PropsSnapshot {
+                    path: report.path.display().to_string(),
+                    properties: report.properties,
+                })
+            }
+            Self::Remote { member, server_id } => {
+                let (path, text) = member.servers.set_props(server_id, updates)?;
+                Ok(PropsSnapshot {
+                    path,
+                    properties: Properties::parse(&text),
+                })
+            }
+        }
+    }
+}
 
 /// 位置参数的三种形态
 #[derive(Debug, PartialEq, Eq)]
@@ -31,11 +109,11 @@ enum Args {
 ///
 /// 服务器不存在（3）、参数形态非法（2）、键 / 值非法（2）或 IO 失败（1）时返回错误
 pub(crate) fn run(name: &str, kv: &[String], printer: Printer) -> Result<()> {
-    let svc = ServerPropsService::new(bootstrap::open_registry()?);
+    let backend = Backend::open(name, printer.lang())?;
     match classify(kv, printer.lang())? {
-        Args::List => list(&svc, name, printer),
-        Args::KeyOnly(key) => set_key_only(&svc, name, key, printer),
-        Args::Direct(updates) => write(&svc, name, &updates, printer),
+        Args::List => list(&backend, name, printer),
+        Args::KeyOnly(key) => set_key_only(&backend, name, key, printer),
+        Args::Direct(updates) => write(&backend, name, &updates, printer),
     }
 }
 
@@ -70,20 +148,20 @@ fn classify(kv: &[String], lang: crate::locale::Lang) -> Result<Args> {
 }
 
 /// 列出全部键值；TTY 下进入交互修改循环
-fn list(svc: &ServerPropsService, name: &str, printer: Printer) -> Result<()> {
-    let report = svc.read(name)?;
+fn list(backend: &Backend, name: &str, printer: Printer) -> Result<()> {
+    let report = backend.read(name)?;
     print_props(&report, printer)?;
     if !printer.is_interactive() {
         return Ok(());
     }
-    edit_loop(svc, name, printer)
+    edit_loop(backend, name, printer)
 }
 
 /// 交互循环：选键 → 输入新值（回车保持当前值）→ 落盘；Esc / Ctrl+C 退出
-fn edit_loop(svc: &ServerPropsService, name: &str, printer: Printer) -> Result<()> {
+fn edit_loop(backend: &Backend, name: &str, printer: Printer) -> Result<()> {
     loop {
         // 每轮重读：默认值要反映上一轮写入后的真实文件
-        let report = svc.read(name)?;
+        let report = backend.read(name)?;
         if report.properties.is_empty() {
             printer.print_section(&crate::i18n::pick(
                 printer.lang(),
@@ -133,13 +211,13 @@ fn edit_loop(svc: &ServerPropsService, name: &str, printer: Printer) -> Result<(
             ));
             continue;
         }
-        write(svc, name, &[(key.clone(), value)], printer)?;
+        write(backend, name, &[(key.clone(), value)], printer)?;
     }
 }
 
 /// 单个 `key` 缺值：交互输入；非交互报用法错误
-fn set_key_only(svc: &ServerPropsService, name: &str, key: String, printer: Printer) -> Result<()> {
-    let report = svc.read(name)?;
+fn set_key_only(backend: &Backend, name: &str, key: String, printer: Printer) -> Result<()> {
+    let report = backend.read(name)?;
     if !printer.is_interactive() {
         return Err(AppDiagnostic::usage(
             crate::i18n::pick(
@@ -174,17 +252,17 @@ fn set_key_only(svc: &ServerPropsService, name: &str, key: String, printer: Prin
         ));
         return Ok(());
     }
-    write(svc, name, &[(key, value)], printer)
+    write(backend, name, &[(key, value)], printer)
 }
 
 /// 写入并报告（human 一行 + 重启提醒；JSON 单对象）
 fn write(
-    svc: &ServerPropsService,
+    backend: &Backend,
     name: &str,
     updates: &[(String, String)],
     printer: Printer,
 ) -> Result<()> {
-    let report = svc.set(name, updates).with_context(|| {
+    let report = backend.set(name, updates).with_context(|| {
         crate::i18n::pick(
             printer.lang(),
             format!("写入 {name} 的 server.properties 失败"),
@@ -202,7 +280,7 @@ fn write(
     }
     let payload = PropsWriteJson {
         name: name.to_owned(),
-        path: report.path.display().to_string(),
+        path: report.path,
         updated: updated_map,
     };
     printer.print_outcome(
@@ -221,7 +299,7 @@ fn write(
 /// # Errors
 ///
 /// 序列化结果失败时返回底层错误
-fn print_props(report: &PropsReport, printer: Printer) -> Result<()> {
+fn print_props(report: &PropsSnapshot, printer: Printer) -> Result<()> {
     let rows: Vec<PropRow<'_>> = report
         .properties
         .entries()
