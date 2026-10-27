@@ -196,7 +196,7 @@ fn perform_stop(shared: &Shared, grace: Duration, force: bool) -> (&'static str,
         if lock(&shared.view).status.is_terminal() {
             return (StopResult::STOPPED, started.elapsed());
         }
-        if started.elapsed() >= grace + KILL_WAIT {
+        if started.elapsed() >= grace.saturating_add(KILL_WAIT) {
             return (StopResult::TIMED_OUT, started.elapsed());
         }
         thread::sleep(TICK);
@@ -236,7 +236,10 @@ fn fulfill(request: Request, shared: &Shared, shutdown: &AtomicBool) -> Response
             }
         }
         Request::Stop { grace_secs, force } => {
-            let (result, elapsed) = perform_stop(shared, Duration::from_secs(grace_secs), force);
+            // 请求来自本机 IPC，同样按领域上限夹紧：宽限过大时等待循环
+            // 永远不会醒来，等于把 supervisor 线程锁死
+            let grace = Duration::from_secs(grace_secs).min(domain::limits::MAX_STOP_GRACE);
+            let (result, elapsed) = perform_stop(shared, grace, force);
             Response::Stop {
                 result: result.to_owned(),
                 elapsed_secs: elapsed.as_secs(),

@@ -308,10 +308,14 @@ impl ServerLifecycleService {
 
     /// 停机：不在运行视为幂等成功；宽限到期映射为 [`LifecycleError::StopTimedOut`]
     ///
+    /// 宽限先按 [`domain::limits::MAX_STOP_GRACE`] 夹紧：这个值可能来自远端
+    /// 帧，`u64::MAX` 会让 supervisor 的等待循环永远不结束。
+    ///
     /// # Errors
     ///
     /// supervisor 无响应、协议失败或宽限超时
-    pub fn stop(&self, name: &str, spec: StopSpec) -> Result<StopOutcome, LifecycleError> {
+    pub fn stop(&self, name: &str, mut spec: StopSpec) -> Result<StopOutcome, LifecycleError> {
+        spec.grace = spec.grace.min(domain::limits::MAX_STOP_GRACE);
         let server = self.registry.get(name)?;
         if self
             .backend
@@ -1176,6 +1180,7 @@ mod tests {
         send_error: Mutex<Option<SupervisorError>>,
         start_calls: Mutex<Vec<SupervisorStartRequest>>,
         stop_calls: Mutex<usize>,
+        stop_specs: Mutex<Vec<StopSpec>>,
         send_calls: Mutex<Vec<String>>,
     }
 
@@ -1224,9 +1229,10 @@ mod tests {
         fn stop(
             &self,
             _server: &port::ServerRef<'_>,
-            _spec: StopSpec,
+            spec: StopSpec,
         ) -> Result<StopOutcome, SupervisorError> {
             *self.stop_calls.lock().expect("lock") += 1;
+            self.stop_specs.lock().expect("lock").push(spec);
             let outcome =
                 self.stop_result
                     .lock()
@@ -1782,6 +1788,31 @@ mod tests {
             }
         );
         assert_eq!(*supervisor.stop_calls.lock().expect("lock"), 1);
+    }
+
+    /// 远端帧可以传 `u64::MAX` 秒：service 必须夹到领域上限再交给 supervisor，
+    /// 否则 supervisor 的等待循环永远不会结束
+    #[test]
+    fn stop_grace_is_clamped_before_reaching_supervisor() {
+        let fixture = Fixture::new(true);
+        let supervisor = Arc::new(FakeSupervisor::running());
+        let svc = service(
+            &fixture,
+            java_service(MemJavaRepo::new(vec![], true), vec![]),
+            Arc::clone(&supervisor),
+        );
+        svc.stop(
+            &fixture.name,
+            StopSpec {
+                grace: Duration::from_secs(u64::MAX),
+                force: true,
+            },
+        )
+        .expect("stop");
+        let specs = supervisor.stop_specs.lock().expect("lock").clone();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].grace, domain::limits::MAX_STOP_GRACE);
+        assert!(specs[0].force, "force 标志不能被判定顺手改掉");
     }
 
     #[test]

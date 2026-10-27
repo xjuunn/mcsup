@@ -336,7 +336,8 @@ impl Agent {
             Err(response) => return response,
         };
         let spec = port::StopSpec {
-            grace: std::time::Duration::from_secs(grace_secs),
+            // 宽限来自远端帧，先按领域上限夹紧再交给 service
+            grace: domain::limits::stop_grace(grace_secs),
             force,
         };
         match self.core.lifecycle.stop(&name, spec) {
@@ -394,7 +395,8 @@ impl Agent {
                 Err(err) => return lifecycle_failure(&err),
             }
         };
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        // 等待上限由领域层夹紧：`u64::MAX` 毫秒会让 `Instant + Duration` 溢出
+        let deadline = std::time::Instant::now() + domain::limits::log_wait(timeout_ms);
         loop {
             match watch.read_new() {
                 Ok(batch) if !batch.is_empty() => {

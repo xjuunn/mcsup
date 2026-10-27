@@ -482,9 +482,11 @@ impl BackupService {
         };
         if online {
             self.send_line(name, CMD_SAVE_ALL)?;
-            let wait = options.flush_wait_ms.unwrap_or(DEFAULT_FLUSH_WAIT_MS);
-            if wait > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(wait));
+            // 等待时长来自 CLI / 远端帧，可能大到让线程锁死；按领域上限夹紧
+            let wait =
+                domain::limits::flush_wait(options.flush_wait_ms.unwrap_or(DEFAULT_FLUSH_WAIT_MS));
+            if !wait.is_zero() {
+                std::thread::sleep(wait);
             }
         }
 
