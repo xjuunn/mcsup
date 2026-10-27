@@ -277,18 +277,36 @@ roundtrip 全量权限覆盖补 `BackupList` 样例（`Permission::Backup` 豁�
 
 ## 后续待办
 
-### 阶段 9 剩余：流式
+### 阶段 9 剩余：流式（未做）
 
-- 日志 follow、备份进度以流式帧承载，接口沿用 `ProgressSink` / `EventSink`。
-  当前 `log_tail` 已走单次 RPC，follow（`server console` attach）仍仅本地。
+现状：`log_tail` 已走单次 `LogsTail` RPC（阶段 9 并回本阶段完成），
+`backup create` 的实时进度在远端路径上被丢弃（客户端只拿到最终结果帧）。
+尚未做的：
 
-### 阶段 10：CLI
+- 日志 follow：`server console` attach 需要服务端流式推帧（当前 `LogLines`
+  是一次拉取，follow 仍仅本地）。设计方向：在 `protocol::remote` 增加
+  服务端主动推送的流式帧（如 `LogChunk`），连接上以「请求订阅 → 持续推送」
+  模型承载，与现有请求-响应帧共存；断线即取消订阅，不引入会话状态。
+- 备份进度：`BackupService::create` 的 `on_progress` 在远端路径上是空回调
+  （见 `verify` 同样单次回调）。设计方向：进度不进帧协议，改为 agent 侧
+  事件日志 + 客户端轮询（`BackupProgress` 查询帧），避免长事务占死
+  请求-响应连接。
+- 两者落地前，`docs/remote.md` 的「进度、日志、备份进度后续以流式帧承载」
+  仍是计划而非承诺；接口沿用 `ProgressSink` / `EventSink` 语义不变。
+
+### 阶段 10：CLI（未做，下一步）
 
 - `remote` 子命令：`serve` / `connect` / `reconnect` / `list` / `ping` /
-  `disconnect` / `revoke`。
-- `connect <target>` 首次配对，`reconnect <name>` 复用已配对记录。
-- 全局 `--origin` 过滤。
-- 退出码新增 6 = 未授权。
+  `disconnect` / `revoke`。`serve` 在 `apps/agent` 已有 bin（`mcsup-agent`），
+  CLI 侧需要补 `mcsup remote serve` 入口（复用 `crates/mcsup` 的同一份
+  `Agent`，满足「serve 端两入口跑同一份实现」）。
+- `connect <target>` 首次配对（打印指纹等用户确认），`reconnect <name>`
+  复用已配对记录；成员表写入 `config.toml [remotes.*]`。
+- 全局 `--origin` 过滤：`OriginFilter`（阶段 2 已在 `service::origin`
+  就绪），接到 `workspace ls` / `server ls` / `java ls` 与列表命令；
+  `MCSUP_ORIGIN` 环境变量与保留字校验同步落地。
+- 退出码新增 6 = 未授权（token 失效 / 权限不足 / 指纹变化）。
+- 完成后 `docs/remote.md` 的「用户接入」一节全部可演示，删除其计划性措辞。
 
 ## 已确认的设计取舍
 
@@ -312,3 +330,6 @@ roundtrip 全量权限覆盖补 `BackupList` 样例（`Permission::Backup` 豁�
   （由 `mcsup java install 21 --vendor temurin -y` 安装，已验证可执行）。
 - `apps/cli/tests/cli_e2e.rs` 隔离 `HOME`，靠宿主 `PATH` 找 java，跑测试前需把
   该 `bin` 目录加进 `PATH`。
+- 远端链路的真机验证（起 `mcsup-agent`、CLI 连局域网地址、跑一次远端备份）
+  待阶段 10 CLI 完成后一并做——当前远端功能可经库接口与 TLS 垫片测试覆盖，
+  但没有独立的 `mcsup remote connect` 命令，手工验证要走临时装配。
