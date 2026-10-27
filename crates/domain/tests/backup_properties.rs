@@ -17,9 +17,19 @@ use proptest::prelude::*;
 /// POSIX 相对路径的任意分段（合法字符集内）
 ///
 /// 排除 `.` / `..`：它们不是「名字」，领域本来就拒绝。生成器不该用它们去
-/// 冒充合法输入，否则测的是生成器而不是实现。
+/// 冒充合法输入，否则测的是生成器而不是实现。同理排除结尾点、`:` 与
+/// Windows 设备名（`CON` / `NUL` / `COM1`…）：这些是领域要拒绝的危险形态，
+/// 不该混进「合法路径」策略里。统一用 `s` 起头最省事——设备名都不以 `s`
+/// 开头，扩展名前也不会留出结尾点。
 fn segment() -> impl Strategy<Value = String> {
-    "[A-Za-z0-9_-][A-Za-z0-9_.-]{0,23}"
+    (
+        "[A-Za-z0-9_-]{1,20}",
+        proptest::option::of("[A-Za-z0-9_-]{1,8}"),
+    )
+        .prop_map(|(stem, ext)| match ext {
+            Some(ext) => format!("s{stem}.{ext}"),
+            None => format!("s{stem}"),
+        })
 }
 
 /// 任意层数的合法相对路径
@@ -27,7 +37,8 @@ fn rel_path() -> impl Strategy<Value = String> {
     proptest::collection::vec(segment(), 1..6).prop_map(|parts| parts.join("/"))
 }
 
-/// 带「危险」成分的路径：绝对路径、`..`、反斜杠、空段
+/// 带「危险」成分的路径：绝对路径、`..`、反斜杠、空段、盘符、ADS、设备名、
+/// 结尾点与空格
 fn hostile_path() -> impl Strategy<Value = String> {
     let pieces = prop_oneof![
         Just("/".to_owned()),
@@ -35,6 +46,13 @@ fn hostile_path() -> impl Strategy<Value = String> {
         Just("..".to_owned()),
         Just(".".to_owned()),
         Just("C:".to_owned()),
+        Just("C:evil".to_owned()),
+        Just("file:stream".to_owned()),
+        Just("NUL".to_owned()),
+        Just("CON.txt".to_owned()),
+        Just("COM1".to_owned()),
+        Just("trail.".to_owned()),
+        Just("trail ".to_owned()),
         Just(String::new()),
         segment(),
     ];
@@ -62,6 +80,12 @@ proptest! {
                 prop_assert!(part != "..", "路径穿越：{raw}");
                 prop_assert!(!part.is_empty(), "空段：{raw}");
                 prop_assert!(!part.contains('\\'), "反斜杠残留：{raw}");
+                // Windows 上不可表示的形态一律不该被接受
+                prop_assert!(!part.contains(':'), "盘符 / ADS 残留：{raw}");
+                prop_assert!(
+                    !part.ends_with('.') && !part.ends_with(' '),
+                    "结尾点或空格会被 Win32 裁掉：{raw}"
+                );
             }
             // 拼回平台路径后，起点仍然是相对路径
             prop_assert!(!rel.to_platform_path().is_absolute(), "{raw}");

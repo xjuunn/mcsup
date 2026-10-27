@@ -206,7 +206,7 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | --- | --- | --- |
 | `create` | `mcsup server backup create [<name>] [--label <text>] [--scope <a,b>] [--no-reuse]` | 默认全量，有历史时按父快照增量复用未改动文件。运行中的服务器先发 `save-off`，完成后发 `save-on`（不停服）。`--scope` 覆盖服务属性 `backup-scope`，缺省为整个服务器目录。`--no-reuse` 强制重读全部文件 |
 | `list` | `mcsup server backup list [<name>] [--page <n>] [--page-size <n>]` | 分页历史表格：ID、时间、状态、文件数、大小、标签（缺省 20 条/页） |
-| `restore` | `mcsup server backup restore [<name>] [<id>] [--to <新名>]` | 恢复。缺 `id` 时交互选择。**原地恢复要求服务器已停止**（运行中返回退出码 4），恢复前自动生成安全快照；`--to` 恢复到新服务，原服务不动 |
+| `restore` | `mcsup server backup restore [<name>] [<id>] [--to <新名>]` | 恢复。缺 `id` 时交互选择。**原地恢复要求服务器已停止**（运行中返回退出码 4），恢复前自动生成安全快照；`--to` 恢复到新服务，原服务不动：新名必须是合法服务器名、目标目录必须不存在，恢复出的目录带全新身份（`mcsup.json` 新 id），之后可直接 `server link` 注册 |
 | `delete` | `mcsup server backup delete [<name>] [<id>]` | 删除某个快照记录；内容对象不即时删除，交由 `prune` 回收 |
 | `verify` | `mcsup server backup verify [<name>] [<id>]` | 校验快照引用的所有对象存在且哈希匹配；有损坏时返回退出码 1 |
 | `prune` | `mcsup server backup prune [<name>] [--keep <n> \| --older-than <dur>] [--dry-run]` | 按保留数或年龄删除快照，并回收整个工作区中不再被任何快照引用的 CAS 对象。`--dry-run` 只预览 |

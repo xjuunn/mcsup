@@ -565,8 +565,11 @@ impl Agent {
             Err(response) => return response,
         };
         let target = match to_new {
-            Some(new_name) => domain::backup::RestoreTarget::NewServer {
-                name: new_name.to_owned(),
+            // 名字直接拼进 `servers/<name>`：对端必须按领域规则校验，
+            // 不能把 `..` / 绝对路径当成合法目标
+            Some(new_name) => match domain::server::meta::ServerName::parse(new_name) {
+                Ok(name) => domain::backup::RestoreTarget::NewServer { name },
+                Err(err) => return failure(ErrorKind::INVALID, err),
             },
             None => domain::backup::RestoreTarget::InPlace,
         };
