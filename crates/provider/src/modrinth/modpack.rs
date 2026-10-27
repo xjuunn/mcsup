@@ -20,7 +20,7 @@
 //! 解析后的 [`ModpackIndex`] 并做路径与格式判定（见 `domain::server::modpack`）。
 //! 这样领域层保持零 serde 依赖。
 
-use super::client::{ModrinthSource, SearchIndex, SearchQuery, VersionFilter};
+use super::client::{HashAlgorithm, ModrinthSource, SearchIndex, SearchQuery, VersionFilter};
 use super::facets::{Facet, FacetTree};
 use super::manifest::{Project, SearchHit, Version};
 use super::{server_archive, server_file};
@@ -35,6 +35,7 @@ use port::modpack::{
     ModpackSource, ModpackSummary, ModpackVersion, ResolvedModpack,
 };
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -194,6 +195,41 @@ impl ModpackSource for ModrinthModpackSource {
             version_number: version.version_number.clone(),
             file: content_file,
         })
+    }
+
+    async fn client_only_hashes(&self, hashes: &[String]) -> Result<HashSet<String>, SourceError> {
+        if hashes.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let mut client_only = HashSet::new();
+        // 批量接口有请求体上限；按 100 个哈希一批，避免大整合包一次打爆
+        for chunk in hashes.chunks(100) {
+            let versions = self
+                .inner
+                .versions_from_hashes(chunk, HashAlgorithm::Sha1)
+                .await?;
+            let project_ids: Vec<String> = versions
+                .values()
+                .map(|version| version.project_id.clone())
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            if project_ids.is_empty() {
+                continue;
+            }
+            let projects = self.inner.projects(&project_ids).await?;
+            let unsupported: HashSet<&str> = projects
+                .iter()
+                .filter(|project| project.server_side.as_deref() == Some("unsupported"))
+                .map(|project| project.id.as_str())
+                .collect();
+            for (hash, version) in &versions {
+                if unsupported.contains(version.project_id.as_str()) {
+                    client_only.insert(hash.clone());
+                }
+            }
+        }
+        Ok(client_only)
     }
 }
 

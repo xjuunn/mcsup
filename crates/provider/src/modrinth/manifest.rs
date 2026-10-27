@@ -134,6 +134,12 @@ pub struct Project {
     /// 支持的环境
     #[serde(default)]
     pub environment: Vec<String>,
+    /// 服务端侧支持情况（`required` / `optional` / `unsupported`）
+    #[serde(default)]
+    pub server_side: Option<String>,
+    /// 客户端侧支持情况（`required` / `optional` / `unsupported`）
+    #[serde(default)]
+    pub client_side: Option<String>,
     /// 支持的全部 MC 版本
     #[serde(default)]
     pub game_versions: Vec<String>,

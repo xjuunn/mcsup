@@ -240,6 +240,7 @@ impl ModpackService {
 
         let index = self.extractor.read_index(&archive_path)?;
         Ok(ModpackPrepared {
+            source: source.name(),
             resolved,
             index,
             archive_path,
@@ -270,11 +271,46 @@ impl ModpackService {
         self.extractor
             .extract_overrides(&prepared.archive_path, server_dir)?;
 
-        // 2. 清单文件：只装服务端需要的（server: unsupported 已由领域层过滤）
+        // 2. 仅客户端模组：清单的 env 字段不可全信。整合包作者常把 ETF /
+        //    Embeddium 之类仅客户端模组标成 `server: required`，按清单装进
+        //    服务端会在启动时加载客户端类并崩溃。能查到权威元数据时以它为准。
+        let source = self.select_source(Some(prepared.source))?;
+        let mod_hashes: Vec<String> = prepared
+            .index
+            .downloadable_server_files()
+            .into_iter()
+            .filter(|file| {
+                file.path.starts_with("mods/")
+                    && Path::new(&file.path)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("jar"))
+            })
+            .filter_map(|file| file.hashes.sha1.clone())
+            .collect();
+        let client_only = source.client_only_hashes(&mod_hashes).await?;
+
+        // 3. 清单文件：只装服务端需要的（server: unsupported 已由领域层过滤）
         let mut reused = 0;
         let mut downloaded_bytes = 0;
+        let mut skipped_client_only = 0;
         for file in prepared.index.downloadable_server_files() {
             let target = safe_target(server_dir, &file.path)?;
+            if file
+                .hashes
+                .sha1
+                .as_ref()
+                .is_some_and(|hash| client_only.contains(hash))
+            {
+                // 上一次安装可能已经把它落盘；重装时顺手清掉，避免旧文件
+                // 继续让服务端起不来。
+                if tokio::fs::metadata(&target).await.is_ok() {
+                    tokio::fs::remove_file(&target)
+                        .await
+                        .map_err(|err| ModpackError::io(&target, err))?;
+                }
+                skipped_client_only += 1;
+                continue;
+            }
             if let Some(parent) = target.parent() {
                 tokio::fs::create_dir_all(parent)
                     .await
@@ -301,12 +337,14 @@ impl ModpackService {
             files = prepared.index.server_files().len(),
             downloaded_bytes,
             reused,
+            skipped_client_only,
             "modpack applied"
         );
         Ok(ModpackApplied {
-            file_count: prepared.index.server_files().len(),
+            file_count: prepared.index.server_files().len() - skipped_client_only,
             downloaded_bytes,
             reused,
+            skipped_client_only,
         })
     }
 
@@ -334,6 +372,8 @@ impl ModpackService {
 /// 持有暂存路径与清单，供 [`ModpackService::apply`] 布置。
 #[derive(Debug)]
 pub struct ModpackPrepared {
+    /// 来源名（`apply` 据此复用同一来源查询元数据）
+    pub source: &'static str,
     /// 来源解析结果
     pub resolved: ResolvedModpack,
     /// 清单
@@ -388,12 +428,14 @@ impl ModpackPrepared {
 /// 布置结果
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModpackApplied {
-    /// 服务端需要的文件数
+    /// 实际安装的服务端文件数
     pub file_count: usize,
     /// 本次下载的字节数
     pub downloaded_bytes: u64,
     /// 已存在而跳过的文件数
     pub reused: usize,
+    /// 按上游元数据判定为仅客户端、已跳过的文件数
+    pub skipped_client_only: usize,
 }
 
 /// 加载器名 → 服务端变体
@@ -559,6 +601,7 @@ mod tests {
 
     fn prepared(index: ModpackIndex) -> ModpackPrepared {
         ModpackPrepared {
+            source: "fake",
             resolved: ResolvedModpack {
                 project_id: "P".to_owned(),
                 version_id: "V".to_owned(),
