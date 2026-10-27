@@ -647,6 +647,51 @@ pub(crate) async fn install_modpack(
     printer.print_outcome(&human, &payload)
 }
 
+/// 远端布置结果的回显：与本地同一 JSON 形状，文案标注目标机器
+///
+/// 帧只回统计量（项目 / 版本 / 文件数 / 字节数），展示口径因此完全一致；
+/// 差异只有「在 <远端>」，用户能一眼看出东西装在哪儿。
+pub(crate) fn report_remote_applied(
+    result: &mcsup::backend::remote::RemoteModpackResult,
+    path: String,
+    origin: &str,
+    printer: Printer,
+) -> Result<()> {
+    let lang = printer.lang();
+    let payload = ModpackInstallJson {
+        source: "modrinth",
+        project_id: &result.project_id,
+        version_id: &result.version_id,
+        version_number: &result.version_number,
+        minecraft: &result.minecraft,
+        loader: result.loader.clone(),
+        files: result.files,
+        downloaded_bytes: result.downloaded_bytes,
+        reused: result.reused,
+        skipped_client_only: result.skipped_client_only,
+        path,
+    };
+    let note = skipped_note(lang, result.skipped_client_only);
+    let human = crate::i18n::pick(
+        lang,
+        format!(
+            "已在 {origin} 按整合包 {} {} 布置服务端：{} 个文件，下载 {}{note}",
+            result.project_id,
+            result.version_number,
+            result.files,
+            crate::output::human_bytes(result.downloaded_bytes)
+        ),
+        format!(
+            "applied modpack {} {} on {origin}: {} files, downloaded {}{note}",
+            result.project_id,
+            result.version_number,
+            result.files,
+            crate::output::human_bytes(result.downloaded_bytes)
+        ),
+    );
+    printer.print_outcome(&human, &payload)
+}
+
 /// 「跳过仅客户端模组」的提示后缀；没跳过时为空串
 ///
 /// 上游元数据判定与清单不一致时，文件数会比清单声明的少。不解释一句，

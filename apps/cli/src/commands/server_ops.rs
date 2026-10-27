@@ -283,7 +283,7 @@ pub(crate) async fn create(args: CreateArgs<'_>, printer: Printer) -> Result<()>
             )
         })?;
         if !origin.is_local() {
-            return create_remote(&origin, name, version, variant, workspace, printer);
+            return create_remote(&origin, name, version, variant, workspace, modpack, printer);
         }
     }
     let interactive = printer.is_interactive();
@@ -398,8 +398,10 @@ pub(crate) async fn create(args: CreateArgs<'_>, printer: Printer) -> Result<()>
 
 /// `server create --origin <remote>`：在对端登记服务器
 ///
-/// 核心下载 / 安装器由对端负责：客户端不下载、不拼远端路径。远端协议当前只有
-/// `ServerCreate`（登记），因此这里明确说明「已登记，核心需在对端 install」。
+/// - 普通变体：对端登记 + 下载核心（`ServerCreate` + `ServerInstall`），
+///   客户端不下载、不拼远端路径。
+/// - 整合包：对端读清单、装加载器、铺 overrides（`ServerCreateModpack`），
+///   一次调用完成「登记 + 布置」。
 #[allow(clippy::too_many_lines)]
 fn create_remote(
     origin: &mcsup::port::Origin,
@@ -407,6 +409,7 @@ fn create_remote(
     version: Option<&str>,
     variant: Option<&str>,
     workspace: Option<&str>,
+    modpack: Option<&str>,
     printer: Printer,
 ) -> Result<()> {
     let lang = printer.lang();
@@ -432,6 +435,25 @@ fn create_remote(
             None,
         )
     })?;
+    // 整合包变体既可由 `--modpack` 隐含，也可显式写 `--variant modrinth-modpack`
+    if let Some(project) = modpack {
+        return create_remote_modpack(member, name, project, version, variant, workspace, printer);
+    }
+    if variant.is_some_and(is_modpack_flag) {
+        return Err(AppDiagnostic::usage(
+            crate::i18n::pick(
+                lang,
+                "整合包变体需要 --modpack <项目 ID 或 slug>",
+                "the modpack variant requires --modpack <project id or slug>",
+            ),
+            Some(crate::i18n::pick(
+                lang,
+                "例如：mcsup server create myserver --origin prod --modpack fabulously-optimized",
+                "e.g. mcsup server create myserver --origin prod --modpack fabulously-optimized",
+            )),
+        )
+        .into());
+    }
     let version = version.ok_or_else(|| {
         AppDiagnostic::usage(
             crate::i18n::pick(
@@ -520,6 +542,100 @@ fn create_remote(
             format!("core {version} installed on the peer"),
         ));
     }
+    Ok(())
+}
+
+/// 远端整合包创建：对端读清单 → 登记 → 装加载器 → 铺文件
+///
+/// `--version` 是整合包版本（可省略取最新正式版），不是 Minecraft 版本；
+/// 清单声明的 MC 版本与加载器变体由对端回传，客户端只做展示。
+fn create_remote_modpack(
+    member: &mcsup::backend::remote::RemoteMember,
+    name: &str,
+    project: &str,
+    version: Option<&str>,
+    variant: Option<&str>,
+    workspace: Option<&str>,
+    printer: Printer,
+) -> Result<()> {
+    let lang = printer.lang();
+    if let Some(variant) = variant.filter(|raw| !is_modpack_flag(raw)) {
+        return Err(AppDiagnostic::usage(
+            crate::i18n::pick(
+                lang,
+                format!("--modpack 不能与 --variant {variant} 同时使用：加载器由整合包清单决定"),
+                format!(
+                    "--modpack cannot be combined with --variant {variant}: the modpack manifest decides the loader"
+                ),
+            ),
+            None,
+        )
+        .into());
+    }
+    let spinner = crate::progress::TaskSpinner::new(
+        crate::i18n::pick(
+            lang,
+            format!("正在 {} 按整合包 {project} 创建 {name}…", member.name),
+            format!("creating {name} from modpack {project} on {}…", member.name),
+        ),
+        printer.is_human(),
+    );
+    let result = member
+        .servers
+        .create_modpack(workspace, name, project, version);
+    spinner.finish();
+    let result = result.with_context(|| {
+        crate::i18n::pick(
+            lang,
+            format!(
+                "在 {} 按整合包创建服务器失败（登记可能已完成，可用 server install 重试）",
+                member.name
+            ),
+            format!(
+                "failed to create the server from the modpack on {} (it may already be registered; retry with `server install`)",
+                member.name
+            ),
+        )
+    })?;
+    let path = server_path(member, &result.meta);
+    super::modpack::report_remote_applied(&result, path.clone(), member.name.as_str(), printer)?;
+    printer.print_outcome(
+        &crate::i18n::pick(
+            lang,
+            format!(
+                "已在 {} 创建服务器 {} {}（{}）",
+                member.name,
+                result.meta.name,
+                result.meta.version,
+                result.meta.variant.as_str()
+            ),
+            format!(
+                "created server {} {} ({}) on {}",
+                result.meta.name,
+                result.meta.version,
+                result.meta.variant.as_str(),
+                member.name
+            ),
+        ),
+        &CreateRow {
+            name: result.meta.name.as_str(),
+            version: result.meta.version.as_str(),
+            variant: result.meta.variant.as_str(),
+            path,
+            linked: None,
+        },
+    )?;
+    printer.print_section(&crate::i18n::pick(
+        lang,
+        format!(
+            "完成。运行 mcsup server start {}/{} 启动",
+            member.name, result.meta.name
+        ),
+        format!(
+            "done. run `mcsup server start {}/{}` to start it",
+            member.name, result.meta.name
+        ),
+    ));
     Ok(())
 }
 

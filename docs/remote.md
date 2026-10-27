@@ -217,11 +217,10 @@ error: “web” 存在于多个位置
 ```
 
 限定名已接到所有接受服务器名的命令（`start` / `stop` / `status` / `send` /
-`logs` / `backup` / `install` 等）。注意：当同一个名字同时存在于本地与远端
-时，远端限定名会被明确拒绝（避免落到本地同名服务器）；此时请先让名字全局
-唯一。
-
-### 创建落点
+`logs` / `backup` / `install` 等）。仍按裸名交给 `service` 的命令（`start` /
+`stop` / `status` / `send`）在本机与远端同名时会明确拒绝远端限定名（避免落到
+本地同名服务器）；按对端 id 寻址的命令（`install` / `props` / `set` /
+`console` / `logs`）不受影响，可直接用 `prod-box/web` 精确指定远端那台。
 
 ### 创建落点
 
@@ -230,14 +229,32 @@ error: “web” 存在于多个位置
 - `--origin <远端名>` 直接在对端执行；缺省本地。
 - `workspace init --origin prod-box --dir /srv/mc/w2` 中的 `--dir` 是**目标
   机器上的路径**，由该机器的 agent 执行同一套 `WorkspaceService::init`。
-- `server create --origin prod-box` 在对端登记服务器（核心安装仍需在对端
-  运行 `mcsup server install`）；`server remove --origin prod-box` 在对端注销。
+- `server create --origin prod-box` 在对端完成「登记 + 核心安装」；加
+  `--modpack <项目>` 时改为对端读清单、装加载器、铺 overrides
+  （`ServerCreateModpack` 一次帧完成），`--version` 是整合包版本。
+- `server remove --origin prod-box` 在对端注销。
 - `java scan --origin prod-box` 让对端扫描并登记本机 JVM。
 
-远端写操作的覆盖范围是「协议已定义的帧」：workspace init/use/remove、
-server create/remove、java scan、生命周期与备份。`server install`、`props`、
-`set`、`version`、`link`、`mod`、`modpack`、`java install/uninstall` 目前
-只有本地实现。
+### 远端能力覆盖
+
+远端写操作的覆盖范围是「协议已定义的帧」，逐个命令看：
+
+| 命令 | 远端执行方式 |
+| --- | --- |
+| `workspace init` / `use` / `remove` | `WorkspaceInit` / `WorkspaceUse` / `WorkspaceRemove`，目录动作全在对端 |
+| `server create` | 普通变体：`ServerCreate` + `ServerInstall`；`--modpack`：`ServerCreateModpack` |
+| `server install` | `ServerInstall`；支持裸名指向唯一远端，缺版本时沿用在册版本 |
+| `server props` / `set` | `PropsGet` / `PropsSet`（原文进出）/ `SettingsSet`；判定与持久化在对端 |
+| `server console` / `logs` | `LogsFollow` 长轮询 + `SendLine` / `StatusMany`（按对端 id，不按名字） |
+| `server start` / `stop` / `restart` / `status` / `send` | 生命周期帧，经 `RoutingSupervisor` 按来源分派 |
+| `server version` | 组合注册表 `get`（不新增帧） |
+| `server backup ...` | 备份帧族（快照元数据跨线，CAS 在对端） |
+| `java scan` / `install` / `uninstall` | `JavaScan` / `JavaInstall` / `JavaUninstall`，下载与登记在对端 |
+| `java list` / `server list` / `workspace list` | 实时合并查询，逐台远端 `list` |
+
+仍只有本地实现的：`server link`、`server mod`、`modpack` 的独立子命令
+（尚未提供），以及 `server create --origin` 的交互向导（远端创建要求显式
+`--version` 或 `--modpack`，不读本地变体 / 版本列表）。
 
 ### 离线、断开与撤销
 
