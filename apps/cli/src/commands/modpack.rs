@@ -3,7 +3,8 @@
 //! 这个模块只服务「按整合包建服务端」这一条路径，因此不对外暴露子命令。
 //! 流程：
 //!
-//! 1. 搜索**能在服务端运行**的整合包（可再加关键词过滤）
+//! 1. 打开即展示**能在服务端运行**的整合包默认列表（上游按下载量排序），
+//!    需要时按关键词搜索
 //! 2. 展示所选整合包的详情（标题、作者、加载器、MC 版本、下载量、简介、来源页）
 //! 3. 选版本（默认只列正式版）
 //! 4. 返回清单里的 MC 版本与版本 ID，交给 `server create` 落库
@@ -56,9 +57,9 @@ const PREV_PAGE: &str = "← 上一页";
 ///
 /// 显式状态机而非嵌套循环：每一步只回答「按 Esc 回到哪」，返回路径因此是
 /// 可见的、可测试的，不会因为嵌套层次变深而漏掉某个返回分支。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Wizard {
-    /// 输入关键词（Esc 取消整个命令）
+    /// 输入关键词（从结果页 Esc 进入；此处 Esc 取消整个命令）
     Search,
     /// 浏览一页搜索结果
     Results { keyword: Option<String>, page: u32 },
@@ -68,6 +69,17 @@ enum Wizard {
         keyword: Option<String>,
         page: u32,
     },
+}
+
+/// 向导起点：直接展示来源的默认列表
+///
+/// 上游在**没有关键词**时返回自己的默认列表（Modrinth 按下载量排序），因此
+/// 不必先让用户面对一个空输入框再回车。关键词搜索由结果页的 Esc 进入。
+fn initial_state() -> Wizard {
+    Wizard::Results {
+        keyword: None,
+        page: 0,
+    }
 }
 
 /// 选择整合包：搜索 → 结果 → 详情并选版本
@@ -138,7 +150,7 @@ async fn run_wizard(
     version_hint: Option<&str>,
     printer: Printer,
 ) -> Result<PickedModpack> {
-    let mut state = Wizard::Search;
+    let mut state = initial_state();
     loop {
         state = match state {
             Wizard::Search => {
@@ -236,7 +248,9 @@ async fn browse_results(
 
     // 0 条也要进入选择器：空列表 + Esc 返回搜索，而不是让整个命令退出。
     let label = results_label(keyword, search.total, page);
-    match select_filter_backable(printer.lang(), &label, &choices, no_scope())? {
+    // Esc 从结果页回到关键词输入（首屏默认列表走这一条路才能搜索）
+    let esc_help = crate::i18n::pick(printer.lang(), "输入关键词搜索", "search by keyword");
+    match select_filter_backable(printer.lang(), &label, &choices, no_scope(), &esc_help)? {
         Backable::Back => Ok(Browse::Back),
         Backable::Picked(picked) if picked == NEXT_PAGE => Ok(Browse::Page(page.saturating_add(1))),
         Backable::Picked(picked) if picked == PREV_PAGE => Ok(Browse::Page(page.saturating_sub(1))),
@@ -332,7 +346,9 @@ async fn finish_pick(
     })
 }
 
-/// 让用户先输关键词（可留空表示浏览全部）
+/// 让用户输关键词；留空表示回到默认列表
+///
+/// 只在结果页按 Esc 时进入：首屏已经是默认列表，不必先面对空输入框。
 fn prompt_keyword(printer: Printer) -> Result<Option<String>> {
     if !printer.is_interactive() {
         return Ok(None);
@@ -489,7 +505,8 @@ fn pick_version_backable(
         .iter()
         .map(|version| ScopedChoice::new(version_label(version), false))
         .collect();
-    match select_filter_backable(lang, "选择整合包版本", &choices, no_scope())? {
+    let esc_help = crate::i18n::pick(lang, "返回上一步", "goes back");
+    match select_filter_backable(lang, "选择整合包版本", &choices, no_scope(), &esc_help)? {
         Backable::Back => Ok(None),
         Backable::Picked(picked) => shown
             .into_iter()
@@ -692,6 +709,19 @@ mod tests {
     #[test]
     fn result_choices_stays_empty_without_hits() {
         assert!(result_choices(Vec::new(), 0, 0, 0).is_empty());
+    }
+
+    /// 向导起点是默认列表：不发关键词、从第一页开始，用户不必先按回车
+    #[test]
+    fn wizard_starts_on_default_list() {
+        assert_eq!(
+            initial_state(),
+            Wizard::Results {
+                keyword: None,
+                page: 0,
+            },
+            "首屏应是默认列表（无关键词过滤、第一页）"
+        );
     }
 
     /// 空结果标题说明原因；有关键词时带上关键词

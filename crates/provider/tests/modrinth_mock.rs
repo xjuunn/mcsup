@@ -5,15 +5,16 @@
 //! 请求体、以及非 2xx 的错误归类。真实上游的正确性由 `modrinth_net.rs`
 //! 承担（它才需要联网）。
 //!
-//! 例外：`client_only_hashes_*` 这几条只打回环地址、不依赖外部网络，默认
-//! 执行——它是整合包安装的服务端安全判定，不能长期停在「手动才跑」。
+//! 例外：`client_only_hashes_*` 与 `modpack_default_search_*` 只打回环地址、
+//! 不依赖外部网络，默认执行——前者是整合包安装的服务端安全判定，后者是
+//! 整合包首屏默认列表的参数契约，都不能长期停在「手动才跑」。
 //!
 //! 用本地服务而不是 `wiremock` 之类的依赖，是因为断言点只有「收到什么」，
 //! 用一个 `TcpListener` + 手写响应足够，且不给 crate 增加测试期依赖。
 
 #![allow(clippy::expect_used, reason = "测试夹具，失败直接 panic 才有用")]
 
-use port::modpack::ModpackSource;
+use port::modpack::{ModpackQuery, ModpackSource};
 use provider::modrinth::{
     Facet, FacetTree, HashAlgorithm, ModrinthModpackSource, ModrinthSource, ProjectType,
     SearchIndex, SearchQuery, VersionChannel, VersionFilter, primary_file,
@@ -235,6 +236,39 @@ async fn search_omits_empty_query() {
     assert!(!target.contains("query="), "{target}");
     assert!(!target.contains("facets="), "{target}");
     assert!(target.contains("index=relevance"), "{target}");
+}
+
+/// 整合包默认列表：不带关键词、按下载量排序、只保留能开服的整合包
+///
+/// 只打回环 mock，默认执行：首屏就是这份列表，参数写错等于用户打开搜索
+/// 看到空列表或客户端的整合包。
+#[tokio::test]
+async fn modpack_default_search_sends_no_keyword() {
+    let mock = Mock::start(vec![("GET", "/v2/search", 200, SEARCH.to_owned())]).await;
+    let source = ModrinthModpackSource::from_source(source_for(&mock));
+
+    let search = source.search(&ModpackQuery::new()).await.expect("默认列表");
+    assert_eq!(search.total, 2, "夹具里的命中数应原样透出");
+
+    let target = &mock.requests()[0].target;
+    assert!(
+        !target.contains("query="),
+        "没有关键词时不应发 query 参数: {target}"
+    );
+    assert!(
+        target.contains("index=downloads"),
+        "默认列表按下载量排序: {target}"
+    );
+    assert!(
+        target.contains("project_type%3Dmodpack"),
+        "仍需限定整合包类型: {target}"
+    );
+    assert!(
+        target.contains("server_side%3Drequired") && target.contains("server_side%3Doptional"),
+        "只列能在服务端运行的整合包: {target}"
+    );
+    assert!(target.contains("offset=0"), "首屏从第一页开始: {target}");
+    assert!(target.contains("limit=20"), "{target}");
 }
 
 /// 项目详情：slug 进路径段

@@ -129,6 +129,9 @@ fn shortcut(choices: &[ScopedChoice]) -> Option<Backable> {
 /// 继续，由调用方的状态机决定是否需要保留返回能力（候选只有一项时通常
 /// 不值得为它多按一次回车）。
 ///
+/// `esc_help` 是 Esc 去向的说明（由调用方按业务给，如「返回上一步」或
+/// 「输入关键词」）：结果页与版本页的 Esc 去向不同，文案不能由组件硬编码。
+///
 /// # Errors
 ///
 /// 非交互终端、按键读取 / 终端写入失败，或用户 Ctrl+C 中断时返回错误
@@ -137,6 +140,7 @@ pub(crate) fn select_filter_backable(
     label: &str,
     choices: &[ScopedChoice],
     hint: ScopeHint,
+    esc_help: &str,
 ) -> Result<Backable> {
     if let Some(picked) = shortcut(choices) {
         return Ok(picked);
@@ -144,11 +148,7 @@ pub(crate) fn select_filter_backable(
     if !std::io::stdin().is_terminal() {
         return Err(InquireError::NotTTY.into());
     }
-    let mut picker = Picker::new(lang, label, choices, hint);
-    picker.esc_help = match lang {
-        Lang::Zh => "返回上一步",
-        Lang::En => "goes back",
-    };
+    let mut picker = Picker::new(lang, label, choices, hint).with_esc_help(esc_help);
     let mut frame = Frame::default();
     let done = {
         let _raw = input::RawMode::enter()?;
@@ -206,7 +206,7 @@ struct Picker<'a> {
     /// 界面语言：帮助行与校验文案按它渲染
     lang: Lang,
     /// Esc 的语义说明，只影响底栏提示文案
-    esc_help: &'static str,
+    esc_help: String,
 }
 
 impl<'a> Picker<'a> {
@@ -233,8 +233,15 @@ impl<'a> Picker<'a> {
             esc_help: match lang {
                 Lang::Zh => "取消",
                 Lang::En => "cancels",
-            },
+            }
+            .to_owned(),
         }
+    }
+
+    /// 覆盖 Esc 的语义说明（默认「取消」）
+    fn with_esc_help(mut self, esc_help: &str) -> Self {
+        esc_help.clone_into(&mut self.esc_help);
+        self
     }
 
     /// 关键字过滤后的全部候选（不截断，滚动窗口见 [`Self::window`]）
@@ -480,7 +487,7 @@ impl<'a> Picker<'a> {
             // 当前范围一个候选都没有（空结果或只剩隐藏候选）时提示没有匹配，
             // 而不是笼统地要求「请输入关键字」。
             let message = if self.pool.is_empty() {
-                err_no_matches(self.lang, self.esc_help)
+                err_no_matches(self.lang, &self.esc_help)
             } else if input.is_empty() {
                 err_empty_input(self.lang)
             } else {
@@ -507,7 +514,7 @@ impl<'a> Picker<'a> {
             lines.push(self.suggestion_line(suggestion, index, max));
         }
         let help = if filtered.is_empty() {
-            let base = err_no_matches(self.lang, self.esc_help);
+            let base = err_no_matches(self.lang, &self.esc_help);
             if self.choices.iter().any(|choice| choice.extra) {
                 // 空范围（如只剩快照版本时切到默认范围）仍要提示怎么切回，
                 // 否则用户只看到「没有匹配」而不知道 Ctrl+A 是出口。
@@ -1012,7 +1019,7 @@ mod tests {
     fn empty_pool_enter_reports_no_matches() {
         let none: Vec<ScopedChoice> = Vec::new();
         let mut picker = new_picker("选择整合包", &none);
-        picker.esc_help = "返回上一步";
+        picker.esc_help = "返回上一步".to_owned();
         assert_eq!(picker.handle(Key::Enter).expect("回车不应失败"), None);
         assert_eq!(
             picker.error.as_deref(),
@@ -1039,7 +1046,7 @@ mod tests {
     fn empty_pool_help_is_localized() {
         let none: Vec<ScopedChoice> = Vec::new();
         let mut picker = Picker::new(Lang::En, "select a modpack", &none, hint());
-        picker.esc_help = "goes back";
+        picker.esc_help = "goes back".to_owned();
         let screen = picker.screen();
         assert!(
             screen
