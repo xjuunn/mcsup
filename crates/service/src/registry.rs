@@ -219,6 +219,25 @@ impl RegisteredServer {
     pub fn server_ref(&self) -> port::ServerRef<'_> {
         port::ServerRef::local(&self.meta.id, &self.dir)
     }
+
+    /// 是否为远端镜像条目
+    ///
+    /// 组合仓库的镜像侧把远端条目的 `dir` 置空（路径是对端本机的，客户端
+    /// 侧拼不出绝对目录），本地条目必有目录。
+    #[must_use]
+    pub fn is_remote(&self) -> bool {
+        self.dir.as_os_str().is_empty()
+    }
+
+    /// 远端实现用的身份引用（只带 id，不带目录）
+    ///
+    /// # Panics
+    ///
+    /// 本地条目调用（目录非空）：远端引用只对镜像条目有意义
+    #[must_use]
+    pub fn remote_ref(&self) -> port::ServerRef<'_> {
+        port::ServerRef::remote(&self.meta.id)
+    }
 }
 
 /// `server remove` 结果

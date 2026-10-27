@@ -564,11 +564,20 @@ impl ServerLifecycleService {
 
     /// 读 `console.log` 末尾若干行；文件不存在返回空
     ///
+    /// 远端服务器：走 `LogsTail` RPC（对端读自己的 `console.log`）。
+    ///
     /// # Errors
     ///
     /// 读取失败（非「不存在」）
     pub fn log_tail(&self, name: &str, lines: usize) -> Result<Vec<String>, LifecycleError> {
         let server = self.registry.get(name)?;
+        if server.is_remote() {
+            return self
+                .backend
+                .supervisor()
+                .logs_tail(&server.remote_ref(), lines)
+                .map_err(LifecycleError::from);
+        }
         Ok(tail_lines(&console_log_path(&server.dir), lines)?)
     }
 

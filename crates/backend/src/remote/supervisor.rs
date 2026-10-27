@@ -172,6 +172,23 @@ impl SupervisorPort for RemoteSupervisor {
         // 通知本地关停：宽限 30 秒、不强杀，与本地实现的缺省口径一致
         self.stop(server, StopSpec::default_grace()).map(|_| ())
     }
+
+    fn logs_tail(
+        &self,
+        server: &ServerRef<'_>,
+        lines: usize,
+    ) -> Result<Vec<String>, SupervisorError> {
+        let response = self.call(&Request::LogsTail {
+            server_id: id_of(server),
+            lines,
+        })?;
+        match response {
+            Response::LogLines { lines } => Ok(lines),
+            other => Err(SupervisorError::Protocol(format!(
+                "server.logs returned an unexpected frame: {other:?}"
+            ))),
+        }
+    }
 }
 
 /// 克隆一个 supervisor 错误（`SupervisorError` 未实现 `Clone`，按变体重造）

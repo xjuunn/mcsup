@@ -1094,6 +1094,24 @@ pub trait SupervisorPort: Send + Sync {
     ///
     /// 协议失败时返回错误
     fn shutdown(&self, server: &ServerRef<'_>) -> Result<(), SupervisorError>;
+
+    /// 读服务端控制台日志末尾若干行
+    ///
+    /// 本地 supervisor 不经手日志（`service` 直接读 `console.log`），默认
+    /// 实现拒绝；远端实现覆盖它，把请求转成一次 `LogsTail` RPC。
+    ///
+    /// # Errors
+    ///
+    /// 远端不可达或对端读取失败时返回 [`SupervisorError::Remote`]
+    fn logs_tail(
+        &self,
+        _server: &ServerRef<'_>,
+        _lines: usize,
+    ) -> Result<Vec<String>, SupervisorError> {
+        Err(SupervisorError::Unreachable(
+            "logs tail is not supported by this supervisor".to_owned(),
+        ))
+    }
 }
 
 /// 领域事件出口：`service` 在关键节点发布事实，消费者（CLI / API / MCP /
