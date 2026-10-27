@@ -326,12 +326,14 @@ disconnect`、`server create/list/status/remove --origin`、`java scan --origin`
   是一次拉取，follow 仍仅本地）。设计方向：在 `protocol::remote` 增加
   服务端主动推送的流式帧（如 `LogChunk`），连接上以「请求订阅 → 持续推送」
   模型承载，与现有请求-响应帧共存；断线即取消订阅，不引入会话状态。
-- 备份进度：`BackupService::create` 的 `on_progress` 在远端路径上是空回调
-  （见 `verify` 同样单次回调）。设计方向：进度不进帧协议，改为 agent 侧
-  事件日志 + 客户端轮询（`BackupProgress` 查询帧），避免长事务占死
-  请求-响应连接。
-- 两者落地前，`docs/remote.md` 的「进度、日志、备份进度后续以流式帧承载」
-  仍是计划而非承诺；接口沿用 `ProgressSink` / `EventSink` 语义不变。
+- 备份进度：**维持远端路径不回传进度的现状**。远端 `backup create` 期间
+  客户端 spinner 持续运转（RPC 未返回即未结束），并非无回显；而事件日志 +
+  `BackupProgress` 轮询帧需要 agent 侧引入跨请求状态（进度快照、过期清理、
+  快照 ID 关联），与「无会话状态、断线即取消」的协议纪律相悖。重新评估的
+  触发条件：备份时长增长到分钟级且用户反馈需要取消能力（取消需要同一套
+  事件通道，届时一并设计）。
+- 日志 follow 已由 `LogsFollow` 长轮询落地（见阶段 10 记录）；备份进度的
+  取舍见上。`docs/remote.md` 的相应措辞已同步收敛。
 
 ### 阶段 10 收尾
 

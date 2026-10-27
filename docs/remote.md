@@ -264,8 +264,9 @@ server create/remove、java scan、生命周期与备份。`server install`、`p
 - `PROTOCOL_VERSION` 不匹配直接拒绝，不猜测兼容；破坏性变更走新增字段 +
   版本递增。
 - 能力协商决定可选能力（backup / file / java / streaming）是否可用。
-- 进度、日志、备份进度后续以流式帧承载，接口沿用 `ProgressSink` /
-  `EventSink` 语义。
+- 日志 follow 用 `LogsFollow` 长轮询帧承载（断线即取消，无会话状态）；
+  备份进度**不回传**——远端备份期间客户端 spinner 持续运转，事件通道的
+  取舍见 `docs/remote-progress.md`。
 
 ## 实施阶段
 
