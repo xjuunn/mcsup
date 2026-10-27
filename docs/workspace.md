@@ -79,6 +79,9 @@ JVM 属机器级命令，禁止放进工作目录：切换工作目录不换 JVM
 - `jar_path` 相对服务器目录（固定 `server.jar`），不存绝对路径。
 - marker 读写 v1 在 service 层直接做；将来 Remote Backend 需要时再抽
   port，禁止提前为单实现建 trait。
+- marker 一律**同目录临时文件 → rename** 原子写入：截断的 `mcsup.json` /
+  `workspace.toml` 等于身份丢失（读取按损坏拒绝，`server link` /
+  `workspace use` 都接不回来）。
 
 # workspace init
 
@@ -167,7 +170,7 @@ mcsup workspace init [--dir <path>] [--name <name>]
 
 ```
 {data_dir}/mcsup/db/
-├── .lock                          # 跨进程写锁（仅在写入瞬间存在）
+├── .lock                          # 跨进程写锁文件（常驻，锁由内核持有）
 ├── workspaces/
 │   ├── state.json                 # 唯一的当前工作区指针
 │   ├── 495493ae-....-36d7c9.json  # 一条工作目录
@@ -249,11 +252,11 @@ mcsup workspace init [--dir <path>] [--name <name>]
 
 - **原子写入**：同目录 `.xxx.json.tmp` → `fsync` → `rename` 覆盖。中断只会
   留下替换前或替换后的完整文件；失败时清理临时文件，旧文件不动。
-- **跨进程锁**：进程内 `Mutex` + 数据根目录的 `.lock` 文件
-  （`create_new` 独占创建），内容记录持有者 pid。两个 mcsup 进程同时写入时
-  串行化，避免「都通过唯一性校验、各自落盘」产生重名。残留锁按
-  **持有者进程是否存活**回收，与锁文件的新旧无关：按文件年龄判断会误删
-  仍在正常持锁的进程的锁，使两个进程同处临界区。等锁上限 30 秒。
+- **跨进程锁**：进程内 `Mutex` + 数据根目录 `.lock` 文件上的**操作系统文件锁**
+  （Unix `flock` / Windows `LockFileEx`）。两个 mcsup 进程同时写入时串行化，
+  避免「都通过唯一性校验、各自落盘」产生重名。锁挂在持有进程的文件句柄上，
+  进程崩溃即自动释放，不需要 pid 存活探测；锁文件因此常驻、不删除——删文件
+  会让等待者在新旧 inode 上各持一把锁。等锁上限 30 秒。
 - **身份自校验**：文件名与内部 `id` 不一致、`version` / `schema` 不符、
   JSON 非法、`id` 越界，均报 `corrupt repository record` 并带上相对路径。
 - **读路径不因 `state.json` 瘫痪**：`state.json` 是全局单点。它损坏时

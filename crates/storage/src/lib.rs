@@ -230,7 +230,7 @@ impl JsonStore {
     /// 返回的 guard 离开作用域时同时释放两把锁。
     fn lock(&self) -> Result<Guard<'_>, RepositoryError> {
         let guard = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
-        let dir_lock = DirLock::acquire(self.root.join(LOCK_FILE))?;
+        let dir_lock = DirLock::acquire(&self.root.join(LOCK_FILE))?;
         Ok(Guard {
             _thread: guard,
             _dir: dir_lock,
@@ -588,37 +588,39 @@ fn remove_file_checked(path: &Path) -> Result<(), RepositoryError> {
 /// 进程内锁挡不住两个 mcsup 进程同时写同一目录。唯一性靠「先扫后写」，
 /// 没有这把锁时两个进程会一起通过校验、各自落盘，产生重名或重复 id。
 ///
-/// 实现：`try_lock` 自旋 + 超时，不用 `flock`（Windows 语义不同），
-/// 锁文件内容写持有者 pid 作为存活凭据。锁文件本身永不删除——删锁文件会
-/// 引入「A 删了锁、B 也创建了锁」的竞态。
+/// 实现是**操作系统文件锁**（Unix `flock` / Windows `LockFileEx`），不是
+/// 「文件存在即持锁」。存在性判定在持有者崩溃后只能靠 pid 存活探测回收，
+/// 而「探测到死亡 → 删文件 → 重建」这段窗口里，一个进程可能删掉别人刚
+/// 创建的新锁、让两个进程同时进入临界区。内核锁挂在文件句柄上：进程一死
+/// 就自动释放，不需要也不允许删除锁文件——删文件会让等待者在新旧 inode
+/// 上各持一把锁。
 struct DirLock {
-    path: PathBuf,
+    /// 锁句柄：关闭（含进程崩溃）即释放；只用于保活
+    _file: std::fs::File,
 }
 
 impl DirLock {
-    fn acquire(path: PathBuf) -> Result<Self, RepositoryError> {
-        // 进程内已排队，超时只可能是别的进程持锁或残留锁
+    fn acquire(path: &Path) -> Result<Self, RepositoryError> {
+        // 锁文件永不删除，这里 open 兼 create，等待者拿到的是同一个 inode
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(storage_err)?;
+        // 进程内已排队，超时只可能是别的进程持锁
         let deadline = std::time::Instant::now() + LOCK_TIMEOUT;
         let mut delay = std::time::Duration::from_millis(2);
         loop {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(mut file) => {
-                    // pid 是回收残留锁的唯一凭据，写失败就无法判断存活，
-                    // 宁可失败也不留下一个无法回收的锁
-                    write!(file, "{}", std::process::id())
-                        .map_err(|err| storage_err(io::Error::new(err.kind(), err.to_string())))?;
-                    return Ok(Self { path });
+            match file.try_lock() {
+                Ok(()) => {
+                    // 内容只是排障线索，不参与互斥判定；写失败不影响持锁
+                    let _ = file.set_len(0);
+                    let _ = writeln!(&file, "{}", std::process::id());
+                    return Ok(Self { _file: file });
                 }
-                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                    if is_stale(&path) {
-                        // 持锁进程已死：清掉后重试。删除失败说明别的进程刚抢到，继续等
-                        let _ = std::fs::remove_file(&path);
-                        continue;
-                    }
+                Err(std::fs::TryLockError::WouldBlock) => {
                     if std::time::Instant::now() >= deadline {
                         return Err(RepositoryError::Storage(Box::new(io::Error::new(
                             io::ErrorKind::WouldBlock,
@@ -630,66 +632,14 @@ impl DirLock {
                     std::thread::sleep(delay);
                     delay = (delay * 2).min(std::time::Duration::from_millis(50));
                 }
-                Err(err) => return Err(storage_err(err)),
+                Err(std::fs::TryLockError::Error(err)) => return Err(storage_err(err)),
             }
         }
     }
 }
 
-impl Drop for DirLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
 /// 单次拿到锁的最长等待时间
 const LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// 锁文件是否是可回收的残留
-///
-/// 判据是**持有者进程是否还活着**，不是锁文件有多旧：
-/// 旧的时间阈值只会误判——正常持锁超过阈值的进程会被当成崩溃，
-/// 锁被别的进程删除后两者同处临界区。
-fn is_stale(path: &Path) -> bool {
-    match std::fs::read_to_string(path) {
-        // 读得到 pid：活着就不是残留
-        Ok(text) => match text.trim().parse::<u32>() {
-            Ok(pid) => !process_alive(pid),
-            // pid 写了一半（写入瞬间崩溃）或为垃圾：判为残留
-            Err(_) => true,
-        },
-        // 文件刚被别的进程释放：不算残留，让调用方下一轮重试创建
-        Err(_) => false,
-    }
-}
-
-#[cfg(unix)]
-fn process_alive(pid: u32) -> bool {
-    // Unix 上 pid 会被复用；信号 0 只探测存在性，已足够区分「崩溃遗留」
-    // 与「仍在运行」两种常见情况
-    std::process::Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-/// Windows：查询打开该 pid 的进程句柄
-///
-/// pid 已退出时 `OpenProcess` 失败并置 `ERROR_INVALID_PARAMETER`。
-/// 不引入 Win32 绑定依赖，改用系统自带的任务列表查询，避免为一次
-/// 诊断性判断扩大依赖面。
-#[cfg(not(unix))]
-fn process_alive(pid: u32) -> bool {
-    std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-        .output()
-        .is_ok_and(|out| {
-            out.status.success() && String::from_utf8_lossy(&out.stdout).contains(&pid.to_string())
-        })
-}
 
 fn conflict_unique(exists: bool, key: &str) -> Result<(), RepositoryError> {
     if exists {
@@ -1835,75 +1785,55 @@ mod tests {
     fn dir_lock_blocks_until_released() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let path = dir.path().join(".lock");
-        let held = DirLock::acquire(path.clone()).expect("第一个拿到锁");
+        let held = DirLock::acquire(&path).expect("第一个拿到锁");
         assert!(path.exists(), "持锁期间锁文件存在");
 
         // 持锁期间其他持有者拿不到：用另一线程 + 超时验证不会立刻成功
         let probe_path = path.clone();
-        let probe = std::thread::spawn(move || DirLock::acquire(probe_path).is_ok());
+        let probe = std::thread::spawn(move || DirLock::acquire(&probe_path).is_ok());
         std::thread::sleep(std::time::Duration::from_millis(150));
         assert!(!probe.is_finished(), "第二个持有者必须等待，而不是立刻拿到");
 
         drop(held);
-        // 等待者一放锁就会立刻补上，因此这里不能断言「锁文件不存在」，
-        // 只能等它拿到、自己释放后再断言
         assert!(probe.join().expect("join"), "释放后等待者应拿到锁");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while path.exists() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(!path.exists(), "最终不残留锁文件");
+        // 锁文件永久保留：删掉它会让等待者在新旧 inode 上各持一把锁
+        assert!(path.exists(), "锁文件不删除");
+        // 没有持有者时可以直接拿到
+        let again = DirLock::acquire(&path).expect("释放后可再次拿到");
+        drop(again);
     }
 
-    /// 持有者已死（pid 不存在）的锁会被回收，不会永久卡住写入
-    #[test]
-    fn stale_lock_is_reclaimed() {
-        let dir = tempfile::TempDir::new().expect("temp dir");
-        let path = dir.path().join(".lock");
-        // 一个几乎不可能存在的 pid：判据是「进程是否存活」而非文件年龄
-        std::fs::write(&path, "4294967290").expect("seed");
-        assert!(is_stale(&path), "死亡 pid 的锁必须判为残留");
-        let lock = DirLock::acquire(path.clone()).expect("残留锁应被回收");
-        drop(lock);
-        assert!(!path.exists());
-    }
-
-    /// 持有者仍活着时，锁无论多旧都不回收
+    /// 残留锁文件（垃圾内容 / 很旧的 mtime）不参与互斥判定
     ///
-    /// 这是旧实现的缺陷：按文件 mtime 判断时，正常持锁超过阈值的进程
-    /// 会被当成崩溃，锁被删除后两个进程同处临界区。
+    /// 旧实现把「pid 不存活」当成回收凭据：探测到死亡到删除之间，可能删掉
+    /// 别人刚建的新锁。现在互斥只由内核锁决定，残留文件既不挡路也不删除。
     #[test]
-    fn live_lock_is_never_reclaimed() {
+    fn leftover_lock_file_does_not_block() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let path = dir.path().join(".lock");
-        std::fs::write(&path, std::process::id().to_string()).expect("seed");
+        std::fs::write(&path, "not-a-pid").expect("seed");
         let ancient = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400);
-        let file = std::fs::File::options()
+        std::fs::File::options()
             .write(true)
             .open(&path)
-            .expect("open");
-        file.set_modified(ancient).expect("set mtime");
-        drop(file);
-        assert!(!is_stale(&path), "pid 存活则不是残留，与文件年龄无关");
+            .expect("open")
+            .set_modified(ancient)
+            .expect("set mtime");
+
+        let lock = DirLock::acquire(&path).expect("残留锁文件不挡路");
+        drop(lock);
+        assert!(path.exists(), "锁文件不删除");
     }
 
-    /// 空或非数字的锁内容（写入瞬间崩溃）判为残留
+    /// 写入结束后锁文件仍在，但已经没人持有：下一条命令能立刻拿到
     #[test]
-    fn unreadable_lock_is_reclaimed() {
-        let dir = tempfile::TempDir::new().expect("temp dir");
-        let path = dir.path().join(".lock");
-        std::fs::write(&path, "").expect("seed");
-        assert!(is_stale(&path));
-        std::fs::write(&path, "not-a-pid").expect("seed");
-        assert!(is_stale(&path));
-    }
-
-    /// 写入结束后锁文件不残留
-    #[test]
-    fn lock_file_removed_after_write() {
+    fn lock_file_survives_and_is_reusable() {
         let store = store_with_ws();
         add_server(&store, &sample_meta("alpha"));
-        assert!(!store.root().join(LOCK_FILE).exists(), "锁文件必须释放");
+        let path = store.root().join(LOCK_FILE);
+        assert!(path.exists(), "锁文件永久保留");
+        let lock = DirLock::acquire(&path).expect("上一把锁已释放");
+        drop(lock);
     }
 
     // ---------------------------------------------------------------- Java

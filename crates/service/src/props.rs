@@ -5,14 +5,12 @@
 
 use crate::fs_error::FsError;
 use crate::registry::{RegisteredServer, ServerRegistry, ServerRegistryError};
+use crate::util::write_atomic;
 use domain::server::props::{PROPERTIES_FILE, Properties};
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
-
-/// 临时文件后缀：写入完成前不触碰正式文件
-const TMP_SUFFIX: &str = ".tmp";
 
 /// 属性读写失败
 #[derive(Debug, Error)]
@@ -96,18 +94,6 @@ impl ServerPropsService {
         write_atomic(&report.path, &report.properties.render())?;
         Ok(report)
     }
-}
-
-/// 临时文件写满后 rename 覆盖：中途失败时正式文件保持原样
-fn write_atomic(path: &Path, text: &str) -> Result<(), PropsError> {
-    let tmp = path.with_file_name(format!("{PROPERTIES_FILE}{TMP_SUFFIX}"));
-    std::fs::write(&tmp, text).map_err(|err| FsError::io(&tmp, err))?;
-    if let Err(err) = std::fs::rename(&tmp, path) {
-        // 清理残留临时文件，避免服务器把它当成别的文件
-        let _ = std::fs::remove_file(&tmp);
-        return Err(FsError::io(path, err).into());
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -291,7 +277,12 @@ mod tests {
         let reread = svc.read("alpha").expect("read");
         assert_eq!(reread.properties.get("max-players"), Some("8"));
         // 临时文件不残留
-        assert!(!dir.join(format!("{PROPERTIES_FILE}.tmp")).exists());
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "残留临时文件: {leftovers:?}");
     }
 
     #[test]
