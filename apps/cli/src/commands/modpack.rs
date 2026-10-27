@@ -328,7 +328,7 @@ fn prompt_keyword(printer: Printer) -> Result<Option<String>> {
     if !printer.is_interactive() {
         return Ok(None);
     }
-    let keyword = crate::prompts::input_text(printer.lang(), "搜索整合包", "", "")?;
+    let keyword = crate::prompts::input_keyword(printer.lang(), "搜索整合包")?;
     if keyword.trim().is_empty() {
         Ok(None)
     } else {

@@ -9,6 +9,7 @@ use crate::locale::Lang;
 use crate::output::Printer;
 use anyhow::{Context, Result};
 use inquire::autocompletion::Replacement;
+use inquire::ui::{RenderConfig, Styled};
 use inquire::validator::{ErrorMessage, Validation};
 use inquire::{Autocomplete, Confirm, CustomUserError, Select, Text};
 use mcsup::domain::workspace::WorkspaceName;
@@ -286,16 +287,18 @@ fn nearest_existing(path: &Path) -> Option<PathBuf> {
 ///
 /// 读取终端输入失败时返回底层错误
 pub(crate) fn input_name(lang: Lang, label: &str, default: &str) -> Result<String> {
-    let input: String = Text::new(label)
-        .with_default(default)
-        .with_help_message(&l(
+    let input: String = text_input(
+        label,
+        default,
+        &l(
             lang,
             "字母、数字、-、_，最长 64；回车取默认值",
             "letters, digits, - or _, up to 64; enter keeps the default",
-        ))
-        .with_validator(move |input: &str| Ok(validate_name(lang, input)))
-        .prompt()
-        .context(l(lang, "读取名称输入", "reading the name"))?;
+        ),
+    )
+    .with_validator(move |input: &str| Ok(validate_name(lang, input)))
+    .prompt()
+    .context(l(lang, "读取名称输入", "reading the name"))?;
     let trimmed = input.trim();
     if trimmed.is_empty() {
         Ok(default.to_owned())
@@ -327,17 +330,50 @@ pub(crate) fn validate_name(lang: Lang, input: &str) -> Validation {
 ///
 /// 读取终端输入失败时返回底层错误
 pub(crate) fn input_text(lang: Lang, label: &str, default: &str, help: &str) -> Result<String> {
-    let input: String = Text::new(label)
-        .with_default(default)
-        .with_help_message(help)
-        .prompt()
-        .context(l(lang, "读取输入", "reading input"))?;
+    let input: String =
+        text_input(label, default, help)
+            .prompt()
+            .context(l(lang, "读取输入", "reading input"))?;
     let trimmed = input.trim();
     if trimmed.is_empty() {
         Ok(default.to_owned())
     } else {
         Ok(trimmed.to_owned())
     }
+}
+
+/// 关键词输入：活动态与已答步骤统一用 `>`，不显示 `?`
+///
+/// 搜索是可选输入，没有默认值和帮助行；`Text` 仍会为它们预留 `()` / `[]`，
+/// 因此这里单独构造，避免留下空占位。
+pub(crate) fn input_keyword(lang: Lang, label: &str) -> Result<String> {
+    let input: String = Text::new(label)
+        .with_render_config(keyword_render_config())
+        .prompt()
+        .context(l(lang, "读取输入", "reading input"))?;
+    Ok(input.trim().to_owned())
+}
+
+/// 关键词输入的渲染配置：活动态与已答态都用 `>`，不显示 `?`
+fn keyword_render_config() -> RenderConfig<'static> {
+    RenderConfig::default()
+        .with_prompt_prefix(Styled::new(">"))
+        .with_answered_prompt_prefix(Styled::new(">"))
+}
+
+/// 构造文本输入框：空默认值 / 空帮助行不设置
+///
+/// inquire 会把默认值渲染成 `()`、帮助行渲染成 `[]`；传空串就会留下
+/// 一对空括号。调用方不必各自判断，统一在这里过滤。
+fn text_input<'a>(label: &'a str, default: &'a str, help: &'a str) -> Text<'a, 'static> {
+    let mut prompt = Text::new(label);
+    if !default.is_empty() {
+        prompt = prompt.with_default(default);
+    }
+    if !help.is_empty() {
+        prompt = prompt.with_help_message(help);
+    }
+    prompt
 }
 
 /// 布尔选择（`server set autostart` 等）：默认项置顶，回车即取默认
@@ -658,6 +694,26 @@ mod tests {
             validate_choice(Lang::Zh, "ab", &opts),
             Validation::Invalid(_)
         ));
+    }
+
+    /// 空默认值 / 空帮助行不落到 inquire，避免渲染出 `()` / `[]`
+    #[test]
+    fn text_input_skips_empty_default_and_help() {
+        let prompt = text_input("搜索整合包", "", "");
+        assert!(prompt.default.is_none());
+        assert!(prompt.help_message.is_none());
+
+        let prompt = text_input("名称", "test1", "help");
+        assert_eq!(prompt.default, Some("test1"));
+        assert_eq!(prompt.help_message, Some("help"));
+    }
+
+    /// 关键词输入不再使用 `?` 前缀
+    #[test]
+    fn keyword_prompt_uses_answered_prefix() {
+        let config = keyword_render_config();
+        assert_eq!(config.prompt_prefix.content, ">");
+        assert_eq!(config.answered_prompt_prefix.content, ">");
     }
 
     /// 补全语义：显式高亮 > 输入全名 > 单一匹配；非法输入不替换
