@@ -248,8 +248,9 @@ async fn browse_results(
 
 /// 结果页的可选项：命中项在前，翻页项在后
 ///
-/// 翻页项是否出现只由 `offset + len` 与 `total` 决定，与网络无关，因此抽成
-/// 纯函数单独测试。
+/// 翻页项按「上一页在上、下一页在下」排列：返回上一页更贴近列表，继续向下
+/// 翻页放在最末。是否出现只由 `offset + len` 与 `total` 决定，与网络无关，
+/// 因此抽成纯函数单独测试。
 fn result_choices(
     mut choices: Vec<ScopedChoice>,
     offset: u32,
@@ -257,11 +258,11 @@ fn result_choices(
     page: u32,
 ) -> Vec<ScopedChoice> {
     let more = u64::from(offset) + choices.len() as u64;
-    if more < total {
-        choices.push(ScopedChoice::new(NEXT_PAGE, false));
-    }
     if page > 0 {
         choices.push(ScopedChoice::new(PREV_PAGE, false));
+    }
+    if more < total {
+        choices.push(ScopedChoice::new(NEXT_PAGE, false));
     }
     choices
 }
@@ -669,6 +670,16 @@ mod tests {
         let last = result_choices(hits, 2, 3, 1);
         assert!(!last.iter().any(|c| c.label == NEXT_PAGE));
         assert_eq!(last.last().map(|c| c.label.as_str()), Some(PREV_PAGE));
+    }
+
+    /// 中间页：上一页在上、下一页在下，选中一行不会把翻页项的顺序看反
+    #[test]
+    fn result_choices_orders_prev_above_next() {
+        let hits = vec![hit("1", "A"), hit("2", "B")];
+        let middle = result_choices(hits, 20, 138, 1);
+        let labels: Vec<&str> = middle.iter().map(|choice| choice.label.as_str()).collect();
+        assert_eq!(labels[labels.len() - 2], PREV_PAGE, "上一页在上");
+        assert_eq!(labels[labels.len() - 1], NEXT_PAGE, "下一页在下");
     }
 
     #[test]
