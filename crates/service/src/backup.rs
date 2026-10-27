@@ -2472,6 +2472,34 @@ mod tests {
     }
 
     #[test]
+    fn prune_fails_closed_when_snapshot_record_is_corrupt() {
+        let fx = Fixture::new(FakeSupervisor::stopped());
+        fx.write("a", b"only-here");
+        let outcome = fx.create();
+        let hash = outcome
+            .snapshot
+            .content
+            .referenced_hashes()
+            .next()
+            .expect("hash")
+            .clone();
+        let record =
+            backup::snapshot_dir(&fx.ws_path, &outcome.snapshot.id).join(backup::SNAPSHOT_FILE);
+        std::fs::write(&record, b"{not json").expect("corrupt");
+
+        let err = fx
+            .service
+            .prune("alpha", Some(RetentionPolicy::Keep(0)), false)
+            .expect_err("损坏记录必须让 prune fail closed");
+        assert!(matches!(err, BackupError::Store(_)), "{err}");
+        let cas = CasStore::new(&fx.backups_root());
+        assert!(
+            cas.stat(&hash).expect("stat").is_some(),
+            "GC 不得删掉仍被引用的对象"
+        );
+    }
+
+    #[test]
     fn prune_older_than_uses_age() {
         let fx = Fixture::new(FakeSupervisor::stopped());
         fx.write("a", b"1");

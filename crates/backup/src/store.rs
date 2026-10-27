@@ -363,9 +363,8 @@ impl SnapshotRepository for SnapshotIndex {
             match self.load(&id) {
                 Ok(Some(snapshot)) => out.push(snapshot),
                 Ok(None) => {}
-                Err(err @ SnapshotStoreError::Corrupt(_)) => {
-                    tracing::warn!(id = %id, error = %err, "skipping corrupt snapshot record");
-                }
+                // GC 依据必须完整：跳过损坏记录会让 prune 把它引用的 CAS
+                // 对象当成孤儿删掉，而记录仍留在盘上（看起来还能恢复）。
                 Err(err) => return Err(err),
             }
         }
@@ -524,6 +523,23 @@ mod tests {
         let listed = index.list_for_server("alpha").expect("list");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id.as_str(), "20260101t000000-a");
+    }
+
+    /// GC 视图必须 fail closed：跳过损坏记录会让 prune 删掉仍被引用的对象
+    #[test]
+    fn list_all_fails_closed_on_corrupt_record() {
+        let (_dir, index) = index();
+        index
+            .complete(&sample("20260101t000000-a", "alpha", 100))
+            .expect("save");
+        let broken = index.dir_of(&SnapshotId::parse("20260102t000000-b").expect("id"));
+        fs::create_dir_all(&broken).expect("mkdir");
+        fs::write(broken.join(SNAPSHOT_FILE), b"{not json").expect("write");
+
+        let err = index
+            .list_all()
+            .expect_err("corrupt record must fail closed");
+        assert!(matches!(err, SnapshotStoreError::Corrupt(_)), "{err}");
     }
 
     #[test]
