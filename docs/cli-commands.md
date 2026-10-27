@@ -276,6 +276,13 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 客户端包里仅客户端模组可能被错误标记为 `server: required`，用服务端归档可
 避免启动崩溃。
 
+清单的 `env` 字段不是权威数据。安装时还会把 `mods/` 下 jar 的 sha1 批量
+反查 Modrinth（`POST /version_files` → `POST /projects`），上游标注
+`server_side = unsupported` 的文件一律不装；上一次安装留下的同名文件会被
+删除。查询失败时中止安装（避免装出一个启动必崩的服务端），来源不支持这项
+能力时退回「按清单装」。JSON 输出里的 `skipped_client_only` 与人类可读输出
+都会报告跳过数量。
+
 清单里 `server: unsupported` 的文件不会装到服务端；`optional` 视为需要安装。
 `.mrpack` 由内置 zip 解析直接解开，不调用系统 `unzip`，归档内的 UTF-8
 文件名按原样落盘。

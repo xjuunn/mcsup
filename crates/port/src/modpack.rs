@@ -16,6 +16,7 @@
 
 use async_trait::async_trait;
 use domain::server::modpack::ModpackIndex;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::SourceError;
@@ -222,6 +223,21 @@ pub trait ModpackSource: ContentSourceInfo + Send + Sync {
         id_or_slug: &str,
         version_id: Option<&str>,
     ) -> Result<ResolvedModpack, SourceError>;
+
+    /// 按文件哈希查上游的「仅客户端」标记
+    ///
+    /// 返回哈希集合：命中的文件在服务端不应安装。默认实现返回空集合，
+    /// 让不提供该能力的来源保持「按清单 env 字段」的旧行为。
+    ///
+    /// 整合包作者常把仅客户端模组写成 `server: required`；只信清单会在
+    /// 服务端启动时加载客户端类并崩溃。来源能查到权威元数据时由它覆盖。
+    ///
+    /// # Errors
+    ///
+    /// 上游不可达、状态码异常或响应无法解析时返回 [`SourceError`]
+    async fn client_only_hashes(&self, _hashes: &[String]) -> Result<HashSet<String>, SourceError> {
+        Ok(HashSet::new())
+    }
 }
 
 /// 整合包搜索页

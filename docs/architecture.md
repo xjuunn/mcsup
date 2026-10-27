@@ -305,6 +305,12 @@ Modrinth 同一版本可以同时提供客户端与服务端文件，服务端�
 客户端包。客户端包常把仅客户端模组标成 `server: required`，直接装到服务端
 会在启动阶段崩溃。
 
+清单的 `env` 字段同样不可全信。`apply` 会把 `mods/` 下 jar 的 sha1 交给
+`port::ModpackSource::client_only_hashes`（默认实现返回空集合），由来源用
+上游元数据判定 `server_side = unsupported` 的文件；命中者不落盘，旧文件一并
+删除。判定逻辑留在 Provider（上游字段语义）与 Service（安装编排）里，入口
+只负责展示 `skipped_client_only`。查询失败即中止安装，不带着未知状态落盘。
+
 ```
 server create --variant modrinth-modpack
    └─→ ModpackService::prepare ──→ port::ModpackSource / ModpackExtractor

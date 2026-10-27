@@ -582,19 +582,21 @@ pub(crate) async fn install_modpack(
         files: applied.file_count,
         downloaded_bytes: applied.downloaded_bytes,
         reused: applied.reused,
+        skipped_client_only: applied.skipped_client_only,
         path: server_dir.display().to_string(),
     };
+    let note = skipped_note(printer.lang(), applied.skipped_client_only);
     let human = crate::i18n::pick(
         printer.lang(),
         format!(
-            "已按整合包 {} {} 布置服务端：{} 个文件，下载 {}",
+            "已按整合包 {} {} 布置服务端：{} 个文件，下载 {}{note}",
             picked.title,
             picked.version_number,
             applied.file_count,
             crate::output::human_bytes(applied.downloaded_bytes)
         ),
         format!(
-            "applied modpack {} {}: {} files, downloaded {}",
+            "applied modpack {} {}: {} files, downloaded {}{note}",
             picked.title,
             picked.version_number,
             applied.file_count,
@@ -602,6 +604,21 @@ pub(crate) async fn install_modpack(
         ),
     );
     printer.print_outcome(&human, &payload)
+}
+
+/// 「跳过仅客户端模组」的提示后缀；没跳过时为空串
+///
+/// 上游元数据判定与清单不一致时，文件数会比清单声明的少。不解释一句，
+/// 用户会以为安装漏了文件。
+fn skipped_note(lang: crate::locale::Lang, skipped: usize) -> String {
+    if skipped == 0 {
+        return String::new();
+    }
+    crate::i18n::pick(
+        lang,
+        format!("，跳过 {skipped} 个仅客户端模组"),
+        format!(", skipped {skipped} client-only mods"),
+    )
 }
 
 /// 整合包布置结果的 JSON 形状
@@ -616,6 +633,8 @@ struct ModpackInstallJson<'a> {
     files: usize,
     downloaded_bytes: u64,
     reused: usize,
+    /// 按上游元数据判定为仅客户端、已跳过的模组数
+    skipped_client_only: usize,
     path: String,
 }
 
@@ -724,5 +743,23 @@ mod tests {
         let long: Vec<String> = (0..10).map(|i| format!("1.{i}")).collect();
         let joined = join_versions(&long);
         assert!(joined.contains("等 10 个"), "{joined}");
+    }
+
+    /// 没跳过时不留尾巴；有跳过时中英文都要说明原因
+    #[test]
+    fn skipped_note_explains_missing_mods() {
+        use crate::locale::Lang;
+        assert_eq!(skipped_note(Lang::Zh, 0), "", "没跳过时不应追加说明");
+        assert_eq!(skipped_note(Lang::En, 0), "");
+        assert_eq!(
+            skipped_note(Lang::Zh, 3),
+            "，跳过 3 个仅客户端模组",
+            "中文提示要带上数量"
+        );
+        assert_eq!(
+            skipped_note(Lang::En, 3),
+            ", skipped 3 client-only mods",
+            "英文提示要带上数量"
+        );
     }
 }
