@@ -286,10 +286,12 @@ Provider 对外提供两个互不重叠的端口：
 | --- | --- |
 | `domain::server::modpack` | `.mrpack` 清单模型、路径安全、`server: unsupported` 过滤、依赖键 → 加载器 |
 | `port::modpack::{ModpackSource, ModpackExtractor}` | 搜索可开服整合包 / 详情 / 版本 / 解析下载目标；读归档清单与铺 overrides |
-| `provider::modrinth::modpack` | Modrinth 实现（`server_side` facet 过滤）+ `unzip` 版归档读取 |
+| `provider::modrinth::modpack` | Modrinth 实现（`server_side` facet 过滤）+ 直接解析 zip 读取归档（不依赖系统 `unzip`） |
 | `service::ModpackService` | prepare（取回 + 读清单）→ apply（铺 overrides + 下载服务端文件） |
 
-开服顺序由入口编排：`prepare` 拿到 MC 版本与加载器 → 写注册表 → 用**既有**
+开服顺序由入口编排：`prepare` 拿到 MC 版本与加载器 → 注册表写入 MC 版本与
+**加载器对应的变体**（`fabric` / `forge` / `neoforge` / `quilt` / `vanilla`，
+而不是 `modrinth-modpack`，后者只是入口标记、没有核心来源）→ 用**既有**
 `ServerJarSource` 装对应加载器（与 `server install` 同一套流程，Forge /
 NeoForge 的安装器运行与 Java 选择不出现第二份实现）→ `apply` 落文件。
 
@@ -300,7 +302,7 @@ NeoForge 的安装器运行与 Java 选择不出现第二份实现）→ `apply`
 ```
 server create --variant modrinth-modpack
    └─→ ModpackService::prepare ──→ port::ModpackSource / ModpackExtractor
-         ├─→ 注册表写入 MC 版本
+         ├─→ 注册表写入 MC 版本与加载器变体
          ├─→ ServerJarSource（Fabric / Forge / NeoForge / Quilt…）
          └─→ ModpackService::apply ──→ port::ArtifactDownloader
 ```

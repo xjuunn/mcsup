@@ -263,10 +263,11 @@ fn net_modpack_create_installs_server() {
     // staging 目录清理干净
     assert!(!dir.join("modpack-staging").exists(), "暂存目录应被清理");
 
-    // JSON 结果：MC 版本来自清单，变体是整合包
+    // JSON 结果：MC 版本来自清单，变体是清单声明的真实加载器
+    // （存 `modrinth-modpack` 会让后续 `server install` 找不到核心来源）
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("\"source\":\"modrinth\""), "{text}");
-    assert!(text.contains("\"variant\":\"modrinth-modpack\""), "{text}");
+    assert!(text.contains("\"variant\":\"fabric\""), "{text}");
 
     // 注册表记录的版本是清单里的 MC 版本（不是整包版本号）
     let status = run(home.path(), &["server", "status", "mp", "--output", "json"]);

@@ -34,6 +34,10 @@ const MIN_INPUT_COLS: usize = 4;
 pub(crate) struct ScopedChoice {
     /// 展示标签，同时是提交值（按全名大小写不敏感归一）
     pub(crate) label: String,
+    /// 实际渲染的正文；`None` 表示与 [`Self::label`] 相同
+    pub(crate) display: Option<String>,
+    /// 正文前面的灰色前缀（如 ID）；只影响渲染，不参与提交值
+    pub(crate) prefix: Option<String>,
     /// 是否属于「切换范围后才显示」的扩展候选
     pub(crate) extra: bool,
 }
@@ -43,8 +47,24 @@ impl ScopedChoice {
     pub(crate) fn new(label: impl Into<String>, extra: bool) -> Self {
         Self {
             label: label.into(),
+            display: None,
+            prefix: None,
             extra,
         }
+    }
+
+    /// 设置灰色前缀（不参与过滤与提交）
+    #[must_use]
+    pub(crate) fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.prefix = Some(prefix.into());
+        self
+    }
+
+    /// 设置渲染正文（过滤与提交仍用 [`Self::label`]）
+    #[must_use]
+    pub(crate) fn with_display(mut self, display: impl Into<String>) -> Self {
+        self.display = Some(display.into());
+        self
     }
 }
 
@@ -523,15 +543,41 @@ impl<'a> Picker<'a> {
         (line, column)
     }
 
-    /// 建议行：高亮项带 `>` 标记并着色
+    /// 建议行：高亮项带 `>` 标记并着色；灰色前缀（如 ID）单独上色
     fn suggestion_line(&self, suggestion: &str, index: usize, max: usize) -> String {
         let highlighted = self.highlight == Some(index);
         let marker = if highlighted { ">" } else { " " };
-        let text = format!("{marker} {suggestion}");
+        let choice = self
+            .choices
+            .iter()
+            .find(|choice| choice.label == suggestion);
+        let prefix = choice.and_then(|choice| choice.prefix.as_deref());
+        let body = choice
+            .and_then(|choice| choice.display.as_deref())
+            .unwrap_or(suggestion);
+
+        // 预算：标记 + 空格 + 前缀 + 两个空格 + 正文
+        let mut budget = max.saturating_sub(2);
+        let prefix = prefix.filter(|prefix| !prefix.is_empty()).map(|prefix| {
+            let shown = truncate_str(prefix, budget, "…").to_string();
+            budget = budget.saturating_sub(measure_text_width(&shown) + 2);
+            shown
+        });
+        let body = truncate_str(body, budget, "…").to_string();
+
         if highlighted {
-            styled(&text, &Style::new().for_stderr().cyan().bold(), max)
-        } else {
-            styled(&text, &Style::new().for_stderr(), max)
+            let text = match &prefix {
+                Some(prefix) => format!("{marker} {prefix}  {body}"),
+                None => format!("{marker} {body}"),
+            };
+            return styled(&text, &Style::new().for_stderr().cyan().bold(), max);
+        }
+        match prefix {
+            Some(prefix) => format!(
+                "{marker} {}  {body}",
+                Style::new().for_stderr().dim().apply_to(&prefix)
+            ),
+            None => format!("{marker} {body}"),
         }
     }
 }

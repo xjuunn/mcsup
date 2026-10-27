@@ -1773,6 +1773,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "domain",
+ "flate2",
  "port",
  "reqwest",
  "rustls",
@@ -1782,6 +1783,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "zip",
 ]
 
 [[package]]

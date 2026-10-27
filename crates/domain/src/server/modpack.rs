@@ -286,15 +286,18 @@ impl fmt::Display for ModpackIndex {
     }
 }
 
-/// 校验清单里的相对路径可以安全落地
+/// 校验归档内相对路径可以安全落地
 ///
 /// 拒绝：绝对路径、盘符（含 `:`）、`..` 段、空路径、只剩分隔符的路径。允许子目录
 /// （`config/x.toml`）——整合包本来就要铺一层配置。
 ///
+/// 清单里的路径与 `overrides/` 里的成员名来自外部归档，解压适配层落盘前也要
+/// 用它：安全检查必须是同一套规则。
+///
 /// # Errors
 ///
-/// 不满足上述约束时返回 [`ModpackError::UnsafePath`]
-fn validate_relative_path(raw: &str) -> Result<(), ModpackError> {
+/// 路径不安全时返回 [`ModpackError::UnsafePath`]
+pub fn validate_relative_path(raw: &str) -> Result<(), ModpackError> {
     if raw.is_empty() {
         return Err(ModpackError::UnsafePath(raw.to_owned()));
     }

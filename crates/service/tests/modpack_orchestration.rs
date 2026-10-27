@@ -8,7 +8,7 @@
 //! - 已存在的同大小文件不重复下载
 //! - 清单缺 MC 版本、归档非法、下载失败都以对应错误收场
 //!
-//! 真正的 `unzip` 解包由 provider 的 `MrpackExtractor` 承担，另在
+//! 真正的 zip 解包由 provider 的 `MrpackExtractor` 承担，另在
 //! `crates/provider/tests/modrinth_mrpack.rs` 用真实 `.mrpack` 覆盖。
 
 #![allow(clippy::expect_used)]

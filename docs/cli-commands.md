@@ -241,21 +241,18 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
   ↓ 回车（关键词发给上游，offset=0）
 结果 ──Esc──→ 搜索（改关键词即重搜）
   ↓ 选中          （「下一页 / 上一页」翻页）
-详情 ──Esc──→ 结果
-  ↓ 继续
-版本 ──Esc──→ 详情
-  ↓ 选中
-确认 ──Esc──→ 版本
-  ↓ 开始创建
+详情 + 版本 ──Esc──→ 结果
+  ↓ 选中版本（即开始创建）
 读 `.mrpack` 清单 → 装加载器核心 → 铺 `overrides/` → 下载清单文件
 ```
 
 - 搜索是**真实的服务端搜索**：关键词直接作为 `ModpackQuery::keyword` 发给
   Modrinth，不是先拉一页再本地过滤，因此能搜到第一页之外的结果。
+- 结果按**下载量**排序（上游 `index=downloads`），每项先显示 ID（灰色）再显示标题。
 - 每页 20 条；结果页底部按需出现「下一页 / 上一页」。Esc 回搜索即重搜。
-- 搜索框常驻提示：**只显示支持服务端的整合包**（`server_side` facet 过滤纯
-  客户端整合包）。
-- 每一步 Esc 回到上一步，Ctrl+C 取消整个命令。
+- 搜索结果只包含支持服务端的整合包（`server_side` facet 过滤纯客户端整合包）。
+- 详情与版本列表在同一屏：详情按行输出，紧接着就是版本选择；选中版本后直接
+  开始创建，不再有单独的确认步骤。Esc 回到上一步，Ctrl+C 取消整个命令。
 
 | 用法 | 说明 |
 | --- | --- |
@@ -266,7 +263,14 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 非交互模式必须用 `--modpack` 指定项目；只用 `--variant modrinth` 且没有
 `--modpack` 会以用法错误退出，而不是静默挑一个包。
 
+注册表记录的是清单加载器对应的真实变体（`fabric` / `forge` / `neoforge` /
+`quilt` / `vanilla`），因此建站后 `server install` 能按变体找到核心来源；
+`modrinth-modpack` 只作为「走整合包流程」的入口标记。
+
 清单里 `server: unsupported` 的文件不会装到服务端；`optional` 视为需要安装。
+`.mrpack` 由内置 zip 解析直接解开，不调用系统 `unzip`，归档内的 UTF-8
+文件名按原样落盘。
+
 建好的整合包服务与 `server create` 建的服务是同一种对象，后续运维都走
 `mcsup server ...`。
 
