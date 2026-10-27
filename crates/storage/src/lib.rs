@@ -911,8 +911,11 @@ impl ServerRepository for JsonStore {
         let _guard = self.lock()?;
         let mut entry = self.find_server_entry(name)?;
         entry.java_major = settings.java_major.map(domain::java::JavaMajor::as_i64);
-        entry.ram_mib = settings.ram_mib.and_then(|mib| i32::try_from(mib).ok());
+        // 全量回写，逐字段抄一遍会漏：`backup_scope` 曾经就没写，重启后
+        // `server set backup-scope` 的结果凭空消失，备份又回到全目录
+        entry.ram_mib = settings.ram_mib.map(i64::from);
         entry.autostart = settings.autostart;
+        entry.backup_scope = settings.backup_scope.entries().to_vec();
         entry.updated_at = updated_at;
         self.write_record(Collection::Servers, &entry.id, &entry)?;
         ServerMeta::try_from(entry)
@@ -1234,14 +1237,16 @@ mod tests {
     }
 
     #[test]
-    fn update_settings_persists_and_bumps_timestamp() {
+    fn update_settings_persists_every_field() {
         let store = store_with_ws();
         add_server(&store, &sample_meta("alpha"));
+        // 非缺省值才能暴露「漏写一列」：`backup-scope` 曾经在回写时整列丢失
         let settings = domain::server::settings::ServerSettings {
             java_major: Some(JavaMajor::parse(21).expect("21")),
-            ram_mib: Some(2048),
+            ram_mib: Some(3072),
             autostart: true,
-            backup_scope: domain::backup::BackupScope::all(),
+            backup_scope: domain::backup::BackupScope::from_entries(["world", "mods"])
+                .expect("scope"),
         };
         let updated = ServerRepository::update_settings(
             &store,
@@ -1251,9 +1256,33 @@ mod tests {
         )
         .expect("update");
         assert_eq!(updated.settings, settings);
+        assert_eq!(updated.updated_at, 1_700_000_200);
         let got = ServerRepository::get(&store, &ServerName::parse("alpha").expect("valid"))
             .expect("get");
         assert_eq!(got.settings, settings);
+    }
+
+    /// 旧的 `ram_mib` 列是 `i32`：超过 `i32::MAX` 时曾经被 `and_then(...).ok()`
+    /// 静默写成 `None`（等价于「用默认值」）。现在列是 `i64`，`u32` 全域都能存回。
+    #[test]
+    fn update_settings_keeps_full_u32_ram_range() {
+        let store = store_with_ws();
+        add_server(&store, &sample_meta("alpha"));
+        let ram = u32::MAX;
+        let settings = domain::server::settings::ServerSettings {
+            ram_mib: Some(ram),
+            ..domain::server::settings::ServerSettings::default()
+        };
+        ServerRepository::update_settings(
+            &store,
+            &ServerName::parse("alpha").expect("valid"),
+            &settings,
+            1,
+        )
+        .expect("update");
+        let got = ServerRepository::get(&store, &ServerName::parse("alpha").expect("valid"))
+            .expect("get");
+        assert_eq!(got.settings.ram_mib, Some(ram));
     }
 
     #[test]

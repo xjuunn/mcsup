@@ -73,8 +73,9 @@ pub(crate) struct ServerEntry {
     pub(crate) java_major: Option<i64>,
     #[serde(default)]
     pub(crate) required_java_major: Option<i64>,
+    /// 堆上限（MiB）：领域是 `u32`，列用 `i64` 存全范围，读回再落回 `u32`
     #[serde(default)]
-    pub(crate) ram_mib: Option<i32>,
+    pub(crate) ram_mib: Option<i64>,
     #[serde(default)]
     pub(crate) autostart: bool,
     /// 备份范围：逗号分隔的顶层项；空 = 整个服务器目录
@@ -169,10 +170,7 @@ impl From<&ServerMeta> for ServerEntry {
             updated_at: meta.updated_at,
             java_major: meta.settings.java_major.map(JavaMajor::as_i64),
             required_java_major: meta.java_major.map(JavaMajor::as_i64),
-            ram_mib: meta
-                .settings
-                .ram_mib
-                .and_then(|mib| i32::try_from(mib).ok()),
+            ram_mib: meta.settings.ram_mib.map(i64::from),
             autostart: meta.settings.autostart,
             backup_scope: meta.settings.backup_scope.entries().to_vec(),
         }
