@@ -44,7 +44,7 @@ pub(crate) fn err_empty_input(lang: Lang) -> String {
     )
 }
 
-/// 空结果 / 过滤无匹配时的提示（可返回的选择器共用）
+/// 空结果 / 过滤无匹配时的提示（可过滤选择的两个组件共用）
 #[must_use]
 pub(crate) fn err_no_matches(lang: Lang, esc_help: &str) -> String {
     l(
@@ -724,6 +724,19 @@ mod tests {
         let config = keyword_render_config();
         assert_eq!(config.prompt_prefix.content, ">");
         assert_eq!(config.answered_prompt_prefix.content, ">");
+    }
+
+    /// 空结果提示按语言渲染，Esc 说明由调用方按语义给出
+    #[test]
+    fn no_matches_message_localizes() {
+        assert_eq!(
+            err_no_matches(Lang::Zh, "返回上一步"),
+            "没有匹配结果；按 Esc 返回上一步"
+        );
+        assert_eq!(
+            err_no_matches(Lang::En, "goes back"),
+            "no matches; Esc goes back"
+        );
     }
 
     /// 补全语义：显式高亮 > 输入全名 > 单一匹配；非法输入不替换

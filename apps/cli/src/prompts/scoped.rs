@@ -109,6 +109,18 @@ pub(crate) enum Backable {
     Back,
 }
 
+/// 免提问就能定下的结果：只有单候选可以自动采纳
+///
+/// 空候选**不是**错误：调用方可能刚搜到 0 条，仍应进入选择器让用户看到
+/// 空列表并按 Esc 返回，因此这里返回 `None`，由 [`select_filter_backable`]
+/// 继续提问。单候选时没有「上一步」可选，返回与选中等价于继续。
+fn shortcut(choices: &[ScopedChoice]) -> Option<Backable> {
+    match choices {
+        [only] => Some(Backable::Picked(only.label.clone())),
+        _ => None,
+    }
+}
+
 /// 可过滤 + 可返回的选择：Esc 返回 [`Backable::Back`]，而不是取消整个命令
 ///
 /// 与 [`select_filter_scoped`] 的唯一区别是 Esc 的语义：向导用它实现「返回
@@ -119,17 +131,15 @@ pub(crate) enum Backable {
 ///
 /// # Errors
 ///
-/// 无可选项、非交互终端、按键读取 / 终端写入失败，或用户 Ctrl+C 中断时返回错误
+/// 非交互终端、按键读取 / 终端写入失败，或用户 Ctrl+C 中断时返回错误
 pub(crate) fn select_filter_backable(
     lang: Lang,
     label: &str,
     choices: &[ScopedChoice],
     hint: ScopeHint,
 ) -> Result<Backable> {
-    // 空候选不是错误：调用方可能刚搜到 0 条，仍应进入选择器让用户
-    // 看到空列表并按 Esc 返回，而不是直接退出命令。
-    if let [only] = choices {
-        return Ok(Backable::Picked(only.label.clone()));
+    if let Some(picked) = shortcut(choices) {
+        return Ok(picked);
     }
     if !std::io::stdin().is_terminal() {
         return Err(InquireError::NotTTY.into());
@@ -467,7 +477,9 @@ impl<'a> Picker<'a> {
         if let Some(submitted) = matched {
             Some(Done::Submitted(submitted))
         } else {
-            let message = if self.choices.is_empty() {
+            // 当前范围一个候选都没有（空结果或只剩隐藏候选）时提示没有匹配，
+            // 而不是笼统地要求「请输入关键字」。
+            let message = if self.pool.is_empty() {
                 err_no_matches(self.lang, self.esc_help)
             } else if input.is_empty() {
                 err_empty_input(self.lang)
@@ -495,7 +507,17 @@ impl<'a> Picker<'a> {
             lines.push(self.suggestion_line(suggestion, index, max));
         }
         let help = if filtered.is_empty() {
-            err_no_matches(self.lang, self.esc_help)
+            let base = err_no_matches(self.lang, self.esc_help);
+            if self.choices.iter().any(|choice| choice.extra) {
+                // 空范围（如只剩快照版本时切到默认范围）仍要提示怎么切回，
+                // 否则用户只看到「没有匹配」而不知道 Ctrl+A 是出口。
+                match self.lang {
+                    Lang::Zh => format!("{base}（Ctrl+A {}）", self.scope_hint()),
+                    Lang::En => format!("{base} (Ctrl+A {})", self.scope_hint()),
+                }
+            } else {
+                base
+            }
         } else {
             match (self.lang, self.choices.iter().any(|choice| choice.extra)) {
                 (Lang::Zh, true) => format!(
@@ -946,7 +968,11 @@ mod tests {
         type_chars(&mut picker, "音乐");
         assert!(picker.filtered().is_empty());
         assert_eq!(picker.handle(Key::Enter).expect("回车不应失败"), None);
-        assert!(picker.error.is_some(), "回车不提交，留在选择器");
+        assert_eq!(
+            picker.error.as_deref(),
+            Some(err_not_a_choice(Lang::Zh).as_str()),
+            "候选还在，只是关键字没匹配：按输入校验"
+        );
         assert!(
             picker
                 .screen()
@@ -979,6 +1005,95 @@ mod tests {
             picker.handle(Key::Esc).expect("Esc 不应失败"),
             Some(Done::Cancelled)
         );
+    }
+
+    /// 空候选进选择器后回车不提交，提示没有匹配而不是要求输入关键字
+    #[test]
+    fn empty_pool_enter_reports_no_matches() {
+        let none: Vec<ScopedChoice> = Vec::new();
+        let mut picker = new_picker("选择整合包", &none);
+        picker.esc_help = "返回上一步";
+        assert_eq!(picker.handle(Key::Enter).expect("回车不应失败"), None);
+        assert_eq!(
+            picker.error.as_deref(),
+            Some(err_no_matches(Lang::Zh, "返回上一步").as_str())
+        );
+        let screen = picker.screen();
+        assert!(
+            screen
+                .lines
+                .iter()
+                .any(|line| line.contains("按 Esc 返回上一步")),
+            "底栏保留返回提示: {:?}",
+            screen.lines
+        );
+        assert!(
+            !screen.lines.iter().any(|line| line.contains("Ctrl+A")),
+            "没有范围切换时不出现 Ctrl+A 提示: {:?}",
+            screen.lines
+        );
+    }
+
+    /// 英文界面下空候选同样进选择器，提示文案跟随语言
+    #[test]
+    fn empty_pool_help_is_localized() {
+        let none: Vec<ScopedChoice> = Vec::new();
+        let mut picker = Picker::new(Lang::En, "select a modpack", &none, hint());
+        picker.esc_help = "goes back";
+        let screen = picker.screen();
+        assert!(
+            screen
+                .lines
+                .iter()
+                .any(|line| line.contains("no matches; Esc goes back")),
+            "英文提示: {:?}",
+            screen.lines
+        );
+        assert_eq!(
+            picker.handle(Key::Esc).expect("Esc 不应失败"),
+            Some(Done::Cancelled)
+        );
+    }
+
+    /// 只有扩展候选时切到空的默认范围：仍提示 Ctrl+A 是出口
+    #[test]
+    fn empty_scope_keeps_toggle_hint() {
+        let only_extra = choices(&[("24w45a（快照）", true)]);
+        let mut picker = new_picker("选择版本", &only_extra);
+        assert_eq!(picker.scope, Scope::All);
+        picker
+            .handle(Key::Chord(Chord::Ctrl('a')))
+            .expect("切换不应失败");
+        assert!(picker.filtered().is_empty(), "默认范围没有候选");
+        let screen = picker.screen();
+        assert!(
+            screen
+                .lines
+                .iter()
+                .any(|line| line.contains("没有匹配结果") && line.contains("Ctrl+A")),
+            "空范围仍要提示怎么切回: {:?}",
+            screen.lines
+        );
+        assert_eq!(picker.handle(Key::Enter).expect("回车不应失败"), None);
+        assert_eq!(
+            picker.error.as_deref(),
+            Some(err_no_matches(Lang::Zh, "取消").as_str()),
+            "空范围回车同样提示没有匹配"
+        );
+    }
+
+    /// 单候选免提问；空候选交给选择器（0 条也要能进去按 Esc 返回）
+    #[test]
+    fn shortcut_only_auto_picks_single_choice() {
+        let none: Vec<ScopedChoice> = Vec::new();
+        assert_eq!(shortcut(&none), None, "空候选不能直接报错或返回");
+        let single = choices(&[("1.21.1", false)]);
+        assert_eq!(
+            shortcut(&single),
+            Some(Backable::Picked("1.21.1".to_owned()))
+        );
+        let two = choices(&[("1.21.1", false), ("1.21.2", false)]);
+        assert_eq!(shortcut(&two), None, "多候选要提问");
     }
 
     /// Esc / Ctrl+C 结束交互，不改状态
