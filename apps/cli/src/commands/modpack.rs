@@ -4,7 +4,7 @@
 //! 流程：
 //!
 //! 1. 打开即展示**能在服务端运行**的整合包默认列表（上游按下载量排序），
-//!    需要时按关键词搜索
+//!    输入框与列表同屏；输入关键字回车即按关键词远端搜索
 //! 2. 展示所选整合包的详情（标题、作者、加载器、MC 版本、下载量、简介、来源页）
 //! 3. 选版本（默认只列正式版）
 //! 4. 返回清单里的 MC 版本与版本 ID，交给 `server create` 落库
@@ -16,9 +16,10 @@
 //! `--output json` 下全部隐藏。
 
 use crate::bootstrap;
+use crate::diagnostic::AppDiagnostic;
 use crate::output::Printer;
 use crate::progress::{BarSink, TaskSpinner};
-use crate::prompts::{Backable, ScopeHint, ScopedChoice, select_filter_backable};
+use crate::prompts::{Backable, EnterMode, ScopeHint, ScopedChoice, select_filter_backable};
 use anyhow::{Context, Result};
 use console::measure_text_width;
 use mcsup::domain::server::variant::ServerVariant;
@@ -60,9 +61,7 @@ const PREV_PAGE: &str = "← 上一页";
 /// 可见的、可测试的，不会因为嵌套层次变深而漏掉某个返回分支。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Wizard {
-    /// 输入关键词（从结果页 Esc 进入；此处 Esc 取消整个命令）
-    Search,
-    /// 浏览一页搜索结果
+    /// 浏览一页结果；`keyword` 为空即上游默认推荐列表
     Results { keyword: Option<String>, page: u32 },
     /// 已选定整合包：详情与版本列表在同一屏（Esc 回到结果页）
     Modpack {
@@ -74,8 +73,8 @@ enum Wizard {
 
 /// 向导起点：直接展示来源的默认列表
 ///
-/// 上游在**没有关键词**时返回自己的默认列表（Modrinth 按下载量排序），因此
-/// 不必先让用户面对一个空输入框再回车。关键词搜索由结果页的 Esc 进入。
+/// 上游在**没有关键词**时返回自己的默认列表（Modrinth 按下载量排序），
+/// 输入框与列表同屏：不输关键字就是推荐列表，输入后回车转成搜索结果。
 fn initial_state() -> Wizard {
     Wizard::Results {
         keyword: None,
@@ -83,7 +82,7 @@ fn initial_state() -> Wizard {
     }
 }
 
-/// 选择整合包：搜索 → 结果 → 详情并选版本
+/// 选择整合包：浏览 / 搜索 → 结果 → 详情并选版本
 ///
 /// 交互路径由 [`Wizard`] 驱动，Esc 逐级返回；`--modpack` 给出项目时跳过
 /// 搜索与详情，直接选版本。非交互模式必须用 `--modpack` 指定项目，否则
@@ -159,13 +158,19 @@ async fn run_wizard(
     let mut state = initial_state();
     loop {
         state = match state {
-            Wizard::Search => {
-                let keyword = prompt_keyword(printer)?;
-                Wizard::Results { keyword, page: 0 }
-            }
             Wizard::Results { keyword, page } => {
                 match browse_results(service, keyword.as_deref(), page, printer).await? {
-                    Browse::Back => Wizard::Search,
+                    // 搜索结果页按 Esc：回到推荐列表，而不是退出整个命令
+                    Browse::Back if keyword.is_some() => Wizard::Results {
+                        keyword: None,
+                        page: 0,
+                    },
+                    // 推荐列表本身再按 Esc：没有上一层可选，取消本次创建
+                    Browse::Back => return Err(AppDiagnostic::cancelled().into()),
+                    Browse::Search(next) => Wizard::Results {
+                        keyword: Some(next),
+                        page: 0,
+                    },
                     Browse::Page(next) => Wizard::Results {
                         keyword,
                         page: next,
@@ -207,8 +212,10 @@ async fn run_wizard(
 
 /// 浏览一页结果后用户的去向
 enum Browse {
-    /// Esc：回到搜索
+    /// Esc：搜索结果页回到推荐列表；推荐列表本身由调用方决定是否取消
     Back,
+    /// 输入了关键词：按它重新搜索第一页
+    Search(String),
     /// 翻到第 `page` 页
     Page(u32),
     /// 选中某个整合包
@@ -249,12 +256,29 @@ async fn browse_results(
         .collect();
     let choices = result_choices(hits, search.offset, search.total, page);
 
-    // 0 条也要进入选择器：空列表 + Esc 返回搜索，而不是让整个命令退出。
+    // 0 条也要进入选择器：空列表 + Esc 返回上一级，而不是让整个命令退出。
     let label = results_label(keyword, search.total, page);
-    // Esc 从结果页回到关键词输入（首屏默认列表走这一条路才能搜索）
-    let esc_help = crate::i18n::pick(printer.lang(), "输入关键词搜索", "search by keyword");
-    match select_filter_backable(printer.lang(), &label, &choices, no_scope(), &esc_help)? {
+    // 搜索结果页的 Esc 回到推荐列表；推荐列表本身按 Esc 取消本次创建。
+    let esc_help = if keyword.is_some() {
+        crate::i18n::pick(
+            printer.lang(),
+            "返回推荐列表",
+            "goes back to recommendations",
+        )
+    } else {
+        crate::i18n::pick(printer.lang(), "取消", "cancels")
+    };
+    // 列表只是推荐 / 上一页结果：回车不拿它做局部校验，而是按输入远端搜索
+    match select_filter_backable(
+        printer.lang(),
+        &label,
+        &choices,
+        no_scope(),
+        &esc_help,
+        EnterMode::Search,
+    )? {
         Backable::Back => Ok(Browse::Back),
+        Backable::Search(keyword) => Ok(Browse::Search(keyword)),
         Backable::Picked(picked) if picked == NEXT_PAGE => Ok(Browse::Page(page.saturating_add(1))),
         Backable::Picked(picked) if picked == PREV_PAGE => Ok(Browse::Page(page.saturating_sub(1))),
         Backable::Picked(picked) => extract_id(&picked)
@@ -286,19 +310,22 @@ fn result_choices(
 
 /// 结果页标题：0 条时说明没有匹配，其余显示页码与总数
 ///
-/// 标题只影响展示，0 条时不改变去向：仍进入可返回选择器。
+/// 标题同时是输入行的前缀：有关键词时带上它，让用户一眼看到当前列表
+/// 是按什么搜出来的；写「搜索」而不是「选择」，提示这一行是搜索框。
 fn results_label(keyword: Option<&str>, total: u64, page: u32) -> String {
     if total == 0 {
         return match keyword {
-            Some(keyword) => format!("选择整合包 · 没有匹配「{keyword}」的结果"),
-            None => "选择整合包 · 没有可在服务端运行的整合包".to_owned(),
+            Some(keyword) => format!("搜索整合包「{keyword}」 · 没有匹配结果"),
+            None => "搜索整合包 · 没有可在服务端运行的整合包".to_owned(),
         };
     }
-    format!(
-        "选择整合包 · 第 {} 页 · 共 {} 个支持服务端",
-        page + 1,
-        total
-    )
+    match keyword {
+        Some(keyword) => format!(
+            "搜索整合包「{keyword}」 · 第 {} 页 · 共 {total} 个结果",
+            page + 1
+        ),
+        None => format!("搜索整合包 · 第 {} 页 · 共 {total} 个支持服务端", page + 1),
+    }
 }
 
 /// 无范围切换时的占位提示
@@ -347,21 +374,6 @@ async fn finish_pick(
         minecraft,
         variant,
     })
-}
-
-/// 让用户输关键词；留空表示回到默认列表
-///
-/// 只在结果页按 Esc 时进入：首屏已经是默认列表，不必先面对空输入框。
-fn prompt_keyword(printer: Printer) -> Result<Option<String>> {
-    if !printer.is_interactive() {
-        return Ok(None);
-    }
-    let keyword = crate::prompts::input_keyword(printer.lang(), "搜索整合包")?;
-    if keyword.trim().is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(keyword.to_lowercase()))
-    }
 }
 
 /// 从 `标题 · ID` 里取回 ID
@@ -534,8 +546,17 @@ fn pick_version_backable(
         .map(|version| ScopedChoice::new(version_label(version), false))
         .collect();
     let esc_help = crate::i18n::pick(lang, "返回上一步", "goes back");
-    match select_filter_backable(lang, "选择整合包版本", &choices, no_scope(), &esc_help)? {
+    match select_filter_backable(
+        lang,
+        "选择整合包版本",
+        &choices,
+        no_scope(),
+        &esc_help,
+        EnterMode::Choice,
+    )? {
         Backable::Back => Ok(None),
+        // 版本候选就是全部可选值，不存在「按关键词去远端搜」这一步
+        Backable::Search(_) => Err(anyhow::anyhow!("版本选择不接受搜索关键词")),
         Backable::Picked(picked) => shown
             .into_iter()
             .find(|version| version_label(version) == picked)
@@ -757,15 +778,19 @@ mod tests {
     fn results_label_explains_empty_search() {
         assert_eq!(
             results_label(Some("音乐"), 0, 0),
-            "选择整合包 · 没有匹配「音乐」的结果"
+            "搜索整合包「音乐」 · 没有匹配结果"
         );
         assert_eq!(
             results_label(None, 0, 0),
-            "选择整合包 · 没有可在服务端运行的整合包"
+            "搜索整合包 · 没有可在服务端运行的整合包"
         );
         assert_eq!(
             results_label(Some("fab"), 42, 2),
-            "选择整合包 · 第 3 页 · 共 42 个支持服务端"
+            "搜索整合包「fab」 · 第 3 页 · 共 42 个结果"
+        );
+        assert_eq!(
+            results_label(None, 42, 2),
+            "搜索整合包 · 第 3 页 · 共 42 个支持服务端"
         );
     }
 

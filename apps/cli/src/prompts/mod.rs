@@ -9,7 +9,6 @@ use crate::locale::Lang;
 use crate::output::Printer;
 use anyhow::{Context, Result};
 use inquire::autocompletion::Replacement;
-use inquire::ui::{RenderConfig, Styled};
 use inquire::validator::{ErrorMessage, Validation};
 use inquire::{Autocomplete, Confirm, CustomUserError, Select, Text};
 use mcsup::domain::workspace::WorkspaceName;
@@ -19,7 +18,7 @@ use std::path::{Path, PathBuf};
 mod scoped;
 
 pub(crate) use scoped::{
-    Backable, ScopeHint, ScopedChoice, select_filter_backable, select_filter_scoped,
+    Backable, EnterMode, ScopeHint, ScopedChoice, select_filter_backable, select_filter_scoped,
 };
 
 /// 交互文案的二元取用：`zh` / `en` 都是已渲染好的字符串
@@ -350,25 +349,6 @@ pub(crate) fn input_text(lang: Lang, label: &str, default: &str, help: &str) -> 
     } else {
         Ok(trimmed.to_owned())
     }
-}
-
-/// 关键词输入：活动态与已答步骤统一用 `>`，不显示 `?`
-///
-/// 搜索是可选输入，没有默认值和帮助行；`Text` 仍会为它们预留 `()` / `[]`，
-/// 因此这里单独构造，避免留下空占位。
-pub(crate) fn input_keyword(lang: Lang, label: &str) -> Result<String> {
-    let input: String = Text::new(label)
-        .with_render_config(keyword_render_config())
-        .prompt()
-        .context(l(lang, "读取输入", "reading input"))?;
-    Ok(input.trim().to_owned())
-}
-
-/// 关键词输入的渲染配置：活动态与已答态都用 `>`，不显示 `?`
-fn keyword_render_config() -> RenderConfig<'static> {
-    RenderConfig::default()
-        .with_prompt_prefix(Styled::new(">"))
-        .with_answered_prompt_prefix(Styled::new(">"))
 }
 
 /// 构造文本输入框：空默认值 / 空帮助行不设置
@@ -716,14 +696,6 @@ mod tests {
         let prompt = text_input("名称", "test1", "help");
         assert_eq!(prompt.default, Some("test1"));
         assert_eq!(prompt.help_message, Some("help"));
-    }
-
-    /// 关键词输入不再使用 `?` 前缀
-    #[test]
-    fn keyword_prompt_uses_answered_prefix() {
-        let config = keyword_render_config();
-        assert_eq!(config.prompt_prefix.content, ">");
-        assert_eq!(config.answered_prompt_prefix.content, ">");
     }
 
     /// 空结果提示按语言渲染，Esc 说明由调用方按语义给出

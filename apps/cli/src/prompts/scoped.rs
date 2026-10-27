@@ -80,11 +80,13 @@ pub(crate) struct ScopeHint {
     pub(crate) show_default: &'static str,
 }
 
-/// 收尾原因：只有这三种会结束交互
+/// 收尾原因：只有这四种会结束交互
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Done {
     /// 提交（值为候选全名）
     Submitted(String),
+    /// 把输入当关键词交给调用方搜索
+    Search(String),
     /// Esc 取消
     Cancelled,
     /// Ctrl+C 中断
@@ -105,8 +107,22 @@ enum Scope {
 pub(crate) enum Backable {
     /// 选中某一项（候选全名）
     Picked(String),
+    /// 用户把输入当关键词提交，要求调用方去远端搜索
+    Search(String),
     /// 用户按 Esc 要求返回上一步
     Back,
+}
+
+/// 回车遇到「输入不是候选全名」时的行为
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnterMode {
+    /// 只接受候选全名：不匹配就留在原地报错（版本选择等）
+    Choice,
+    /// 把输入当关键词交给调用方搜索，返回 [`Backable::Search`]
+    ///
+    /// 候选只是一页推荐列表时用这个：输入框与列表同屏，回车才真正去
+    /// 远端搜索，而不是拿当前这页候选做局部校验。
+    Search,
 }
 
 /// 免提问就能定下的结果：只有单候选可以自动采纳
@@ -123,14 +139,19 @@ fn shortcut(choices: &[ScopedChoice]) -> Option<Backable> {
 
 /// 可过滤 + 可返回的选择：Esc 返回 [`Backable::Back`]，而不是取消整个命令
 ///
-/// 与 [`select_filter_scoped`] 的唯一区别是 Esc 的语义：向导用它实现「返回
+/// 与 [`select_filter_scoped`] 的主要区别是 Esc 的语义：向导用它实现「返回
 /// 上一步」，Ctrl+C 仍是取消整个命令（由调用方按 `is_cancelled` 处理）。
+/// 另外 `enter` 可以开启「输入当关键词」模式，供列表只是推荐 / 上一轮结果
+/// 的场景使用。
 /// 单候选免提问直接返回该项——此时没有「上一步」可选，返回与选中等价于
 /// 继续，由调用方的状态机决定是否需要保留返回能力（候选只有一项时通常
 /// 不值得为它多按一次回车）。
 ///
 /// `esc_help` 是 Esc 去向的说明（由调用方按业务给，如「返回上一步」或
 /// 「输入关键词」）：结果页与版本页的 Esc 去向不同，文案不能由组件硬编码。
+///
+/// `enter` 决定回车遇到非候选全名时的去向：版本页只认候选，
+/// 整合包列表页把输入当关键词返回给调用方搜索。
 ///
 /// # Errors
 ///
@@ -141,6 +162,7 @@ pub(crate) fn select_filter_backable(
     choices: &[ScopedChoice],
     hint: ScopeHint,
     esc_help: &str,
+    enter: EnterMode,
 ) -> Result<Backable> {
     if let Some(picked) = shortcut(choices) {
         return Ok(picked);
@@ -148,7 +170,9 @@ pub(crate) fn select_filter_backable(
     if !std::io::stdin().is_terminal() {
         return Err(InquireError::NotTTY.into());
     }
-    let mut picker = Picker::new(lang, label, choices, hint).with_esc_help(esc_help);
+    let mut picker = Picker::new(lang, label, choices, hint)
+        .with_esc_help(esc_help)
+        .with_enter_mode(enter);
     let mut frame = Frame::default();
     let done = {
         let _raw = input::RawMode::enter()?;
@@ -166,6 +190,8 @@ pub(crate) fn select_filter_backable(
             print_answer(label, &value);
             Ok(Backable::Picked(value))
         }
+        // 关键词不是最终答案：静默返回调用方，由它搜索后再开一轮选择
+        Done::Search(keyword) => Ok(Backable::Search(keyword)),
         Done::Cancelled => Ok(Backable::Back),
         Done::Interrupted => Err(InquireError::OperationInterrupted).context("读取选择"),
     }
@@ -207,6 +233,8 @@ struct Picker<'a> {
     lang: Lang,
     /// Esc 的语义说明，只影响底栏提示文案
     esc_help: String,
+    /// 回车遇到非候选全名时的行为
+    enter: EnterMode,
 }
 
 impl<'a> Picker<'a> {
@@ -235,12 +263,19 @@ impl<'a> Picker<'a> {
                 Lang::En => "cancels",
             }
             .to_owned(),
+            enter: EnterMode::Choice,
         }
     }
 
     /// 覆盖 Esc 的语义说明（默认「取消」）
     fn with_esc_help(mut self, esc_help: &str) -> Self {
         esc_help.clone_into(&mut self.esc_help);
+        self
+    }
+
+    /// 覆盖回车遇到非候选全名时的行为（默认只认候选）
+    fn with_enter_mode(mut self, enter: EnterMode) -> Self {
+        self.enter = enter;
         self
     }
 
@@ -466,6 +501,10 @@ impl<'a> Picker<'a> {
     }
 
     /// 回车：有高亮直接采纳；否则要求输入是候选全名（口径同 `select_filter`）
+    ///
+    /// `EnterMode::Search` 下，输入不是候选全名时把输入当关键词交给调用方
+    /// 远端搜索——此时当前列表只是推荐 / 上一轮结果，局部菜单里没有这项
+    /// 不代表不存在。
     fn submit(&mut self) -> Option<Done> {
         if let Some(index) = self.highlight {
             let filtered = self.filtered();
@@ -482,20 +521,22 @@ impl<'a> Picker<'a> {
             canonical_choice(input, &self.pool).cloned()
         };
         if let Some(submitted) = matched {
-            Some(Done::Submitted(submitted))
-        } else {
-            // 当前范围一个候选都没有（空结果或只剩隐藏候选）时提示没有匹配，
-            // 而不是笼统地要求「请输入关键字」。
-            let message = if self.pool.is_empty() {
-                err_no_matches(self.lang, &self.esc_help)
-            } else if input.is_empty() {
-                err_empty_input(self.lang)
-            } else {
-                err_not_a_choice(self.lang)
-            };
-            self.error = Some(message);
-            None
+            return Some(Done::Submitted(submitted));
         }
+        if self.enter == EnterMode::Search && !input.is_empty() {
+            return Some(Done::Search(input.to_owned()));
+        }
+        // 当前范围一个候选都没有（空结果或只剩隐藏候选）时提示没有匹配，
+        // 而不是笼统地要求「请输入关键字」。
+        let message = if self.pool.is_empty() {
+            err_no_matches(self.lang, &self.esc_help)
+        } else if input.is_empty() {
+            err_empty_input(self.lang)
+        } else {
+            err_not_a_choice(self.lang)
+        };
+        self.error = Some(message);
+        None
     }
 
     /// 一帧画面：行块与终端光标落点
@@ -513,44 +554,48 @@ impl<'a> Picker<'a> {
         for (index, suggestion) in filtered.iter().enumerate().take(end).skip(start) {
             lines.push(self.suggestion_line(suggestion, index, max));
         }
-        let help = if filtered.is_empty() {
-            let base = err_no_matches(self.lang, &self.esc_help);
-            if self.choices.iter().any(|choice| choice.extra) {
-                // 空范围（如只剩快照版本时切到默认范围）仍要提示怎么切回，
-                // 否则用户只看到「没有匹配」而不知道 Ctrl+A 是出口。
-                match self.lang {
-                    Lang::Zh => format!("{base}（Ctrl+A {}）", self.scope_hint()),
-                    Lang::En => format!("{base} (Ctrl+A {})", self.scope_hint()),
-                }
-            } else {
-                base
-            }
-        } else {
-            match (self.lang, self.choices.iter().any(|choice| choice.extra)) {
-                (Lang::Zh, true) => format!(
-                    "输入关键字过滤；↑↓ 选择，Tab 补全，回车确认，Esc {}（Ctrl+A {}）",
-                    self.esc_help,
-                    self.scope_hint()
-                ),
-                (Lang::Zh, false) => format!(
-                    "输入关键字过滤；↑↓ 选择，Tab 补全，回车确认，Esc {}",
-                    self.esc_help
-                ),
-                (Lang::En, true) => format!(
-                    "type to filter; ↑↓ move, Tab completes, Enter confirms, Esc {} (Ctrl+A {})",
-                    self.esc_help,
-                    self.scope_hint()
-                ),
-                (Lang::En, false) => format!(
-                    "type to filter; ↑↓ move, Tab completes, Enter confirms, Esc {}",
-                    self.esc_help
-                ),
-            }
-        };
+        let help = self.help_text(
+            filtered.is_empty(),
+            self.choices.iter().any(|choice| choice.extra),
+        );
         lines.push(styled(&help, &Style::new().for_stderr().dim(), max));
         Screen {
             lines,
             cursor: (row, column),
+        }
+    }
+
+    /// 底栏帮助：光标模式决定说法，空结果时提示怎么继续
+    ///
+    /// `Search` 模式下列表只是推荐 / 上一轮结果，必须告诉用户回车是去远端
+    /// 搜索，而不是「从建议里挑一个」。
+    fn help_text(&self, empty: bool, can_scope: bool) -> String {
+        let esc = &self.esc_help;
+        let base = match (self.enter, empty) {
+            (EnterMode::Search, true) => match self.lang {
+                Lang::Zh => format!("没有匹配结果；输入关键字回车搜索，Esc {esc}"),
+                Lang::En => format!("no matches; type a keyword and Enter to search, Esc {esc}"),
+            },
+            (EnterMode::Search, false) => match self.lang {
+                Lang::Zh => format!("输入关键字回车搜索；↑↓ 选择后回车确认，Tab 补全，Esc {esc}"),
+                Lang::En => {
+                    format!("type + Enter searches; ↑↓ then Enter picks, Tab completes, Esc {esc}")
+                }
+            },
+            (EnterMode::Choice, true) => err_no_matches(self.lang, esc),
+            (EnterMode::Choice, false) => match self.lang {
+                Lang::Zh => format!("输入关键字过滤；↑↓ 选择，Tab 补全，回车确认，Esc {esc}"),
+                Lang::En => {
+                    format!("type to filter; ↑↓ move, Tab completes, Enter confirms, Esc {esc}")
+                }
+            },
+        };
+        if !can_scope {
+            return base;
+        }
+        match self.lang {
+            Lang::Zh => format!("{base}（Ctrl+A {}）", self.scope_hint()),
+            Lang::En => format!("{base} (Ctrl+A {})", self.scope_hint()),
         }
     }
 
@@ -733,6 +778,8 @@ pub(crate) fn select_filter_scoped(
             print_answer(label, &value);
             Ok(value)
         }
+        // 本入口不开搜索模式：回车只可能提交或报错
+        Done::Search(_) => Err(anyhow::anyhow!("选择器未启用搜索模式")),
         Done::Cancelled => Err(InquireError::OperationCanceled).context("读取选择"),
         Done::Interrupted => Err(InquireError::OperationInterrupted).context("读取选择"),
     }
@@ -943,6 +990,73 @@ mod tests {
             picker.handle(Key::Enter).expect("回车不应失败"),
             Some(Done::Submitted("1.21.2".to_owned())),
             "输入全名可直接提交"
+        );
+    }
+
+    /// 搜索模式：非候选全名的输入回车返回关键词，交给调用方远端搜索
+    #[test]
+    fn enter_search_mode_returns_keyword() {
+        let all = choices(&[("Survival", false), ("Creative", false)]);
+        let mut picker = new_picker("搜索整合包", &all).with_enter_mode(EnterMode::Search);
+        type_chars(&mut picker, "音乐");
+        assert_eq!(
+            picker.handle(Key::Enter).expect("回车不应失败"),
+            Some(Done::Search("音乐".to_owned()))
+        );
+
+        // 高亮项优先：回车仍是选中，而不是搜索
+        let mut picker = new_picker("搜索整合包", &all).with_enter_mode(EnterMode::Search);
+        picker.handle(Key::Down).expect("按键不应失败");
+        assert_eq!(
+            picker.handle(Key::Enter).expect("回车不应失败"),
+            Some(Done::Submitted("Survival".to_owned()))
+        );
+
+        // 候选全名优先：即使输入正好是某个候选，也不把它当关键词
+        let mut picker = new_picker("搜索整合包", &all).with_enter_mode(EnterMode::Search);
+        type_chars(&mut picker, "Creative");
+        assert_eq!(
+            picker.handle(Key::Enter).expect("回车不应失败"),
+            Some(Done::Submitted("Creative".to_owned()))
+        );
+
+        // 空输入不搜索
+        let mut picker = new_picker("搜索整合包", &all).with_enter_mode(EnterMode::Search);
+        assert_eq!(picker.handle(Key::Enter).expect("回车不应失败"), None);
+    }
+
+    /// 搜索结果 0 条时仍可输入新关键词再搜，而不是只能 Esc 退出
+    #[test]
+    fn search_mode_can_refine_empty_result() {
+        let none: Vec<ScopedChoice> = Vec::new();
+        let mut picker = new_picker("搜索整合包", &none).with_enter_mode(EnterMode::Search);
+        type_chars(&mut picker, "cobble");
+        assert_eq!(
+            picker.handle(Key::Enter).expect("回车不应失败"),
+            Some(Done::Search("cobble".to_owned()))
+        );
+    }
+
+    /// 搜索模式的帮助行说明回车是搜索，而不是从候选里挑
+    #[test]
+    fn search_mode_help_mentions_enter_search() {
+        let all = choices(&[("Survival", false), ("Creative", false)]);
+        let picker = new_picker("搜索整合包", &all).with_enter_mode(EnterMode::Search);
+        let screen = picker.screen();
+        assert!(
+            screen.lines.iter().any(|line| line.contains("回车搜索")),
+            "{:?}",
+            screen.lines
+        );
+
+        let none: Vec<ScopedChoice> = Vec::new();
+        let mut picker = new_picker("搜索整合包", &none).with_enter_mode(EnterMode::Search);
+        picker.esc_help = "返回上一步".to_owned();
+        let screen = picker.screen();
+        assert!(
+            screen.lines.iter().any(|line| line.contains("回车搜索")),
+            "空结果也要提示怎么继续搜: {:?}",
+            screen.lines
         );
     }
 
