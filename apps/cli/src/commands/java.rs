@@ -446,14 +446,12 @@ fn prompt_registered_runtime(service: &JavaService, lang: Lang) -> Result<PathBu
             "选择要卸载的 Java 运行时",
             "select the Java runtime to uninstall",
         ),
-        choices,
+        choices.clone(),
     )
     .with_page_size(12)
     .prompt()
     .context(crate::i18n::pick(lang, "选择取消", "selection cancelled"))?;
-    runtimes
-        .iter()
-        .find(|rt| selected.starts_with(&format!("{} · ", rt.major)))
+    pick_selected(&runtimes, &choices, &selected)
         .map(|rt| rt.path.clone())
         .ok_or_else(|| {
             anyhow!(crate::i18n::pick(
@@ -486,13 +484,12 @@ fn prompt_runtime(lang: Lang, major: JavaMajor, matches: &[JavaRuntime]) -> Resu
         format!("大版本 {major} 有多个运行时，选择要卸载的"),
         format!("major version {major} has several runtimes; pick one to uninstall"),
     );
-    let selected = Select::new(&label, choices)
+    let selected = Select::new(&label, choices.clone())
         .prompt()
         .context(crate::i18n::pick(lang, "选择取消", "selection cancelled"))?;
-    // 第一个匹配即用户选中的（label 与 matches 一一对应）
-    matches
-        .iter()
-        .find(|rt| selected.starts_with(&rt.path.display().to_string()))
+    // 标签与 matches 一一对应：按**完整标签**取回同一位置，不能用路径前缀
+    // 反查——`/java/17` 会遮住 `/java/17.0.9`。
+    pick_selected(matches, &choices, &selected)
         .map(|rt| rt.path.clone())
         .ok_or_else(|| {
             anyhow!(crate::i18n::pick(
@@ -501,4 +498,48 @@ fn prompt_runtime(lang: Lang, major: JavaMajor, matches: &[JavaRuntime]) -> Resu
                 "the selected runtime was not matched",
             ))
         })
+}
+
+/// 标签与数据一一对应时，按选中标签取回同一位置的数据
+///
+/// 不能用 `starts_with` 反查：同大版本（`17 · …`）或路径前缀
+/// （`/java/17` 与 `/java/17.0.9`）都会把选择映射到前一条。
+fn pick_selected<'a, T>(items: &'a [T], labels: &[String], selected: &str) -> Option<&'a T> {
+    labels
+        .iter()
+        .position(|label| label == selected)
+        .and_then(|index| items.get(index))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pick_selected;
+
+    /// 同大版本的两条运行时必须按完整标签映射，不能都落到第一条
+    #[test]
+    fn selected_runtime_maps_by_exact_label_not_major_prefix() {
+        let items = ["system-17", "managed-17"];
+        let labels = vec![
+            "17 · 17.0.9 · /java/17 (系统)".to_owned(),
+            "17 · 17.0.11 · /java/17.0.11 (mcsup)".to_owned(),
+        ];
+        assert_eq!(
+            pick_selected(&items, &labels, &labels[1]),
+            Some(&"managed-17")
+        );
+    }
+
+    /// 路径前缀不能遮住更长的路径（`/java/17` 与 `/java/17.0.9`）
+    #[test]
+    fn selected_path_prefix_does_not_shadow_longer_path() {
+        let items = ["/java/17", "/java/17.0.9"];
+        let labels = vec![
+            "/java/17 · 17.0.9 (系统)".to_owned(),
+            "/java/17.0.9 · 17.0.9 (mcsup)".to_owned(),
+        ];
+        assert_eq!(
+            pick_selected(&items, &labels, &labels[1]),
+            Some(&"/java/17.0.9")
+        );
+    }
 }
