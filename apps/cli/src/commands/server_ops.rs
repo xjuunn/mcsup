@@ -400,6 +400,7 @@ pub(crate) async fn create(args: CreateArgs<'_>, printer: Printer) -> Result<()>
 ///
 /// 核心下载 / 安装器由对端负责：客户端不下载、不拼远端路径。远端协议当前只有
 /// `ServerCreate`（登记），因此这里明确说明「已登记，核心需在对端 install」。
+#[allow(clippy::too_many_lines)]
 fn create_remote(
     origin: &mcsup::port::Origin,
     name: Option<&str>,
@@ -457,26 +458,101 @@ fn create_remote(
         .with_context(|| {
             crate::i18n::pick(lang, "在远端创建服务器", "creating the server on the peer")
         })?;
+    // 登记成功即装核心：与本地 `server create` 同一条语义（建站 = 登记 + 下载核心）。
+    // 安装失败保留登记，提示对端重试——「已登记、可重试」与本地 setup_server 失败
+    // 路径的口径完全一致。
+    let installed = member.servers.install(meta.name.as_str(), version);
+    let (jar_version, path) = match installed {
+        Ok(updated) => match updated.jar.as_ref() {
+            Some(_) => (
+                Some(updated.version.as_str().to_owned()),
+                Some(server_path(member, &updated)),
+            ),
+            None => (None, None),
+        },
+        Err(err) => {
+            printer.print_warning(&crate::i18n::pick(
+                lang,
+                format!(
+                    "服务器已在 {} 登记，但核心安装失败，可重试 mcsup server install {}/{}",
+                    member.name, member.name, meta.name
+                ),
+                format!(
+                    "the server is registered on {} but the core install failed; retry with `mcsup server install {}/{}'",
+                    member.name, member.name, meta.name
+                ),
+            ));
+            return Err(err).with_context(|| {
+                crate::i18n::pick(lang, "远端核心安装失败", "remote core install failed")
+            });
+        }
+    };
     printer.print_outcome(
         &crate::i18n::pick(
             lang,
             format!(
-                "已在 {} 创建服务器 {} {}（{}）；核心需在对端运行 mcsup server install {}",
-                member.name, meta.name, meta.version, meta.variant.as_str(), meta.name
+                "已在 {} 创建服务器 {} {}（{}）",
+                member.name,
+                meta.name,
+                meta.version,
+                meta.variant.as_str()
             ),
             format!(
-                "created server {} {} ({}) on {}; install the core on the peer with `mcsup server install {}`",
-                meta.name, meta.version, meta.variant.as_str(), member.name, meta.name
+                "created server {} {} ({}) on {}",
+                meta.name,
+                meta.version,
+                meta.variant.as_str(),
+                member.name
             ),
         ),
         &CreateRow {
             name: meta.name.as_str(),
             version: meta.version.as_str(),
             variant: meta.variant.as_str(),
-            path: String::new(),
+            path: path.unwrap_or_default(),
             linked: None,
         },
-    )
+    )?;
+    if let Some(version) = jar_version {
+        printer.print_section(&crate::i18n::pick(
+            lang,
+            format!("核心版本 {version} 已在对端安装完成"),
+            format!("core {version} installed on the peer"),
+        ));
+    }
+    Ok(())
+}
+
+/// 远端服务器的目录展示口径：对端的 `{workspace}/servers/{rel_dir}`
+fn server_path(
+    member: &mcsup::backend::remote::RemoteMember,
+    meta: &mcsup::domain::server::meta::ServerMeta,
+) -> String {
+    use mcsup::port::WorkspaceRepository as _;
+    member
+        .workspaces
+        .list()
+        .ok()
+        .and_then(|workspaces| {
+            workspaces
+                .iter()
+                .find(|ws| ws.id.as_str() == meta.workspace_id.as_str())
+                .map(|ws| {
+                    ws.path
+                        .join("servers")
+                        .join(meta.rel_dir.clone())
+                        .display()
+                        .to_string()
+                })
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "{}/{}/{}",
+                member.name,
+                meta.workspace_id.as_str(),
+                meta.rel_dir.display()
+            )
+        })
 }
 
 /// 创建服务器之后的服务端布置

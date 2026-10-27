@@ -185,8 +185,15 @@ async fn server(action: ServerAction, cfg: &ConfigFile, printer: Printer) -> Res
             )
             .await
         }
+        // install 需要原始限定名：远端安装按 origin/name 路由到对端，
+        // 不能像其它命令那样先剥成裸名
         ServerAction::Install { name, version } => {
-            let name = server_ops::require_server_name(name.as_deref(), "server install", printer)?;
+            let name = server_ops::require_text(
+                name,
+                "server install 缺少服务器名称",
+                "非交互模式：mcsup server install <name>",
+                printer,
+            )?;
             install::run(&name, version.as_deref(), cfg, printer).await
         }
         ServerAction::Start { name, accept_eula } => {

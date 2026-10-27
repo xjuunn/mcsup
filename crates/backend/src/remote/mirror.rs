@@ -237,6 +237,33 @@ impl RemoteServerRepository {
         }
     }
 
+    /// 在对端安装 / 更换服务端核心
+    ///
+    /// 下载、校验、（安装器类变体的）安装器执行都在对端完成；返回对端回写的
+    /// 最新注册记录（含 jar 与启动方式）。
+    ///
+    /// # Errors
+    ///
+    /// 对端拒绝（来源不可达、版本不存在…）或传输失败时返回 [`RepositoryError`]
+    pub fn install(&self, name: &str, version: &str) -> Result<ServerMeta, RepositoryError> {
+        let response = self.link.expect(
+            &Request::ServerInstall {
+                name: name.to_owned(),
+                version: version.to_owned(),
+            },
+            "servers",
+        )?;
+        match response {
+            Response::Servers { mut items } => {
+                let wire = items.pop().ok_or_else(|| {
+                    RepositoryError::Corrupt("server.install returned no record".to_owned())
+                })?;
+                ServerMeta::try_from(wire)
+            }
+            other => Err(unexpected(other, "server.install")),
+        }
+    }
+
     /// 注销对端的服务器；`purge` 时对端一并删盘
     ///
     /// # Errors

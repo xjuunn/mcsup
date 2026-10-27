@@ -271,6 +271,7 @@ fn connect_to_a_dead_endpoint_fails_cleanly() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn remote_server_create_list_and_remove_route_to_the_peer() {
     let home = temp_home();
     let agent = AgentHandle::start();
@@ -330,17 +331,20 @@ fn remote_server_create_list_and_remove_route_to_the_peer() {
             "json",
         ],
     );
-    assert_ok(&created, "server create --origin");
-    assert_eq!(json(&created)["name"], "web");
-
-    // 合并列表与按来源过滤
-    let all = run(home_path, &["server", "ls", "--output", "json"]);
-    assert_ok(&all, "server ls");
-    let all = json(&all);
+    // 远端 create 会继续在对端安装核心；核心下载依赖外网，两种结果都合法：
+    // 成功 → 登记带 jar；失败 → 登记保留、jar 为空（与本地 create 同一语义）。
+    let listed = run(home_path, &["server", "ls", "--output", "json"]);
+    assert_ok(&listed, "server ls after create");
+    let all = json(&listed);
     let all = all.as_array().expect("array");
     assert_eq!(all.len(), 1);
     assert_eq!(all[0]["origin"], "test-box");
     assert_eq!(all[0]["name"], "web");
+    assert_eq!(
+        created.status.success(),
+        !all[0]["jar"].is_null(),
+        "create 的退出码必须与核心登记状态一致"
+    );
 
     let local = run(
         home_path,
@@ -356,6 +360,23 @@ fn remote_server_create_list_and_remove_route_to_the_peer() {
     );
     assert_ok(&status, "server status qualified");
     assert_eq!(json(&status)["name"], "web");
+
+    // 远端 install 复用同一帧：核心下载依赖外网，结果不固定，但
+    // 「退出码 ↔ jar 登记」必须一致
+    let install = run(
+        home_path,
+        &["server", "install", "test-box/web", "--output", "json"],
+    );
+    let listed = run(home_path, &["server", "ls", "--output", "json"]);
+    assert_ok(&listed, "server ls after install");
+    let all = json(&listed);
+    let all = all.as_array().expect("array");
+    assert_eq!(
+        install.status.success(),
+        !all[0]["jar"].is_null(),
+        "install 退出码必须与核心登记状态一致（stderr=[{}])",
+        String::from_utf8_lossy(&install.stderr)
+    );
 
     let removed = run(
         home_path,

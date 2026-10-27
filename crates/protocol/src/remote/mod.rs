@@ -206,6 +206,16 @@ pub enum Request {
         /// 同时删除磁盘目录
         purge: bool,
     },
+    /// 在对端安装 / 更换服务端核心
+    ///
+    /// 下载、校验、（安装器类变体的）安装器执行全部发生在对端；客户端只
+    /// 搬名字与版本。`version` 传 `latest` 由对端来源解析为最新稳定版。
+    ServerInstall {
+        /// 服务器名
+        name: String,
+        /// 服务端版本（接受 `latest` 别名）
+        version: String,
+    },
 
     /// 列出 Java 运行时
     JavaList,
@@ -343,6 +353,7 @@ impl Request {
             | Self::WorkspaceRemove { .. }
             | Self::ServerCreate { .. }
             | Self::ServerRemove { .. }
+            | Self::ServerInstall { .. }
             | Self::JavaScan => Some(Permission::Write),
             Self::Start { .. } | Self::Stop { .. } | Self::SendLine { .. } => {
                 Some(Permission::Control)
@@ -377,6 +388,7 @@ impl Request {
             Self::ServerList => "server.list",
             Self::ServerCreate { .. } => "server.create",
             Self::ServerRemove { .. } => "server.remove",
+            Self::ServerInstall { .. } => "server.install",
             Self::JavaList => "java.list",
             Self::JavaScan => "java.scan",
             Self::ClientList => "client.list",

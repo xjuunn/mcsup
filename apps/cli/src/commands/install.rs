@@ -1,4 +1,5 @@
 use crate::bootstrap;
+use crate::diagnostic::AppDiagnostic;
 use crate::output::Printer;
 use crate::progress::{InstallSession, TaskSpinner};
 use crate::prompts;
@@ -6,6 +7,7 @@ use anyhow::{Context, Result};
 use mcsup::domain::server::version::{ServerVariant, ServerVersion, VersionId, VersionKind};
 use mcsup::file::FileCoreInspector;
 use mcsup::port::ServerJarSource;
+use mcsup::port::WorkspaceRepository as _;
 use mcsup::service::ServerInstaller;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,6 +31,10 @@ pub(crate) async fn run(
     _cfg: &crate::config::ConfigFile,
     printer: Printer,
 ) -> Result<()> {
+    // 远端服务器：核心下载、校验、（安装器类变体的）安装器执行全部在对端
+    if let Some(outcome) = install_remote(name, version, printer)? {
+        return Ok(outcome);
+    }
     let registry = bootstrap::open_registry()?;
     let srv = registry.get(name).with_context(|| {
         crate::i18n::pick(
@@ -51,6 +57,85 @@ pub(crate) async fn run(
     let (size, destination) =
         download_jar(name, &version_id, source, srv.meta.variant, printer).await?;
     printer.print_installed(&version_id, size, &destination)
+}
+
+/// 远端安装：按来源查组合注册表，远端条目整段转发到对端
+///
+/// 返回 `Ok(Some(()))` 表示已由远端处理（含输出）；`Ok(None)` 表示本地条目，
+/// 调用方继续走本地路径。失败时不重试——下载 / 校验失败是对端的事实，重试
+/// 语义由用户再次执行决定。
+///
+/// # Errors
+///
+/// 服务器不存在（3）、远端拒绝或传输失败（5）、未授权（6）时返回错误
+fn install_remote(name: &str, version: Option<&str>, printer: Printer) -> Result<Option<()>> {
+    let lang = printer.lang();
+    let selector = mcsup::service::Selector::parse(name);
+    if selector.origin().is_none_or(mcsup::port::Origin::is_local) {
+        // 未限定或限定本地：按裸名查组合注册表，本地命中即走本地路径
+        return Ok(None);
+    }
+    let Some(origin) = selector.origin().cloned() else {
+        return Ok(None);
+    };
+    let cfg = crate::config::ConfigFile::locate(None).load()?;
+    let members = bootstrap::remote_members(&cfg)?;
+    let member = super::origin::member(&members, &origin, lang)?.ok_or_else(|| {
+        AppDiagnostic::not_found(
+            crate::i18n::pick(
+                lang,
+                format!("远端 {} 未就绪（缺凭证或指纹）", origin.as_str()),
+                format!(
+                    "remote {} is not ready (missing credential or fingerprint)",
+                    origin.as_str()
+                ),
+            ),
+            None,
+        )
+    })?;
+    let meta = member
+        .servers
+        .install(selector.name(), version.unwrap_or("latest"))
+        .with_context(|| {
+            crate::i18n::pick(
+                lang,
+                format!("在 {} 安装 {} 的核心失败", origin.as_str(), selector.name()),
+                format!(
+                    "failed to install the core of {} on {}",
+                    selector.name(),
+                    origin.as_str()
+                ),
+            )
+        })?;
+    let Some(jar) = meta.jar.as_ref() else {
+        return Err(anyhow::anyhow!(
+            "{}",
+            crate::i18n::pick(
+                lang,
+                "对端安装完成但注册记录缺少核心元数据",
+                "the peer finished the install but the record has no core metadata"
+            )
+        ));
+    };
+    let destination = server_dir_of(member, &meta)?;
+    printer.print_installed(&meta.version, jar.size, &destination)?;
+    Ok(Some(()))
+}
+
+/// 远端服务器的目录展示口径：`{workspace path}/servers/{rel_dir}` 在对端的
+/// 绝对路径，由镜像侧记录拼出；拼不出时退回限定名
+fn server_dir_of(
+    member: &mcsup::backend::remote::RemoteMember,
+    meta: &mcsup::domain::server::meta::ServerMeta,
+) -> Result<PathBuf> {
+    let workspaces = member.workspaces.list()?;
+    let ws = workspaces
+        .iter()
+        .find(|ws| ws.id.as_str() == meta.workspace_id.as_str());
+    Ok(ws.map_or_else(
+        || PathBuf::from(meta.rel_dir.to_string_lossy().into_owned()),
+        |ws| ws.path.join("servers").join(meta.rel_dir.clone()),
+    ))
 }
 
 /// 版本别名归一：`lts` 与 `latest` 同义

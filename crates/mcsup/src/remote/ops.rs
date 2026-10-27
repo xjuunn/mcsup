@@ -10,11 +10,13 @@
 use super::Agent;
 use domain::java::JavaMajor;
 use domain::server::version::{ServerVariant, VersionId};
+use file::FileCoreInspector;
 use protocol::remote::wire::{WireServer, WireSnapshot, WireStatusEntry};
 use protocol::remote::{ErrorKind, Request, Response};
 use service::{
-    InitOutcome, JavaError, LifecycleError, LifecycleErrorKind, ServerRegistryError,
-    ServerRegistryErrorKind, StartOptions, WorkspaceError, WorkspaceErrorKind,
+    InitOutcome, InstallJarError, InstallerContext, JavaError, LifecycleError, LifecycleErrorKind,
+    ServerInstaller, ServerRegistryError, ServerRegistryErrorKind, StartOptions, WorkspaceError,
+    WorkspaceErrorKind,
 };
 use transport::RemoteFailure;
 
@@ -32,9 +34,10 @@ impl Agent {
             | Request::WorkspaceInit { .. }
             | Request::WorkspaceUse { .. }
             | Request::WorkspaceRemove { .. } => self.workspace_op(request),
-            Request::ServerList | Request::ServerCreate { .. } | Request::ServerRemove { .. } => {
-                self.server_op(request)
-            }
+            Request::ServerList
+            | Request::ServerCreate { .. }
+            | Request::ServerRemove { .. }
+            | Request::ServerInstall { .. } => self.server_op(request),
             Request::JavaList | Request::JavaScan => self.java_op(request),
 
             Request::ClientList => match self.clients.load() {
@@ -202,6 +205,7 @@ impl Agent {
                     Err(err) => registry_failure(&err),
                 }
             }
+            Request::ServerInstall { name, version } => self.server_install(name, version),
             other => unreachable_frame(other),
         }
     }
@@ -378,6 +382,60 @@ impl Agent {
                 RemoteFailure::new(ErrorKind::NOT_FOUND, format!("no such server: {server_id}"))
                     .into_response()
             })
+    }
+
+    /// `server install`：在对端下载 / 安装核心
+    ///
+    /// 编排与本地 CLI 走同一份 `install_jar_checked`：下载、校验、（安装器类
+    /// 变体的）安装器执行都在对端，客户端只拿到更新后的注册记录。
+    ///
+    /// `install_jar_checked` 是 async（下载走 HTTP），而分发线程是同步的。
+    /// 远端命令本就是「一请求一连接一线程」，在当前线程上建一个
+    /// current-thread runtime 阻塞执行即可；transport 的 600s 读写超时与
+    /// 下载时长同一量级，不构成额外约束。
+    fn server_install(&self, name: &str, version: &str) -> Response {
+        let variant = match self.core.registry.get(name) {
+            Ok(srv) => srv.meta.variant,
+            Err(err) => return registry_failure(&err),
+        };
+        let Some(source) = pick_source(&self.core.jar_sources, &variant) else {
+            return RemoteFailure::new(
+                ErrorKind::INVALID,
+                format!("no server jar source for variant {}", variant.as_str()),
+            )
+            .into_response();
+        };
+        let installer = ServerInstaller::new(source, self.core.downloader.clone());
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(err) => return failure(ErrorKind::IO, err),
+        };
+        let outcome = runtime.block_on(async {
+            self.core
+                .lifecycle
+                .install_jar_checked(
+                    name,
+                    &VersionId::new(version.to_owned()),
+                    &installer,
+                    &FileCoreInspector,
+                    installer_ctx(self, name, &variant).as_ref(),
+                    None,
+                    None,
+                    &port::CancellationToken::new(),
+                )
+                .await
+        });
+        match outcome {
+            Ok(outcome) => match WireServer::try_from(&outcome.server.meta) {
+                Ok(item) => Response::Servers { items: vec![item] },
+                Err(err) => failure(ErrorKind::IO, err),
+            },
+            Err(LifecycleError::InstallJar(err)) => install_failure(&err),
+            Err(err) => lifecycle_failure(&err),
+        }
     }
 
     // ---- backup（阶段 9）：转发给与本地 CLI 同一份 BackupService ----
@@ -677,4 +735,55 @@ fn backup_failure(err: &service::BackupError) -> Response {
         Some(_) | None => ErrorKind::IO,
     };
     failure(kind, err)
+}
+
+/// 变体 → 来源；`Unknown` 兜底到 vanilla（与本地 CLI 同一规则）
+fn pick_source(
+    sources: &[std::sync::Arc<dyn port::ServerJarSource>],
+    variant: &ServerVariant,
+) -> Option<std::sync::Arc<dyn port::ServerJarSource>> {
+    let target = if *variant == ServerVariant::Unknown {
+        &ServerVariant::Vanilla
+    } else {
+        variant
+    };
+    sources
+        .iter()
+        .find(|source| &source.variant() == target)
+        .cloned()
+}
+
+/// 安装器类变体需要的安装上下文（Java 选择判定在 `service`）
+///
+/// `installer_java_bin` 只对安装器类变体才有意义；直接可运行的来源不读上下文，
+/// 因此这里只按变体判一次，不重复实现 Java 挑选规则。
+fn installer_ctx(agent: &Agent, name: &str, variant: &ServerVariant) -> Option<InstallerContext> {
+    if !matches!(variant, ServerVariant::Forge | ServerVariant::NeoForge) {
+        return None;
+    }
+    let java_bin = agent
+        .core
+        .lifecycle
+        .installer_java_bin(name, &mut || {}, &mut |_| {})
+        .ok()?;
+    Some(InstallerContext {
+        java_bin,
+        runner: std::sync::Arc::new(runtime::LocalInstallerRunner::new()),
+        output: None,
+    })
+}
+
+/// 安装失败 → 错误帧（按领域判定分类，不解析文案）
+fn install_failure(err: &InstallJarError) -> Response {
+    let kind = match err {
+        InstallJarError::Registry(inner) => {
+            return registry_failure(inner);
+        }
+        InstallJarError::Inspect(_) | InstallJarError::Downgrade { .. } => ErrorKind::INVALID,
+        // 下载 / 校验失败按 IO：客户端提示「来源不可达或传输失败」
+        InstallJarError::Install(_)
+        // #[non_exhaustive]：未来新增变体按通用失败处理
+        | _ => ErrorKind::IO,
+    };
+    RemoteFailure::new(kind, err.to_string()).into_response()
 }

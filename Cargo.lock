@@ -1458,6 +1458,7 @@ dependencies = [
  "storage",
  "tempfile",
  "thiserror",
+ "tokio",
  "tracing",
  "transport",
 ]

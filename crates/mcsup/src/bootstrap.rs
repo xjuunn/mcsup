@@ -91,6 +91,12 @@ pub struct Mcsup {
     pub content: ContentService,
     /// 整合包开服编排（取回清单 → 装加载器 → 铺 overrides → 装文件）
     pub modpack: ModpackService,
+    /// 下载器（HTTP 传输 + 断点续传）：远端安装核心时由 agent 侧复用
+    ///
+    /// 与各 service 内部持有的是同一个实例；单独暴露是因为远端安装（
+    /// `ServerInstall` 帧）的编排需要「来源 + 下载器」重新组一个
+    /// [`service::ServerInstaller`]，而 service 不向外传实现细节。
+    pub downloader: Arc<dyn port::ArtifactDownloader>,
     /// 元数据仓库句柄（Workspace / Server / Java 三个仓库共用）
     ///
     /// 具体存储类型是实现细节，对外只经 [`McsupBuilder::server_repository`]
@@ -465,6 +471,7 @@ impl McsupBuilder {
             jar_sources,
             content,
             modpack,
+            downloader,
             store,
         })
     }
