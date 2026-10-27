@@ -291,8 +291,10 @@ impl ContentSourceRegistry {
 
 /// 内容安装路径的解析辅助：来源给出的文件名不可信
 ///
-/// 上游的 `filename` 直接拼进安装目录会被 `../` 穿越到目录外。这里只取最后
-/// 一个路径段并拒绝空名与 `.` / `..`；结果仍由调用方与目标目录拼接。
+/// 上游的 `filename` 直接拼进安装目录会被 `../` 穿越到目录外，Windows 上
+/// `C:evil.jar` 这类盘符相对路径还会让 `join` 替换掉整个安装目录。这里只取
+/// 最后一个路径段，并拒绝空名、`.` / `..` 与任何冒号；结果仍由调用方与目标
+/// 目录拼接。
 ///
 /// # Errors
 ///
@@ -303,7 +305,7 @@ pub fn safe_filename(filename: &str) -> Result<String, SourceError> {
         .next()
         .unwrap_or(filename)
         .trim();
-    if name.is_empty() || name == "." || name == ".." {
+    if name.is_empty() || name == "." || name == ".." || name.contains(':') {
         return Err(SourceError::Decode(Box::new(std::io::Error::other(
             format!("unsafe content filename: {filename:?}"),
         ))));
@@ -334,6 +336,14 @@ mod tests {
     #[test]
     fn safe_filename_rejects_traversal() {
         for bad in ["", "  ", "..", ".", "a/..", "a/./", "dir/"] {
+            assert!(safe_filename(bad).is_err(), "{bad:?} 应被拒绝");
+        }
+    }
+
+    /// Windows 盘符相对路径（`C:evil.jar`）会让 `join` 替换掉安装目录
+    #[test]
+    fn safe_filename_rejects_drive_prefix() {
+        for bad in ["C:evil.jar", "a/C:evil.jar"] {
             assert!(safe_filename(bad).is_err(), "{bad:?} 应被拒绝");
         }
     }
