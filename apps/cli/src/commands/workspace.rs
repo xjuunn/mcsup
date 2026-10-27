@@ -28,15 +28,46 @@ pub(crate) fn run(action: WorkspaceAction, printer: Printer) -> Result<()> {
     } else {
         Arc::new(mcsup::backend::remote::CombinedWorkspaceRepository::new(
             local.clone(),
-            members,
+            members.clone(),
         ))
     };
     let svc = WorkspaceService::new(workspaces, local.clone());
     match action {
-        WorkspaceAction::Init { dir, name } => init(&svc, dir.as_deref(), name.as_deref(), printer),
-        WorkspaceAction::List => list(&svc, &reg, printer),
-        WorkspaceAction::Use { name } => use_ws(&svc, name.as_deref(), printer),
-        WorkspaceAction::Remove { name, purge } => {
+        WorkspaceAction::Init { dir, name, origin } => {
+            if let Some(remote) = remote_target(origin.as_deref(), &members, printer)? {
+                return init_remote(remote, dir.as_deref(), name.as_deref(), printer);
+            }
+            init(&svc, dir.as_deref(), name.as_deref(), printer)
+        }
+        WorkspaceAction::List { origin } => {
+            let filter = super::origin::filter(origin.as_deref(), printer.lang())?;
+            list(&svc, &reg, &filter, printer)
+        }
+        WorkspaceAction::Use { name, origin } => {
+            if let Some(remote) = remote_target(origin.as_deref(), &members, printer)? {
+                return use_remote(remote, name.as_deref(), printer);
+            }
+            use_ws(&svc, name.as_deref(), printer)
+        }
+        WorkspaceAction::Remove {
+            name,
+            purge,
+            origin,
+        } => {
+            if let Some(remote) = remote_target(origin.as_deref(), &members, printer)? {
+                let Some(name) = name else {
+                    return Err(AppDiagnostic::usage(
+                        crate::i18n::pick(
+                            printer.lang(),
+                            "workspace remove --origin 需要工作区名称",
+                            "workspace remove --origin requires a workspace name",
+                        ),
+                        None,
+                    )
+                    .into());
+                };
+                return remove_remote(remote, &name, purge, printer);
+            }
             let name = match name {
                 Some(name) => name,
                 None if printer.is_interactive() => pick_workspace(&svc, printer)?,
@@ -227,6 +258,155 @@ pub(crate) fn init(
     report_init(svc.init(&dir, name.as_deref())?, printer)
 }
 
+/// `--origin` 指向远端时返回该成员；本地 / 缺省返回 `None`
+fn remote_target<'a>(
+    origin: Option<&str>,
+    members: &'a mcsup::backend::remote::RemoteMembers,
+    printer: Printer,
+) -> Result<Option<&'a mcsup::backend::remote::RemoteMember>> {
+    let Some(raw) = origin else {
+        return Ok(None);
+    };
+    let origin = mcsup::port::Origin::parse(raw).map_err(|err| {
+        AppDiagnostic::usage(
+            crate::i18n::pick(
+                printer.lang(),
+                format!("--origin 取值非法: {raw}"),
+                format!("invalid --origin value: {raw}"),
+            ),
+            Some(err.to_string()),
+        )
+    })?;
+    if origin.is_local() {
+        return Ok(None);
+    }
+    super::origin::member(members, &origin, printer.lang())
+}
+
+/// `workspace init --origin <remote>`：在对端执行同一套 init
+fn init_remote(
+    member: &mcsup::backend::remote::RemoteMember,
+    dir: Option<&Path>,
+    name: Option<&str>,
+    printer: Printer,
+) -> Result<()> {
+    let lang = printer.lang();
+    let Some(dir) = dir else {
+        return Err(AppDiagnostic::usage(
+            crate::i18n::pick(
+                lang,
+                "远端 workspace init 需要 --dir（对端机器上的路径）",
+                "remote `workspace init` requires --dir (a path on the peer)",
+            ),
+            None,
+        )
+        .into());
+    };
+    let ws = member.workspaces.init(dir, name).with_context(|| {
+        crate::i18n::pick(
+            lang,
+            "在远端创建工作区",
+            "creating the workspace on the peer",
+        )
+    })?;
+    printer.print_outcome(
+        &crate::i18n::pick(
+            lang,
+            format!(
+                "已在 {} 创建工作区 {} ({})",
+                member.name,
+                ws.name,
+                ws.path.display()
+            ),
+            format!(
+                "created workspace {} on {} ({})",
+                ws.name,
+                member.name,
+                ws.path.display()
+            ),
+        ),
+        &WorkspaceInitRow {
+            name: ws.name.as_str(),
+            path: ws.path.display().to_string(),
+            status: "created",
+        },
+    )
+}
+
+/// `workspace use --origin <remote>`：切换对端的当前工作区
+fn use_remote(
+    member: &mcsup::backend::remote::RemoteMember,
+    name: Option<&str>,
+    printer: Printer,
+) -> Result<()> {
+    let lang = printer.lang();
+    let Some(name) = name else {
+        return Err(AppDiagnostic::usage(
+            crate::i18n::pick(
+                lang,
+                "远端 workspace use 需要工作区名称",
+                "remote `workspace use` requires a workspace name",
+            ),
+            None,
+        )
+        .into());
+    };
+    let ws = member.workspaces.set_current(name).with_context(|| {
+        crate::i18n::pick(
+            lang,
+            "切换远端当前工作区",
+            "switching the peer's current workspace",
+        )
+    })?;
+    printer.print_outcome(
+        &crate::i18n::pick(
+            lang,
+            format!(
+                "{} 的当前工作区已切换为 {} ({})",
+                member.name,
+                ws.name,
+                ws.path.display()
+            ),
+            format!(
+                "{}'s current workspace is now {} ({})",
+                member.name,
+                ws.name,
+                ws.path.display()
+            ),
+        ),
+        &WorkspaceUseJson {
+            name: ws.name.as_str(),
+            path: ws.path.display().to_string(),
+        },
+    )
+}
+
+/// `workspace remove --origin <remote>`：注销对端工作区（可选删盘）
+fn remove_remote(
+    member: &mcsup::backend::remote::RemoteMember,
+    name: &str,
+    purge: bool,
+    printer: Printer,
+) -> Result<()> {
+    let lang = printer.lang();
+    let disk_purged = member.workspaces.remove(name, purge).with_context(|| {
+        crate::i18n::pick(lang, "注销远端工作区", "removing the workspace on the peer")
+    })?;
+    printer.print_outcome(
+        &crate::i18n::pick(
+            lang,
+            format!("已在 {} 注销工作区 {name}", member.name),
+            format!("removed workspace {name} on {}", member.name),
+        ),
+        &WorkspaceRemoveJson {
+            name,
+            path: String::new(),
+            purged: purge,
+            disk_purged,
+        },
+    )
+}
+
 /// 输出 `workspace init` 的三种结果；JSON 模式只出数据行，文案不参与
 fn report_init(outcome: InitOutcome, printer: Printer) -> Result<()> {
     let lang = printer.lang();
@@ -309,12 +489,23 @@ fn report_init(outcome: InitOutcome, printer: Printer) -> Result<()> {
     Ok(())
 }
 
-fn list(svc: &WorkspaceService, reg: &ServerRegistry, printer: Printer) -> Result<()> {
-    let all = svc.list()?;
+fn list(
+    svc: &WorkspaceService,
+    reg: &ServerRegistry,
+    filter: &mcsup::service::OriginFilter,
+    printer: Printer,
+) -> Result<()> {
+    let all = svc.list_sourced()?;
+    let all: Vec<_> = all
+        .into_iter()
+        .filter(|sourced| filter.matches(&sourced.origin))
+        .collect();
     let rows: Vec<WorkspaceRow<'_>> = all
         .iter()
-        .map(|ws| {
+        .map(|sourced| {
+            let ws = &sourced.value;
             Ok(WorkspaceRow {
+                origin: super::origin::label(&sourced.origin),
                 name: ws.name.as_str(),
                 path: ws.path.display().to_string(),
                 servers: reg.count_in(&ws.id)?,
@@ -334,13 +525,15 @@ fn list(svc: &WorkspaceService, reg: &ServerRegistry, printer: Printer) -> Resul
             let mut table = Table::new();
             table.set_header([
                 crate::i18n::text(lang, "名称", "name"),
+                crate::i18n::text(lang, "来源", "origin"),
                 crate::i18n::text(lang, "路径", "path"),
                 crate::i18n::text(lang, "服务器数", "servers"),
                 crate::i18n::text(lang, "当前", "current"),
             ]);
-            for (ws, row) in all.iter().zip(&rows) {
+            for (sourced, row) in all.iter().zip(&rows) {
                 table.add_row([
-                    ws.name.as_str().to_owned(),
+                    sourced.value.name.as_str().to_owned(),
+                    row.origin.clone(),
                     row.path.clone(),
                     row.servers.to_string(),
                     if row.current { "*" } else { "" }.to_owned(),

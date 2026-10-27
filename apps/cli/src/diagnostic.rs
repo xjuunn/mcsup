@@ -39,6 +39,36 @@ impl AppDiagnostic {
         }
     }
 
+    /// 普通失败（退出码 1）：业务拒绝、远端不可达等，不是「尚未实现」
+    #[must_use]
+    pub(crate) fn failure(message: impl Into<String>, help: Option<String>) -> Self {
+        Self {
+            exit_code: 1,
+            message: message.into(),
+            help,
+        }
+    }
+
+    /// 目标不存在（退出码 3）
+    #[must_use]
+    pub(crate) fn not_found(message: impl Into<String>, help: Option<String>) -> Self {
+        Self {
+            exit_code: 3,
+            message: message.into(),
+            help,
+        }
+    }
+
+    /// 未授权（退出码 6）：token 失效、权限不足、指纹变化
+    #[must_use]
+    pub(crate) fn unauthorized(message: impl Into<String>, help: Option<String>) -> Self {
+        Self {
+            exit_code: 6,
+            message: message.into(),
+            help,
+        }
+    }
+
     /// 用法错误（退出码 2，与 clap 的参数解析错误同级）：
     /// 非交互 / JSON 模式下缺必选参数、取值不合法时走这里，不进入交互兜底
     #[must_use]

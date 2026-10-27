@@ -3,7 +3,7 @@ use domain::java::{JavaMajor, JavaPackageType, JavaRuntime, JavaVendor};
 use port::{
     ArchiveExtractor, ArtifactDownloader, CancellationToken, DownloadRequest, DownloadedArtifact,
     JavaPackageRequest, JavaRuntimeRepository, JavaScanner, JavaSourceRegistryPort, ProgressSink,
-    RepositoryError, ScannedJava, SourceError,
+    RepositoryError, ScannedJava, SourceError, Sourced,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -254,6 +254,26 @@ impl JavaService {
     /// 扫描或注册表失败时返回 [`JavaError`]
     pub fn list(&self) -> Result<Vec<JavaRuntime>, JavaError> {
         self.list_or_scan(&mut || {}, &mut |_| {})
+    }
+
+    /// 全部运行时并标注来源（本地 + 已配对远端）
+    ///
+    /// 与 [`Self::list`] 的差别只是来源标注：远端运行时的扫描是**对端**的
+    /// 事，本地扫描只补本机条目。入口用它在合并列表里显示 `ORIGIN`。
+    ///
+    /// # Errors
+    ///
+    /// 扫描或注册表失败时返回 [`JavaError`]
+    pub fn list_sourced(
+        &self,
+        on_first_scan: &mut dyn FnMut(),
+        on_found: &mut dyn FnMut(&ScannedJava),
+    ) -> Result<Vec<Sourced<JavaRuntime>>, JavaError> {
+        if !self.has_scanned()? {
+            on_first_scan();
+            self.scan(false, on_found)?;
+        }
+        Ok(self.repo.list_sourced()?)
     }
 
     /// 列出全部已注册运行时；未扫描过则先扫描并逐个回调
@@ -1578,5 +1598,17 @@ mod tests {
         let archive = dir.path().join("ok.zip");
         let home = require_jvm_home(&archive, dir.path()).expect("home");
         assert_eq!(home, dir.path().join("jdk-27"));
+    }
+
+    /// `list_sourced` 在纯本地仓库上给每条标 `Origin::Local`
+    #[test]
+    fn list_sourced_marks_local_origin() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (service, _repo) = svc(tmp.path());
+        let sourced = service
+            .list_sourced(&mut || {}, &mut |_| {})
+            .expect("sourced");
+        assert_eq!(sourced.len(), 1);
+        assert!(sourced[0].origin.is_local());
     }
 }

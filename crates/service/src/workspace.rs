@@ -1,6 +1,6 @@
 use crate::fs_error::{FsError, deletion_hint};
 use domain::workspace::{InvalidWorkspaceName, Workspace, WorkspaceId, WorkspaceName};
-use port::{RepositoryError, ServerRepository, WorkspaceRepository};
+use port::{RepositoryError, ServerRepository, Sourced, WorkspaceRepository};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -312,6 +312,23 @@ impl WorkspaceService {
             .list()?
             .into_iter()
             .map(normalize_workspace)
+            .collect())
+    }
+
+    /// 全部工作目录并标注来源（本地 + 已配对远端）
+    ///
+    /// 组合仓库下每条带真实来源；纯本地实现全部是 [`port::Origin::Local`]。
+    /// 入口用它在合并列表里显示 `ORIGIN`，并按 `--origin` 过滤。
+    ///
+    /// # Errors
+    ///
+    /// 注册表失败时返回 [`WorkspaceError`]
+    pub fn list_sourced(&self) -> Result<Vec<Sourced<Workspace>>, WorkspaceError> {
+        Ok(self
+            .repo
+            .list_sourced()?
+            .into_iter()
+            .map(|sourced| sourced.map(normalize_workspace))
             .collect())
     }
 
@@ -1285,5 +1302,19 @@ mod tests {
         );
         assert!(foreign.is_dir(), "目标目录不能被删");
         assert!(svc.resolve("ws01").is_ok(), "记录必须保留");
+    }
+
+    /// `list_sourced` 在纯本地仓库上给每条标 `Origin::Local`
+    #[test]
+    fn list_sourced_marks_local_origin() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let repo = Arc::new(MemRepo::new());
+        let servers: Arc<dyn ServerRepository> = Arc::new(MemServers::new());
+        let svc = WorkspaceService::new(repo, servers);
+        svc.init(tmp.path(), Some("alpha")).expect("init");
+        let sourced = svc.list_sourced().expect("sourced");
+        assert_eq!(sourced.len(), 1);
+        assert!(sourced[0].origin.is_local());
+        assert_eq!(sourced[0].value.name.as_str(), "alpha");
     }
 }

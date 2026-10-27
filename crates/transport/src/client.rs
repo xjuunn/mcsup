@@ -14,9 +14,9 @@ use crate::handler::{Enrolled, Greeting, SessionInfo};
 use crate::session::Session;
 use crate::tls;
 use protocol::remote::{self, Request, Response};
-use rustls::{ClientConnection, StreamOwned};
+use rustls::{ClientConfig, ClientConnection, StreamOwned};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// 建连超时：局域网内建连失败通常立刻返回，这个上限只兜「对端不响应」
@@ -30,6 +30,18 @@ pub const IO_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// 一条已握手的客户端连接
 type Conn = Session<StreamOwned<ClientConnection, TcpStream>>;
+
+/// 首次配对前的探测结果：对端证书指纹 + 握手信息
+///
+/// 指纹来自 TLS 握手本身（不是对端自报），用户确认后用它构造固定指纹的
+/// [`Client`]；对端在 `Hello` 里自报的指纹必须与之一致，否则按中间人拒绝。
+#[derive(Debug, Clone)]
+pub struct Probe {
+    /// TLS 证书指纹
+    pub fingerprint: Fingerprint,
+    /// 握手信息（名称 / 版本 / 能力 / 是否已有客户端）
+    pub greeting: Greeting,
+}
 
 /// 远端客户端
 pub struct Client {
@@ -93,6 +105,61 @@ impl Client {
         let mut guard = self.lock()?;
         *guard = None;
         Ok(())
+    }
+
+    /// 首次配对前的探测：建连、捕获对端证书指纹并读取握手信息
+    ///
+    /// 不认证、不写任何东西。调用方把 [`Probe::fingerprint`] 展示给用户，
+    /// 确认后再用固定指纹的 [`Client`] 完成 `Enroll`。
+    ///
+    /// # Errors
+    ///
+    /// 建连、TLS 或协议失败时返回 [`TransportError`]
+    pub fn probe(target: &str) -> Result<Probe, TransportError> {
+        let captured: Arc<Mutex<Option<Fingerprint>>> = Arc::new(Mutex::new(None));
+        let config = tls::client_config_capture(Arc::clone(&captured))?;
+        let mut conn = connect_with(target, &config)?;
+        let greeting = match conn.exchange(&hello_request())? {
+            Response::Hello {
+                protocol_version,
+                agent_version,
+                server_name,
+                capabilities,
+                fingerprint,
+                has_clients,
+            } => {
+                remote::check_protocol_version(protocol_version)
+                    .map_err(TransportError::Protocol)?;
+                let declared = Fingerprint::parse(&fingerprint)?;
+                let actual = captured_fingerprint(&captured)?;
+                if declared != actual {
+                    return Err(TransportError::FingerprintMismatch {
+                        expected: actual.to_string(),
+                        actual: declared.to_string(),
+                    });
+                }
+                Greeting {
+                    agent_version,
+                    server_name,
+                    capabilities,
+                    fingerprint: actual,
+                    has_clients,
+                }
+            }
+            Response::Error { kind, message } => {
+                return Err(TransportError::Remote { kind, message });
+            }
+            other => {
+                return Err(TransportError::Protocol(format!(
+                    "expected hello, got {}",
+                    response_name(&other)
+                )));
+            }
+        };
+        Ok(Probe {
+            fingerprint: captured_fingerprint(&captured)?,
+            greeting,
+        })
     }
 
     /// 握手并取对端信息（不需要认证）
@@ -245,30 +312,8 @@ impl Client {
 
     /// 建一条新连接（已完成 TLS 握手）
     fn connect(&self) -> Result<Conn, TransportError> {
-        let addr = self
-            .target
-            .to_socket_addrs()
-            .map_err(|err| TransportError::io(format!("resolve {}", self.target), err))?
-            .next()
-            .ok_or_else(|| {
-                TransportError::io(
-                    format!("resolve {}", self.target),
-                    std::io::Error::new(
-                        std::io::ErrorKind::AddrNotAvailable,
-                        "no address resolved",
-                    ),
-                )
-            })?;
-        let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
-            .map_err(|err| TransportError::io(format!("connect {}", self.target), err))?;
-        configure(&stream)?;
-
         let config = tls::client_config(&self.fingerprint)?;
-        let server_name = rustls_pki_types::ServerName::try_from("mcsup.local")
-            .map_err(|err| TransportError::Protocol(format!("server name: {err}")))?
-            .to_owned();
-        let connection = ClientConnection::new(config, server_name)?;
-        Ok(Session::new(StreamOwned::new(connection, stream)))
+        connect_with(&self.target, &config)
     }
 
     /// 取连接锁
@@ -277,6 +322,40 @@ impl Client {
             .lock()
             .map_err(|_| TransportError::Protocol("client connection lock poisoned".to_owned()))
     }
+}
+
+/// 按目标地址与 TLS 配置建一条已握手的连接
+fn connect_with(target: &str, config: &Arc<ClientConfig>) -> Result<Conn, TransportError> {
+    let addr = target
+        .to_socket_addrs()
+        .map_err(|err| TransportError::io(format!("resolve {target}"), err))?
+        .next()
+        .ok_or_else(|| {
+            TransportError::io(
+                format!("resolve {target}"),
+                std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no address resolved"),
+            )
+        })?;
+    let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+        .map_err(|err| TransportError::io(format!("connect {target}"), err))?;
+    configure(&stream)?;
+
+    let server_name = rustls_pki_types::ServerName::try_from("mcsup.local")
+        .map_err(|err| TransportError::Protocol(format!("server name: {err}")))?
+        .to_owned();
+    let connection = ClientConnection::new(Arc::clone(config), server_name)?;
+    Ok(Session::new(StreamOwned::new(connection, stream)))
+}
+
+/// 取 TLS 握手期间捕获的指纹
+fn captured_fingerprint(
+    captured: &Arc<Mutex<Option<Fingerprint>>>,
+) -> Result<Fingerprint, TransportError> {
+    captured
+        .lock()
+        .map_err(|_| TransportError::Protocol("fingerprint lock poisoned".to_owned()))?
+        .clone()
+        .ok_or_else(|| TransportError::Protocol("peer did not present a certificate".to_owned()))
 }
 
 /// 客户端首帧

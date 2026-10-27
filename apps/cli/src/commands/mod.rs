@@ -5,7 +5,9 @@ mod install;
 mod java;
 mod lifecycle;
 mod modpack;
+mod origin;
 mod props;
+mod remote;
 mod server_ops;
 mod settings;
 mod workspace;
@@ -19,12 +21,14 @@ use anyhow::{Context, Result};
 use std::path::Path;
 
 pub(crate) async fn run(cli: Cli, cfg: &ConfigFile, lang: Lang) -> Result<()> {
-    let printer = Printer::new(cli.output, lang);
+    // 全局 `-y` 必须随 Printer 一起进入命令层：确认式提问（删除、首次信任
+    // 指纹）统一读 `assumes_yes()`，在这里丢掉会让 `-y` 对命令完全失效。
+    let printer = Printer::new(cli.output, lang).with_yes(cli.yes);
     match cli.command {
         Command::Workspace { action } => workspace::run(action, printer),
         Command::Server { action } => server(action, cfg, printer).await,
         Command::Java { action } => java(action, printer).await,
-        Command::Remote { .. } => err("remote"),
+        Command::Remote { action } => remote::run(action, printer),
         Command::Doctor { only, strict } => doctor::run(cfg, &only, strict, printer).await,
         Command::Config { action } => config::run(action, printer),
         Command::Update => err("update"),
@@ -116,8 +120,28 @@ const PROFILE: &str = if cfg!(debug_assertions) {
 
 async fn java(action: JavaAction, printer: Printer) -> Result<()> {
     match action {
-        JavaAction::List => java::list(printer),
-        JavaAction::Scan => java::scan(printer),
+        JavaAction::List { origin } => {
+            let filter = origin::filter(origin.as_deref(), printer.lang())?;
+            java::list(&filter, printer)
+        }
+        JavaAction::Scan { origin } => {
+            if let Some(origin) = origin {
+                let origin = mcsup::port::Origin::parse(&origin).map_err(|err| {
+                    AppDiagnostic::usage(
+                        crate::i18n::pick(
+                            printer.lang(),
+                            format!("--origin 取值非法: {origin}"),
+                            format!("invalid --origin value: {origin}"),
+                        ),
+                        Some(err.to_string()),
+                    )
+                })?;
+                if !origin.is_local() {
+                    return java::scan_remote(&origin, printer);
+                }
+            }
+            java::scan(printer)
+        }
         JavaAction::Install {
             version,
             jre,
@@ -129,11 +153,16 @@ async fn java(action: JavaAction, printer: Printer) -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn server(action: ServerAction, cfg: &ConfigFile, printer: Printer) -> Result<()> {
     match action {
-        ServerAction::List => server_ops::list(printer),
+        ServerAction::List { origin } => {
+            let filter = origin::filter(origin.as_deref(), printer.lang())?;
+            server_ops::list(&filter, printer)
+        }
         ServerAction::Create {
             name,
+            origin,
             version,
             variant,
             workspace,
@@ -144,6 +173,7 @@ async fn server(action: ServerAction, cfg: &ConfigFile, printer: Printer) -> Res
             server_ops::create(
                 server_ops::CreateArgs {
                     name: name.as_deref(),
+                    origin: origin.as_deref(),
                     version: version.as_deref(),
                     variant: variant.as_deref(),
                     workspace: workspace.as_deref(),
@@ -206,8 +236,27 @@ async fn server(action: ServerAction, cfg: &ConfigFile, printer: Printer) -> Res
             let name = server_ops::require_server_name(name.as_deref(), "server set", printer)?;
             settings::set(&name, key.as_deref(), value.as_deref(), printer)
         }
-        ServerAction::Remove { name, purge } => {
+        ServerAction::Remove {
+            name,
+            purge,
+            origin,
+        } => {
             let name = server_ops::require_server_name(name.as_deref(), "server remove", printer)?;
+            if let Some(origin) = origin {
+                let origin = mcsup::port::Origin::parse(&origin).map_err(|err| {
+                    AppDiagnostic::usage(
+                        crate::i18n::pick(
+                            printer.lang(),
+                            format!("--origin 取值非法: {origin}"),
+                            format!("invalid --origin value: {origin}"),
+                        ),
+                        Some(err.to_string()),
+                    )
+                })?;
+                if !origin.is_local() {
+                    return server_ops::remove_remote(&origin, &name, purge, printer);
+                }
+            }
             server_ops::remove(&name, purge, printer)
         }
         ServerAction::Link {

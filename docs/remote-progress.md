@@ -16,7 +16,7 @@
 | 7 | 远端仓库（workspace / server / java） | 完成 |
 | 8 | `RemoteBackend`：远端 supervisor（`RemoteSupervisor` + `RoutingSupervisor`） | 完成 |
 | 9 | 远端备份（元数据帧路由）+ 远端日志尾部 | 完成（流式进度未做） |
-| 10 | CLI `remote` 命令与 `--origin` | 待开始 |
+| 10 | CLI `remote` 命令与 `--origin` | 完成（SSH / 局域网发现待实现） |
 
 ## 已完成
 
@@ -275,7 +275,46 @@ roundtrip 全量权限覆盖补 `BackupList` 样例（`Permission::Backup` 豁�
   一切非 aarch64 当成 x64。
 - 回归测试锁住归一规则与「aarch64 请求不得接受 x64 归档」。
 
+### 阶段 10：CLI（已完成的部分）
+
+- `remote serve`：前台运行 `mcsup::remote::Agent`，打印名称 / 地址 / 指纹 /
+  配对码；码过期自动轮换。`--status` 离线读身份、名册与 pid；`--stop` 按
+  `{data_dir}/remote/agent.pid` 终止前台进程。**系统服务注册（systemd /
+  launchd）尚未实现**，`serve` 目前是前台进程。
+- `remote connect <host[:port]>`：`Client::probe` 捕获 TLS 指纹 → 展示并确认
+  （非交互需 `-y`）→ `Enroll` → 写 `credentials.toml`（0600）与
+  `config.toml [remotes.*]` → 打印同步摘要。`--code` 给配对码，`--name`
+  覆盖远端名，`--read-only` 以 viewer 配对。
+- `remote reconnect <name>`：复用记录，先 probe 校验指纹未变，再用已存 token
+  认证；指纹变化要求重新 `connect`。
+- `remote list` / `status` / `ping` / `disconnect` / `revoke`：`list` 每台做一次
+  `Ping` 探测（`ok` / `unreachable` / `unauthorized`）；`revoke` 在 serve 端
+  离线删除名册记录。
+- `--origin`：`workspace ls` / `server ls` / `java ls` 支持
+  `all|local|remote|<name>`，`MCSUP_ORIGIN` 作为缺省；人类输出加 `ORIGIN`
+  列，JSON 每项加 `origin` 字段。`workspace init/use/remove`、
+  `server create/remove`、`java scan` 支持 `--origin <远端>` 直接在对端执行。
+- 限定名 `origin/name` 接到服务器选择器；同名跨来源时明确拒绝远端路由，
+  避免落到本地同名服务器。
+- 退出码 6（未授权：token 失效 / 权限不足 / 指纹变化）。
+- 修复：`commands::run` 重建 `Printer` 时丢失全局 `-y`，导致 `-y` 对确认
+  式提问完全失效。
+
+测试：`apps/cli/tests/cli_remote.rs` 用真 agent + 真 CLI 覆盖
+`connect → list → workspace init --origin → workspace ls --origin → ping →
+disconnect`、`server create/list/status/remove --origin`、`java scan --origin`，
+以及无 `-y` 拒绝信任未知指纹、死端点失败路径。
+
 ## 后续待办
+
+### SSH 接入与局域网发现（未做）
+
+- `connect user@host` 目前明确报「SSH 接入尚未实现」；`RemoteVia::Ssh` 在
+  装配层被跳过。实现方式：用 SSH 执行远端 `mcsup remote serve` 引导、把
+  配对码经 SSH 回传，复用已有 SSH 信任，不新增凭证。
+- `connect` 无参数目前报用法错误；局域网发现需要 mDNS/SSDP 或端口扫描，
+  并处理多网卡、防火墙与同名冲突。
+- 系统服务注册（systemd unit / launchd plist）未做，`serve` 仍是前台进程。
 
 ### 阶段 9 剩余：流式（未做）
 
@@ -294,19 +333,11 @@ roundtrip 全量权限覆盖补 `BackupList` 样例（`Permission::Backup` 豁�
 - 两者落地前，`docs/remote.md` 的「进度、日志、备份进度后续以流式帧承载」
   仍是计划而非承诺；接口沿用 `ProgressSink` / `EventSink` 语义不变。
 
-### 阶段 10：CLI（未做，下一步）
+### 阶段 10 收尾
 
-- `remote` 子命令：`serve` / `connect` / `reconnect` / `list` / `ping` /
-  `disconnect` / `revoke`。`serve` 在 `apps/agent` 已有 bin（`mcsup-agent`），
-  CLI 侧需要补 `mcsup remote serve` 入口（复用 `crates/mcsup` 的同一份
-  `Agent`，满足「serve 端两入口跑同一份实现」）。
-- `connect <target>` 首次配对（打印指纹等用户确认），`reconnect <name>`
-  复用已配对记录；成员表写入 `config.toml [remotes.*]`。
-- 全局 `--origin` 过滤：`OriginFilter`（阶段 2 已在 `service::origin`
-  就绪），接到 `workspace ls` / `server ls` / `java ls` 与列表命令；
-  `MCSUP_ORIGIN` 环境变量与保留字校验同步落地。
-- 退出码新增 6 = 未授权（token 失效 / 权限不足 / 指纹变化）。
-- 完成后 `docs/remote.md` 的「用户接入」一节全部可演示，删除其计划性措辞。
+- 阶段 10 已完成；剩余项见「SSH 接入与局域网发现」与「阶段 9 剩余：流式」。
+- `docs/remote.md` 的用户接入一节已按实际能力收敛（SSH / 局域网发现 /
+  系统服务注册明确标为未实现）。
 
 ## 已确认的设计取舍
 
@@ -330,6 +361,6 @@ roundtrip 全量权限覆盖补 `BackupList` 样例（`Permission::Backup` 豁�
   （由 `mcsup java install 21 --vendor temurin -y` 安装，已验证可执行）。
 - `apps/cli/tests/cli_e2e.rs` 隔离 `HOME`，靠宿主 `PATH` 找 java，跑测试前需把
   该 `bin` 目录加进 `PATH`。
-- 远端链路的真机验证（起 `mcsup-agent`、CLI 连局域网地址、跑一次远端备份）
-  待阶段 10 CLI 完成后一并做——当前远端功能可经库接口与 TLS 垫片测试覆盖，
-  但没有独立的 `mcsup remote connect` 命令，手工验证要走临时装配。
+- 远端链路的自动化验证：`apps/cli/tests/cli_remote.rs` 在本机起真 agent +
+  真 CLI，覆盖配对、来源过滤、远端建站 / 删站、远端 Java 扫描与断开。跨机器
+  真机验证（两台物理机 + 局域网地址 + 远端备份）仍待手工执行。

@@ -15,6 +15,8 @@ use serde::Serialize;
 /// `server list` 单行
 #[derive(Debug, Serialize)]
 pub struct ServerRow<'a> {
+    /// 来源：`local` 或远端名
+    pub origin: String,
     /// 服务器名
     pub name: &'a str,
     /// 工作区显示名
@@ -231,6 +233,8 @@ pub struct VersionJson<'a> {
 /// `workspace list` 单行
 #[derive(Debug, Serialize)]
 pub struct WorkspaceRow<'a> {
+    /// 来源：`local` 或远端名
+    pub origin: String,
     /// 工作区名
     pub name: &'a str,
     /// 目录绝对路径
@@ -314,6 +318,8 @@ pub struct DoctorJson<'a> {
 /// `java list` 单行
 #[derive(Debug, Serialize)]
 pub struct JavaRow<'a> {
+    /// 来源：`local` 或远端名
+    pub origin: String,
     /// Java 大版本
     pub major: i64,
     /// 完整版本串
@@ -448,6 +454,99 @@ pub struct VersionInfoJson<'a> {
     pub protocol_version: u32,
 }
 
+/// `remote list` / `remote status` 单行
+#[derive(Debug, Serialize)]
+pub struct RemoteRow {
+    /// 远端名（同时是 `--origin` 的取值）
+    pub name: String,
+    /// 用户输入的原始 target
+    pub target: String,
+    /// 接入方式：`direct` / `ssh`
+    pub via: String,
+    /// 连接状态：`ok` / `unreachable` / `unauthorized`
+    pub state: String,
+    /// 角色：`viewer` / `operator` / `admin`；未知时为 `null`
+    pub role: Option<String>,
+    /// 对端 agent 版本；不可达时为 `null`
+    pub agent_version: Option<String>,
+    /// 证书指纹
+    pub fingerprint: Option<String>,
+    /// 是否只读配对
+    pub read_only: bool,
+}
+
+/// `remote list` 信封
+#[derive(Debug, Serialize)]
+pub struct RemoteListJson {
+    /// 全部远端
+    pub items: Vec<RemoteRow>,
+}
+
+/// `remote ping` 结果
+#[derive(Debug, Serialize)]
+pub struct RemotePingJson<'a> {
+    /// 远端名
+    pub name: &'a str,
+    /// 对端 agent 版本
+    pub agent_version: &'a str,
+    /// 远端协议版本
+    pub protocol_version: u32,
+    /// 已运行秒数
+    pub uptime_secs: u64,
+    /// 能力名（稳定升序）
+    pub capabilities: Vec<&'a str>,
+}
+
+/// `remote connect` / `reconnect` 结果
+#[derive(Debug, Serialize)]
+pub struct RemoteConnectJson<'a> {
+    /// 远端名
+    pub name: &'a str,
+    /// 连接目标
+    pub target: &'a str,
+    /// 证书指纹（已固定）
+    pub fingerprint: &'a str,
+    /// 角色
+    pub role: &'a str,
+    /// 同步到的工作区数
+    pub workspaces: usize,
+    /// 同步到的服务器数
+    pub servers: usize,
+    /// 同步到的 Java 运行时数
+    pub java: usize,
+}
+
+/// `remote disconnect` 结果
+#[derive(Debug, Serialize)]
+pub struct RemoteDisconnectJson<'a> {
+    /// 远端名
+    pub name: &'a str,
+    /// 是否删除了本地配对记录（幂等：本来就没有时为 `false`）
+    pub removed: bool,
+}
+
+/// `remote serve` 结果（常驻进程启动时打印一次）
+#[derive(Debug, Serialize)]
+pub struct RemoteServeJson<'a> {
+    /// 本机名
+    pub name: &'a str,
+    /// 监听地址
+    pub listen: &'a str,
+    /// 证书指纹
+    pub fingerprint: &'a str,
+    /// 当前配对码；无可用码时为 `null`
+    pub pairing_code: Option<&'a str>,
+}
+
+/// `remote revoke` 结果
+#[derive(Debug, Serialize)]
+pub struct RemoteRevokeJson<'a> {
+    /// 被撤销的客户端
+    pub client: &'a str,
+    /// 是否真的删除了记录（幂等）
+    pub removed: bool,
+}
+
 /// `backup list` 单行
 ///
 /// 字段口径与 `service` 层的快照类型对齐，但只暴露稳定、机器可读的
@@ -568,6 +667,7 @@ mod tests {
     #[test]
     fn server_row_field_names_are_stable() {
         let row = ServerRow {
+            origin: "local".to_owned(),
             name: "alpha",
             workspace: "ws".to_owned(),
             version: "1.21.1",
@@ -579,6 +679,7 @@ mod tests {
         };
         let json = serde_json::to_string(&row).expect("serialize");
         for field in [
+            "\"origin\":\"local\"",
             "\"name\":\"alpha\"",
             "\"workspace\":\"ws\"",
             "\"version\":\"1.21.1\"",

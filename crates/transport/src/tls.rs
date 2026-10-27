@@ -69,6 +69,81 @@ pub fn client_config(expected: &Fingerprint) -> Result<Arc<ClientConfig>, Transp
     Ok(Arc::new(config))
 }
 
+/// 首次配对：接受对端证书并记下指纹（TOFU 的「首次」一半）
+///
+/// 这里不校验任何东西——用户还没见过指纹，也就没有可校验的对象。指纹被
+/// 捕获后由入口展示给用户确认，确认过的值再走 [`client_config`] 固定。
+///
+/// # Errors
+///
+/// 密码学后端不可用时返回 [`TransportError::Tls`]
+pub fn client_config_capture(
+    captured: Arc<std::sync::Mutex<Option<Fingerprint>>>,
+) -> Result<Arc<ClientConfig>, TransportError> {
+    let provider = provider();
+    let verifier = Arc::new(CaptureVerifier {
+        captured,
+        algorithms: provider.signature_verification_algorithms,
+    });
+    let config = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    Ok(Arc::new(config))
+}
+
+/// 首次配对用的校验器：只记录，不拒绝
+struct CaptureVerifier {
+    captured: Arc<std::sync::Mutex<Option<Fingerprint>>>,
+    algorithms: WebPkiSupportedAlgorithms,
+}
+
+impl std::fmt::Debug for CaptureVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CaptureVerifier").finish_non_exhaustive()
+    }
+}
+
+impl ServerCertVerifier for CaptureVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let fingerprint = Fingerprint::of_der(end_entity.as_ref());
+        if let Ok(mut slot) = self.captured.lock() {
+            *slot = Some(fingerprint);
+        }
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.algorithms.supported_schemes()
+    }
+}
+
 /// 固定指纹的证书校验器
 ///
 /// 只比对指纹，不查有效期、不查名称、不查链：这张证书是我们唯一认识的那张，

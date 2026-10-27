@@ -6,12 +6,14 @@ expression: shape(&listed)
   {
     "current": "bool",
     "name": "string",
+    "origin": "string",
     "path": "string",
     "servers": "number"
   },
   {
     "current": "bool",
     "name": "string",
+    "origin": "string",
     "path": "string",
     "servers": "number"
   }

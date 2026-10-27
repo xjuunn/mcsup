@@ -67,7 +67,7 @@ pub(crate) fn require_server_name(
     printer: Printer,
 ) -> Result<String> {
     if let Some(name) = name {
-        return Ok(name.to_owned());
+        return super::origin::resolve_server_name(name, printer);
     }
     if !printer.is_interactive() {
         return Err(AppDiagnostic::usage(
@@ -134,24 +134,30 @@ pub(crate) fn require_text(
     )
 }
 
-pub(crate) fn list(printer: Printer) -> Result<()> {
-    let reg = open_registry()?;
-    let all = reg.list().context(crate::i18n::pick(
+pub(crate) fn list(filter: &mcsup::service::OriginFilter, printer: Printer) -> Result<()> {
+    let reg = bootstrap::open_registry_with_remotes()?;
+    let all = reg.list_sourced().context(crate::i18n::pick(
         printer.lang(),
         "列出服务器失败",
         "failed to list servers",
     ))?;
+    let all: Vec<_> = all
+        .into_iter()
+        .filter(|sourced| filter.matches(&sourced.origin))
+        .collect();
     let ws_names = workspace_names()?;
     let statuses = super::lifecycle::lifecycle_service()?.statuses()?;
     let rows: Vec<ServerRowView<'_>> = all
         .iter()
-        .map(|srv| {
+        .map(|sourced| {
+            let srv = &sourced.value;
             // 单台探测失败记 unknown，不拖死整个列表
             let probe = statuses.get(srv.meta.name.as_str());
             let view = probe.and_then(|p| p.as_ref().ok()).and_then(Option::as_ref);
             let unreachable = probe.is_some_and(Result::is_err);
             ServerRowView {
                 row: ServerRow {
+                    origin: super::origin::label(&sourced.origin),
                     name: srv.meta.name.as_str(),
                     workspace: ws_names
                         .get(&srv.meta.workspace_id)
@@ -187,6 +193,7 @@ pub(crate) fn list(printer: Printer) -> Result<()> {
             let mut table = Table::new();
             table.set_header([
                 crate::i18n::text(lang, "名称", "name"),
+                crate::i18n::text(lang, "来源", "origin"),
                 crate::i18n::text(lang, "工作区", "workspace"),
                 crate::i18n::text(lang, "版本", "version"),
                 crate::i18n::text(lang, "变体", "variant"),
@@ -201,6 +208,7 @@ pub(crate) fn list(printer: Printer) -> Result<()> {
                 };
                 table.add_row([
                     Cell::new(row.row.name),
+                    Cell::new(&row.row.origin),
                     Cell::new(&row.row.workspace),
                     Cell::new(row.row.version),
                     Cell::new(row.row.variant),
@@ -218,6 +226,8 @@ pub(crate) fn list(printer: Printer) -> Result<()> {
 pub(crate) struct CreateArgs<'a> {
     /// 服务器名（位置参数）
     pub(crate) name: Option<&'a str>,
+    /// 目标来源：`local`（缺省）或远端名
+    pub(crate) origin: Option<&'a str>,
     /// 服务端版本（`--version`，接受 `latest` / `lts` / `latest-snapshot`）
     pub(crate) version: Option<&'a str>,
     /// 服务端变体（`--variant`）
@@ -248,9 +258,11 @@ fn is_modpack_flag(raw: &str) -> bool {
 /// # Errors
 ///
 /// 用法错误（2）、工作区 / 服务器冲突（3 / 4）、来源未支持、下载失败时返回错误
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn create(args: CreateArgs<'_>, printer: Printer) -> Result<()> {
     let CreateArgs {
         name,
+        origin,
         version,
         variant,
         workspace,
@@ -258,6 +270,22 @@ pub(crate) async fn create(args: CreateArgs<'_>, printer: Printer) -> Result<()>
         workspace_dir,
         modpack,
     } = args;
+    // 远端落点：远端只做「登记 + 核心安装由对端负责」，本地向导不参与
+    if let Some(origin) = origin {
+        let origin = mcsup::port::Origin::parse(origin).map_err(|err| {
+            AppDiagnostic::usage(
+                crate::i18n::pick(
+                    printer.lang(),
+                    format!("--origin 取值非法: {origin}"),
+                    format!("invalid --origin value: {origin}"),
+                ),
+                Some(err.to_string()),
+            )
+        })?;
+        if !origin.is_local() {
+            return create_remote(&origin, name, version, variant, workspace, printer);
+        }
+    }
     let interactive = printer.is_interactive();
     // `--modpack` 隐含整合包变体，避免用户同时写两个参数还写错
     let variant = modpack.is_some().then_some("modrinth-modpack").or(variant);
@@ -366,6 +394,89 @@ pub(crate) async fn create(args: CreateArgs<'_>, printer: Printer) -> Result<()>
     )
     .await?;
     report_created(&srv, printer)
+}
+
+/// `server create --origin <remote>`：在对端登记服务器
+///
+/// 核心下载 / 安装器由对端负责：客户端不下载、不拼远端路径。远端协议当前只有
+/// `ServerCreate`（登记），因此这里明确说明「已登记，核心需在对端 install」。
+fn create_remote(
+    origin: &mcsup::port::Origin,
+    name: Option<&str>,
+    version: Option<&str>,
+    variant: Option<&str>,
+    workspace: Option<&str>,
+    printer: Printer,
+) -> Result<()> {
+    let lang = printer.lang();
+    let cfg = crate::config::ConfigFile::locate(None).load()?;
+    let members = bootstrap::remote_members(&cfg)?;
+    let member = super::origin::member(&members, origin, lang)?.ok_or_else(|| {
+        AppDiagnostic::usage(
+            crate::i18n::pick(
+                lang,
+                "本地来源不需要远端创建",
+                "local origin does not need remote create",
+            ),
+            None,
+        )
+    })?;
+    let name = name.ok_or_else(|| {
+        AppDiagnostic::usage(
+            crate::i18n::pick(
+                lang,
+                "server create 缺少服务器名称",
+                "server create requires a server name",
+            ),
+            None,
+        )
+    })?;
+    let version = version.ok_or_else(|| {
+        AppDiagnostic::usage(
+            crate::i18n::pick(
+                lang,
+                "远端 server create 需要 --version",
+                "remote `server create` requires --version",
+            ),
+            None,
+        )
+    })?;
+    let variant = variant.ok_or_else(|| {
+        AppDiagnostic::usage(
+            crate::i18n::pick(
+                lang,
+                "远端 server create 需要 --variant",
+                "remote `server create` requires --variant",
+            ),
+            None,
+        )
+    })?;
+    let meta = member
+        .servers
+        .create(workspace, name, version, variant, None)
+        .with_context(|| {
+            crate::i18n::pick(lang, "在远端创建服务器", "creating the server on the peer")
+        })?;
+    printer.print_outcome(
+        &crate::i18n::pick(
+            lang,
+            format!(
+                "已在 {} 创建服务器 {} {}（{}）；核心需在对端运行 mcsup server install {}",
+                member.name, meta.name, meta.version, meta.variant.as_str(), meta.name
+            ),
+            format!(
+                "created server {} {} ({}) on {}; install the core on the peer with `mcsup server install {}`",
+                meta.name, meta.version, meta.variant.as_str(), member.name, meta.name
+            ),
+        ),
+        &CreateRow {
+            name: meta.name.as_str(),
+            version: meta.version.as_str(),
+            variant: meta.variant.as_str(),
+            path: String::new(),
+            linked: None,
+        },
+    )
 }
 
 /// 创建服务器之后的服务端布置
@@ -1193,6 +1304,45 @@ fn report_removed(
             purged: purge,
             disk_purged,
             linked: srv.linked,
+        },
+    )
+}
+
+/// `server remove --origin <remote>`：注销对端服务器（可选删盘）
+pub(crate) fn remove_remote(
+    origin: &mcsup::port::Origin,
+    name: &str,
+    purge: bool,
+    printer: Printer,
+) -> Result<()> {
+    let lang = printer.lang();
+    let cfg = crate::config::ConfigFile::locate(None).load()?;
+    let members = bootstrap::remote_members(&cfg)?;
+    let member = super::origin::member(&members, origin, lang)?.ok_or_else(|| {
+        AppDiagnostic::usage(
+            crate::i18n::pick(
+                lang,
+                "本地来源不需要远端删除",
+                "local origin does not need remote removal",
+            ),
+            None,
+        )
+    })?;
+    let disk_purged = member.servers.remove(name, purge).with_context(|| {
+        crate::i18n::pick(lang, "在远端删除服务器", "removing the server on the peer")
+    })?;
+    printer.print_outcome(
+        &crate::i18n::pick(
+            lang,
+            format!("已在 {} 注销服务器 {name}", member.name),
+            format!("removed server {name} on {}", member.name),
+        ),
+        &RemoveJson {
+            name: name.to_owned(),
+            path: String::new(),
+            purged: purge,
+            disk_purged,
+            linked: false,
         },
     )
 }

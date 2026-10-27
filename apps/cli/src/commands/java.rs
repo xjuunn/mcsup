@@ -13,12 +13,12 @@ use tracing::info;
 use crate::bootstrap;
 use crate::locale::Lang;
 
-pub(crate) fn list(printer: Printer) -> Result<()> {
+pub(crate) fn list(filter: &mcsup::service::OriginFilter, printer: Printer) -> Result<()> {
     let service = bootstrap::open_java_service()?;
     let mut progress = ScanProgress::new(printer.is_human(), printer.lang());
     let mut first_scan = false;
-    let runtimes = service
-        .list_or_scan(
+    let sourced = service
+        .list_sourced(
             &mut || {
                 first_scan = true;
                 printer.print_section(&crate::i18n::pick(
@@ -44,14 +44,22 @@ pub(crate) fn list(printer: Printer) -> Result<()> {
             "scan complete",
         ));
     }
+    let runtimes: Vec<_> = sourced
+        .into_iter()
+        .filter(|item| filter.matches(&item.origin))
+        .collect();
     let rows: Vec<JavaRow<'_>> = runtimes
         .iter()
-        .map(|rt| JavaRow {
-            major: rt.major.as_i64(),
-            version: rt.version.as_str(),
-            vendor: rt.vendor.as_str(),
-            managed: rt.managed,
-            path: rt.path.display().to_string(),
+        .map(|item| {
+            let rt = &item.value;
+            JavaRow {
+                origin: super::origin::label(&item.origin),
+                major: rt.major.as_i64(),
+                version: rt.version.as_str(),
+                vendor: rt.vendor.as_str(),
+                managed: rt.managed,
+                path: rt.path.display().to_string(),
+            }
         })
         .collect();
     printer.print_rows(
@@ -67,14 +75,17 @@ pub(crate) fn list(printer: Printer) -> Result<()> {
             let l = printer.lang();
             table.set_header([
                 crate::i18n::text(l, "大版本", "major"),
+                crate::i18n::text(l, "来源", "origin"),
                 crate::i18n::text(l, "完整版本", "version"),
                 crate::i18n::text(l, "厂商", "vendor"),
                 crate::i18n::text(l, "管理", "managed"),
                 crate::i18n::text(l, "路径", "path"),
             ]);
-            for rt in &runtimes {
+            for item in &runtimes {
+                let rt = &item.value;
                 table.add_row([
                     rt.major.to_string(),
+                    super::origin::label(&item.origin),
                     rt.version.clone(),
                     rt.vendor.as_str().to_owned(),
                     if rt.managed {
@@ -119,6 +130,46 @@ pub(crate) fn scan(printer: Printer) -> Result<()> {
         &JavaScanJson {
             registered: outcome.registered,
             skipped: outcome.skipped,
+        },
+    )
+}
+
+/// `java scan --origin <remote>`：让对端扫描并登记
+pub(crate) fn scan_remote(origin: &mcsup::port::Origin, printer: Printer) -> Result<()> {
+    let lang = printer.lang();
+    let cfg = crate::config::ConfigFile::locate(None).load()?;
+    let members = bootstrap::remote_members(&cfg)?;
+    let member = super::origin::member(&members, origin, lang)?.ok_or_else(|| {
+        AppDiagnostic::usage(
+            crate::i18n::pick(
+                lang,
+                "本地来源不需要远端扫描",
+                "local origin does not need a remote scan",
+            ),
+            None,
+        )
+    })?;
+    let runtimes = member
+        .java
+        .scan()
+        .with_context(|| crate::i18n::pick(lang, "远端扫描失败", "remote scan failed"))?;
+    printer.print_outcome(
+        &crate::i18n::pick(
+            lang,
+            format!(
+                "{} 扫描完成：已登记 {} 个 Java 运行时",
+                member.name,
+                runtimes.len()
+            ),
+            format!(
+                "scan on {} complete: {} Java runtimes registered",
+                member.name,
+                runtimes.len()
+            ),
+        ),
+        &JavaScanJson {
+            registered: runtimes.len(),
+            skipped: 0,
         },
     )
 }

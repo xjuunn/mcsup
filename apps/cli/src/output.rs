@@ -70,6 +70,15 @@ impl Printer {
         }
     }
 
+    /// 直接打印一张已构建的表格，仅人类模式
+    ///
+    /// JSON 模式下不输出任何内容：调用方负责在 JSON 分支自行序列化。
+    pub(crate) fn print_table(self, table: &Table) {
+        if self.format == OutputFormat::Human {
+            print_table(table);
+        }
+    }
+
     /// 一行红色警示，仅人类模式：不可恢复的危险操作前的最后提示
     #[allow(clippy::print_stdout)]
     pub(crate) fn print_warning(self, text: &str) {
@@ -241,6 +250,9 @@ impl Printer {
             if let Some(download) = cause.downcast_ref::<mcsup::port::DownloadError>() {
                 return download_exit_code(download);
             }
+            if let Some(transport) = cause.downcast_ref::<mcsup::transport::TransportError>() {
+                return transport_exit_code(transport);
+            }
         }
         1
     }
@@ -378,6 +390,23 @@ fn download_exit_code(err: &mcsup::port::DownloadError) -> u8 {
     }
 }
 
+/// 传输层失败 → 退出码
+///
+/// 未授权（token 失效 / 权限不足 / 指纹变化）单列 6，让脚本能把「重新配对」
+/// 与「网络断了」区分开；其余传输错误按后端失败（5）处理。
+fn transport_exit_code(err: &mcsup::transport::TransportError) -> u8 {
+    match err {
+        mcsup::transport::TransportError::Unauthorized(_)
+        | mcsup::transport::TransportError::FingerprintMismatch { .. } => 6,
+        mcsup::transport::TransportError::Remote { kind, .. }
+            if kind == mcsup::protocol::remote::ErrorKind::UNAUTHORIZED =>
+        {
+            6
+        }
+        _ => 5,
+    }
+}
+
 fn source_exit_code(source: &mcsup::port::SourceError) -> u8 {
     match source {
         // 400 是「你给的版本组合不存在」，与 NotFound 同为「资源不存在」，
@@ -499,7 +528,7 @@ fn print_error_line(text: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::Printer;
+    use super::{Printer, transport_exit_code};
     use anyhow::Context as _;
     use mcsup::domain::server::version::VersionId;
     use mcsup::port::SourceError;
@@ -759,5 +788,44 @@ mod tests {
             .context("下载服务端失败")
             .unwrap_err();
         assert_eq!(Printer::exit_code(&err), 130);
+    }
+
+    #[test]
+    fn transport_unauthorized_maps_to_exit_code_6() {
+        use mcsup::transport::TransportError;
+        assert_eq!(
+            transport_exit_code(&TransportError::Unauthorized("revoked".to_owned())),
+            6
+        );
+        assert_eq!(
+            transport_exit_code(&TransportError::FingerprintMismatch {
+                expected: "a".to_owned(),
+                actual: "b".to_owned(),
+            }),
+            6
+        );
+        assert_eq!(
+            transport_exit_code(&TransportError::Remote {
+                kind: mcsup::protocol::remote::ErrorKind::UNAUTHORIZED.to_owned(),
+                message: "nope".to_owned(),
+            }),
+            6
+        );
+        assert_eq!(
+            transport_exit_code(&TransportError::Remote {
+                kind: mcsup::protocol::remote::ErrorKind::NOT_FOUND.to_owned(),
+                message: "gone".to_owned(),
+            }),
+            5
+        );
+    }
+
+    #[test]
+    fn unauthorized_diagnostic_maps_to_exit_code_6() {
+        let err = anyhow::Error::from(crate::diagnostic::AppDiagnostic::unauthorized(
+            "token revoked",
+            None,
+        ));
+        assert_eq!(Printer::exit_code(&err), 6);
     }
 }

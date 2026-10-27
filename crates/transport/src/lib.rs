@@ -35,7 +35,7 @@ pub mod server;
 pub mod session;
 pub mod tls;
 
-pub use client::Client;
+pub use client::{Client, Probe};
 pub use error::TransportError;
 pub use fingerprint::Fingerprint;
 pub use handler::{Enrolled, Greeting, Handler, RemoteFailure, SessionInfo};

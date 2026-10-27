@@ -87,6 +87,37 @@ fn greeting_reports_identity_and_no_clients() {
     assert!(greeting.capabilities.has(Capability::Installer));
 }
 
+/// `Client::probe`：首次配对前捕获的指纹必须来自 TLS 证书本身
+///
+/// 这是 TOFU 的第一步：用户看到的指纹就是之后固定的那个；对端在 Hello 里
+/// 自报的指纹若与证书不一致，probe 直接拒绝（中间人）。
+#[test]
+fn probe_captures_the_certificate_fingerprint() {
+    let harness = Harness::start();
+    let probe = Client::probe(&harness.addr.to_string()).expect("probe");
+    assert_eq!(probe.fingerprint.to_string(), harness.fingerprint);
+    assert_eq!(probe.greeting.server_name, "test-box");
+    assert!(!probe.greeting.has_clients);
+    // probe 不消耗配对码，也不登记客户端
+    assert!(harness.agent.clients().is_empty().expect("empty"));
+}
+
+/// probe 之后仍可用捕获的指纹完成配对：两步之间没有状态丢失
+#[test]
+fn probe_then_enroll_uses_the_same_identity() {
+    let harness = Harness::start();
+    let probe = Client::probe(&harness.addr.to_string()).expect("probe");
+    let code = harness.agent.issue_pairing_code().expect("issue");
+    let enrolled = Client::new(harness.addr.to_string(), probe.fingerprint)
+        .enroll(&code.display_form(), "laptop", false)
+        .expect("enroll");
+    let client = harness.client().with_token(enrolled.token);
+    assert!(matches!(
+        client.call(&Request::Ping).expect("ping"),
+        Response::Pong { .. }
+    ));
+}
+
 /// 错码被拒且不消耗客户端名额
 #[test]
 fn wrong_pairing_code_is_rejected() {

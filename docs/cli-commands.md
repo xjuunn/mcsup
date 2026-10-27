@@ -56,10 +56,11 @@ restart / status / console / send / logs / props / set / remove / version`、
 `workspace init / use / remove`、`java install / uninstall`、
 `config set / unset`。
 
-尚未实现的命令（`server mod`、`remote`）参数声明已按规则改为可选，
-但入口在 service 能力落地前直接返回「尚未实现」，因此缺失必填参数时给的是
-未实现错误而非补参交互。service 层实现后，入口只需接上已有的
-`require_server_name` / 补参组件即可。
+尚未实现的命令（`server mod`）参数声明已按规则改为可选，但入口在 service
+能力落地前直接返回「尚未实现」，因此缺失必填参数时给的是未实现错误而非
+补参交互。service 层实现后，入口只需接上已有的 `require_server_name` /
+补参组件即可。`remote` 已全部接入（SSH 接入与局域网发现除外，二者显式报
+「尚未实现」）。
 
 ### 界面语言
 
@@ -142,7 +143,7 @@ mcsup
 │   ├── backup (bak)  create (cr) · list (ls) · restore (rt) · delete (rm) · verify (vf) · prune (pr)
 │   └── mod (md)      list (ls) · install (in) · remove (rm) · update (up) · outdated (od)
 ├── java (jv)                 # 机器级 JVM 运行时
-│   └── list (ls) [--origin <o>] / scan (sc) / install (in) / uninstall (un|rm)
+│   └── list (ls) [--origin <o>] / scan (sc) [--origin <名字>] / install (in) / uninstall (un|rm)
 ├── remote (rmt)              # 远端执行位置（Backend）
 │   ├── serve (sv) [--listen <addr>] [--name <n>] / serve --stop / serve --status
 │   ├── connect (con) [<user@host> | <host[:port]>] [--name <n>] [--read-only]
@@ -165,7 +166,7 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | 子命令 | 用法 | 说明 |
 | --- | --- | --- |
 | `list` | `mcsup server list [--origin <all\|local\|remote\|名字>]` | 列出所有服务与状态；`--origin` 按来源过滤（缺省 `all`），见 `docs/remote.md` |
-| `create` | `mcsup server create [<name>] [--version <ver>] [--variant <v>] [--workspace <名或路径>] [--workspace-name <名>] [--workspace-dir <路径>] [--origin <名字>]` | 建站并下载核心 JAR；`--origin` 选择远端落点，缺省跟随当前工作区的来源（变体从可用能力列选，缺省 vanilla；版本交互从列表选，也接受 `latest` / `lts` / `latest-snapshot` 别名，`lts` 等价 `latest`）。`--workspace` 命中已有工作区直接使用，未命中时配合 `--workspace-name` / `--workspace-dir` 新建；名称与路径不一致 → 退出码 2。TTY 缺名/缺版本进向导（名称重输直到唯一，步骤回显 `[n/3]`，参数给定则跳过对应步）；无工作区且可交互时先复用 `workspace init` 向导再继续；非 TTY 缺 `--version` 或缺名 → 退出码 2；显式变体未知/未支持 → 2 并列出可用变体；下载失败保留已注册结果，提示 `mcsup server install <name>` 重试。`--variant forge` 走「下载安装器 + 运行 `--installServer`」两步；`neoforge` 同理 |
+| `create` | `mcsup server create [<name>] [--version <ver>] [--variant <v>] [--workspace <名或路径>] [--workspace-name <名>] [--workspace-dir <路径>] [--origin <名字>]` | 建站并下载核心 JAR；`--origin <远端>` 在对端只做登记（核心需在对端 `server install`），本地缺省行为不变（变体从可用能力列选，缺省 vanilla；版本交互从列表选，也接受 `latest` / `lts` / `latest-snapshot` 别名，`lts` 等价 `latest`）。`--workspace` 命中已有工作区直接使用，未命中时配合 `--workspace-name` / `--workspace-dir` 新建；名称与路径不一致 → 退出码 2。TTY 缺名/缺版本进向导（名称重输直到唯一，步骤回显 `[n/3]`，参数给定则跳过对应步）；无工作区且可交互时先复用 `workspace init` 向导再继续；非 TTY 缺 `--version` 或缺名 → 退出码 2；显式变体未知/未支持 → 2 并列出可用变体；下载失败保留已注册结果，提示 `mcsup server install <name>` 重试。`--variant forge` 走「下载安装器 + 运行 `--installServer`」两步；`neoforge` 同理 |
 | `install` | `mcsup server install [<name>] [--version <ver>]` | 给既有服务安装/更换服务端核心（JAR），校验后落盘；交互无 `--version` 从版本列表选择（Release/Snapshot/旧版标注），非 TTY 缺省 `latest` 解析为 manifest 当前稳定版；服务器不存在 → 退出码 3。变体为 `forge` / `neoforge` 时要先运行安装器，缺可用 Java → 退出码 3 并提示先装 Java |
 | `start` | `mcsup server start [<name>] [--accept-eula]` | 经后台 supervisor 拉起 JVM（`server set java-version` 绑定了大版本则用该版本，否则取已注册 Java 最高大版本；核心 JAR 取已安装项；堆上限 `server set ram` 优先、缺省 2048 MiB），返回 supervisor PID；EULA 未同意时 TTY 询问，非交互缺 `--accept-eula` → 退出码 2；已在运行 → 4；无核心 / 无 Java / 绑定大版本无运行时 → 3；spawn / IPC 失败 → 5 |
 | `stop` | `mcsup server stop [<name>] [--grace <sec>] [--force]` | 先优雅停机（默认宽限 30s），宽限后 `--force` 强杀；未在运行幂等成功（exit 0）；超时未 `--force` → 退出码 1 并提示 `--force` |
@@ -177,7 +178,7 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | `props` | `mcsup server props [<name>] [key=value ...]` | 无参列出 `server.properties`（TTY 下随后进入交互：选键改值、逐项写入、Esc 退出）；`key=value` 直接写入并提醒重启生效；单独 `key` 缺值时 TTY 交互输入、非 TTY → 退出码 2；键 / 值非法 → 2 |
 | `set` | `mcsup server set [<name>] [<key>] [<value>]` | 设置服务属性，见下表；TTY 下缺 key 从键列表选、缺 value 按类型补齐（java-version 从已注册大版本选、ram 输入、autostart 二选一）；非 TTY 缺参 → 退出码 2；`java-version` 绑定无运行时的大版本 → 3 |
 | `link` | `mcsup server link <path> [--name <name>] [--workspace <ws>]` | 注册服务器目录：外部目录建符号链接进工作区（目标不能在任一工作区 `servers/` 内）；目标是某工作区 `servers/` 的直接子目录时不建链接、就地注册（恢复注册丢失的服务器，名称必须与目录名一致，`--workspace` 必须与目录归属一致）；带 `mcsup.json` 时复用其身份 |
-| `remove` | `mcsup server remove [<name>] [--purge]` | 缺名称时交互选择要删除的服务器；默认注销保留磁盘；交互下询问是否删除磁盘数据（默认不删），同意后红色警示并要求输入服务器名称确认（`-y` 跳过这两道确认）；`--purge` 跳过询问直接删目录（链接服务器拒绝 `--purge`，仅移除链接）；非交互不询问；终端工作目录就在该服务器目录内时拒绝（退出码 4，cd 出去后重试）；删盘的前置条件在确认框之前就校验，不满足立刻报错；JSON 同时输出 `purged`（请求了删盘）与 `disk_purged`（磁盘真的删了），目录本就不存在时后者为 `false` |
+| `remove` | `mcsup server remove [<name>] [--purge] [--origin <名字>]` | `--origin <远端>` 在对端注销（可选删盘）。缺名称时交互选择要删除的服务器；默认注销保留磁盘；交互下询问是否删除磁盘数据（默认不删），同意后红色警示并要求输入服务器名称确认（`-y` 跳过这两道确认）；`--purge` 跳过询问直接删目录（链接服务器拒绝 `--purge`，仅移除链接）；非交互不询问；终端工作目录就在该服务器目录内时拒绝（退出码 4，cd 出去后重试）；删盘的前置条件在确认框之前就校验，不满足立刻报错；JSON 同时输出 `purged`（请求了删盘）与 `disk_purged`（磁盘真的删了），目录本就不存在时后者为 `false` |
 | `version` | `mcsup server version [<name>]` | 当前安装的版本、变体、来源（provider 名）、核心大小与校验和；未安装核心提示 `server install` |
 
 ### 内部入口（隐藏）
@@ -228,8 +229,8 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | --- | --- | --- |
 | `init` | `mcsup workspace init [--dir <path>] [--name <name>] [--origin <名字>]` | 创建并注册工作目录；无 `--dir` 进入交互（默认当前目录），目录必须为空；`--dir` 是目标机器上的路径，`--origin` 选择远端，缺省本地 |
 | `list` | `mcsup workspace list [--origin <all\|local\|remote\|名字>]` | 已注册工作目录：名称、来源、路径、服务器数、是否当前；`--origin` 按来源过滤（缺省 `all`） |
-| `use` | `mcsup workspace use [<name>]` | 切换当前工作区；接受 `origin/name` 限定名；不带名字在 TTY 下交互选择；只影响 `create` / `link` 缺省落点，不隐藏其他目录的服务器 |
-| `remove` | `mcsup workspace remove [<name>] [--purge]` | 注销工作目录，同时清除该工作目录下的服务器登记；交互下询问是否删除磁盘数据（默认不删），同意后红色警示并要求输入工作区名称确认，`--purge` 跳过询问直接删除；删盘的前置条件（终端工作目录不在该工作区内、目录里的 `workspace.toml` 属于该记录）在确认框之前就校验，不满足立刻报错；终端工作目录就在该工作区内时拒绝（退出码 4，cd 出去后重试）；删除失败（目录被占用）保留注册，退出占用后重试即可；JSON 同时输出 `purged`（请求了删盘）与 `disk_purged`（磁盘真的删了），目录本就不存在时后者为 `false`；删除当前工作区时当前标记移交给剩余中按名称排序的第一个 |
+| `use` | `mcsup workspace use [<name>] [--origin <名字>]` | 切换当前工作区（`--origin <远端>` 切换对端的当前工作区）；接受 `origin/name` 限定名；不带名字在 TTY 下交互选择；只影响 `create` / `link` 缺省落点，不隐藏其他目录的服务器 |
+| `remove` | `mcsup workspace remove [<name>] [--purge] [--origin <名字>]` | `--origin <远端>` 在对端注销（可选删盘）。本地注销：同时清除该工作目录下的服务器登记；交互下询问是否删除磁盘数据（默认不删），同意后红色警示并要求输入工作区名称确认，`--purge` 跳过询问直接删除；删盘的前置条件（终端工作目录不在该工作区内、目录里的 `workspace.toml` 属于该记录）在确认框之前就校验，不满足立刻报错；终端工作目录就在该工作区内时拒绝（退出码 4，cd 出去后重试）；删除失败（目录被占用）保留注册，退出占用后重试即可；JSON 同时输出 `purged`（请求了删盘）与 `disk_purged`（磁盘真的删了），目录本就不存在时后者为 `false`；删除当前工作区时当前标记移交给剩余中按名称排序的第一个 |
 | `doctor` | `mcsup workspace doctor [--only <kind,...>] [--strict]` | 只读体检工作区与注册表一致性：10 项检查（见 `docs/workspace.md` 的表），error 级非零退出；`--only` 按检查项标识过滤，`--strict` 让 warning 也算失败 |
 
 ## 整合包（`server create --variant modrinth-modpack`）
@@ -279,7 +280,7 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | 子命令 | 用法 | 说明 |
 | --- | --- | --- |
 | `list` | `mcsup java list [--origin <all\|local\|remote\|名字>]` | 已注册运行时；未扫描过则自动扫描本机；`--origin` 按来源过滤（缺省 `all`） |
-| `scan` | `mcsup java scan` | 重新扫描本机已安装的 Java |
+| `scan` | `mcsup java scan [--origin <名字>]` | 扫描本机 Java 并登记；`--origin <远端>` 让对端扫描并返回其运行时列表 |
 | `install` | `mcsup java install [<version>] [--jre] [--vendor <name>]` | 从远端下载安装 JDK（默认）或 JRE；缺省版本时交互选择 |
 | `uninstall` | `mcsup java uninstall [<version或路径>] [--dir <路径>]` | 卸载；系统 Java 仅移除注册记录，文件保留。缺目标时 TTY 下从已注册运行时中交互选择（无注册运行时提示先 `java scan`）；同一 major 多个运行时且在 TTY 下交互选择；非 TTY 须用 `--dir` 显式指定路径 |
 
@@ -289,24 +290,24 @@ JVM 安装在平台数据目录 `{data_dir}/mcsup/java/`，不属于任何工作
 
 ## mcsup remote（远端执行位置 = Backend）
 
-接入只需两侧各一条命令：被连接端 `mcsup remote serve`，连接端
-`mcsup remote connect`。之后 `workspace` / `server` / `java` / `backup`
-命令完全不变，远端资源以 `ORIGIN` 列出现在原有列表中。完整设计见
-`docs/remote.md`。
+接入只需两侧各一条命令：被连接端 `mcsup remote serve`（前台进程，系统服务
+注册未实现），连接端 `mcsup remote connect <host[:port]> --code <配对码>`。
+之后 `workspace` / `server` / `java` / `backup` 命令不变，远端资源以
+`ORIGIN` 列出现在原有列表中。SSH 接入（`user@host`）与无参数局域网发现
+**尚未实现**。完整设计见 `docs/remote.md`。
 
 | 子命令 | 用法 | 说明 |
 | --- | --- | --- |
-| `serve` | `mcsup remote serve [--listen <addr>] [--name <n>]` | 本机作为被连接端：启动 agent、注册为系统服务、打印名称 / 地址 / 配对码 |
-| `serve --stop` | `mcsup remote serve --stop` | 停止并移除本机系统服务 |
-| `serve --status` | `mcsup remote serve --status` | 本机服务状态、监听地址、已配对客户端 |
-| `connect` | `mcsup remote connect [<user@host> \| <host[:port]>] [--name <n>] [--read-only]` | 配对远端；无参数时局域网发现 + 配对码；`user@host` 复用 SSH 信任 |
-| `list` | `mcsup remote list` | 已配对远端、连接状态、权限、agent 版本 |
-| `status` | `mcsup remote status [<name>]` | 单个远端详情 |
+| `serve` | `mcsup remote serve [--listen <addr>] [--name <n>]` | 本机作为被连接端：前台运行 agent，打印名称 / 地址 / 指纹 / 配对码（码过期自动轮换） |
+| `serve --stop` | `mcsup remote serve --stop` | 按 `{data_dir}/remote/agent.pid` 终止前台进程 |
+| `serve --status` | `mcsup remote serve --status` | 离线读本机身份、指纹、pid 与已配对客户端 |
+| `connect` | `mcsup remote connect <host[:port]> [--code <码>] [-y]` | 直连配对：probe 捕获指纹 → 展示确认（非交互需 `-y`）→ `Enroll` → 写配置与凭证 |
+| `reconnect` | `mcsup remote reconnect <name>` | 复用记录重新认证；指纹变化要求重新 connect |
+| `list` | `mcsup remote list` | 已配对远端、连接状态（`ok` / `unreachable` / `unauthorized`）、角色、agent 版本 |
+| `status` | `mcsup remote status [<name>]` | 单个远端详情（缺名等价 list） |
 | `ping` | `mcsup remote ping <name>` | 连通性 / 版本 / 能力，供脚本使用 |
-| `disconnect` | `mcsup remote disconnect <name>` | 删除本地配对与缓存，远端不受影响 |
-| `revoke` | `mcsup remote revoke <client>` | 在 serve 端撤销某个客户端，token 立即失效 |
-
-不带子命令的 `mcsup remote` 显示本机服务状态与已配对远端。
+| `disconnect` | `mcsup remote disconnect <name>` | 删除本地配对与凭证，远端不受影响 |
+| `revoke` | `mcsup remote revoke <client>` | 在 serve 端离线删除客户端记录，token 立即失效 |
 
 ### 来源（origin）与过滤
 
@@ -326,7 +327,7 @@ JVM 安装在平台数据目录 `{data_dir}/mcsup/java/`，不属于任何工作
 - `all` / `local` / `remote` 是保留字，不能用作远端名；远端名禁止包含 `/`。
 - 过滤只影响展示与返回集合，不改变命令语义；过滤后为空是成功（退出码 0）。
 - 人类输出增加 `ORIGIN` 列；JSON 每项增加 `origin` 字段。
-- 远端不可达时保留缓存条目，标记 `(offline)`；JSON 用 `available: false`。
+- 远端不可达时该来源的条目省略并记 warn（本地缓存未实现），本地条目照常返回。
 
 ## 平台级
 

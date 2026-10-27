@@ -101,7 +101,108 @@ pub(crate) fn java() -> &'static str {
 
 #[must_use]
 pub(crate) fn remote() -> &'static str {
-    t("远程执行位置", "remote execution targets")
+    t("远端接入与管理", "remote access and management")
+}
+
+#[must_use]
+pub(crate) fn remote_serve() -> &'static str {
+    t(
+        "本机作为被连接端：启动 agent 并打印配对信息",
+        "serve this machine: start the agent and print pairing info",
+    )
+}
+
+#[must_use]
+pub(crate) fn remote_connect() -> &'static str {
+    t(
+        "配对远端；缺省用局域网发现，也接受 user@host 或 host:port",
+        "pair a remote; discovers on the LAN by default, or pass user@host / host:port",
+    )
+}
+
+#[must_use]
+pub(crate) fn remote_reconnect() -> &'static str {
+    t(
+        "复用已配对记录重新连接（刷新 token / 指纹）",
+        "reconnect a paired remote (refresh token / fingerprint)",
+    )
+}
+
+#[must_use]
+pub(crate) fn remote_list() -> &'static str {
+    t(
+        "已配对远端与连接状态",
+        "paired remotes and connection status",
+    )
+}
+
+#[must_use]
+pub(crate) fn remote_status() -> &'static str {
+    t("单个远端的详细信息", "details for one remote")
+}
+
+#[must_use]
+pub(crate) fn remote_ping() -> &'static str {
+    t(
+        "连通性 / 版本 / 能力探测",
+        "probe connectivity, version and capabilities",
+    )
+}
+
+#[must_use]
+pub(crate) fn remote_disconnect() -> &'static str {
+    t(
+        "删除本地配对与缓存（远端服务不受影响）",
+        "remove the local pairing and cache (the remote keeps running)",
+    )
+}
+
+#[must_use]
+pub(crate) fn remote_revoke() -> &'static str {
+    t(
+        "在 serve 端撤销一个客户端",
+        "revoke a client on the serving side",
+    )
+}
+
+#[must_use]
+pub(crate) fn origin_filter_arg() -> &'static str {
+    t(
+        "按来源过滤：all（缺省）/ local / remote / <远端名>；也可用 MCSUP_ORIGIN",
+        "filter by origin: all (default) / local / remote / <remote-name>; also MCSUP_ORIGIN",
+    )
+}
+
+#[must_use]
+pub(crate) fn origin_target_arg() -> &'static str {
+    t(
+        "目标来源：local（缺省）或远端名；远端名即在该机器上执行",
+        "target origin: local (default) or a remote name; the remote name executes there",
+    )
+}
+
+#[must_use]
+pub(crate) fn remote_listen_arg() -> &'static str {
+    t(
+        "监听地址（缺省 0.0.0.0:7681）",
+        "listen address (default 0.0.0.0:7681)",
+    )
+}
+
+#[must_use]
+pub(crate) fn remote_name_arg() -> &'static str {
+    t(
+        "远端名（缺省取对端主机名）",
+        "remote name (defaults to the peer host name)",
+    )
+}
+
+#[must_use]
+pub(crate) fn remote_read_only_arg() -> &'static str {
+    t(
+        "以只读权限配对（viewer 角色）",
+        "pair with read-only permission (viewer role)",
+    )
 }
 
 #[must_use]

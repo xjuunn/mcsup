@@ -139,13 +139,22 @@ pub(crate) enum WorkspaceAction {
         dir: Option<PathBuf>,
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
+        #[arg(long, value_name = "ORIGIN", help = crate::meta::origin_target_arg())]
+        origin: Option<String>,
     },
     #[command(about = crate::meta::workspace_list())]
     #[command(visible_alias = "ls")]
-    List,
+    List {
+        #[arg(long, value_name = "ORIGIN", help = crate::meta::origin_filter_arg())]
+        origin: Option<String>,
+    },
     #[command(about = crate::meta::workspace_use())]
     #[command(visible_alias = "sw")]
-    Use { name: Option<String> },
+    Use {
+        name: Option<String>,
+        #[arg(long, value_name = "ORIGIN", help = crate::meta::origin_target_arg())]
+        origin: Option<String>,
+    },
     #[command(about = crate::meta::workspace_remove())]
     #[command(visible_alias = "rm")]
     Remove {
@@ -153,6 +162,8 @@ pub(crate) enum WorkspaceAction {
         name: Option<String>,
         #[arg(long)]
         purge: bool,
+        #[arg(long, value_name = "ORIGIN", help = crate::meta::origin_target_arg())]
+        origin: Option<String>,
     },
     #[command(name = "doctor", about = crate::meta::workspace_doctor())]
     #[command(visible_alias = "doc")]
@@ -173,7 +184,10 @@ pub(crate) enum WorkspaceAction {
 pub(crate) enum ServerAction {
     #[command(about = crate::meta::server_list())]
     #[command(visible_alias = "ls")]
-    List,
+    List {
+        #[arg(long, value_name = "ORIGIN", help = crate::meta::origin_filter_arg())]
+        origin: Option<String>,
+    },
     #[command(about = crate::meta::server_create())]
     #[command(visible_alias = "cr")]
     Create {
@@ -211,6 +225,8 @@ pub(crate) enum ServerAction {
             help = crate::meta::server_create_modpack_arg()
         )]
         modpack: Option<String>,
+        #[arg(long, value_name = "ORIGIN", help = crate::meta::origin_target_arg())]
+        origin: Option<String>,
     },
     #[command(about = crate::meta::server_install())]
     #[command(visible_alias = "in")]
@@ -320,6 +336,8 @@ pub(crate) enum ServerAction {
         name: Option<String>,
         #[arg(long)]
         purge: bool,
+        #[arg(long, value_name = "ORIGIN", help = crate::meta::origin_target_arg())]
+        origin: Option<String>,
     },
     #[command(about = crate::meta::server_link())]
     #[command(visible_alias = "ln")]
@@ -467,10 +485,16 @@ pub(crate) enum ModAction {
 pub(crate) enum JavaAction {
     #[command(about = crate::meta::java_list())]
     #[command(visible_alias = "ls")]
-    List,
+    List {
+        #[arg(long, value_name = "ORIGIN", help = crate::meta::origin_filter_arg())]
+        origin: Option<String>,
+    },
     #[command(about = crate::meta::java_scan())]
     #[command(visible_alias = "sc")]
-    Scan,
+    Scan {
+        #[arg(long, value_name = "ORIGIN", help = crate::meta::origin_target_arg())]
+        origin: Option<String>,
+    },
     #[command(about = crate::meta::java_install())]
     #[command(visible_alias = "in")]
     Install {
@@ -500,19 +524,61 @@ pub(crate) enum JavaAction {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum RemoteAction {
+    #[command(about = crate::meta::remote_serve())]
+    #[command(visible_alias = "sv")]
+    Serve {
+        #[arg(
+            long,
+            value_name = "ADDR",
+            default_value = "0.0.0.0:7681",
+            help = crate::meta::remote_listen_arg()
+        )]
+        listen: String,
+        #[arg(long, value_name = "NAME", help = crate::meta::remote_name_arg())]
+        name: Option<String>,
+        /// 停止本机服务（向正在运行的 agent 发 Shutdown）
+        #[arg(long, conflicts_with_all = ["name", "status"])]
+        stop: bool,
+        /// 查看本机服务状态（身份、指纹、已配对客户端）
+        #[arg(long, conflicts_with = "name")]
+        status: bool,
+    },
+    #[command(about = crate::meta::remote_connect())]
+    #[command(visible_alias = "con")]
+    Connect {
+        /// `user@host`（复用 SSH 信任）或 `host[:port]`（直连 + 配对码）
+        target: Option<String>,
+        #[arg(long, value_name = "NAME", help = crate::meta::remote_name_arg())]
+        name: Option<String>,
+        #[arg(long, help = crate::meta::remote_read_only_arg())]
+        read_only: bool,
+        /// 配对码；非交互下必填，交互下缺省提示输入
+        #[arg(long, value_name = "CODE")]
+        code: Option<String>,
+    },
+    #[command(about = crate::meta::remote_reconnect())]
+    #[command(visible_alias = "rc")]
+    Reconnect { name: String },
+    #[command(about = crate::meta::remote_list())]
     #[command(visible_alias = "ls")]
     List,
-    #[command(visible_alias = "dp")]
-    Deploy {
-        name: String,
-        host: String,
-        #[arg(long, value_name = "TOKEN")]
-        token: Option<String>,
-    },
+    #[command(about = crate::meta::remote_status())]
+    #[command(visible_alias = "st")]
+    Status { name: Option<String> },
+    #[command(about = crate::meta::remote_ping())]
     #[command(visible_alias = "pg")]
     Ping { name: String },
-    #[command(visible_alias = "rm")]
-    Remove { name: String },
+    #[command(about = crate::meta::remote_disconnect())]
+    #[command(visible_alias = "dc")]
+    Disconnect { name: String },
+    #[command(about = crate::meta::remote_revoke())]
+    #[command(visible_alias = "rv")]
+    Revoke {
+        /// 客户端 id 或名称
+        client: String,
+        #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:7681")]
+        listen: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -658,5 +724,95 @@ mod tests {
         // 二级同理：`server l` 不推断为 list / link / logs 之一
         let err = Cli::try_parse_from(["mcsup", "server", "l"]).expect_err("`server l` 不应被接受");
         assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
+    }
+
+    /// `--origin` 在三类列表命令上都能解析，缺省为 `None`
+    #[test]
+    fn origin_filter_parses_on_list_commands() {
+        for args in [
+            vec!["mcsup", "workspace", "ls", "--origin", "prod-box"],
+            vec!["mcsup", "server", "ls", "--origin", "remote"],
+            vec!["mcsup", "java", "ls", "--origin", "local"],
+        ] {
+            let cli = Cli::try_parse_from(&args).expect("parse");
+            let origin = match cli.command {
+                Command::Workspace {
+                    action: WorkspaceAction::List { origin },
+                }
+                | Command::Server {
+                    action: ServerAction::List { origin },
+                }
+                | Command::Java {
+                    action: JavaAction::List { origin },
+                } => origin,
+                other => panic!("unexpected: {other:?}"),
+            };
+            assert!(origin.is_some(), "{args:?}");
+        }
+        let cli = Cli::try_parse_from(["mcsup", "workspace", "ls"]).expect("parse");
+        match cli.command {
+            Command::Workspace {
+                action: WorkspaceAction::List { origin },
+            } => assert!(origin.is_none()),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// 创建类命令接受 `--origin`，缺省为 `None`
+    #[test]
+    fn origin_target_parses_on_create_commands() {
+        let cli = Cli::try_parse_from([
+            "mcsup",
+            "server",
+            "create",
+            "web",
+            "--version",
+            "1.21.1",
+            "--variant",
+            "vanilla",
+            "--origin",
+            "prod-box",
+        ])
+        .expect("parse");
+        match cli.command {
+            Command::Server {
+                action: ServerAction::Create { origin, .. },
+            } => assert_eq!(origin.as_deref(), Some("prod-box")),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// `remote` 的新子命令都能解析
+    #[test]
+    fn remote_subcommands_parse() {
+        for args in [
+            vec!["mcsup", "remote", "serve", "--listen", "127.0.0.1:0"],
+            vec!["mcsup", "remote", "serve", "--stop"],
+            vec!["mcsup", "remote", "serve", "--status"],
+            vec![
+                "mcsup",
+                "remote",
+                "connect",
+                "10.0.0.5",
+                "--code",
+                "1234-5678",
+            ],
+            vec!["mcsup", "remote", "reconnect", "prod-box"],
+            vec!["mcsup", "remote", "list"],
+            vec!["mcsup", "remote", "status", "prod-box"],
+            vec!["mcsup", "remote", "ping", "prod-box"],
+            vec!["mcsup", "remote", "disconnect", "prod-box"],
+            vec!["mcsup", "remote", "revoke", "laptop"],
+        ] {
+            Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+        }
+    }
+
+    /// `serve --stop` 与 `--status` 互斥，避免一次做两件事
+    #[test]
+    fn serve_stop_and_status_conflict() {
+        let err = Cli::try_parse_from(["mcsup", "remote", "serve", "--stop", "--status"])
+            .expect_err("conflict");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 }

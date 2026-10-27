@@ -24,7 +24,8 @@ mcsup 的远程能力：一台机器上的 `mcsup` 可以像管理本地资源�
 ## 设计原则
 
 1. **身份路由，不做模式切换**：远端是资源属性，不是全局状态。
-2. **只读镜像，无冲突解决**：远端元数据拉到本地缓存供读，写操作直连远端。
+2. **只读镜像，无冲突解决**：远端元数据只供读，写操作直连远端（本地缓存
+   待实现，见「数据与同步」）。
 3. **按需连接，无常驻会话**：本地不跑守护进程，命令按需建连。
 4. **离线不阻塞**：远端不可达时本地资源照常工作。
 5. **复用既有信任**：优先复用 SSH，不新增凭证体系。
@@ -77,63 +78,55 @@ mcsup 已开始接受连接
   配对码  4821-9375        （10 分钟内有效）
 ```
 
-它会把自身注册为系统服务（systemd / launchd），重启后自动拉起。之后远端
-不再需要任何日常操作。
+它当前是**前台进程**（与 `mcsup-agent` 同一份实现）；系统服务注册
+（systemd / launchd）尚未实现，需要用户自行用 `nohup` / `tmux` / 服务管理器
+托管。
 
 | 命令 | 说明 |
 | --- | --- |
-| `mcsup remote serve` | 启动并注册为系统服务，打印名称、地址、配对码 |
-| `mcsup remote serve --stop` | 停止并移除系统服务 |
-| `mcsup remote serve --status` | 本机服务状态、监听地址、已配对客户端 |
-| `mcsup remote revoke <client>` | 撤销某个客户端的访问权限（立即失效） |
+| `mcsup remote serve [--listen <addr>] [--name <n>]` | 前台运行 agent，打印名称、地址、指纹、配对码 |
+| `mcsup remote serve --status` | 离线查看本机身份指纹、pid 与已配对客户端 |
+| `mcsup remote serve --stop` | 按 `{data_dir}/remote/agent.pid` 终止前台进程 |
+| `mcsup remote revoke <client>` | 离线撤销某个客户端（删除名册记录，立即失效） |
 
 ### 连接端（本地主机）
 
 一条命令，三选一，按推荐程度排列：
 
-**首选：复用 SSH 信任**
+**当前可用：直连 + 配对码**
 
 ```
-$ mcsup remote connect user@host
+$ mcsup remote connect host:port --code 4821-9375
 ```
 
-能 ssh 上去就证明已有权限。它顺手完成 agent 安装、服务拉起、密钥交换，
-不需要新凭证，也不需要复制配对码。
+交互终端下省略 `--code` 会提示输入；首次连接会展示证书指纹并要求确认，
+非交互（脚本 / 管道）下必须加 `-y` 才接受该指纹。
 
-**同局域网：自动发现**
+**尚未实现**
 
-```
-$ mcsup remote connect
-发现 1 台附近的 mcsup 机器：
-  prod-box  10.0.0.5
-正在连接… 输入 prod-box 屏幕上显示的配对码：4821-9375
-已连接 prod-box
-```
-
-**跨网：直连**
-
-```
-$ mcsup remote connect host:port
-```
+- `mcsup remote connect user@host`（复用 SSH 信任自动引导）会明确报
+  「SSH 接入尚未实现」。
+- `mcsup remote connect`（无参数局域网发现）会报用法错误，提示改用
+  `host[:port]`。
 
 成功后输出同步摘要：
 
 ```
 已连接 prod-box
-  同步 3 个工作区、5 台服务器、2 个备份、4 个 Java 运行时
+  同步 3 个工作区、5 台服务器、4 个 Java 运行时
   指纹 sha256:…（已保存）
 ```
 
 | 命令 | 说明 |
 | --- | --- |
-| `mcsup remote connect [<user@host> \| <host[:port]>]` | 配对远端；无参数时局域网发现 |
-| `mcsup remote connect --name <n>` | 覆盖自动识别的远端名 |
-| `mcsup remote connect --read-only` | 以只读权限配对 |
-| `mcsup remote` | 不带子命令：显示本机服务状态与已配对远端 |
-| `mcsup remote list` | 已配对远端、连接状态、权限、agent 版本 |
-| `mcsup remote status [<name>]` | 单个远端的详细信息 |
+| `mcsup remote connect <host[:port]> [--code <码>] [-y]` | 配对远端（直连） |
+| `mcsup remote connect --name <n>` | 覆盖对端自报的远端名 |
+| `mcsup remote connect --read-only` | 以只读权限配对（viewer） |
+| `mcsup remote reconnect <name>` | 复用记录重新认证；指纹变化要求重新 connect |
+| `mcsup remote list` | 已配对远端、连接状态、角色、agent 版本 |
+| `mcsup remote status [<name>]` | 单个远端的详细信息（缺名等价 list） |
 | `mcsup remote ping <name>` | 连通性 / 版本 / 能力，供脚本使用 |
-| `mcsup remote disconnect <name>` | 删除本地配对与缓存，远端不受影响 |
+| `mcsup remote disconnect <name>` | 删除本地配对与凭证，远端不受影响 |
 
 `connect` 幂等：重复执行等于重新握手并刷新 token 与指纹。
 
@@ -185,8 +178,8 @@ mcsup java ls --origin all
 - 过滤只影响展示与返回集合，不改变命令语义；过滤后为空是成功（退出码 0）。
 - 人类可读输出增加 `ORIGIN` 列；JSON 输出每项增加 `origin` 字段，其余
   形状不变。
-- 远端不可达时保留缓存中的条目，来源标记追加 `(offline)`；JSON 用
-  `available: false` 表达。
+- 当前实现**没有本地缓存**：合并列表是实时查询，远端不可达时该来源的
+  条目省略并记 warn，本地条目照常返回（离线缓存与 `(offline)` 标记待补）。
 
 ### 限定名
 
@@ -204,37 +197,49 @@ error: “web” 存在于多个位置
 提示: 用 local/web 或 prod-box/web 指定
 ```
 
-限定名可用于所有接受名字的命令（`start` / `stop` / `status` / `backup` /
-`java` 选择等），因此选择性操作也不需要额外 flag。
+限定名已接到所有接受服务器名的命令（`start` / `stop` / `status` / `send` /
+`logs` / `backup` / `install` 等）。注意：当同一个名字同时存在于本地与远端
+时，远端限定名会被明确拒绝（避免落到本地同名服务器）；此时请先让名字全局
+唯一。
 
 ### 创建落点
 
-创建类命令（`workspace init`、`server create`）按当前工作区的来源决定落点：
+### 创建落点
 
-- `mcsup workspace use prod-box/w1` 之后，`mcsup server create web` 建在
-  `prod-box` 的 `w1` 下。
-- 也可显式指定 `--origin <origin>`，优先于当前工作区来源。
+创建类命令（`workspace init`、`server create`）按 `--origin` 决定落点：
+
+- `--origin <远端名>` 直接在对端执行；缺省本地。
 - `workspace init --origin prod-box --dir /srv/mc/w2` 中的 `--dir` 是**目标
   机器上的路径**，由该机器的 agent 执行同一套 `WorkspaceService::init`。
+- `server create --origin prod-box` 在对端登记服务器（核心安装仍需在对端
+  运行 `mcsup server install`）；`server remove --origin prod-box` 在对端注销。
+- `java scan --origin prod-box` 让对端扫描并登记本机 JVM。
+
+远端写操作的覆盖范围是「协议已定义的帧」：workspace init/use/remove、
+server create/remove、java scan、生命周期与备份。`server install`、`props`、
+`set`、`version`、`link`、`mod`、`modpack`、`java install/uninstall` 目前
+只有本地实现。
 
 ### 离线、断开与撤销
 
-- 远端掉线：列表仍返回缓存内容并标记 `(offline)`；写操作明确失败；本地
-  资源完全不受影响。
-- `mcsup remote disconnect <name>` 删除本地信任与缓存；远端服务继续运行。
-- `mcsup remote revoke <client>` 在远端执行，立即失效该客户端的 token。
-- 未配对或 token 失效：命令报「未授权」，不自动降级到本地。
+- 远端掉线：合并列表省略该来源并记 warn（缓存落地后会改为返回缓存并标记
+  `(offline)`）；写操作明确失败；本地资源完全不受影响。
+- `mcsup remote disconnect <name>` 删除本地配对记录与凭证；远端服务继续运行。
+- `mcsup remote revoke <client>` 在 serve 端离线删除名册记录，立即失效该
+  客户端的 token。
+- 未配对或 token 失效：命令报「未授权」（退出码 6），不自动降级到本地。
 
 ## 数据与同步
 
-本地缓存位于 `{data_dir}/remotes/<remote-id>/`，只读镜像远端的
-`workspaces` / `servers` / `java` / `backups` 元数据。远端身份用生成的
-`RemoteId`，不随改名变化。
+当前实现是**实时查询**：组合仓库每次读都逐台远端发 list 请求，没有本地
+缓存（`connect` 的同步摘要只是打印当时的数据量）。这一段是已确认的设计
+方向，缓存待实现：
 
-- `connect` 做一次全量同步。
-- 每次读命令按 TTL（缺省 30 秒）尝试刷新；失败回退缓存。
+- 目标缓存位置 `{data_dir}/remotes/<remote-id>/`，只读镜像远端的
+  `workspaces` / `servers` / `java` / `backups` 元数据；远端身份用 `RemoteId`，
+  不随改名变化。
+- 每次读命令按 TTL 尝试刷新；失败回退缓存并标记 `(offline)`。
 - 写命令直连远端，成功后回写或失效对应缓存条目。
-- 本地写操作永不回写远端缓存。
 - **不做双向同步**：因此没有版本向量、没有冲突合并、没有最后写入获胜。
 
 ## 安全
@@ -278,11 +283,13 @@ error: “web” 存在于多个位置
 8. 远端备份：`RemoteBackupPort`（按服务器身份寻址、域类型出入参），
    `BackupService` 按条目来源路由——远端条目整段转发到对端执行（扫描、
    CAS、恢复写盘都在对端），跨线只走元数据帧（`WireSnapshot`），CAS 对象
-   留在对端；agent 侧复用与本地 CLI 同一份 `BackupService`。备份进度与
-   文件流式传输后续再评估；此时再评估 `transport` 是否切换为 tonic。
+   留在对端；agent 侧复用与本地 CLI 同一份 `BackupService`。
+9. CLI：`remote serve/connect/reconnect/list/status/ping/disconnect/revoke`，
+   `--origin` 过滤与 `ORIGIN` 列，创建 / 删除 / 扫描的远端路由，退出码 6。
+10. 流式日志 follow 与备份进度（未做）；此时再评估 `transport` 是否切换为
+    tonic。
 
-每一步可独立提交；第 1 步后已有可演示的连接状态，第 5 步后主要命令已
-与本地一致。
+第 1–9 步已完成；SSH 接入、局域网发现、系统服务注册与流式仍未做。
 
 实施进度、已完成内容与逐阶段待办记在 `docs/remote-progress.md`。
 
@@ -302,4 +309,4 @@ error: “web” 存在于多个位置
 | origin | 资源来源：`local` 或某个远端名 |
 | 被连接端 / serve 端 | 运行 `mcsup remote serve` 的机器 |
 | 连接端 / 客户端 | 运行 `mcsup remote connect` 的机器 |
-| 只读镜像 | 本地缓存远端元数据，供读不供写 |
+| 只读镜像 | 远端仓库只供读（本地缓存待实现） |
