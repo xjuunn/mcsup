@@ -6,8 +6,11 @@ pub mod origin;
 
 pub use backend::Backend;
 pub use backup::{
-    BackupStore, CasError, ContentStore, RUNTIME_ENTRIES, ScanError, ScanOutcome, ScanRules,
-    Scanner, SkipReason, Skipped, SnapshotRepository, SnapshotStoreError, workspace_backups_root,
+    BackupStore, CasError, ContentStore, RUNTIME_ENTRIES, RemoteBackupCreate, RemoteBackupError,
+    RemoteBackupPort, RemoteCreateOutcome, RemoteDeleteOutcome, RemotePruneOutcome,
+    RemoteRestoreOutcome, RemoteSnapshotPage, RemoteVerifyOutcome, ScanError, ScanOutcome,
+    ScanRules, Scanner, SkipReason, Skipped, SnapshotRepository, SnapshotStoreError,
+    workspace_backups_root,
 };
 use domain::java::{JavaMajor, JavaPackageType, JavaRuntime, JavaVendor};
 use domain::server::artifact::{Checksum, JarArtifact};

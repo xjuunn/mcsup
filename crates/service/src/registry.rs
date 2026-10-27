@@ -642,6 +642,25 @@ impl ServerRegistry {
         Ok(out)
     }
 
+    /// 按名解析服务器（附来源）
+    ///
+    /// # Errors
+    ///
+    /// 不存在时返回 [`ServerRegistryError`]
+    pub fn get_sourced(
+        &self,
+        name: &str,
+    ) -> Result<Sourced<RegisteredServer>, ServerRegistryError> {
+        let parsed =
+            ServerName::parse(name).map_err(|_| ServerRegistryError::NotFound(name.to_owned()))?;
+        for sourced in self.list_sourced()? {
+            if sourced.value.meta.name == parsed {
+                return Ok(sourced);
+            }
+        }
+        Err(ServerRegistryError::NotFound(name.to_owned()))
+    }
+
     /// 按名解析服务器
     ///
     /// # Errors

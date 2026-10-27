@@ -220,15 +220,17 @@ mod tests {
                 server_id: "id".to_owned(),
                 lines: 10,
             },
+            Request::BackupList {
+                server_id: "id".to_owned(),
+                page: 1,
+                page_size: 20,
+            },
         ];
         let used: Vec<Permission> = samples
             .iter()
             .filter_map(Request::required_permission)
             .collect();
         for permission in Permission::ALL {
-            if *permission == Permission::Backup {
-                continue;
-            }
             assert!(used.contains(permission), "{permission} 没有任何请求使用");
         }
     }

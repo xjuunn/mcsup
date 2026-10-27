@@ -318,6 +318,8 @@ pub struct BackupService {
     registry: Arc<ServerRegistry>,
     backend: Arc<dyn Backend>,
     store: Arc<dyn port::BackupStore>,
+    /// 远端备份执行器；未注入时远端条目按「不可达」拒绝
+    remote: Option<Arc<dyn port::RemoteBackupPort>>,
     events: Arc<dyn port::EventSink>,
 }
 
@@ -343,8 +345,18 @@ impl BackupService {
             registry,
             backend,
             store,
+            remote: None,
             events: Arc::new(port::NoopEventSink),
         }
+    }
+
+    /// 注入远端备份执行器
+    ///
+    /// 注入后，来源为远端的服务器的备份操作整段转发到对端执行。
+    #[must_use]
+    pub fn with_remote_backups(mut self, remote: Arc<dyn port::RemoteBackupPort>) -> Self {
+        self.remote = Some(remote);
+        self
     }
 
     /// 注入领域事件出口
@@ -407,6 +419,28 @@ impl BackupService {
         name: &str,
         options: &CreateOptions,
     ) -> Result<CreateOutcome, BackupError> {
+        // 远端：整段转发（扫描与 CAS 都在对端），只回传元数据
+        if let Some((server_id, remote)) = self.route_remote(name)? {
+            let options = port::RemoteBackupCreate {
+                label: options.label.clone(),
+                scope: options.scope.clone(),
+                no_reuse: options.no_reuse,
+                flush_wait_ms: options.flush_wait_ms,
+            };
+            let outcome = remote
+                .create(&server_id, &options)
+                .map_err(|err| Self::remote_failure(name, &err))?;
+            self.events
+                .publish(domain::server::event::DomainEvent::BackupCompleted {
+                    name: name.to_owned(),
+                    snapshot: outcome.snapshot.id.as_str().to_owned(),
+                    added_bytes: outcome.snapshot.added_bytes,
+                });
+            return Ok(CreateOutcome {
+                snapshot: outcome.snapshot,
+                skipped: outcome.skipped,
+            });
+        }
         match self.create_inner(name, options) {
             Ok(outcome) => Ok(outcome),
             Err(err) => {
@@ -533,6 +567,56 @@ impl BackupService {
             .map(|server| server.meta.settings.backup_scope.clone())
     }
 
+    // ---- 远端路由 ----
+
+    /// 远端服务器的备份整段转发到对端；本地返回 `None`
+    ///
+    /// 路由依据来自组合仓库的真实来源（`get_sourced`），不按名字猜。远端
+    /// 未注入执行器时按「不可达」拒绝——有远端条目却没装配连接是装配错误，
+    /// 静默落到本地会在错误的磁盘上写快照。
+    #[allow(clippy::type_complexity)]
+    fn route_remote(
+        &self,
+        name: &str,
+    ) -> Result<
+        Option<(
+            domain::server::meta::ServerId,
+            Arc<dyn port::RemoteBackupPort>,
+        )>,
+        BackupError,
+    > {
+        let sourced = self.registry.get_sourced(name)?;
+        if sourced.origin.is_local() {
+            return Ok(None);
+        }
+        let Some(remote) = &self.remote else {
+            return Err(BackupError::Supervisor(port::SupervisorError::Unreachable(
+                format!(
+                    "server '{}' is on remote '{}' but no remote connection is configured",
+                    name,
+                    sourced.origin.as_str()
+                ),
+            )));
+        };
+        Ok(Some((sourced.value.meta.id.clone(), remote.clone())))
+    }
+
+    /// 远端失败 → `BackupError`（远端错误文案已含上下文，原样携带）
+    fn remote_failure(server: &str, err: &port::RemoteBackupError) -> BackupError {
+        tracing::warn!(server = %server, error = %err, "remote backup failed");
+        BackupError::Supervisor(port::SupervisorError::Remote {
+            kind: match err {
+                port::RemoteBackupError::NotFound(_) => "not_found",
+                port::RemoteBackupError::Invalid(_) => "invalid",
+                port::RemoteBackupError::Unreachable(_) => "unreachable",
+                port::RemoteBackupError::Protocol(_) => "protocol",
+                port::RemoteBackupError::Io(_) | _ => "io",
+            }
+            .to_owned(),
+            message: err.to_string(),
+        })
+    }
+
     // ---- list ----
 
     /// 快照列表（按时间倒序分页）；`digest` 返回 sha256 前 12 位便于人工核对
@@ -543,6 +627,18 @@ impl BackupService {
     ///
     /// 服务器不存在或快照索引读取失败时返回 [`BackupError`]
     pub fn list(&self, name: &str, page: Page) -> Result<SnapshotPage, BackupError> {
+        // 远端：对端分页，原样回传
+        if let Some((server_id, remote)) = self.route_remote(name)? {
+            let outcome = remote
+                .list(&server_id, page)
+                .map_err(|err| Self::remote_failure(name, &err))?;
+            return Ok(SnapshotPage {
+                items: outcome.items,
+                total: outcome.total,
+                page: outcome.page,
+                page_size: outcome.page_size,
+            });
+        }
         let layout = self.resolve(name)?;
         let mut items = layout.index.list_for_server(name)?;
         items.sort_by(|a, b| (b.created_at, b.id.as_str()).cmp(&(a.created_at, a.id.as_str())));
@@ -579,6 +675,24 @@ impl BackupService {
         snapshot_id: &str,
         target: &RestoreTarget,
     ) -> Result<RestoreOutcome, BackupError> {
+        // 远端：对端写盘，`--to` 的目标也创建在对端
+        if let Some((server_id, remote)) = self.route_remote(name)? {
+            let to_new = match target {
+                RestoreTarget::InPlace => None,
+                RestoreTarget::NewServer { name: new_name } => Some(new_name.as_str()),
+            };
+            let outcome = remote
+                .restore(&server_id, snapshot_id, to_new)
+                .map_err(|err| Self::remote_failure(name, &err))?;
+            return Ok(RestoreOutcome {
+                snapshot: outcome.snapshot,
+                destination: PathBuf::from(&outcome.destination),
+                files: outcome.files,
+                bytes: outcome.bytes,
+                safety_snapshot: outcome.safety_snapshot,
+                deleted: outcome.deleted,
+            });
+        }
         let layout = self.resolve(name)?;
         let id = SnapshotId::parse(snapshot_id)
             .map_err(|_| BackupError::SnapshotNotFound(snapshot_id.to_owned()))?;
@@ -646,6 +760,16 @@ impl BackupService {
     ///
     /// 快照不存在或索引写入失败时返回 [`BackupError`]
     pub fn delete(&self, name: &str, snapshot_id: &str) -> Result<DeleteOutcome, BackupError> {
+        // 远端：对端删记录
+        if let Some((server_id, remote)) = self.route_remote(name)? {
+            let outcome = remote
+                .delete(&server_id, snapshot_id)
+                .map_err(|err| Self::remote_failure(name, &err))?;
+            return Ok(DeleteOutcome {
+                snapshot: outcome.snapshot,
+                orphaned: outcome.orphaned,
+            });
+        }
         let layout = self.resolve(name)?;
         let id = SnapshotId::parse(snapshot_id)
             .map_err(|_| BackupError::SnapshotNotFound(snapshot_id.to_owned()))?;
@@ -681,6 +805,19 @@ impl BackupService {
         snapshot_id: &str,
         on_progress: &mut dyn FnMut(usize, usize),
     ) -> Result<VerifyOutcome, BackupError> {
+        // 远端：对端逐对象校验（进度单次回调，跨线不流式）
+        if let Some((server_id, remote)) = self.route_remote(name)? {
+            let _ = on_progress;
+            let outcome = remote
+                .verify(&server_id, snapshot_id)
+                .map_err(|err| Self::remote_failure(name, &err))?;
+            return Ok(VerifyOutcome {
+                snapshot: outcome.snapshot,
+                objects: outcome.objects,
+                bytes: outcome.bytes,
+                broken: outcome.broken,
+            });
+        }
         let layout = self.resolve(name)?;
         let id = SnapshotId::parse(snapshot_id)
             .map_err(|_| BackupError::SnapshotNotFound(snapshot_id.to_owned()))?;
@@ -725,6 +862,18 @@ impl BackupService {
         policy: Option<RetentionPolicy>,
         dry_run: bool,
     ) -> Result<PruneOutcome, BackupError> {
+        // 远端：策略判定与 GC 都在对端（快照与 CAS 都在那边）
+        if let Some((server_id, remote)) = self.route_remote(name)? {
+            let outcome = remote
+                .prune(&server_id, policy, dry_run)
+                .map_err(|err| Self::remote_failure(name, &err))?;
+            return Ok(PruneOutcome {
+                removed: outcome.removed,
+                objects_reclaimed: outcome.objects_reclaimed,
+                bytes_reclaimed: outcome.bytes_reclaimed,
+                dry_run: outcome.dry_run,
+            });
+        }
         let layout = self.resolve(name)?;
         let now = unix_now();
         let candidates = Self::all_snapshots(&layout, name)?;

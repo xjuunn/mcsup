@@ -161,6 +161,7 @@ pub struct McsupBuilder {
     supervisor: Option<Arc<dyn port::SupervisorPort>>,
     backend: Option<Arc<dyn port::Backend>>,
     backup_store: Option<Arc<dyn port::BackupStore>>,
+    remote_backups: Option<Arc<dyn port::RemoteBackupPort>>,
     events: Option<Arc<dyn port::EventSink>>,
     jar_sources: Option<Vec<Arc<dyn ServerJarSource>>>,
     content_sources: Option<Vec<Arc<dyn ContentSource>>>,
@@ -182,6 +183,7 @@ impl std::fmt::Debug for McsupBuilder {
             .field("supervisor", &"Option<dyn …>")
             .field("backend", &"Option<dyn …>")
             .field("backup_store", &"Option<dyn …>")
+            .field("remote_backups", &"Option<dyn …>")
             .field("events", &"Option<dyn …>")
             .field(
                 "jar_sources",
@@ -280,6 +282,13 @@ impl McsupBuilder {
         self
     }
 
+    /// 注入远端备份执行器（远端服务器的备份整段转发到对端）
+    #[must_use]
+    pub fn remote_backups(mut self, remote: Arc<dyn port::RemoteBackupPort>) -> Self {
+        self.remote_backups = Some(remote);
+        self
+    }
+
     /// 注入自定义执行位置（Local / Remote），整体接管进程、存储与备份
     ///
     /// 给定后不再按默认 `LocalBackend` 装配；`supervisor` 忽略。
@@ -344,6 +353,7 @@ impl McsupBuilder {
     /// # Errors
     ///
     /// 见 [`BootstrapError`]
+    #[allow(clippy::too_many_lines)] // 装配序列本身长；拆出小函数只会增加跳转
     pub fn build(self, data_dir: &Path) -> Result<Mcsup, BootstrapError> {
         let db_root = data_dir.join("db");
         let store = match self.store {
@@ -416,6 +426,10 @@ impl McsupBuilder {
         let backup =
             service::BackupService::new(Arc::clone(&registry), Arc::clone(&backend), backup_store)
                 .with_events(events);
+        let backup = match self.remote_backups {
+            Some(remote) => backup.with_remote_backups(remote),
+            None => backup,
+        };
 
         let jar_sources: Vec<Arc<dyn ServerJarSource>> = match self.jar_sources {
             Some(sources) => sources,

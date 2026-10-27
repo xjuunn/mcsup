@@ -1,4 +1,4 @@
-use domain::backup::{BackupScope, ContentHash, RelPath, Snapshot, SnapshotId};
+use domain::backup::{BackupScope, ContentHash, RelPath, RetentionPolicy, Snapshot, SnapshotId};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -328,6 +328,197 @@ pub trait BackupStore: Send + Sync {
 
     /// 按工作区备份根目录给出快照索引
     fn snapshot_repository(&self, backups_root: &Path) -> std::sync::Arc<dyn SnapshotRepository>;
+}
+
+/// 远端备份执行：对某台远端上的服务器做一次备份操作
+///
+/// 与 [`BackupStore`] 的差异：`BackupStore` 是**数据能力**（CAS / 索引 /
+/// 扫描器三件套，编排仍在 `service`），这个 trait 是**整段执行**——扫描、
+/// 写 CAS、落快照全部发生在对端，跨线只走元数据帧。远端的 `BackupLayout`
+/// 依赖对端的目录事实（workspace 推导、CAS 落点），客户端拼不出来，也不
+/// 该拼。
+///
+/// 全部按服务器稳定身份寻址；实现负责把 id 路由到正确的远端。
+pub trait RemoteBackupPort: Send + Sync {
+    /// 创建快照（对端扫描 + 写对端 CAS）
+    ///
+    /// # Errors
+    ///
+    /// 服务器不存在、范围为空或对端执行失败时返回 [`RemoteBackupError`]
+    fn create(
+        &self,
+        server_id: &domain::server::meta::ServerId,
+        options: &RemoteBackupCreate,
+    ) -> Result<RemoteCreateOutcome, RemoteBackupError>;
+
+    /// 快照列表（按时间倒序分页）
+    ///
+    /// # Errors
+    ///
+    /// 服务器不存在或对端执行失败时返回 [`RemoteBackupError`]
+    fn list(
+        &self,
+        server_id: &domain::server::meta::ServerId,
+        page: domain::backup::Page,
+    ) -> Result<RemoteSnapshotPage, RemoteBackupError>;
+
+    /// 恢复快照（对端写盘；`to_new` 在对端创建新服务器目录）
+    ///
+    /// # Errors
+    ///
+    /// 快照不存在、不可恢复、对端服务器在运行或执行失败时返回
+    /// [`RemoteBackupError`]
+    fn restore(
+        &self,
+        server_id: &domain::server::meta::ServerId,
+        snapshot_id: &str,
+        to_new: Option<&str>,
+    ) -> Result<RemoteRestoreOutcome, RemoteBackupError>;
+
+    /// 删除快照记录（CAS 对象留给对端 prune 回收）
+    ///
+    /// # Errors
+    ///
+    /// 快照不存在或对端执行失败时返回 [`RemoteBackupError`]
+    fn delete(
+        &self,
+        server_id: &domain::server::meta::ServerId,
+        snapshot_id: &str,
+    ) -> Result<RemoteDeleteOutcome, RemoteBackupError>;
+
+    /// 校验快照引用的对端 CAS 对象
+    ///
+    /// # Errors
+    ///
+    /// 快照不存在或对端执行失败时返回 [`RemoteBackupError`]
+    fn verify(
+        &self,
+        server_id: &domain::server::meta::ServerId,
+        snapshot_id: &str,
+    ) -> Result<RemoteVerifyOutcome, RemoteBackupError>;
+
+    /// 按保留策略清理对端快照与 CAS 对象
+    ///
+    /// # Errors
+    ///
+    /// 策略冲突或对端执行失败时返回 [`RemoteBackupError`]
+    fn prune(
+        &self,
+        server_id: &domain::server::meta::ServerId,
+        policy: Option<RetentionPolicy>,
+        dry_run: bool,
+    ) -> Result<RemotePruneOutcome, RemoteBackupError>;
+}
+
+/// 远端备份创建参数
+#[derive(Debug, Clone, Default)]
+pub struct RemoteBackupCreate {
+    /// 用户标签
+    pub label: Option<String>,
+    /// 备份范围；`None` = 用对端服务器属性里的范围
+    pub scope: Option<BackupScope>,
+    /// 禁用增量复用（强制全量）
+    pub no_reuse: bool,
+    /// 等待 `save-all` 落盘的毫秒数
+    pub flush_wait_ms: Option<u64>,
+}
+
+/// 远端备份失败
+///
+/// 变体与协议的 `ErrorKind` 对齐；`service` 把它包进 `BackupError`，
+/// 入口按文案提示，不再二次判级。
+#[derive(Debug, Clone, Error)]
+#[non_exhaustive]
+pub enum RemoteBackupError {
+    /// 服务器或快照不存在
+    #[error("not found: {0}")]
+    NotFound(String),
+    /// 参数或状态不合法（范围空、恢复中服务器在运行等）
+    #[error("{0}")]
+    Invalid(String),
+    /// 远端不可达（未连接 / 连接失败）
+    #[error("remote unreachable: {0}")]
+    Unreachable(String),
+    /// 对端协议错误
+    #[error("remote protocol error: {0}")]
+    Protocol(String),
+    /// 对端 IO 失败
+    #[error("remote io error: {0}")]
+    Io(String),
+}
+
+/// 远端创建结果
+#[derive(Debug, Clone)]
+pub struct RemoteCreateOutcome {
+    /// 新建的快照
+    pub snapshot: Snapshot,
+    /// 扫描期跳过的条目数
+    pub skipped: usize,
+}
+
+/// 远端快照列表一页
+#[derive(Debug, Clone)]
+pub struct RemoteSnapshotPage {
+    /// 本页快照（按时间倒序）
+    pub items: Vec<Snapshot>,
+    /// 该服务器的快照总数
+    pub total: usize,
+    /// 当前页码
+    pub page: usize,
+    /// 每页条数
+    pub page_size: usize,
+}
+
+/// 远端恢复结果
+#[derive(Debug, Clone)]
+pub struct RemoteRestoreOutcome {
+    /// 被恢复的快照
+    pub snapshot: Snapshot,
+    /// 对端上的恢复目标目录
+    pub destination: String,
+    /// 写回的文件数
+    pub files: usize,
+    /// 写回的字节数
+    pub bytes: u64,
+    /// 原地恢复前自动生成的安全快照 id
+    pub safety_snapshot: Option<SnapshotId>,
+    /// 按墓碑 / 快照外文件删除的路径数
+    pub deleted: usize,
+}
+
+/// 远端删除结果
+#[derive(Debug, Clone)]
+pub struct RemoteDeleteOutcome {
+    /// 被删除的快照
+    pub snapshot: Snapshot,
+    /// 该快照释放的 CAS 引用计数缺口（待对端 prune 回收）
+    pub orphaned: usize,
+}
+
+/// 远端校验结果
+#[derive(Debug, Clone)]
+pub struct RemoteVerifyOutcome {
+    /// 被校验的快照
+    pub snapshot: Snapshot,
+    /// 被引用的对象数（去重后）
+    pub objects: usize,
+    /// 校验通过的字节数
+    pub bytes: u64,
+    /// 损坏或缺失的对象哈希
+    pub broken: Vec<ContentHash>,
+}
+
+/// 远端清理结果
+#[derive(Debug, Clone, Default)]
+pub struct RemotePruneOutcome {
+    /// 被删除的快照
+    pub removed: Vec<Snapshot>,
+    /// 回收的 CAS 对象数
+    pub objects_reclaimed: usize,
+    /// 回收的字节数
+    pub bytes_reclaimed: u64,
+    /// 是否只是试运行
+    pub dry_run: bool,
 }
 
 #[cfg(test)]

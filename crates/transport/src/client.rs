@@ -338,6 +338,12 @@ fn response_name(response: &Response) -> &'static str {
         Response::Stopped { .. } => "stopped",
         Response::LogLines { .. } => "log_lines",
         Response::Removed { .. } => "removed",
+        Response::SnapshotCreated { .. } => "snapshot_created",
+        Response::Snapshots { .. } => "snapshots",
+        Response::Restored { .. } => "restored",
+        Response::SnapshotDeleted { .. } => "snapshot_deleted",
+        Response::SnapshotVerified { .. } => "snapshot_verified",
+        Response::Pruned { .. } => "pruned",
         Response::Error { .. } => "error",
     }
 }

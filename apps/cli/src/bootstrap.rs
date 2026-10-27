@@ -348,9 +348,22 @@ pub(crate) fn open_mcsup_with_remotes() -> Result<Mcsup> {
             remote_supervisors,
             combined_servers.clone(),
         ));
+    // 备份路由：远端服务器的备份整段转发到对端（元数据帧），
+    // 按 id 查组合仓库来源分派到对应远端
+    let mut backup_executors = std::collections::HashMap::new();
+    for member in members.all() {
+        backup_executors.insert(
+            member.name.clone(),
+            mcsup::backend::remote::RemoteBackups::new(member.servers_link()),
+        );
+    }
+    let remote_backups: Arc<dyn mcsup::port::RemoteBackupPort> = Arc::new(
+        mcsup::backend::remote::RoutingBackups::new(backup_executors, combined_servers.clone()),
+    );
     let mc = McsupBuilder::new()
         .store(store.clone())
         .supervisor(supervisor)
+        .remote_backups(remote_backups)
         .workspace_repository(Arc::new(CombinedWorkspaceRepository::new(
             store.clone(),
             members.clone(),

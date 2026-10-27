@@ -24,7 +24,8 @@ use mcsup::service::{BackupService, CreateOptions};
 
 /// 装配备份服务：经库侧组合根统一装配（注册表 + supervisor）
 fn backup_service() -> Result<BackupService> {
-    let mcsup = bootstrap::open_mcsup()?;
+    // 带远端装配：备份按来源路由（本地直写、远端走 RPC）
+    let mcsup = bootstrap::open_mcsup_with_remotes()?;
     Ok(mcsup.backup.clone())
 }
 

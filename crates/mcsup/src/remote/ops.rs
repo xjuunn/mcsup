@@ -10,7 +10,7 @@
 use super::Agent;
 use domain::java::JavaMajor;
 use domain::server::version::{ServerVariant, VersionId};
-use protocol::remote::wire::{WireServer, WireStatusEntry};
+use protocol::remote::wire::{WireServer, WireSnapshot, WireStatusEntry};
 use protocol::remote::{ErrorKind, Request, Response};
 use service::{
     InitOutcome, JavaError, LifecycleError, LifecycleErrorKind, ServerRegistryError,
@@ -58,6 +58,44 @@ impl Agent {
             } => self.stop(server_id, *grace_secs, *force),
             Request::SendLine { server_id, line } => self.send_line(server_id, line),
             Request::LogsTail { server_id, lines } => self.logs_tail(server_id, *lines),
+
+            Request::BackupCreate {
+                server_id,
+                label,
+                scope,
+                no_reuse,
+                flush_wait_ms,
+            } => self.backup_create(
+                server_id,
+                label.as_deref(),
+                scope.as_ref(),
+                *no_reuse,
+                *flush_wait_ms,
+            ),
+            Request::BackupList {
+                server_id,
+                page,
+                page_size,
+            } => self.backup_list(server_id, *page, *page_size),
+            Request::BackupRestore {
+                server_id,
+                snapshot,
+                to_new,
+            } => self.backup_restore(server_id, snapshot, to_new.as_deref()),
+            Request::BackupDelete {
+                server_id,
+                snapshot,
+            } => self.backup_delete(server_id, snapshot),
+            Request::BackupVerify {
+                server_id,
+                snapshot,
+            } => self.backup_verify(server_id, snapshot),
+            Request::BackupPrune {
+                server_id,
+                keep,
+                older_than_secs,
+                dry_run,
+            } => self.backup_prune(server_id, *keep, *older_than_secs, *dry_run),
 
             // 握手帧只在连接前两步出现；走到这里说明客户端在已认证连接上重放
             Request::Hello { .. } | Request::Enroll { .. } | Request::Authenticate { .. } => {
@@ -325,6 +363,7 @@ impl Agent {
     }
 
     /// 身份 → 名字：`service` 的写路径按名字寻址，远端帧按稳定身份寻址
+    #[allow(clippy::result_large_err)] // 错误即 Response 帧，按帧返回是分发器的统一口径
     fn name_of(&self, server_id: &str) -> Result<String, Response> {
         let servers = self
             .core
@@ -339,6 +378,198 @@ impl Agent {
                 RemoteFailure::new(ErrorKind::NOT_FOUND, format!("no such server: {server_id}"))
                     .into_response()
             })
+    }
+
+    // ---- backup（阶段 9）：转发给与本地 CLI 同一份 BackupService ----
+
+    fn backup_create(
+        &self,
+        server_id: &str,
+        label: Option<&str>,
+        scope: Option<&Vec<String>>,
+        no_reuse: bool,
+        flush_wait_ms: Option<u64>,
+    ) -> Response {
+        let name = match self.name_of(server_id) {
+            Ok(name) => name,
+            Err(response) => return response,
+        };
+        let options = service::CreateOptions {
+            label: label.map(str::to_owned),
+            scope: match scope {
+                Some(entries) => {
+                    match domain::backup::BackupScope::from_entries(entries.iter().cloned()) {
+                        Ok(built) => Some(built),
+                        Err(err) => {
+                            return RemoteFailure::new(ErrorKind::INVALID, err.to_string())
+                                .into_response();
+                        }
+                    }
+                }
+                None => None,
+            },
+            no_reuse,
+            flush_wait_ms,
+        };
+        match self.core.backup.create(&name, &options) {
+            Ok(outcome) => {
+                let snapshot = match WireSnapshot::try_from(&outcome.snapshot) {
+                    Ok(wire) => wire,
+                    Err(err) => return failure(ErrorKind::PROTOCOL, err),
+                };
+                Response::SnapshotCreated {
+                    snapshot,
+                    skipped: outcome.skipped,
+                }
+            }
+            Err(err) => backup_failure(&err),
+        }
+    }
+
+    fn backup_list(&self, server_id: &str, page: usize, page_size: usize) -> Response {
+        let name = match self.name_of(server_id) {
+            Ok(name) => name,
+            Err(response) => return response,
+        };
+        match self
+            .core
+            .backup
+            .list(&name, domain::backup::Page::new(page, page_size))
+        {
+            Ok(paged) => {
+                let items = paged
+                    .items
+                    .iter()
+                    .map(WireSnapshot::try_from)
+                    .collect::<Result<Vec<_>, _>>();
+                match items {
+                    Ok(items) => Response::Snapshots {
+                        items,
+                        total: paged.total,
+                        page: paged.page,
+                        page_size: paged.page_size,
+                    },
+                    Err(err) => failure(ErrorKind::PROTOCOL, err),
+                }
+            }
+            Err(err) => backup_failure(&err),
+        }
+    }
+
+    fn backup_restore(&self, server_id: &str, snapshot: &str, to_new: Option<&str>) -> Response {
+        let name = match self.name_of(server_id) {
+            Ok(name) => name,
+            Err(response) => return response,
+        };
+        let target = match to_new {
+            Some(new_name) => domain::backup::RestoreTarget::NewServer {
+                name: new_name.to_owned(),
+            },
+            None => domain::backup::RestoreTarget::InPlace,
+        };
+        match self.core.backup.restore(&name, snapshot, &target) {
+            Ok(outcome) => {
+                let restored = match WireSnapshot::try_from(&outcome.snapshot) {
+                    Ok(wire) => wire,
+                    Err(err) => return failure(ErrorKind::PROTOCOL, err),
+                };
+                Response::Restored {
+                    snapshot: restored,
+                    destination: outcome.destination.to_string_lossy().into_owned(),
+                    files: outcome.files,
+                    bytes: outcome.bytes,
+                    safety_snapshot: outcome
+                        .safety_snapshot
+                        .as_ref()
+                        .map(|id| id.as_str().to_owned()),
+                    deleted: outcome.deleted,
+                }
+            }
+            Err(err) => backup_failure(&err),
+        }
+    }
+
+    fn backup_delete(&self, server_id: &str, snapshot: &str) -> Response {
+        let name = match self.name_of(server_id) {
+            Ok(name) => name,
+            Err(response) => return response,
+        };
+        match self.core.backup.delete(&name, snapshot) {
+            Ok(outcome) => {
+                let deleted = match WireSnapshot::try_from(&outcome.snapshot) {
+                    Ok(wire) => wire,
+                    Err(err) => return failure(ErrorKind::PROTOCOL, err),
+                };
+                Response::SnapshotDeleted {
+                    snapshot: deleted,
+                    orphaned: outcome.orphaned,
+                }
+            }
+            Err(err) => backup_failure(&err),
+        }
+    }
+
+    fn backup_verify(&self, server_id: &str, snapshot: &str) -> Response {
+        let name = match self.name_of(server_id) {
+            Ok(name) => name,
+            Err(response) => return response,
+        };
+        match self.core.backup.verify(&name, snapshot, &mut |_, _| ()) {
+            Ok(outcome) => {
+                let verified = match WireSnapshot::try_from(&outcome.snapshot) {
+                    Ok(wire) => wire,
+                    Err(err) => return failure(ErrorKind::PROTOCOL, err),
+                };
+                Response::SnapshotVerified {
+                    snapshot: verified,
+                    objects: outcome.objects,
+                    bytes: outcome.bytes,
+                    broken: outcome
+                        .broken
+                        .iter()
+                        .map(|hash| hash.as_str().to_owned())
+                        .collect(),
+                }
+            }
+            Err(err) => backup_failure(&err),
+        }
+    }
+
+    fn backup_prune(
+        &self,
+        server_id: &str,
+        keep: Option<usize>,
+        older_than_secs: Option<u64>,
+        dry_run: bool,
+    ) -> Response {
+        let name = match self.name_of(server_id) {
+            Ok(name) => name,
+            Err(response) => return response,
+        };
+        let policy = match (keep, older_than_secs) {
+            (Some(n), _) => Some(domain::backup::RetentionPolicy::Keep(n)),
+            (None, Some(secs)) => Some(domain::backup::RetentionPolicy::OlderThan(secs)),
+            (None, None) => None,
+        };
+        match self.core.backup.prune(&name, policy, dry_run) {
+            Ok(outcome) => {
+                let removed = outcome
+                    .removed
+                    .iter()
+                    .map(WireSnapshot::try_from)
+                    .collect::<Result<Vec<_>, _>>();
+                match removed {
+                    Ok(removed) => Response::Pruned {
+                        removed,
+                        objects_reclaimed: outcome.objects_reclaimed,
+                        bytes_reclaimed: outcome.bytes_reclaimed,
+                        dry_run: outcome.dry_run,
+                    },
+                    Err(err) => failure(ErrorKind::PROTOCOL, err),
+                }
+            }
+            Err(err) => backup_failure(&err),
+        }
     }
 }
 
@@ -423,6 +654,25 @@ fn lifecycle_failure(err: &LifecycleError) -> Response {
             | LifecycleErrorKind::EulaRequired
             | LifecycleErrorKind::NoJava
             | LifecycleErrorKind::UnknownJavaMajor { .. },
+        ) => ErrorKind::INVALID,
+        Some(_) | None => ErrorKind::IO,
+    };
+    failure(kind, err)
+}
+
+/// 备份失败 → 错误帧：按领域判定分类，不解析文案
+fn backup_failure(err: &service::BackupError) -> Response {
+    let kind = match err.kind() {
+        Some(service::BackupErrorKind::SnapshotNotFound { .. }) => ErrorKind::NOT_FOUND,
+        Some(
+            service::BackupErrorKind::NotRestorable { .. }
+            | service::BackupErrorKind::RestoreWhileRunning { .. }
+            | service::BackupErrorKind::TargetExists { .. }
+            | service::BackupErrorKind::EmptyScope
+            | service::BackupErrorKind::InvalidLabel { .. }
+            | service::BackupErrorKind::ConflictingRetention
+            // 校验失败属于业务结果（对象损坏 / 缺失）：不是 IO，也不该静默成功
+            | service::BackupErrorKind::VerifyFailed { .. },
         ) => ErrorKind::INVALID,
         Some(_) | None => ErrorKind::IO,
     };

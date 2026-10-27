@@ -122,6 +122,32 @@ pub(crate) mod mcsup_agent_shim {
         servers: Mutex<Vec<protocol::remote::wire::WireServer>>,
         /// 服务器身份 → 运行状态（supervisor 垫片）
         running: Mutex<Vec<RunningServer>>,
+        /// 备份垫片的快照索引
+        snapshots: Mutex<Vec<protocol::remote::wire::WireSnapshot>>,
+    }
+
+    impl MemAgent {
+        /// 一条固定内容的快照（id 随机后缀避免同秒撞名）
+        fn snapshot(server: &str) -> protocol::remote::wire::WireSnapshot {
+            protocol::remote::wire::WireSnapshot {
+                id: format!("20990101t000000-{:06x}", fastrand()),
+                workspace_id: "survival".to_owned(),
+                server: server.to_owned(),
+                label: None,
+                parent: None,
+                scope: Vec::new(),
+                status: "complete".to_owned(),
+                entries: vec![("world/level.dat".to_owned(), "a".repeat(64))],
+                deleted: Vec::new(),
+                stamps: vec![("world/level.dat".to_owned(), 100, 1)],
+                added: 1,
+                reused: 0,
+                total_bytes: 100,
+                added_bytes: 100,
+                server_online: false,
+                created_at: 1,
+            }
+        }
     }
 
     /// supervisor 垫片里的一台「运行中」服务器
@@ -311,6 +337,99 @@ pub(crate) mod mcsup_agent_shim {
                 Request::LogsTail { lines, .. } => Response::LogLines {
                     lines: (0..*lines).map(|i| format!("log line {i}")).collect(),
                 },
+                // 备份垫片：一台固定快照的内存索引（create 追加，delete/prune 移除）
+                Request::BackupCreate { server_id, .. } => {
+                    let snapshot = MemAgent::snapshot(server_id);
+                    let mut guard = self.snapshots.lock().expect("lock");
+                    guard.push(snapshot.clone());
+                    Response::SnapshotCreated {
+                        snapshot,
+                        skipped: 0,
+                    }
+                }
+                Request::BackupList {
+                    page, page_size, ..
+                } => {
+                    let guard = self.snapshots.lock().expect("lock");
+                    let total = guard.len();
+                    let skip = page.saturating_sub(1) * page_size;
+                    Response::Snapshots {
+                        items: guard.iter().skip(skip).take(*page_size).cloned().collect(),
+                        total,
+                        page: *page,
+                        page_size: *page_size,
+                    }
+                }
+                Request::BackupRestore {
+                    server_id,
+                    snapshot,
+                    to_new,
+                } => {
+                    let guard = self.snapshots.lock().expect("lock");
+                    match guard.iter().find(|snap| snap.id == *snapshot) {
+                        Some(found) => Response::Restored {
+                            snapshot: found.clone(),
+                            destination: format!("/srv/mc/{server_id}"),
+                            files: 1,
+                            bytes: 100,
+                            safety_snapshot: if to_new.is_none() {
+                                Some("20990101t000000-safety".to_owned())
+                            } else {
+                                None
+                            },
+                            deleted: 0,
+                        },
+                        None => RemoteFailure::new(
+                            protocol::remote::ErrorKind::NOT_FOUND,
+                            format!("no such snapshot: {snapshot}"),
+                        )
+                        .into_response(),
+                    }
+                }
+                Request::BackupDelete { snapshot, .. } => {
+                    let mut guard = self.snapshots.lock().expect("lock");
+                    let index = guard.iter().position(|snap| snap.id == *snapshot);
+                    match index {
+                        Some(at) => {
+                            let deleted = guard.remove(at);
+                            Response::SnapshotDeleted {
+                                snapshot: deleted,
+                                orphaned: 1,
+                            }
+                        }
+                        None => RemoteFailure::new(
+                            protocol::remote::ErrorKind::NOT_FOUND,
+                            format!("no such snapshot: {snapshot}"),
+                        )
+                        .into_response(),
+                    }
+                }
+                Request::BackupVerify { snapshot, .. } => {
+                    let guard = self.snapshots.lock().expect("lock");
+                    match guard.iter().find(|snap| snap.id == *snapshot) {
+                        Some(found) => Response::SnapshotVerified {
+                            snapshot: found.clone(),
+                            objects: 1,
+                            bytes: 100,
+                            broken: Vec::new(),
+                        },
+                        None => RemoteFailure::new(
+                            protocol::remote::ErrorKind::NOT_FOUND,
+                            format!("no such snapshot: {snapshot}"),
+                        )
+                        .into_response(),
+                    }
+                }
+                Request::BackupPrune { .. } => {
+                    let mut guard = self.snapshots.lock().expect("lock");
+                    let removed: Vec<_> = guard.drain(..).collect();
+                    Response::Pruned {
+                        removed,
+                        objects_reclaimed: 0,
+                        bytes_reclaimed: 0,
+                        dry_run: false,
+                    }
+                }
                 other => RemoteFailure::invalid(format!("unsupported: {}", other.operation()))
                     .into_response(),
             }

@@ -566,6 +566,146 @@ impl WireStatusEntry {
     }
 }
 
+/// 快照的线格式
+///
+/// `entries` / `deleted` / `stamps` 是快照内容的三份清单：路径一律 `/` 分隔，
+/// 哈希是 64 位小写十六进制。只传元数据——CAS 对象本身留在对端。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireSnapshot {
+    /// 快照 id
+    pub id: String,
+    /// 所属工作区标识
+    pub workspace_id: String,
+    /// 所属服务器名
+    pub server: String,
+    /// 用户标签
+    pub label: Option<String>,
+    /// 父快照 id（增量基线）
+    pub parent: Option<String>,
+    /// 备份范围（顶层项）；空 = 整个目录
+    pub scope: Vec<String>,
+    /// 状态文本（`in_progress` / `complete` / `failed`）
+    pub status: String,
+    /// 相对路径 → 内容哈希
+    pub entries: Vec<(String, String)>,
+    /// 删除墓碑（相对父快照被删掉的路径）
+    pub deleted: Vec<String>,
+    /// 相对路径 → (字节数, 修改时间)
+    pub stamps: Vec<(String, u64, i64)>,
+    /// 本次新建的 CAS 对象数
+    pub added: usize,
+    /// 复用已存在对象的文件数
+    pub reused: usize,
+    /// 逻辑总字节数
+    pub total_bytes: u64,
+    /// 本次净增字节数
+    pub added_bytes: u64,
+    /// 备份时服务器是否在运行
+    pub server_online: bool,
+    /// Unix 秒
+    pub created_at: i64,
+}
+
+impl TryFrom<&domain::backup::Snapshot> for WireSnapshot {
+    type Error = RepositoryError;
+
+    fn try_from(snapshot: &domain::backup::Snapshot) -> Result<Self, Self::Error> {
+        let mut entries = Vec::with_capacity(snapshot.content.len());
+        for (path, hash) in snapshot.content.entries() {
+            entries.push((path.as_str().to_owned(), hash.as_str().to_owned()));
+        }
+        let stamps = snapshot
+            .content
+            .stamps()
+            .iter()
+            .map(|(path, size, mtime)| (path.as_str().to_owned(), *size, *mtime))
+            .collect();
+        Ok(Self {
+            id: snapshot.id.as_str().to_owned(),
+            workspace_id: snapshot.workspace_id.clone(),
+            server: snapshot.server.clone(),
+            label: snapshot.label.clone(),
+            parent: snapshot.parent.as_ref().map(|id| id.as_str().to_owned()),
+            scope: snapshot.scope.entries().to_vec(),
+            status: snapshot.status.as_str().to_owned(),
+            entries,
+            deleted: snapshot
+                .content
+                .deleted()
+                .iter()
+                .map(|path| path.as_str().to_owned())
+                .collect(),
+            stamps,
+            added: snapshot.added,
+            reused: snapshot.reused,
+            total_bytes: snapshot.total_bytes,
+            added_bytes: snapshot.added_bytes,
+            server_online: snapshot.server_online,
+            created_at: snapshot.created_at,
+        })
+    }
+}
+
+impl TryFrom<WireSnapshot> for domain::backup::Snapshot {
+    type Error = RepositoryError;
+
+    fn try_from(wire: WireSnapshot) -> Result<Self, Self::Error> {
+        let mut entries = Vec::with_capacity(wire.entries.len());
+        for (path, hash) in wire.entries {
+            entries.push((
+                domain::backup::RelPath::parse(&path)
+                    .map_err(|err| corrupt("snapshot path", &path, err))?,
+                domain::backup::ContentHash::parse(&hash)
+                    .map_err(|err| corrupt("snapshot hash", &hash, err))?,
+            ));
+        }
+        let mut deleted = Vec::with_capacity(wire.deleted.len());
+        for path in wire.deleted {
+            deleted.push(
+                domain::backup::RelPath::parse(&path)
+                    .map_err(|err| corrupt("snapshot tombstone", &path, err))?,
+            );
+        }
+        let stamps = wire
+            .stamps
+            .into_iter()
+            .map(|(path, size, mtime)| {
+                domain::backup::RelPath::parse(&path)
+                    .map(|path| (path, size, mtime))
+                    .map_err(|err| corrupt("snapshot stamp", &path, err))
+            })
+            .collect::<Result<Vec<_>, RepositoryError>>()?;
+        let content = domain::backup::SnapshotContent::new(entries, deleted)
+            .map_err(|err| corrupt("snapshot content", "", err))?
+            .with_stamps(stamps);
+        Ok(Self {
+            id: domain::backup::SnapshotId::parse(&wire.id)
+                .map_err(|err| corrupt("snapshot id", &wire.id, err))?,
+            workspace_id: wire.workspace_id,
+            server: wire.server,
+            label: wire.label,
+            parent: wire
+                .parent
+                .map(|raw| {
+                    domain::backup::SnapshotId::parse(&raw)
+                        .map_err(|err| corrupt("snapshot parent", &raw, err))
+                })
+                .transpose()?,
+            scope: BackupScope::from_entries(wire.scope)
+                .map_err(|err| corrupt("snapshot scope", "", err))?,
+            status: domain::backup::SnapshotStatus::parse(&wire.status)
+                .map_err(|err| corrupt("snapshot status", &wire.status, err))?,
+            content,
+            added: wire.added,
+            reused: wire.reused,
+            total_bytes: wire.total_bytes,
+            added_bytes: wire.added_bytes,
+            server_online: wire.server_online,
+            created_at: wire.created_at,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

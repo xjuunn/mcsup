@@ -13,12 +13,15 @@
 //! [`RemoteBackend`] 是 `port::Backend` 的远端实现：supervisor 走 RPC
 //! （[`RemoteSupervisor`]），installer 在 Installer 帧落地前不可用。
 
+pub mod backup;
 pub mod combined;
 pub mod link;
 pub mod mirror;
 pub mod router;
 pub mod supervisor;
 
+#[cfg(test)]
+mod backup_tests;
 #[cfg(test)]
 mod router_tests;
 #[cfg(test)]
@@ -27,6 +30,7 @@ mod supervisor_tests;
 #[cfg(test)]
 pub(crate) mod testkit;
 
+pub use backup::{RemoteBackups, RoutingBackups};
 pub use combined::{
     CombinedJavaRepository, CombinedServerRepository, CombinedWorkspaceRepository, RemoteMember,
     RemoteMembers,

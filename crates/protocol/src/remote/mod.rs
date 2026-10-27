@@ -30,7 +30,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Write};
 use wire::{
-    WireClient, WireJava, WireServer, WireStartOutcome, WireStatusEntry, WireStop, WireWorkspace,
+    WireClient, WireJava, WireServer, WireSnapshot, WireStartOutcome, WireStatusEntry, WireStop,
+    WireWorkspace,
 };
 
 /// 远端协议版本；不匹配直接拒绝，禁止猜测兼容
@@ -260,6 +261,64 @@ pub enum Request {
         /// 回看行数
         lines: usize,
     },
+
+    // ---- backup（阶段 9）：全部走元数据帧，CAS 对象留在对端 ----
+    /// 创建快照（对端扫描 + 写对端 CAS）
+    BackupCreate {
+        /// 服务器身份
+        server_id: String,
+        /// 用户标签
+        label: Option<String>,
+        /// 备份范围（顶层项）；`None` = 用对端服务器属性里的范围
+        scope: Option<Vec<String>>,
+        /// 禁用增量复用（强制全量）
+        no_reuse: bool,
+        /// 等待 `save-all` 落盘的毫秒数
+        flush_wait_ms: Option<u64>,
+    },
+    /// 快照列表（分页，按时间倒序）
+    BackupList {
+        /// 服务器身份
+        server_id: String,
+        /// 页码（1 基）
+        page: usize,
+        /// 每页条数
+        page_size: usize,
+    },
+    /// 恢复快照
+    BackupRestore {
+        /// 服务器身份
+        server_id: String,
+        /// 快照 id
+        snapshot: String,
+        /// 恢复目标：`None` = 原地；`Some(name)` = 恢复为新服务
+        to_new: Option<String>,
+    },
+    /// 删除快照记录
+    BackupDelete {
+        /// 服务器身份
+        server_id: String,
+        /// 快照 id
+        snapshot: String,
+    },
+    /// 校验快照引用的 CAS 对象
+    BackupVerify {
+        /// 服务器身份
+        server_id: String,
+        /// 快照 id
+        snapshot: String,
+    },
+    /// 按保留策略清理
+    BackupPrune {
+        /// 服务器身份
+        server_id: String,
+        /// 保留最近 N 份；与 `older_than_secs` 二选一
+        keep: Option<usize>,
+        /// 删除早于该秒数的快照
+        older_than_secs: Option<u64>,
+        /// 只报告不执行
+        dry_run: bool,
+    },
 }
 
 impl Request {
@@ -288,6 +347,13 @@ impl Request {
             Self::Start { .. } | Self::Stop { .. } | Self::SendLine { .. } => {
                 Some(Permission::Control)
             }
+            // 备份写对端磁盘并可能覆盖服务器目录，比 Write 更重，单列 Backup
+            Self::BackupCreate { .. }
+            | Self::BackupList { .. }
+            | Self::BackupRestore { .. }
+            | Self::BackupDelete { .. }
+            | Self::BackupVerify { .. }
+            | Self::BackupPrune { .. } => Some(Permission::Backup),
             // 客户端名册是访问控制数据：能看就能做社会工程，按 Manage 处理
             Self::Shutdown | Self::ClientList | Self::ClientRevoke { .. } => {
                 Some(Permission::Manage)
@@ -320,6 +386,12 @@ impl Request {
             Self::Stop { .. } => "server.stop",
             Self::SendLine { .. } => "server.send",
             Self::LogsTail { .. } => "server.logs",
+            Self::BackupCreate { .. } => "backup.create",
+            Self::BackupList { .. } => "backup.list",
+            Self::BackupRestore { .. } => "backup.restore",
+            Self::BackupDelete { .. } => "backup.delete",
+            Self::BackupVerify { .. } => "backup.verify",
+            Self::BackupPrune { .. } => "backup.prune",
         }
     }
 }
@@ -412,6 +484,70 @@ pub enum Response {
     Removed {
         /// 磁盘目录是否被本次调用实际删除
         disk_purged: bool,
+    },
+
+    // ---- backup（阶段 9） ----
+    /// 快照创建结果
+    SnapshotCreated {
+        /// 新建的快照
+        snapshot: WireSnapshot,
+        /// 扫描期跳过的条目数
+        skipped: usize,
+    },
+    /// 快照列表一页（顺序与请求一致）
+    Snapshots {
+        /// 本页快照
+        items: Vec<WireSnapshot>,
+        /// 该服务器的快照总数
+        total: usize,
+        /// 当前页码
+        page: usize,
+        /// 每页条数
+        page_size: usize,
+    },
+    /// 恢复结果
+    Restored {
+        /// 被恢复的快照
+        snapshot: WireSnapshot,
+        /// 对端上的恢复目标目录
+        destination: String,
+        /// 写回的文件数
+        files: usize,
+        /// 写回的字节数
+        bytes: u64,
+        /// 原地恢复前自动生成的安全快照 id
+        safety_snapshot: Option<String>,
+        /// 按墓碑 / 快照外文件删除的路径数
+        deleted: usize,
+    },
+    /// 删除结果
+    SnapshotDeleted {
+        /// 被删除的快照
+        snapshot: WireSnapshot,
+        /// 该快照释放的 CAS 引用计数缺口（待 prune 回收）
+        orphaned: usize,
+    },
+    /// 校验结果
+    SnapshotVerified {
+        /// 被校验的快照
+        snapshot: WireSnapshot,
+        /// 被引用的对象数（去重后）
+        objects: usize,
+        /// 校验通过的字节数
+        bytes: u64,
+        /// 损坏或缺失的对象哈希
+        broken: Vec<String>,
+    },
+    /// 清理结果
+    Pruned {
+        /// 被删除的快照
+        removed: Vec<WireSnapshot>,
+        /// 回收的 CAS 对象数
+        objects_reclaimed: usize,
+        /// 回收的字节数
+        bytes_reclaimed: u64,
+        /// 是否只是试运行
+        dry_run: bool,
     },
     /// 业务 / 协议错误
     Error {
@@ -600,7 +736,30 @@ mod tests {
         read_response(&mut cursor).expect("read")
     }
 
+    /// 一条最小合法的 `WireSnapshot`（完整内容清单，验编解码不丢字段）
+    fn snapshot_wire() -> WireSnapshot {
+        WireSnapshot {
+            id: "20260101t000000-abc123".to_owned(),
+            workspace_id: "survival".to_owned(),
+            server: "web".to_owned(),
+            label: Some("before-upgrade".to_owned()),
+            parent: None,
+            scope: vec!["world".to_owned()],
+            status: "complete".to_owned(),
+            entries: vec![("world/level.dat".to_owned(), "a".repeat(64))],
+            deleted: vec!["logs/old.log".to_owned()],
+            stamps: vec![("world/level.dat".to_owned(), 4096, 1_700_000_000)],
+            added: 1,
+            reused: 0,
+            total_bytes: 4096,
+            added_bytes: 4096,
+            server_online: false,
+            created_at: 1_700_000_000,
+        }
+    }
+
     #[test]
+    #[allow(clippy::too_many_lines)] // 帧样本清单本身就是长列表，拆分反而难对账
     fn every_request_roundtrips_with_version() {
         let requests = [
             Request::Hello {
@@ -668,6 +827,37 @@ mod tests {
                 server_id: "550e8400-e29b-41d4-a716-446655440000".to_owned(),
                 lines: 30,
             },
+            Request::BackupCreate {
+                server_id: "550e8400-e29b-41d4-a716-446655440000".to_owned(),
+                label: Some("before-upgrade".to_owned()),
+                scope: Some(vec!["world".to_owned()]),
+                no_reuse: false,
+                flush_wait_ms: Some(2000),
+            },
+            Request::BackupList {
+                server_id: "550e8400-e29b-41d4-a716-446655440000".to_owned(),
+                page: 1,
+                page_size: 20,
+            },
+            Request::BackupRestore {
+                server_id: "550e8400-e29b-41d4-a716-446655440000".to_owned(),
+                snapshot: "20260101t000000-abc123".to_owned(),
+                to_new: Some("web-restored".to_owned()),
+            },
+            Request::BackupDelete {
+                server_id: "550e8400-e29b-41d4-a716-446655440000".to_owned(),
+                snapshot: "20260101t000000-abc123".to_owned(),
+            },
+            Request::BackupVerify {
+                server_id: "550e8400-e29b-41d4-a716-446655440000".to_owned(),
+                snapshot: "20260101t000000-abc123".to_owned(),
+            },
+            Request::BackupPrune {
+                server_id: "550e8400-e29b-41d4-a716-446655440000".to_owned(),
+                keep: Some(3),
+                older_than_secs: None,
+                dry_run: true,
+            },
         ];
         for request in requests {
             let back = roundtrip(&request);
@@ -720,6 +910,40 @@ mod tests {
                 lines: vec!["[12:00:00] done".to_owned()],
             },
             Response::Removed { disk_purged: true },
+            Response::SnapshotCreated {
+                snapshot: snapshot_wire(),
+                skipped: 2,
+            },
+            Response::Snapshots {
+                items: vec![snapshot_wire()],
+                total: 1,
+                page: 1,
+                page_size: 20,
+            },
+            Response::Restored {
+                snapshot: snapshot_wire(),
+                destination: "/srv/mc/web".to_owned(),
+                files: 10,
+                bytes: 4096,
+                safety_snapshot: Some("20260101t000100-def456".to_owned()),
+                deleted: 1,
+            },
+            Response::SnapshotDeleted {
+                snapshot: snapshot_wire(),
+                orphaned: 3,
+            },
+            Response::SnapshotVerified {
+                snapshot: snapshot_wire(),
+                objects: 10,
+                bytes: 4096,
+                broken: Vec::new(),
+            },
+            Response::Pruned {
+                removed: vec![snapshot_wire()],
+                objects_reclaimed: 3,
+                bytes_reclaimed: 12_288,
+                dry_run: false,
+            },
             Response::Error {
                 kind: ErrorKind::NOT_FOUND.to_owned(),
                 message: "server web not found".to_owned(),
