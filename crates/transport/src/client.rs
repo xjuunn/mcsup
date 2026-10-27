@@ -257,22 +257,34 @@ impl Client {
 
     /// 执行一个操作（自动握手 + 认证）
     ///
-    /// 连接断了会重建一次再重试：远端在两次命令之间重启是常态，把「重启」
-    /// 表现成一次失败会让每个脚本都要自己重试。
+    /// 复用中的连接断了会重建一次再重试：远端在两次命令之间重启是常态，把
+    /// 「重启」表现成一次失败会让每个脚本都要自己重试。
+    ///
+    /// **建连本身就失败时不重试**：没有「断掉的连接」可重建，第二次尝试只会
+    /// 把等待翻倍（不可达远端一次 SYN 超时已经够久），而结果不会变好。
     ///
     /// # Errors
     ///
     /// 建连、认证失败或对端返回错误时返回 [`TransportError`]
     pub fn call(&self, request: &Request) -> Result<Response, TransportError> {
+        let reused = self.has_connection();
         match self.call_once(request) {
             Ok(response) => Ok(response),
-            Err(err) if err.is_retryable() => {
+            Err(err) if should_retry(&err, reused) => {
                 tracing::debug!(%err, "remote connection dropped, retrying once");
                 self.disconnect()?;
                 self.call_once(request)
             }
             Err(err) => Err(err),
         }
+    }
+
+    /// 连接池里是否已有一条连接（只窥探，不建连）
+    ///
+    /// 用来区分「复用中的连接断了」与「压根没连上」：只有前者值得重试。
+    /// 锁中毒按「没有连接」处理——那种情况下重试也修不好。
+    fn has_connection(&self) -> bool {
+        self.conn.lock().is_ok_and(|guard| guard.is_some())
     }
 
     /// 执行一个操作，不做重试
@@ -436,6 +448,14 @@ pub(crate) fn configure(stream: &TcpStream) -> Result<(), TransportError> {
         .map_err(|err| TransportError::io("configure socket", err))
 }
 
+/// 是否值得重试：只有「复用中的连接断了」才值得
+///
+/// `reused` 为 false 表示这次调用连连接都没建起来：没有可重建的断连，重试
+/// 只是把等待时间翻倍（对端不可达时一次建连超时已经够久），结果不会变好。
+fn should_retry(err: &TransportError, reused: bool) -> bool {
+    reused && err.is_retryable()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,6 +487,26 @@ mod tests {
         let err = client.call(&Request::Ping).expect_err("refused");
         assert!(matches!(err, TransportError::Io { .. }), "{err:?}");
         assert!(err.is_retryable());
+    }
+
+    /// 建连失败不重试：没有断掉的连接可重建，重试只会把等待翻倍
+    #[test]
+    fn retry_needs_an_existing_connection() {
+        let refused = TransportError::io(
+            "connect 127.0.0.1:1",
+            std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+        );
+        assert!(refused.is_retryable(), "建连失败本身是可重试类别");
+        assert!(!should_retry(&refused, false), "没连上过就不重试");
+        assert!(should_retry(&refused, true), "复用中的连接断了才重试");
+    }
+
+    /// 不可重试的错误（未授权 / 协议）无论如何都不重试
+    #[test]
+    fn non_retryable_errors_are_never_retried() {
+        let unauthorized = TransportError::Unauthorized("no token".to_owned());
+        assert!(!should_retry(&unauthorized, true));
+        assert!(!should_retry(&unauthorized, false));
     }
 
     #[test]

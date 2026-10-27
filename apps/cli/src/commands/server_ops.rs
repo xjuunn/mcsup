@@ -2,6 +2,7 @@ use crate::bootstrap;
 use crate::diagnostic::AppDiagnostic;
 use crate::locale::Lang;
 use crate::output::Printer;
+use crate::progress::TaskSpinner;
 use crate::prompts;
 use anyhow::{Context, Result};
 use comfy_table::{Cell, Color, Table};
@@ -353,9 +354,16 @@ pub(crate) async fn create(args: CreateArgs<'_>, printer: Printer) -> Result<()>
 
     let reg = open_registry()?;
 
+    // 交互预检只查本地注册表：名称那一格是「早提示」，不该为一台离线远端
+    // 付建连等待（远端读是实时查询，见 docs/remote.md）。全局查重仍由
+    // `reg.create` 在登记时做——唯一判定点不搬家。
+    let local_reg = bootstrap::open_registry()?;
+
     // 4-6. 名称 / 变体 / 版本：给定即用，缺哪项补哪项
-    let inputs =
-        finish_create_inputs(&reg, &available, name, variant, version, modpack, printer).await?;
+    let inputs = finish_create_inputs(
+        &local_reg, &available, name, variant, version, modpack, printer,
+    )
+    .await?;
     let CreateInputs {
         name,
         variant,
@@ -366,8 +374,15 @@ pub(crate) async fn create(args: CreateArgs<'_>, printer: Printer) -> Result<()>
 
     // Java 版本要求不在此预取：下载核心时 `install_jar` 会随元数据一并回写，
     // 预取会重复打一遍 manifest/details 网络请求
-    let srv = reg
-        .create(
+    //
+    // 登记前要查全量名称（含已配对远端），离线远端会等一次建连超时：这步
+    // 可能明显可见，挂 spinner 而不是让终端静止。
+    let srv = {
+        let _spinner = TaskSpinner::new(
+            crate::i18n::pick(printer.lang(), "登记服务器", "registering server"),
+            printer.is_human(),
+        );
+        reg.create(
             selector.as_deref(),
             &name,
             &version_id,
@@ -380,7 +395,8 @@ pub(crate) async fn create(args: CreateArgs<'_>, printer: Printer) -> Result<()>
                 format!("创建服务器 {name} 失败"),
                 format!("failed to create server {name}"),
             )
-        })?;
+        })?
+    };
 
     // 7. 布置服务端（核心 / 整合包），失败保留已注册结果
     setup_server(
@@ -617,7 +633,7 @@ struct CreateInputs {
 }
 
 async fn finish_create_inputs(
-    reg: &ServerRegistry,
+    local_reg: &ServerRegistry,
     available: &[ServerVariant],
     name: Option<&str>,
     variant: Option<ServerVariant>,
@@ -634,7 +650,7 @@ async fn finish_create_inputs(
             3,
             &crate::i18n::pick(printer.lang(), "服务器名称", "server name"),
         );
-        prompt_unique_name(reg, printer)?
+        prompt_unique_name(local_reg, printer)?
     };
 
     let variant = match variant {
@@ -814,15 +830,19 @@ fn pick_variant(available: &[ServerVariant], printer: Printer) -> Result<ServerV
         .ok_or_else(|| anyhow::anyhow!("无效变体: {picked}"))
 }
 
-/// 名称重输：语法由 prompts 校验，重复（注册表已有）时警示后重问
-fn prompt_unique_name(reg: &ServerRegistry, printer: Printer) -> Result<String> {
+/// 名称重输：语法由 prompts 校验，重复（本地已有）时警示后重问
+///
+/// 只查本地注册表：这格是交互预检，候选列表与提示必须立刻出现，不能为一台
+/// 离线远端付建连等待。远端 / 全局重名由登记阶段（`ServerRegistry::create`）
+/// 兜底——那里才是名称唯一性的判定点。
+fn prompt_unique_name(local_reg: &ServerRegistry, printer: Printer) -> Result<String> {
     loop {
         let candidate = prompts::input_name(
             printer.lang(),
             &crate::i18n::pick(printer.lang(), "服务器名称", "server name"),
             "server",
         )?;
-        match reg.get(&candidate) {
+        match local_reg.get(&candidate) {
             Err(ServerRegistryError::NotFound(_)) => return Ok(candidate),
             Err(err) => return Err(err.into()),
             Ok(_) => printer.print_warning(&crate::i18n::pick(
