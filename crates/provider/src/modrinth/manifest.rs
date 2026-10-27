@@ -182,6 +182,18 @@ pub struct Project {
     pub donation_urls: Option<Vec<DonationUrl>>,
 }
 
+impl Project {
+    /// 上游是否明确标注「不能在服务端运行」
+    ///
+    /// 只有明确的 `unsupported` 才算。字段缺失表示上游没有回填（默认
+    /// `required`），按「可以在服务端运行」处理——宁可多装一个文件，也不能
+    /// 把真正的服务端模组判成仅客户端删掉。
+    #[must_use]
+    pub fn is_server_unsupported(&self) -> bool {
+        self.server_side.as_deref() == Some("unsupported")
+    }
+}
+
 /// 许可证信息
 #[derive(Debug, Clone, Deserialize)]
 pub struct License {
@@ -445,10 +457,52 @@ mod tests {
         assert_eq!(project.id, "AABBCCDD");
         assert_eq!(project.project_type, "modpack");
         assert_eq!(project.license.id, "LGPL-3.0-or-later");
+        assert_eq!(project.server_side.as_deref(), Some("required"));
+        assert_eq!(project.client_side.as_deref(), Some("required"));
+        assert!(!project.is_server_unsupported());
         assert_eq!(project.gallery.len(), 1);
         assert!(project.gallery[0].featured);
         assert_eq!(project.versions.len(), 2);
         assert!(project.donation_urls.is_none());
+    }
+
+    /// `server_side` / `client_side` 缺失时为 `None`：旧夹具与旧上游响应都要能解析
+    #[test]
+    fn side_support_is_optional() {
+        let raw = r#"{
+            "id": "X", "team": "T", "title": "t", "description": "d", "body": "b",
+            "status": "approved", "project_type": "mod", "license": {"id": "MIT"},
+            "published": "2024-01-01T00:00:00Z", "updated": "2024-01-01T00:00:00Z",
+            "downloads": 0, "followers": 0
+        }"#;
+        let project: Project = serde_json::from_str(raw).expect("缺省 sides 应解析");
+        assert!(project.server_side.is_none());
+        assert!(project.client_side.is_none());
+        assert!(!project.is_server_unsupported());
+    }
+
+    /// 只有 `unsupported` 判为不支持服务端
+    #[test]
+    fn unsupported_is_the_only_server_unsupported_value() {
+        for (value, expected) in [
+            ("unsupported", true),
+            ("required", false),
+            ("optional", false),
+            ("unknown", false),
+        ] {
+            let raw = format!(
+                r#"{{"id": "X", "team": "T", "title": "t", "description": "d", "body": "b",
+                    "status": "approved", "project_type": "mod", "license": {{"id": "MIT"}},
+                    "published": "2024-01-01T00:00:00Z", "updated": "2024-01-01T00:00:00Z",
+                    "downloads": 0, "followers": 0, "server_side": "{value}"}}"#
+            );
+            let project: Project = serde_json::from_str(&raw).expect("应解析");
+            assert_eq!(
+                project.is_server_unsupported(),
+                expected,
+                "server_side={value} 的判定不符"
+            );
+        }
     }
 
     /// 版本列表完整解析：文件哈希、依赖、文件列表

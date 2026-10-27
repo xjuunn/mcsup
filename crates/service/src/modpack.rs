@@ -28,6 +28,7 @@ use port::modpack::{
     ModpackExtractError, ModpackExtractor, ModpackSource, ModpackSourceRegistry, ResolvedModpack,
 };
 use port::{ArtifactDownloader, CancellationToken, DownloadRequest, ProgressSink, SourceError};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
@@ -287,7 +288,12 @@ impl ModpackService {
             })
             .filter_map(|file| file.hashes.sha1.clone())
             .collect();
-        let client_only = source.client_only_hashes(&mod_hashes).await?;
+        // 纯配置 / 资源包整合包没有可反查的 jar，直接省掉一次上游请求
+        let client_only = if mod_hashes.is_empty() {
+            HashSet::new()
+        } else {
+            source.client_only_hashes(&mod_hashes).await?
+        };
 
         // 3. 清单文件：只装服务端需要的（server: unsupported 已由领域层过滤）
         let mut reused = 0;

@@ -35,7 +35,7 @@ use port::modpack::{
     ModpackSource, ModpackSummary, ModpackVersion, ResolvedModpack,
 };
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -47,6 +47,12 @@ const SEARCH_LIMIT_MAX: u32 = 100;
 
 /// 项目页根地址（展示用；API 根地址是 `api.modrinth.com/v2`）
 const WEB_ROOT: &str = "https://modrinth.com";
+
+/// 批量哈希反查的单批上限
+///
+/// `POST /version_files` 的请求体是一次性数组；按批发送，避免大整合包
+/// （常见 300+ 个 jar）一次打爆请求体。
+const HASH_QUERY_BATCH: usize = 100;
 
 impl ContentSourceInfo for ModrinthModpackSource {
     fn name(&self) -> &'static str {
@@ -202,8 +208,7 @@ impl ModpackSource for ModrinthModpackSource {
             return Ok(HashSet::new());
         }
         let mut client_only = HashSet::new();
-        // 批量接口有请求体上限；按 100 个哈希一批，避免大整合包一次打爆
-        for chunk in hashes.chunks(100) {
+        for chunk in hashes.chunks(HASH_QUERY_BATCH) {
             let versions = self
                 .inner
                 .versions_from_hashes(chunk, HashAlgorithm::Sha1)
@@ -215,22 +220,33 @@ impl ModpackSource for ModrinthModpackSource {
                 .into_iter()
                 .collect();
             if project_ids.is_empty() {
+                // 本批哈希在 Modrinth 上一个都没命中（第三方站下载的 jar），
+                // 不必再查项目详情
                 continue;
             }
             let projects = self.inner.projects(&project_ids).await?;
-            let unsupported: HashSet<&str> = projects
-                .iter()
-                .filter(|project| project.server_side.as_deref() == Some("unsupported"))
-                .map(|project| project.id.as_str())
-                .collect();
-            for (hash, version) in &versions {
-                if unsupported.contains(version.project_id.as_str()) {
-                    client_only.insert(hash.clone());
-                }
-            }
+            client_only.extend(client_only_from(&versions, &projects));
         }
         Ok(client_only)
     }
+}
+
+/// 从「哈希 → 版本」与「项目详情」里挑出仅客户端条目
+///
+/// 只有上游明确标注 `server_side = unsupported` 的项目才算仅客户端；字段缺失
+/// 或取值未知都按「可在服务端运行」处理——上游没有回填时宁可多装一个文件，
+/// 也不能把真正的服务端模组删掉。
+fn client_only_from(versions: &HashMap<String, Version>, projects: &[Project]) -> HashSet<String> {
+    let unsupported: HashSet<&str> = projects
+        .iter()
+        .filter(|project| project.is_server_unsupported())
+        .map(|project| project.id.as_str())
+        .collect();
+    versions
+        .iter()
+        .filter(|(_hash, version)| unsupported.contains(version.project_id.as_str()))
+        .map(|(hash, _version)| hash.clone())
+        .collect()
 }
 
 /// 搜索结果 → 摘要
@@ -668,5 +684,79 @@ mod tests {
     fn mrpack_staging_dir_is_under_base() {
         let base = Path::new("/srv/mc");
         assert!(mrpack_staging_dir(base).starts_with(base));
+    }
+
+    /// 构造一条指向指定项目的最小版本记录
+    fn version_in(project_id: &str) -> Version {
+        let mut version = version("release");
+        version.project_id = project_id.to_owned();
+        version
+    }
+
+    /// 构造项目详情：只关心 id 与 `server_side`
+    fn project(id: &str, server_side: Option<&str>) -> Project {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "team": "T",
+            "title": "t",
+            "description": "d",
+            "body": "b",
+            "status": "approved",
+            "project_type": "mod",
+            "license": {"id": "MIT"},
+            "published": "2024-01-01T00:00:00Z",
+            "updated": "2024-01-01T00:00:00Z",
+            "downloads": 0,
+            "followers": 0,
+            "server_side": server_side,
+        }))
+        .expect("project 夹具")
+    }
+
+    /// 只有 `server_side = unsupported` 才算仅客户端；
+    /// `required` / `optional` / 缺失都不标记
+    #[test]
+    fn client_only_from_marks_only_unsupported_projects() {
+        let mut versions = HashMap::new();
+        versions.insert("client-hash".to_owned(), version_in("P-CLIENT"));
+        versions.insert("server-hash".to_owned(), version_in("P-SERVER"));
+        versions.insert("unknown-hash".to_owned(), version_in("P-UNKNOWN"));
+        let projects = vec![
+            project("P-CLIENT", Some("unsupported")),
+            project("P-SERVER", Some("required")),
+            project("P-UNKNOWN", None),
+        ];
+
+        let mut marked: Vec<String> = client_only_from(&versions, &projects).into_iter().collect();
+        marked.sort();
+        assert_eq!(
+            marked,
+            vec!["client-hash".to_owned()],
+            "只应标记上游标注 server_side=unsupported 的文件，实际：{marked:?}"
+        );
+    }
+
+    /// 项目详情查不到（上游没返回该 id）时不删任何文件
+    #[test]
+    fn client_only_from_without_project_details_marks_nothing() {
+        let mut versions = HashMap::new();
+        versions.insert("client-hash".to_owned(), version_in("P-CLIENT"));
+        assert!(
+            client_only_from(&versions, &[]).is_empty(),
+            "没有项目详情时不得把文件判成仅客户端"
+        );
+    }
+
+    /// 空哈希列表在发请求前短路：地址不可达也不会报错
+    #[tokio::test]
+    async fn empty_hashes_do_not_touch_network() {
+        let source = ModrinthModpackSource::from_source(
+            ModrinthSource::for_test("http://127.0.0.1:1/v2").expect("source"),
+        );
+        let marked = source
+            .client_only_hashes(&[])
+            .await
+            .expect("空输入不应发请求");
+        assert!(marked.is_empty());
     }
 }

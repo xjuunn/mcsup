@@ -5,6 +5,9 @@
 //! 请求体、以及非 2xx 的错误归类。真实上游的正确性由 `modrinth_net.rs`
 //! 承担（它才需要联网）。
 //!
+//! 例外：`client_only_hashes_*` 这几条只打回环地址、不依赖外部网络，默认
+//! 执行——它是整合包安装的服务端安全判定，不能长期停在「手动才跑」。
+//!
 //! 用本地服务而不是 `wiremock` 之类的依赖，是因为断言点只有「收到什么」，
 //! 用一个 `TcpListener` + 手写响应足够，且不给 crate 增加测试期依赖。
 
@@ -15,7 +18,7 @@ use provider::modrinth::{
     Facet, FacetTree, HashAlgorithm, ModrinthModpackSource, ModrinthSource, ProjectType,
     SearchIndex, SearchQuery, VersionChannel, VersionFilter, primary_file,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -409,6 +412,172 @@ async fn versions_from_hashes_posts_map() {
         serde_json::from_str(&request.body).expect("body 应为 JSON");
     assert_eq!(body["algorithm"], serde_json::json!("sha1"));
     assert_eq!(body["hashes"], serde_json::json!(["abc"]));
+}
+
+/// 最小版本对象：只带 `Version` 的必填字段
+fn version_body(id: &str, project_id: &str) -> String {
+    format!(
+        r#"{{"version_number":"1.0.0","id":"{id}","project_id":"{project_id}","author_id":"A","date_published":"2024-01-01T00:00:00Z","downloads":0,"files":[]}}"#
+    )
+}
+
+/// 最小项目对象：只关心 `id` 与 `server_side`
+fn project_body(id: &str, server_side: &str) -> String {
+    format!(
+        r#"{{"id":"{id}","team":"T","title":"t","description":"d","body":"b","status":"approved","project_type":"mod","license":{{"id":"MIT"}},"published":"2024-01-01T00:00:00Z","updated":"2024-01-01T00:00:00Z","downloads":0,"followers":0,"server_side":"{server_side}"}}"#
+    )
+}
+
+/// 仅客户端判定：批量反查 → 项目详情，只标记 `server_side=unsupported`。
+///
+/// 用回环 mock 而不是真实上游，因此默认执行（不打外部网络）。
+#[tokio::test]
+async fn client_only_hashes_marks_unsupported_projects() {
+    // clienthash 与 althash 指向同一个仅客户端项目：项目 ID 要去重后只查一次
+    let versions = format!(
+        r#"{{"clienthash":{},"althash":{},"serverhash":{}}}"#,
+        version_body("V1", "P-CLIENT"),
+        version_body("V2", "P-CLIENT"),
+        version_body("V3", "P-SERVER")
+    );
+    let projects = format!(
+        "[{},{}]",
+        project_body("P-CLIENT", "unsupported"),
+        project_body("P-SERVER", "required")
+    );
+    let mock = Mock::start(vec![
+        ("POST", "/v2/version_files", 200, versions),
+        ("POST", "/v2/projects", 200, projects),
+    ])
+    .await;
+    let source = ModrinthModpackSource::from_source(source_for(&mock));
+
+    let marked = source
+        .client_only_hashes(&[
+            "clienthash".to_owned(),
+            "althash".to_owned(),
+            "serverhash".to_owned(),
+        ])
+        .await
+        .expect("查询仅客户端");
+
+    assert_eq!(
+        marked,
+        HashSet::from(["clienthash".to_owned(), "althash".to_owned()]),
+        "只有 server_side=unsupported 的文件应被标记，实际：{marked:?}"
+    );
+
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2, "一次哈希反查 + 一次项目详情");
+    let lookup: serde_json::Value =
+        serde_json::from_str(&requests[0].body).expect("哈希反查 body 应为 JSON");
+    assert_eq!(lookup["algorithm"], serde_json::json!("sha1"));
+    assert_eq!(
+        lookup["hashes"].as_array().expect("hashes 数组").len(),
+        3,
+        "请求体应带上全部哈希：{}",
+        requests[0].body
+    );
+    let ids: HashSet<String> =
+        serde_json::from_str(&requests[1].body).expect("项目详情 body 应为 ID 数组");
+    assert_eq!(
+        ids,
+        HashSet::from(["P-CLIENT".to_owned(), "P-SERVER".to_owned()]),
+        "同一个项目的多个文件只查一次：{}",
+        requests[1].body
+    );
+}
+
+/// 反查一个都没命中时不再查项目详情（第三方站下载的 jar 很常见）
+#[tokio::test]
+async fn client_only_hashes_skips_project_lookup_without_hits() {
+    let mock = Mock::start(vec![("POST", "/v2/version_files", 200, "{}".to_owned())]).await;
+    let source = ModrinthModpackSource::from_source(source_for(&mock));
+
+    let marked = source
+        .client_only_hashes(&["unknown".to_owned()])
+        .await
+        .expect("查询仅客户端");
+
+    assert!(marked.is_empty());
+    let targets: Vec<String> = mock
+        .requests()
+        .into_iter()
+        .map(|request| request.target)
+        .collect();
+    assert_eq!(
+        targets,
+        vec!["/v2/version_files".to_owned()],
+        "没有命中时不应再查项目详情"
+    );
+}
+
+/// 大批量按 100 个一批发送，不会一次塞进一个请求体
+#[tokio::test]
+async fn client_only_hashes_batches_by_hundred() {
+    let mock = Mock::start(vec![("POST", "/v2/version_files", 200, "{}".to_owned())]).await;
+    let source = ModrinthModpackSource::from_source(source_for(&mock));
+    let hashes: Vec<String> = (0..101).map(|index| format!("hash{index:03}")).collect();
+
+    let marked = source
+        .client_only_hashes(&hashes)
+        .await
+        .expect("查询仅客户端");
+    assert!(marked.is_empty());
+
+    let batches: Vec<usize> = mock
+        .requests()
+        .iter()
+        .map(|request| {
+            let body: serde_json::Value =
+                serde_json::from_str(&request.body).expect("body 应为 JSON");
+            body["hashes"].as_array().expect("hashes 数组").len()
+        })
+        .collect();
+    assert_eq!(
+        batches,
+        vec![100, 1],
+        "101 个哈希应切成 100 + 1 两批，实际 {batches:?}"
+    );
+}
+
+/// 上游失败原样上报：调用方据此中止安装，而不是带着未知状态继续落盘
+#[tokio::test]
+async fn client_only_hashes_propagates_upstream_error() {
+    let mock = Mock::start(vec![("POST", "/v2/version_files", 503, String::new())]).await;
+    let source = ModrinthModpackSource::from_source(source_for(&mock));
+
+    let err = source
+        .client_only_hashes(&["abc".to_owned()])
+        .await
+        .expect_err("上游 503 应报错");
+    assert!(err.retryable(), "503 应归类为可重试: {err:?}");
+    assert!(
+        matches!(err, port::SourceError::Status { status: 503 }),
+        "{err:?}"
+    );
+}
+
+/// 项目详情失败同样上报：只拿到哈希反查结果不足以判定是否仅客户端
+#[tokio::test]
+async fn client_only_hashes_propagates_project_error() {
+    let versions = format!(r#"{{"clienthash":{}}}"#, version_body("V1", "P-CLIENT"));
+    let mock = Mock::start(vec![
+        ("POST", "/v2/version_files", 200, versions),
+        ("POST", "/v2/projects", 404, "{}".to_owned()),
+    ])
+    .await;
+    let source = ModrinthModpackSource::from_source(source_for(&mock));
+
+    let err = source
+        .client_only_hashes(&["clienthash".to_owned()])
+        .await
+        .expect_err("项目详情失败应报错");
+    assert!(
+        matches!(err, port::SourceError::Upstream { status: 404, .. }),
+        "{err:?}"
+    );
+    assert!(!err.retryable(), "404 不可重试: {err:?}");
 }
 
 /// 依赖图与标签端点
