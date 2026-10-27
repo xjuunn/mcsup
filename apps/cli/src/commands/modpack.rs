@@ -222,12 +222,6 @@ async fn browse_results(
     let search = service.select_source(None)?.search(&query).await;
     spinner.finish();
     let search = search.context("搜索整合包失败")?;
-    if search.hits.is_empty() {
-        match keyword {
-            Some(keyword) => anyhow::bail!("没有匹配「{keyword}」且支持服务端的整合包"),
-            None => anyhow::bail!("没有找到可在服务端运行的整合包"),
-        }
-    }
 
     let hits: Vec<ScopedChoice> = search
         .hits
@@ -240,11 +234,8 @@ async fn browse_results(
         .collect();
     let choices = result_choices(hits, search.offset, search.total, page);
 
-    let label = format!(
-        "选择整合包 · 第 {} 页 · 共 {} 个支持服务端",
-        page + 1,
-        search.total
-    );
+    // 0 条也要进入选择器：空列表 + Esc 返回搜索，而不是让整个命令退出。
+    let label = results_label(keyword, search.total, page);
     match select_filter_backable(printer.lang(), &label, &choices, no_scope())? {
         Backable::Back => Ok(Browse::Back),
         Backable::Picked(picked) if picked == NEXT_PAGE => Ok(Browse::Page(page.saturating_add(1))),
@@ -273,6 +264,23 @@ fn result_choices(
         choices.push(ScopedChoice::new(PREV_PAGE, false));
     }
     choices
+}
+
+/// 结果页标题：0 条时说明没有匹配，其余显示页码与总数
+///
+/// 标题只影响展示，0 条时不改变去向：仍进入可返回选择器。
+fn results_label(keyword: Option<&str>, total: u64, page: u32) -> String {
+    if total == 0 {
+        return match keyword {
+            Some(keyword) => format!("选择整合包 · 没有匹配「{keyword}」的结果"),
+            None => "选择整合包 · 没有可在服务端运行的整合包".to_owned(),
+        };
+    }
+    format!(
+        "选择整合包 · 第 {} 页 · 共 {} 个支持服务端",
+        page + 1,
+        total
+    )
 }
 
 /// 无范围切换时的占位提示
@@ -648,6 +656,29 @@ mod tests {
     fn result_choices_has_no_pager_when_everything_fits() {
         let choices = result_choices(vec![hit("1", "A")], 0, 1, 0);
         assert_eq!(choices.len(), 1);
+    }
+
+    /// 0 条时不生成翻页项，空列表原样交给可返回选择器
+    #[test]
+    fn result_choices_stays_empty_without_hits() {
+        assert!(result_choices(Vec::new(), 0, 0, 0).is_empty());
+    }
+
+    /// 空结果标题说明原因；有关键词时带上关键词
+    #[test]
+    fn results_label_explains_empty_search() {
+        assert_eq!(
+            results_label(Some("音乐"), 0, 0),
+            "选择整合包 · 没有匹配「音乐」的结果"
+        );
+        assert_eq!(
+            results_label(None, 0, 0),
+            "选择整合包 · 没有可在服务端运行的整合包"
+        );
+        assert_eq!(
+            results_label(Some("fab"), 42, 2),
+            "选择整合包 · 第 3 页 · 共 42 个支持服务端"
+        );
     }
 
     #[test]
