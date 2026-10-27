@@ -275,8 +275,11 @@ error: “web” 存在于多个位置
 6. `RemoteJavaRepository`，打通 `java ls` / `scan` / `install`。
 7. `RemoteBackend`（`SupervisorPort` + `InstallerRunner`）：远端由 agent
    拉起 `mcsup __supervise`。
-8. `RemoteBackupStore` 与远端文件能力；流式日志与进度。此时再评估
-   `transport` 是否切换为 tonic。
+8. 远端备份：`RemoteBackupPort`（按服务器身份寻址、域类型出入参），
+   `BackupService` 按条目来源路由——远端条目整段转发到对端执行（扫描、
+   CAS、恢复写盘都在对端），跨线只走元数据帧（`WireSnapshot`），CAS 对象
+   留在对端；agent 侧复用与本地 CLI 同一份 `BackupService`。备份进度与
+   文件流式传输后续再评估；此时再评估 `transport` 是否切换为 tonic。
 
 每一步可独立提交；第 1 步后已有可演示的连接状态，第 5 步后主要命令已
 与本地一致。

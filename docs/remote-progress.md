@@ -14,11 +14,108 @@
 | 5 | `transport`：TLS 帧传输与连接池 | 完成 |
 | 6 | `apps/agent`：`mcsup remote serve` | 完成 |
 | 7 | 远端仓库（workspace / server / java） | 完成 |
-| 8 | `RemoteBackend`：远端 supervisor | 待开始 |
-| 9 | 流式：日志 / 进度 / 备份 | 待开始 |
+| 8 | `RemoteBackend`：远端 supervisor（`RemoteSupervisor` + `RoutingSupervisor`） | 完成 |
+| 9 | 远端备份（元数据帧路由）+ 远端日志尾部 | 完成（流式进度未做） |
 | 10 | CLI `remote` 命令与 `--origin` | 待开始 |
 
 ## 已完成
+
+### 阶段 9：远端备份与远端日志尾部
+
+#### 备份路由收在 `BackupService`
+
+- `port::RemoteBackupPort`（`port/backup.rs`）：按服务器稳定身份寻址、
+  域类型出入参的六个方法（create / list / restore / delete / verify /
+  prune）。与 `BackupStore` 的分工：`BackupStore` 是**数据能力**三件套
+  （CAS / 快照索引 / 扫描器，编排仍在 service），`RemoteBackupPort` 是
+  **整段执行**——远端的 `BackupLayout` 依赖对端目录事实（workspace 推导、
+  CAS 落点），客户端拼不出来也不该拼。
+- `BackupService` 新增 `remote: Option<Arc<dyn RemoteBackupPort>>` +
+  `with_remote_backups()`；`route_remote()` 按
+  `ServerRegistry::get_sourced()`（新方法）查**真实来源**分叉，远端条目
+  整段转发、发布 `BackupCompleted`（含 `added_bytes`）；远端未注入执行器时
+  按 Unreachable 拒绝——有远端条目却没装配连接是装配错误，静默落到本地
+  会在错误的磁盘上写快照。
+- 跨线只走**元数据帧**：扫描、CAS、恢复写盘全部发生在对端，帧载荷是
+  `WireSnapshot`（快照三份清单：entries / deleted / stamps），CAS 对象
+  留在对端。这也意味着远端 `backup create` 不会把世界文件字节拉回客户端。
+- `RemoteBackupError` 变体与协议 `ErrorKind` 对齐：NotFound / Invalid /
+  Unreachable / Protocol / Io；`service` 包进 `BackupError::Supervisor`，
+  入口按文案提示不再二次判级。
+
+#### 协议帧（`protocol::remote`）
+
+- 请求：`BackupCreate{label, scope, no_reuse, flush_wait_ms}` /
+  `BackupList{page, page_size}` / `BackupRestore{snapshot, to_new}` /
+  `BackupDelete` / `BackupVerify` / `BackupPrune{keep, older_than_secs,
+  dry_run}`，全部要求 `Permission::Backup`。
+- 响应：`SnapshotCreated{snapshot, skipped}` / `Snapshots{items, total,
+  page, page_size}` / `Restored{snapshot, destination, files, bytes,
+  safety_snapshot, deleted}` / `SnapshotDeleted{snapshot, orphaned}` /
+  `SnapshotVerified{snapshot, objects, bytes, broken}` / `Pruned{removed,
+  objects_reclaimed, bytes_reclaimed, dry_run}`。
+- `wire::WireSnapshot`：`SnapshotId` / `RelPath` / `ContentHash` /
+  `BackupScope` / `SnapshotStatus` 文本互转，`SnapshotContent::new +
+  with_stamps` 重建，往返一致性由测试锁定。
+- 备份恢复写路径的领域判定（可恢复性、运行中禁恢复、目标冲突、范围空）
+  仍收敛在 `service` / `domain`，agent 分发与客户端都只搬参数。
+
+#### backend 客户端侧（`backend/remote/backup.rs`）
+
+- `RemoteBackups`：单远端 RPC 客户端，`ErrorKind → RemoteBackupError`
+  映射出口唯一；对端返回非预期帧按 `Protocol` 报错。
+- `RoutingBackups`：多台远端按 id 查组合仓库来源分派（与
+  `RoutingSupervisor` 同构）；本地条目报 Unreachable（service 先分叉，
+  走到这里即装配错误）。
+- CLI：`open_mcsup_with_remotes` 为每台远端构造 `RemoteBackups` 装入
+  `RoutingBackups`，经 `McsupBuilder::remote_backups()`（新注入口）注入；
+  `backup` 命令切换到带远端装配。
+
+#### agent 侧（`crates/mcsup/src/remote/ops.rs`）
+
+六个 backup 方法转发给与本地 CLI **同一份** `BackupService`（不复制业务
+逻辑）；`backup_failure()` 按领域错误分类：
+SnapshotNotFound→not_found；NotRestorable / RestoreWhileRunning /
+TargetExists / EmptyScope / InvalidLabel / ConflictingRetention /
+VerifyFailed→invalid；其余→io。`InvalidScopeEntry` 在入帧解析期报 invalid。
+
+#### 远端日志尾部（并回本阶段）
+
+- `SupervisorPort::logs_tail`（新 trait 方法，默认拒绝——本地不经手日志）；
+  `RemoteSupervisor` 覆写为一次 `LogsTail` RPC。
+- `RegisteredServer::is_remote()` / `remote_ref()`（镜像条目 `dir` 为空即
+  远端）；`BackupService::log_tail` 按条目来源分叉：远端走 RPC，本地仍
+  直读 `console.log`。`server logs` 的 tail 至此对远端可用（follow 仍仅
+  本地，属阶段 9 剩余的流式部分）。
+
+测试：协议 12 帧往返；backend 真 TLS 垫片 5 用例（create/list、restore
+安全快照、verify/delete/prune、NotFound 映射 ×2）；service `backup_routing`
+4 用例（远端转发、未注入 Unreachable、本地不触执行器、未知服务器）；agent
+roundtrip 全量权限覆盖补 `BackupList` 样例（`Permission::Backup` 豁免删除）。
+
+### 阶段 8：远端 supervisor 与路由（RemoteBackend）
+
+#### `RemoteSupervisor`（`backend/remote/supervisor.rs`）
+
+`port::SupervisorPort` 的 RPC 实现，与 `runtime::LocalSupervisor` 对偶：
+本地走 IPC 守护进程，远端走 transport 帧。判定全部在对端 `service`（agent
+的 ops 分发），客户端只做参数搬运、解帧与错误映射。`status_many` 覆写成
+一次 `StatusMany` RPC（trait 默认实现逐台 status，远端会 N+1）。
+
+#### `RoutingSupervisor`（`backend/remote/router.rs`）
+
+持本地 supervisor + 每台远端 `RemoteSupervisor`，按 id 查组合仓库
+`list_sourced()` 分派；`status_many` 按目标分桶（桶键 `Origin`）、各桶
+一次批量调用、输出顺序与入参一致；未知 id → `SupervisorError::Unreachable`。
+
+#### CLI 装配（`apps/cli/src/bootstrap.rs`）
+
+`open_mcsup_with_remotes` 为每台远端构造 `RemoteSupervisor`（连接来自
+成员表），与 `runtime::LocalSupervisor` 一起装入 `RoutingSupervisor`，
+经 `McsupBuilder::supervisor()` 注入。无已配对远端时与原装配完全等价。
+
+测试：`RoutingSupervisor` 5 用例（本地分派、远端分派、未知 id、批量分桶
+保序、远端不可达）；`RemoteSupervisor` 走真 TLS 垫片的往返用例。
 
 ### 阶段 7：远端仓库与 CLI 装配接入
 
@@ -180,16 +277,10 @@
 
 ## 后续待办
 
-### 阶段 7：远端仓库（已完成，见「已完成」节）
+### 阶段 9 剩余：流式
 
-### 阶段 8：`RemoteBackend`
-
-- 实现 `SupervisorPort`，远端由 agent 拉起 `mcsup __supervise` 子进程。
-- 用 `status_many` 批量接口，避免 N+1。
-
-### 阶段 9：流式
-
-- 日志、进度、备份进度以流式帧承载，接口沿用 `ProgressSink` / `EventSink`。
+- 日志 follow、备份进度以流式帧承载，接口沿用 `ProgressSink` / `EventSink`。
+  当前 `log_tail` 已走单次 RPC，follow（`server console` attach）仍仅本地。
 
 ### 阶段 10：CLI
 
@@ -201,6 +292,10 @@
 
 ## 已确认的设计取舍
 
+- 备份路由收在 `BackupService`（按组合仓库真实来源分叉），而不是给
+  `BackupStore` 的 Scanner / CAS trait 硬套远端语义——那些能力的实现依赖
+  本地目录事实，硬套会把「数据存在哪里」与「在哪台机器执行」两个轴搅在
+  一起。远端走 `RemoteBackupPort` 整段执行 + 元数据帧，CAS 对象不跨线。
 - `connect` 保留首次配对，新增 `reconnect <name>`；记录存原始 target 字符串
   + `via` 字段。
 - token 绑定客户端密钥对（mTLS 降级为 enrollment 凭据），带 TTL。
