@@ -579,6 +579,16 @@ pub(crate) enum RemoteAction {
         #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:7681")]
         listen: String,
     },
+    /// SSH 引导入口（隐藏）：前台起 agent，把握手 JSON 写 stdout
+    #[command(name = "__serve-ssh", hide = true)]
+    ServeSsh {
+        /// 数据目录（远端机器上的路径）
+        #[arg(long, value_name = "PATH")]
+        data_dir: Option<PathBuf>,
+        /// 本机名
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

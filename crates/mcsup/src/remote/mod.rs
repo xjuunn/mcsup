@@ -41,6 +41,68 @@ pub use supervise::{
     SUPERVISE_COMMAND, SuperviseError, SuperviseSpec, is_supervise_invocation, supervise_main,
 };
 
+/// SSH 引导的机器契约：一行 JSON 打到 stdout，进程保持前台服务
+///
+/// `mcsup remote connect user@host` 经 SSH 执行这条入口；本地从 stdout 读出
+/// 地址、指纹与配对码完成配对。打印后 agent 继续服务直到 SSH 会话结束——
+/// stdout 只在开头出现这一行，之后是配对码轮换（各占一行 JSONL），所以
+/// 读取方必须逐行解析而不是读完就关。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SshHandshake {
+    /// agent 监听地址（`127.0.0.1:0` 时是系统分配的真实端口）
+    pub addr: String,
+    /// 证书指纹
+    pub fingerprint: String,
+    /// 当前有效配对码
+    pub pairing_code: String,
+    /// 本机名（客户端 `--name` 缺省值）
+    pub server_name: String,
+}
+
+/// SSH 引导入口：前台起 agent 并把握手信息写 stdout
+///
+/// 由 `mcsup remote serve-ssh` 与 `mcsup-agent __serve-ssh` 调用；阻塞到
+/// 监听结束。任何失败都写 stderr 并以非零退出，stdout 保持纯数据。
+///
+/// # Errors
+///
+/// 装配、绑定或 IO 失败时返回 [`AgentError`]
+pub fn serve_ssh_main(data_dir: &Path, server_name: &str) -> Result<(), AgentError> {
+    let agent = Arc::new(Agent::open(data_dir, server_name)?);
+    let code = agent.issue_pairing_code()?;
+    let server = agent.bind("127.0.0.1:0")?;
+    let addr = server.local_addr()?;
+    let handshake = SshHandshake {
+        addr: addr.to_string(),
+        fingerprint: agent.fingerprint().as_str().to_owned(),
+        pairing_code: code.display_form(),
+        server_name: server_name.to_owned(),
+    };
+    write_ssh_line(&handshake)?;
+
+    // 配对码轮换：新码也打一行 JSONL，让配对失败重试的用户总能拿到当前码
+    let watch = Agent::watch_pairing_code(&agent, |code| {
+        let rotation = serde_json::json!({ "pairing_code": code.display_form() });
+        let _ = write_ssh_line(&rotation);
+    });
+    let result = server.run();
+    drop(watch);
+    result
+}
+
+/// 把一行 JSON 契约写到 stdout 并冲刷
+///
+/// SSH 路径的 stdout 是唯一的机器通道：握手、配对码轮换都走这里，stderr
+/// 留给日志。写失败意味着 SSH 会话已断，按传输错误上报。
+fn write_ssh_line<T: serde::Serialize>(payload: &T) -> Result<(), AgentError> {
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout();
+    let json = serde_json::to_string(payload).map_err(|err| AgentError::SshOutput(err.into()))?;
+    writeln!(stdout, "{json}")
+        .and_then(|()| stdout.flush())
+        .map_err(AgentError::SshOutput)
+}
+
 /// 配对码轮换的检查间隔
 ///
 /// 只影响「过期后多久换上屏幕」，与码的有效期无关；取值远小于
@@ -75,6 +137,9 @@ pub enum AgentError {
     /// 系统随机源不可用
     #[error(transparent)]
     Pairing(#[from] PairingCodeError),
+    /// SSH 引导握手写 stdout 失败（会话已断）
+    #[error("failed to write the ssh handshake: {0}")]
+    SshOutput(#[source] std::io::Error),
 }
 
 /// 被连接端

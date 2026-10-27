@@ -32,6 +32,9 @@ tracing = { workspace = true, optional = true }
 # 远端安装（`ServerInstall` 帧）要在同步的分发线程里跑 async 的下载编排：
 # 每次请求起一个 current-thread runtime 阻塞执行，连接本身是一请求一线程
 tokio = { workspace = true, features = ["rt"], optional = true }
+# SSH 引导握手（`SshHandshake` / 配对码轮换行）是跨进程机器契约
+serde = { workspace = true, features = ["derive"], optional = true }
+serde_json = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -64,6 +67,8 @@ remote = [
     "dep:thiserror",
     "dep:tracing",
     "dep:tokio",
+    "dep:serde",
+    "dep:serde_json",
 ]
 # 默认组合根：一次装配全部默认实现（storage/service/file/java/provider/runtime）
 bootstrap = [

@@ -459,6 +459,7 @@ mod remote_tests {
             added_at: 1,
             fingerprint: fingerprint.map(str::to_owned),
             credential: None,
+            remote_addr: None,
         }
     }
 

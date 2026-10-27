@@ -63,6 +63,12 @@ pub struct RemoteRecord {
     /// 凭证句柄：钥匙串条目名，或 `file:<路径>`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential: Option<String>,
+    /// SSH 接入时远端 agent 的监听地址（隧道重建需要）
+    ///
+    /// `__serve-ssh` 每次启动用随机端口，所以隧道必须知道上一次握手给出的
+    /// 地址；直连接入不需要这个字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_addr: Option<String>,
 }
 
 /// 远端接入方式
@@ -482,6 +488,7 @@ mod tests {
             added_at: 1_700_000_000,
             fingerprint: None,
             credential: None,
+            remote_addr: None,
         }
     }
 

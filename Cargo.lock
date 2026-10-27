@@ -1454,6 +1454,8 @@ dependencies = [
  "protocol",
  "provider",
  "runtime",
+ "serde",
+ "serde_json",
  "service",
  "storage",
  "tempfile",

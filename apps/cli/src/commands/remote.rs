@@ -38,6 +38,13 @@ const AGENT_PID: &str = "agent.pid";
 pub(crate) fn run(action: RemoteAction, printer: Printer) -> Result<()> {
     let file = ConfigFile::locate(None);
     match action {
+        RemoteAction::ServeSsh { data_dir, name } => {
+            let dir = data_dir.unwrap_or_else(crate::config::platform_data_dir);
+            let name = name.unwrap_or_else(host_name);
+            mcsup::remote::serve_ssh_main(&dir, &name).with_context(|| {
+                crate::i18n::pick(printer.lang(), "SSH 引导 agent", "serving over ssh")
+            })
+        }
         RemoteAction::Serve {
             listen,
             name,
@@ -325,15 +332,7 @@ fn connect(
         .into());
     };
     if raw.contains('@') {
-        return Err(AppDiagnostic::usage(
-            crate::i18n::pick(
-                lang,
-                "SSH 接入尚未实现；请用 mcsup remote connect <host[:port]> --code <配对码>",
-                "SSH bootstrap is not implemented yet; use `mcsup remote connect <host[:port]> --code <code>`",
-            ),
-            None,
-        )
-        .into());
+        return connect_ssh(file, raw, name, read_only, printer);
     }
 
     let target = normalize_target(raw);
@@ -376,6 +375,7 @@ fn connect(
             added_at: unix_now(),
             fingerprint: Some(fingerprint.as_str().to_owned()),
             credential: Some(format!("file:{}", credentials.path().display())),
+            remote_addr: None,
         },
     );
     file.save(&cfg)?;
@@ -383,6 +383,88 @@ fn connect(
     report_connected(
         &remote_name,
         &target,
+        &fingerprint,
+        &enrolled.role.to_string(),
+        printer,
+    )
+}
+
+/// SSH 引导配对：复用已有 SSH 信任，不要求用户抄配对码
+///
+/// 流程：SSH 起远端 `__serve-ssh` → 读回 `{addr, fingerprint, pairing_code}` →
+/// 建本地隧道 → 走与直连完全相同的 probe / enroll / 落盘路径。记录里的
+/// `via` 是 `ssh`、`target` 是原始 `user@host`；后续命令由装配层按需重建隧道。
+///
+/// # Errors
+///
+/// SSH 不可用、远端缺 mcsup、隧道失败、配对被拒时返回错误
+fn connect_ssh(
+    file: &ConfigFile,
+    target: &str,
+    name: Option<&str>,
+    read_only: bool,
+    printer: Printer,
+) -> Result<()> {
+    let lang = printer.lang();
+    let (user, host) = crate::ssh::parse_user_host(target, lang)?;
+    let ssh_target = format!("{user}@{host}");
+    let (handshake, mut child) = crate::ssh::bootstrap(&ssh_target, lang)?;
+    let tunnel = crate::ssh::open_tunnel(&ssh_target, &handshake.addr, lang)?;
+    // 隧道就绪后远端 agent 必须继续活着：`__serve-ssh` 进程由 SSH 会话承载，
+    // 这里不 kill，交给它继续服务；CLI 退出时 SSH 连接断开、远端进程随之结束。
+    let _ = &mut child;
+
+    let probe = Client::probe(&tunnel.local).with_context(|| {
+        crate::i18n::pick(
+            lang,
+            format!("通过 SSH 隧道连接 {ssh_target} 失败"),
+            format!("failed to connect to {ssh_target} over ssh"),
+        )
+    })?;
+    // 指纹必须与远端自报的一致（probe 已校验），用户仍需确认——SSH 只证明
+    // 「能登上去」，不证明「agent 是同一台机器上的那个」
+    let fingerprint = confirm_fingerprint(&probe, printer)?;
+    let remote_name = match name {
+        Some(name) => crate::commands::origin::remote_name(name, lang)?,
+        None => resolve_remote_name(None, &probe, printer)?,
+    };
+    let client_name = client_display_name();
+    let client = Client::new(&tunnel.local, fingerprint.clone());
+    let enrolled = client
+        .enroll(&handshake.pairing_code, &client_name, read_only)
+        .with_context(|| crate::i18n::pick(lang, "SSH 配对失败", "ssh pairing failed"))?;
+
+    let credentials = credential_store();
+    credentials
+        .put(
+            remote_name.as_str(),
+            &StoredCredential {
+                token: enrolled.token.clone(),
+                client_id: enrolled.client_id.as_str().to_owned(),
+                role: enrolled.role.to_string(),
+            },
+        )
+        .context(crate::i18n::pick(lang, "保存凭证", "saving the credential"))?;
+    let mut cfg = file.load()?;
+    cfg.put_remote(
+        &remote_name,
+        RemoteRecord {
+            // 原始 user@host：reconnect 要按原样重放 SSH 路径
+            target: ssh_target.clone(),
+            via: RemoteVia::Ssh,
+            read_only,
+            added_at: unix_now(),
+            fingerprint: Some(fingerprint.as_str().to_owned()),
+            credential: Some(format!("file:{}", credentials.path().display())),
+            // 远端 agent 的监听地址：隧道重建时需要它（`__serve-ssh` 用随机端口）
+            remote_addr: Some(handshake.addr.clone()),
+        },
+    );
+    file.save(&cfg)?;
+
+    report_connected(
+        &remote_name,
+        &ssh_target,
         &fingerprint,
         &enrolled.role.to_string(),
         printer,
@@ -1155,6 +1237,7 @@ mod tests {
             added_at: 1,
             fingerprint: fingerprint.map(str::to_owned),
             credential: None,
+            remote_addr: None,
         }
     }
 

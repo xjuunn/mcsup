@@ -13,6 +13,7 @@ mod meta;
 mod output;
 mod progress;
 mod prompts;
+mod ssh;
 mod verbosity;
 
 use crate::config::ConfigFile;
