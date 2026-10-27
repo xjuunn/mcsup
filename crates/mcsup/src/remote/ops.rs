@@ -61,6 +61,11 @@ impl Agent {
             } => self.stop(server_id, *grace_secs, *force),
             Request::SendLine { server_id, line } => self.send_line(server_id, line),
             Request::LogsTail { server_id, lines } => self.logs_tail(server_id, *lines),
+            Request::LogsFollow {
+                server_id,
+                lines,
+                timeout_ms,
+            } => self.logs_follow(server_id, *lines, *timeout_ms),
 
             Request::BackupCreate {
                 server_id,
@@ -363,6 +368,46 @@ impl Agent {
         match self.core.lifecycle.log_tail(&name, lines) {
             Ok(lines) => Response::LogLines { lines },
             Err(err) => lifecycle_failure(&err),
+        }
+    }
+
+    /// 日志跟随（长轮询）：等到有新行或超时
+    ///
+    /// 历史只回一次（`lines > 0` 时），之后客户端传 0 只拿增量；等待期间没有
+    /// 新行返回空列表，客户端自行决定下一轮。断线即停：transport 层连接断开，
+    /// 这个阻塞调用随线程结束，没有需要清理的订阅状态。
+    fn logs_follow(&self, server_id: &str, lines: usize, timeout_ms: u64) -> Response {
+        let name = match self.name_of(server_id) {
+            Ok(name) => name,
+            Err(response) => return response,
+        };
+        // 历史只在第一条请求里回：open_tail 的文件长度快照与返回的历史对齐，
+        // 之后的增量由 read_new 提供，不重不漏
+        let (mut watch, mut history) = if lines > 0 {
+            match self.core.lifecycle.log_watch_tail(&name, lines) {
+                Ok((tail, watch)) => (watch, tail),
+                Err(err) => return lifecycle_failure(&err),
+            }
+        } else {
+            match self.core.lifecycle.log_watch(&name) {
+                Ok(watch) => (watch, Vec::new()),
+                Err(err) => return lifecycle_failure(&err),
+            }
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        loop {
+            match watch.read_new() {
+                Ok(batch) if !batch.is_empty() => {
+                    history.extend(batch);
+                    return Response::LogLines { lines: history };
+                }
+                Ok(_) => {}
+                Err(err) => return lifecycle_failure(&err),
+            }
+            if std::time::Instant::now() >= deadline {
+                return Response::LogLines { lines: history };
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
         }
     }
 

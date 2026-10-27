@@ -306,6 +306,11 @@ fn build_member(
 
 /// 客户端凭证存储（`{data_dir}/credentials.toml`）
 fn credential_store() -> FileCredentialStore {
+    open_credential_store()
+}
+
+/// [`credential_store`] 的公开口径：远端跟随日志等命令要按名读回 token
+pub(crate) fn open_credential_store() -> FileCredentialStore {
     FileCredentialStore::new(config::platform_data_dir().join("credentials.toml"))
 }
 

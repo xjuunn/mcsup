@@ -651,12 +651,26 @@ impl ServerRegistry {
         &self,
         name: &str,
     ) -> Result<Sourced<RegisteredServer>, ServerRegistryError> {
-        let parsed =
-            ServerName::parse(name).map_err(|_| ServerRegistryError::NotFound(name.to_owned()))?;
+        // 限定名（origin/name）在跨来源解析层统一处理；裸名保持「精确命中、
+        // 唯一前缀」的既有语义之外，这里只做精确匹配（列出与歧义错误由
+        // `--origin` 过滤与 resolve_index 承担）
+        let selector = crate::origin::Selector::parse(name);
+        let want = ServerName::parse(selector.name())
+            .map_err(|_| ServerRegistryError::NotFound(name.to_owned()))?;
+        let filter = match selector.origin() {
+            Some(origin) => crate::origin::OriginFilter::Named(match origin {
+                port::Origin::Remote(remote_name) => remote_name.clone(),
+                port::Origin::Local => {
+                    return Err(ServerRegistryError::NotFound(name.to_owned()));
+                }
+            }),
+            None => crate::origin::OriginFilter::All,
+        };
         for sourced in self.list_sourced()? {
-            if sourced.value.meta.name == parsed {
-                return Ok(sourced);
+            if sourced.value.meta.name != want || !filter.matches(&sourced.origin) {
+                continue;
             }
+            return Ok(sourced);
         }
         Err(ServerRegistryError::NotFound(name.to_owned()))
     }

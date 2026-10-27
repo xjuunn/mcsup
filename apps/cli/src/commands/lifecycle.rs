@@ -497,6 +497,10 @@ pub(crate) fn send(name: &str, command: &str, printer: Printer) -> Result<()> {
 
 /// `server logs`：末尾若干行，`--follow` 持续跟踪（JSON 模式 JSONL）
 pub(crate) fn logs(name: &str, tail: usize, follow: bool, printer: Printer) -> Result<()> {
+    // 远端日志：历史 + 增量都走长轮询帧，本地路径不感知
+    if let Some(outcome) = logs_remote(name, tail, follow, printer)? {
+        return Ok(outcome);
+    }
     let service = lifecycle_service()?;
     let lines = service.log_tail(name, tail)?;
     if printer.is_human() {
@@ -522,6 +526,116 @@ pub(crate) fn logs(name: &str, tail: usize, follow: bool, printer: Printer) -> R
         }
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+/// 远端日志：历史一次性拉回；`--follow` 用长轮询循环取增量
+///
+/// 返回 `Ok(Some(()))` 表示目标在远端且已处理完毕；`Ok(None)` 表示本地目标，
+/// 调用方继续走本地路径。轮询间隔由对端的等待时长决定（无新行最多等
+/// [`FOLLOW_WAIT_MS`]），断线即失败——用户 Ctrl+C 或 agent 重启都会结束跟随。
+///
+/// # Errors
+///
+/// 服务器不存在（3）、远端不可达（5）或未授权（6）时返回错误
+fn logs_remote(name: &str, tail: usize, follow: bool, printer: Printer) -> Result<Option<()>> {
+    let lang = printer.lang();
+    let cfg = crate::config::ConfigFile::locate(None).load()?;
+    let members = bootstrap::remote_members(&cfg)?;
+    if members.is_empty() {
+        return Ok(None);
+    }
+    let reg = bootstrap::open_registry_with_remotes()?;
+    let sourced = match reg.get_sourced(name) {
+        Ok(sourced) => sourced,
+        Err(mcsup::service::ServerRegistryError::NotFound(_)) => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let mcsup::port::Origin::Remote(remote_name) = &sourced.origin else {
+        return Ok(None);
+    };
+    let member = super::origin::member(&members, &sourced.origin, lang)?.ok_or_else(|| {
+        AppDiagnostic::not_found(
+            crate::i18n::pick(
+                lang,
+                format!("远端 {remote_name} 未就绪（缺凭证或指纹）"),
+                format!("remote {remote_name} is not ready (missing credential or fingerprint)"),
+            ),
+            None,
+        )
+    })?;
+    let server_id = sourced.value.meta.id.as_str().to_owned();
+
+    // 历史：一次 LogsFollow 带 tail；增量：循环带 0
+    let client = transport_client(member)?;
+    let mut request = mcsup::protocol::remote::Request::LogsFollow {
+        server_id: server_id.clone(),
+        lines: tail,
+        timeout_ms: FOLLOW_WAIT_MS,
+    };
+    let mut printed_history = false;
+    loop {
+        let response = client.call(&request).with_context(|| {
+            crate::i18n::pick(
+                lang,
+                format!("跟随 {} 的日志失败", sourced.value.meta.name),
+                format!("failed to follow the logs of {}", sourced.value.meta.name),
+            )
+        })?;
+        let mcsup::protocol::remote::Response::LogLines { lines } = response else {
+            return Err(anyhow::anyhow!(
+                "{}",
+                crate::i18n::pick(
+                    lang,
+                    "对端返回了非预期帧",
+                    "the peer returned an unexpected frame"
+                )
+            ));
+        };
+        if !printer.is_human() && !printed_history {
+            // JSONL 契约：--follow 的每一行都是一个对象；历史也逐行输出
+            printed_history = true;
+        }
+        for line in &lines {
+            print_stream_line(printer, line)?;
+        }
+        if !follow {
+            return Ok(Some(()));
+        }
+        request = mcsup::protocol::remote::Request::LogsFollow {
+            server_id: server_id.clone(),
+            lines: 0,
+            timeout_ms: FOLLOW_WAIT_MS,
+        };
+    }
+}
+
+/// 远端长轮询的单次等待上限（毫秒）：太短会高频打帧，太长 Ctrl+C 延迟高
+const FOLLOW_WAIT_MS: u64 = 1_500;
+
+/// 用一条远端成员构造已认证的客户端
+fn transport_client(
+    member: &mcsup::backend::remote::RemoteMember,
+) -> Result<mcsup::transport::Client> {
+    let cfg = crate::config::ConfigFile::locate(None).load()?;
+    let record = cfg
+        .remote(&member.name)
+        .ok_or_else(|| anyhow::anyhow!("remote {} is not configured", member.name))?;
+    let fingerprint = mcsup::transport::Fingerprint::parse(
+        record
+            .fingerprint
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("remote {} has no fingerprint", member.name))?,
+    )?;
+    let credential = {
+        use mcsup::auth::CredentialStore as _;
+        bootstrap::open_credential_store()
+            .get(member.name.as_str())
+            .map_err(|err| anyhow::anyhow!("read credential for {}: {err}", member.name))?
+    };
+    Ok(
+        mcsup::transport::Client::new(member.servers_link().target(), fingerprint)
+            .with_token(credential.token),
+    )
 }
 
 /// 流式单行：human 原样输出；JSON 一行一个对象（`--follow` 的 JSONL 契约）

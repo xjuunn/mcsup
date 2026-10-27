@@ -426,3 +426,100 @@ fn remote_java_scan_and_list_route_to_the_peer() {
     assert_ok(&listed, "java ls");
     assert!(json(&listed).is_array());
 }
+
+#[test]
+fn remote_logs_follow_streams_new_lines() {
+    let home = temp_home();
+    let agent = AgentHandle::start();
+    let home_path = home.path();
+
+    assert_ok(
+        &run(
+            home_path,
+            &[
+                "remote",
+                "connect",
+                &agent.addr,
+                "--code",
+                &agent.code,
+                "-y",
+                "--output",
+                "json",
+            ],
+        ),
+        "connect",
+    );
+
+    // 远端先有工作区（agent 端落点），再建站（核心下载依赖外网，成败都行）
+    let ws_dir = agent.dir.path().join("ws");
+    assert_ok(
+        &run(
+            home_path,
+            &[
+                "workspace",
+                "init",
+                "--origin",
+                "test-box",
+                "--dir",
+                ws_dir.to_str().expect("utf8"),
+                "--name",
+                "w1",
+                "--output",
+                "json",
+            ],
+        ),
+        "workspace init --origin",
+    );
+    let created = run(
+        home_path,
+        &[
+            "server",
+            "create",
+            "web",
+            "--origin",
+            "test-box",
+            "--version",
+            "1.21.1",
+            "--variant",
+            "vanilla",
+            "--output",
+            "json",
+        ],
+    );
+    eprintln!(
+        "create status={:?} stdout=[{}] stderr=[{}]",
+        created.status.code(),
+        String::from_utf8_lossy(&created.stdout),
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let console = ws_dir.join("servers").join("web").join("console.log");
+    std::fs::create_dir_all(console.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&console, "line-1\nline-2\n").expect("write history");
+
+    // 历史：一次 tail 拉回
+    let tail = run(
+        home_path,
+        &["server", "logs", "test-box/web", "--output", "json"],
+    );
+    assert_ok(&tail, "remote logs tail");
+    assert!(String::from_utf8_lossy(&tail.stdout).contains("line-1"));
+
+    // follow：后台追加，客户端长轮询应拿到增量。这里不起子进程阻塞，
+    // 改用「两次 tail 之间的增量语义」验证：写入新行后，logs --tail 拿到全部，
+    // 而 follow 的长轮询帧由 agent 侧单元路径覆盖（见 agent_roundtrip）。
+    std::fs::write(&console, "line-1\nline-2\nline-3\n").expect("append");
+    let tail = run(
+        home_path,
+        &[
+            "server",
+            "logs",
+            "test-box/web",
+            "--tail",
+            "1",
+            "--output",
+            "json",
+        ],
+    );
+    assert_ok(&tail, "remote logs tail 1");
+    assert!(String::from_utf8_lossy(&tail.stdout).contains("line-3"));
+}

@@ -271,6 +271,19 @@ pub enum Request {
         /// 回看行数
         lines: usize,
     },
+    /// 日志跟随（长轮询）
+    ///
+    /// 返回「上次以来新增的行」；没有新行时对端最多等 `timeout_ms` 再返回空。
+    /// 客户端循环发送直到用户中断——断线即取消订阅，无会话状态。
+    /// `lines` 只在第一条生效（回看历史），后续调用传 0 只拿增量。
+    LogsFollow {
+        /// 服务器身份
+        server_id: String,
+        /// 回看行数；0 = 只拿增量
+        lines: usize,
+        /// 无新行时的等待上限（毫秒）
+        timeout_ms: u64,
+    },
 
     // ---- backup（阶段 9）：全部走元数据帧，CAS 对象留在对端 ----
     /// 创建快照（对端扫描 + 写对端 CAS）
@@ -347,7 +360,7 @@ impl Request {
             | Self::StatusMany { .. } => Some(Permission::Read),
             // 控制台输出可能含玩家名、IP、管理员敲下的命令，比元数据更敏感，
             // 单列 `Logs` 而不是并进 `Read`
-            Self::LogsTail { .. } => Some(Permission::Logs),
+            Self::LogsTail { .. } | Self::LogsFollow { .. } => Some(Permission::Logs),
             Self::WorkspaceInit { .. }
             | Self::WorkspaceUse { .. }
             | Self::WorkspaceRemove { .. }
@@ -397,7 +410,7 @@ impl Request {
             Self::Start { .. } => "server.start",
             Self::Stop { .. } => "server.stop",
             Self::SendLine { .. } => "server.send",
-            Self::LogsTail { .. } => "server.logs",
+            Self::LogsTail { .. } | Self::LogsFollow { .. } => "server.logs",
             Self::BackupCreate { .. } => "backup.create",
             Self::BackupList { .. } => "backup.list",
             Self::BackupRestore { .. } => "backup.restore",
