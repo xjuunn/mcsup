@@ -44,6 +44,16 @@ pub(crate) fn err_empty_input(lang: Lang) -> String {
     )
 }
 
+/// 空结果 / 过滤无匹配时的提示（可返回的选择器共用）
+#[must_use]
+pub(crate) fn err_no_matches(lang: Lang, esc_help: &str) -> String {
+    l(
+        lang,
+        format!("没有匹配结果；按 Esc {esc_help}"),
+        format!("no matches; Esc {esc_help}"),
+    )
+}
+
 /// 非候选全名的校验文案（同上）
 #[must_use]
 pub(crate) fn err_not_a_choice(lang: Lang) -> String {

@@ -21,7 +21,10 @@ use std::io::{IsTerminal, Write};
 
 use crate::locale::Lang;
 
-use super::{FilterComplete, canonical_choice, err_empty_input, err_not_a_choice, filter_choices};
+use super::{
+    FilterComplete, canonical_choice, err_empty_input, err_no_matches, err_not_a_choice,
+    filter_choices,
+};
 
 /// 建议列表每页条数（与 `select_filter` 的建议条数一致）
 const PAGE_SIZE: usize = 10;
@@ -123,10 +126,10 @@ pub(crate) fn select_filter_backable(
     choices: &[ScopedChoice],
     hint: ScopeHint,
 ) -> Result<Backable> {
-    match choices {
-        [] => return Err(anyhow::anyhow!("没有可选项")),
-        [only] => return Ok(Backable::Picked(only.label.clone())),
-        _ => {}
+    // 空候选不是错误：调用方可能刚搜到 0 条，仍应进入选择器让用户
+    // 看到空列表并按 Esc 返回，而不是直接退出命令。
+    if let [only] = choices {
+        return Ok(Backable::Picked(only.label.clone()));
     }
     if !std::io::stdin().is_terminal() {
         return Err(InquireError::NotTTY.into());
@@ -464,7 +467,9 @@ impl<'a> Picker<'a> {
         if let Some(submitted) = matched {
             Some(Done::Submitted(submitted))
         } else {
-            let message = if input.is_empty() {
+            let message = if self.choices.is_empty() {
+                err_no_matches(self.lang, self.esc_help)
+            } else if input.is_empty() {
                 err_empty_input(self.lang)
             } else {
                 err_not_a_choice(self.lang)
@@ -489,25 +494,29 @@ impl<'a> Picker<'a> {
         for (index, suggestion) in filtered.iter().enumerate().take(end).skip(start) {
             lines.push(self.suggestion_line(suggestion, index, max));
         }
-        let help = match (self.lang, self.choices.iter().any(|choice| choice.extra)) {
-            (Lang::Zh, true) => format!(
-                "输入关键字过滤；↑↓ 选择，Tab 补全，回车确认，Esc {}（Ctrl+A {}）",
-                self.esc_help,
-                self.scope_hint()
-            ),
-            (Lang::Zh, false) => format!(
-                "输入关键字过滤；↑↓ 选择，Tab 补全，回车确认，Esc {}",
-                self.esc_help
-            ),
-            (Lang::En, true) => format!(
-                "type to filter; ↑↓ move, Tab completes, Enter confirms, Esc {} (Ctrl+A {})",
-                self.esc_help,
-                self.scope_hint()
-            ),
-            (Lang::En, false) => format!(
-                "type to filter; ↑↓ move, Tab completes, Enter confirms, Esc {}",
-                self.esc_help
-            ),
+        let help = if filtered.is_empty() {
+            err_no_matches(self.lang, self.esc_help)
+        } else {
+            match (self.lang, self.choices.iter().any(|choice| choice.extra)) {
+                (Lang::Zh, true) => format!(
+                    "输入关键字过滤；↑↓ 选择，Tab 补全，回车确认，Esc {}（Ctrl+A {}）",
+                    self.esc_help,
+                    self.scope_hint()
+                ),
+                (Lang::Zh, false) => format!(
+                    "输入关键字过滤；↑↓ 选择，Tab 补全，回车确认，Esc {}",
+                    self.esc_help
+                ),
+                (Lang::En, true) => format!(
+                    "type to filter; ↑↓ move, Tab completes, Enter confirms, Esc {} (Ctrl+A {})",
+                    self.esc_help,
+                    self.scope_hint()
+                ),
+                (Lang::En, false) => format!(
+                    "type to filter; ↑↓ move, Tab completes, Enter confirms, Esc {}",
+                    self.esc_help
+                ),
+            }
         };
         lines.push(styled(&help, &Style::new().for_stderr().dim(), max));
         Screen {
@@ -926,6 +935,49 @@ mod tests {
         assert_eq!(
             picker.handle(Key::Enter).expect("回车不应失败"),
             Some(Done::Submitted("24w45a（快照）".to_owned()))
+        );
+    }
+
+    /// 过滤无匹配时仍留在选择器里，提示按 Esc 返回
+    #[test]
+    fn no_matches_keeps_picker_open_with_hint() {
+        let all = choices(&[("Survival", false), ("Creative", false)]);
+        let mut picker = new_picker("选择整合包", &all);
+        type_chars(&mut picker, "音乐");
+        assert!(picker.filtered().is_empty());
+        assert_eq!(picker.handle(Key::Enter).expect("回车不应失败"), None);
+        assert!(picker.error.is_some(), "回车不提交，留在选择器");
+        assert!(
+            picker
+                .screen()
+                .lines
+                .iter()
+                .any(|line| line.contains("没有匹配结果")),
+            "空结果行要显示提示"
+        );
+        assert_eq!(
+            picker.handle(Key::Esc).expect("Esc 不应失败"),
+            Some(Done::Cancelled),
+            "Esc 返回上一步"
+        );
+    }
+
+    /// 候选为空时也可进入选择器，不直接报错退出
+    #[test]
+    fn empty_pool_renders_and_can_go_back() {
+        let none: Vec<ScopedChoice> = Vec::new();
+        let mut picker = new_picker("选择整合包", &none);
+        assert!(picker.filtered().is_empty());
+        assert!(
+            picker
+                .screen()
+                .lines
+                .iter()
+                .any(|line| line.contains("没有匹配结果"))
+        );
+        assert_eq!(
+            picker.handle(Key::Esc).expect("Esc 不应失败"),
+            Some(Done::Cancelled)
         );
     }
 

@@ -222,12 +222,6 @@ async fn browse_results(
     let search = service.select_source(None)?.search(&query).await;
     spinner.finish();
     let search = search.context("搜索整合包失败")?;
-    if search.hits.is_empty() {
-        match keyword {
-            Some(keyword) => anyhow::bail!("没有匹配「{keyword}」且支持服务端的整合包"),
-            None => anyhow::bail!("没有找到可在服务端运行的整合包"),
-        }
-    }
 
     let hits: Vec<ScopedChoice> = search
         .hits
@@ -240,11 +234,19 @@ async fn browse_results(
         .collect();
     let choices = result_choices(hits, search.offset, search.total, page);
 
-    let label = format!(
-        "选择整合包 · 第 {} 页 · 共 {} 个支持服务端",
-        page + 1,
-        search.total
-    );
+    // 0 条也要进入选择器：空列表 + Esc 返回搜索，而不是让整个命令退出。
+    let label = if search.total == 0 {
+        match keyword {
+            Some(keyword) => format!("选择整合包 · 没有匹配「{keyword}」的结果"),
+            None => "选择整合包 · 没有可在服务端运行的整合包".to_owned(),
+        }
+    } else {
+        format!(
+            "选择整合包 · 第 {} 页 · 共 {} 个支持服务端",
+            page + 1,
+            search.total
+        )
+    };
     match select_filter_backable(printer.lang(), &label, &choices, no_scope())? {
         Backable::Back => Ok(Browse::Back),
         Backable::Picked(picked) if picked == NEXT_PAGE => Ok(Browse::Page(page.saturating_add(1))),
