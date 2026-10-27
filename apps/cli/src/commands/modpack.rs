@@ -19,6 +19,7 @@ use crate::output::Printer;
 use crate::progress::{BarSink, TaskSpinner};
 use crate::prompts::{Backable, ScopeHint, ScopedChoice, select_filter_backable};
 use anyhow::{Context, Result};
+use console::measure_text_width;
 use mcsup::domain::server::variant::ServerVariant;
 use mcsup::port::CancellationToken;
 use mcsup::port::modpack::{ModpackDetail, ModpackQuery, ModpackVersion};
@@ -111,11 +112,16 @@ async fn pick_by_project(
     version_hint: Option<&str>,
     printer: Printer,
 ) -> Result<PickedModpack> {
-    let detail = service.select_source(None)?.detail(project).await;
+    // 详情与版本一起取回、取完再打印：分两次取会让详情先上屏，随后才出现
+    // 版本选择，看起来闪一下。
+    let source = service.select_source(None)?;
+    let spinner = TaskSpinner::new(format!("获取 {project} 详情与版本"), printer.is_human());
+    let (detail, versions) = tokio::join!(source.detail(project), source.versions(project));
+    spinner.finish();
     let detail = detail.context("获取整合包详情失败")?;
+    let versions = versions.context("获取整合包版本失败")?;
     print_detail(&detail, printer)?;
     let title = detail.summary.title.clone();
-    let versions = service.select_source(None)?.versions(project).await?;
     let version = match version_hint {
         Some(hint) => versions
             .into_iter()
@@ -156,19 +162,16 @@ async fn run_wizard(
                 }
             }
             Wizard::Modpack { id, keyword, page } => {
-                // 详情与版本同屏：先打印数据行，紧接着进入版本选择，不再多问
-                // 一次「下一步」
-                let spinner = TaskSpinner::new(format!("获取 {id} 详情"), printer.is_human());
-                let detail = service.select_source(None)?.detail(&id).await;
+                // 详情与版本同屏：两者一起取回、一起呈现，打印完详情紧接着就是
+                // 版本选择；先打印再取版本会让简介和版本列表分两次出现。
+                let source = service.select_source(None)?;
+                let spinner = TaskSpinner::new(format!("获取 {id} 详情与版本"), printer.is_human());
+                let (detail, versions) = tokio::join!(source.detail(&id), source.versions(&id));
                 spinner.finish();
                 let detail = detail.context("获取整合包详情失败")?;
+                let versions = versions.context("获取整合包版本失败")?;
                 print_detail(&detail, printer)?;
                 let title = detail.summary.title.clone();
-
-                let spinner = TaskSpinner::new(format!("获取 {title} 版本"), printer.is_human());
-                let versions = service.select_source(None)?.versions(&id).await;
-                spinner.finish();
-                let versions = versions.context("获取整合包版本失败")?;
 
                 // `--version` 已指定则直接取；否则逐版选择（Esc 回结果页）
                 let picked = if let Some(hint) = version_hint {
@@ -369,39 +372,59 @@ struct DetailJson<'a> {
     source: &'a str,
 }
 
+/// 详情字段：标签 + 值，顺序即展示顺序
+///
+/// 可选字段（slug / 作者 / 许可证）缺省时不占行。
+fn detail_rows(detail: &ModpackDetail) -> Vec<(&'static str, String)> {
+    let summary = &detail.summary;
+    let mut rows = vec![("标题", summary.title.clone()), ("ID", summary.id.clone())];
+    if let Some(slug) = summary.slug.as_deref() {
+        rows.push(("slug", slug.to_owned()));
+    }
+    if let Some(author) = summary.author.as_deref() {
+        rows.push(("作者", author.to_owned()));
+    }
+    rows.push(("加载器", summary.loaders.join(", ")));
+    rows.push(("游戏版本", join_versions(&summary.game_versions)));
+    rows.push(("下载量", summary.downloads.to_string()));
+    if let Some(license) = summary.license.as_deref() {
+        rows.push(("许可证", license.to_owned()));
+    }
+    rows.push(("来源", detail.source_name.to_owned()));
+    rows.push(("页面", detail.page_url.clone()));
+    rows.push(("简介", summary.description.clone()));
+    rows
+}
+
+/// 标签列按最宽标签右补空格，值列起点对齐；不画表格边框
+///
+/// 中文标签是双宽字符，补空格按显示宽度而不是字符数算，否则「ID」和
+/// 「游戏版本」后面的值会错开。
+fn render_detail(rows: &[(&str, String)]) -> String {
+    let width = rows
+        .iter()
+        .map(|(label, _)| measure_text_width(label))
+        .max()
+        .unwrap_or(0);
+    rows.iter()
+        .map(|(label, value)| {
+            let pad = width.saturating_sub(measure_text_width(label));
+            format!("{label}{}: {value}", " ".repeat(pad))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// 展示整合包详情
 ///
-/// 人类可读模式每行一个字段，不使用表格：版本选择会紧接在同一屏出现，
-/// 表格边框只会挤占宽度。
+/// 人类可读模式按「标签列 + 值列」对齐输出，不画表格边框：版本选择紧接在
+/// 同一屏出现，边框只会挤占宽度。
 fn print_detail(detail: &ModpackDetail, printer: Printer) -> Result<()> {
-    let summary = &detail.summary;
-
     if printer.is_human() {
-        let mut lines = vec![
-            format!("标题: {}", summary.title),
-            format!("ID: {}", summary.id),
-        ];
-        if let Some(slug) = summary.slug.as_deref() {
-            lines.push(format!("slug: {slug}"));
-        }
-        if let Some(author) = summary.author.as_deref() {
-            lines.push(format!("作者: {author}"));
-        }
-        lines.push(format!("加载器: {}", summary.loaders.join(", ")));
-        lines.push(format!(
-            "游戏版本: {}",
-            join_versions(&summary.game_versions)
-        ));
-        lines.push(format!("下载量: {}", summary.downloads));
-        if let Some(license) = summary.license.as_deref() {
-            lines.push(format!("许可证: {license}"));
-        }
-        lines.push(format!("来源: {}", detail.source_name));
-        lines.push(format!("页面: {}", detail.page_url));
-        lines.push(format!("简介: {}", summary.description));
-        printer.print_section(&lines.join("\n"));
+        printer.print_section(&render_detail(&detail_rows(detail)));
         return Ok(());
     }
+    let summary = &detail.summary;
     // JSON：输出详情对象，供脚本读取
     let payload = DetailJson {
         id: &summary.id,
@@ -754,6 +777,76 @@ mod tests {
         let long: Vec<String> = (0..10).map(|i| format!("1.{i}")).collect();
         let joined = join_versions(&long);
         assert!(joined.contains("等 10 个"), "{joined}");
+    }
+
+    fn modpack_detail(all_optional: bool) -> ModpackDetail {
+        use mcsup::port::modpack::ModpackSummary;
+        ModpackDetail {
+            summary: ModpackSummary {
+                id: "l9m9tuPN".to_owned(),
+                slug: all_optional.then(|| "zombie-invade-100-days".to_owned()),
+                title: "Zombie Invade 100 Days".to_owned(),
+                description: "僵尸入侵 100 天".to_owned(),
+                author: all_optional.then(|| "Forge Labs".to_owned()),
+                loaders: vec!["forge".to_owned()],
+                game_versions: vec!["1.19.2".to_owned(), "1.20.1".to_owned()],
+                downloads: 15_413_875,
+                follows: 0,
+                icon_url: None,
+                license: all_optional.then(|| "LicenseRef-All-Rights-Reserved".to_owned()),
+                updated: None,
+            },
+            body: String::new(),
+            gallery: Vec::new(),
+            page_url: "https://modrinth.com/modpack/zombie-invade-100-days".to_owned(),
+            source_name: "Modrinth",
+        }
+    }
+
+    /// 标签按显示宽度补空格，值列起点一致；不画边框
+    #[test]
+    fn render_detail_aligns_values_by_display_width() {
+        let rows = detail_rows(&modpack_detail(true));
+        let rendered = render_detail(&rows);
+        let width = rows
+            .iter()
+            .map(|(label, _)| measure_text_width(label))
+            .max()
+            .expect("详情至少有一行");
+        assert_eq!(width, measure_text_width("游戏版本"), "最宽标签决定列宽");
+        for line in rendered.lines() {
+            let split = line.find(": ").expect("每行都是「标签: 值」");
+            assert_eq!(
+                measure_text_width(&line[..split]),
+                width,
+                "标签列宽度不一致: {line}"
+            );
+            assert!(!line.contains('│') && !line.contains('|'), "不画表格边框");
+        }
+    }
+
+    /// 可选字段缺省时不占行，剩余行仍对齐
+    #[test]
+    fn detail_rows_skip_missing_optional_fields() {
+        let rows = detail_rows(&modpack_detail(false));
+        let labels: Vec<&str> = rows.iter().map(|(label, _)| *label).collect();
+        assert!(!labels.contains(&"slug"), "{labels:?}");
+        assert!(!labels.contains(&"作者"), "{labels:?}");
+        assert!(!labels.contains(&"许可证"), "{labels:?}");
+        assert_eq!(labels.last().copied(), Some("简介"), "简介是最后一行");
+        assert_eq!(labels.first().copied(), Some("标题"));
+        assert_eq!(labels.len(), 8);
+
+        let rendered = render_detail(&rows);
+        assert_eq!(rendered.lines().count(), rows.len());
+        for line in rendered.lines() {
+            let split = line.find(": ").expect("每行都是「标签: 值」");
+            assert_eq!(
+                measure_text_width(&line[..split]),
+                8,
+                "列宽仍然是 8: {line}"
+            );
+        }
     }
 
     /// 没跳过时不留尾巴；有跳过时中英文都要说明原因
