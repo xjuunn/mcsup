@@ -146,7 +146,7 @@ async fn pick_by_project(
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("整合包 {project} 没有可用版本"))?,
     };
-    finish_pick(service, project, &title, version).await
+    finish_pick(service, project, &title, version, printer).await
 }
 
 /// 交互向导主循环：状态转移全部集中在这里
@@ -204,7 +204,7 @@ async fn run_wizard(
                     version
                 };
                 // 选中版本即开始创建，不再额外确认
-                return finish_pick(service, &id, &title, picked).await;
+                return finish_pick(service, &id, &title, picked, printer).await;
             }
         };
     }
@@ -346,15 +346,24 @@ async fn finish_pick(
     project: &str,
     title: &str,
     version: ModpackVersion,
+    printer: Printer,
 ) -> Result<PickedModpack> {
+    // 取回 `.mrpack` 是网络下载：版本选定后到「服务器已创建」之间若没有回显，
+    // 用户会以为卡死。spinner 覆盖解析与建连，首字节到达后接管为进度条。
+    let label = format!("取回整合包 {title} {}", version.version_number);
+    let spinner = TaskSpinner::new(label.clone(), printer.is_human());
+    let sink = BarSink::new(spinner.handle(), label);
     let prepared = service
         .prepare(
             project,
-            ModpackInstallOptions::new(std::env::temp_dir().as_path()).version(&version.id),
+            ModpackInstallOptions::new(std::env::temp_dir().as_path())
+                .version(&version.id)
+                .progress(&sink),
             &CancellationToken::new(),
         )
         .await
         .context("读取整合包清单失败")?;
+    spinner.finish();
     let minecraft = prepared
         .minecraft_version()
         .map_err(|err| anyhow::anyhow!(err.to_string()))?
