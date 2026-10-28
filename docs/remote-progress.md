@@ -341,8 +341,9 @@ roundtrip 全量权限覆盖补 `BackupList` 样例（`Permission::Backup` 豁�
   launchd）尚未实现**，`serve` 目前是前台进程。
 - `remote connect <host[:port]>`：`Client::probe` 捕获 TLS 指纹 → 展示并确认
   （非交互需 `-y`）→ `Enroll` → 写 `credentials.toml`（0600）与
-  `config.toml [remotes.*]` → 打印同步摘要。`--code` 给配对码，`--name`
-  覆盖远端名，`--read-only` 以 viewer 配对。
+  `config.toml [remotes.*]` → 打印同步摘要。交互确认指纹后提示命名（默认
+  对端自报主机名；同名指向别的 target 时警示重问），`--name` 跳过提示；
+  `--code` 给配对码，`--read-only` 以 viewer 配对。
 - `remote reconnect <name>`：复用记录，先 probe 校验指纹未变，再用已存 token
   认证；指纹变化要求重新 `connect`。
 - `remote list` / `status` / `ping` / `disconnect` / `revoke`：`list` 每台做一次

@@ -103,7 +103,8 @@ $ mcsup remote connect user@host
 地址、证书指纹与配对码，再起一条 `ssh -N -L` 隧道把本地回环端口转到该地址。
 用户不需要在远端开端口、不需要抄配对码，也不需要额外分发凭证——能登上这台
 机器的 SSH 就是授权。首次连接仍需确认证书指纹（TOFU），SSH 只证明「能连上」，
-不证明「agent 是同一台机器上的那个」。
+不证明「agent 是同一台机器上的那个」；确认后交互终端会提示为这台远端命名，
+默认填对端自报的主机名。
 
 隧道与远端 agent 都是**按命令临时起、随命令结束**：
 
@@ -120,8 +121,10 @@ $ mcsup remote connect host:port --code 4821-9375
 ```
 
 交互终端下省略 `--code` 会提示输入；首次连接会展示证书指纹并要求确认，
-非交互（脚本 / 管道）下必须加 `-y` 才接受该指纹。直连接入要求远端
-`remote serve` 常驻并可达（自管端口 / 防火墙自行处理）。
+随后提示为这台远端命名（默认填对端自报的主机名，回车即接受），最后才要求
+配对码。非交互（脚本 / 管道）下不进入命名提示，直接取对端自报主机名；
+指纹确认仍需加 `-y`。直连接入要求远端 `remote serve` 常驻并可达
+（自管端口 / 防火墙自行处理）。
 
 **尚未实现**
 
@@ -139,7 +142,7 @@ $ mcsup remote connect host:port --code 4821-9375
 | 命令 | 说明 |
 | --- | --- |
 | `mcsup remote connect <host[:port]> [--code <码>] [-y]` | 配对远端（直连） |
-| `mcsup remote connect --name <n>` | 覆盖对端自报的远端名 |
+| `mcsup remote connect --name <n>` | 指定远端名并跳过交互命名 |
 | `mcsup remote connect --read-only` | 以只读权限配对（viewer） |
 | `mcsup remote reconnect <name>` | 复用记录重新认证；指纹变化要求重新 connect |
 | `mcsup remote list` | 已配对远端、连接状态、角色、agent 版本 |

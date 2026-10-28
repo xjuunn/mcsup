@@ -12,6 +12,7 @@ use inquire::autocompletion::Replacement;
 use inquire::validator::{ErrorMessage, Validation};
 use inquire::{Autocomplete, Confirm, CustomUserError, Select, Text};
 use mcsup::domain::workspace::WorkspaceName;
+use mcsup::port::RemoteName;
 use mcsup::service::{MARKER_FILE, NOISE_ENTRIES, absolute_path};
 use std::path::{Path, PathBuf};
 
@@ -333,6 +334,52 @@ pub(crate) fn validate_name(lang: Lang, input: &str) -> Validation {
     }
 }
 
+/// 远端名输入：回车取默认值，非法即时重输
+///
+/// 与工作区 / 服务器名不同，远端名允许 `.`，且禁用 `all` / `local` / `remote`
+/// 这三个 `--origin` 保留字，因此单独按 [`RemoteName`] 的规则校验。
+///
+/// # Errors
+///
+/// 读取终端输入失败时返回底层错误
+pub(crate) fn input_remote_name(lang: Lang, label: &str, default: &str) -> Result<String> {
+    let input: String = text_input(
+        label,
+        default,
+        &l(
+            lang,
+            "字母、数字、-、_、.，最长 64；不能是 all / local / remote；回车取默认值",
+            "letters, digits, - or _, or ., up to 64; not all/local/remote; enter keeps the default",
+        ),
+    )
+    .with_validator(move |input: &str| Ok(validate_remote_name(lang, input)))
+    .prompt()
+    .context(l(lang, "读取名称输入", "reading the name"))?;
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        Ok(default.to_owned())
+    } else {
+        Ok(trimmed.to_owned())
+    }
+}
+
+/// 远端名校验：空 = 取默认；其余按 [`RemoteName`] 规则
+#[must_use]
+pub(crate) fn validate_remote_name(lang: Lang, input: &str) -> Validation {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Validation::Valid;
+    }
+    match RemoteName::parse(trimmed) {
+        Ok(_) => Validation::Valid,
+        Err(_) => Validation::Invalid(ErrorMessage::Custom(l(
+            lang,
+            "名称需为 1–64 个字母、数字、-、_ 或 .，且不能是 all / local / remote",
+            "names must be 1-64 letters, digits, -, _ or ., and not all/local/remote",
+        ))),
+    }
+}
+
 /// 通用文本输入：回车取默认值（默认值常为该项当前值）
 ///
 /// # Errors
@@ -563,6 +610,34 @@ mod tests {
         ));
         assert!(matches!(
             validate_name(Lang::Zh, &"x".repeat(65)),
+            Validation::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn remote_name_validation_follows_port_rules() {
+        assert!(matches!(
+            validate_remote_name(Lang::Zh, "prod-box.local"),
+            Validation::Valid
+        ));
+        assert!(matches!(
+            validate_remote_name(Lang::Zh, "  "),
+            Validation::Valid
+        ));
+        assert!(matches!(
+            validate_remote_name(Lang::Zh, "all"),
+            Validation::Invalid(_)
+        ));
+        assert!(matches!(
+            validate_remote_name(Lang::Zh, "local"),
+            Validation::Invalid(_)
+        ));
+        assert!(matches!(
+            validate_remote_name(Lang::Zh, "bad name"),
+            Validation::Invalid(_)
+        ));
+        assert!(matches!(
+            validate_remote_name(Lang::Zh, "a/b"),
             Validation::Invalid(_)
         ));
     }

@@ -344,8 +344,8 @@ fn connect(
             format!("failed to connect to {target}"),
         )
     })?;
-    let remote_name = resolve_remote_name(name, &probe, printer)?;
     let fingerprint = confirm_fingerprint(&probe, printer)?;
+    let remote_name = resolve_remote_name(name, &probe, file, &target, printer)?;
     let code = resolve_pairing_code(code, &probe, printer)?;
     let client_name = client_display_name();
 
@@ -423,10 +423,7 @@ fn connect_ssh(
     // 指纹必须与远端自报的一致（probe 已校验），用户仍需确认——SSH 只证明
     // 「能登上去」，不证明「agent 是同一台机器上的那个」
     let fingerprint = confirm_fingerprint(&probe, printer)?;
-    let remote_name = match name {
-        Some(name) => crate::commands::origin::remote_name(name, lang)?,
-        None => resolve_remote_name(None, &probe, printer)?,
-    };
+    let remote_name = resolve_remote_name(name, &probe, file, &ssh_target, printer)?;
     let client_name = client_display_name();
     let client = Client::new(&local, fingerprint.clone());
     let enrolled = client
@@ -1013,15 +1010,57 @@ fn resolve_pairing_code(code: Option<String>, probe: &Probe, printer: Printer) -
     )
 }
 
-/// 远端名：显式 > 对端自报主机名（规范化后）> 目标主机
-fn resolve_remote_name(name: Option<&str>, probe: &Probe, printer: Printer) -> Result<RemoteName> {
+/// 远端名：显式 > 交互命名 > 对端自报主机名（规范化后）> `remote`
+///
+/// 显式 `--name` 与非交互（JSON / 非 TTY）都不提问。交互下默认填对端自报的
+/// 主机名，用户可直接回车；若输入的名字已配对到另一台机器，警示后重问，
+/// 避免一次回车静默覆盖别的远端。同目标重连不拦（`connect` 幂等）。
+fn resolve_remote_name(
+    name: Option<&str>,
+    probe: &Probe,
+    file: &ConfigFile,
+    target: &str,
+    printer: Printer,
+) -> Result<RemoteName> {
+    let lang = printer.lang();
     if let Some(name) = name {
-        return crate::commands::origin::remote_name(name, printer.lang());
+        return crate::commands::origin::remote_name(name, lang);
     }
     let candidate = sanitize_name(&probe.greeting.server_name);
-    match RemoteName::parse(&candidate) {
-        Ok(name) => Ok(name),
-        Err(_) => crate::commands::origin::remote_name("remote", printer.lang()),
+    if !printer.is_interactive() {
+        return match RemoteName::parse(&candidate) {
+            Ok(name) => Ok(name),
+            Err(_) => crate::commands::origin::remote_name("remote", lang),
+        };
+    }
+    let cfg = file.load()?;
+    loop {
+        let entered = prompts::input_remote_name(
+            lang,
+            &crate::i18n::pick(
+                lang,
+                format!("为远程设备命名（{}）", probe.greeting.server_name),
+                format!("name this remote ({})", probe.greeting.server_name),
+            ),
+            &candidate,
+        )?;
+        let name = crate::commands::origin::remote_name(&entered, lang)?;
+        match cfg.remote(&name) {
+            Some(record) if record.target != target => {
+                printer.print_warning(&crate::i18n::pick(
+                    lang,
+                    format!(
+                        "远端名 {} 已用于 {}；换一个，或先 remote disconnect {}",
+                        name, record.target, name
+                    ),
+                    format!(
+                        "remote name {} is already used by {}; pick another or run `remote disconnect {}` first",
+                        name, record.target, name
+                    ),
+                ));
+            }
+            _ => return Ok(name),
+        }
     }
 }
 
