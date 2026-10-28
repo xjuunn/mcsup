@@ -622,6 +622,12 @@ pub struct WireStatusEntry {
     /// 单台查询失败的原因；`None` = 查询成功
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// 失败种类（[`super::ErrorKind`] 文本）；`None` = 查询成功或对端未给出
+    ///
+    /// 客户端据此决定把失败归到「不存在 / 不可达」还是普通远端错误，
+    /// 而不是解析 `error` 文案。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 impl WireStatusEntry {
@@ -631,15 +637,23 @@ impl WireStatusEntry {
         Self {
             status: status.map(WireStatus::from),
             error: None,
+            kind: None,
         }
     }
 
-    /// 单台查询失败
+    /// 单台查询失败（默认归 `io`）
     #[must_use]
     pub fn failed(message: impl Into<String>) -> Self {
+        Self::failed_kind(super::ErrorKind::IO, message)
+    }
+
+    /// 单台查询失败，并带上错误种类
+    #[must_use]
+    pub fn failed_kind(kind: &str, message: impl Into<String>) -> Self {
         Self {
             status: None,
             error: Some(message.into()),
+            kind: Some(kind.to_owned()),
         }
     }
 
@@ -975,6 +989,7 @@ mod tests {
                 exit_code: None,
             }),
             error: Some("boom".to_owned()),
+            kind: Some(crate::remote::ErrorKind::IO.to_owned()),
         };
         assert!(both.into_result().is_err());
 

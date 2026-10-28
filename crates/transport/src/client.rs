@@ -260,6 +260,10 @@ impl Client {
     /// 复用中的连接断了会重建一次再重试：远端在两次命令之间重启是常态，把
     /// 「重启」表现成一次失败会让每个脚本都要自己重试。
     ///
+    /// 只有**只读 / 幂等**的请求（[`Request::is_retry_safe`]）才重试：写请求
+    /// 若已被对端执行而响应丢失，重发会造成重复副作用（重复快照、重复下载、
+    /// 二次登记）。
+    ///
     /// **建连本身就失败时不重试**：没有「断掉的连接」可重建，第二次尝试只会
     /// 把等待翻倍（不可达远端一次 SYN 超时已经够久），而结果不会变好。
     ///
@@ -270,8 +274,8 @@ impl Client {
         let reused = self.has_connection();
         match self.call_once(request) {
             Ok(response) => Ok(response),
-            Err(err) if should_retry(&err, reused) => {
-                tracing::debug!(%err, "remote connection dropped, retrying once");
+            Err(err) if request.is_retry_safe() && should_retry(&err, reused) => {
+                tracing::debug!(%err, op = request.operation(), "remote connection dropped, retrying once");
                 self.disconnect()?;
                 self.call_once(request)
             }

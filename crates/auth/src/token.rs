@@ -18,6 +18,13 @@ const TOKEN_BYTES: usize = 32;
 /// token 文本长度（十六进制编码）
 pub const TOKEN_LEN: usize = TOKEN_BYTES * 2;
 
+/// 新配对 token 的默认有效期：30 天
+///
+/// 服务端在配对时把 `paired_at + TTL` 写进客户端记录；过期后认证被拒，用户
+/// 需重新 `remote connect`。引入 TTL 之前的旧记录没有过期时间，按「不过期」
+/// 兼容处理。
+pub const DEFAULT_TOKEN_TTL_SECS: i64 = 30 * 24 * 60 * 60;
+
 /// 客户端身份
 ///
 /// 由服务端在配对成功时生成并写进 token 记录，用来实现「撤销某个客户端」
