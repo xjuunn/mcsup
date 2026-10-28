@@ -1,6 +1,9 @@
 use crate::fs_error::{FsError, deletion_hint};
+use crate::origin::{OriginFilter, ResolveError, Selector, resolve_index};
 use domain::workspace::{InvalidWorkspaceName, Workspace, WorkspaceId, WorkspaceName};
-use port::{RepositoryError, ServerRepository, Sourced, WorkspaceRepository};
+use port::{
+    Origin, RepositoryError, ServerRepository, Sourced, WorkspaceRepository, WorkspaceSelection,
+};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -40,6 +43,12 @@ pub enum WorkspaceError {
     /// 尚无当前工作区
     #[error("no current workspace; run `mcsup workspace init` or `mcsup workspace use` first")]
     NoCurrent,
+    /// 当前工作区指向的远端此刻不可用（离线 / 未配对）
+    #[error("current workspace is on unavailable origin {origin}")]
+    CurrentOriginUnavailable {
+        /// 来源（远端名）
+        origin: String,
+    },
     /// 当前进程的工作目录位于待删目录内：先删它会把调用方终端锁死在已删除路径上
     #[error(
         "current working directory {cwd} is inside {target}; move out of it first, \
@@ -91,6 +100,9 @@ impl WorkspaceError {
                 candidates,
             },
             Self::NoCurrent => WorkspaceErrorKind::NoCurrent,
+            Self::CurrentOriginUnavailable { origin } => {
+                WorkspaceErrorKind::CurrentOriginUnavailable { origin }
+            }
             Self::CwdInsideTarget { cwd, target } => {
                 WorkspaceErrorKind::CwdInsideTarget { cwd, target }
             }
@@ -132,6 +144,11 @@ pub enum WorkspaceErrorKind<'a> {
     },
     /// 尚无当前工作区
     NoCurrent,
+    /// 当前工作区指向的远端不可用
+    CurrentOriginUnavailable {
+        /// 来源（远端名）
+        origin: &'a str,
+    },
     /// 调用方工作目录位于待删目录内
     CwdInsideTarget {
         /// 调用方工作目录
@@ -308,61 +325,123 @@ impl WorkspaceService {
     /// 注册表失败时返回 [`WorkspaceError`]
     pub fn list(&self) -> Result<Vec<Workspace>, WorkspaceError> {
         Ok(self
-            .repo
-            .list()?
+            .list_sourced()?
             .into_iter()
-            .map(normalize_workspace)
+            .map(|sourced| sourced.value)
             .collect())
     }
 
     /// 全部工作目录并标注来源（本地 + 已配对远端）
     ///
     /// 组合仓库下每条带真实来源；纯本地实现全部是 [`port::Origin::Local`]。
-    /// 入口用它在合并列表里显示 `ORIGIN`，并按 `--origin` 过滤。
+    /// `is_current` 只按**本机选择**计算：远端仓库带回来的 `is_current`
+    /// 是对端机器自己的状态，必须忽略。
     ///
     /// # Errors
     ///
     /// 注册表失败时返回 [`WorkspaceError`]
     pub fn list_sourced(&self) -> Result<Vec<Sourced<Workspace>>, WorkspaceError> {
-        Ok(self
+        let selection = self.repo.current_selection()?;
+        let mut items: Vec<Sourced<Workspace>> = self
             .repo
             .list_sourced()?
             .into_iter()
             .map(|sourced| sourced.map(normalize_workspace))
-            .collect())
+            .collect();
+        for item in &mut items {
+            item.value.is_current = selection
+                .as_ref()
+                .is_some_and(|sel| sel.origin == item.origin && sel.workspace == item.value.id);
+        }
+        Ok(items)
     }
 
     /// 当前工作区：`create` / `link` 等缺省操作的落点
     ///
+    /// 选择可以指向远端；远端离线时明确报「来源不可用」，不退回本地。
+    ///
     /// # Errors
     ///
-    /// 无当前或注册表失败时返回 [`WorkspaceError`]
+    /// 无当前、当前来源不可用或注册表失败时返回 [`WorkspaceError`]
     pub fn current_workspace(&self) -> Result<Workspace, WorkspaceError> {
-        self.repo
-            .current()?
-            .map(normalize_workspace)
-            .ok_or(WorkspaceError::NoCurrent)
+        Ok(self.current_sourced()?.value)
     }
 
-    /// 按名选择器解析：精确 → 唯一前缀 → 报错
+    /// 当前工作区（含来源）；远端不可用时明确报错，不退回本地
+    ///
+    /// # Errors
+    ///
+    /// 无当前、当前来源不可用或注册表失败时返回 [`WorkspaceError`]
+    pub fn current_sourced(&self) -> Result<Sourced<Workspace>, WorkspaceError> {
+        let Some(selection) = self.repo.current_selection()? else {
+            return Err(WorkspaceError::NoCurrent);
+        };
+        let found = self
+            .list_sourced()?
+            .into_iter()
+            .find(|item| item.origin == selection.origin && item.value.id == selection.workspace);
+        match found {
+            Some(item) => Ok(item),
+            None if selection.origin.is_local() => Err(WorkspaceError::NoCurrent),
+            None => Err(WorkspaceError::CurrentOriginUnavailable {
+                origin: selection.origin.as_str().to_owned(),
+            }),
+        }
+    }
+
+    /// 跨来源解析工作区选择器（精确 → 唯一前缀），返回来源 + 记录
+    ///
+    /// # Errors
+    ///
+    /// 未找到 / 歧义 / 注册表失败时返回 [`WorkspaceError`]
+    pub fn resolve_sourced(&self, selector: &str) -> Result<Sourced<Workspace>, WorkspaceError> {
+        let selector = Selector::parse(selector);
+        let items = self.list_sourced()?;
+        let candidates: Vec<(Origin, &str)> = items
+            .iter()
+            .map(|item| (item.origin.clone(), item.value.name.as_str()))
+            .collect();
+        let index = match resolve_index(&candidates, &selector, &OriginFilter::All) {
+            Ok(index) => index,
+            // 工作区保留前缀补全：精确无命中时在（限定后的）候选里找唯一前缀
+            Err(ResolveError::NotFound(_)) => resolve_prefix(&candidates, &selector)?,
+            Err(err) => return Err(resolve_error(err)),
+        };
+        Ok(items[index].clone())
+    }
+
+    /// 按名选择器解析（仅本地）：精确 → 唯一前缀 → 报错
+    ///
+    /// `remove` / 本地预检用它；跨来源切换走 [`Self::set_current`]。
     ///
     /// # Errors
     ///
     /// 未找到 / 歧义 / 注册表失败时返回 [`WorkspaceError`]
     pub fn resolve(&self, selector: &str) -> Result<Workspace, WorkspaceError> {
-        let all = self.list()?;
+        let all: Vec<Workspace> = self
+            .list_sourced()?
+            .into_iter()
+            .filter(|item| item.origin.is_local())
+            .map(|item| item.value)
+            .collect();
         resolve_selector(&all, selector)
     }
 
-    /// 切换当前工作区
+    /// 切换本机当前工作区；支持 `origin/name` 限定名
+    ///
+    /// 只写本机指针（[`WorkspaceRepository::set_current_selection`]），绝不改
+    /// 对端 current。裸名重名时报歧义。
     ///
     /// # Errors
     ///
-    /// 不存在或注册表失败时返回 [`WorkspaceError`]
+    /// 未找到 / 歧义 / 注册表失败时返回 [`WorkspaceError`]
     pub fn set_current(&self, selector: &str) -> Result<Workspace, WorkspaceError> {
-        let ws = self.resolve(selector)?;
-        self.repo.set_current(&ws.id)?;
-        let mut ws = ws;
+        let picked = self.resolve_sourced(selector)?;
+        self.repo.set_current_selection(&WorkspaceSelection {
+            origin: picked.origin.clone(),
+            workspace: picked.value.id.clone(),
+        })?;
+        let mut ws = picked.value;
         ws.is_current = true;
         Ok(ws)
     }
@@ -408,9 +487,15 @@ impl WorkspaceService {
         self.servers.remove_by_workspace(&ws.id)?;
         self.repo.remove(&ws.id)?;
         if ws.is_current
-            && let Some(next) = self.repo.list()?.first()
+            && let Some(next) = self
+                .list_sourced()?
+                .into_iter()
+                .find(|item| item.origin.is_local())
         {
-            self.repo.set_current(&next.id)?;
+            self.repo.set_current_selection(&WorkspaceSelection {
+                origin: Origin::Local,
+                workspace: next.value.id,
+            })?;
         }
         Ok(RemoveOutcome {
             workspace: ws,
@@ -548,6 +633,55 @@ pub fn resolve_selector(all: &[Workspace], selector: &str) -> Result<Workspace, 
             selector: selector.to_owned(),
             candidates: many.iter().map(|w| w.name.as_str().to_owned()).collect(),
         }),
+    }
+}
+
+/// 前缀补全：在限定来源内（或全部来源）找唯一前缀
+///
+/// 与 [`resolve_selector`] 的本地前缀语义一致，只是候选带来源、可跨端。
+fn resolve_prefix(
+    candidates: &[(Origin, &str)],
+    selector: &Selector,
+) -> Result<usize, WorkspaceError> {
+    let scoped: Vec<usize> = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, (origin, _))| selector.origin().is_none_or(|want| want == origin))
+        .map(|(index, _)| index)
+        .collect();
+    let hits: Vec<usize> = scoped
+        .into_iter()
+        .filter(|&index| candidates[index].1.starts_with(selector.name()))
+        .collect();
+    match hits.as_slice() {
+        [] => Err(WorkspaceError::NotFound(selector.name().to_owned())),
+        [one] => Ok(*one),
+        many => {
+            let mut names: Vec<String> = many
+                .iter()
+                .map(|&index| candidates[index].0.qualify(candidates[index].1))
+                .collect();
+            names.sort();
+            Err(WorkspaceError::Ambiguous {
+                selector: selector.name().to_owned(),
+                candidates: names,
+            })
+        }
+    }
+}
+
+/// 跨来源解析错误 → 工作区错误
+fn resolve_error(err: ResolveError) -> WorkspaceError {
+    match err {
+        ResolveError::NotFound(name) => WorkspaceError::NotFound(name),
+        ResolveError::OriginNotPaired(origin) => WorkspaceError::NotFound(origin),
+        ResolveError::Ambiguous {
+            selector,
+            candidates,
+        } => WorkspaceError::Ambiguous {
+            selector,
+            candidates,
+        },
     }
 }
 

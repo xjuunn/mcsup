@@ -419,6 +419,22 @@ pub(crate) fn open_registry_with_remotes() -> Result<Arc<mcsup::service::ServerR
     )))
 }
 
+/// 装配组合仓库版 `WorkspaceService`（本地 + 已配对远端）
+///
+/// `workspace ls` / `server ls` 展示名字、`workspace use` 解析限定名都用它；
+/// 写入仍委托本地（`current` 是本机状态）。
+pub(crate) fn workspace_service_with_remotes() -> Result<mcsup::service::WorkspaceService> {
+    let store = open_store()?;
+    let cfg = ConfigFile::locate(None).load()?;
+    let members = remote_members(&cfg)?;
+    let workspaces: Arc<dyn mcsup::port::WorkspaceRepository> = if members.is_empty() {
+        store.clone()
+    } else {
+        Arc::new(CombinedWorkspaceRepository::new(store.clone(), members))
+    };
+    Ok(mcsup::service::WorkspaceService::new(workspaces, store))
+}
+
 /// 库侧默认组合根（`mcsup::bootstrap`）：CLI 全部命令的统一装配口径。
 ///
 /// 单一入口：路径来自 `config`，网络能力与默认实现全部来自库侧组合根，

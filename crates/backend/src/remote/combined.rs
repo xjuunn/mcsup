@@ -35,7 +35,7 @@ use domain::server::version::VersionId;
 use domain::workspace::{Workspace, WorkspaceId, WorkspaceName};
 use port::{
     JavaRuntimeRepository, Origin, RemoteName, RepositoryError, ServerRepository, Sourced,
-    WorkspaceRepository,
+    WorkspaceRepository, WorkspaceSelection,
 };
 use std::sync::Arc;
 
@@ -175,7 +175,11 @@ impl WorkspaceRepository for CombinedWorkspaceRepository {
         let mut out = self.local.list()?;
         for member in self.remotes.all() {
             match member.workspaces.list() {
-                Ok(items) => out.extend(items),
+                Ok(items) => out.extend(items.into_iter().map(|mut ws| {
+                    // 对端的 current 属于对端机器，不能当成客户端的 current
+                    ws.is_current = false;
+                    ws
+                })),
                 Err(err) => {
                     // 离线不阻塞：本地列表照常返回，远端条目缺失由入口提示
                     tracing::warn!(remote = member.name.as_str(), %err, "remote workspace list failed; skipping");
@@ -186,20 +190,17 @@ impl WorkspaceRepository for CombinedWorkspaceRepository {
     }
 
     fn current(&self) -> Result<Option<Workspace>, RepositoryError> {
-        // 当前工作区是本机状态：本地有就用本地的，本地没有再看远端
-        if let Some(current) = self.local.current()? {
-            return Ok(Some(current));
-        }
-        for member in self.remotes.all() {
-            match member.workspaces.current() {
-                Ok(Some(ws)) => return Ok(Some(ws)),
-                Ok(None) => {}
-                Err(err) => {
-                    tracing::warn!(remote = member.name.as_str(), %err, "remote current lookup failed");
-                }
-            }
-        }
-        Ok(None)
+        // 只认本地 current；远端 current 是对端机器自己的状态
+        self.local.current()
+    }
+
+    /// 本机视角的 current：可指向远端，但只存本地
+    fn current_selection(&self) -> Result<Option<WorkspaceSelection>, RepositoryError> {
+        self.local.current_selection()
+    }
+
+    fn set_current_selection(&self, selection: &WorkspaceSelection) -> Result<(), RepositoryError> {
+        self.local.set_current_selection(selection)
     }
 
     /// 本地优先：远端的「当前工作区」是对端状态，不由本机写路径切换
@@ -230,7 +231,10 @@ impl WorkspaceRepository for CombinedWorkspaceRepository {
             self.local.list()?.into_iter().map(Sourced::local).collect();
         for member in self.remotes.all() {
             match member.workspaces.list_sourced() {
-                Ok(items) => out.extend(items),
+                Ok(items) => out.extend(items.into_iter().map(|mut sourced| {
+                    sourced.value.is_current = false;
+                    sourced
+                })),
                 Err(err) => {
                     tracing::warn!(remote = member.name.as_str(), %err, "remote workspace list failed; skipping");
                 }

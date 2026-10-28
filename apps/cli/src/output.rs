@@ -433,10 +433,10 @@ fn registry_exit_code(err: &mcsup::service::ServerRegistryError) -> u8 {
 
 fn workspace_exit_code(err: &mcsup::service::WorkspaceError) -> u8 {
     match err {
-        // 未找到 / 无当前工作区都是「缺省资源不存在」（契约：3 未找到）
-        mcsup::service::WorkspaceError::NotFound(_) | mcsup::service::WorkspaceError::NoCurrent => {
-            3
-        }
+        // 未找到 / 无当前 / 当前来源不可用都是「缺省资源不可用」（契约：3 未找到）
+        mcsup::service::WorkspaceError::NotFound(_)
+        | mcsup::service::WorkspaceError::NoCurrent
+        | mcsup::service::WorkspaceError::CurrentOriginUnavailable { .. } => 3,
         // 名称冲突 / 工作目录挡着删除：都是状态冲突，处理后可重试
         mcsup::service::WorkspaceError::AlreadyExists(_)
         | mcsup::service::WorkspaceError::CwdInsideTarget { .. } => 4,

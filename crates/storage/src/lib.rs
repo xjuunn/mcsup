@@ -3,7 +3,8 @@
 //! 目录布局（`{root}` = `{data_dir}/mcsup/db`）：
 //!
 //! ```text
-//! {root}/workspaces/state.json      {"version":1,"current":"<uuid>|null"}
+//! {root}/workspaces/state.json      {"version":2,"current":{"origin":"local","workspace":"<uuid>"}|null}
+//!                                   v1 `{"current":"<uuid>"}` 读作本地选择
 //! {root}/workspaces/<uuid>.json     一条工作目录
 //! {root}/servers/<uuid>.json        一台服务器
 //! {root}/java/state.json            {"version":1,"scanned_at":<unix 秒>|null}
@@ -33,7 +34,10 @@ use domain::java::JavaRuntime;
 use domain::server::meta::{ServerMeta, ServerName};
 use domain::server::version::VersionId;
 use domain::workspace::{Workspace, WorkspaceId, WorkspaceName};
-use port::{JavaRuntimeRepository, RepositoryError, ServerRepository, WorkspaceRepository};
+use port::{
+    JavaRuntimeRepository, LOCAL_NAME, Origin, RepositoryError, ServerRepository,
+    WorkspaceRepository, WorkspaceSelection,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
@@ -41,7 +45,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 /// `state.json` 的格式版本
-const STATE_VERSION: u32 = 1;
+///
+/// v2 把裸 uuid 换成 `{origin, workspace}`：当前工作区可以指向远端。
+const WORKSPACE_STATE_VERSION: u32 = 2;
+/// Java 集合的 `state.json` 仍是 v1（只有扫描时间）
+const JAVA_STATE_VERSION: u32 = 1;
 /// 记录文件扩展名
 const RECORD_EXT: &str = "json";
 /// 当前工作区指针文件名
@@ -55,8 +63,24 @@ const LOCK_FILE: &str = ".lock";
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct WorkspaceState {
     version: u32,
-    /// 当前工作区 id。指向已删除或损坏的记录时读取视为「无当前」。
-    current: Option<String>,
+    /// 本机视角的当前工作区。指向已删除 / 损坏 / 不可达来源时读取视为「无当前」。
+    #[serde(default)]
+    current: Option<CurrentPointer>,
+}
+
+/// `current` 的线上形态：兼容 v1 的裸 uuid
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum CurrentPointer {
+    /// v1：裸 uuid，等价于 `origin = local`
+    Bare(String),
+    /// v2：带来源
+    Scoped {
+        /// 来源（`local` 或远端名）
+        origin: String,
+        /// 工作区 id
+        workspace: String,
+    },
 }
 
 /// Java 集合的全局状态
@@ -70,16 +94,37 @@ struct JavaState {
 impl WorkspaceState {
     fn new() -> Self {
         Self {
-            version: STATE_VERSION,
+            version: WORKSPACE_STATE_VERSION,
             current: None,
         }
+    }
+
+    /// 解析为本机视角的选择；非法 / 损坏视为「无当前」
+    fn selection(&self) -> Option<WorkspaceSelection> {
+        let (origin, workspace) = match self.current.as_ref()? {
+            CurrentPointer::Bare(id) => (Origin::Local, id.clone()),
+            CurrentPointer::Scoped { origin, workspace } => {
+                (Origin::parse(origin).ok()?, workspace.clone())
+            }
+        };
+        Some(WorkspaceSelection {
+            origin,
+            workspace: WorkspaceId::parse(&workspace).ok()?,
+        })
+    }
+
+    /// 本地 current 指针：只有 origin 为本地时才参与本地记录的 `is_current`
+    fn local_id(&self) -> Option<String> {
+        self.selection()
+            .filter(|selection| selection.origin.is_local())
+            .map(|selection| selection.workspace.to_string())
     }
 }
 
 impl JavaState {
     fn new() -> Self {
         Self {
-            version: STATE_VERSION,
+            version: JAVA_STATE_VERSION,
             scanned_at: None,
         }
     }
@@ -376,20 +421,43 @@ impl JsonStore {
     // ---------------------------------------------------------------- 状态读写
 
     fn load_workspace_state(&self) -> Result<WorkspaceState, RepositoryError> {
-        self.load_state(Collection::Workspaces, WorkspaceState::new)
+        let path = self.state_path(Collection::Workspaces);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(WorkspaceState::new()),
+            Err(err) => return Err(storage_err(err)),
+        };
+        let state: WorkspaceState = serde_json::from_slice(&bytes)
+            .map_err(|err| RepositoryError::Corrupt(format!("{}: {err}", self.display(&path))))?;
+        // 兼容 v1（裸 uuid）与 v2；其余版本视为损坏
+        if !(1..=WORKSPACE_STATE_VERSION).contains(&state.version) {
+            return Err(RepositoryError::Corrupt(format!(
+                "{}: version {}, expected 1..={WORKSPACE_STATE_VERSION}",
+                self.display(&path),
+                state.version
+            )));
+        }
+        Ok(state)
     }
 
-    /// 读当前工作区指针，读不出时退化为「无当前」
+    /// 读本机视角的当前工作区，读不出时退化为「无当前」
     ///
     /// `state.json` 是全局单点：解析失败或版本未知时若直接报错，
     /// `workspace list` / `server list` 会整体不可用。而这两个命令
     /// 并不需要「当前」才能给出有用结果，因此这里只降级不失败，
     /// 与悬空指针同一语义。写入路径仍走 [`Self::load_workspace_state`]：
     /// 写之前必须知道状态是否真的可改，不能静默覆盖一份读不懂的文件。
-    fn current_pointer(&self) -> Option<String> {
+    fn selection_pointer(&self) -> Option<WorkspaceSelection> {
         self.load_workspace_state()
             .ok()
-            .and_then(|state| state.current)
+            .and_then(|state| state.selection())
+    }
+
+    /// 本地 current 指针；只有选择本身指向本地时才返回
+    fn local_current_id(&self) -> Option<String> {
+        self.load_workspace_state()
+            .ok()
+            .and_then(|state| state.local_id())
     }
 
     fn load_java_state(&self) -> Result<JavaState, RepositoryError> {
@@ -408,9 +476,9 @@ impl JsonStore {
         };
         let state: T = serde_json::from_slice(&bytes)
             .map_err(|err| RepositoryError::Corrupt(format!("{}: {err}", self.display(&path))))?;
-        if state.state_version() != STATE_VERSION {
+        if state.state_version() != JAVA_STATE_VERSION {
             return Err(RepositoryError::Corrupt(format!(
-                "{}: version {}, expected {STATE_VERSION}",
+                "{}: version {}, expected {JAVA_STATE_VERSION}",
                 self.display(&path),
                 state.state_version()
             )));
@@ -719,7 +787,10 @@ impl WorkspaceRepository for JsonStore {
         // 崩溃只会留下「已登记但不是当前」，不会留下两个当前
         if ws.is_current {
             let mut state = self.load_workspace_state()?;
-            state.current = Some(ws.id.as_str().to_owned());
+            state.current = Some(CurrentPointer::Scoped {
+                origin: LOCAL_NAME.to_owned(),
+                workspace: ws.id.to_string(),
+            });
             self.write_state(Collection::Workspaces, &state)?;
         }
         Ok(())
@@ -730,7 +801,7 @@ impl WorkspaceRepository for JsonStore {
         let entry = self
             .load_record::<WorkspaceEntry>(Collection::Workspaces, id.as_str())?
             .ok_or_else(|| RepositoryError::NotFound(id.as_str().to_owned()))?;
-        into_workspace(entry, self.current_pointer().as_deref())
+        into_workspace(entry, self.local_current_id().as_deref())
     }
 
     fn get_by_name(&self, name: &WorkspaceName) -> Result<Workspace, RepositoryError> {
@@ -740,14 +811,14 @@ impl WorkspaceRepository for JsonStore {
             .into_iter()
             .find(|entry| entry.name == name.as_str())
             .ok_or_else(|| RepositoryError::NotFound(name.as_str().to_owned()))?;
-        into_workspace(entry, self.current_pointer().as_deref())
+        into_workspace(entry, self.local_current_id().as_deref())
     }
 
     fn list(&self) -> Result<Vec<Workspace>, RepositoryError> {
         let _guard = self.lock()?;
         // 单条损坏不应让整个列表不可用：跳过它，其余照常返回
         let (records, _) = self.scan::<WorkspaceEntry>(Collection::Workspaces, true)?;
-        let current = self.current_pointer();
+        let current = self.local_current_id();
         let mut rows = records
             .into_iter()
             .map(|entry| into_workspace(entry, current.as_deref()))
@@ -758,7 +829,7 @@ impl WorkspaceRepository for JsonStore {
 
     fn current(&self) -> Result<Option<Workspace>, RepositoryError> {
         let _guard = self.lock()?;
-        let Some(id) = self.current_pointer() else {
+        let Some(id) = self.local_current_id() else {
             return Ok(None);
         };
         // 指针悬空（记录已删 / 损坏）按「无当前」处理，不改文件：
@@ -773,6 +844,10 @@ impl WorkspaceRepository for JsonStore {
         into_workspace(entry, Some(&id)).map(Some)
     }
 
+    fn current_selection(&self) -> Result<Option<WorkspaceSelection>, RepositoryError> {
+        Ok(self.selection_pointer())
+    }
+
     fn set_current(&self, id: &WorkspaceId) -> Result<(), RepositoryError> {
         let _guard = self.lock()?;
         if self
@@ -782,7 +857,34 @@ impl WorkspaceRepository for JsonStore {
             return Err(RepositoryError::NotFound(id.as_str().to_owned()));
         }
         let mut state = self.load_workspace_state()?;
-        state.current = Some(id.as_str().to_owned());
+        state.current = Some(CurrentPointer::Scoped {
+            origin: LOCAL_NAME.to_owned(),
+            workspace: id.to_string(),
+        });
+        self.write_state(Collection::Workspaces, &state)
+    }
+
+    fn set_current_selection(&self, selection: &WorkspaceSelection) -> Result<(), RepositoryError> {
+        let _guard = self.lock()?;
+        // 本地选择必须指向真实记录；远端选择由组合仓库 / 服务层在解析时校验，
+        // 本地存储只负责保存这个指针
+        if selection.origin.is_local()
+            && self
+                .load_record::<WorkspaceEntry>(
+                    Collection::Workspaces,
+                    selection.workspace.as_str(),
+                )?
+                .is_none()
+        {
+            return Err(RepositoryError::NotFound(
+                selection.workspace.as_str().to_owned(),
+            ));
+        }
+        let mut state = self.load_workspace_state()?;
+        state.current = Some(CurrentPointer::Scoped {
+            origin: selection.origin.as_str().to_owned(),
+            workspace: selection.workspace.to_string(),
+        });
         self.write_state(Collection::Workspaces, &state)
     }
 
@@ -795,9 +897,9 @@ impl WorkspaceRepository for JsonStore {
             return Err(RepositoryError::NotFound(id.as_str().to_owned()));
         }
         self.remove_record(Collection::Workspaces, id.as_str())?;
-        // 删的正是当前项：清指针。另有剩余项的移交由 service 层完成
+        // 删的正是本机的当前项：清指针。另有剩余项的移交由 service 层完成
         let mut state = self.load_workspace_state()?;
-        if state.current.as_deref() == Some(id.as_str()) {
+        if state.local_id().as_deref() == Some(id.as_str()) {
             state.current = None;
             self.write_state(Collection::Workspaces, &state)?;
         }
@@ -1619,6 +1721,73 @@ mod tests {
         );
         let text = std::fs::read_to_string(&state_path).expect("read");
         assert!(text.contains(WS02), "读不应改写状态文件");
+    }
+
+    /// v1 的裸 uuid 指针读作「本地选择」
+    #[test]
+    fn v1_state_migrates_to_local_selection() {
+        let store = store_with_ws();
+        let state_path = store.state_path(Collection::Workspaces);
+        std::fs::write(
+            &state_path,
+            format!(r#"{{"version":1,"current":"{WS01}"}}"#),
+        )
+        .expect("seed");
+        let selection = WorkspaceRepository::current_selection(&store)
+            .expect("selection")
+            .expect("some");
+        assert_eq!(selection.origin, Origin::Local);
+        assert_eq!(selection.workspace.as_str(), WS01);
+        assert!(
+            WorkspaceRepository::current(&store)
+                .expect("current")
+                .is_some()
+        );
+    }
+
+    /// 远端选择只存本机指针：不冒充本地 current，也不给本机记录打 current
+    #[test]
+    fn remote_selection_is_client_local_only() {
+        let store = store_with_ws();
+        let selection = WorkspaceSelection {
+            origin: Origin::Remote(port::RemoteName::parse("r1").expect("name")),
+            workspace: WorkspaceId::parse(WS02).expect("uuid"),
+        };
+        WorkspaceRepository::set_current_selection(&store, &selection).expect("set");
+        assert_eq!(
+            WorkspaceRepository::current_selection(&store).expect("selection"),
+            Some(selection)
+        );
+        assert!(
+            WorkspaceRepository::current(&store)
+                .expect("current")
+                .is_none(),
+            "远端选择不能冒充本地 current"
+        );
+        assert!(
+            WorkspaceRepository::list(&store)
+                .expect("list")
+                .iter()
+                .all(|w| !w.is_current),
+            "本机记录不能因为远端选择而被标成 current"
+        );
+        let text = std::fs::read_to_string(store.state_path(Collection::Workspaces)).expect("read");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(value["current"]["origin"], "r1");
+        assert_eq!(value["current"]["workspace"], WS02);
+    }
+
+    /// 新建即当前时写 v2 本地指针
+    #[test]
+    fn first_current_workspace_writes_v2_local_pointer() {
+        let store = JsonStore::open_in_memory().expect("open");
+        let mut ws = sample_ws("ws01", "/tmp/ws01", WS01);
+        ws.is_current = true;
+        add_ws(&store, &ws);
+        let text = std::fs::read_to_string(store.state_path(Collection::Workspaces)).expect("read");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(value["current"]["origin"], "local");
+        assert_eq!(value["current"]["workspace"], WS01);
     }
 
     #[test]

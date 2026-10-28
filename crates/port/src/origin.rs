@@ -8,6 +8,7 @@
 //! 一个列表）需要标注来源，而实现层不能依赖 `service`。过滤与选择器解析
 //! 仍是 `service` 的事（那是入口语义，不是契约）。
 
+use domain::workspace::WorkspaceId;
 use std::fmt;
 use thiserror::Error;
 
@@ -160,6 +161,22 @@ pub struct Sourced<T> {
     pub origin: Origin,
     /// 资源本体
     pub value: T,
+}
+
+/// 客户端视角的「当前工作区」选择
+///
+/// 「当前」是**查看它的那台机器**的状态，不是资源自身的属性：本机 `use`
+/// 某个远端工作区时只改这个本地指针，绝不去改对端的 current（对端机器上
+/// 直接跑 mcsup 的人仍保留自己的 current）。
+///
+/// `origin` 用远端名而不是证书指纹：与 `--origin` / 限定名的口径一致；
+/// 此时改远端名会让选择悬空，按「无当前」安全失败。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSelection {
+    /// 工作区所在来源
+    pub origin: Origin,
+    /// 工作区稳定身份
+    pub workspace: WorkspaceId,
 }
 
 impl<T> Sourced<T> {

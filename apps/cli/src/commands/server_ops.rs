@@ -50,12 +50,11 @@ pub(crate) fn workspace_selector(flag: Option<&str>) -> Option<String> {
 }
 
 fn workspace_names() -> Result<HashMap<WorkspaceId, String>> {
-    let store = bootstrap::open_store()?;
-    let svc = WorkspaceService::new(store.clone(), store);
-    Ok(svc
-        .list()?
+    // 远端服务器的工作区名也要能解析：只查本地会把远端条目显示成 UID
+    Ok(bootstrap::workspace_service_with_remotes()?
+        .list_sourced()?
         .into_iter()
-        .map(|w| (w.id, w.name.as_str().to_owned()))
+        .map(|sourced| (sourced.value.id, sourced.value.name.as_str().to_owned()))
         .collect())
 }
 
@@ -272,21 +271,48 @@ pub(crate) async fn create(args: CreateArgs<'_>, printer: Printer) -> Result<()>
         workspace_dir,
         modpack,
     } = args;
-    // 远端落点：远端只做「登记 + 核心安装由对端负责」，本地向导不参与
-    if let Some(origin) = origin {
-        let origin = mcsup::port::Origin::parse(origin).map_err(|err| {
+    let origin = origin
+        .map(mcsup::port::Origin::parse)
+        .transpose()
+        .map_err(|err| {
             AppDiagnostic::usage(
                 crate::i18n::pick(
                     printer.lang(),
-                    format!("--origin 取值非法: {origin}"),
-                    format!("invalid --origin value: {origin}"),
+                    format!("--origin 取值非法: {}", origin.unwrap_or("")),
+                    format!("invalid --origin value: {}", origin.unwrap_or("")),
                 ),
                 Some(err.to_string()),
             )
         })?;
-        if !origin.is_local() {
-            return create_remote(&origin, name, version, variant, workspace, modpack, printer);
-        }
+    // 远端落点：远端只做「登记 + 核心安装由对端负责」，本地向导不参与
+    if let Some(origin) = &origin
+        && !origin.is_local()
+    {
+        let workspace = remote_workspace_for_origin(origin, workspace, printer)?;
+        return create_remote(
+            origin,
+            name,
+            version,
+            variant,
+            workspace.as_deref(),
+            modpack,
+            printer,
+        );
+    }
+    // 未显式 `--origin` 时，`--workspace` 或本机 current 指向远端 → 同样走远端创建
+    if origin.is_none()
+        && let Some((target_origin, target_ws)) =
+            remote_create_target(workspace, workspace_name, workspace_dir)?
+    {
+        return create_remote(
+            &target_origin,
+            name,
+            version,
+            variant,
+            Some(&target_ws),
+            modpack,
+            printer,
+        );
     }
     let interactive = printer.is_interactive();
     // `--modpack` 隐含整合包变体，避免用户同时写两个参数还写错
@@ -411,6 +437,85 @@ pub(crate) async fn create(args: CreateArgs<'_>, printer: Printer) -> Result<()>
     )
     .await?;
     report_created(&srv, printer)
+}
+
+/// 显式 `--origin <remote>` 时确定远端工作区名
+///
+/// - 给了 `--workspace`：去掉可选的来源前缀，来源必须与 `--origin` 一致；
+/// - 没给：优先本机 current（若恰好在该远端），否则交给对端自己的 current。
+///
+/// 仍然**不写**对端 current；`--origin` 是用户显式指定的来源，未点名工作区时
+/// 使用对端默认落点是既有语义。
+fn remote_workspace_for_origin(
+    origin: &mcsup::port::Origin,
+    workspace: Option<&str>,
+    printer: Printer,
+) -> Result<Option<String>> {
+    if let Some(raw) = workspace {
+        let selector = mcsup::service::Selector::parse(raw);
+        if let Some(given) = selector.origin()
+            && given != origin
+        {
+            return Err(AppDiagnostic::usage(
+                crate::i18n::pick(
+                    printer.lang(),
+                    format!(
+                        "--workspace 的来源 {given} 与 --origin {} 不一致",
+                        origin.as_str()
+                    ),
+                    format!(
+                        "--workspace origin {given} does not match --origin {}",
+                        origin.as_str()
+                    ),
+                ),
+                None,
+            )
+            .into());
+        }
+        return Ok(Some(selector.name().to_owned()));
+    }
+    let svc = bootstrap::workspace_service_with_remotes()?;
+    match svc.current_sourced() {
+        Ok(item) if &item.origin == origin => Ok(Some(item.value.name.as_str().to_owned())),
+        // 没有本机 current（或不在该远端）：让对端用它自己的 current
+        Ok(_)
+        | Err(WorkspaceError::NoCurrent | WorkspaceError::CurrentOriginUnavailable { .. }) => {
+            Ok(None)
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// 未显式 `--origin` 时，`--workspace` 或本机 current 指向远端 → 返回远端落点
+///
+/// 返回 `None` 表示按本地路径处理（本地工作区 / 新建 / 交互 init）。
+fn remote_create_target(
+    workspace: Option<&str>,
+    workspace_name: Option<&str>,
+    workspace_dir: Option<&Path>,
+) -> Result<Option<(mcsup::port::Origin, String)>> {
+    // 带新建参数 = 在本机新建工作区，不路由远端
+    if workspace_name.is_some() || workspace_dir.is_some() {
+        return Ok(None);
+    }
+    let svc = bootstrap::workspace_service_with_remotes()?;
+    if let Some(raw) = workspace {
+        return match svc.resolve_sourced(raw) {
+            Ok(item) if !item.origin.is_local() => {
+                Ok(Some((item.origin, item.value.name.as_str().to_owned())))
+            }
+            // 本地命中 / 找不到：交给本地新建 / 交互 init 的既有路径
+            Ok(_) | Err(WorkspaceError::NotFound(_)) => Ok(None),
+            Err(err) => Err(err.into()),
+        };
+    }
+    match svc.current_sourced() {
+        Ok(item) if !item.origin.is_local() => {
+            Ok(Some((item.origin, item.value.name.as_str().to_owned())))
+        }
+        Ok(_) | Err(WorkspaceError::NoCurrent) => Ok(None),
+        Err(err) => Err(err.into()),
+    }
 }
 
 /// `server create --origin <remote>`：在对端登记服务器
@@ -1447,20 +1552,29 @@ pub(crate) fn link(
     origin: Option<&str>,
     printer: Printer,
 ) -> Result<()> {
-    if let Some(origin) = origin {
-        let origin = mcsup::port::Origin::parse(origin).map_err(|err| {
+    let origin = origin
+        .map(mcsup::port::Origin::parse)
+        .transpose()
+        .map_err(|err| {
             AppDiagnostic::usage(
                 crate::i18n::pick(
                     printer.lang(),
-                    format!("--origin 取值非法: {origin}"),
-                    format!("invalid --origin value: {origin}"),
+                    format!("--origin 取值非法: {}", origin.unwrap_or("")),
+                    format!("invalid --origin value: {}", origin.unwrap_or("")),
                 ),
                 Some(err.to_string()),
             )
         })?;
-        if !origin.is_local() {
-            return link_remote(&origin, path, name, workspace, printer);
-        }
+    if let Some(origin) = &origin
+        && !origin.is_local()
+    {
+        let workspace = remote_workspace_for_origin(origin, workspace, printer)?;
+        return link_remote(origin, path, name, workspace.as_deref(), printer);
+    }
+    if origin.is_none()
+        && let Some((target_origin, target_ws)) = remote_create_target(workspace, None, None)?
+    {
+        return link_remote(&target_origin, path, name, Some(&target_ws), printer);
     }
     let reg = open_registry()?;
     let selector = workspace_selector(workspace);

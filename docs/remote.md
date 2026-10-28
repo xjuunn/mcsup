@@ -220,6 +220,10 @@ error: “web” 存在于多个位置
 提示: 用 local/web 或 prod-box/web 指定
 ```
 
+工作区名同样支持限定名：`workspace use r1/ws`、`server create --workspace r1/ws`。
+`workspace ls` 的 `CURRENT` 只按**本机** current 标注（至多一个 `*`）；对端机器
+自己的 current 不参与本机判断，`workspace use` 也不会去改它。
+
 限定名已接到所有接受服务器名的命令（`start` / `stop` / `status` / `send` /
 `logs` / `backup` / `install` 等）。仍按裸名交给 `service` 的命令（`start` /
 `stop` / `status` / `send`）在本机与远端同名时会明确拒绝远端限定名（避免落到
@@ -231,6 +235,9 @@ error: “web” 存在于多个位置
 创建类命令（`workspace init`、`server create`）按 `--origin` 决定落点：
 
 - `--origin <远端名>` 直接在对端执行；缺省本地。
+- **未给 `--origin` 时跟随本机 current**：`workspace use r1/ws` 之后直接
+  `server create` 会落到 r1 的 ws。等价写法是 `server create --workspace r1/ws`。
+  current 指向的远端不可达时报「来源不可用」，不退回本地。
 - `workspace init --origin prod-box --dir /srv/mc/w2` 中的 `--dir` 是**目标
   机器上的路径**，由该机器的 agent 执行同一套 `WorkspaceService::init`。
 - `server create --origin prod-box` 在对端完成「登记 + 核心安装」；加
@@ -245,7 +252,8 @@ error: “web” 存在于多个位置
 
 | 命令 | 远端执行方式 |
 | --- | --- |
-| `workspace init` / `use` / `remove` | `WorkspaceInit` / `WorkspaceUse` / `WorkspaceRemove`，目录动作全在对端 |
+| `workspace init` / `remove` | `WorkspaceInit` / `WorkspaceRemove`，目录动作全在对端 |
+| `workspace use` | **本机状态**：只写本地 current 指针（可指向远端），不改对端 current |
 | `server create` | 普通变体：`ServerCreate` + `ServerInstall`；`--modpack`：`ServerCreateModpack` |
 | `server install` | `ServerInstall`；支持裸名指向唯一远端，缺版本时沿用在册版本 |
 | `server props` / `set` | `PropsGet` / `PropsSet`（原文进出）/ `SettingsSet`；判定与持久化在对端 |

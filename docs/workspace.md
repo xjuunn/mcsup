@@ -115,8 +115,16 @@ mcsup workspace init [--dir <path>] [--name <name>]
   显式 `mcsup workspace use`（不带名字时 TTY 下交互选择）。
 - current 只决定 `server create` / `server link` 缺省落点，不隐藏、不过滤
   任何服务器。禁止「工作区上下文」式的可见性切换。
-- 删除 current 时当前标记移交给剩余中按名称排序的第一个；无剩余则无当前，
-  缺省落点操作报 `NoCurrent`。
+- current 是**本机**状态，记 `(origin, workspace_id)`：可以指向远端。
+  `workspace use r1/ws` 只改本机指针，**不修改对端 `state.json`**；对端机器上
+  直接跑 mcsup 的人仍保留自己的 current。
+- `workspace use` 支持 `origin/name` 限定名；裸名在本地与远端重名时报歧义并
+  列出候选。`use` 之后 `server create` / `server link` 的缺省落点跟随该选择
+  （含远端），但 `server ls` 仍全局可见，裸名重名仍要 `r1/name`。
+- current 指向的远端离线或被 disconnect 时，缺省落点明确报「来源不可用」，
+  **不退回本地**。
+- 删除本地 current 时当前标记移交给剩余**本地**中按名称排序的第一个；无剩余
+  则无当前，缺省落点操作报 `NoCurrent`。
 - `workspace remove --purge` / `server remove --purge` 的 `cwd` 闸：调用方
   进程的工作目录位于待删目录内时拒绝（`CwdInsideTarget`，退出码 4）。子进程
   改不了父进程的工作目录，真删掉会让调用方终端停在已不存在的路径上，之后
@@ -208,8 +216,8 @@ mcsup workspace init [--dir <path>] [--name <name>]
 ```
 
 ```json
-// workspaces/state.json
-{ "version": 1, "current": "<uuid>|null" }
+// workspaces/state.json（v2；v1 的裸 uuid 读作 origin=local）
+{ "version": 2, "current": { "origin": "local|r1", "workspace": "<uuid>" } | null }
 ```
 
 ```json
@@ -232,7 +240,7 @@ mcsup workspace init [--dir <path>] [--name <name>]
 - `workspaces.name`、`workspaces.path` 各自全局唯一
 - `servers.name` 全局唯一，`(workspace_id, rel_dir)` 组内唯一
 - `servers.workspace_id` 必须指向存在的 workspace 记录
-- 当前工作区至多一个（由 `state.json` 保证，不再是分散的布尔）
+- 当前工作区至多一个（由 `state.json` 的 `(origin, workspace)` 指针保证，不再是分散的布尔）
 - 记录 `id` 只含字母、数字、`-`、`_`
 - `jar_*` 四项同生同灭
 

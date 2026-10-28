@@ -44,10 +44,8 @@ pub(crate) fn run(action: WorkspaceAction, printer: Printer) -> Result<()> {
             list(&svc, &reg, &filter, printer)
         }
         WorkspaceAction::Use { name, origin } => {
-            if let Some(remote) = remote_target(origin.as_deref(), &members, printer)? {
-                return use_remote(remote, name.as_deref(), printer);
-            }
-            use_ws(&svc, name.as_deref(), printer)
+            // `use` 只改本机指针：远端工作区也用同一套限定名解析，不再改对端 current
+            use_ws(&svc, name.as_deref(), origin.as_deref(), printer)
         }
         WorkspaceAction::Remove {
             name,
@@ -70,7 +68,7 @@ pub(crate) fn run(action: WorkspaceAction, printer: Printer) -> Result<()> {
             }
             let name = match name {
                 Some(name) => name,
-                None if printer.is_interactive() => pick_workspace(&svc, printer)?,
+                None if printer.is_interactive() => pick_local_workspace(&svc, printer)?,
                 None => {
                     return Err(AppDiagnostic::usage(
                         crate::i18n::pick(
@@ -333,54 +331,6 @@ fn init_remote(
     )
 }
 
-/// `workspace use --origin <remote>`：切换对端的当前工作区
-fn use_remote(
-    member: &mcsup::backend::remote::RemoteMember,
-    name: Option<&str>,
-    printer: Printer,
-) -> Result<()> {
-    let lang = printer.lang();
-    let Some(name) = name else {
-        return Err(AppDiagnostic::usage(
-            crate::i18n::pick(
-                lang,
-                "远端 workspace use 需要工作区名称",
-                "remote `workspace use` requires a workspace name",
-            ),
-            None,
-        )
-        .into());
-    };
-    let ws = member.workspaces.set_current(name).with_context(|| {
-        crate::i18n::pick(
-            lang,
-            "切换远端当前工作区",
-            "switching the peer's current workspace",
-        )
-    })?;
-    printer.print_outcome(
-        &crate::i18n::pick(
-            lang,
-            format!(
-                "{} 的当前工作区已切换为 {} ({})",
-                member.name,
-                ws.name,
-                ws.path.display()
-            ),
-            format!(
-                "{}'s current workspace is now {} ({})",
-                member.name,
-                ws.name,
-                ws.path.display()
-            ),
-        ),
-        &WorkspaceUseJson {
-            name: ws.name.as_str(),
-            path: ws.path.display().to_string(),
-        },
-    )
-}
-
 /// `workspace remove --origin <remote>`：注销对端工作区（可选删盘）
 fn remove_remote(
     member: &mcsup::backend::remote::RemoteMember,
@@ -544,10 +494,37 @@ fn list(
     )
 }
 
-fn use_ws(svc: &WorkspaceService, name: Option<&str>, printer: Printer) -> Result<()> {
-    let selector = match name {
-        Some(name) => name.to_owned(),
-        None => pick_workspace(svc, printer)?,
+/// `workspace use [<origin>/]<name>`：只改本机指针
+///
+/// 远端工作区与本地走同一套限定名解析；绝不发 `WorkspaceUse` 去改对端 current。
+fn use_ws(
+    svc: &WorkspaceService,
+    name: Option<&str>,
+    origin: Option<&str>,
+    printer: Printer,
+) -> Result<()> {
+    let origin = origin
+        .map(mcsup::port::Origin::parse)
+        .transpose()
+        .map_err(|err| {
+            AppDiagnostic::usage(
+                crate::i18n::pick(
+                    printer.lang(),
+                    format!("--origin 取值非法: {}", origin.unwrap_or("")),
+                    format!("invalid --origin value: {}", origin.unwrap_or("")),
+                ),
+                Some(err.to_string()),
+            )
+        })?;
+    let selector = match (name, &origin) {
+        (Some(name), Some(origin)) => origin.qualify(name),
+        (Some(name), None) => name.to_owned(),
+        (None, Some(origin)) => pick_workspace(svc, Some(origin), printer)?
+            .map(|(origin, name)| origin.qualify(&name))
+            .ok_or_else(|| usage_requires_name(printer))?,
+        (None, None) => pick_workspace(svc, None, printer)?
+            .map(|(origin, name)| origin.qualify(&name))
+            .ok_or_else(|| usage_requires_name(printer))?,
     };
     let ws = svc.set_current(&selector)?;
     printer.print_outcome(
@@ -567,48 +544,46 @@ fn use_ws(svc: &WorkspaceService, name: Option<&str>, printer: Printer) -> Resul
     )
 }
 
-/// 无参 `workspace use`：交互选择器
-fn pick_workspace(svc: &WorkspaceService, printer: Printer) -> Result<String> {
-    // 缺必选参数：非交互 / JSON 下不提问、不落库，直接用法错误（退出码 2）
+/// 缺必选参数：非交互 / JSON 下不提问、不落库，直接用法错误（退出码 2）
+fn usage_requires_name(printer: Printer) -> anyhow::Error {
+    AppDiagnostic::usage(
+        crate::i18n::pick(
+            printer.lang(),
+            "workspace use 缺少工作区名称",
+            "workspace use requires a workspace name",
+        ),
+        Some(crate::i18n::pick(
+            printer.lang(),
+            "非交互模式：mcsup workspace use <名称>".to_owned(),
+            "non-interactive: mcsup workspace use <name>".to_owned(),
+        )),
+    )
+    .into()
+}
+
+/// 交互选择工作区；`origin` 限定时只列该来源
+///
+/// 返回 `(来源, 名称)`；非交互返回 `None`（由调用方报用法错误）。
+fn pick_workspace(
+    svc: &WorkspaceService,
+    origin: Option<&mcsup::port::Origin>,
+    printer: Printer,
+) -> Result<Option<(mcsup::port::Origin, String)>> {
     if !printer.is_interactive() {
-        return Err(AppDiagnostic::usage(
-            crate::i18n::pick(
-                printer.lang(),
-                "workspace use 缺少工作区名称",
-                "workspace use requires a workspace name",
-            ),
-            Some(crate::i18n::pick(
-                printer.lang(),
-                "非交互模式：mcsup workspace use <名称>".to_owned(),
-                "non-interactive: mcsup workspace use <name>".to_owned(),
-            )),
-        )
-        .into());
+        return Ok(None);
     }
-    let all = svc.list()?;
-    if all.is_empty() {
+    let all = svc.list_sourced()?;
+    let items: Vec<_> = all
+        .into_iter()
+        .filter(|sourced| origin.is_none_or(|want| &sourced.origin == want))
+        .collect();
+    if items.is_empty() {
         anyhow::bail!(crate::i18n::pick(
             printer.lang(),
             "尚无工作目录，先运行 mcsup workspace init".to_owned(),
             "no workspaces yet; run `mcsup workspace init` first".to_owned(),
         ));
     }
-    let current = svc.current_workspace().ok();
-    let options: Vec<String> = all
-        .iter()
-        .map(|w| {
-            let mark = if current.as_ref().is_some_and(|c| c.id == w.id) {
-                crate::i18n::pick(
-                    printer.lang(),
-                    " (当前)".to_owned(),
-                    " (current)".to_owned(),
-                )
-            } else {
-                String::new()
-            };
-            format!("{}{mark}", w.name.as_str())
-        })
-        .collect();
     let current_marker = crate::i18n::pick(
         printer.lang(),
         " (当前)".to_owned(),
@@ -619,18 +594,54 @@ fn pick_workspace(svc: &WorkspaceService, printer: Printer) -> Result<String> {
         "选择工作区".to_owned(),
         "select a workspace".to_owned(),
     );
-    let choice = inquire::Select::new(&label, options)
+    let mut labels = Vec::with_capacity(items.len());
+    let mut values = Vec::with_capacity(items.len());
+    for sourced in &items {
+        let qualified = sourced.origin.qualify(sourced.value.name.as_str());
+        let mark = if sourced.value.is_current {
+            current_marker.as_str()
+        } else {
+            ""
+        };
+        labels.push(format!("{qualified}{mark}"));
+        values.push((
+            sourced.origin.clone(),
+            sourced.value.name.as_str().to_owned(),
+        ));
+    }
+    let choice = inquire::Select::new(&label, labels.clone())
         .prompt()
         .context(crate::i18n::pick(
             printer.lang(),
             "读取工作区选择".to_owned(),
             "reading the workspace choice".to_owned(),
         ))?;
-    let name = choice
-        .split(current_marker.as_str())
-        .next()
-        .unwrap_or(&choice);
-    Ok(name.to_owned())
+    let index = labels
+        .iter()
+        .position(|label| label == &choice)
+        .ok_or_else(|| anyhow::anyhow!("invalid choice: {choice}"))?;
+    Ok(Some(values[index].clone()))
+}
+
+/// 无参 `workspace remove`：只列本机工作区
+fn pick_local_workspace(svc: &WorkspaceService, printer: Printer) -> Result<String> {
+    pick_workspace(svc, Some(&mcsup::port::Origin::Local), printer)?
+        .map(|(_, name)| name)
+        .ok_or_else(|| {
+            AppDiagnostic::usage(
+                crate::i18n::pick(
+                    printer.lang(),
+                    "workspace remove 缺少工作区名称",
+                    "workspace remove requires a workspace name",
+                ),
+                Some(crate::i18n::pick(
+                    printer.lang(),
+                    "非交互模式：mcsup workspace remove <名称>".to_owned(),
+                    "non-interactive: mcsup workspace remove <name>".to_owned(),
+                )),
+            )
+            .into()
+        })
 }
 
 fn remove(svc: &WorkspaceService, name: &str, purge: bool, printer: Printer) -> Result<()> {

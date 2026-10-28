@@ -565,6 +565,14 @@ pub(crate) fn workspace(kind: &WorkspaceErrorKind<'_>, lang: Lang) -> String {
                     .to_owned()
             }
         },
+        WorkspaceErrorKind::CurrentOriginUnavailable { origin } => match lang {
+            Lang::Zh => format!(
+                "当前工作区位于 {origin}，但该来源当前不可用；请检查远端连接或用 mcsup workspace use 切换"
+            ),
+            Lang::En => format!(
+                "the current workspace is on {origin}, which is unavailable; check the remote or switch with `mcsup workspace use`"
+            ),
+        },
         _ => "workspace operation failed".to_owned(),
     }
 }

@@ -448,6 +448,152 @@ fn remote_server_create_list_and_remove_route_to_the_peer() {
     assert_eq!(json(&after).as_array().expect("array").len(), 0);
 }
 
+/// `workspace use <remote>/<ws>` 只改本机 current；之后的 `server create`
+/// （不带 `--origin`）落到该远端工作区，且 `workspace ls` 只有一个当前。
+#[test]
+#[allow(clippy::too_many_lines)]
+fn use_remote_workspace_routes_create_and_marks_single_current() {
+    let home = temp_home();
+    let agent = AgentHandle::start();
+    let home_path = home.path();
+    assert_ok(
+        &run(
+            home_path,
+            &[
+                "remote",
+                "connect",
+                &agent.addr,
+                "--code",
+                &agent.code,
+                "--name",
+                "test-box",
+                "-y",
+                "--output",
+                "json",
+            ],
+        ),
+        "connect",
+    );
+
+    // 本地 + 远端各一个工作区，用来验证「只有一个当前」
+    let local_dir = home_path.join("local-ws");
+    assert_ok(
+        &run(
+            home_path,
+            &[
+                "workspace",
+                "init",
+                "--dir",
+                local_dir.to_str().expect("utf8"),
+                "--name",
+                "localws",
+                "--output",
+                "json",
+            ],
+        ),
+        "local workspace init",
+    );
+    let remote_dir = agent.dir.path().join("ws");
+    assert_ok(
+        &run(
+            home_path,
+            &[
+                "workspace",
+                "init",
+                "--origin",
+                "test-box",
+                "--dir",
+                remote_dir.to_str().expect("utf8"),
+                "--name",
+                "w1",
+                "--output",
+                "json",
+            ],
+        ),
+        "remote workspace init",
+    );
+
+    // use 远程：只改本机指针
+    assert_ok(
+        &run(
+            home_path,
+            &["workspace", "use", "test-box/w1", "--output", "json"],
+        ),
+        "use remote workspace",
+    );
+    let listed = run(home_path, &["workspace", "ls", "--output", "json"]);
+    assert_ok(&listed, "workspace ls");
+    let rows = json(&listed);
+    let rows = rows.as_array().expect("array");
+    let currents: Vec<_> = rows.iter().filter(|row| row["current"] == true).collect();
+    assert_eq!(currents.len(), 1, "只能有一个当前: {}", json(&listed));
+    assert_eq!(currents[0]["origin"], "test-box");
+    assert_eq!(currents[0]["name"], "w1");
+
+    // 不带 --origin 的 create 落到 current 指向的远端工作区
+    let _ = run(
+        home_path,
+        &[
+            "server",
+            "create",
+            "auto-web",
+            "--version",
+            "1.21.1",
+            "--variant",
+            "vanilla",
+            "--output",
+            "json",
+        ],
+    );
+    let listed = run(home_path, &["server", "ls", "--output", "json"]);
+    assert_ok(&listed, "server ls");
+    let all = json(&listed);
+    let all = all.as_array().expect("array");
+    let remote = all
+        .iter()
+        .find(|s| s["name"] == "auto-web")
+        .unwrap_or_else(|| panic!("缺少远端创建的服务器: {}", json(&listed)));
+    assert_eq!(remote["origin"], "test-box");
+    assert_eq!(remote["workspace"], "w1");
+    assert!(
+        all.iter().all(|s| s["origin"] == "test-box"),
+        "不应建到本地: {}",
+        json(&listed)
+    );
+
+    // 切回本地后 create 回到本地
+    assert_ok(
+        &run(
+            home_path,
+            &["workspace", "use", "local/localws", "--output", "json"],
+        ),
+        "use local workspace",
+    );
+    let _ = run(
+        home_path,
+        &[
+            "server",
+            "create",
+            "local-web",
+            "--version",
+            "1.21.1",
+            "--variant",
+            "vanilla",
+            "--output",
+            "json",
+        ],
+    );
+    let listed = run(home_path, &["server", "ls", "--output", "json"]);
+    assert_ok(&listed, "server ls after local create");
+    let all = json(&listed);
+    let all = all.as_array().expect("array");
+    let local = all
+        .iter()
+        .find(|s| s["name"] == "local-web")
+        .expect("本地服务器");
+    assert_eq!(local["origin"], "local");
+}
+
 /// `server link --origin`：目录动作发生在对端（建符号链接 + 入库）
 #[test]
 fn remote_server_link_registers_a_directory_on_the_peer() {

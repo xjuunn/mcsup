@@ -22,6 +22,7 @@ use domain::server::world::{DataVersion, WorldInfo};
 use domain::workspace::{Workspace, WorkspaceId, WorkspaceName};
 pub use origin::{
     LOCAL_NAME, MAX_NAME_LEN, Origin, OriginError, RESERVED_NAMES, RemoteName, Sourced,
+    WorkspaceSelection,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -603,6 +604,40 @@ pub trait WorkspaceRepository: Send + Sync {
     ///
     /// 底层失败返回 [`RepositoryError::Storage`]
     fn list(&self) -> Result<Vec<Workspace>, RepositoryError>;
+
+    /// 本机视角的当前工作区（本地或某个远端）
+    ///
+    /// 与 [`Self::current`] 的区别：`current` 是单来源仓库里的本地指针；
+    /// 本方法允许指向远端，供客户端 `use` 远端工作区后决定缺省落点。
+    /// 默认实现把本地 current 当作选择。
+    ///
+    /// # Errors
+    ///
+    /// 底层失败返回 [`RepositoryError::Storage`]
+    fn current_selection(&self) -> Result<Option<WorkspaceSelection>, RepositoryError> {
+        Ok(self.current()?.map(|ws| WorkspaceSelection {
+            origin: Origin::Local,
+            workspace: ws.id,
+        }))
+    }
+
+    /// 设置本机视角的当前工作区（本地或某个远端）
+    ///
+    /// 默认实现只接受本地选择；组合仓库与本地存储覆写它。
+    ///
+    /// # Errors
+    ///
+    /// 选择指向本仓库不拥有的来源，或本地记录不存在时返回
+    /// [`RepositoryError::NotFound`] / [`RepositoryError::Storage`]
+    fn set_current_selection(&self, selection: &WorkspaceSelection) -> Result<(), RepositoryError> {
+        if selection.origin.is_local() {
+            self.set_current(&selection.workspace)
+        } else {
+            Err(RepositoryError::Storage(Box::new(std::io::Error::other(
+                "this repository cannot persist a remote workspace selection",
+            ))))
+        }
+    }
 
     /// 当前工作区；尚无注册时为 `None`
     ///
