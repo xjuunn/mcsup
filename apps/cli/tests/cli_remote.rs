@@ -37,6 +37,8 @@ fn run(home: &Path, args: &[&str]) -> Output {
         .env_remove("LC_CTYPE")
         .env_remove("MCSUP_ORIGIN")
         .env("MCSUP_WORKSPACE", "")
+        // 凭证固定走 0600 文件：集成测试不触碰真实系统钥匙串（否则会弹窗 / 依赖桌面会话）
+        .env("MCSUP_CREDENTIAL_STORE", "file")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -390,6 +392,105 @@ fn remote_server_create_list_and_remove_route_to_the_peer() {
     let after = run(home_path, &["server", "ls", "--output", "json"]);
     assert_ok(&after, "server ls after remove");
     assert_eq!(json(&after).as_array().expect("array").len(), 0);
+}
+
+/// `server link --origin`：目录动作发生在对端（建符号链接 + 入库）
+#[test]
+fn remote_server_link_registers_a_directory_on_the_peer() {
+    let home = temp_home();
+    let agent = AgentHandle::start();
+    let home_path = home.path();
+
+    assert_ok(
+        &run(
+            home_path,
+            &[
+                "remote",
+                "connect",
+                &agent.addr,
+                "--code",
+                &agent.code,
+                "-y",
+                "--output",
+                "json",
+            ],
+        ),
+        "connect",
+    );
+
+    // 远端需要一个工作区作为 servers/ 的落点
+    let ws_dir = agent.dir.path().join("ws");
+    assert_ok(
+        &run(
+            home_path,
+            &[
+                "workspace",
+                "init",
+                "--origin",
+                "test-box",
+                "--dir",
+                ws_dir.to_str().expect("utf8"),
+                "--name",
+                "w1",
+                "--output",
+                "json",
+            ],
+        ),
+        "workspace init",
+    );
+
+    // 对端机器上一个已存在的目录：外部目录 → 对端建符号链接
+    let external = agent.dir.path().join("external-server");
+    std::fs::create_dir_all(&external).expect("mkdir external");
+
+    let linked = run(
+        home_path,
+        &[
+            "server",
+            "link",
+            external.to_str().expect("utf8"),
+            "--origin",
+            "test-box",
+            "--name",
+            "linked1",
+            "--output",
+            "json",
+        ],
+    );
+    assert_ok(&linked, "server link --origin");
+    let payload = json(&linked);
+    assert_eq!(payload["name"], "linked1");
+    assert_eq!(payload["linked"], true, "{payload}");
+    // 对端会 canonicalize（macOS 上 /var → /private/var），只比对尾段
+    assert!(
+        payload["path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("external-server")),
+        "{payload}"
+    );
+
+    // 合并列表可见，且来源标注为远端
+    let listed = run(
+        home_path,
+        &["server", "ls", "--origin", "test-box", "--output", "json"],
+    );
+    assert_ok(&listed, "server ls --origin test-box");
+    let items = json(&listed);
+    let items = items.as_array().expect("array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["name"], "linked1");
+    assert_eq!(items[0]["origin"], "test-box");
+
+    // 链接服务器随工作区注销一起清理，避免影响后续断言
+    assert_ok(
+        &run(
+            home_path,
+            &[
+                "server", "remove", "linked1", "--origin", "test-box", "--output", "json",
+            ],
+        ),
+        "server remove linked",
+    );
 }
 
 #[test]

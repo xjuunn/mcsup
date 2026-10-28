@@ -89,6 +89,8 @@ fn run(home: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
         .env_remove("LC_CTYPE")
         .env_remove("MCSUP_ORIGIN")
         .env("MCSUP_WORKSPACE", "")
+        // 凭证固定走 0600 文件：集成测试不触碰真实系统钥匙串
+        .env("MCSUP_CREDENTIAL_STORE", "file")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -210,12 +212,23 @@ fn ssh_connect_then_every_command_rebuilds_the_tunnel() {
     assert_eq!(payload["fingerprint"], agent.fingerprint.as_str());
 
     // 2. 记录落盘为 ssh 接入，且不含 token 本体
+    //    数据目录随平台不同：Linux 走 XDG_DATA_HOME，Windows 走 AppData，
+    //    macOS 的 dirs::data_dir() 落在 Library/Application Support
     let config = std::fs::read_to_string(home_path.join("share").join("mcsup").join("config.toml"))
         .or_else(|_| {
             std::fs::read_to_string(
                 home_path
                     .join("AppData")
                     .join("Roaming")
+                    .join("mcsup")
+                    .join("config.toml"),
+            )
+        })
+        .or_else(|_| {
+            std::fs::read_to_string(
+                home_path
+                    .join("Library")
+                    .join("Application Support")
                     .join("mcsup")
                     .join("config.toml"),
             )

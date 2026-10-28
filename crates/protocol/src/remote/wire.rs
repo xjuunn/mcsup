@@ -13,7 +13,7 @@ use domain::server::artifact::{Checksum, ChecksumAlgorithm};
 use domain::server::launch::LaunchSpec;
 use domain::server::meta::{InstalledJar, ServerId, ServerMeta, ServerName};
 use domain::server::settings::ServerSettings;
-use domain::server::version::{ServerVariant, VersionId};
+use domain::server::version::{ServerVariant, ServerVersion, VersionId, VersionKind};
 use domain::workspace::{Workspace, WorkspaceId, WorkspaceName};
 use port::{RepositoryError, StopOutcome, SupervisorStartOutcome, SupervisorStatus};
 use serde::{Deserialize, Serialize};
@@ -371,6 +371,77 @@ impl TryFrom<WireServer> for ServerMeta {
             java_major,
             created_at: wire.created_at,
             updated_at: wire.updated_at,
+        })
+    }
+}
+
+/// 服务端版本的线格式
+///
+/// 供 `server create --origin` 的交互向导在客户端呈现对端的版本列表。
+/// `kind` 用文本而不是枚举：与其余线格式一致，枚举值的增减不破坏旧客户端。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireVersion {
+    /// 版本标识（如 `1.21.1`）
+    pub id: String,
+    /// 版本种类：`release` / `snapshot` / `historical`
+    pub kind: String,
+    /// 变体标识
+    pub variant: String,
+    /// 该版本要求的 Java 大版本
+    pub java_major: Option<i64>,
+}
+
+impl WireVersion {
+    /// 版本种类的线格式文本
+    fn kind_text(kind: VersionKind) -> &'static str {
+        match kind {
+            VersionKind::Release => "release",
+            VersionKind::Snapshot => "snapshot",
+            // `VersionKind` 是 `#[non_exhaustive]`：`Historical` 与将来新增的
+            // 种类都按旧版处理
+            _ => "historical",
+        }
+    }
+
+    /// 从线格式文本还原版本种类
+    fn parse_kind(raw: &str) -> Result<VersionKind, RepositoryError> {
+        match raw {
+            "release" => Ok(VersionKind::Release),
+            "snapshot" => Ok(VersionKind::Snapshot),
+            "historical" => Ok(VersionKind::Historical),
+            other => Err(corrupt("version kind", other, "unknown version kind")),
+        }
+    }
+}
+
+impl From<&ServerVersion> for WireVersion {
+    fn from(version: &ServerVersion) -> Self {
+        Self {
+            id: version.id.as_str().to_owned(),
+            kind: WireVersion::kind_text(version.kind).to_owned(),
+            variant: version.variant.as_str().to_owned(),
+            java_major: version.java_major.map(JavaMajor::as_i64),
+        }
+    }
+}
+
+impl TryFrom<WireVersion> for ServerVersion {
+    type Error = RepositoryError;
+
+    fn try_from(wire: WireVersion) -> Result<Self, Self::Error> {
+        let variant = ServerVariant::from_id(wire.variant.clone())
+            .map_err(|err| corrupt("variant", &wire.variant, err))?;
+        let java_major = match wire.java_major {
+            Some(raw) => {
+                Some(JavaMajor::parse(raw).map_err(|err| corrupt("java major", raw, err))?)
+            }
+            None => None,
+        };
+        Ok(Self {
+            id: VersionId::new(wire.id),
+            kind: WireVersion::parse_kind(&wire.kind)?,
+            variant,
+            java_major,
         })
     }
 }

@@ -26,6 +26,9 @@ url = "2.5.8"
 toml = "1.1.8"
 uuid = { version = "1", features = ["v4"] }
 tempfile = "3.27.0"
+# 系统钥匙串：token 优先存操作系统凭证库（macOS Keychain / Windows Credential
+# Manager / Linux Secret Service），无钥匙串时退到 0600 文件（见 auth::credential）。
+keyring = { version = "4", default-features = false, features = ["v1"] }
 # 属性测试：随机输入打穿领域判定（路径穿越、哈希键空间）
 proptest = "1.12.0"
 # 快照测试：CLI 机器契约（JSON 输出、落盘格式）一旦变形立即红

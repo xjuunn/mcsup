@@ -252,10 +252,12 @@ error: “web” 存在于多个位置
 | `server backup ...` | 备份帧族（快照元数据跨线，CAS 在对端） |
 | `java scan` / `install` / `uninstall` | `JavaScan` / `JavaInstall` / `JavaUninstall`，下载与登记在对端 |
 | `java list` / `server list` / `workspace list` | 实时合并查询，逐台远端 `list` |
+| `server link --origin` | `ServerLink`：符号链接、marker 与入库全在对端 |
+| `server create --origin`（交互） | `ServerVariants` / `ServerVersions` 取对端变体与版本，再走普通创建 |
 
-仍只有本地实现的：`server link`、`server mod`、`modpack` 的独立子命令
-（尚未提供），以及 `server create --origin` 的交互向导（远端创建要求显式
-`--version` 或 `--modpack`，不读本地变体 / 版本列表）。
+仍只有本地实现的：`server mod`、`modpack` 的独立子命令（尚未提供）。
+`server create --origin` 的整合包变体仍要求显式 `--modpack`（清单要在对端读，
+远端侧不提供交互式整合包搜索）。
 
 ### 离线、断开与撤销
 
@@ -284,7 +286,10 @@ error: “web” 存在于多个位置
 - **身份**：agent 首次 `serve` 生成密钥对与自签证书，打印指纹。
 - **首次信任**：TOFU，确认后固定校验指纹；指纹变化必须显式重新配对。
 - **传输**：必须 TLS，不提供明文模式。
-- **凭证**：token 存操作系统钥匙串；无钥匙串时退到权限 `0600` 的文件。
+- **凭证**：token 存操作系统钥匙串（macOS Keychain / Windows Credential
+  Manager / Linux Secret Service）；无钥匙串时退到权限 `0600` 的文件。用
+  `MCSUP_CREDENTIAL_STORE`（`auto` / `keyring` / `file`）显式选择后端，
+  `auto` 在无桌面会话的机器上自动落到文件。
 - **配对码**：短时有效、单次使用、限速尝试，防止暴力猜测。
 - **权限**：默认 operator，可 `--read-only`（viewer）；角色最小化为
   Admin / Operator / Viewer，先满足真实需求。

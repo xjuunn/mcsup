@@ -15,9 +15,7 @@ use crate::output::Printer;
 use crate::prompts;
 use anyhow::{Context, Result};
 use comfy_table::Table;
-use mcsup::auth::{
-    ClientId, ClientRegistry, CredentialStore, FileCredentialStore, StoredCredential,
-};
+use mcsup::auth::{ClientId, ClientRegistry, CredentialStore, CredentialVault, StoredCredential};
 use mcsup::port::{Origin, RemoteName};
 use mcsup::protocol::cli::{
     RemoteConnectJson, RemoteDisconnectJson, RemoteListJson, RemotePingJson, RemoteRevokeJson,
@@ -375,7 +373,7 @@ fn connect(
             read_only,
             added_at: unix_now(),
             fingerprint: Some(fingerprint.as_str().to_owned()),
-            credential: Some(format!("file:{}", credentials.path().display())),
+            credential: Some(credentials.describe()),
         },
     );
     file.save(&cfg)?;
@@ -454,7 +452,7 @@ fn connect_ssh(
             read_only,
             added_at: unix_now(),
             fingerprint: Some(fingerprint.as_str().to_owned()),
-            credential: Some(format!("file:{}", credentials.path().display())),
+            credential: Some(credentials.describe()),
         },
     );
     file.save(&cfg)?;
@@ -1077,9 +1075,9 @@ fn host_name() -> String {
         .unwrap_or_else(|| "mcsup".to_owned())
 }
 
-/// 客户端凭证存储（`{data_dir}/credentials.toml`）
-fn credential_store() -> FileCredentialStore {
-    FileCredentialStore::new(crate::config::platform_data_dir().join("credentials.toml"))
+/// 客户端凭证存储：优先系统钥匙串，无钥匙串时退到 `{data_dir}/credentials.toml`
+fn credential_store() -> CredentialVault {
+    CredentialVault::open(crate::config::platform_data_dir().join("credentials.toml"))
 }
 
 fn capability_name(capability: Capability) -> &'static str {
@@ -1109,6 +1107,9 @@ fn response_label(response: &Response) -> &'static str {
         Response::Stopped { .. } => "stopped",
         Response::LogLines { .. } => "log_lines",
         Response::Removed { .. } => "removed",
+        Response::Linked { .. } => "linked",
+        Response::Variants { .. } => "variants",
+        Response::Versions { .. } => "versions",
         Response::SnapshotCreated { .. } => "snapshot_created",
         Response::Snapshots { .. } => "snapshots",
         Response::Restored { .. } => "restored",

@@ -287,7 +287,14 @@ async fn server(action: ServerAction, cfg: &ConfigFile, printer: Printer) -> Res
             ref path,
             ref name,
             ref workspace,
-        } => server_ops::link(path, name.as_deref(), workspace.as_deref(), printer),
+            ref origin,
+        } => server_ops::link(
+            path,
+            name.as_deref(),
+            workspace.as_deref(),
+            origin.as_deref(),
+            printer,
+        ),
         ServerAction::Version { name } => {
             let name = server_ops::require_server_name(name.as_deref(), "server version", printer)?;
             settings::version(&name, printer)

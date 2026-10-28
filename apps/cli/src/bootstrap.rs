@@ -1,7 +1,6 @@
 use crate::config::{self, ConfigFile};
 use crate::locale::Lang;
 use anyhow::{Context, Result, anyhow};
-use mcsup::auth::FileCredentialStore;
 use mcsup::backend::remote::{
     CombinedJavaRepository, CombinedServerRepository, CombinedWorkspaceRepository, RemoteLink,
     RemoteMember, RemoteMembers,
@@ -324,14 +323,14 @@ fn build_member(
     Ok(Some(RemoteMember::new(link, remote_name)))
 }
 
-/// 客户端凭证存储（`{data_dir}/credentials.toml`）
-fn credential_store() -> FileCredentialStore {
+/// 客户端凭证存储：优先系统钥匙串，无钥匙串时退到 `{data_dir}/credentials.toml`
+fn credential_store() -> mcsup::auth::CredentialVault {
     open_credential_store()
 }
 
 /// [`credential_store`] 的公开口径：远端跟随日志等命令要按名读回 token
-pub(crate) fn open_credential_store() -> FileCredentialStore {
-    FileCredentialStore::new(config::platform_data_dir().join("credentials.toml"))
+pub(crate) fn open_credential_store() -> mcsup::auth::CredentialVault {
+    mcsup::auth::CredentialVault::open(config::platform_data_dir().join("credentials.toml"))
 }
 
 /// `open_mcsup` 的带远端版本：有已配对远端时注入组合仓库

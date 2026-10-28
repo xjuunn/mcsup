@@ -264,6 +264,76 @@ fn workspace_and_server_ops_run_on_the_agent() {
     );
 }
 
+/// `server link` / `server variants` / `server versions` 在真实 agent 上执行
+#[test]
+fn server_link_variants_and_versions_run_on_the_agent() {
+    let harness = Harness::start();
+    let client = harness.paired("admin-ish", false);
+
+    // link 需要一个工作区作为 servers/ 的落点
+    let ws_dir = harness.dir.path().join("ws");
+    let created = client
+        .call(&Request::WorkspaceInit {
+            dir: ws_dir.to_string_lossy().into_owned(),
+            name: Some("ws01".to_owned()),
+        })
+        .expect("init ws");
+    assert!(
+        matches!(created, Response::Workspaces { .. }),
+        "{created:?}"
+    );
+
+    // 对端上一个已存在的目录：link 在对端建符号链接并入库
+    let external = harness.dir.path().join("external");
+    std::fs::create_dir_all(&external).expect("mkdir external");
+    let response = client
+        .call(&Request::ServerLink {
+            target: external.to_string_lossy().into_owned(),
+            name: Some("linked".to_owned()),
+            workspace: Some("ws01".to_owned()),
+        })
+        .expect("link");
+    let Response::Linked {
+        server,
+        target,
+        linked,
+    } = response
+    else {
+        panic!("link 应返回 Linked：{response:?}");
+    };
+    assert_eq!(server.name, "linked");
+    assert!(linked, "外部目录应建立符号链接");
+    assert!(target.ends_with("external"), "{target}");
+
+    // 变体列表来自 agent 的默认来源，至少含 vanilla
+    let response = client.call(&Request::ServerVariants).expect("variants");
+    let Response::Variants { items } = response else {
+        panic!("variants 应返回列表：{response:?}");
+    };
+    assert!(
+        items.iter().any(|variant| variant == "vanilla"),
+        "{items:?}"
+    );
+
+    // 版本列表走真实来源：拿到列表就校验字段；外网不可用时对端回错误帧，
+    // 链路本身仍算正常（不把测试绑定到上游数据）
+    let response = client
+        .call(&Request::ServerVersions {
+            variant: "vanilla".to_owned(),
+        })
+        .expect("versions");
+    match response {
+        Response::Versions { items } => {
+            assert!(
+                items.iter().all(|version| !version.id.is_empty()),
+                "{items:?}"
+            );
+        }
+        Response::Error { .. } => {}
+        other => panic!("versions 应返回列表或错误帧：{other:?}"),
+    }
+}
+
 /// 撤销立即失效：同一个 token 再连必须被拒
 ///
 /// 撤销需要 `Manage`（operator 没有），所以先在本机把管理员升到 `admin`：

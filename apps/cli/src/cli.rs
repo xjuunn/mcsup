@@ -356,6 +356,8 @@ pub(crate) enum ServerAction {
             help = crate::meta::server_workspace_arg()
         )]
         workspace: Option<String>,
+        #[arg(long, value_name = "ORIGIN", help = crate::meta::origin_target_arg())]
+        origin: Option<String>,
     },
     #[command(about = crate::meta::server_version())]
     #[command(visible_alias = "ver")]
