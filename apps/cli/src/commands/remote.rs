@@ -26,6 +26,7 @@ use mcsup::protocol::cli::{
 use mcsup::protocol::remote::{Capability, Request, Response};
 use mcsup::service::{RemoteRecord, RemoteVia};
 use mcsup::transport::{Client, Fingerprint, Probe, TransportError};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1010,11 +1011,12 @@ fn resolve_pairing_code(code: Option<String>, probe: &Probe, printer: Printer) -
     )
 }
 
-/// 远端名：显式 > 交互命名 > 对端自报主机名（规范化后）> `remote`
+/// 远端名：显式 > 交互命名 > 默认 `r1` / `r2` 递增
 ///
-/// 显式 `--name` 与非交互（JSON / 非 TTY）都不提问。交互下默认填对端自报的
-/// 主机名，用户可直接回车；若输入的名字已配对到另一台机器，警示后重问，
-/// 避免一次回车静默覆盖别的远端。同目标重连不拦（`connect` 幂等）。
+/// 显式 `--name` 与非交互（JSON / 非 TTY）都不提问。默认名取当前配置里
+/// 最小的空闲 `rN`；同一 target 已有记录时沿用其名字，保证 `connect` 幂等。
+/// 交互下用户可直接回车；若输入的名字已配对到另一台机器，警示后重问，
+/// 避免一次回车静默覆盖别的远端。
 fn resolve_remote_name(
     name: Option<&str>,
     probe: &Probe,
@@ -1026,14 +1028,18 @@ fn resolve_remote_name(
     if let Some(name) = name {
         return crate::commands::origin::remote_name(name, lang);
     }
-    let candidate = sanitize_name(&probe.greeting.server_name);
-    if !printer.is_interactive() {
-        return match RemoteName::parse(&candidate) {
-            Ok(name) => Ok(name),
-            Err(_) => crate::commands::origin::remote_name("remote", lang),
-        };
-    }
     let cfg = file.load()?;
+    let candidate = cfg
+        .remotes
+        .iter()
+        .find(|(_, record)| record.target == target)
+        .map_or_else(
+            || next_remote_name(cfg.remote_names()),
+            |(name, _)| name.clone(),
+        );
+    if !printer.is_interactive() {
+        return crate::commands::origin::remote_name(&candidate, lang);
+    }
     loop {
         let entered = prompts::input_remote_name(
             lang,
@@ -1064,24 +1070,19 @@ fn resolve_remote_name(
     }
 }
 
-/// 把任意主机名收成合法远端名：只保留 `[A-Za-z0-9_.-]`
-fn sanitize_name(raw: &str) -> String {
-    let cleaned: String = raw
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') {
-                c
-            } else {
-                '-'
-            }
-        })
+/// 默认远端名：最小的空闲 `rN`（`r1`、`r2` …）
+///
+/// 只把形如 `r<数字>` 的名字计入占用；用户自定义的其它名字不影响序号。
+fn next_remote_name<'a>(existing: impl Iterator<Item = &'a str>) -> String {
+    let used: HashSet<usize> = existing
+        .filter_map(|name| name.strip_prefix('r'))
+        .filter_map(|digits| digits.parse().ok())
         .collect();
-    let trimmed = cleaned.trim_matches(['-', '.']).to_owned();
-    if trimmed.is_empty() {
-        "remote".to_owned()
-    } else {
-        trimmed
+    let mut n = 1;
+    while used.contains(&n) {
+        n += 1;
     }
+    format!("r{n}")
 }
 
 /// 目标归一：无端口补 `:7681`
@@ -1259,13 +1260,14 @@ mod tests {
     }
 
     #[test]
-    fn host_names_are_sanitized_into_remote_names() {
-        assert_eq!(sanitize_name("prod-box"), "prod-box");
-        assert_eq!(sanitize_name("prod box"), "prod-box");
-        assert_eq!(sanitize_name("prod.local_2"), "prod.local_2");
-        assert_eq!(sanitize_name(""), "remote");
-        assert_eq!(sanitize_name(".."), "remote");
-        assert!(RemoteName::parse(&sanitize_name("PROD BOX")).is_ok());
+    fn default_remote_names_increment_from_r1() {
+        assert_eq!(next_remote_name(std::iter::empty()), "r1");
+        assert_eq!(next_remote_name(["r1"].into_iter()), "r2");
+        assert_eq!(next_remote_name(["r1", "r2"].into_iter()), "r3");
+        assert_eq!(next_remote_name(["r2"].into_iter()), "r1");
+        assert_eq!(next_remote_name(["r1", "r3"].into_iter()), "r2");
+        assert_eq!(next_remote_name(["prod-box", "r1"].into_iter()), "r2");
+        assert_eq!(next_remote_name(["rX", "r2"].into_iter()), "r1");
     }
 
     #[test]
