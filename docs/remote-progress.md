@@ -342,7 +342,8 @@ roundtrip 全量权限覆盖补 `BackupList` 样例（`Permission::Backup` 豁�
 - `remote connect <host[:port]>`：`Client::probe` 捕获 TLS 指纹 → 展示并确认
   （非交互需 `-y`）→ `Enroll` → 写 `credentials.toml`（0600）与
   `config.toml [remotes.*]` → 打印同步摘要。交互确认指纹后提示命名（默认
-  对端自报主机名；同名指向别的 target 时警示重问），`--name` 跳过提示；
+  最小空闲序号 `r1` / `r2` …；同名指向别的 target 时警示重问），`--name`
+  跳过提示；
   `--code` 给配对码，`--read-only` 以 viewer 配对。
 - `remote reconnect <name>`：复用记录，先 probe 校验指纹未变，再用已存 token
   认证；指纹变化要求重新 `connect`。

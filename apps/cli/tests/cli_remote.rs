@@ -119,6 +119,8 @@ fn connect_then_manage_remote_resources_with_identical_commands() {
             &agent.addr,
             "--code",
             &agent.code,
+            "--name",
+            "test-box",
             "-y",
             "--output",
             "json",
@@ -228,6 +230,56 @@ fn connect_then_manage_remote_resources_with_identical_commands() {
 }
 
 #[test]
+fn connect_defaults_to_incremented_remote_names() {
+    let home = temp_home();
+    let first = AgentHandle::start();
+    let second = AgentHandle::start();
+    let home_path = home.path();
+
+    let connected = run(
+        home_path,
+        &[
+            "remote",
+            "connect",
+            &first.addr,
+            "--code",
+            &first.code,
+            "-y",
+            "--output",
+            "json",
+        ],
+    );
+    assert_ok(&connected, "connect first");
+    assert_eq!(json(&connected)["name"], "r1");
+
+    let connected = run(
+        home_path,
+        &[
+            "remote",
+            "connect",
+            &second.addr,
+            "--code",
+            &second.code,
+            "-y",
+            "--output",
+            "json",
+        ],
+    );
+    assert_ok(&connected, "connect second");
+    assert_eq!(json(&connected)["name"], "r2");
+
+    let listed = run(home_path, &["remote", "list", "--output", "json"]);
+    assert_ok(&listed, "remote list");
+    let names: Vec<_> = json(&listed)["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|item| item["name"].as_str().expect("name").to_owned())
+        .collect();
+    assert_eq!(names, ["r1", "r2"]);
+}
+
+#[test]
 fn connect_without_yes_refuses_to_trust_an_unknown_fingerprint() {
     let home = temp_home();
     let agent = AgentHandle::start();
@@ -286,6 +338,8 @@ fn remote_server_create_list_and_remove_route_to_the_peer() {
                 &agent.addr,
                 "--code",
                 &agent.code,
+                "--name",
+                "test-box",
                 "-y",
                 "--output",
                 "json",
@@ -407,6 +461,8 @@ fn remote_java_scan_and_list_route_to_the_peer() {
                 &agent.addr,
                 "--code",
                 &agent.code,
+                "--name",
+                "test-box",
                 "-y",
                 "--output",
                 "json",
@@ -443,6 +499,8 @@ fn remote_props_set_and_version_route_to_the_peer() {
                 &agent.addr,
                 "--code",
                 &agent.code,
+                "--name",
+                "test-box",
                 "-y",
                 "--output",
                 "json",
@@ -591,6 +649,8 @@ fn remote_logs_follow_streams_new_lines() {
                 &agent.addr,
                 "--code",
                 &agent.code,
+                "--name",
+                "test-box",
                 "-y",
                 "--output",
                 "json",
