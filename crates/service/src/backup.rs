@@ -738,6 +738,7 @@ impl BackupService {
         let destination = match target {
             RestoreTarget::InPlace => layout.dir.clone(),
             RestoreTarget::NewServer { name: new_name } => {
+                // 名字已由 `ServerName` 校验：`../x` / `/abs` / `C:\x` 进不来。
                 if self.registry.get(new_name.as_str()).is_ok() {
                     return Err(BackupError::TargetExists(new_name.to_string()));
                 }
@@ -2348,6 +2349,44 @@ mod tests {
     }
 
     #[test]
+    fn restore_to_traversal_name_is_rejected_before_writing() {
+        let fx = Fixture::new(FakeSupervisor::stopped());
+        fx.write("a", b"1");
+        // `RestoreTarget::NewServer` 只接受 `ServerName`，非法名字在入口
+        // 就构造不出来——这里锁定「哪些名字必须被拒绝」这一层契约。
+        for name in ["../escape", "..\\escape", "/abs", "C:\\abs", "a/b", ""] {
+            assert!(
+                ServerName::parse(name).is_err(),
+                "{name} 必须被 ServerName 拒绝"
+            );
+        }
+        assert!(
+            !fx.ws_path.join("escape").exists(),
+            "恢复目标逃出 servers/ 目录"
+        );
+    }
+
+    /// 磁盘上已有但未注册的目录同样不能作为恢复目标：否则旧文件会混进恢复结果
+    #[test]
+    fn restore_to_existing_unregistered_dir_is_rejected() {
+        let fx = Fixture::new(FakeSupervisor::stopped());
+        fx.write("a", b"1");
+        let outcome = fx.create();
+        std::fs::create_dir(fx.ws_path.join("servers").join("copy")).expect("mkdir");
+        let err = fx
+            .service
+            .restore(
+                "alpha",
+                outcome.snapshot.id.as_str(),
+                &RestoreTarget::NewServer {
+                    name: ServerName::parse("copy").expect("name"),
+                },
+            )
+            .expect_err("dir exists");
+        assert!(matches!(err, BackupError::TargetExists(_)), "{err}");
+    }
+
+    #[test]
     fn restore_unknown_snapshot_fails() {
         let fx = Fixture::new(FakeSupervisor::stopped());
         let err = fx
@@ -2578,6 +2617,34 @@ mod tests {
                 .verify("alpha", outcome.snapshot.id.as_str(), &mut |_, _| {})
                 .expect("verify")
                 .is_healthy()
+        );
+    }
+
+    #[test]
+    fn prune_fails_closed_when_snapshot_record_is_corrupt() {
+        let fx = Fixture::new(FakeSupervisor::stopped());
+        fx.write("a", b"only-here");
+        let outcome = fx.create();
+        let hash = outcome
+            .snapshot
+            .content
+            .referenced_hashes()
+            .next()
+            .expect("hash")
+            .clone();
+        let record =
+            backup::snapshot_dir(&fx.ws_path, &outcome.snapshot.id).join(backup::SNAPSHOT_FILE);
+        std::fs::write(&record, b"{not json").expect("corrupt");
+
+        let err = fx
+            .service
+            .prune("alpha", Some(RetentionPolicy::Keep(0)), false)
+            .expect_err("损坏记录必须让 prune fail closed");
+        assert!(matches!(err, BackupError::Store(_)), "{err}");
+        let cas = CasStore::new(&fx.backups_root());
+        assert!(
+            cas.stat(&hash).expect("stat").is_some(),
+            "GC 不得删掉仍被引用的对象"
         );
     }
 

@@ -292,32 +292,59 @@ impl Printer {
 /// 没有 `kind()`，要落到内层才能取到判定。
 fn structured_message(err: &anyhow::Error, lang: Lang) -> Option<String> {
     for cause in err.chain() {
-        if let Some(life) = cause.downcast_ref::<mcsup::service::LifecycleError>() {
-            let kind = life.kind()?;
-            return Some(crate::i18n::lifecycle(&kind, lang));
+        if let Some(life) = cause.downcast_ref::<mcsup::service::LifecycleError>()
+            && let Some(message) = lifecycle_message(life, lang)
+        {
+            return Some(message);
         }
-        if let Some(jar) = cause.downcast_ref::<mcsup::service::InstallJarError>() {
-            let kind = jar.kind()?;
-            return Some(crate::i18n::install_jar(&kind, lang));
+        if let Some(jar) = cause.downcast_ref::<mcsup::service::InstallJarError>()
+            && let Some(message) = install_jar_message(jar, lang)
+        {
+            return Some(message);
         }
-        if let Some(settings) = cause.downcast_ref::<mcsup::service::SettingsError>() {
-            let kind = settings.kind()?;
+        if let Some(settings) = cause.downcast_ref::<mcsup::service::SettingsError>()
+            && let Some(kind) = settings.kind()
+        {
             return Some(crate::i18n::settings(&kind, lang));
         }
-        if let Some(backup) = cause.downcast_ref::<mcsup::service::BackupError>() {
-            let kind = backup.kind()?;
+        if let Some(backup) = cause.downcast_ref::<mcsup::service::BackupError>()
+            && let Some(kind) = backup.kind()
+        {
             return Some(crate::i18n::backup(&kind, lang));
         }
-        if let Some(reg) = cause.downcast_ref::<mcsup::service::ServerRegistryError>() {
-            let kind = reg.kind()?;
+        if let Some(reg) = cause.downcast_ref::<mcsup::service::ServerRegistryError>()
+            && let Some(kind) = reg.kind()
+        {
             return Some(crate::i18n::registry(&kind, lang));
         }
-        if let Some(ws) = cause.downcast_ref::<mcsup::service::WorkspaceError>() {
-            let kind = ws.kind()?;
+        if let Some(ws) = cause.downcast_ref::<mcsup::service::WorkspaceError>()
+            && let Some(kind) = ws.kind()
+        {
             return Some(crate::i18n::workspace(&kind, lang));
         }
     }
     None
+}
+
+/// `LifecycleError` 的透明包装不把内层错误放进 `chain()`：必须按变体下钻
+fn lifecycle_message(life: &mcsup::service::LifecycleError, lang: Lang) -> Option<String> {
+    use mcsup::service::LifecycleError as Life;
+    match life {
+        Life::Registry(reg) => reg.kind().map(|kind| crate::i18n::registry(&kind, lang)),
+        Life::InstallJar(jar) => install_jar_message(jar, lang),
+        other => other.kind().map(|kind| crate::i18n::lifecycle(&kind, lang)),
+    }
+}
+
+/// `InstallJarError` 同样是透明包装，Registry 变体要下钻一层才能拿到分类
+fn install_jar_message(jar: &mcsup::service::InstallJarError, lang: Lang) -> Option<String> {
+    use mcsup::service::InstallJarError as Jar;
+    match jar {
+        Jar::Registry(reg) => reg.kind().map(|kind| crate::i18n::registry(&kind, lang)),
+        other => other
+            .kind()
+            .map(|kind| crate::i18n::install_jar(&kind, lang)),
+    }
 }
 
 /// 生命周期错误判级：状态冲突 4、缺资源 3、EULA 用法 2、后端 5、其余 1
@@ -528,7 +555,8 @@ fn print_error_line(text: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Printer, transport_exit_code};
+    use super::{Printer, structured_message, transport_exit_code};
+    use crate::locale::Lang;
     use anyhow::Context as _;
     use mcsup::domain::server::version::VersionId;
     use mcsup::port::SourceError;
@@ -541,6 +569,20 @@ mod tests {
         .context("安装服务端失败")
         .unwrap_err();
         assert_eq!(Printer::exit_code(&err), 5);
+    }
+
+    /// 包装变体没有 kind()：必须继续沿链下钻到内层 registry 错误，
+    /// 不能 `?` 直接放弃整条链
+    #[test]
+    fn structured_message_drills_through_wrapper_without_kind() {
+        use mcsup::service::{LifecycleError, ServerRegistryError};
+        let err = anyhow::Error::from(LifecycleError::from(ServerRegistryError::NotFound(
+            "alpha".to_owned(),
+        )));
+        assert_eq!(
+            structured_message(&err, Lang::Zh).as_deref(),
+            Some("服务器 alpha 不存在")
+        );
     }
 
     #[test]

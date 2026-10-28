@@ -403,10 +403,10 @@ roundtrip 全量权限覆盖补 `BackupList` 样例（`Permission::Backup` 豁�
   - `supervise.rs`：`__supervise` 参数解析与入口，与 `mcsup __supervise`
     解析同一份参数形状。
 - `apps/agent`（package `agent`，bin `mcsup-agent`）：薄入口，只做参数解析与
-  打印。缺省监听 `0.0.0.0:7681`。
+  打印。缺省监听 `127.0.0.1:7681`（对外直连需 `--listen 0.0.0.0:7681`）。
 - 配对码在常驻进程里**过期自动轮换**：`PairingCodeStore::expired()` /
-  `rotate_if_expired()`，只有自然过期才换新。用掉与锁死都保持关闭，否则限速
-  形同虚设。
+  `rotate_if_expired()`，只有自然过期才换新。用掉保持关闭；猜错达上限进入
+  60 秒冷却而不是作废（作废等于允许匿名者关掉别人的配对窗口）。
 - agent 侧 `start` 从注册表读 `meta.launch`，`supervisor_exe` 默认是
   `current_exe()`（`mcsup-agent` 自己也实现了 `__supervise`，省掉第二个 bin）。
 - 认证与业务都**不缓存**判定结果：名册每次读盘、配对码每次读内存状态。缓存

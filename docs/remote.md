@@ -71,12 +71,16 @@ mcsup 的远程能力：一台机器上的 `mcsup` 可以像管理本地资源�
 只需要一条命令：
 
 ```
-$ mcsup remote serve
+$ mcsup remote serve --listen 0.0.0.0:7681
 mcsup 已开始接受连接
   名称    prod-box
-  地址    10.0.0.5:7681   （同一局域网可自动发现）
+  地址    0.0.0.0:7681      （同一局域网可自动发现）
   配对码  4821-9375        （10 分钟内有效）
 ```
+
+缺省监听 `127.0.0.1:7681`，只接受本机连接（SSH 引导足够用）。
+要让同一网络里的其他机器直连，必须显式 `--listen 0.0.0.0:7681` 并自行
+放行防火墙——对外开端口是用户的决定，不该由缺省值代劳。
 
 它当前是**前台进程**（与 `mcsup-agent` 同一份实现）；系统服务注册
 （systemd / launchd）尚未实现，需要用户自行用 `nohup` / `tmux` / 服务管理器
@@ -84,9 +88,9 @@ mcsup 已开始接受连接
 
 | 命令 | 说明 |
 | --- | --- |
-| `mcsup remote serve [--listen <addr>] [--name <n>]` | 前台运行 agent，打印名称、地址、指纹、配对码 |
+| `mcsup remote serve [--listen <addr>] [--name <n>]` | 前台运行 agent，打印名称、地址、指纹、配对码；缺省只听 `127.0.0.1:7681`，对外直连需显式 `--listen 0.0.0.0:7681` |
 | `mcsup remote serve --status` | 离线查看本机身份指纹、pid 与已配对客户端 |
-| `mcsup remote serve --stop` | 按 `{data_dir}/remote/agent.pid` 终止前台进程 |
+| `mcsup remote serve --stop` | 按 `{data_dir}/remote/agent.pid` 终止前台进程；pid 已被别的程序复用时拒绝误杀并清理陈旧文件 |
 | `mcsup remote revoke <client>` | 离线撤销某个客户端（删除名册记录，立即失效） |
 
 ### 连接端（本地主机）
@@ -303,7 +307,12 @@ error: “web” 存在于多个位置
   `auto` 真实探测钥匙串是否可用，不可用（headless / 无 Secret Service）时
   退到文件。新配对 token **30 天过期**，旧记录（无过期时间）按不过期兼容；
   过期后重新 `remote connect` 即可。
-- **配对码**：短时有效、单次使用、限速尝试，防止暴力猜测。
+- **配对码**：短时有效、单次使用、限速尝试。连续猜错达上限后进入 60 秒
+  冷却：**不作废码**，否则任何能连到端口的人猜 5 次就能关掉合法用户的配对
+  窗口（窗口轮换后还能继续关），构成远程拒绝服务。
+- **暴露面**：缺省只听回环；对外监听必须显式传 `--listen`。TCP 连接数有上限，
+  且握手阶段（TLS + `Hello` + 认证）有 10 秒独立超时——连上不发数据的扫描器
+  不能占着连接槽位等业务超时。
 - **权限**：默认 operator，可 `--read-only`（viewer）。`Admin` 目前没有
   配对入口，`Manage` 权限的 `Shutdown` / `ClientList` / `ClientRevoke` 帧
   保留但**当前不可达**。
@@ -358,8 +367,7 @@ error: “web” 存在于多个位置
    逻辑）还是仅名称。
 2. 远端 supervisor 形态：每服务器一个 `mcsup __supervise` 子进程（推荐，
    改动小）还是 agent 内嵌运行时。
-3. `remote serve` 的缺省监听地址与防火墙引导。
-4. 无系统钥匙串时的凭证落盘策略是否需要额外加密。
+3. 无系统钥匙串时的凭证落盘策略是否需要额外加密。
 
 ## 术语
 

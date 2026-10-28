@@ -536,7 +536,7 @@ pub(crate) enum RemoteAction {
         #[arg(
             long,
             value_name = "ADDR",
-            default_value = "0.0.0.0:7681",
+            default_value = "127.0.0.1:7681",
             help = crate::meta::remote_listen_arg()
         )]
         listen: String,

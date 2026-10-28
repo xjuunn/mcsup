@@ -827,6 +827,14 @@ mod tests {
         assert_eq!(RelPath::parse("a/b").expect("ok").as_str(), "a/b");
     }
 
+    /// 盘符 / NTFS ADS 的 `:` 在 Unix 上是普通字符，必须按跨平台口径拒绝
+    #[test]
+    fn rel_path_rejects_colon_on_every_platform() {
+        assert!(RelPath::parse("C:/evil").is_err());
+        assert!(RelPath::parse("a/C:evil").is_err());
+        assert!(RelPath::from_path(Path::new("a/C:evil")).is_err());
+    }
+
     #[test]
     fn rel_path_prefix_match_respects_component_boundary() {
         let path = rel("world_nether/region/r.0.0.mca");

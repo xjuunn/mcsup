@@ -281,7 +281,12 @@ fn supervisor_exit_code(status: ServerStatus) -> i32 {
     }
 }
 
-/// 环境准备：run 目录 / 清场 / console.log / 子进程 / 共享状态 / IPC 监听
+/// 环境准备：run 目录 / 清场 / console.log / IPC 监听 / 子进程 / 共享状态
+///
+/// **先绑 IPC 端点，再启动子进程**：`Child` 在 drop 时不会杀进程，若先 spawn
+/// 再 bind，任何 bind / `set_nonblocking` 失败都会留下一个仍在写 world 的
+/// Minecraft 进程，而且调用方已经收到启动失败。反过来，bind 失败时子进程
+/// 尚未存在，直接返回即可；spawn 失败时 listener 随作用域 drop 并清掉端点。
 ///
 /// # Errors
 ///
@@ -311,6 +316,24 @@ where
         }
     };
     let log = Arc::new(Mutex::new(BufWriter::new(log_file)));
+
+    let name = endpoint::endpoint_name(server_dir).map_err(|err| {
+        supervisor_note(&format!("endpoint name failed: {err}"));
+        1
+    })?;
+    let listener = interprocess::local_socket::ListenerOptions::new()
+        .name(name)
+        .create_sync()
+        .map_err(|err| {
+            supervisor_note(&format!("bind ipc endpoint failed: {err}"));
+            1
+        })?;
+    listener
+        .set_nonblocking(ListenerNonblockingMode::Accept)
+        .map_err(|err| {
+            supervisor_note(&format!("set nonblocking failed: {err}"));
+            1
+        })?;
 
     let mut child = match spawn() {
         Ok(child) => child,
@@ -351,23 +374,6 @@ where
         thread::spawn(move || pump(BufReader::new(stderr), &shared));
     }
 
-    let name = endpoint::endpoint_name(server_dir).map_err(|err| {
-        supervisor_note(&format!("endpoint name failed: {err}"));
-        1
-    })?;
-    let listener = interprocess::local_socket::ListenerOptions::new()
-        .name(name)
-        .create_sync()
-        .map_err(|err| {
-            supervisor_note(&format!("bind ipc endpoint failed: {err}"));
-            1
-        })?;
-    listener
-        .set_nonblocking(ListenerNonblockingMode::Accept)
-        .map_err(|err| {
-            supervisor_note(&format!("set nonblocking failed: {err}"));
-            1
-        })?;
     Ok((shared, listener))
 }
 
@@ -494,6 +500,36 @@ pub fn run_supervisor(launch: &MinecraftLaunch) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::strip_line_ending;
+    #[cfg(unix)]
+    use super::{prepare, run_dir};
+
+    /// bind 失败时不得先启动服务端进程
+    ///
+    /// `Child` 在 drop 时不会杀进程：若先 spawn 再 bind，bind 失败会留下仍在
+    /// 写 world 的孤儿 JVM，而调用方已经收到启动失败。
+    ///
+    /// 用目录占住 Unix socket 路径：`cleanup_stale` 只能删文件，删不掉目录，
+    /// 后续 bind 必然失败。Windows 端点走命名管道，不适用这条构造。
+    #[cfg(unix)]
+    #[test]
+    fn bind_failure_does_not_spawn_server() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run = run_dir(dir.path());
+        std::fs::create_dir_all(&run).expect("run dir");
+        std::fs::create_dir(run.join("supervisor.sock")).expect("block socket path");
+
+        let mut spawned = false;
+        let result = prepare(dir.path(), || {
+            spawned = true;
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg("true")
+                .spawn()
+        });
+
+        assert!(result.is_err(), "占用 socket 路径时 bind 应失败");
+        assert!(!spawned, "bind 失败时不得启动服务端进程");
+    }
 
     /// 行尾统一剥成不含换行的字节，供写入端补单个 `\n`
     #[test]

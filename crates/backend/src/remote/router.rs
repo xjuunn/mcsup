@@ -142,6 +142,7 @@ impl SupervisorPort for RoutingSupervisor {
 
         // 桶键即来源：本地 / 某台远端
         let mut buckets: Vec<(Origin, Vec<usize>)> = Vec::new();
+        // 每个槽都要拿到自己的结果；解析失败的位置由下面的 None 兜底
         let mut out: Vec<Option<Result<Option<SupervisorStatus>, SupervisorError>>> =
             (0..servers.len()).map(|_| None).collect();
         for (index, server) in servers.iter().enumerate() {

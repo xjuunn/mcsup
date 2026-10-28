@@ -30,6 +30,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 /// 变成拒绝服务而不是把线程表打满。
 pub const MAX_CONNECTIONS: usize = 32;
 
+/// 握手阶段（TLS + `Hello` + 认证）的读写上限
+///
+/// 业务帧允许长事务（安装、备份），连接建立后是 [`crate::client::IO_TIMEOUT`]；
+/// 但握手阶段客户端最多发两帧，允许它占着连接十分钟等于把
+/// [`MAX_CONNECTIONS`] 的槽位白送给「连上不发数据」的扫描器。
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// 从任意线程请求服务端停止的句柄
 ///
 /// `Handler` 在会话线程里跑，业务侧要能「处理完这一帧就退出」（`Shutdown`）。
@@ -231,6 +238,13 @@ fn serve_connection(
     handler: &dyn Handler,
 ) -> Result<(), TransportError> {
     crate::client::configure(&stream)?;
+    // 握手阶段用短超时接管 socket 的读写上限；认证完成后再放宽到业务超时。
+    // clone 出来的句柄指向同一个 socket，改选项对原连接生效。
+    set_timeouts(&stream, HANDSHAKE_TIMEOUT)?;
+    let business = stream
+        .try_clone()
+        .map_err(|err| TransportError::io("clone handshake socket", err))?;
+
     let connection = ServerConnection::new(config)?;
     let mut session = Session::new(StreamOwned::new(connection, stream));
 
@@ -239,7 +253,16 @@ fn serve_connection(
         // 认证被拒或刚完成配对：token 已交付，连接到此为止
         return Ok(());
     };
+    set_timeouts(&business, crate::client::IO_TIMEOUT)?;
     dispatch(&mut session, handler, &session_info)
+}
+
+/// 覆盖 socket 的读写超时（`client::configure` 之外单独调，用于握手阶段降级）
+fn set_timeouts(stream: &TcpStream, timeout: std::time::Duration) -> Result<(), TransportError> {
+    stream
+        .set_read_timeout(Some(timeout))
+        .and_then(|()| stream.set_write_timeout(Some(timeout)))
+        .map_err(|err| TransportError::io("configure handshake timeout", err))
 }
 
 /// 第一步：`Hello` 交换
@@ -608,5 +631,23 @@ mod tests {
         let err = Server::bind(&addr.to_string(), &identity, handler).expect_err("in use");
         assert!(matches!(err, TransportError::Io { .. }), "{err:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 握手超时必须真的落在 socket 上
+    ///
+    /// 漏掉这一步时测试不会自己变红，但「连上不发数据」的扫描器能白占
+    /// [`MAX_CONNECTIONS`] 槽位直到业务超时（600s）。
+    #[test]
+    fn handshake_timeout_is_applied_to_the_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let client = TcpStream::connect(addr).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        set_timeouts(&server, HANDSHAKE_TIMEOUT).expect("set timeouts");
+        assert_eq!(
+            server.read_timeout().expect("read timeout"),
+            Some(HANDSHAKE_TIMEOUT)
+        );
+        drop(client);
     }
 }

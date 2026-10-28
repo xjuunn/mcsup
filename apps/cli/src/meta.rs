@@ -184,8 +184,8 @@ pub(crate) fn origin_target_arg() -> &'static str {
 #[must_use]
 pub(crate) fn remote_listen_arg() -> &'static str {
     t(
-        "监听地址（缺省 0.0.0.0:7681）",
-        "listen address (default 0.0.0.0:7681)",
+        "监听地址（缺省 127.0.0.1:7681，只监听本机；其他机器要连请显式写 0.0.0.0:7681）",
+        "listen address (default 127.0.0.1:7681, loopback only; use 0.0.0.0:7681 to accept other machines)",
     )
 }
 

@@ -24,6 +24,15 @@ pub const DEFAULT_TTL_SECS: u64 = 10 * 60;
 /// 默认允许的失败尝试次数
 pub const DEFAULT_MAX_ATTEMPTS: u32 = 5;
 
+/// 失败次数用尽后的冷却时长
+///
+/// 早期实现在达到上限时直接作废整枚码：任何能连到端口的人猜 5 次，就能把
+/// 合法用户的配对窗口关掉；窗口到期轮换后还能继续关，等于远程拒绝服务。
+/// 改为「暂停尝试、不作废码」：攻击者的猜码速率被压到每分钟 5 次（10 分钟
+/// 窗口内最多 50 次，面对 1e8 的码空间可以忽略），而持有正确码的用户最多
+/// 等一分钟就能配对。
+pub const ATTEMPT_COOLDOWN_SECS: u64 = 60;
+
 /// 配对码操作失败
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PairingCodeError {
@@ -138,6 +147,8 @@ struct ActiveCode {
     code: PairingCode,
     issued_at: u64,
     attempts: u32,
+    /// 冷却截止时刻；冷却期间拒绝一切尝试，但码本身不作废
+    blocked_until: u64,
 }
 
 impl PairingCodeStore {
@@ -161,6 +172,7 @@ impl PairingCodeStore {
             code: code.clone(),
             issued_at: now,
             attempts: 0,
+            blocked_until: 0,
         });
         Ok(code)
     }
@@ -174,15 +186,20 @@ impl PairingCodeStore {
             .map(|active| &active.code)
     }
 
-    /// 兑换：成功即作废，失败计数并在达上限时作废
+    /// 兑换：成功即作废；失败计数，达上限后进入冷却（不作废码）
     ///
     /// # Errors
     ///
-    /// 没有有效码 / 输入形态非法 / 码不对时返回 [`PairingCodeError`]
+    /// 没有有效码 / 输入形态非法 / 码不对 / 处于冷却期时返回
+    /// [`PairingCodeError`]
     pub fn redeem(&mut self, presented: &str, now: u64) -> Result<(), PairingCodeError> {
-        // 先判定存活再取可变借用：过期与锁死都归到同一个 Unusable
+        // 先判定存活再取可变借用：过期与冷却都归到同一个 Unusable
         match self.active.as_ref() {
-            Some(active) if self.is_live(active, now) => {}
+            Some(active) if self.is_live(active, now) => {
+                if now < active.blocked_until {
+                    return Err(PairingCodeError::Unusable);
+                }
+            }
             Some(_) => {
                 self.active = None;
                 return Err(PairingCodeError::Unusable);
@@ -200,7 +217,10 @@ impl PairingCodeStore {
 
         active.attempts += 1;
         if active.attempts >= self.window.max_attempts {
-            self.active = None;
+            // 暂停而不是作废：作废等于把「关掉别人配对窗口」的能力交给任何
+            // 能连到端口的人（见 ATTEMPT_COOLDOWN_SECS）
+            active.attempts = 0;
+            active.blocked_until = now.saturating_add(ATTEMPT_COOLDOWN_SECS);
             return Err(PairingCodeError::Unusable);
         }
         Err(PairingCodeError::Mismatch)
@@ -211,11 +231,12 @@ impl PairingCodeStore {
         self.active = None;
     }
 
-    /// 当前码是否只是**自然过期**（不是用掉、也不是猜错锁死）
+    /// 当前码是否只是**自然过期**（不是用掉、也不是猜错进入冷却）
     ///
     /// 三种失效原因对外的错误相同（都报 [`PairingCodeError::Unusable`]，避免
     /// 告诉猜码的人离成功有多近），但对内必须分开：过期可以轮换出新码继续
-    /// 服务，而「已用掉」与「锁死」必须保持失效，否则限速就形同虚设。
+    /// 服务，而「已用掉」必须保持失效；「冷却」有明确的结束时刻，也不该
+    /// 因为轮换被提前放行。
     #[must_use]
     pub fn expired(&self, now: u64) -> bool {
         self.active
@@ -318,11 +339,11 @@ mod tests {
     }
 
     #[test]
-    fn wrong_attempts_are_limited_and_lock_the_code() {
+    fn wrong_attempts_pause_the_code_instead_of_burning_it() {
         let mut store = store();
         let code = store.issue(T0).expect("issue");
         let wrong = "00000000";
-        // 前 max_attempts-1 次报 Mismatch，第 max_attempts 次直接锁死
+        // 前 max_attempts-1 次报 Mismatch，第 max_attempts 次进入冷却
         for _ in 0..DEFAULT_MAX_ATTEMPTS - 1 {
             assert_eq!(
                 store.redeem(wrong, T0),
@@ -333,12 +354,19 @@ mod tests {
         assert_eq!(
             store.redeem(wrong, T0),
             Err(PairingCodeError::Unusable),
-            "达上限后作废"
+            "达上限后进入冷却"
         );
-        // 锁死之后即使给出正确的码也不再接受
+        // 冷却期内即使给出正确的码也不接受
         assert_eq!(
             store.redeem(&code.display_form(), T0),
             Err(PairingCodeError::Unusable)
+        );
+        // 但码没有被作废：冷却结束后持码用户仍能配对。
+        // 作废等于任何能连端口的人猜 5 次就能关掉别人的配对窗口。
+        let after_cooldown = T0 + ATTEMPT_COOLDOWN_SECS;
+        assert!(
+            store.redeem(&code.display_form(), after_cooldown).is_ok(),
+            "冷却结束应接受正确的码"
         );
     }
 
@@ -393,7 +421,7 @@ mod tests {
         assert_eq!(window.max_attempts, 5);
     }
 
-    /// 只有自然过期才算「可轮换」：用掉与锁死都必须保持关闭
+    /// 只有自然过期才算「可轮换」：用掉与冷却都不算
     #[test]
     fn only_natural_expiry_counts_as_expired() {
         let mut store = store();
@@ -403,11 +431,18 @@ mod tests {
         store.redeem(&code.display_form(), T0).expect("兑换");
         assert!(!store.expired(T0 + DEFAULT_TTL_SECS), "用掉不是过期");
 
-        let mut locked = store_with_attempts();
+        let mut cooled = store_with_attempts();
         for _ in 0..DEFAULT_MAX_ATTEMPTS {
-            let _ = locked.redeem("00000000", T0);
+            let _ = cooled.redeem("00000000", T0);
         }
-        assert!(!locked.expired(T0 + DEFAULT_TTL_SECS), "锁死不是过期");
+        assert!(
+            !cooled.expired(T0 + DEFAULT_TTL_SECS - 1),
+            "冷却不是过期：窗口内不轮换"
+        );
+        assert!(
+            cooled.expired(T0 + DEFAULT_TTL_SECS),
+            "TTL 到期就是自然过期，应允许轮换"
+        );
     }
 
     fn store_with_attempts() -> PairingCodeStore {

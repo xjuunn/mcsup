@@ -164,11 +164,14 @@ pub trait SnapshotRepository: Send + Sync {
     /// 底层失败返回 [`SnapshotStoreError::Storage`]
     fn list_for_server(&self, server: &str) -> Result<Vec<Snapshot>, SnapshotStoreError>;
 
-    /// 全部快照，按创建时间升序（GC 与跨服查询用）
+    /// 全部快照，按创建时间升序（GC 用）
+    ///
+    /// GC 依据必须完整：遇到损坏记录返回 [`SnapshotStoreError::Corrupt`]，
+    /// 不能跳过——跳过会让引用计数漏掉该记录，prune 随后删掉仍被引用的对象。
     ///
     /// # Errors
     ///
-    /// 底层失败返回 [`SnapshotStoreError::Storage`]
+    /// 底层失败或存在损坏记录时返回 [`SnapshotStoreError`]
     fn list_all(&self) -> Result<Vec<Snapshot>, SnapshotStoreError>;
 
     /// 删除一条记录；已不存在视为成功（幂等）

@@ -12,9 +12,10 @@ use std::process::ExitCode;
 
 /// 缺省监听地址
 ///
-/// 监听全部网卡是「让别的机器连进来」这个功能的全部意义；`127.0.0.1` 只在
-/// 本机自测时有用，用户还得再查一遍文档才知道要改。
-const DEFAULT_LISTEN: &str = "0.0.0.0:7681";
+/// 缺省只监听本机：`mcsup-agent` 一旦被暴露到网络，配对码就是唯一门槛，
+/// 而默认值不应该替用户做「对外开端口」这个决定。需要别的机器连进来时
+/// 显式 `--listen 0.0.0.0:7681`，并由用户自己处理防火墙。
+const DEFAULT_LISTEN: &str = "127.0.0.1:7681";
 
 fn main() -> ExitCode {
     // 隐藏入口先分流：它不初始化日志与网络，直接跑 supervisor
@@ -63,6 +64,9 @@ fn announce(agent: &mcsup::remote::Agent, args: &Args, addr: std::net::SocketAdd
     println!("  地址    {addr}");
     println!("  指纹    {}", agent.fingerprint());
     println!("  数据    {}", args.data_dir.display());
+    if addr.ip().is_loopback() {
+        println!("  提示    只监听本机；其他机器连进来需 --listen 0.0.0.0:7681 并放行防火墙");
+    }
 }
 
 /// 配对码：带分组显示，并说明有效期

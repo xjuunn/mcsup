@@ -292,9 +292,23 @@ fn resolve_mc_id(raw: &str, metadata: &MavenMetadata) -> Option<String> {
     }
 }
 
-/// 最新的 MC 版本：`BTreeMap` 已按版本串字典序排列，末项即最新
+/// 最新的 MC 版本：按领域版本顺序取第一，不能按 `BTreeMap` 的字典序
+///
+/// 字典序会把 `1.9.4` 排在 `1.21.1` 之后（`'9' > '2'`），`latest` 会错选旧版本。
 fn latest_mc(metadata: &MavenMetadata) -> Option<String> {
-    metadata.keys().next_back().cloned()
+    let mut versions: Vec<ServerVersion> = metadata
+        .keys()
+        .map(|mc| ServerVersion {
+            id: VersionId::new(mc.clone()),
+            kind: VersionKind::Release,
+            variant: ServerVariant::Forge,
+            java_major: None,
+        })
+        .collect();
+    ServerVersion::sort_display_order(&mut versions);
+    versions
+        .first()
+        .map(|version| version.id.as_str().to_owned())
 }
 
 /// 在某 MC 版本下选 build：推荐值须存在于该 MC 的列表里，否则退回末项
@@ -479,7 +493,7 @@ mod tests {
         assert!(into_server_version("1.21.1".to_owned(), &["1.21.1-52.0.1".to_owned()]).is_some());
     }
 
-    /// `latest` 取字典序最后的 MC 版本（Forge 无快照档）
+    /// `latest` 取数值最新的 MC 版本（Forge 无快照档）
     #[test]
     fn resolve_latest_picks_highest_mc_version() {
         let meta = metadata();
@@ -487,6 +501,16 @@ mod tests {
         assert_eq!(latest, latest_mc(&meta).expect("非空"));
         // fixture 里最高版本应为 26.3
         assert_eq!(latest, "26.3");
+    }
+
+    /// `latest` 必须按版本数值比较：`1.9.4` 的字符串比 `1.21.1` 大
+    #[test]
+    fn resolve_latest_compares_versions_numerically() {
+        let mut meta = MavenMetadata::new();
+        for mc in ["1.9.4", "1.10.2", "1.12.2", "1.20.1", "1.21.1"] {
+            meta.insert(mc.to_owned(), vec![format!("{mc}-47.2.0")]);
+        }
+        assert_eq!(resolve_mc_id("latest", &meta).as_deref(), Some("1.21.1"));
     }
 
     /// 字面版本必须在列表里：命中返回原值，未命中返回 `None`

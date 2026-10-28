@@ -110,7 +110,7 @@ fn serve(
     ))?;
 
     write_pid(&data_dir, std::process::id())?;
-    report_serve(&agent, &name, &addr.to_string(), &code, printer);
+    report_serve(&agent, &name, addr, &code, printer);
     // 监听所有网卡时提醒暴露面：仅配对码保护，防火墙需用户自行处理
     if addr.ip().is_unspecified() && printer.is_human() {
         printer.print_warning(&crate::i18n::pick(
@@ -145,14 +145,14 @@ fn serve(
 fn report_serve(
     agent: &mcsup::remote::Agent,
     name: &str,
-    addr: &str,
+    addr: std::net::SocketAddr,
     code: &mcsup::auth::PairingCode,
     printer: Printer,
 ) {
     let lang = printer.lang();
     let payload = RemoteServeJson {
         name,
-        listen: addr,
+        listen: &addr.to_string(),
         fingerprint: agent.fingerprint().as_str(),
         pairing_code: Some(&code.display_form()),
     };
@@ -179,6 +179,13 @@ fn report_serve(
                 code.display_form()
             ),
         ));
+        if addr.ip().is_loopback() {
+            printer.print_section(&crate::i18n::pick(
+                lang,
+                "  提示    只监听本机；其他机器要连请 --listen 0.0.0.0:7681 并放行防火墙",
+                "  hint    loopback only; use --listen 0.0.0.0:7681 and open the firewall to accept other machines",
+            ));
+        }
     } else {
         // JSON 模式：启动信息一行，后续配对码变化各一行 JSONL
         let _ = printer.print_outcome("", &payload);
@@ -223,7 +230,7 @@ fn serve_status(data_dir: &Path, printer: Printer) -> Result<()> {
         "reading the client registry",
     ))?;
     let pid = read_pid(data_dir);
-    let running = pid.is_some_and(is_alive);
+    let running = pid.is_some_and(|pid| is_alive(pid) && is_mcsup_process(pid));
 
     if printer.is_human() {
         printer.print_section(&crate::i18n::pick(
@@ -306,15 +313,14 @@ fn serve_stop(data_dir: &Path, printer: Printer) -> Result<()> {
         )
         .into());
     }
-    // pid 可能被系统复用：先确认它看起来仍是 mcsup，避免误杀无关进程
-    if !looks_like_agent(pid) {
+    // pid 会被系统复用：文件里的数字活着，不代表还是当初那个 agent
+    if !is_mcsup_process(pid) {
+        remove_pid(data_dir);
         return Err(AppDiagnostic::failure(
             crate::i18n::pick(
                 lang,
-                format!("进程 {pid} 看起来不是 mcsup agent，拒绝终止；请检查陈旧 pid 文件"),
-                format!(
-                    "process {pid} does not look like a mcsup agent; refusing to kill it (check the stale pid file)"
-                ),
+                format!("pid {pid} 已被别的程序复用（镜像不是 mcsup），已清理陈旧 pid 文件"),
+                format!("pid {pid} now belongs to a non-mcsup process; removed the stale pid file"),
             ),
             None,
         )
@@ -1217,42 +1223,6 @@ fn remove_pid(data_dir: &Path) {
     let _ = std::fs::remove_file(pid_path(data_dir));
 }
 
-/// 该 pid 是否看起来是本项目的 agent（best-effort）
-///
-/// pid 文件是上次进程留下的；pid 可能已被系统复用。终止前确认命令行仍含
-/// `mcsup`，读不到命令行时按「像」处理（不牺牲原有功能）。
-fn looks_like_agent(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        match std::process::Command::new("ps")
-            .args(["-p", &pid.to_string(), "-o", "command="])
-            .output()
-        {
-            Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
-                .to_ascii_lowercase()
-                .contains("mcsup"),
-            _ => true,
-        }
-    }
-    #[cfg(windows)]
-    {
-        match std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-            .output()
-        {
-            Ok(output) => String::from_utf8_lossy(&output.stdout)
-                .to_ascii_lowercase()
-                .contains("mcsup"),
-            Err(_) => true,
-        }
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = pid;
-        true
-    }
-}
-
 /// 进程是否存活（`kill -0` / `tasklist`，不引平台库）
 fn is_alive(pid: u32) -> bool {
     #[cfg(unix)]
@@ -1275,6 +1245,51 @@ fn is_alive(pid: u32) -> bool {
         let _ = pid;
         false
     }
+}
+
+/// 进程的镜像名 / 命令行；取不到返回 `None`
+fn process_command(pid: u32) -> Option<String> {
+    #[cfg(unix)]
+    {
+        // `command=` 是完整命令行；`comm=` 在 Linux 上会被截到 15 字符
+        let out = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "command="])
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    }
+    #[cfg(windows)]
+    {
+        // CSV 首列是镜像名：`"mcsup.exe","1234",...`
+        let out = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        text.lines()
+            .next()
+            .and_then(|line| line.split(',').next())
+            .map(|image| image.trim_matches('"').to_owned())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// pid 对应的进程看起来是不是 mcsup
+///
+/// pid 文件与进程生命周期没有绑定：agent 崩溃后 pid 会被系统复用，
+/// 照 pid 直接杀会打死无关进程。终止前必须核对镜像名 / 命令行，
+/// 这与 `is_alive` 是两件事：活着不代表还是当初那个进程。
+fn is_mcsup_process(pid: u32) -> bool {
+    process_command(pid).is_some_and(|command| command.to_ascii_lowercase().contains("mcsup"))
 }
 
 /// 终止进程
@@ -1409,6 +1424,22 @@ mod tests {
     }
 
     struct MemCreds(Option<StoredCredential>);
+
+    /// 不存在的 pid 不能当成 mcsup：`--stop` 靠这条判定拒绝误杀
+    #[test]
+    fn nonexistent_pid_is_not_a_mcsup_process() {
+        assert!(!is_mcsup_process(u32::MAX), "无效 pid 不应被判为 mcsup");
+    }
+
+    /// `serve --stop` 的 pid 文件读写往返
+    #[test]
+    fn pid_file_round_trips() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_pid(dir.path(), 4242).expect("write");
+        assert_eq!(read_pid(dir.path()), Some(4242));
+        remove_pid(dir.path());
+        assert_eq!(read_pid(dir.path()), None);
+    }
 
     impl CredentialStore for MemCreds {
         fn put(&self, _: &str, _: &StoredCredential) -> Result<(), mcsup::auth::CredentialError> {

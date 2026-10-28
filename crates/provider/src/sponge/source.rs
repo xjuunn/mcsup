@@ -119,7 +119,9 @@ impl SpongeSource {
         version: &str,
     ) -> Result<domain::server::artifact::Checksum, SourceError> {
         let url = self.sha1_url(version);
-        match get_text(&self.http, &url, None).await {
+        // 404 必须归类为 `NotFound` 才能走下面的降级分支：Nexus 的 404 带 HTML
+        // body，若 `not_found_id` 为空会被归成 `Upstream`，侧车缺失就变成硬失败。
+        match get_text(&self.http, &url, Some(VersionId::new(version))).await {
             Ok(text) => Ok(parse_sha1_sidecar(&text)
                 .unwrap_or_else(domain::server::artifact::Checksum::unverified)),
             Err(SourceError::NotFound(_)) => Ok(domain::server::artifact::Checksum::unverified()),
@@ -334,5 +336,39 @@ mod tests {
     fn mc_axis_is_prefix_before_first_dash() {
         assert_eq!(mc_version_of("26.3-21.0.0-RC2755"), "26.3");
         assert_eq!(mc_version_of("1.21.1"), "1.21.1");
+    }
+
+    /// `.sha1` 侧车 404 必须降级为无校验
+    ///
+    /// Nexus 的 404 带 HTML body；若 `not_found_id` 为空会被归成 `Upstream`，
+    /// 一个存在的 JAR 会因缺侧车而安装失败。
+    #[tokio::test]
+    async fn missing_sha1_sidecar_degrades_to_unverified() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = [0_u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nContent-Type: text/html\r\n\r\nnot found",
+                )
+                .await
+                .expect("write");
+        });
+        let source = SpongeSource {
+            http: build_client().expect("client"),
+            repo_base: format!("http://{addr}"),
+        };
+        let checksum = source
+            .fetch_checksum("1.21.1-14.0.0")
+            .await
+            .expect("sidecar 缺失不应失败");
+        assert!(!checksum.is_verified());
     }
 }
