@@ -210,15 +210,24 @@ fn clone_error(err: &SupervisorError) -> SupervisorError {
 
 /// 一条状态项 → 状态结果
 fn entry_into_status(entry: WireStatusEntry) -> Result<Option<SupervisorStatus>, SupervisorError> {
-    entry.into_result().map_err(|message| {
-        // 单台查询失败：对端给的文案已含上下文；「不存在」归 Unreachable
-        if message.starts_with("server not found") {
-            SupervisorError::Unreachable(message)
-        } else {
-            SupervisorError::Remote {
-                kind: ErrorKind::IO.to_owned(),
-                message,
-            }
+    let kind = entry.kind.clone();
+    match entry.into_result() {
+        Ok(status) => Ok(status),
+        Err(message) => {
+            let err = match kind.as_deref() {
+                // 「不存在」与「连不上」在 service 侧都按不可达渲染；用对端给出的
+                // 结构化 kind 判定，不解析 message 文案
+                Some(ErrorKind::NOT_FOUND) => SupervisorError::Unreachable(message),
+                Some(other) => SupervisorError::Remote {
+                    kind: other.to_owned(),
+                    message,
+                },
+                None => SupervisorError::Remote {
+                    kind: ErrorKind::IO.to_owned(),
+                    message,
+                },
+            };
+            Err(err)
         }
-    })
+    }
 }

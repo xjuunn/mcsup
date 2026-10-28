@@ -337,7 +337,7 @@ SSH 起远端 agent + 本地 `ssh -L` 隧道，每条命令临时建立），
 | `status` | `mcsup remote status [<name>]` | 单个远端详情（缺名等价 list） |
 | `ping` | `mcsup remote ping <name>` | 连通性 / 版本 / 能力，供脚本使用 |
 | `disconnect` | `mcsup remote disconnect <name>` | 删除本地配对与凭证，远端不受影响 |
-| `revoke` | `mcsup remote revoke <client>` | 在 serve 端离线删除客户端记录，token 立即失效 |
+| `revoke` | `mcsup remote revoke <client>` | 在 serve 端**本机**离线删除客户端记录；该会话在下一帧请求前被拒（token 立即失效） |
 
 ### 来源（origin）与过滤
 

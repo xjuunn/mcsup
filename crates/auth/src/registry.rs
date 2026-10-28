@@ -34,6 +34,17 @@ pub struct ClientRecord {
     pub role: Role,
     /// 配对时间（Unix 秒）
     pub paired_at: i64,
+    /// 过期时间（Unix 秒）；`None` = 永不过期（兼容引入 TTL 前的旧记录）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+}
+
+impl ClientRecord {
+    /// 该记录此刻是否已过期
+    #[must_use]
+    pub fn is_expired(&self, now: i64) -> bool {
+        self.expires_at.is_some_and(|expires_at| now >= expires_at)
+    }
 }
 
 /// 名册操作失败
@@ -238,6 +249,7 @@ mod tests {
             digest: token.digest(),
             role,
             paired_at: 1_700_000_000,
+            expires_at: None,
         }
     }
 
@@ -335,6 +347,32 @@ mod tests {
             .set_role(&ClientId::generate(), Role::Admin)
             .expect_err("unknown");
         assert!(matches!(err, RegistryError::InvalidName(_)), "{err}");
+    }
+
+    #[test]
+    fn expired_record_is_detected_and_legacy_never_expires() {
+        let token = Token::generate().expect("token");
+        let mut rec = record("laptop", &token, Role::Operator);
+        // 旧记录（`expires-at` 缺省）永不过期
+        assert!(!rec.is_expired(4_000_000_000));
+        rec.expires_at = Some(1_700_000_100);
+        assert!(!rec.is_expired(1_700_000_099));
+        assert!(rec.is_expired(1_700_000_100));
+    }
+
+    /// 引入 TTL 前落盘的记录没有 `expires-at`，必须能读回且视为不过期
+    #[test]
+    fn legacy_record_without_expiry_deserializes() {
+        let token = Token::generate().expect("token");
+        let id = ClientId::generate();
+        let text = format!(
+            "client-id = \"{}\"\nname = \"laptop\"\ndigest = \"{}\"\nrole = \"operator\"\npaired-at = 1\n",
+            id.as_str(),
+            token.digest().as_str()
+        );
+        let rec: ClientRecord = toml::from_str(&text).expect("legacy record");
+        assert_eq!(rec.expires_at, None);
+        assert!(!rec.is_expired(i64::MAX));
     }
 
     #[test]

@@ -22,7 +22,7 @@ pub(crate) fn run(action: WorkspaceAction, printer: Printer) -> Result<()> {
     // 组合仓库版工作区服务：远端工作区出现在 list，本地 init / use / remove
     // 语义不变（service 的写落组合仓库的本地臂）
     let cfg = crate::config::ConfigFile::locate(None).load()?;
-    let members = bootstrap::remote_members(&cfg)?;
+    let members = bootstrap::remote_members(&cfg);
     let workspaces: Arc<dyn mcsup::port::WorkspaceRepository> = if members.is_empty() {
         local.clone()
     } else {

@@ -361,6 +361,14 @@ fn dispatch<S: std::io::Read + std::io::Write>(
             Err(err) => return Err(err),
         };
         let is_shutdown = matches!(request, Request::Shutdown);
+        // 每条业务帧前重查会话有效性：撤销 / 过期必须在**下一帧**就生效，
+        // 而不是等连接自然断开
+        if !handler.still_authorized(session_info) {
+            let _ = session.send_response(
+                &RemoteFailure::unauthorized("session revoked or expired").into_response(),
+            );
+            return Ok(());
+        }
         let response = if session_info.permits(&request) {
             handler.handle(session_info, &request)
         } else {

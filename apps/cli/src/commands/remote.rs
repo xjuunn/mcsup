@@ -69,7 +69,7 @@ pub(crate) fn run(action: RemoteAction, printer: Printer) -> Result<()> {
         RemoteAction::Status { name } => status(&file, name.as_deref(), printer),
         RemoteAction::Ping { name } => ping(&file, &name, printer),
         RemoteAction::Disconnect { name } => disconnect(&file, &name, printer),
-        RemoteAction::Revoke { client, listen } => revoke(&client, &listen, printer),
+        RemoteAction::Revoke { client } => revoke(&client, printer),
     }
 }
 
@@ -111,6 +111,20 @@ fn serve(
 
     write_pid(&data_dir, std::process::id())?;
     report_serve(&agent, &name, &addr.to_string(), &code, printer);
+    // 监听所有网卡时提醒暴露面：仅配对码保护，防火墙需用户自行处理
+    if addr.ip().is_unspecified() && printer.is_human() {
+        printer.print_warning(&crate::i18n::pick(
+            printer.lang(),
+            format!(
+                "正在监听所有网卡（{addr}）；仅配对码保护，请自行用防火墙限制可达范围，或改用 --listen 127.0.0.1:{} 只开本机",
+                addr.port()
+            ),
+            format!(
+                "listening on all interfaces ({addr}); it is protected only by the pairing code. Restrict access with a firewall, or bind loopback with `--listen 127.0.0.1:{}`",
+                addr.port()
+            ),
+        ));
+    }
 
     // 码自然过期时轮换：屏幕上始终有当前有效码。JSON 模式下每次变化打一行
     // JSONL，stdout 仍是纯数据。
@@ -287,6 +301,20 @@ fn serve_stop(data_dir: &Path, printer: Printer) -> Result<()> {
                 lang,
                 format!("agent 进程 {pid} 已不在，已清理陈旧 pid 文件"),
                 format!("agent process {pid} is gone; removed the stale pid file"),
+            ),
+            None,
+        )
+        .into());
+    }
+    // pid 可能被系统复用：先确认它看起来仍是 mcsup，避免误杀无关进程
+    if !looks_like_agent(pid) {
+        return Err(AppDiagnostic::failure(
+            crate::i18n::pick(
+                lang,
+                format!("进程 {pid} 看起来不是 mcsup agent，拒绝终止；请检查陈旧 pid 文件"),
+                format!(
+                    "process {pid} does not look like a mcsup agent; refusing to kill it (check the stale pid file)"
+                ),
             ),
             None,
         )
@@ -736,9 +764,7 @@ fn disconnect(file: &ConfigFile, name: &str, printer: Printer) -> Result<()> {
     let remote_name = crate::commands::origin::remote_name(name, lang)?;
     let mut cfg = file.load()?;
     let removed = cfg.remove_remote(&remote_name).is_some();
-    if removed {
-        file.save(&cfg)?;
-    }
+    // 先删凭证（安全优先：宁可留下一条缺凭证的配置记录，也不要留下有效 token）
     credential_store()
         .remove(remote_name.as_str())
         .context(crate::i18n::pick(
@@ -746,6 +772,9 @@ fn disconnect(file: &ConfigFile, name: &str, printer: Printer) -> Result<()> {
             "删除凭证",
             "removing the credential",
         ))?;
+    if removed {
+        file.save(&cfg)?;
+    }
     printer.print_outcome(
         &crate::i18n::pick(
             lang,
@@ -759,11 +788,9 @@ fn disconnect(file: &ConfigFile, name: &str, printer: Printer) -> Result<()> {
     )
 }
 
-/// `remote revoke`：在 serve 端离线删除客户端记录
-fn revoke(client: &str, listen: &str, printer: Printer) -> Result<()> {
+/// `remote revoke`：在 serve 端本机离线删除客户端记录
+fn revoke(client: &str, printer: Printer) -> Result<()> {
     let lang = printer.lang();
-    // `listen` 只用于提示当前实现是本地离线操作；保留参数让未来能切到 RPC
-    let _ = listen;
     let data_dir = crate::config::platform_data_dir();
     let registry = ClientRegistry::new(mcsup::remote::clients_path(&data_dir));
     let records = registry.load().context(crate::i18n::pick(
@@ -1188,6 +1215,42 @@ fn read_pid(data_dir: &Path) -> Option<u32> {
 
 fn remove_pid(data_dir: &Path) {
     let _ = std::fs::remove_file(pid_path(data_dir));
+}
+
+/// 该 pid 是否看起来是本项目的 agent（best-effort）
+///
+/// pid 文件是上次进程留下的；pid 可能已被系统复用。终止前确认命令行仍含
+/// `mcsup`，读不到命令行时按「像」处理（不牺牲原有功能）。
+fn looks_like_agent(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        match std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "command="])
+            .output()
+        {
+            Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+                .to_ascii_lowercase()
+                .contains("mcsup"),
+            _ => true,
+        }
+    }
+    #[cfg(windows)]
+    {
+        match std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+        {
+            Ok(output) => String::from_utf8_lossy(&output.stdout)
+                .to_ascii_lowercase()
+                .contains("mcsup"),
+            Err(_) => true,
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        true
+    }
 }
 
 /// 进程是否存活（`kill -0` / `tasklist`，不引平台库）

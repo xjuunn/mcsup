@@ -44,6 +44,15 @@ pub struct RoutingBackups {
     remotes: std::collections::HashMap<port::RemoteName, RemoteBackups>,
     /// 组合服务器仓库：id → 来源的唯一真相源
     servers: Arc<dyn port::ServerRepository>,
+    /// id → 来源缓存（同 `RoutingSupervisor`：单进程单命令内来源不变）
+    ///
+    /// 用 `Arc<OnceLock<…>>` 而不是裸 `OnceLock`：`RoutingBackups` 需要 `Clone`，
+    /// 克隆后共享同一份缓存。
+    origins: Arc<
+        std::sync::OnceLock<
+            Arc<std::collections::HashMap<domain::server::meta::ServerId, port::Origin>>,
+        >,
+    >,
 }
 
 impl std::fmt::Debug for RoutingBackups {
@@ -61,7 +70,35 @@ impl RoutingBackups {
         remotes: std::collections::HashMap<port::RemoteName, RemoteBackups>,
         servers: Arc<dyn port::ServerRepository>,
     ) -> Self {
-        Self { remotes, servers }
+        Self {
+            remotes,
+            servers,
+            origins: Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+
+    /// 取（必要时构建）id → 来源的缓存
+    fn origin_map(
+        &self,
+    ) -> Result<
+        Arc<std::collections::HashMap<domain::server::meta::ServerId, port::Origin>>,
+        RemoteBackupError,
+    > {
+        if let Some(map) = self.origins.get() {
+            return Ok(Arc::clone(map));
+        }
+        let sourced = self
+            .servers
+            .list_sourced()
+            .map_err(|err| RemoteBackupError::Unreachable(err.to_string()))?;
+        let map = Arc::new(
+            sourced
+                .into_iter()
+                .map(|entry| (entry.value.id, entry.origin))
+                .collect(),
+        );
+        let _ = self.origins.set(Arc::clone(&map));
+        Ok(map)
     }
 
     /// 按 id 解析远端执行器
@@ -69,17 +106,9 @@ impl RoutingBackups {
         &self,
         id: &domain::server::meta::ServerId,
     ) -> Result<&RemoteBackups, RemoteBackupError> {
-        let sourced = self
-            .servers
-            .list_sourced()
-            .map_err(|err| RemoteBackupError::Unreachable(err.to_string()))?;
-        let origin = sourced
-            .into_iter()
-            .find(|entry| entry.value.id == *id)
-            .map(|entry| entry.origin)
-            .ok_or_else(|| {
-                RemoteBackupError::NotFound(format!("no such server: {}", id.as_str()))
-            })?;
+        let origin = self.origin_map()?.get(id).cloned().ok_or_else(|| {
+            RemoteBackupError::NotFound(format!("no such server: {}", id.as_str()))
+        })?;
         match origin {
             port::Origin::Local => Err(RemoteBackupError::Unreachable(format!(
                 "server {} is local; remote backups do not apply",

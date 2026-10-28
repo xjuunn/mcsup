@@ -161,17 +161,26 @@ impl RemoteLink {
         self.client()?.call(request)
     }
 
-    /// 执行一个操作，把 `Error` 帧映射成 [`RepositoryError`]
+    /// 执行一个操作，把错误帧 / 传输失败映射成 [`RepositoryError`]
+    ///
+    /// 业务错误帧（`not_found` / `already_exists` / `invalid` …）在这里就转成
+    /// 对应的 [`RepositoryError`] 变体，**保留 kind**；调用方不应再看到
+    /// `Response::Error`。这样镜像仓库与 supervisor / backup 的错误分类口径一致。
     ///
     /// # Errors
     ///
-    /// 传输失败或对端拒绝时返回 [`RepositoryError::Storage`]；载荷解码失败
-    /// 返回 [`RepositoryError::Corrupt`]
+    /// 传输失败或对端拒绝时返回 [`RepositoryError`]；载荷解码失败返回
+    /// [`RepositoryError::Corrupt`]
     pub fn call(&self, request: &Request) -> Result<Response, RepositoryError> {
-        self.client()
+        let response = self
+            .client()
             .map_err(remote_error)?
             .call(request)
-            .map_err(remote_error)
+            .map_err(remote_error)?;
+        match response {
+            Response::Error { kind, message } => Err(repository_error(&kind, &message)),
+            other => Ok(other),
+        }
     }
 
     /// 执行一个操作并要求特定载荷；其余响应按协议错误处理
@@ -185,12 +194,28 @@ impl RemoteLink {
         what: &'static str,
     ) -> Result<Response, RepositoryError> {
         let response = self.call(request)?;
+        // `call` 已把业务错误帧转成 Err；这里只防漏网，不丢 kind
         if matches!(response, Response::Error { .. }) {
             return Err(RepositoryError::Storage(Box::new(
                 TransportError::Protocol(format!("expected {what}, got an error frame")),
             )));
         }
         Ok(response)
+    }
+}
+
+/// 业务错误帧（`ErrorKind` + message）→ [`RepositoryError`]
+///
+/// 镜像仓库与 supervisor / backup 共用的唯一分类出口：按 `kind` 映射，不看文案。
+fn repository_error(kind: &str, message: &str) -> RepositoryError {
+    match kind {
+        ErrorKind::NOT_FOUND => RepositoryError::NotFound(message.to_owned()),
+        ErrorKind::ALREADY_EXISTS => RepositoryError::AlreadyExists(message.to_owned()),
+        ErrorKind::PROTOCOL => RepositoryError::Corrupt(message.to_owned()),
+        _ => RepositoryError::Storage(Box::new(TransportError::Remote {
+            kind: kind.to_owned(),
+            message: message.to_owned(),
+        })),
     }
 }
 
@@ -201,12 +226,7 @@ impl RemoteLink {
 /// 链条最底层的 `TransportError` 给出提示与退出码。
 pub(crate) fn remote_error(err: TransportError) -> RepositoryError {
     match err {
-        TransportError::Remote { kind, message } => match kind.as_str() {
-            ErrorKind::NOT_FOUND => RepositoryError::NotFound(message),
-            ErrorKind::ALREADY_EXISTS => RepositoryError::AlreadyExists(message),
-            ErrorKind::PROTOCOL => RepositoryError::Corrupt(message),
-            _ => RepositoryError::Storage(Box::new(TransportError::Remote { kind, message })),
-        },
+        TransportError::Remote { kind, message } => repository_error(&kind, &message),
         other => RepositoryError::Storage(Box::new(other)),
     }
 }

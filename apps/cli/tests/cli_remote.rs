@@ -417,8 +417,9 @@ fn remote_server_create_list_and_remove_route_to_the_peer() {
     assert_ok(&status, "server status qualified");
     assert_eq!(json(&status)["name"], "web");
 
-    // 远端 install 复用同一帧：核心下载依赖外网，结果不固定，但
-    // 「退出码 ↔ jar 登记」必须一致
+    // 远端 install 复用同一帧：核心下载依赖外网，结果不固定。这里只断言
+    // 「成功 ⇒ 对端已登记 jar」；失败可能只是网络不可用，且此前 create 已
+    // 登记过核心，不能据此要求 jar 为空。
     let install = run(
         home_path,
         &["server", "install", "test-box/web", "--output", "json"],
@@ -427,12 +428,16 @@ fn remote_server_create_list_and_remove_route_to_the_peer() {
     assert_ok(&listed, "server ls after install");
     let all = json(&listed);
     let all = all.as_array().expect("array");
-    assert_eq!(
-        install.status.success(),
-        !all[0]["jar"].is_null(),
-        "install 退出码必须与核心登记状态一致（stderr=[{}])",
-        String::from_utf8_lossy(&install.stderr)
-    );
+    if install.status.success() {
+        assert!(
+            !all[0]["jar"].is_null(),
+            "install 成功时对端必须登记了 jar（stderr=[{}])",
+            String::from_utf8_lossy(&install.stderr)
+        );
+    } else {
+        // 失败也要保留服务器登记，供后续 remove 清理
+        assert_eq!(all[0]["name"], "web");
+    }
 
     let removed = run(
         home_path,

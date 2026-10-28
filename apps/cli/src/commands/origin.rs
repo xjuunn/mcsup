@@ -217,7 +217,7 @@ fn pick_hit<'a, T>(
 /// 远端读取失败，或该远端在配置里有记录但凭证 / 指纹不可用时返回错误
 pub(crate) fn remote_target(raw: &str, lang: crate::locale::Lang) -> Result<Option<RemoteTarget>> {
     let cfg = crate::config::ConfigFile::locate(None).load()?;
-    let members = crate::bootstrap::remote_members(&cfg)?;
+    let members = crate::bootstrap::remote_members(&cfg);
     if members.is_empty() {
         return Ok(None);
     }

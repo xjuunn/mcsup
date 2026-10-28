@@ -34,6 +34,9 @@ pub struct RoutingSupervisor {
     remotes: HashMap<RemoteName, RemoteSupervisor>,
     /// 组合服务器仓库：id → 来源的唯一真相源
     servers: Arc<dyn port::ServerRepository>,
+    /// id → 来源缓存：CLI 一个进程只跑一条命令，来源在进程内不会变；
+    /// 缓存避免每个操作都重新向所有远端拉一次列表（N+1）
+    origins: std::sync::OnceLock<Arc<HashMap<ServerId, Origin>>>,
 }
 
 impl std::fmt::Debug for RoutingSupervisor {
@@ -60,22 +63,34 @@ impl RoutingSupervisor {
             local,
             remotes,
             servers,
+            origins: std::sync::OnceLock::new(),
         }
     }
 
-    /// 按 id 解析目标：`Err` 表示该 id 不属于任何已接入一侧
-    fn resolve(&self, id: &ServerId) -> Result<&dyn SupervisorPort, SupervisorError> {
+    /// 取（必要时构建）id → 来源的缓存
+    fn origin_map(&self) -> Result<Arc<HashMap<ServerId, Origin>>, SupervisorError> {
+        if let Some(map) = self.origins.get() {
+            return Ok(Arc::clone(map));
+        }
         let sourced = self
             .servers
             .list_sourced()
             .map_err(|err| SupervisorError::Unreachable(err.to_string()))?;
-        let origin = sourced
+        let map: HashMap<ServerId, Origin> = sourced
             .into_iter()
-            .find(|entry| entry.value.id == *id)
-            .map(|entry| entry.origin)
-            .ok_or_else(|| {
-                SupervisorError::Unreachable(format!("no such server: {}", id.as_str()))
-            })?;
+            .map(|entry| (entry.value.id, entry.origin))
+            .collect();
+        let map = Arc::new(map);
+        // 并发首用时可能有人先 set 了；以先到的为准，结果相同
+        let _ = self.origins.set(Arc::clone(&map));
+        Ok(map)
+    }
+
+    /// 按 id 解析目标：`Err` 表示该 id 不属于任何已接入一侧
+    fn resolve(&self, id: &ServerId) -> Result<&dyn SupervisorPort, SupervisorError> {
+        let origin = self.origin_map()?.get(id).cloned().ok_or_else(|| {
+            SupervisorError::Unreachable(format!("no such server: {}", id.as_str()))
+        })?;
         match origin {
             Origin::Local => Ok(self.local.as_ref()),
             Origin::Remote(name) => self
@@ -113,25 +128,24 @@ impl SupervisorPort for RoutingSupervisor {
         &self,
         servers: &[ServerRef<'_>],
     ) -> Vec<Result<Option<SupervisorStatus>, SupervisorError>> {
-        // 先查一次来源，把请求按目标分桶；每桶一次调用，远端仍是单次批量 RPC
-        let sourced = match self.servers.list_sourced() {
-            Ok(sourced) => sourced,
+        // 先查一次来源（进程内缓存），把请求按目标分桶；每桶一次调用，远端仍是单次批量 RPC
+        let origins = match self.origin_map() {
+            Ok(origins) => origins,
             Err(err) => {
+                let message = err.to_string();
                 return servers
                     .iter()
-                    .map(|_| Err(SupervisorError::Unreachable(err.to_string())))
+                    .map(|_| Err(SupervisorError::Unreachable(message.clone())))
                     .collect();
             }
         };
 
         // 桶键即来源：本地 / 某台远端
         let mut buckets: Vec<(Origin, Vec<usize>)> = Vec::new();
-        let mut resolve_err: Option<(usize, SupervisorError)> = None;
+        let mut out: Vec<Option<Result<Option<SupervisorStatus>, SupervisorError>>> =
+            (0..servers.len()).map(|_| None).collect();
         for (index, server) in servers.iter().enumerate() {
-            let origin = sourced
-                .iter()
-                .find(|entry| entry.value.id == *server.id)
-                .map(|entry| entry.origin.clone());
+            let origin = origins.get(server.id).cloned();
             match origin {
                 Some(origin) => {
                     // 同目标的并入同一桶
@@ -150,19 +164,15 @@ impl SupervisorPort for RoutingSupervisor {
                     }
                 }
                 None => {
-                    resolve_err = Some((
-                        index,
-                        SupervisorError::Unreachable(format!(
-                            "no such server: {}",
-                            server.id.as_str()
-                        )),
-                    ));
+                    // 每个未知 id 各自保留错误，不能只记住最后一个
+                    out[index] = Some(Err(SupervisorError::Unreachable(format!(
+                        "no such server: {}",
+                        server.id.as_str()
+                    ))));
                 }
             }
         }
 
-        let mut out: Vec<Option<Result<Option<SupervisorStatus>, SupervisorError>>> =
-            (0..servers.len()).map(|_| None).collect();
         for (origin, indexes) in &buckets {
             let refs: Vec<ServerRef<'_>> = indexes.iter().map(|&i| servers[i]).collect();
             let results = match origin {
@@ -183,9 +193,6 @@ impl SupervisorPort for RoutingSupervisor {
             for (position, result) in results.into_iter().enumerate() {
                 out[indexes[position]] = Some(result);
             }
-        }
-        if let Some((index, err)) = resolve_err {
-            out[index] = Some(Err(err));
         }
         out.into_iter()
             .map(|slot| {

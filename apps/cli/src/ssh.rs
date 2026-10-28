@@ -156,7 +156,7 @@ pub(crate) fn parse_user_host(target: &str, lang: Lang) -> Result<(String, Strin
             None,
         )
     })?;
-    if user.is_empty() || host.is_empty() {
+    if user.is_empty() || host.is_empty() || target.starts_with('-') {
         return Err(AppDiagnostic::usage(
             crate::i18n::pick(
                 lang,
@@ -184,6 +184,8 @@ pub(crate) fn parse_user_host(target: &str, lang: Lang) -> Result<(String, Strin
 /// SSH 不可用、远端没有 mcsup、握手超时或首行非法时返回错误
 fn bootstrap(target: &str, lang: Lang) -> Result<(SshHandshake, Child, LineReader)> {
     let mut child = Command::new(ssh_bin())
+        // `--` 终止选项解析：目标即使以 `-` 开头也不会被 ssh 当成选项
+        .arg("--")
         .arg(target)
         .arg(remote_bin())
         .args(["remote", "__serve-ssh"])
@@ -241,6 +243,9 @@ fn bootstrap(target: &str, lang: Lang) -> Result<(SshHandshake, Child, LineReade
                     continue;
                 }
                 if let Ok(handshake) = serde_json::from_str::<SshHandshake>(trimmed) {
+                    // 握手成功后不再读 stderr：必须排空，否则远端日志写满管道
+                    // 会阻塞 agent（长会话里很常见）
+                    drain_child_stderr(&mut child);
                     return Ok((handshake, child, lines));
                 }
             }
@@ -336,6 +341,20 @@ fn take_stderr(child: &mut Child) -> String {
     stderr
 }
 
+/// 后台排空子进程 stderr，避免写满管道把对端阻塞
+///
+/// 只在「进程要继续跑」的路径调用：失败路径仍同步读取 stderr 用于报错。
+fn drain_child_stderr(child: &mut Child) {
+    let Some(mut stderr) = child.stderr.take() else {
+        return;
+    };
+    std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut buf = [0u8; 4096];
+        while matches!(stderr.read(&mut buf), Ok(read) if read > 0) {}
+    });
+}
+
 /// 建一条本地隧道到远端 agent 端口
 ///
 /// 本地端口由系统分配：先绑定 `127.0.0.1:0` 拿到端口再释放，交给 `ssh -L`。
@@ -376,8 +395,9 @@ fn open_tunnel(target: &str, remote_addr: &str, lang: Lang) -> Result<(String, C
     let local = format!("127.0.0.1:{local_port}");
     let forward = format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}");
 
-    let child = Command::new(ssh_bin())
+    let mut child = Command::new(ssh_bin())
         .args(["-N", "-o", "ExitOnForwardFailure=yes", "-L", &forward])
+        .arg("--")
         .arg(target)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -394,7 +414,14 @@ fn open_tunnel(target: &str, remote_addr: &str, lang: Lang) -> Result<(String, C
             )
         })?;
 
-    wait_ready(&local, lang)?;
+    // 隧道进程要长期存活：stderr 必须排空，否则写满管道会阻塞 ssh
+    drain_child_stderr(&mut child);
+    if let Err(err) = wait_ready(&local, lang) {
+        // 就绪失败不能留下孤儿 ssh 进程：先收掉再返回
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(err);
+    }
     Ok((local, child))
 }
 
@@ -458,7 +485,19 @@ pub(crate) fn session(target: &str, lang: Lang) -> Result<(String, SshHandshake)
     let mut guard = sessions()
         .lock()
         .map_err(|_| anyhow::anyhow!("ssh session registry is poisoned"))?;
+    // 建会话期间没有持锁，可能有人先登记了同一个目标：复用它，丢弃本次
+    if let Some((existing_local, existing_handshake)) = guard
+        .iter()
+        .find(|(key, _)| key == target)
+        .map(|(_, session)| (session.local.clone(), session.handshake.clone()))
+    {
+        drop(guard);
+        // Drop 会 kill 本次多起的引导进程 / 隧道
+        drop(session);
+        return Ok((existing_local, existing_handshake));
+    }
     guard.push((target.to_owned(), session));
+    drop(guard);
     Ok((local, handshake))
 }
 

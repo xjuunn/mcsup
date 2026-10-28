@@ -179,6 +179,8 @@ pub struct Agent {
     clients: ClientRegistry,
     /// 配对窗口：单码、单次使用、限速（`auth::code`）
     pairing: Mutex<PairingCodeStore>,
+    /// 名册写入串行化：`insert` / `revoke` 是读-改-写，并发会丢更新
+    registry_lock: Mutex<()>,
     /// 本机名（`remote connect` 的缺省远端名）
     server_name: String,
     /// 拉起远端 supervisor 的可执行文件：本进程自身（见 [`SuperviseSpec`]）
@@ -224,6 +226,7 @@ impl Agent {
             identity,
             clients: ClientRegistry::new(clients_path(data_dir)),
             pairing: Mutex::new(PairingCodeStore::new(PairingWindow::default())),
+            registry_lock: Mutex::new(()),
             server_name: server_name.into(),
             supervisor_exe,
             cwd,
@@ -506,11 +509,20 @@ impl Handler for Agent {
             digest: token.digest(),
             role,
             paired_at: now_secs().cast_signed(),
+            expires_at: Some(now_secs().cast_signed() + auth::token::DEFAULT_TOKEN_TTL_SECS),
         };
         let client_id = record.client_id.clone();
-        self.clients
-            .insert(record)
-            .map_err(|err| RemoteFailure::new(protocol::remote::ErrorKind::IO, err.to_string()))?;
+        {
+            let _guard = self.registry_lock.lock().map_err(|_| {
+                RemoteFailure::new(
+                    protocol::remote::ErrorKind::IO,
+                    "client registry lock is poisoned",
+                )
+            })?;
+            self.clients.insert(record).map_err(|err| {
+                RemoteFailure::new(protocol::remote::ErrorKind::IO, err.to_string())
+            })?;
+        }
         tracing::info!(client = %client_id, %name, ?role, "remote client enrolled");
         Ok(Enrolled {
             token: token.expose().to_owned(),
@@ -527,10 +539,28 @@ impl Handler for Agent {
             .find_by_digest(&parsed.digest())
             .map_err(|err| RemoteFailure::new(protocol::remote::ErrorKind::IO, err.to_string()))?
             .ok_or_else(|| RemoteFailure::unauthorized("token is unknown or revoked"))?;
+        if record.is_expired(now_secs().cast_signed()) {
+            return Err(RemoteFailure::unauthorized(
+                "token expired; run `remote connect` again",
+            ));
+        }
         Ok(SessionInfo {
             client_id: record.client_id,
             role: record.role,
         })
+    }
+
+    /// 每帧前重查名册：撤销 / 过期立即生效（`docs/remote.md`「安全」）
+    fn still_authorized(&self, session: &SessionInfo) -> bool {
+        match self.clients.find(&session.client_id) {
+            Ok(Some(record)) => !record.is_expired(now_secs().cast_signed()),
+            Ok(None) => false,
+            Err(err) => {
+                // 名册读不出来时按无效处理（fail-closed），并记一笔
+                tracing::warn!(%err, "client registry read failed; treating session as invalid");
+                false
+            }
+        }
     }
 
     fn handle(

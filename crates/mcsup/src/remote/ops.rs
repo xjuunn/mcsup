@@ -322,7 +322,14 @@ impl Agent {
             return RemoteFailure::new(ErrorKind::NOT_FOUND, format!("no such client: {selector}"))
                 .into_response();
         };
-        match self.clients.revoke(&client_id) {
+        let revoked = match self.registry_lock.lock() {
+            Ok(_guard) => self.clients.revoke(&client_id),
+            Err(_) => {
+                return RemoteFailure::new(ErrorKind::IO, "client registry lock is poisoned")
+                    .into_response();
+            }
+        };
+        match revoked {
             // 撤销即删除：本来就不存在也算成功（幂等）
             Ok(_) => {
                 tracing::info!(client = %client_id, "remote client revoked");
@@ -348,14 +355,20 @@ impl Agent {
         let mut items = Vec::with_capacity(ids.len());
         for id in ids {
             let Some(server) = servers.iter().find(|srv| srv.meta.id.as_str() == id) else {
-                items.push(WireStatusEntry::failed(format!("server not found: {id}")));
+                items.push(WireStatusEntry::failed_kind(
+                    ErrorKind::NOT_FOUND,
+                    format!("server not found: {id}"),
+                ));
                 continue;
             };
             let name = server.meta.name.as_str();
             items.push(match statuses.get(name) {
                 Some(Ok(status)) => WireStatusEntry::ok(status.as_ref()),
                 Some(Err(err)) => WireStatusEntry::failed(err.to_string()),
-                None => WireStatusEntry::failed(format!("no status for {name}")),
+                None => WireStatusEntry::failed_kind(
+                    ErrorKind::NOT_FOUND,
+                    format!("no status for {name}"),
+                ),
             });
         }
         Response::Statuses { items }
@@ -596,7 +609,14 @@ impl Agent {
             Err(err) => return failure(ErrorKind::IO, err),
         };
         runtime.block_on(async {
-            let staging = std::env::temp_dir();
+            // 每次创建用唯一暂存目录：多台远端命令可能并发创建整合包，
+            // 共享 `temp/mcsup-modpack-staging` 会互相删暂存文件
+            let staging = unique_staging_dir();
+            if let Err(err) = std::fs::create_dir_all(&staging) {
+                return failure(ErrorKind::IO, err);
+            }
+            // 守卫保证任何提前返回都会清理暂存目录
+            let _staging_guard = StagingGuard(staging.clone());
             let mut options = ModpackInstallOptions::new(&staging);
             if let Some(version) = version {
                 options = options.version(version);
@@ -640,10 +660,7 @@ impl Agent {
                 Ok(applied) => applied,
                 Err(err) => return modpack_failure(&err),
             };
-            // `.mrpack` 暂存目录用完即删
-            if let Some(parent) = prepared.archive_path.parent() {
-                let _ = std::fs::remove_dir_all(parent);
-            }
+            // `.mrpack` 暂存目录由 `StagingGuard` 在作用域结束时删除
             let updated = match self.core.registry.get(name) {
                 Ok(srv) => srv,
                 Err(err) => return registry_failure(&err),
@@ -1005,6 +1022,23 @@ fn current_thread_runtime() -> std::io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
+}
+
+/// 一次整合包创建用的唯一暂存目录
+fn unique_staging_dir() -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    std::env::temp_dir().join(format!("mcsup-modpack-{}-{nanos}", std::process::id()))
+}
+
+/// 暂存目录的 Drop 守卫：提前返回也会清理
+struct StagingGuard(std::path::PathBuf);
+
+impl Drop for StagingGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 fn workspace_failure(err: &WorkspaceError) -> Response {
