@@ -277,7 +277,12 @@ impl ServerLifecycleService {
 
         let settings = server.meta.settings;
         let runtimes = self.java.list_or_scan(on_first_scan, on_found)?;
-        let runtime = pick_runtime(&runtimes, settings.java_major, server.meta.java_major, name)?;
+        let runtime = pick_runtime(
+            &runtimes,
+            settings.java_major,
+            meta_java_major(server.meta.java_major, server.meta.version.as_str()),
+            name,
+        )?;
 
         let request = SupervisorStartRequest {
             server_id: server.meta.id.clone(),
@@ -448,7 +453,12 @@ impl ServerLifecycleService {
         let server = self.registry.get(name)?;
         let settings = server.meta.settings;
         let runtimes = self.java.list_or_scan(on_first_scan, on_found)?;
-        let runtime = pick_runtime(&runtimes, settings.java_major, server.meta.java_major, name)?;
+        let runtime = pick_runtime(
+            &runtimes,
+            settings.java_major,
+            meta_java_major(server.meta.java_major, server.meta.version.as_str()),
+            name,
+        )?;
         Ok(java_bin_under(&runtime.path))
     }
 
@@ -625,6 +635,18 @@ impl ServerLifecycleService {
     }
 }
 
+/// 服务器记录缺少 Java 要求时，按 MC 版本推算补上
+///
+/// `Fabric` / `Quilt` / `NeoForge` 的元数据不声明 Java 要求，旧记录里
+/// `java_major` 可能是 `None`。不补的话会落到「本机最高 JDK」，用 25 跑
+/// 要求 21 的模组会直接崩。推算口径与来源安装时写入的一致。
+fn meta_java_major(
+    recorded: Option<domain::java::JavaMajor>,
+    mc: &str,
+) -> Option<domain::java::JavaMajor> {
+    recorded.or_else(|| domain::server::version::required_java_major(mc))
+}
+
 /// Java 选择：`server set java-version` 绑定大版本时取该版本的运行时，
 /// 未绑定且服务器元数据记录了版本要求时按该要求取运行时，
 /// 否则取已注册运行时中的最高大版本
@@ -634,15 +656,23 @@ fn pick_runtime<'a>(
     meta_java_major: Option<domain::java::JavaMajor>,
     name: &str,
 ) -> Result<&'a domain::java::JavaRuntime, LifecycleError> {
+    // 一个运行时都没有：报「缺 Java」比报「缺 Java 21」更准确，交互入口
+    // 据此装当前 LTS
+    if runtimes.is_empty() {
+        return Err(LifecycleError::NoJava);
+    }
     // 优先级：显式绑定 > 服务器元数据记录的 java_major > 最高已注册版本
     let target_major = bound.or(meta_java_major);
     match target_major {
-        Some(major) => runtimes.iter().find(|rt| rt.major == major).ok_or_else(|| {
-            LifecycleError::UnknownJavaMajor {
-                name: name.to_owned(),
-                major,
-            }
-        }),
+        Some(major) => {
+            runtimes
+                .iter()
+                .find(|rt| rt.major == major)
+                .ok_or(LifecycleError::UnknownJavaMajor {
+                    name: name.to_owned(),
+                    major,
+                })
+        }
         // 无任何依据时不猜具体版本：用户装什么由交互入口决定
         None => runtimes
             .iter()
@@ -1518,6 +1548,23 @@ mod tests {
             requests[0].java_bin,
             java_bin_under(Path::new("/opt/java17"))
         );
+    }
+
+    /// 记录缺少 Java 要求时按 MC 版本补：`Fabric` / `Quilt` / `NeoForge` 的旧记录
+    /// 在 1.21.1 上必须推出 21，而不是落到本机最高 JDK
+    #[test]
+    fn meta_java_major_falls_back_to_mc_version() {
+        assert_eq!(
+            meta_java_major(None, "1.21.1"),
+            Some(JavaMajor::parse(21).expect("21"))
+        );
+        // 已记录的要求优先，不被 MC 版本覆盖
+        assert_eq!(
+            meta_java_major(Some(JavaMajor::parse(17).expect("17")), "1.21.1"),
+            Some(JavaMajor::parse(17).expect("17"))
+        );
+        // 快照版本无法推算时保持 None，由 `pick_runtime` 走原有兜底
+        assert_eq!(meta_java_major(None, "24w14a"), None);
     }
 
     /// 版本自带 Java 要求（`required_java_major`）：未绑定时按版本要求选运行时，

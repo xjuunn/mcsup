@@ -142,7 +142,9 @@ impl ServerJarSource for FabricSource {
                 checksum: Checksum::unverified(),
             },
             location,
-            java_major: None,
+            // Fabric 元数据不声明 Java 要求，按 MC 版本推算；否则启动时
+            // 会落到「本机最高 JDK」，用 SDK 25 跑要求 21 的 1.21.1 会崩
+            java_major: domain::server::version::required_java_major(&game),
             install: port::InstallKind::Direct,
             installer_args_dir: None,
         })
@@ -533,7 +535,7 @@ mod tests {
         assert!(mapped.iter().all(|v| v.variant == ServerVariant::Fabric));
         assert!(
             mapped.iter().all(|v| v.java_major.is_none()),
-            "Fabric 不做 MC Java 版本的猜测"
+            "版本列表不携带 Java 要求；安装时由 artifact 按 MC 版本推算"
         );
     }
 }

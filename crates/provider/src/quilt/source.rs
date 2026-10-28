@@ -200,10 +200,14 @@ impl ServerJarSource for QuiltSource {
     async fn artifact(&self, version: &VersionId) -> Result<port::ResolvedArtifact, SourceError> {
         // 先解析 MC 版本：不存在的版本应在打安装器之前报 `NotFound`，
         // 而不是给出一个「装哪儿都行」的安装器地址让下游失败
-        let _mc = self.resolve_mc(version).await?;
+        let mc = self.resolve_mc(version).await?;
         let _loader = self.pick_loader().await?;
         let location = parse_https_url(&self.installer_url)?;
-        Ok(Downloads::installer(location).resolve(version, None))
+        // Quilt 元数据不声明 Java 要求，按 MC 版本推算（与 Forge 同口径）
+        let java_major = domain::server::version::required_java_major(&mc);
+        Ok(Downloads::installer(location)
+            .java_major(java_major)
+            .resolve(version, None))
     }
 }
 

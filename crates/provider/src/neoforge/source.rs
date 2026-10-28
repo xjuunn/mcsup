@@ -217,8 +217,11 @@ impl ServerJarSource for NeoForgeSource {
         }
         let location = parse_https_url(&self.installer_url(&build))?;
         let checksum = self.fetch_checksum(&build).await?;
+        // NeoForge 元数据不声明 Java 要求，按 MC 版本推算（与 Forge 同口径）
+        let java_major = domain::server::version::required_java_major(&mc);
         Ok(Downloads::installer(location)
             .checksum(checksum)
+            .java_major(java_major)
             .resolve(version, Some(build)))
     }
 }
