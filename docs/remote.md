@@ -291,12 +291,16 @@ error: “web” 存在于多个位置
 - **传输**：必须 TLS，不提供明文模式。
 - **凭证**：token 存操作系统钥匙串（macOS Keychain / Windows Credential
   Manager / Linux Secret Service）；无钥匙串时退到权限 `0600` 的文件。用
-  `MCSUP_CREDENTIAL_STORE`（`auto` / `keyring` / `file`）显式选择后端，
-  `auto` 在无桌面会话的机器上自动落到文件。
+  `MCSUP_CREDENTIAL_STORE`（`auto` / `keyring` / `file`）显式选择后端；
+  `auto` 真实探测钥匙串是否可用，不可用（headless / 无 Secret Service）时
+  退到文件。新配对 token **30 天过期**，旧记录（无过期时间）按不过期兼容；
+  过期后重新 `remote connect` 即可。
 - **配对码**：短时有效、单次使用、限速尝试，防止暴力猜测。
-- **权限**：默认 operator，可 `--read-only`（viewer）；角色最小化为
-  Admin / Operator / Viewer，先满足真实需求。
-- **撤销**：revoke 立即失效 token 并断开现有连接。
+- **权限**：默认 operator，可 `--read-only`（viewer）。`Admin` 目前没有
+  配对入口，`Manage` 权限的 `Shutdown` / `ClientList` / `ClientRevoke` 帧
+  保留但**当前不可达**。
+- **撤销**：revoke 立即删除名册记录；已建立的连接在**下一帧**前重查名册，
+  被撤销 / 过期的会话随即被拒（不需要等连接自然断开）。
 - **审计**：agent 记录调用方、时间、操作、结果。
 - **无 Shell**：agent 只暴露带类型的 RPC，不接受任意命令或任意路径拼接。
 - **路径**：远端路径由 agent 按自身规则校验，客户端传入的路径不直接拼接

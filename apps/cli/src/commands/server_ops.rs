@@ -431,7 +431,7 @@ fn create_remote(
 ) -> Result<()> {
     let lang = printer.lang();
     let cfg = crate::config::ConfigFile::locate(None).load()?;
-    let members = bootstrap::remote_members(&cfg)?;
+    let members = bootstrap::remote_members(&cfg);
     let member = super::origin::member(&members, origin, lang)?.ok_or_else(|| {
         AppDiagnostic::usage(
             crate::i18n::pick(
@@ -1530,7 +1530,7 @@ fn link_remote(
 ) -> Result<()> {
     let lang = printer.lang();
     let cfg = crate::config::ConfigFile::locate(None).load()?;
-    let members = bootstrap::remote_members(&cfg)?;
+    let members = bootstrap::remote_members(&cfg);
     let member = super::origin::member(&members, origin, lang)?.ok_or_else(|| {
         AppDiagnostic::usage(
             crate::i18n::pick(
@@ -1744,7 +1744,7 @@ pub(crate) fn remove_remote(
 ) -> Result<()> {
     let lang = printer.lang();
     let cfg = crate::config::ConfigFile::locate(None).load()?;
-    let members = bootstrap::remote_members(&cfg)?;
+    let members = bootstrap::remote_members(&cfg);
     let member = super::origin::member(&members, origin, lang)?.ok_or_else(|| {
         AppDiagnostic::usage(
             crate::i18n::pick(

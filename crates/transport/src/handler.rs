@@ -127,6 +127,15 @@ pub trait Handler: Send + Sync {
     /// token 无效或已被撤销时返回 [`RemoteFailure`]
     fn authenticate(&self, token: &str) -> Result<SessionInfo, RemoteFailure>;
 
+    /// 该会话此刻是否仍然有效（撤销 / 过期后返回 `false`）
+    ///
+    /// 传输层在**每条业务帧前**调用：认证只在连接建立时做一次，而一旦连接
+    /// 建立，撤销或过期不会自动生效。默认恒真——只有真正持有名册的实现
+    /// （agent）才需要覆写；内存垫片 / 测试不需要。
+    fn still_authorized(&self, _session: &SessionInfo) -> bool {
+        true
+    }
+
     /// 执行一个已认证的操作
     fn handle(&self, session: &SessionInfo, request: &Request) -> Response;
 }

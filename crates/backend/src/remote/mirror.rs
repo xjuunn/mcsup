@@ -962,6 +962,16 @@ mod tests {
     }
 
     #[test]
+    fn peer_not_found_maps_to_repository_not_found() {
+        let harness = PairingHarness::spawn();
+        let servers = RemoteServerRepository::new(harness.link(), origin());
+        // 垫片对未知服务器的 install 回 NOT_FOUND；错误分类必须保留 kind，
+        // 不能被统一吞成「协议错误」
+        let err = servers.install("missing", "1.21.1").expect_err("not found");
+        assert!(matches!(err, RepositoryError::NotFound(_)), "{err:?}");
+    }
+
+    #[test]
     fn trait_write_methods_are_explicitly_unsupported() {
         // 编译期验证：这些方法存在且返回错误，而不是 panic
         let harness = PairingHarness::spawn();

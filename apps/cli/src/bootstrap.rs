@@ -51,7 +51,7 @@ pub(crate) fn open_java_service() -> Result<JavaService> {
     let store = open_store()?;
     // Java 注册表用组合仓库：远端 JVM 出现在 `java list` 里（离线降级为本地）
     let cfg = ConfigFile::locate(None).load()?;
-    let members = remote_members(&cfg)?;
+    let members = remote_members(&cfg);
     let repo: Arc<dyn mcsup::port::JavaRuntimeRepository> = if members.is_empty() {
         store.clone()
     } else {
@@ -254,15 +254,15 @@ pub(crate) fn join_variants(available: &[ServerVariant], lang: Lang) -> String {
 /// 任何一台远端连不上都只是跳过（warn），不阻塞本地命令——离线是常态而非
 /// 异常（`docs/remote.md`「设计原则 4」）。配置记录缺凭证同样跳过：可能是
 /// 配对到一半被中断，入口命令会在用到该远端时报「未认证」。
-pub(crate) fn remote_members(cfg: &mcsup::service::Config) -> Result<RemoteMembers> {
+pub(crate) fn remote_members(cfg: &mcsup::service::Config) -> RemoteMembers {
     let credentials = credential_store();
     let mut members = RemoteMembers::empty();
     for (name, record) in &cfg.remotes {
-        if let Some(member) = build_member(name, record, &credentials)? {
+        if let Some(member) = build_member(name, record, &credentials) {
             members.push(member);
         }
     }
-    Ok(members)
+    members
 }
 
 /// 单台远端 → 成员；任何一步不满足都返回 `None`（跳过该台，不阻塞其余）
@@ -277,25 +277,32 @@ fn build_member(
     name: &str,
     record: &mcsup::service::RemoteRecord,
     credentials: &dyn mcsup::auth::CredentialStore,
-) -> Result<Option<RemoteMember>> {
+) -> Option<RemoteMember> {
     let remote_name = match RemoteName::parse(name) {
         Ok(name) => name,
         Err(err) => {
             tracing::warn!(remote = %name, %err, "invalid remote name in config; skipping");
-            return Ok(None);
+            return None;
         }
     };
     let Some(fingerprint_hex) = record.fingerprint.as_deref() else {
         tracing::warn!(remote = %name, "remote has no pinned fingerprint; skipping");
-        return Ok(None);
+        return None;
     };
-    let fingerprint = Fingerprint::parse(fingerprint_hex)
-        .with_context(|| format!("解析远端 {name} 的证书指纹"))?;
+    let fingerprint = match Fingerprint::parse(fingerprint_hex) {
+        Ok(fingerprint) => fingerprint,
+        // 一条记录的指纹损坏只跳过该台：让整个 `remote_members` 失败会把
+        // 纯本地命令也一起拖垮，违背「离线/坏记录不阻塞」的约定
+        Err(err) => {
+            tracing::warn!(remote = %name, %err, "invalid pinned fingerprint in config; skipping");
+            return None;
+        }
+    };
     let credential = match credentials.get(name) {
         Ok(cred) => cred,
         Err(err) => {
             tracing::warn!(remote = %name, %err, "no usable credential; skipping");
-            return Ok(None);
+            return None;
         }
     };
     let link = match record.via {
@@ -320,7 +327,7 @@ fn build_member(
             )
         }
     };
-    Ok(Some(RemoteMember::new(link, remote_name)))
+    Some(RemoteMember::new(link, remote_name))
 }
 
 /// 客户端凭证存储：优先系统钥匙串，无钥匙串时退到 `{data_dir}/credentials.toml`
@@ -340,7 +347,7 @@ pub(crate) fn open_credential_store() -> mcsup::auth::CredentialVault {
 pub(crate) fn open_mcsup_with_remotes() -> Result<Mcsup> {
     let data_dir = config::platform_data_dir();
     let cfg = ConfigFile::locate(None).load()?;
-    let members = remote_members(&cfg)?;
+    let members = remote_members(&cfg);
     if members.is_empty() {
         return open_mcsup();
     }
@@ -400,7 +407,7 @@ pub(crate) fn open_mcsup_with_remotes() -> Result<Mcsup> {
 pub(crate) fn open_registry_with_remotes() -> Result<Arc<mcsup::service::ServerRegistry>> {
     let store = open_store()?;
     let cfg = ConfigFile::locate(None).load()?;
-    let members = remote_members(&cfg)?;
+    let members = remote_members(&cfg);
     let servers: Arc<dyn mcsup::port::ServerRepository> = if members.is_empty() {
         store.clone()
     } else {
@@ -491,9 +498,8 @@ mod remote_tests {
             data_dir: None,
             remotes: BTreeMap::from([("box".to_owned(), record("127.0.0.1:7681", Some(FPR)))]),
         };
-        let member = build_member("box", cfg.remotes.get("box").expect("rec"), &creds)
-            .expect("build")
-            .expect("member");
+        let member =
+            build_member("box", cfg.remotes.get("box").expect("rec"), &creds).expect("member");
         assert_eq!(member.name.as_str(), "box");
     }
 
@@ -502,7 +508,7 @@ mod remote_tests {
     fn missing_fingerprint_skips() {
         let creds = MemCredentials(BTreeMap::from([("box".to_owned(), credential("a"))]));
         let rec = record("127.0.0.1:7681", None);
-        assert!(build_member("box", &rec, &creds).expect("build").is_none());
+        assert!(build_member("box", &rec, &creds).is_none());
     }
 
     /// 缺凭证 → 跳过（配对到一半）
@@ -510,7 +516,7 @@ mod remote_tests {
     fn missing_credential_skips() {
         let creds = MemCredentials(BTreeMap::new());
         let rec = record("127.0.0.1:7681", Some(FPR));
-        assert!(build_member("box", &rec, &creds).expect("build").is_none());
+        assert!(build_member("box", &rec, &creds).is_none());
     }
 
     /// ssh 接入也装配成成员：地址延迟解析，装配期不起 ssh 子进程
@@ -519,9 +525,7 @@ mod remote_tests {
         let creds = MemCredentials(BTreeMap::from([("box".to_owned(), credential("a"))]));
         let mut rec = record("user@host", Some(FPR));
         rec.via = RemoteVia::Ssh;
-        let member = build_member("box", &rec, &creds)
-            .expect("build")
-            .expect("member");
+        let member = build_member("box", &rec, &creds).expect("member");
         assert_eq!(member.name.as_str(), "box");
         // 日志与错误信息里指代的是原始 SSH 目标，不是隧道端口
         assert_eq!(member.servers_link().target(), "user@host");
@@ -532,7 +536,7 @@ mod remote_tests {
     fn invalid_name_skips() {
         let creds = MemCredentials(BTreeMap::from([("b/ad".to_owned(), credential("a"))]));
         let rec = record("127.0.0.1:7681", Some(FPR));
-        assert!(build_member("b/ad", &rec, &creds).expect("build").is_none());
+        assert!(build_member("b/ad", &rec, &creds).is_none());
     }
 
     /// 成员表空判定：过滤后一台不剩时走纯本地路径
@@ -545,7 +549,7 @@ mod remote_tests {
             "box".to_owned(),
             record("127.0.0.1:7681", None), // 缺指纹
         );
-        let members = remote_members(&cfg).expect("members");
+        let members = remote_members(&cfg);
         assert!(members.is_empty());
     }
 }

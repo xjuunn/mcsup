@@ -465,6 +465,31 @@ impl Request {
         }
     }
 
+    /// 该帧在「连接断开后重发」是否安全
+    ///
+    /// 传输层在复用连接断掉时会重连一次；只有**只读 / 幂等**的帧允许重发。
+    /// 写帧被对端执行后若响应丢失，重发会造成重复副作用（重复快照、重复下载、
+    /// 二次登记），因此一律不重试——宁可让用户看到一次失败后自己重试。
+    #[must_use]
+    pub const fn is_retry_safe(&self) -> bool {
+        matches!(
+            self,
+            Self::Ping
+                | Self::WorkspaceList
+                | Self::ServerList
+                | Self::ServerVariants
+                | Self::ServerVersions { .. }
+                | Self::PropsGet { .. }
+                | Self::JavaList
+                | Self::ClientList
+                | Self::StatusMany { .. }
+                | Self::LogsTail { .. }
+                | Self::LogsFollow { .. }
+                | Self::BackupList { .. }
+                | Self::BackupVerify { .. }
+        )
+    }
+
     /// 操作名（审计日志、错误提示共用）
     #[must_use]
     pub const fn operation(&self) -> &'static str {
@@ -1273,6 +1298,66 @@ mod tests {
             java_major: None,
         };
         assert!(ServerVersion::try_from(bad).is_err());
+    }
+
+    /// 重试安全判定必须对写操作保守
+    #[test]
+    fn retry_safety_is_conservative_for_writes() {
+        assert!(Request::Ping.is_retry_safe());
+        assert!(Request::ServerList.is_retry_safe());
+        assert!(Request::ServerVariants.is_retry_safe());
+        assert!(
+            Request::ServerVersions {
+                variant: "paper".to_owned()
+            }
+            .is_retry_safe()
+        );
+        assert!(
+            Request::BackupList {
+                server_id: "id".to_owned(),
+                page: 1,
+                page_size: 20
+            }
+            .is_retry_safe()
+        );
+
+        for write in [
+            Request::ServerLink {
+                target: "/srv/x".to_owned(),
+                name: None,
+                workspace: None,
+            },
+            Request::ServerCreate {
+                workspace: None,
+                name: "web".to_owned(),
+                version: "1.21.1".to_owned(),
+                variant: "vanilla".to_owned(),
+                java_major: None,
+            },
+            Request::BackupCreate {
+                server_id: "id".to_owned(),
+                label: None,
+                scope: None,
+                no_reuse: false,
+                flush_wait_ms: None,
+            },
+            Request::BackupRestore {
+                server_id: "id".to_owned(),
+                snapshot: "s".to_owned(),
+                to_new: None,
+            },
+            Request::Start {
+                server_id: "id".to_owned(),
+                ram_mib: None,
+                accept_eula: false,
+            },
+        ] {
+            assert!(
+                !write.is_retry_safe(),
+                "{} 不得在断线后自动重发",
+                write.operation()
+            );
+        }
     }
 
     #[test]

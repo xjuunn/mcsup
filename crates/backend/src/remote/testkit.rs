@@ -387,10 +387,12 @@ pub(crate) mod mcsup_agent_shim {
                                 Some(srv) => WireStatusEntry {
                                     status: Some(srv.status.clone()),
                                     error: None,
+                                    kind: None,
                                 },
                                 None => WireStatusEntry {
                                     status: None,
                                     error: None,
+                                    kind: None,
                                 },
                             })
                             .collect(),

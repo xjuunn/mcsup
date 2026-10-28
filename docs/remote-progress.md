@@ -19,8 +19,51 @@
 | 10 | CLI `remote` 命令与 `--origin`（含 SSH 接入） | 完成（局域网发现待实现） |
 | 11 | 远端能力对等：props / set / console / version / install / modpack / java install·uninstall | 完成 |
 | 12 | `server link` 远端化、`server create --origin` 交互向导、系统钥匙串 | 完成（跨机器真机仍待手工） |
+| 13 | 健壮性/安全修复：错误分类、重试幂等、TTL、撤销即时性、SSH、keyring 探测等 | 完成 |
 
 ## 已完成
+
+### 阶段 13：健壮性与安全修复
+
+针对代码审查发现的问题做的一轮修复（不改变命令形态）：
+
+- **错误分类**：`RemoteLink::call` 把业务错误帧按 `ErrorKind` 转成对应
+  `RepositoryError`（not_found / already_exists / corrupt），镜像写不再被统一
+  吞成「协议错误」。
+- **重试幂等**：`Request::is_retry_safe()` 只允许只读/幂等帧在断线后自动重发，
+  写帧不重试，避免重复快照 / 重复下载 / 二次登记。
+- **token TTL**：新配对 30 天过期（`DEFAULT_TOKEN_TTL_SECS`），旧记录无
+  `expires-at` 按不过期兼容；`authenticate` 拒绝过期 token。
+- **撤销即时性**：`Handler::still_authorized` 在**每帧前**重查名册，撤销 / 过期
+  的会话下一帧即被拒（无需等连接断开）。
+- **Admin 缺口**：不提供 Admin 配对入口；文档标明 `Manage` 帧（`Shutdown` /
+  `ClientList` / `ClientRevoke`）保留但当前不可达；修正 `serve --stop` 帮助文案
+  （实际按 pid 停机，不走 Shutdown 帧）。
+- **SSH**：`ssh` 目标前置 `--` 并拒绝以 `-` 开头（防选项注入）；引导 / 隧道
+  子进程 stderr 后台排空（防管道写满阻塞）；隧道就绪失败时收掉 ssh 子进程；
+  会话登记二次检查避免重复建会话。
+- **配置健壮性**：单条远端指纹损坏只跳过该台，不再拖垮所有命令。
+- **路由性能**：`RoutingSupervisor` / `RoutingBackups` 缓存 id→来源映射，
+  每个操作不再重复向所有远端拉列表（消除 N+1）；`status_many` 多个未知 id
+  各自保留错误。
+- **钥匙串回退**：`auto` 真实探测钥匙串可用性（只读探针），不可用才退文件。
+- **整合包暂存**：远端每次创建使用唯一暂存目录，并用 Drop 守卫清理。
+- **名册并发**：agent 对 `insert` / `revoke` 串行化，避免读-改-写丢更新。
+- **CLI 一致性**：移除 `remote revoke` 上无效的 `--listen`；`disconnect` 先删
+  凭证再删配置（不留下孤立 token）；`remote serve` 绑定所有网卡时打印暴露面提醒。
+
+保留不改（有意为之）：
+
+- **单请求读写超时 600s**：安装核心 / 扫描 Java 是分钟级操作，缩短会误伤；
+  对端黑洞时确实可能长时间等待，权衡后保留。
+- **`NOT_FOUND` → `SupervisorError::Unreachable`**：`service` 侧把「不存在」与
+  「不可达」都按「目标不可用」渲染，统一归 `Unreachable`，不额外区分。
+- **默认监听 `0.0.0.0:7681`**：直连接入需要局域网可达；已用运行时提醒引导
+  用户收紧防火墙或改绑回环。
+- **`server link` / `workspace init --origin` 接受任意绝对路径**：远端管理员
+  的既有能力（`Write` 权限），不引入白名单以免阻断合法布局。
+- **钥匙串 `names()` 依赖索引 entry**：实体先写、索引后写，最坏是漏列而不是
+  列出不存在的凭证；`get` 仍按名可靠读取。
 
 ### 阶段 11：远端能力对等
 

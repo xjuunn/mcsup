@@ -542,7 +542,7 @@ pub(crate) enum RemoteAction {
         listen: String,
         #[arg(long, value_name = "NAME", help = crate::meta::remote_name_arg())]
         name: Option<String>,
-        /// 停止本机服务（向正在运行的 agent 发 Shutdown）
+        /// 按 pid 文件停止本机前台 agent（不经过网络）
         #[arg(long, conflicts_with_all = ["name", "status"])]
         stop: bool,
         /// 查看本机服务状态（身份、指纹、已配对客户端）
@@ -582,8 +582,6 @@ pub(crate) enum RemoteAction {
     Revoke {
         /// 客户端 id 或名称
         client: String,
-        #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:7681")]
-        listen: String,
     },
     /// SSH 引导入口（隐藏）：前台起 agent，把握手 JSON 写 stdout
     #[command(name = "__serve-ssh", hide = true)]

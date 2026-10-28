@@ -428,7 +428,7 @@ enum StoreChoice {
     Keyring,
 }
 
-/// 解析环境变量取值；`auto` / 非法值都返回 `None`，交给平台能力决定
+/// 解析环境变量取值；`auto` / 非法值都返回 `None`，交给可用性探测决定
 fn parse_choice(raw: Option<&str>) -> Option<StoreChoice> {
     match raw.map(str::trim) {
         Some("file") => Some(StoreChoice::File),
@@ -437,25 +437,26 @@ fn parse_choice(raw: Option<&str>) -> Option<StoreChoice> {
     }
 }
 
-/// `auto` 模式下是否默认使用钥匙串
+/// 探针 account：只读探测一个不存在的条目
+const PROBE_ACCOUNT: &str = "__mcsup_probe__";
+
+/// 选择后端：显式取值优先，否则按钥匙串是否真的可用决定
+fn choose_backend(raw: Option<&str>, keyring_available: bool) -> StoreChoice {
+    parse_choice(raw).unwrap_or(if keyring_available {
+        StoreChoice::Keyring
+    } else {
+        StoreChoice::File
+    })
+}
+
+/// 本机钥匙串此刻是否可用（进程内只探测一次）
 ///
-/// macOS / Windows 默认使用；其余 Unix 只在存在会话总线 / 运行时目录（说明
-/// 有 Secret Service）时使用，否则直接落到 0600 文件——headless 服务器上
-/// 没有钥匙串，硬试只会每次报错。
-fn auto_prefers_keyring() -> bool {
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    {
-        true
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some()
-            || std::env::var_os("XDG_RUNTIME_DIR").is_some()
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        false
-    }
+/// 不看平台 / 环境变量，而是真的读一个不存在的探针条目：
+/// `Ok(None)` / `Ok(Some(_))` 说明后端能工作，`Err` 说明没有可用的钥匙串
+/// （headless 机器、没有 Secret Service 等），此时退到 0600 文件。
+fn keyring_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| SystemKeyring.get(KEYRING_SERVICE, PROBE_ACCOUNT).is_ok())
 }
 
 /// 平台凭证存储：优先系统钥匙串，无钥匙串时退到 0600 文件
@@ -476,14 +477,10 @@ impl CredentialVault {
     #[must_use]
     pub fn open(file_path: impl Into<PathBuf>) -> Self {
         let file_path = file_path.into();
-        let choice = parse_choice(std::env::var(CREDENTIAL_STORE_ENV).ok().as_deref())
-            .unwrap_or_else(|| {
-                if auto_prefers_keyring() {
-                    StoreChoice::Keyring
-                } else {
-                    StoreChoice::File
-                }
-            });
+        let choice = choose_backend(
+            std::env::var(CREDENTIAL_STORE_ENV).ok().as_deref(),
+            keyring_available(),
+        );
         match choice {
             StoreChoice::Keyring => {
                 Self::Keyring(KeyringCredentialStore::new(KEYRING_SERVICE, SystemKeyring))
@@ -708,6 +705,12 @@ mod tests {
         assert_eq!(parse_choice(Some("keyring")), Some(StoreChoice::Keyring));
         // 非法值按 auto 处理，不 panic
         assert_eq!(parse_choice(Some("bogus")), None);
+
+        // auto：按钥匙串真实可用性决定；显式取值优先
+        assert_eq!(choose_backend(None, true), StoreChoice::Keyring);
+        assert_eq!(choose_backend(None, false), StoreChoice::File);
+        assert_eq!(choose_backend(Some("file"), true), StoreChoice::File);
+        assert_eq!(choose_backend(Some("keyring"), false), StoreChoice::Keyring);
 
         let dir = tempfile::TempDir::new().expect("tempdir");
         let path = dir.path().join("credentials.toml");
