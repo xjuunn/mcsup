@@ -433,7 +433,7 @@ pub(crate) fn open_registry_with_remotes() -> Result<Arc<mcsup::service::ServerR
 pub(crate) fn workspace_service_with_remotes() -> Result<mcsup::service::WorkspaceService> {
     let store = open_store()?;
     let cfg = ConfigFile::locate(None).load()?;
-    let members = remote_members(&cfg)?;
+    let members = remote_members(&cfg);
     let workspaces: Arc<dyn mcsup::port::WorkspaceRepository> = if members.is_empty() {
         store.clone()
     } else {
