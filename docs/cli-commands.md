@@ -331,7 +331,7 @@ SSH 起远端 agent + 本地 `ssh -L` 隧道，每条命令临时建立），
 | `serve` | `mcsup remote serve [--listen <addr>] [--name <n>]` | 本机作为被连接端：前台运行 agent，打印名称 / 地址 / 指纹 / 配对码（码过期自动轮换） |
 | `serve --stop` | `mcsup remote serve --stop` | 按 `{data_dir}/remote/agent.pid` 终止前台进程 |
 | `serve --status` | `mcsup remote serve --status` | 离线读本机身份、指纹、pid 与已配对客户端 |
-| `connect` | `mcsup remote connect <host[:port]> [--code <码>] [-y]` | 直连配对：probe 捕获指纹 → 展示确认（非交互需 `-y`）→ `Enroll` → 写配置与凭证 |
+| `connect` | `mcsup remote connect <host[:port]> [--name <名>] [--code <码>] [-y]` | 直连配对：probe 捕获指纹 → 展示确认（非交互需 `-y`）→ 交互命名（默认对端自报主机名，`--name` 跳过）→ `Enroll` → 写配置与凭证 |
 | `reconnect` | `mcsup remote reconnect <name>` | 复用记录重新认证；指纹变化要求重新 connect |
 | `list` | `mcsup remote list` | 已配对远端、连接状态（`ok` / `unreachable` / `unauthorized`）、角色、agent 版本 |
 | `status` | `mcsup remote status [<name>]` | 单个远端详情（缺名等价 list） |

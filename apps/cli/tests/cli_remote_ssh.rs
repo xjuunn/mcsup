@@ -220,6 +220,15 @@ fn ssh_connect_then_every_command_rebuilds_the_tunnel() {
                     .join("config.toml"),
             )
         })
+        .or_else(|_| {
+            std::fs::read_to_string(
+                home_path
+                    .join("Library")
+                    .join("Application Support")
+                    .join("mcsup")
+                    .join("config.toml"),
+            )
+        })
         .expect("config.toml");
     assert!(config.contains("via = \"ssh\""), "{config}");
     assert!(config.contains("target = \"me@ssh-box\""), "{config}");
