@@ -346,7 +346,7 @@ fn connect(
         )
     })?;
     let fingerprint = confirm_fingerprint(&probe, printer)?;
-    let remote_name = resolve_remote_name(name, &probe, file, &target, printer)?;
+    let remote_name = resolve_remote_name(name, file, &target, printer)?;
     let code = resolve_pairing_code(code, &probe, printer)?;
     let client_name = client_display_name();
 
@@ -424,7 +424,7 @@ fn connect_ssh(
     // 指纹必须与远端自报的一致（probe 已校验），用户仍需确认——SSH 只证明
     // 「能登上去」，不证明「agent 是同一台机器上的那个」
     let fingerprint = confirm_fingerprint(&probe, printer)?;
-    let remote_name = resolve_remote_name(name, &probe, file, &ssh_target, printer)?;
+    let remote_name = resolve_remote_name(name, file, &ssh_target, printer)?;
     let client_name = client_display_name();
     let client = Client::new(&local, fingerprint.clone());
     let enrolled = client
@@ -1019,7 +1019,6 @@ fn resolve_pairing_code(code: Option<String>, probe: &Probe, printer: Printer) -
 /// 避免一次回车静默覆盖别的远端。
 fn resolve_remote_name(
     name: Option<&str>,
-    probe: &Probe,
     file: &ConfigFile,
     target: &str,
     printer: Printer,
@@ -1043,11 +1042,7 @@ fn resolve_remote_name(
     loop {
         let entered = prompts::input_remote_name(
             lang,
-            &crate::i18n::pick(
-                lang,
-                format!("为远程设备命名（{}）", probe.greeting.server_name),
-                format!("name this remote ({})", probe.greeting.server_name),
-            ),
+            &crate::i18n::pick(lang, "为远程设备命名", "name this remote"),
             &candidate,
         )?;
         let name = crate::commands::origin::remote_name(&entered, lang)?;
