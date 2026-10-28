@@ -75,8 +75,39 @@ Windows 事件日志经 `wevtutil`（系统自带，参数为固定字面量）�
 cargo build -p dev
 ```
 
-仓库根目录的 `opencode.jsonc` 已指向 `./target/debug/mcsup-dev-tools.exe`。
-其他客户端把同样的命令配成 `stdio` 服务器即可。
+### 所有 worktree 共用一份构建产物
+
+`opencode.jsonc` 指向 `scripts/dev-tools.cmd`（Windows）而不是直接指向 exe。
+原因有两个：
+
+1. **产物位置不在 worktree 内**。所有 worktree 共用
+   `$(git rev-parse --git-common-dir)/mcsup-build/`，该路径由启动器在运行时
+   算出；配置里没法执行 git 命令。
+2. **工程根不靠 exe 位置判断**。客户端把 cwd 设为当前 worktree，`workspace_root()`
+   从 cwd 上溯，因此同一个 exe 能被每个 worktree 正确识别——`get_diff`
+   报的是该 worktree 的分支与改动，`run_check` 跑的是该 worktree 的脚本。
+
+构建缓存的共享由 `scripts/dev-tools-env.sh` 提供，`scripts/check.sh` 与
+`scripts/check-e2e.sh` 都会 source 它并导出 `CARGO_TARGET_DIR`。冷缓存下整棵
+依赖树只需编一次，之后每个 worktree 直接复用。
+
+第一次使用前在当前 worktree 里构建一次即可（只要共享目录里已有产物，后续
+worktree 无需重复）：
+
+```
+cargo build -p dev --bin mcsup-dev-tools
+```
+
+`scripts/dev-tools.cmd` 必须保持纯 ASCII：`cmd.exe` 按 OEM 代码页解析 `.cmd`，
+UTF-8 中文会被截断并让整行失效。
+
+其他平台把 `command` 换成 `["scripts/dev-tools.sh"]`。其他客户端把同样的命令
+配成 `stdio` 服务器即可。
+
+### 配置结构
+
+必须用 V2 的 `mcp.servers`。把服务器名直接写在 `mcp` 下（V1 的
+`mcp.<name>`）在 V2 里不被识别，表现为服务静默不连接、工具全部缺失。
 
 ## 新增工具
 

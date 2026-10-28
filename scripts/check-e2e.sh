@@ -14,5 +14,9 @@ set -eu
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 
+# 与其他构建共用一份缓存；本脚本也能单独运行，所以要自己接入。
+. ./scripts/dev-tools-env.sh
+mcsup_use_shared_target
+
 printf '\n==> e2e（CLI 端到端）\n'
 cargo test -p cli --test cli_e2e --all-features
