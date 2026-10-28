@@ -6,7 +6,9 @@ members = ["apps/agent","apps/cli","apps/dev","crates/auth","crates/backend","cr
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+# 1.89 起有 `std::fs::File::try_lock`；跨进程目录锁改为内核锁（见 storage::DirLock），
+# 不再用「pid 存活 + 删文件」的存在性锁
+rust-version = "1.89"
 license = "MIT"
 
 # CI 的 clippy 步骤以 `-D warnings` 运行，rustc 与 clippy 的 warn 都会让它失败。

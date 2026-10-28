@@ -174,13 +174,33 @@ pub(crate) async fn start(name: &str, accept_eula: bool, printer: Printer) -> Re
     )
 }
 
+/// 构造停机规格：`--grace` 超过领域上限时按用法错误（2）拒绝
+///
+/// 上限在 [`mcsup::domain::limits::MAX_STOP_GRACE`]；入口只负责映射错误。
+/// 静默夹紧会让用户以为「宽限 100 年」真的生效了。
+fn stop_spec(grace: u64, force: bool, lang: crate::locale::Lang) -> Result<StopSpec> {
+    let max = mcsup::domain::limits::MAX_STOP_GRACE.as_secs();
+    if grace > max {
+        return Err(AppDiagnostic::usage(
+            crate::i18n::pick(
+                lang,
+                format!("--grace 最大 {max}s，收到 {grace}"),
+                format!("--grace must be at most {max}s, got {grace}"),
+            ),
+            Some(crate::i18n::pick(lang, "默认 30s", "the default is 30s")),
+        )
+        .into());
+    }
+    Ok(StopSpec {
+        grace: Duration::from_secs(grace),
+        force,
+    })
+}
+
 /// `server stop`：优雅停机（`--grace` 到期且 `--force` 时强杀）
 pub(crate) fn stop(name: &str, grace: u64, force: bool, printer: Printer) -> Result<()> {
     let service = lifecycle_service()?;
-    let spec = StopSpec {
-        grace: Duration::from_secs(grace),
-        force,
-    };
+    let spec = stop_spec(grace, force, printer.lang())?;
     let outcome = with_spinner(
         printer,
         crate::i18n::pick(
@@ -244,10 +264,7 @@ pub(crate) async fn restart(
     let service = lifecycle_service()?;
     let supervisor_exe = std::env::current_exe().context("定位 mcsup 可执行文件")?;
 
-    let spec = StopSpec {
-        grace: Duration::from_secs(grace),
-        force,
-    };
+    let spec = stop_spec(grace, force, printer.lang())?;
     let stop_outcome = with_spinner(
         printer,
         crate::i18n::pick(
@@ -840,7 +857,9 @@ fn fmt_uptime(secs: Option<u64>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::fmt_uptime;
+    use super::{fmt_uptime, stop_spec};
+    use crate::locale::Lang;
+    use std::time::Duration;
 
     #[test]
     fn uptime_formats_by_scale() {
@@ -851,5 +870,22 @@ mod tests {
         assert_eq!(fmt_uptime(Some(200)), "3m20s");
         assert_eq!(fmt_uptime(Some(3600)), "1h0m");
         assert_eq!(fmt_uptime(Some(3725)), "1h2m");
+    }
+
+    #[test]
+    fn stop_spec_rejects_grace_above_domain_max() {
+        let too_long = mcsup::domain::limits::MAX_STOP_GRACE.as_secs() + 1;
+        let err = stop_spec(too_long, true, Lang::En).expect_err("out of range");
+        let diagnostic = err
+            .downcast_ref::<crate::diagnostic::AppDiagnostic>()
+            .expect("usage diagnostic");
+        assert_eq!(diagnostic.exit_code, 2, "超过上限是用法错误: {err}");
+    }
+
+    #[test]
+    fn stop_spec_keeps_in_range_grace_and_force() {
+        let spec = stop_spec(30, true, Lang::Zh).expect("in range");
+        assert_eq!(spec.grace, Duration::from_secs(30));
+        assert!(spec.force);
     }
 }

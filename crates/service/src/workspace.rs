@@ -729,7 +729,9 @@ fn write_marker(dir: &Path, marker: &MarkerToml) -> Result<(), WorkspaceError> {
     let path = dir.join(MARKER_FILE);
     let text = toml::to_string_pretty(marker)
         .map_err(|err| WorkspaceError::marker(path.clone(), err.to_string()))?;
-    std::fs::write(&path, text).map_err(|err| WorkspaceError::io(&path, err))
+    // 原子替换：marker 被截断等于工作区身份丢失，`workspace use` 会直接拒绝
+    crate::util::write_atomic(&path, &text)?;
+    Ok(())
 }
 
 fn is_empty_dir(dir: &Path) -> Result<bool, WorkspaceError> {

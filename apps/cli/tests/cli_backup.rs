@@ -255,6 +255,37 @@ fn backup_roundtrip_through_cli() {
     assert_eq!(stdout_json(&list)["total"], 1);
 }
 
+/// `--to` 的目标名直接拼进 `servers/<name>`：非法名字必须是用法错误（2），
+/// 且在任何写盘动作之前就被拒绝
+///
+/// 这条防的是路径穿越：`--to ../escape` 在入口或服务层漏判一次，恢复就会把
+/// 整个快照写到工作区之外。
+#[test]
+fn backup_restore_rejects_unsafe_to_name() {
+    let home = temp_home();
+    let ws = init_workspace(&home, "ws1");
+    let srv = register_server(&home, &ws, "alpha");
+    seed(&srv);
+    let create = backup(&home, &["create", "alpha", "--output", "json"]);
+    ok(&create, "backup create");
+    let id = stdout_json(&create)["snapshot"]["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    for bad in ["../escape", "a/b", "a\\b", "C:evil", ""] {
+        let out = backup(&home, &["restore", "alpha", &id, "--to", bad]);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "--to {bad:?} 应是用法错误: {}",
+            stderr(&out)
+        );
+    }
+    assert!(!ws.join("escape").exists(), "工作区外不应出现恢复产物");
+    assert!(!home.path().join("escape").exists());
+}
+
 /// `--scope` 只备份指定顶层项：world 之外的文件不进快照
 #[test]
 fn backup_scope_limits_snapshot() {

@@ -371,6 +371,38 @@ impl ServerRegistry {
         })
     }
 
+    /// 为新目录写入一份全新身份（`backup restore --to` 用）
+    ///
+    /// 恢复只复制文件，不复制身份：快照里的 `mcsup.json` 属于源服务器，
+    /// 沿用会让新目录与源服务器撞 id，`server link` 必然失败。这里生成新
+    /// id 并写进目标目录，之后用户照常 `server link <dir>` 即可。
+    ///
+    /// 名称已注册时拒绝，避免写出一个永远注册不上的目录。
+    ///
+    /// # Errors
+    ///
+    /// 名称已注册、marker 写入失败时返回 [`ServerRegistryError`]
+    pub fn assign_new_identity(
+        &self,
+        dir: &Path,
+        name: &ServerName,
+    ) -> Result<ServerId, ServerRegistryError> {
+        if self.servers.get(name).is_ok() {
+            return Err(ServerRegistryError::AlreadyExists(name.as_str().to_owned()));
+        }
+        let id = ServerId::parse(&uuid::Uuid::new_v4().to_string())
+            .map_err(|err| ServerRegistryError::marker(dir.join(SERVER_MARKER), err.to_string()))?;
+        write_server_marker(
+            dir,
+            &ServerMarkerJson {
+                schema: SERVER_MARKER_SCHEMA,
+                id: id.as_str().to_owned(),
+                name: name.as_str().to_owned(),
+            },
+        )?;
+        Ok(id)
+    }
+
     /// 把服务器目录注册进工作区：外部目录建符号链接，工作区内目录就地注册
     ///
     /// 外部目标在 `<ws>/servers/<name>` 建指向 `target` 的符号链接，
@@ -1213,7 +1245,9 @@ fn write_server_marker(dir: &Path, marker: &ServerMarkerJson) -> Result<(), Serv
     let path = dir.join(SERVER_MARKER);
     let text = serde_json::to_string_pretty(marker)
         .map_err(|err| ServerRegistryError::marker(path.clone(), err.to_string()))?;
-    std::fs::write(&path, text).map_err(|err| ServerRegistryError::io(&path, err))
+    // 原子替换：marker 被截断等于服务器身份丢失，`server link` 再也接不回来
+    crate::util::write_atomic(&path, &text)?;
+    Ok(())
 }
 
 /// 就地注册的名称口径：以目录名为准，`--name` 不一致时拒绝

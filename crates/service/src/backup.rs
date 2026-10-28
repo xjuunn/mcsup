@@ -482,9 +482,11 @@ impl BackupService {
         };
         if online {
             self.send_line(name, CMD_SAVE_ALL)?;
-            let wait = options.flush_wait_ms.unwrap_or(DEFAULT_FLUSH_WAIT_MS);
-            if wait > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(wait));
+            // 等待时长来自 CLI / 远端帧，可能大到让线程锁死；按领域上限夹紧
+            let wait =
+                domain::limits::flush_wait(options.flush_wait_ms.unwrap_or(DEFAULT_FLUSH_WAIT_MS));
+            if !wait.is_zero() {
+                std::thread::sleep(wait);
             }
         }
 
@@ -665,10 +667,14 @@ impl BackupService {
     /// 它继续写旧 inode（Windows 直接失败，Unix 上「恢复了但又被写回去」）。
     /// 原地恢复前会先自动备份当前状态，恢复错了还能回去。
     ///
+    /// `--to` 只复制内容，不复制身份：新目录会拿到一份全新的 `mcsup.json`，
+    /// 否则与源服务器撞 id，`server link` 永远注册不上。
+    ///
     /// # Errors
     ///
     /// 快照不存在 / 不可恢复、原地恢复且服务器在运行、目标服务名已占用、
-    /// CAS 对象缺失或写盘失败时返回 [`BackupError`]
+    /// 落点逃出服务器目录（符号链接）、CAS 对象缺失或写盘失败时返回
+    /// [`BackupError`]
     pub fn restore(
         &self,
         name: &str,
@@ -732,13 +738,25 @@ impl BackupService {
         let destination = match target {
             RestoreTarget::InPlace => layout.dir.clone(),
             RestoreTarget::NewServer { name: new_name } => {
-                if self.registry.get(new_name).is_ok() {
-                    return Err(BackupError::TargetExists(new_name.clone()));
+                if self.registry.get(new_name.as_str()).is_ok() {
+                    return Err(BackupError::TargetExists(new_name.to_string()));
                 }
-                layout.workspace.join("servers").join(new_name.as_str())
+                let dest = layout.workspace.join("servers").join(new_name.as_str());
+                // 目录已存在（哪怕没注册）也拒绝：往残留目录里合并写入，
+                // 产物就不再是快照的完整副本，还可能撞上里面预置的符号链接。
+                if dest.symlink_metadata().is_ok() {
+                    return Err(BackupError::TargetExists(new_name.to_string()));
+                }
+                dest
             }
         };
         let outcome = materialize(&layout, &snapshot, &destination, target)?;
+        // `--to` 复制的是内容，不是身份：快照里的 `mcsup.json` 属于源服务器，
+        // 沿用会让新目录与源服务器撞 id，`server link` 必然失败。恢复完成后
+        // 立即写一份新身份，目录才真的能被注册。
+        if let RestoreTarget::NewServer { name: new_name } = target {
+            self.registry.assign_new_identity(&destination, new_name)?;
+        }
         Ok(RestoreOutcome {
             snapshot,
             destination: outcome.destination,
@@ -1222,7 +1240,9 @@ struct Materialized {
 /// 再按路径逐个 rename 覆盖。这样中途失败时原服务器目录仍可用，不会出现
 /// 「删了一半旧文件、写了一半新文件」的混合状态。
 ///
-/// `--to` 恢复直接写到新目录，不走暂存区：新目录本就是空的。
+/// `--to` 恢复直接写到新目录，不走暂存区：新目录本就是空的。快照里的
+/// `mcsup.json` 会原样落盘，调用方随后用新身份覆盖（见
+/// [`BackupService::restore`]）——内容可以复制，身份不能。
 fn materialize(
     layout: &BackupLayout,
     snapshot: &Snapshot,
@@ -1231,14 +1251,15 @@ fn materialize(
 ) -> Result<Materialized, BackupError> {
     match target {
         RestoreTarget::NewServer { .. } => {
-            // 新服务目录要能直接被识别为服务器：带上快照里的 mcsup.json
             std::fs::create_dir_all(destination).map_err(|err| FsError::io(destination, err))?;
+            // `--to` 也不信任落点：目标目录可能是用户预先建好的，里面可能有
+            // 指向目录外的符号链接。
+            let mut guard = Containment::new(destination)?;
             let mut files = 0;
             let mut bytes = 0u64;
             for (path, hash) in snapshot.content.entries() {
-                bytes += layout
-                    .cas
-                    .get(hash, &destination.join(path.to_platform_path()))?;
+                let sink = guard.writable(path)?;
+                bytes += layout.cas.get(hash, &sink)?;
                 files += 1;
             }
             Ok(Materialized {
@@ -1270,14 +1291,13 @@ fn materialize(
                 files += 1;
             }
             // 内容就绪后再动原目录：逐个 rename 覆盖
+            let mut dest_guard = Containment::new(destination)?;
             for (path, _) in snapshot.content.entries() {
                 let from = staging.join(path.to_platform_path());
-                let to = destination.join(path.to_platform_path());
-                if let Some(parent) = to.parent() {
-                    std::fs::create_dir_all(parent).map_err(|err| FsError::io(parent, err))?;
-                }
-                // Windows 上目标存在时 rename 会失败：先删再换
-                if to.is_file() {
+                let to = dest_guard.writable(path)?;
+                // Windows 上目标存在时 rename 会失败：先删再换。用
+                // symlink_metadata 判断「存在」，悬空链接也算占用。
+                if to.symlink_metadata().is_ok() {
                     std::fs::remove_file(&to).map_err(|err| FsError::io(&to, err))?;
                 }
                 std::fs::rename(&from, &to).map_err(|err| FsError::io(&to, err))?;
@@ -1285,7 +1305,7 @@ fn materialize(
             // 墓碑：快照记录「这个文件当时不存在」，必须删掉它，否则复活
             let mut deleted = 0;
             for path in snapshot.content.deleted() {
-                let victim = destination.join(path.to_platform_path());
+                let victim = dest_guard.existing(path)?;
                 match std::fs::remove_file(&victim) {
                     Ok(()) => deleted += 1,
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -1304,6 +1324,70 @@ fn materialize(
                 deleted,
             })
         }
+    }
+}
+
+/// 恢复落点守卫：每个路径都必须真的落在服务器目录之内
+///
+/// 领域层的 [`RelPath`] 已挡掉 `..`、盘符、ADS 与设备名，但磁盘上的**符号
+/// 链接**仍能把 `world/level.dat` 指到目录外。父目录建好后 `canonicalize`
+/// 出真实位置，确认仍在根内；链接指向目录内部是允许的（共享世界是常见用法）。
+/// 校验过的父目录缓存下来，避免每个文件都做两次系统调用。
+struct Containment {
+    root: PathBuf,
+    verified: std::collections::HashSet<PathBuf>,
+}
+
+impl Containment {
+    fn new(root: &Path) -> Result<Self, BackupError> {
+        let root = std::fs::canonicalize(root).map_err(|err| FsError::io(root, err))?;
+        Ok(Self {
+            root,
+            verified: std::collections::HashSet::new(),
+        })
+    }
+
+    /// 写入落点：缺的父目录直接建出来
+    fn writable(&mut self, rel: &RelPath) -> Result<PathBuf, BackupError> {
+        self.checked(rel, true)
+    }
+
+    /// 删除落点：不建目录；父目录不存在说明没有可删的东西
+    fn existing(&mut self, rel: &RelPath) -> Result<PathBuf, BackupError> {
+        self.checked(rel, false)
+    }
+
+    fn checked(&mut self, rel: &RelPath, create: bool) -> Result<PathBuf, BackupError> {
+        let target = self.root.join(rel.to_platform_path());
+        let parent = target
+            .parent()
+            .ok_or_else(|| FsError::marker(target.clone(), "snapshot path has no parent"))?;
+        if !self.verified.contains(parent) {
+            let resolved = if create {
+                std::fs::create_dir_all(parent).map_err(|err| FsError::io(parent, err))?;
+                Some(std::fs::canonicalize(parent).map_err(|err| FsError::io(parent, err))?)
+            } else {
+                match std::fs::canonicalize(parent) {
+                    Ok(resolved) => Some(resolved),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(err) => return Err(FsError::io(parent, err).into()),
+                }
+            };
+            if let Some(resolved) = resolved {
+                if !resolved.starts_with(&self.root) {
+                    return Err(FsError::marker(
+                        &target,
+                        format!(
+                            "snapshot path escapes the server directory: {}",
+                            rel.as_str()
+                        ),
+                    )
+                    .into());
+                }
+                self.verified.insert(parent.to_path_buf());
+            }
+        }
+        Ok(target)
     }
 }
 
@@ -2140,6 +2224,7 @@ mod tests {
     fn restore_to_new_server_leaves_original_untouched() {
         let fx = Fixture::new(FakeSupervisor::stopped());
         fx.write("world/level.dat", b"v1");
+        let original_id = fx.registry.get("alpha").expect("get").meta.id;
         let outcome = fx.create();
         fx.write("world/level.dat", b"v2");
 
@@ -2149,7 +2234,7 @@ mod tests {
                 "alpha",
                 outcome.snapshot.id.as_str(),
                 &RestoreTarget::NewServer {
-                    name: "copy".to_owned(),
+                    name: ServerName::parse("copy").expect("name"),
                 },
             )
             .expect("restore");
@@ -2158,6 +2243,30 @@ mod tests {
         assert!(restored.safety_snapshot.is_none());
         let copy = restored.destination.join("world/level.dat");
         assert_eq!(std::fs::read(copy).expect("read"), b"v1");
+
+        // 身份不跟着内容复制：新目录必须拿到新 id，名称改成新服务名，
+        // 否则 `server link` 会因 id 冲突一直失败
+        let marker = read_marker(&restored.destination);
+        assert_ne!(marker.0, original_id.as_str());
+        assert_eq!(marker.1, "copy");
+
+        // 验收点：恢复出来的目录必须真的能注册（快照里那份 marker 会让
+        // `link` 撞上源服务器的 id）
+        let linked = fx
+            .registry
+            .link(&restored.destination, None, Some("ws01"))
+            .expect("link restored copy");
+        assert_eq!(linked.server.meta.name.as_str(), "copy");
+    }
+
+    /// 读回 `mcsup.json` 的 (id, name)
+    fn read_marker(dir: &Path) -> (String, String) {
+        let text = std::fs::read_to_string(dir.join("mcsup.json")).expect("marker");
+        let marker: serde_json::Value = serde_json::from_str(&text).expect("json");
+        (
+            marker["id"].as_str().expect("id").to_owned(),
+            marker["name"].as_str().expect("name").to_owned(),
+        )
     }
 
     #[test]
@@ -2171,11 +2280,71 @@ mod tests {
                 "alpha",
                 outcome.snapshot.id.as_str(),
                 &RestoreTarget::NewServer {
-                    name: "alpha".to_owned(),
+                    name: ServerName::parse("alpha").expect("name"),
                 },
             )
             .expect_err("exists");
         assert!(matches!(err, BackupError::TargetExists { .. }), "{err}");
+    }
+
+    /// 目标目录存在但未注册时也拒绝：合并写入会把残留文件混进「快照副本」
+    #[test]
+    fn restore_to_leftover_directory_is_rejected() {
+        let fx = Fixture::new(FakeSupervisor::stopped());
+        fx.write("a", b"1");
+        let outcome = fx.create();
+        let leftover = fx.ws_path.join("servers").join("copy");
+        std::fs::create_dir_all(&leftover).expect("mkdir");
+        std::fs::write(leftover.join("stale.txt"), b"x").expect("write");
+
+        let err = fx
+            .service
+            .restore(
+                "alpha",
+                outcome.snapshot.id.as_str(),
+                &RestoreTarget::NewServer {
+                    name: ServerName::parse("copy").expect("name"),
+                },
+            )
+            .expect_err("exists");
+        assert!(matches!(err, BackupError::TargetExists { .. }), "{err}");
+        // 残留目录原样不动
+        assert_eq!(
+            std::fs::read(leftover.join("stale.txt")).expect("read"),
+            b"x"
+        );
+    }
+
+    /// 恢复落点被符号链接指到目录外时必须拒绝
+    ///
+    /// 领域层挡得住 `..`，挡不住磁盘上已有的链接。只校验「拼出来的路径」不够，
+    /// 要把父目录规范化后再比一次。
+    #[cfg(unix)]
+    #[test]
+    fn in_place_restore_refuses_symlink_escape() {
+        let fx = Fixture::new(FakeSupervisor::stopped());
+        fx.write("world/level.dat", b"v1");
+        let outcome = fx.create();
+        // 快照之后把 world 换成指向目录外的链接
+        std::fs::remove_dir_all(fx.server_dir.join("world")).expect("rm");
+        let outside = fx.ws_path.join("outside");
+        std::fs::create_dir_all(&outside).expect("mkdir");
+        std::os::unix::fs::symlink(&outside, fx.server_dir.join("world")).expect("symlink");
+
+        let err = fx
+            .service
+            .restore(
+                "alpha",
+                outcome.snapshot.id.as_str(),
+                &RestoreTarget::InPlace,
+            )
+            .expect_err("escapes");
+        assert!(
+            err.to_string().contains("escapes the server directory"),
+            "{err}"
+        );
+        // 目录外不能出现文件
+        assert!(!outside.join("level.dat").exists());
     }
 
     #[test]

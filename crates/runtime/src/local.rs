@@ -116,7 +116,7 @@ impl SupervisorPort for LocalSupervisor {
     }
 
     fn stop(&self, server: &ServerRef<'_>, spec: StopSpec) -> Result<StopOutcome, SupervisorError> {
-        let timeout = spec.grace + Duration::from_secs(10);
+        let timeout = spec.grace.saturating_add(Duration::from_secs(10));
         let response = client::rpc(
             server.dir()?,
             Request::Stop {

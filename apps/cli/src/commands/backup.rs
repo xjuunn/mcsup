@@ -16,6 +16,7 @@ use comfy_table::{ContentArrangement, Table};
 use mcsup::domain::backup::{
     BackupScope, ContentHash, Page, RestoreTarget, RetentionPolicy, Snapshot, SnapshotId, parse_age,
 };
+use mcsup::domain::server::meta::ServerName;
 use mcsup::protocol::cli::{
     BackupCreateJson, BackupDeleteJson, BackupListJson, BackupPruneJson, BackupRestoreJson,
     BackupRow, BackupVerifyJson,
@@ -217,12 +218,7 @@ pub(crate) async fn restore(
             .into());
         }
     };
-    let target = match to {
-        Some(new_name) => RestoreTarget::NewServer {
-            name: new_name.to_owned(),
-        },
-        None => RestoreTarget::InPlace,
-    };
+    let target = restore_target(printer.lang(), to)?;
 
     let spinner = TaskSpinner::new(
         crate::i18n::pick(
@@ -286,6 +282,36 @@ pub(crate) async fn restore(
         ));
     }
     Ok(())
+}
+
+/// 解析 `backup restore --to` 的目标
+///
+/// 名字要拼进 `servers/<name>`，入口先按领域规则校验：非法名字是用法错误
+/// （2），不是运行期失败。判定本身在 [`ServerName::parse`]，这里只负责把
+/// 失败映射成入口的错误分类。
+///
+/// # Errors
+///
+/// `--to` 不是合法服务器名时返回用法错误
+fn restore_target(lang: crate::locale::Lang, to: Option<&str>) -> Result<RestoreTarget> {
+    let Some(new_name) = to else {
+        return Ok(RestoreTarget::InPlace);
+    };
+    let name = ServerName::parse(new_name).map_err(|_| {
+        AppDiagnostic::usage(
+            crate::i18n::pick(
+                lang,
+                format!("非法的服务器名：{new_name}"),
+                format!("invalid server name: {new_name}"),
+            ),
+            Some(crate::i18n::pick(
+                lang,
+                "只允许 A-Za-z0-9_-，长度 1-64",
+                "only A-Za-z0-9_- allowed, 1-64 characters",
+            )),
+        )
+    })?;
+    Ok(RestoreTarget::NewServer { name })
 }
 
 /// `backup delete`：缺 id 交互选择
