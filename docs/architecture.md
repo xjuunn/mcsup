@@ -389,6 +389,12 @@ Protocol 定义传输什么（`StartServerRequest` / `StartServerResponse` /
 `LogEvent` / `FileChunk` / `BackupProgress` 等消息类型）；Transport 定义怎么传
 （gRPC / tonic / prost / streaming）。禁止把具体 gRPC 实现污染到 Domain。
 
+长任务的观察者（`TaskStage` / `TaskEvent` / `TaskObserver`）定义在 `port` 而不是
+各入口：`service` 只往它上面抛事件，本地入口接到终端渲染，远端把事件装进
+`Response::Task` 中间帧回传，客户端解帧后仍交给同一个观察者。事件是旁路，
+不允许因为「终端写不进去 / 对端断开」让业务失败。新增一个耗时操作只需要
+`service` 发事件，本地与远端自动同时具备进度回显。
+
 `protocol::cli` 承载 CLI `--output json` 的机器契约 DTO：它是 CLI 对第三方的
 稳定承诺，与 REST / WebSocket / 桌面客户端共用同一批类型，因此作为「唯一
 契约来源」放在 `protocol` 是**有意**的，不属于入口逻辑泄漏。渲染（表格、

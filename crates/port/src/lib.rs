@@ -3,6 +3,7 @@ pub mod backup;
 pub mod content;
 pub mod modpack;
 pub mod origin;
+pub mod task;
 
 pub use backend::Backend;
 pub use backup::{
@@ -27,6 +28,7 @@ pub use origin::{
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+pub use task::{NoopTaskObserver, TaskEvent, TaskObserver, TaskStage};
 use thiserror::Error;
 use url::Url;
 
@@ -148,18 +150,23 @@ pub struct DownloadRequest {
 }
 
 /// 下载进度观察者
+///
+/// 窄接口：下载器只需要字节数。入口级观察者见 [`task::TaskObserver`]，
+/// 它把这一层包含为超 trait，可以直接上转后传下来。
 pub trait ProgressSink: Send + Sync {
     /// 已传输字节与总量；总量未知时为 `None`
-    fn on_progress(&self, transferred: u64, total: Option<u64>);
+    fn on_progress(&self, _transferred: u64, _total: Option<u64>) {}
 }
 
 /// 安装器输出观察者
 ///
 /// 安装器联网拉取 libraries 可达数分钟，期间整段都是在「下载」——只有把它的
 /// 输出实时透传出来，用户才知道它在干活而不是卡死。
+///
+/// 窄接口：执行器只需要一行文本。入口级观察者见 [`task::TaskObserver`]。
 pub trait InstallerOutputSink: Send + Sync {
     /// 收到一行安装器输出（已去掉行尾换行）
-    fn on_output(&self, line: &str);
+    fn on_output(&self, _line: &str) {}
 }
 
 /// 协作式取消令牌

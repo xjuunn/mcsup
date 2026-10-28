@@ -1188,6 +1188,7 @@ fn response_label(response: &Response) -> &'static str {
         Response::SnapshotDeleted { .. } => "snapshot_deleted",
         Response::SnapshotVerified { .. } => "snapshot_verified",
         Response::Pruned { .. } => "pruned",
+        Response::Task { .. } => "task",
         Response::Error { .. } => "error",
     }
 }

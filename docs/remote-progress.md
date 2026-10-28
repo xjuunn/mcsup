@@ -20,8 +20,77 @@
 | 11 | 远端能力对等：props / set / console / version / install / modpack / java install·uninstall | 完成 |
 | 12 | `server link` 远端化、`server create --origin` 交互向导、系统钥匙串 | 完成（跨机器真机仍待手工） |
 | 13 | 健壮性/安全修复：错误分类、重试幂等、TTL、撤销即时性、SSH、keyring 探测等 | 完成 |
+| 14 | 统一进度通道：`port::TaskObserver` + `Response::Task` 中间帧，本地与远端同一套渲染 | 完成 |
 
 ## 已完成
+
+### 阶段 14：统一进度通道（本地与远端同一套流程）
+
+远端安装此前没有任何回显：`transport` 严格一问一答、代理侧整段跑完才回帧，
+CLI 又为远端提前分流、根本不装配 `InstallSession`。本阶段把「观察耗时任务」
+收敛成一条通道，入口不再为远端单独写进度代码。
+
+#### 契约（`port::task`）
+
+- `TaskStage`：阶段词表（探测 / 查询 / 解析 / 下载 / 安装器 / 解压 / 登记 /
+  扫描 / 写入 / 校验 / 恢复 / 布置），文案只有这一份。
+- `TaskEvent`：`stage` / `progress` / `output` 三种事件，本地回调与线上帧共用
+  同一份 serde 定义。
+- `TaskObserver`：入口级唯一观察者，`ProgressSink` / `InstallerOutputSink`
+  是它的超 trait（下载器与安装器执行器只要窄接口，按需上转）。
+
+#### 服务端（`transport`）
+
+- `Response::Task { event }`：长任务的中间帧，**不是**终结响应
+  （`Response::is_progress()`）。
+- `Handler::handle_with(session, request, &dyn TaskObserver)`：默认实现退回
+  `handle`，只有 agent 覆写。`dispatch` 提供一个把事件写成帧的 `SessionSink`，
+  进度帧按 ≥128 KiB / ≥100 ms 节流，阶段与输出不节流。
+- 协议版本升到 2：新增帧对旧客户端是破坏性变更，必须一起升版。
+
+#### 服务（`service`）
+
+- `ServerInstaller::install` / `ServerRegistry::install_jar` /
+  `Lifecycle::install_jar_checked` / `JavaService::install` 统一收一个
+  `Option<&dyn TaskObserver>`，不再分别收 progress + stages；安装器输出也由
+  同一个观察者下发（`InstallerContext.output` 字段随之删除）。
+- `InstallStage` / `StageSink` 删除，改用 `port::TaskStage` / `TaskObserver`：
+  阶段词表只有一处。
+
+#### 客户端（`transport` / `backend`）
+
+- `Client::call_streaming`：读到 `Response::Task` 交给观察者后继续读，直到终结
+  帧；不带观察者的 `call` 同样能吃掉中间帧，旧调用方不受影响。
+- `RemoteLink::call_streaming` / `expect_streaming`；
+  `RemoteServerRepository::install_with`、`create_modpack(.., observer)`、
+  `RemoteJavaRepository::install_with`。不带观察者的同名方法保留，等价于传
+  `NoopTaskObserver`。
+
+#### 入口（CLI）
+
+- `InstallSession` 只实现一个 `TaskObserver`，同时是本地 service 的 sink 与远端
+  的帧接收端。
+- `server install` / `server create --origin` / `java install --origin` /
+  `server create --modpack --origin` 都用同一个 `InstallSession`：远端分支不再
+  单独起 spinner，画面与本地一致。
+- 结果打印收敛成一处（`Installed` + `print_installed`）。
+
+#### 测试
+
+- `transport`：中间帧先于终结帧到达并交给观察者；不带观察者也能拿到终结帧。
+- `backend`：`install_with` 把垫片回传的 stage / progress 交给观察者，终结帧
+  仍是服务器记录。
+- `port`：事件分发与线上编码稳定。
+
+#### 未覆盖
+
+- 备份仍只回阶段级进度（本地与远端一致）：`BackupService` 的扫描 / CAS 写入
+  还没有接观察者，逐文件进度留给后续；接的时候只需在 service 发事件。
+- 进度帧只做字节 / 条目数，不含「当前文件」文案：对端文件名属于路径信息，
+  默认不外发。
+- **取消不跨线**：Ctrl-C 只取消本地回显（`InstallSession` 的令牌），对端不会
+  因此中止安装——目前没有取消帧。远端安装的语义仍是「发起后等待结果」，
+  中断本地进程不会撤销对端动作。
 
 ### 阶段 13：健壮性与安全修复
 
@@ -342,7 +411,8 @@ roundtrip 全量权限覆盖补 `BackupList` 样例（`Permission::Backup` 豁�
 
 新模块 `protocol::remote`（与本地 IPC 的 `protocol` 平级，互不共用版本号）：
 
-- 独立 `REMOTE_PROTOCOL_VERSION = 1`。不复用 `PROTOCOL_VERSION`：远端两端
+- 独立 `REMOTE_PROTOCOL_VERSION = 1`（阶段 14 新增中间帧后升到 2）。不复用
+  `PROTOCOL_VERSION`：远端两端
   可以分别升级，把版本绑在一起会让「本地 CLI 与 supervisor 的 IPC 协议」
   和「跨机器协议」互相拖住。
 - `wire.rs` 定义线格式与双向转换。**线格式单独一层**而不是给 `domain` /

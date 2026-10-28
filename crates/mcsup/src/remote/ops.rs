@@ -12,6 +12,7 @@ use domain::java::{JavaMajor, JavaPackageType, JavaVendor};
 use domain::server::settings::SettingKey;
 use domain::server::version::{ServerVariant, ServerVersion, VersionId};
 use file::FileCoreInspector;
+use port::TaskObserver;
 use protocol::remote::wire::{
     WirePropUpdate, WireServer, WireSettings, WireSnapshot, WireStatusEntry, WireVersion,
 };
@@ -25,8 +26,11 @@ use service::{
 use transport::RemoteFailure;
 
 impl Agent {
-    /// 执行一个已认证的操作
-    pub(crate) fn dispatch(&self, request: &Request) -> Response {
+    /// 执行一个已认证的操作，并把长任务的阶段 / 进度 / 输出交给 `progress`
+    ///
+    /// `progress` 由传输层提供：它把每条事件写成 `Response::Task` 中间帧，客户端
+    /// 用**同一个**观察者渲染——远端与本地共用一套进度代码，差别只在传输。
+    pub(crate) fn dispatch_with(&self, request: &Request, progress: &dyn TaskObserver) -> Response {
         match request {
             Request::Ping => Response::Pong {
                 agent_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -48,11 +52,11 @@ impl Agent {
             | Request::ServerVersions { .. }
             | Request::PropsGet { .. }
             | Request::PropsSet { .. }
-            | Request::SettingsSet { .. } => self.server_op(request),
+            | Request::SettingsSet { .. } => self.server_op(request, progress),
             Request::JavaList
             | Request::JavaScan
             | Request::JavaInstall { .. }
-            | Request::JavaUninstall { .. } => self.java_op(request),
+            | Request::JavaUninstall { .. } => self.java_op(request, progress),
 
             Request::ClientList => match self.clients.load() {
                 Ok(records) => Response::Clients {
@@ -173,7 +177,7 @@ impl Agent {
     }
 
     /// 服务器注册表帧
-    fn server_op(&self, request: &Request) -> Response {
+    fn server_op(&self, request: &Request, progress: &dyn TaskObserver) -> Response {
         match request {
             Request::ServerList => match self.core.registry.list() {
                 Ok(items) => match items
@@ -224,7 +228,9 @@ impl Agent {
                     Err(err) => registry_failure(&err),
                 }
             }
-            Request::ServerInstall { name, version } => self.server_install(name, version),
+            Request::ServerInstall { name, version } => {
+                self.server_install(name, version, progress)
+            }
             Request::ServerLink {
                 target,
                 name,
@@ -253,9 +259,13 @@ impl Agent {
                 name,
                 project,
                 version,
-            } => {
-                self.server_create_modpack(workspace.as_deref(), name, project, version.as_deref())
-            }
+            } => self.server_create_modpack(
+                workspace.as_deref(),
+                name,
+                project,
+                version.as_deref(),
+                progress,
+            ),
             Request::PropsGet { server_id } => self.props_get(server_id),
             Request::PropsSet { server_id, updates } => self.props_set(server_id, updates),
             Request::SettingsSet {
@@ -268,7 +278,7 @@ impl Agent {
     }
 
     /// Java 帧
-    fn java_op(&self, request: &Request) -> Response {
+    fn java_op(&self, request: &Request, progress: &dyn TaskObserver) -> Response {
         match request {
             Request::JavaList => self.java_list(),
             // 扫描结果直接回列表：跨机器没有「扫到几个」的渲染位置，
@@ -278,7 +288,7 @@ impl Agent {
                 Err(err) => java_failure(&err),
             },
             Request::JavaInstall { major, jre, vendor } => {
-                self.java_install(*major, *jre, vendor.as_deref())
+                self.java_install(*major, *jre, vendor.as_deref(), progress)
             }
             Request::JavaUninstall { path } => self.java_uninstall(path),
             other => unreachable_frame(other),
@@ -504,7 +514,7 @@ impl Agent {
     ///
     /// 编排与本地 CLI 走同一份 `install_jar_checked`：下载、校验、（安装器类
     /// 变体的）安装器执行都在对端，客户端只拿到更新后的注册记录。
-    fn server_install(&self, name: &str, version: &str) -> Response {
+    fn server_install(&self, name: &str, version: &str, progress: &dyn TaskObserver) -> Response {
         let variant = match self.core.registry.get(name) {
             Ok(srv) => srv.meta.variant,
             Err(err) => return registry_failure(&err),
@@ -513,7 +523,7 @@ impl Agent {
             Ok(runtime) => runtime,
             Err(err) => return failure(ErrorKind::IO, err),
         };
-        match runtime.block_on(self.install_core_async(name, version, &variant)) {
+        match runtime.block_on(self.install_core_async(name, version, &variant, progress)) {
             Ok(item) => Response::Servers { items: vec![item] },
             Err(response) => *response,
         }
@@ -560,6 +570,7 @@ impl Agent {
         name: &str,
         version: &str,
         variant: &ServerVariant,
+        progress: &dyn TaskObserver,
     ) -> Result<WireServer, Box<Response>> {
         let Some(source) = pick_source(&self.core.jar_sources, variant) else {
             return Err(Box::new(
@@ -580,8 +591,7 @@ impl Agent {
                 &installer,
                 &FileCoreInspector,
                 installer_ctx(self, name, variant).as_ref(),
-                None,
-                None,
+                Some(progress),
                 &port::CancellationToken::new(),
             )
             .await
@@ -605,6 +615,7 @@ impl Agent {
         name: &str,
         project: &str,
         version: Option<&str>,
+        progress: &dyn TaskObserver,
     ) -> Response {
         let runtime = match current_thread_runtime() {
             Ok(runtime) => runtime,
@@ -619,7 +630,8 @@ impl Agent {
             }
             // 守卫保证任何提前返回都会清理暂存目录
             let _staging_guard = StagingGuard(staging.clone());
-            let mut options = ModpackInstallOptions::new(&staging);
+            let mut options =
+                ModpackInstallOptions::new(&staging).progress(progress as &dyn port::ProgressSink);
             if let Some(version) = version {
                 options = options.version(version);
             }
@@ -650,13 +662,21 @@ impl Agent {
                 Err(err) => return registry_failure(&err),
             };
             // 先装核心再铺文件：失败留在「已登记」状态，重试入口是 `server install`
-            if let Err(response) = self.install_core_async(name, &minecraft, &variant).await {
+            if let Err(response) = self
+                .install_core_async(name, &minecraft, &variant, progress)
+                .await
+            {
                 return *response;
             }
             let applied = match self
                 .core
                 .modpack
-                .apply(&prepared, &dir, None, &cancel)
+                .apply(
+                    &prepared,
+                    &dir,
+                    Some(progress as &dyn port::ProgressSink),
+                    &cancel,
+                )
                 .await
             {
                 Ok(applied) => applied,
@@ -749,7 +769,13 @@ impl Agent {
     }
 
     /// 在对端安装 Java；返回对端登记的全部运行时
-    fn java_install(&self, major: i64, jre: bool, vendor: Option<&str>) -> Response {
+    fn java_install(
+        &self,
+        major: i64,
+        jre: bool,
+        vendor: Option<&str>,
+        progress: &dyn TaskObserver,
+    ) -> Response {
         let major = match JavaMajor::parse(major) {
             Ok(major) => major,
             Err(err) => return failure(ErrorKind::INVALID, err),
@@ -768,8 +794,7 @@ impl Agent {
             major,
             package,
             vendor,
-            None,
-            None,
+            Some(progress),
             &port::CancellationToken::new(),
         ));
         match outcome {
@@ -1215,7 +1240,6 @@ fn installer_ctx(agent: &Agent, name: &str, variant: &ServerVariant) -> Option<I
     Some(InstallerContext {
         java_bin,
         runner: std::sync::Arc::new(runtime::LocalInstallerRunner::new()),
-        output: None,
     })
 }
 

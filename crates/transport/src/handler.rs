@@ -138,6 +138,24 @@ pub trait Handler: Send + Sync {
 
     /// 执行一个已认证的操作
     fn handle(&self, session: &SessionInfo, request: &Request) -> Response;
+
+    /// 执行一个已认证的操作，期间允许回传中间进度帧
+    ///
+    /// 默认实现忽略 `progress` 并转给 [`Self::handle`]：只有会跑长任务的实现
+    /// （agent 的安装 / 备份）需要覆写它。传输层负责把观察者收到的每条事件写成
+    /// [`protocol::remote::Response::Task`] 中间帧，终结响应仍取本方法的返回值。
+    ///
+    /// 中间帧是旁路：写不出去（客户端已断开）不改变业务结果，最终响应写失败时
+    /// 连接照常断开。
+    fn handle_with(
+        &self,
+        session: &SessionInfo,
+        request: &Request,
+        progress: &dyn port::TaskObserver,
+    ) -> Response {
+        let _ = progress;
+        self.handle(session, request)
+    }
 }
 
 #[cfg(test)]

@@ -290,12 +290,29 @@ impl RemoteServerRepository {
     ///
     /// 对端拒绝（来源不可达、版本不存在…）或传输失败时返回 [`RepositoryError`]
     pub fn install(&self, name: &str, version: &str) -> Result<ServerMeta, RepositoryError> {
-        let response = self.link.expect(
+        self.install_with(name, version, &port::NoopTaskObserver)
+    }
+
+    /// [`Self::install`] 的流式版本：把对端的阶段 / 进度 / 安装器输出交给 `observer`
+    ///
+    /// 本地安装与远端安装喂的是入口侧的同一个观察者，因此进度回显完全一致。
+    ///
+    /// # Errors
+    ///
+    /// 对端拒绝（来源不可达、版本不存在…）或传输失败时返回 [`RepositoryError`]
+    pub fn install_with(
+        &self,
+        name: &str,
+        version: &str,
+        observer: &dyn port::TaskObserver,
+    ) -> Result<ServerMeta, RepositoryError> {
+        let response = self.link.expect_streaming(
             &Request::ServerInstall {
                 name: name.to_owned(),
                 version: version.to_owned(),
             },
             "servers",
+            observer,
         )?;
         match response {
             Response::Servers { mut items } => {
@@ -322,8 +339,9 @@ impl RemoteServerRepository {
         name: &str,
         project: &str,
         version: Option<&str>,
+        observer: &dyn port::TaskObserver,
     ) -> Result<RemoteModpackResult, RepositoryError> {
-        let response = self.link.expect(
+        let response = self.link.expect_streaming(
             &Request::ServerCreateModpack {
                 workspace: workspace.map(str::to_owned),
                 name: name.to_owned(),
@@ -331,6 +349,7 @@ impl RemoteServerRepository {
                 version: version.map(str::to_owned),
             },
             "modpack_applied",
+            observer,
         )?;
         match response {
             Response::ModpackApplied {
@@ -646,13 +665,29 @@ impl RemoteJavaRepository {
         jre: bool,
         vendor: Option<&str>,
     ) -> Result<Vec<JavaRuntime>, RepositoryError> {
-        let response = self.link.expect(
+        self.install_with(major, jre, vendor, &port::NoopTaskObserver)
+    }
+
+    /// [`Self::install`] 的流式版本：把对端的阶段 / 字节进度交给 `observer`
+    ///
+    /// # Errors
+    ///
+    /// 来源不可达、下载 / 解压失败、对端拒绝或传输失败时返回 [`RepositoryError`]
+    pub fn install_with(
+        &self,
+        major: i64,
+        jre: bool,
+        vendor: Option<&str>,
+        observer: &dyn port::TaskObserver,
+    ) -> Result<Vec<JavaRuntime>, RepositoryError> {
+        let response = self.link.expect_streaming(
             &Request::JavaInstall {
                 major,
                 jre,
                 vendor: vendor.map(str::to_owned),
             },
             "javas",
+            observer,
         )?;
         match response {
             Response::Javas { items } => {
@@ -770,6 +805,32 @@ mod tests {
     use port::ServerRepository as _;
     use port::WorkspaceRepository as _;
     use std::path::PathBuf;
+
+    /// 记录对端回传的任务事件，用于验证流式帧真的交到了观察者
+    #[derive(Default)]
+    struct Recorder {
+        seen: std::sync::Mutex<Vec<port::TaskEvent>>,
+    }
+
+    impl port::ProgressSink for Recorder {
+        fn on_progress(&self, done: u64, total: Option<u64>) {
+            self.seen
+                .lock()
+                .expect("lock")
+                .push(port::TaskEvent::Progress { done, total });
+        }
+    }
+
+    impl port::InstallerOutputSink for Recorder {}
+
+    impl port::TaskObserver for Recorder {
+        fn on_stage(&self, stage: port::TaskStage) {
+            self.seen
+                .lock()
+                .expect("lock")
+                .push(port::TaskEvent::Stage { stage });
+        }
+    }
 
     fn origin() -> Origin {
         Origin::Remote(port::RemoteName::parse("test-box").expect("name"))
@@ -889,12 +950,42 @@ mod tests {
         assert_eq!(updated.updated_at, 2);
     }
 
+    /// 安装的中间帧必须交给观察者，终结帧仍是服务器记录
+    ///
+    /// 这条链路是「远端也有进度条」的全部依据：镜像不解析事件内容，只保证
+    /// 「读到 Task 就转给同一个观察者、继续读到终结帧」。
+    #[test]
+    fn server_install_streams_progress_to_the_observer() {
+        let harness = PairingHarness::spawn();
+        let servers = RemoteServerRepository::new(harness.link(), origin());
+        let _ = servers
+            .create(None, "web", "1.21.1", "vanilla", None)
+            .expect("create");
+        let recorder = Recorder::default();
+        let updated = servers
+            .install_with("web", "1.21.4", &recorder)
+            .expect("install");
+        assert_eq!(updated.version.as_str(), "1.21.4");
+        assert_eq!(
+            recorder.seen.lock().expect("lock").as_slice(),
+            [
+                port::TaskEvent::Stage {
+                    stage: port::TaskStage::Downloading
+                },
+                port::TaskEvent::Progress {
+                    done: 10,
+                    total: Some(10)
+                },
+            ]
+        );
+    }
+
     #[test]
     fn server_create_modpack_decodes_the_applied_frame() {
         let harness = PairingHarness::spawn();
         let servers = RemoteServerRepository::new(harness.link(), origin());
         let result = servers
-            .create_modpack(None, "atm", "all-the-mods", None)
+            .create_modpack(None, "atm", "all-the-mods", None, &port::NoopTaskObserver)
             .expect("create modpack");
         assert_eq!(result.project_id, "all-the-mods");
         assert_eq!(result.version_id, "v1", "缺省版本由对端决定");

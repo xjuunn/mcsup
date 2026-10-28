@@ -551,6 +551,20 @@ pub(crate) mod mcsup_agent_shim {
                     .into_response(),
             }
         }
+
+        /// 安装帧顺带回两条进度：验证客户端把中间帧交给观察者而不是当结果
+        fn handle_with(
+            &self,
+            session: &SessionInfo,
+            request: &Request,
+            progress: &dyn port::TaskObserver,
+        ) -> Response {
+            if matches!(request, Request::ServerInstall { .. }) {
+                progress.on_stage(port::TaskStage::Downloading);
+                progress.on_progress(10, Some(10));
+            }
+            self.handle(session, request)
+        }
     }
 
     fn uuid_v4() -> String {

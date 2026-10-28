@@ -2,7 +2,7 @@ use crate::bootstrap;
 use crate::diagnostic::AppDiagnostic;
 use crate::locale::Lang;
 use crate::output::Printer;
-use crate::progress::TaskSpinner;
+use crate::progress::{InstallSession, TaskSpinner};
 use crate::prompts;
 use anyhow::{Context, Result};
 use comfy_table::{Cell, Color, Table};
@@ -10,7 +10,7 @@ use mcsup::domain::server::meta::ServerName;
 use mcsup::domain::server::status::ServerStatus;
 use mcsup::domain::server::version::{ServerVariant, VersionId};
 use mcsup::domain::workspace::{WorkspaceId, WorkspaceName};
-use mcsup::port::ServerJarSource;
+use mcsup::port::{ServerJarSource, TaskStage};
 use mcsup::protocol::cli::{CreateRow, RemoveJson, ServerRow};
 use mcsup::service::{
     InitOutcome, ServerRegistry, ServerRegistryError, WorkspaceError, WorkspaceService,
@@ -641,8 +641,19 @@ fn create_remote(
         })?;
     // 登记成功即装核心：与本地 `server create` 同一条语义（建站 = 登记 + 下载核心）。
     // 安装失败保留登记，提示对端重试——「已登记、可重试」与本地 setup_server 失败
-    // 路径的口径完全一致。
-    let installed = member.servers.install(meta.name.as_str(), &version);
+    // 路径的口径完全一致。进度用与本地同一个 InstallSession 渲染。
+    let session = InstallSession::new(
+        crate::i18n::pick(
+            lang,
+            format!("在 {} 安装 {} 的核心", member.name, meta.name),
+            format!("installing the core of {} on {}", meta.name, member.name),
+        ),
+        printer.is_human(),
+    );
+    let installed = member
+        .servers
+        .install_with(meta.name.as_str(), &version, &session);
+    session.finish();
     let (jar_version, path) = match installed {
         Ok(updated) => match updated.jar.as_ref() {
             Some(_) => (
@@ -818,18 +829,13 @@ fn create_remote_modpack(
         )
         .into());
     }
-    let spinner = TaskSpinner::new(
-        crate::i18n::pick(
-            lang,
-            format!("正在 {} 按整合包 {project} 创建 {name}…", member.name),
-            format!("creating {name} from modpack {project} on {}…", member.name),
-        ),
-        printer.is_human(),
-    );
+    // 与本地 `server create --modpack` 同一个回显装配：阶段 / 字节进度由对端
+    // 经 Task 帧回传，这里只负责画
+    let session = InstallSession::new(TaskStage::Probing.message(), printer.is_human());
     let result = member
         .servers
-        .create_modpack(workspace, name, project, version);
-    spinner.finish();
+        .create_modpack(workspace, name, project, version, &session);
+    session.finish();
     let result = result.with_context(|| {
         crate::i18n::pick(
             lang,

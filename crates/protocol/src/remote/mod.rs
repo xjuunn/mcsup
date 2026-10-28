@@ -26,6 +26,7 @@ pub mod wire;
 
 use crate::Frame;
 use auth::{ClientId, Permission, Role};
+pub use port::task::{TaskEvent, TaskObserver, TaskStage};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Write};
@@ -35,7 +36,10 @@ use wire::{
 };
 
 /// 远端协议版本；不匹配直接拒绝，禁止猜测兼容
-pub const REMOTE_PROTOCOL_VERSION: u32 = 1;
+///
+/// 2：新增中间帧 [`Response::Task`]（长任务的阶段 / 进度 / 输出）。旧客户端
+/// 收到不认识的 `op` 会整条报错，因此这是破坏性变更，必须随帧集一起升版。
+pub const REMOTE_PROTOCOL_VERSION: u32 = 2;
 
 /// 单帧字节上限
 ///
@@ -751,6 +755,18 @@ pub enum Response {
         /// 是否只是试运行
         dry_run: bool,
     },
+    /// **中间帧**：长任务执行期间的阶段 / 进度 / 输出
+    ///
+    /// 与其余响应不同，它不是终结帧：同一请求在若干条 `Task` 之后仍会收到一条
+    /// 终结响应（`Servers` / `Javas` / `ModpackApplied` / `Error` …）。客户端
+    /// 必须一直读到终结帧为止。
+    ///
+    /// 用同一组 [`TaskEvent`] 而不是各自一套 DTO：本地渲染与远端回传解析的是
+    /// 同一份定义，新增阶段时两端一起变。
+    Task {
+        /// 一条任务事件
+        event: TaskEvent,
+    },
     /// 业务 / 协议错误
     Error {
         /// 错误种类（`unauthorized` / `not_found` / `busy` / `protocol` / `io` …）
@@ -758,6 +774,17 @@ pub enum Response {
         /// 人类可读消息
         message: String,
     },
+}
+
+impl Response {
+    /// 是否为长任务的中间进度帧（不是终结响应）
+    ///
+    /// 收发两侧都用它判断「继续读」还是「本次请求结束」：中间帧绝不能当成
+    /// 结果返回给调用方，否则安装会被当成「对端回了一条进度」而提前结束。
+    #[must_use]
+    pub const fn is_progress(&self) -> bool {
+        matches!(self, Self::Task { .. })
+    }
 }
 
 /// 错误种类常量：客户端按此决定退出码与提示，不解析 `message`

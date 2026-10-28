@@ -9,7 +9,7 @@
 //! [`RepositoryError::NotFound`] 等。按 `kind` 映射而不是解析消息，与 agent
 //! 侧的分类纪律一致。
 
-use port::RepositoryError;
+use port::{RepositoryError, TaskObserver};
 use protocol::remote::{ErrorKind, Request, Response};
 use std::sync::{Arc, Mutex};
 use transport::{Client, Fingerprint, TransportError};
@@ -195,6 +195,51 @@ impl RemoteLink {
     ) -> Result<Response, RepositoryError> {
         let response = self.call(request)?;
         // `call` 已把业务错误帧转成 Err；这里只防漏网，不丢 kind
+        if matches!(response, Response::Error { .. }) {
+            return Err(RepositoryError::Storage(Box::new(
+                TransportError::Protocol(format!("expected {what}, got an error frame")),
+            )));
+        }
+        Ok(response)
+    }
+
+    /// 执行一个长任务操作，把对端回传的中间帧交给 `observer`
+    ///
+    /// 与 [`Self::call`] 的区别只有一点：读到 `Response::Task` 时不当作结果，
+    /// 而是转给同一个 [`TaskObserver`]。本地安装与远端安装因此共用同一套
+    /// 渲染代码——观察者是入口侧的同一个对象。
+    ///
+    /// # Errors
+    ///
+    /// 见 [`Self::call`]
+    pub fn call_streaming(
+        &self,
+        request: &Request,
+        observer: &dyn TaskObserver,
+    ) -> Result<Response, RepositoryError> {
+        let response = self
+            .client()
+            .map_err(remote_error)?
+            .call_streaming(request, observer)
+            .map_err(remote_error)?;
+        match response {
+            Response::Error { kind, message } => Err(repository_error(&kind, &message)),
+            other => Ok(other),
+        }
+    }
+
+    /// [`Self::expect`] 的流式版本
+    ///
+    /// # Errors
+    ///
+    /// 见 [`Self::call_streaming`]
+    pub fn expect_streaming(
+        &self,
+        request: &Request,
+        what: &'static str,
+        observer: &dyn TaskObserver,
+    ) -> Result<Response, RepositoryError> {
+        let response = self.call_streaming(request, observer)?;
         if matches!(response, Response::Error { .. }) {
             return Err(RepositoryError::Storage(Box::new(
                 TransportError::Protocol(format!("expected {what}, got an error frame")),

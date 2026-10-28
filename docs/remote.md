@@ -328,11 +328,33 @@ error: “web” 存在于多个位置
 - 复用 `protocol::Frame`，首帧为 `Hello { protocol_version, agent_version,
   capabilities }`。
 - `PROTOCOL_VERSION` 不匹配直接拒绝，不猜测兼容；破坏性变更走新增字段 +
-  版本递增。
+  版本递增。当前 `REMOTE_PROTOCOL_VERSION = 2`（新增中间帧 `Response::Task`）。
 - 能力协商决定可选能力（backup / file / java / streaming）是否可用。
-- 日志 follow 用 `LogsFollow` 长轮询帧承载（断线即取消，无会话状态）；
-  备份进度**不回传**——远端备份期间客户端 spinner 持续运转，事件通道的
-  取舍见 `docs/remote-progress.md`。
+- 日志 follow 用 `LogsFollow` 长轮询帧承载（断线即取消，无会话状态）。
+- **进度通道**：长任务（装核心 / 装 Java / 整合包布置）在终结响应之前回若干
+  条 `Response::Task { event }` 中间帧，event 取 `port::TaskEvent`
+  （`stage` / `progress` / `output`）。客户端一直读到终结帧为止，把中间帧交给
+  **同一个** `port::TaskObserver`——本地与远端因此共用一套阶段文案与渲染，
+  新增长任务不需要为远端另写一套进度代码。
+- 备份目前不回传逐文件进度：本地与远端执行的是同一份 `BackupService`，两侧
+  同样只给出阶段级回显，不存在「本地有、远端没有」的差异。
+
+## 进度回显
+
+进度不是入口各自的实现，而是一条从 `service` 到终端的单向事件流：
+
+```
+service ──TaskObserver──▶ 本地：apps/cli/src/progress.rs
+                 └──────▶ 远端：transport 写成 Response::Task → 客户端解帧 → 同一个渲染器
+```
+
+- 观察者定义在 `port`（`TaskStage` / `TaskEvent` / `TaskObserver`），
+  `service` 只发事件，不关心谁在听。
+- 阶段文案只有一份（`TaskStage::message`），入口不得另写。
+- 传输层把事件写成中间帧并做节流（进度帧 ≥ 128 KiB 或 ≥ 100 ms 才发一条）；
+  阶段与安装器输出不节流。
+- 客户端 `Client::call_streaming` 读到 `Response::Task` 就交给观察者并继续读；
+  终结帧（`Servers` / `Javas` / `ModpackApplied` / `Error`）才是结果。
 
 ## 实施阶段
 
@@ -357,7 +379,9 @@ error: “web” 存在于多个位置
     tonic。
 
 第 1–9 步已完成；SSH 接入已落地（`remote connect user@host`，见「用户视角」）。
-局域网发现、系统服务注册与流式仍未做。
+第 13 步补齐了长任务进度回显（`Response::Task` 中间帧 + `port::TaskObserver`），
+本地与远端共用同一套阶段文案与渲染。
+局域网发现、系统服务注册与备份的逐文件进度仍未做。
 
 实施进度、已完成内容与逐阶段待办记在 `docs/remote-progress.md`。
 

@@ -9,6 +9,8 @@ publish = false
 [dependencies]
 # 契约层：帧类型与权限表都在 protocol，transport 只做「怎么把帧送过去」
 protocol = { version = "0.1.0", path = "../protocol" }
+# 长任务的观察者词表（阶段 / 进度 / 输出）由 port 定义，服务端回传时复用
+port = { version = "0.1.0", path = "../port" }
 auth = { version = "0.1.0", path = "../auth" }
 pem = "3.0"
 # TLS：与 provider 同一套后端（rustls + ring），不引入 C 工具链

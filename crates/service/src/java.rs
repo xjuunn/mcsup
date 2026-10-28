@@ -3,7 +3,7 @@ use domain::java::{JavaMajor, JavaPackageType, JavaRuntime, JavaVendor};
 use port::{
     ArchiveExtractor, ArtifactDownloader, CancellationToken, DownloadRequest, DownloadedArtifact,
     JavaPackageRequest, JavaRuntimeRepository, JavaScanner, JavaSourceRegistryPort, ProgressSink,
-    RepositoryError, ScannedJava, SourceError, Sourced,
+    RepositoryError, ScannedJava, SourceError, Sourced, TaskObserver, TaskStage,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -81,50 +81,6 @@ pub enum UninstallOutcome {
     RemovedManaged { path: PathBuf },
     /// 系统运行时：仅移除记录，文件保留
     UnregisteredSystem { path: PathBuf },
-}
-
-/// 安装阶段回调：CLI 用它实时切换 spinner 文案
-pub trait StageSink: Send + Sync {
-    /// 进入新阶段
-    fn on_stage(&self, stage: InstallStage);
-}
-
-/// 安装流程的阶段划分
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InstallStage {
-    /// 探测并排序下载源
-    Probing,
-    /// 查询可用发行包
-    Listing,
-    /// 解析下载地址
-    Resolving,
-    /// 下载归档
-    Downloading,
-    /// 解压并注册
-    Extracting,
-    /// 下载安装器本体（`Forge` / `NeoForge` 等 install 方式的来源）
-    DownloadingInstaller,
-    /// 运行安装器产出服务端目录：耗时可长达数分钟，输出逐行透传给用户
-    Installing,
-    /// 安装完成，登记服务端核心（写注册表）
-    Finalizing,
-}
-
-impl InstallStage {
-    /// 面向用户的简短文案
-    #[must_use]
-    pub const fn message(self) -> &'static str {
-        match self {
-            Self::Probing => "探测下载源…",
-            Self::Listing => "查询可用版本…",
-            Self::Resolving => "解析下载地址…",
-            Self::Downloading => "下载 Java…",
-            Self::Extracting => "解压并注册…",
-            Self::DownloadingInstaller => "下载安装器…",
-            Self::Installing => "运行安装器…",
-            Self::Finalizing => "登记服务端核心…",
-        }
-    }
 }
 
 /// Java 生命周期编排：扫描、安装、卸载、列表
@@ -299,7 +255,8 @@ impl JavaService {
 
     /// 从远端安装到 `{java_root}/{id}` 并注册
     ///
-    /// `stage` 用于在各阶段切换回显文案；`progress` 只覆盖下载字节进度
+    /// `observer` 收阶段、字节进度与后续可能的输出；本地与远端入口传同一个
+    /// [`TaskObserver`]，渲染方式因此完全一致。
     ///
     /// # Errors
     ///
@@ -309,21 +266,21 @@ impl JavaService {
         major: JavaMajor,
         package_type: JavaPackageType,
         vendor: Option<JavaVendor>,
-        stage: Option<&dyn StageSink>,
-        progress: Option<&dyn ProgressSink>,
+        observer: Option<&dyn TaskObserver>,
         cancel: &CancellationToken,
     ) -> Result<InstallOutcome, JavaError> {
-        let notify = |s: InstallStage| {
-            if let Some(sink) = stage {
-                sink.on_stage(s);
+        let notify = |s: TaskStage| {
+            if let Some(observer) = observer {
+                observer.on_stage(s);
             }
         };
+        let progress = observer.map(|observer| observer as &dyn ProgressSink);
 
         // 源探测与排序属于安装编排的一部分，换入口（CLI/API/MCP）共享同一阶段机
-        notify(InstallStage::Probing);
+        notify(TaskStage::Probing);
         let registry = until_cancelled(self.registry.ranked(), cancel).await?;
 
-        notify(InstallStage::Listing);
+        notify(TaskStage::Listing);
         let request = JavaPackageRequest::for_current_platform(major, package_type);
         let packages = until_cancelled(registry.list_packages(&request), cancel).await??;
         let package = packages
@@ -335,7 +292,7 @@ impl JavaService {
                 ))
             })?;
 
-        notify(InstallStage::Resolving);
+        notify(TaskStage::Resolving);
         let resolved = until_cancelled(registry.resolve_binary(&package), cancel).await??;
 
         // 上次硬中断（断电 / kill -9）残留的临时文件在安装开始时统一回收
@@ -365,7 +322,7 @@ impl JavaService {
             return Err(JavaError::Download(port::DownloadError::Cancelled));
         }
 
-        notify(InstallStage::Downloading);
+        notify(TaskStage::Downloading);
         let request = DownloadRequest {
             location: resolved.location,
             destination: destination.clone(),
@@ -387,7 +344,7 @@ impl JavaService {
             return Err(JavaError::Download(port::DownloadError::Cancelled));
         }
 
-        notify(InstallStage::Extracting);
+        notify(TaskStage::Extracting);
         // 解压失败时归档（可能数百 MB）与半成品都在 install_dir 里，必须回收。
         // 解压是重活（外部工具链 + 大量文件 IO），放到阻塞线程池。
         let dest = destination.clone();
@@ -1190,7 +1147,6 @@ mod tests {
                 JavaPackageType::Jdk,
                 None,
                 None,
-                None,
                 &cancel,
             )
             .await
@@ -1230,7 +1186,6 @@ mod tests {
                 JavaPackageType::Jdk,
                 None,
                 None,
-                None,
                 &cancel,
             )
             .await
@@ -1255,7 +1210,6 @@ mod tests {
             .install(
                 JavaMajor::parse(21).expect("21"),
                 JavaPackageType::Jdk,
-                None,
                 None,
                 None,
                 &cancel,
@@ -1284,7 +1238,6 @@ mod tests {
             .install(
                 JavaMajor::parse(21).expect("21"),
                 JavaPackageType::Jdk,
-                None,
                 None,
                 None,
                 &cancel,
@@ -1352,7 +1305,6 @@ mod tests {
             service.install(
                 JavaMajor::parse(21).expect("21"),
                 JavaPackageType::Jdk,
-                None,
                 None,
                 None,
                 &cancel,
@@ -1429,7 +1381,6 @@ mod tests {
                 JavaPackageType::Jdk,
                 None,
                 None,
-                None,
                 &cancel,
             )
             .await
@@ -1480,7 +1431,6 @@ mod tests {
             .install(
                 JavaMajor::parse(21).expect("21"),
                 JavaPackageType::Jdk,
-                None,
                 None,
                 None,
                 &cancel,

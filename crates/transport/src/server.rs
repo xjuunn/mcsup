@@ -18,7 +18,7 @@ use crate::handler::{Handler, RemoteFailure, SessionInfo};
 use crate::identity::ServerIdentity;
 use crate::session::Session;
 use crate::tls;
-use protocol::remote::{self, ErrorKind, Request, Response};
+use protocol::remote::{self, ErrorKind, Request, Response, TaskEvent, TaskStage};
 use rustls::{ServerConnection, StreamOwned};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
@@ -365,8 +365,87 @@ fn authenticate<S: std::io::Read + std::io::Write>(
     Ok(Some(info))
 }
 
+/// 把任务事件写成中间帧的观察者
+///
+/// 连接线程同一时刻只处理一个请求，`Mutex` 只是为了让观察者满足
+/// [`port::TaskObserver`] 的 `Sync` 约束——不存在并发写同一条连接的场景。
+struct SessionSink<'a, S: std::io::Read + std::io::Write> {
+    session: std::sync::Mutex<&'a mut Session<S>>,
+    /// 上次已发出的进度：下载回调按块触发，逐块发帧会把连接与客户端都打满
+    progress: std::sync::Mutex<ProgressMark>,
+}
+
+/// 进度帧的节流状态
+#[derive(Debug, Default)]
+struct ProgressMark {
+    done: u64,
+    at: Option<std::time::Instant>,
+}
+
+/// 进度帧最小间隔与最小增量
+///
+/// 下载器每块都回调一次（8–64 KiB），逐块发一条 JSON 帧会让「进度条比下载还慢」。
+/// 阶段与输出不节流：它们的频率本来就很低，且是用户判断「有没有卡死」的依据。
+const PROGRESS_MIN_BYTES: u64 = 128 * 1024;
+const PROGRESS_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+impl<S: std::io::Read + std::io::Write> SessionSink<'_, S> {
+    /// 尽力写出一帧：事件是旁路，写失败（对端已断开）不改变业务结果
+    fn send(&self, event: TaskEvent) {
+        let Ok(mut session) = self.session.lock() else {
+            return;
+        };
+        let _ = session.send_response(&Response::Task { event });
+    }
+
+    /// 是否值得为这次进度发一帧
+    fn should_emit(&self, done: u64, total: Option<u64>) -> bool {
+        // 走完（或已知总量且已到终点）必须发：否则进度条停在 99%
+        if total == Some(done) {
+            return true;
+        }
+        let Ok(mut mark) = self.progress.lock() else {
+            return false;
+        };
+        let now = std::time::Instant::now();
+        let enough_bytes = done.saturating_sub(mark.done) >= PROGRESS_MIN_BYTES;
+        let enough_time = mark
+            .at
+            .is_none_or(|at| now.duration_since(at) >= PROGRESS_MIN_INTERVAL);
+        if enough_bytes || enough_time {
+            mark.done = done;
+            mark.at = Some(now);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl<S: std::io::Read + std::io::Write + Send> port::ProgressSink for SessionSink<'_, S> {
+    fn on_progress(&self, done: u64, total: Option<u64>) {
+        if self.should_emit(done, total) {
+            self.send(TaskEvent::Progress { done, total });
+        }
+    }
+}
+
+impl<S: std::io::Read + std::io::Write + Send> port::InstallerOutputSink for SessionSink<'_, S> {
+    fn on_output(&self, line: &str) {
+        self.send(TaskEvent::Output {
+            line: line.to_owned(),
+        });
+    }
+}
+
+impl<S: std::io::Read + std::io::Write + Send> port::TaskObserver for SessionSink<'_, S> {
+    fn on_stage(&self, stage: TaskStage) {
+        self.send(TaskEvent::Stage { stage });
+    }
+}
+
 /// 第三步：业务帧一问一答，直到对端关闭
-fn dispatch<S: std::io::Read + std::io::Write>(
+fn dispatch<S: std::io::Read + std::io::Write + Send>(
     session: &mut Session<S>,
     handler: &dyn Handler,
     session_info: &SessionInfo,
@@ -392,15 +471,23 @@ fn dispatch<S: std::io::Read + std::io::Write>(
             );
             return Ok(());
         }
-        let response = if session_info.permits(&request) {
-            handler.handle(session_info, &request)
-        } else {
-            RemoteFailure::unauthorized(format!(
-                "role {} cannot perform {}",
-                session_info.role,
-                request.operation()
-            ))
-            .into_response()
+        let response = {
+            // 观察者只在这次调用期间借用连接：同一线程内不会有第二个写者，
+            // 放进 `Mutex` 只是为了满足 `TaskObserver: Sync`
+            let sink = SessionSink {
+                session: std::sync::Mutex::new(&mut *session),
+                progress: std::sync::Mutex::new(ProgressMark::default()),
+            };
+            if session_info.permits(&request) {
+                handler.handle_with(session_info, &request, &sink)
+            } else {
+                RemoteFailure::unauthorized(format!(
+                    "role {} cannot perform {}",
+                    session_info.role,
+                    request.operation()
+                ))
+                .into_response()
+            }
         };
         let ok = !matches!(response, Response::Error { .. });
         session.send_response(&response)?;
@@ -497,6 +584,47 @@ mod tests {
                     .into_response(),
             }
         }
+
+        /// `Ping` 顺带回两条进度：验证「中间帧在前、终结帧在后」的线序
+        fn handle_with(
+            &self,
+            session: &SessionInfo,
+            request: &Request,
+            progress: &dyn port::TaskObserver,
+        ) -> Response {
+            if matches!(request, Request::Ping) {
+                progress.on_stage(TaskStage::Downloading);
+                progress.on_progress(0, None);
+                progress.on_progress(100, Some(100));
+            }
+            self.handle(session, request)
+        }
+    }
+
+    /// 记录收到的任务事件，用于断言「中间帧在前、终结帧在后」
+    #[derive(Default)]
+    struct Recorder {
+        seen: Mutex<Vec<TaskEvent>>,
+    }
+
+    impl port::ProgressSink for Recorder {
+        fn on_progress(&self, done: u64, total: Option<u64>) {
+            self.seen
+                .lock()
+                .expect("lock")
+                .push(TaskEvent::Progress { done, total });
+        }
+    }
+
+    impl port::InstallerOutputSink for Recorder {}
+
+    impl port::TaskObserver for Recorder {
+        fn on_stage(&self, stage: TaskStage) {
+            self.seen
+                .lock()
+                .expect("lock")
+                .push(TaskEvent::Stage { stage });
+        }
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -559,6 +687,58 @@ mod tests {
 
         stop.store(true, Ordering::Relaxed);
         // 唤醒 accept：连一次即可（服务端会先看到停止标志并退出）
+        let _ = TcpStream::connect(addr);
+        let _ = join.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 中间帧必须先于终结帧到达，并被交给观察者；不带观察者的 `call` 也要能吃掉它们
+    ///
+    /// 这条线是远端进度的根：漏掉「读到 Task 继续读」，安装会被当成「对端回了
+    /// 一条进度」而提前结束；漏掉节流之外的转发，用户看到的就是空白等待。
+    #[test]
+    fn progress_frames_precede_the_final_response() {
+        let dir = temp_dir("progress");
+        let identity = ServerIdentity::load_or_create(&dir).expect("identity");
+        let fingerprint = identity.fingerprint().clone();
+        let handler = Arc::new(TestHandler::new(identity.fingerprint().clone()));
+        let server = Server::bind("127.0.0.1:0", &identity, handler).expect("bind");
+        let addr = server.local_addr().expect("addr");
+        let stop = server.stop_flag();
+        let join = std::thread::spawn(move || server.run());
+
+        let authed = crate::client::Client::new(addr.to_string(), fingerprint.clone())
+            .with_token("a".repeat(64));
+        let recorder = Recorder::default();
+        let response = authed
+            .call_streaming(&Request::Ping, &recorder)
+            .expect("streaming ping");
+        assert!(
+            matches!(response, Response::Pong { .. }),
+            "终结帧必须是 Pong，不能把进度帧当结果：{response:?}"
+        );
+        assert_eq!(
+            recorder.seen.lock().expect("lock").as_slice(),
+            [
+                TaskEvent::Stage {
+                    stage: TaskStage::Downloading
+                },
+                TaskEvent::Progress {
+                    done: 0,
+                    total: None
+                },
+                TaskEvent::Progress {
+                    done: 100,
+                    total: Some(100)
+                },
+            ]
+        );
+
+        // 不带观察者的调用方不受影响：中间帧被丢弃，仍然拿到终结帧
+        let response = authed.call(&Request::Ping).expect("plain ping");
+        assert!(matches!(response, Response::Pong { .. }), "{response:?}");
+
+        stop.store(true, Ordering::Relaxed);
         let _ = TcpStream::connect(addr);
         let _ = join.join();
         let _ = std::fs::remove_dir_all(&dir);

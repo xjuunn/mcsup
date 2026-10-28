@@ -42,7 +42,7 @@ pub(crate) fn java_root() -> Result<PathBuf> {
 /// 装配 `JavaService`
 ///
 /// 源列表在此只组装不打网络；延迟探测排序由 service 在安装阶段
-/// （[`mcsup::service::InstallStage::Probing`]）触发，本地命令因此零网络开销。
+/// （[`mcsup::port::TaskStage::Probing`]）触发，本地命令因此零网络开销。
 pub(crate) fn open_java_service() -> Result<JavaService> {
     let scanner = Arc::new(mcsup::java::HostJavaScanner::new());
     let registry = Arc::new(mcsup::provider::java::JavaSourceRegistry::all_sources());

@@ -30,8 +30,7 @@ use domain::server::error::InvalidTransition;
 use domain::server::version::VersionId;
 pub use fs_error::FsError;
 pub use java::{
-    InstallOutcome, InstallStage, JavaError, JavaService, RemoteJavaPackage, ScanOutcome,
-    StageSink, UninstallOutcome,
+    InstallOutcome, JavaError, JavaService, RemoteJavaPackage, ScanOutcome, UninstallOutcome,
 };
 pub use lifecycle::{
     BusyOp, DEFAULT_RAM_MIB, LifecycleError, LifecycleErrorKind, LogWatch, ServerLifecycleService,
@@ -54,6 +53,8 @@ use port::{
 };
 /// 来源类型定义在 `port`（组合仓库要用），此处转出便于既有调用方
 pub use port::{LOCAL_NAME, MAX_NAME_LEN, Origin, OriginError, RESERVED_NAMES, RemoteName};
+/// 任务观察者（阶段 / 进度 / 输出）定义在 `port`，本地与远端入口共用同一份
+pub use port::{NoopTaskObserver, TaskEvent, TaskObserver, TaskStage};
 pub use props::{PropsError, PropsReport, ServerPropsService};
 /// 服务器注销的结果（与工作目录的 [`RemoveOutcome`] 同名，用别名区分）
 pub use registry::RemoveOutcome as ServerRemoveOutcome;
@@ -124,8 +125,6 @@ pub struct InstallerContext {
     pub java_bin: PathBuf,
     /// 安装器执行器
     pub runner: Arc<dyn port::InstallerRunner>,
-    /// 安装器输出的实时观察者：联网拉 libraries 可达数分钟，逐行透传给用户
-    pub output: Option<Arc<dyn port::InstallerOutputSink>>,
 }
 
 impl std::fmt::Debug for InstallerContext {
@@ -162,8 +161,9 @@ impl ServerInstaller {
     /// 就地安装成服务端目录。`installer` 仅在需要时读取：来源声明为
     /// [`port::InstallKind::Direct`] 时传 `None` 即可。
     ///
-    /// `stages` 用于回显安装器阶段：下载完成到安装完成之间可能长达数分钟
-    /// （安装器要联网拉 libraries），没有阶段回调时用户只看到冻结的进度条。
+    /// `observer` 是入口级唯一观察者：阶段、字节进度与安装器输出都从它出去。
+    /// 安装器要联网拉 libraries（可达数分钟），没有输出透传时用户只看到冻结的
+    /// 进度条。
     ///
     /// # Errors
     ///
@@ -174,8 +174,7 @@ impl ServerInstaller {
         version: &VersionId,
         destination: PathBuf,
         installer: Option<&InstallerContext>,
-        progress: Option<&dyn ProgressSink>,
-        stages: Option<&dyn StageSink>,
+        observer: Option<&dyn TaskObserver>,
         cancel: &CancellationToken,
     ) -> Result<InstalledDownload, InstallError> {
         let mut status = DownloadStatus::Pending.transition(DownloadStatus::Downloading)?;
@@ -187,11 +186,12 @@ impl ServerInstaller {
         // 自己的版本串（Forge 为 `26.3-66.1.0`），与 `VersionId`（`26.3`）不同；
         // 由来源在解析时给出，这里只负责往下传。
         let build = resolved.installer_args_dir;
-        let notify = |stage: InstallStage| {
-            if let Some(sink) = stages {
-                sink.on_stage(stage);
+        let notify = |stage: TaskStage| {
+            if let Some(observer) = observer {
+                observer.on_stage(stage);
             }
         };
+        let progress = observer.map(|observer| observer as &dyn ProgressSink);
 
         // 上游未提供哈希 / 大小时不传校验条件：Fabric 等服务端 JAR 走 chunked
         // 且无 Content-Length，占位值参与比对必然失败，只能以「无校验」下载。
@@ -206,9 +206,9 @@ impl ServerInstaller {
             expected_size: (!unverified && known_size).then_some(resolved.artifact.size),
         };
         notify(if install == port::InstallKind::Installer {
-            InstallStage::DownloadingInstaller
+            TaskStage::DownloadingInstaller
         } else {
-            InstallStage::Downloading
+            TaskStage::Downloading
         });
         let artifact = self.downloader.download(&request, progress, cancel).await?;
         status = status.transition(DownloadStatus::Verifying)?;
@@ -229,15 +229,15 @@ impl ServerInstaller {
             })?;
             // 从这里到返回之间是纯阻塞执行（几分钟量级），安装器的输出会逐行
             // 透传给用户，让他们看到正在联机下载 libraries 而不是卡死
-            notify(InstallStage::Installing);
+            notify(TaskStage::Installing);
             ctx.runner.run_installer(
                 &ctx.java_bin,
                 &destination,
                 dir,
-                ctx.output.as_deref(),
+                observer.map(|observer| observer as &dyn port::InstallerOutputSink),
                 cancel,
             )?;
-            notify(InstallStage::Finalizing);
+            notify(TaskStage::Finalizing);
         }
 
         status = status.transition(DownloadStatus::Ready)?;
@@ -364,7 +364,6 @@ mod tests {
                 PathBuf::from("/tmp/server.jar"),
                 None,
                 None,
-                None,
                 &CancellationToken::new(),
             )
             .await?;
@@ -394,7 +393,6 @@ mod tests {
             .install(
                 &VersionId::new("1.21.1"),
                 PathBuf::from("/tmp/server.jar"),
-                None,
                 None,
                 None,
                 &CancellationToken::new(),
@@ -440,7 +438,6 @@ mod tests {
                 PathBuf::from("/tmp/server.jar"),
                 None,
                 None,
-                None,
                 &CancellationToken::new(),
             )
             .await;
@@ -473,7 +470,6 @@ mod tests {
             .install(
                 &VersionId::new("1.21.1"),
                 PathBuf::from("/tmp/server.jar"),
-                None,
                 None,
                 None,
                 &CancellationToken::new(),
@@ -519,7 +515,6 @@ mod tests {
             .install(
                 &VersionId::new("1.21.1"),
                 PathBuf::from("/tmp/server.jar"),
-                None,
                 None,
                 None,
                 &CancellationToken::new(),
@@ -586,7 +581,6 @@ mod tests {
             runner: Arc::new(FakeRunner {
                 calls: Arc::clone(&calls),
             }),
-            output: None,
         };
 
         let out = installer
@@ -594,7 +588,6 @@ mod tests {
                 &VersionId::new("26.3"),
                 dir.path().join(".forge-installer.jar"),
                 Some(&ctx),
-                None,
                 None,
                 &CancellationToken::new(),
             )

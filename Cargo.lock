@@ -2132,6 +2132,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "domain",
+ "serde",
+ "serde_json",
  "thiserror",
  "url",
 ]
@@ -3366,6 +3368,7 @@ version = "0.1.0"
 dependencies = [
  "auth",
  "pem 3.0.6",
+ "port",
  "protocol",
  "rcgen",
  "ring",

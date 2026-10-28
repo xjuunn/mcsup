@@ -1,6 +1,5 @@
 use indicatif::{ProgressBar, ProgressStyle};
-use mcsup::port::{CancellationToken, InstallerOutputSink, ProgressSink};
-use mcsup::service::{InstallStage, StageSink};
+use mcsup::port::{CancellationToken, InstallerOutputSink, ProgressSink, TaskObserver, TaskStage};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -322,9 +321,12 @@ impl InstallerOutputSink for InstallerOutput {
 /// 一次安装的回显与取消装配：spinner + 下载进度条 + 取消令牌
 ///
 /// 三者同生同灭，装错一次就整段安装只有半截回显或转不停的 spinner：
-/// - 与阶段机共用同一条回显线（见 [`StageSink`] 实现）
+/// - 与阶段机共用同一条回显线（见 [`TaskObserver`] 实现）
 /// - `Drop` 兜底：`?` 提前返回、Ctrl-C 中断时收线并请求取消，
 ///   不留转不停的 spinner 挡住错误输出
+///
+/// 本地安装与远端安装传的是**同一个**实例：远端经 `Response::Task` 帧回传的
+/// 阶段 / 进度 / 输出，走的也是这里的渲染，因此两边画面完全一致。
 pub(crate) struct InstallSession {
     spinner: TaskSpinner,
     sink: BarSink,
@@ -359,9 +361,8 @@ impl InstallSession {
         }
     }
 
-    /// 安装器输出的实时透传句柄：交给 [`InstallerContext::output`]
-    ///
-    /// [`InstallerContext::output`]: mcsup::service::InstallerContext::output
+    /// 安装器输出的实时透传句柄（测试与内部断言用）
+    #[cfg(test)]
     pub(crate) fn installer_output(&self) -> std::sync::Arc<InstallerOutput> {
         self.installer_output.clone()
     }
@@ -398,8 +399,8 @@ impl InstallSession {
     }
 }
 
-impl StageSink for InstallSession {
-    fn on_stage(&self, stage: InstallStage) {
+impl TaskObserver for InstallSession {
+    fn on_stage(&self, stage: TaskStage) {
         use std::sync::atomic::Ordering;
         // 取消后回显线已由 Ctrl-C 处理器收掉，任何迟到的阶段/进度都不再画
         if self.cancel.is_cancelled() {
@@ -407,8 +408,15 @@ impl StageSink for InstallSession {
         }
         match stage {
             // 下载：立即接管这条线，从发起请求到首字节之间也要有回显
-            InstallStage::Downloading => {
+            TaskStage::Downloading => {
                 self.downloading.store(true, Ordering::Relaxed);
+                self.sink.start();
+            }
+            // 安装器本体同样是一次下载；文案用阶段自带的「下载安装器…」，
+            // 不沿用调用方为「核心 JAR」设的那句（两者描述的不是同一个文件）
+            TaskStage::DownloadingInstaller => {
+                self.downloading.store(true, Ordering::Relaxed);
+                self.sink.set_message(stage.message());
                 self.sink.start();
             }
             // 运行安装器：收起自己的回显线，只透传安装器输出
@@ -416,7 +424,7 @@ impl StageSink for InstallSession {
             // 安装器自己刷进度，我们既拿不到它的真实进度，叠一条 bar/spinner
             // 只会两边抢同一行。这里先让出这条线（若刚下载完还要把 bar 交还），
             // 之后的状态全由安装器自己的输出表达。
-            InstallStage::Installing => {
+            TaskStage::Installing => {
                 if self.downloading.swap(false, Ordering::Relaxed) {
                     self.sink.finish();
                 }
@@ -437,6 +445,13 @@ impl StageSink for InstallSession {
             }
             stage => self.spinner.set_message(stage.message()),
         }
+    }
+}
+
+impl InstallerOutputSink for InstallSession {
+    fn on_output(&self, line: &str) {
+        // 安装器阶段之外的输出同样逐行透传：远端与本地走的是同一条渲染路径
+        self.installer_output.on_output(line);
     }
 }
 
@@ -510,12 +525,12 @@ mod tests {
     /// 后续阶段全部画不出来 —— 那几秒空白就是这么来的。
     #[test]
     fn install_session_keeps_one_live_line() {
-        let session = InstallSession::new(InstallStage::Probing.message(), false);
+        let session = InstallSession::new(TaskStage::Probing.message(), false);
         session.set_download_message("下载 Java 25 jdk");
         let line = session.handle_for_test();
 
-        session.on_stage(InstallStage::Listing);
-        assert_eq!(line.message(), InstallStage::Listing.message());
+        session.on_stage(TaskStage::Listing);
+        assert_eq!(line.message(), TaskStage::Listing.message());
 
         // 交互提示独占这一行，结束后必须恢复
         session.pause_for_prompt();
@@ -523,18 +538,18 @@ mod tests {
         session.resume_after_prompt();
         assert!(!line.is_finished());
 
-        session.on_stage(InstallStage::Resolving);
-        assert_eq!(line.message(), InstallStage::Resolving.message());
+        session.on_stage(TaskStage::Resolving);
+        assert_eq!(line.message(), TaskStage::Resolving.message());
 
         // 进入下载：同一条线交给进度条，不等首字节
-        session.on_stage(InstallStage::Downloading);
+        session.on_stage(TaskStage::Downloading);
         assert_eq!(line.message(), "下载 Java 25 jdk");
         session.on_progress(1, Some(100));
         assert_eq!(line.length(), Some(100));
 
         // 解压：进度条交还 spinner，同一条线继续有回显
-        session.on_stage(InstallStage::Extracting);
-        assert_eq!(line.message(), InstallStage::Extracting.message());
+        session.on_stage(TaskStage::Extracting);
+        assert_eq!(line.message(), TaskStage::Extracting.message());
         assert!(!line.is_finished());
     }
 
@@ -544,14 +559,14 @@ mod tests {
     /// 而且我们拿不到它的真实进度，画出来的是假进度。
     #[test]
     fn installing_stage_yields_the_line() {
-        let session = InstallSession::new(InstallStage::Probing.message(), false);
+        let session = InstallSession::new(TaskStage::Probing.message(), false);
         let line = session.handle_for_test();
 
-        session.on_stage(InstallStage::DownloadingInstaller);
-        assert_eq!(line.message(), InstallStage::DownloadingInstaller.message());
+        session.on_stage(TaskStage::DownloadingInstaller);
+        assert_eq!(line.message(), TaskStage::DownloadingInstaller.message());
 
         // 进入安装器阶段：回显线收起
-        session.on_stage(InstallStage::Installing);
+        session.on_stage(TaskStage::Installing);
         assert!(line.is_finished());
 
         // 安装器阶段的进度回调不再画到这条线上
@@ -559,9 +574,9 @@ mod tests {
         assert!(line.is_finished());
 
         // 安装器结束、进入登记核心：重新挂回 spinner
-        session.on_stage(InstallStage::Finalizing);
+        session.on_stage(TaskStage::Finalizing);
         assert!(!line.is_finished());
-        assert_eq!(line.message(), InstallStage::Finalizing.message());
+        assert_eq!(line.message(), TaskStage::Finalizing.message());
     }
 
     /// 中途 drop（错误提前返回 / Ctrl-C）也要收线并请求取消

@@ -11,9 +11,9 @@ use domain::server::eula::{EULA_FILE, eula_accepted, render_eula};
 use domain::server::layout::console_log_path;
 use domain::server::version::VersionId;
 use port::{
-    Backend, CancellationToken, CoreInspector, EventSink, NoopEventSink, ProgressSink, ScannedJava,
-    StopOutcome, StopSpec, SupervisorError, SupervisorStartOutcome, SupervisorStartRequest,
-    SupervisorStatus,
+    Backend, CancellationToken, CoreInspector, EventSink, NoopEventSink, ScannedJava, StopOutcome,
+    StopSpec, SupervisorError, SupervisorStartOutcome, SupervisorStartRequest, SupervisorStatus,
+    TaskObserver,
 };
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
@@ -409,7 +409,7 @@ impl ServerLifecycleService {
     /// 运行中返回 [`LifecycleError::Busy`]；其余见
     /// [`crate::InstallJarError`]（经 [`LifecycleError::Registry`]
     /// 的扩展转换，见 `From` 实现）
-    // 参数都是编排必需的输入（目标、版本、来源、校验器、安装器上下文、进度、
+    // 参数都是编排必需的输入（目标、版本、来源、校验器、安装器上下文、观察者、
     // 取消），拆结构体只会把调用方搞得更绕，保持平铺
     #[allow(clippy::too_many_arguments)]
     pub async fn install_jar_checked(
@@ -419,8 +419,7 @@ impl ServerLifecycleService {
         installer: &crate::ServerInstaller,
         inspector: &dyn CoreInspector,
         installer_ctx: Option<&crate::InstallerContext>,
-        progress: Option<&dyn ProgressSink>,
-        stages: Option<&dyn crate::StageSink>,
+        observer: Option<&dyn TaskObserver>,
         cancel: &CancellationToken,
     ) -> Result<crate::InstalledServerJar, LifecycleError> {
         self.ensure_stopped(name, BusyOp::InstallJar)?;
@@ -432,8 +431,7 @@ impl ServerLifecycleService {
                 installer,
                 inspector,
                 installer_ctx,
-                progress,
-                stages,
+                observer,
                 cancel,
             )
             .await?)
@@ -2009,7 +2007,6 @@ mod tests {
                 &VersionId::new("1.21.2"),
                 &installer,
                 &NoopInspector,
-                None,
                 None,
                 None,
                 &CancellationToken::new(),

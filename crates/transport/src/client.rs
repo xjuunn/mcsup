@@ -271,13 +271,41 @@ impl Client {
     ///
     /// 建连、认证失败或对端返回错误时返回 [`TransportError`]
     pub fn call(&self, request: &Request) -> Result<Response, TransportError> {
+        self.call_observing(request, None)
+    }
+
+    /// 执行一个可能回传中间进度帧的操作
+    ///
+    /// 与 [`Client::call`] 唯一的区别是：读到 [`Response::Task`] 中间帧时不把它
+    /// 当成结果，而是交给 `progress` 后继续读，直到终结响应到达。安装 / 备份这类
+    /// 分钟级操作靠它把对端的阶段与字节进度搬回本地渲染。
+    ///
+    /// 中间帧不是结果：观察者为 `None` 时直接丢弃，行为与 `call` 等价。
+    ///
+    /// # Errors
+    ///
+    /// 同 [`Client::call`]
+    pub fn call_streaming(
+        &self,
+        request: &Request,
+        progress: &dyn port::TaskObserver,
+    ) -> Result<Response, TransportError> {
+        self.call_observing(request, Some(progress))
+    }
+
+    /// 执行一个操作（可带中间帧观察者），失败按同一规则决定是否重试
+    fn call_observing(
+        &self,
+        request: &Request,
+        progress: Option<&dyn port::TaskObserver>,
+    ) -> Result<Response, TransportError> {
         let reused = self.has_connection();
-        match self.call_once(request) {
+        match self.call_once_observing(request, progress) {
             Ok(response) => Ok(response),
             Err(err) if request.is_retry_safe() && should_retry(&err, reused) => {
                 tracing::debug!(%err, op = request.operation(), "remote connection dropped, retrying once");
                 self.disconnect()?;
-                self.call_once(request)
+                self.call_once_observing(request, progress)
             }
             Err(err) => Err(err),
         }
@@ -297,6 +325,15 @@ impl Client {
     ///
     /// 同 [`Client::call`]
     pub fn call_once(&self, request: &Request) -> Result<Response, TransportError> {
+        self.call_once_observing(request, None)
+    }
+
+    /// 执行一个操作，不做重试；可选地把中间帧交给观察者
+    fn call_once_observing(
+        &self,
+        request: &Request,
+        progress: Option<&dyn port::TaskObserver>,
+    ) -> Result<Response, TransportError> {
         let token = self.token()?;
         let mut guard = self.lock()?;
         let mut conn = if let Some(conn) = guard.take() {
@@ -306,7 +343,7 @@ impl Client {
             handshake(&mut conn, &token)?;
             conn
         };
-        match conn.exchange(request) {
+        match exchange_until_final(&mut conn, request, progress) {
             Ok(response) => {
                 *guard = Some(conn);
                 Ok(response)
@@ -382,6 +419,30 @@ fn hello_request() -> Request {
     }
 }
 
+/// 发一帧请求并读到终结响应为止
+///
+/// 长任务会在终结响应之前回若干条 [`Response::Task`]：它们只是进度，不是结果。
+/// 把「中间帧该不该继续读」的判断收在这一个函数里，所有调用方（含不带观察者
+/// 的 `call`）都不必知道流式帧存在。
+fn exchange_until_final(
+    conn: &mut Conn,
+    request: &Request,
+    progress: Option<&dyn port::TaskObserver>,
+) -> Result<Response, TransportError> {
+    conn.send_request(request)?;
+    loop {
+        let response = conn.recv_response()?;
+        match response {
+            Response::Task { event } => {
+                if let Some(observer) = progress {
+                    observer.apply(&event);
+                }
+            }
+            other => return Ok(other),
+        }
+    }
+}
+
 /// `Hello` + `Authenticate`：新连接必须先过这两步
 fn handshake(conn: &mut Conn, token: &str) -> Result<SessionInfo, TransportError> {
     expect_hello(conn.exchange(&hello_request())?)?;
@@ -446,6 +507,7 @@ fn response_name(response: &Response) -> &'static str {
         Response::SnapshotDeleted { .. } => "snapshot_deleted",
         Response::SnapshotVerified { .. } => "snapshot_verified",
         Response::Pruned { .. } => "pruned",
+        Response::Task { .. } => "task",
         Response::Error { .. } => "error",
     }
 }

@@ -5,9 +5,9 @@ use anyhow::{Context, Result, anyhow};
 use comfy_table::{ContentArrangement, Table};
 use inquire::Select;
 use mcsup::domain::java::{JavaMajor, JavaPackageType, JavaRuntime, JavaVendor};
-use mcsup::port::JavaRuntimeRepository as _;
+use mcsup::port::{JavaRuntimeRepository as _, TaskStage};
 use mcsup::protocol::cli::{JavaInstallJson, JavaRow, JavaScanJson, JavaUninstallJson};
-use mcsup::service::{InstallStage, UninstallOutcome};
+use mcsup::service::UninstallOutcome;
 use std::path::{Path, PathBuf};
 use tracing::info;
 
@@ -183,7 +183,7 @@ pub(crate) async fn install_with_outcome(
     printer: Printer,
 ) -> Result<mcsup::service::InstallOutcome> {
     let enable = printer.is_human();
-    let session = InstallSession::new(InstallStage::Probing.message(), enable);
+    let session = InstallSession::new(TaskStage::Probing.message(), enable);
     let service = bootstrap::open_java_service()?;
     let package_type = if jre {
         JavaPackageType::Jre
@@ -213,7 +213,6 @@ pub(crate) async fn install_with_outcome(
             major,
             package_type,
             vendor_enum,
-            Some(&session),
             Some(&session),
             session.cancel(),
         )
@@ -321,16 +320,21 @@ pub(crate) fn install_on(
     } else {
         prompt_major(printer)?
     };
-    let spinner = TaskSpinner::new(
-        crate::i18n::pick(
-            lang,
-            format!("在 {} 安装 Java {major}…", member.name),
-            format!("installing Java {major} on {}…", member.name),
+    // 与本地同一个回显装配：阶段 / 字节进度都由对端经 Task 帧回传，
+    // 本地只负责画，因此画面与 `java install` 完全一致
+    let session = InstallSession::new(TaskStage::Probing.message(), printer.is_human());
+    session.set_download_message(crate::i18n::pick(
+        lang,
+        format!("下载 Java {major} {}", if jre { "jre" } else { "jdk" }),
+        format!(
+            "downloading Java {major} {}",
+            if jre { "jre" } else { "jdk" }
         ),
-        printer.is_human(),
-    );
-    let result = member.java.install(major.as_i64(), jre, vendor);
-    spinner.finish();
+    ));
+    let result = member
+        .java
+        .install_with(major.as_i64(), jre, vendor, &session);
+    session.finish();
     let runtimes = result.with_context(|| {
         crate::i18n::pick(
             lang,

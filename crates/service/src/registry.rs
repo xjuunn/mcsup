@@ -5,8 +5,8 @@ use domain::server::version::{ServerVariant, VersionId};
 use domain::server::world::{DataVersion, ensure_world_readable};
 use domain::workspace::{Workspace, WorkspaceId};
 use port::{
-    CancellationToken, CoreInspector, ProgressSink, RepositoryError, ServerRepository, Sourced,
-    WorkspaceRepository,
+    CancellationToken, CoreInspector, RepositoryError, ServerRepository, Sourced, TaskObserver,
+    TaskStage, WorkspaceRepository,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -15,7 +15,7 @@ use thiserror::Error;
 
 use crate::fs_error::{FsError, deletion_hint};
 use crate::workspace::WorkspaceError;
-use crate::{InstallError, InstallStage, InstalledDownload, ServerInstaller};
+use crate::{InstallError, InstalledDownload, ServerInstaller};
 
 const SERVER_MARKER: &str = "mcsup.json";
 const SERVER_MARKER_SCHEMA: u32 = 1;
@@ -806,8 +806,7 @@ impl ServerRegistry {
         installer: &ServerInstaller,
         inspector: &dyn CoreInspector,
         installer_ctx: Option<&crate::InstallerContext>,
-        progress: Option<&dyn ProgressSink>,
-        stages: Option<&dyn crate::StageSink>,
+        observer: Option<&dyn TaskObserver>,
         cancel: &CancellationToken,
     ) -> Result<InstalledServerJar, InstallJarError> {
         let srv = self.get(name)?;
@@ -823,8 +822,7 @@ impl ServerRegistry {
                     installer,
                     ctx,
                     &srv.dir,
-                    progress,
-                    stages,
+                    observer,
                     cancel,
                 )
                 .await?
@@ -839,7 +837,7 @@ impl ServerRegistry {
 
         let world = inspector.world_info(&srv.dir)?;
         let out: InstalledDownload = installer
-            .install(version, staging.clone(), None, progress, None, cancel)
+            .install(version, staging.clone(), None, observer, cancel)
             .await?;
         let target = match inspector.jar_data_version(&staging) {
             Ok(target) => target,
@@ -906,8 +904,7 @@ impl ServerRegistry {
         installer: &ServerInstaller,
         ctx: &crate::InstallerContext,
         dir: &Path,
-        progress: Option<&dyn ProgressSink>,
-        stages: Option<&dyn crate::StageSink>,
+        observer: Option<&dyn TaskObserver>,
         cancel: &CancellationToken,
     ) -> Result<Option<InstalledServerJar>, InstallJarError> {
         let installer_path = dir.join(STAGING_INSTALLER);
@@ -916,14 +913,7 @@ impl ServerRegistry {
         // 污染备份，也会让下次安装误以为「已经下过」。失败路径同样要清——
         // 否则一次网络中断就在服务器目录留下一个 9MB 的死文件。
         let out = installer
-            .install(
-                version,
-                installer_path.clone(),
-                Some(ctx),
-                progress,
-                stages,
-                cancel,
-            )
+            .install(version, installer_path.clone(), Some(ctx), observer, cancel)
             .await;
         let _ = std::fs::remove_file(&installer_path);
         let out = out?;
@@ -932,8 +922,8 @@ impl ServerRegistry {
             return Ok(None);
         }
 
-        if let Some(sink) = stages {
-            sink.on_stage(InstallStage::Finalizing);
+        if let Some(observer) = observer {
+            observer.on_stage(TaskStage::Finalizing);
         }
         // 参数文件所在目录名是安装器产物的完整 build 串（`26.3-66.1.0`），
         // 不是 `VersionId` 里的 MC 版本（`26.3`）——拿 MC 版本拼路径必然落空，
@@ -1362,7 +1352,7 @@ fn remove_link_or_dir(path: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use domain::workspace::{Workspace, WorkspaceId, WorkspaceName};
-    use port::{ServerRepository, WorkspaceRepository};
+    use port::{ProgressSink, ServerRepository, WorkspaceRepository};
     use std::path::Path;
 
     struct MemServers {
@@ -2119,7 +2109,6 @@ mod tests {
                 &inspector,
                 None,
                 None,
-                None,
                 &CancellationToken::new(),
             )
             .await
@@ -2159,7 +2148,6 @@ mod tests {
                 &VersionId::new("26.1"),
                 &installer,
                 &inspector,
-                None,
                 None,
                 None,
                 &CancellationToken::new(),

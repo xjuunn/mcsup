@@ -12,6 +12,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
 
+/// 一次安装的结果：本地与远端同一形状，供入口统一打印
+struct Installed {
+    /// 实际安装的版本
+    version: VersionId,
+    /// 核心 / 安装器产物的字节数
+    size: u64,
+    /// 落点（本地路径，或对端机器上的路径）
+    destination: PathBuf,
+}
+
 /// 按注册表定位服务器并安装 / 更换服务端核心
 ///
 /// 目标目录 = 注册表里该服务器的目录（`{workspace}/servers/{name}/server.jar`），
@@ -20,6 +30,10 @@ use tracing::info;
 /// 版本：`--version` 直用；核心尚未装成时沿用注册表里已记录的版本（下载失败后
 /// 重试不再重选）；其余交互下从版本列表选择，非交互保留 `latest`
 /// （由来源解析为最新稳定版）。
+///
+/// 落点（本地 / 某台远端）只决定「在哪里执行」；进度回显、阶段文案与结果打印
+/// 在两侧完全一致——远端把同一组 `TaskEvent` 经协议帧回传，本地入口用同一个
+/// `InstallSession` 渲染。
 ///
 /// # Errors
 ///
@@ -31,8 +45,8 @@ pub(crate) async fn run(
     printer: Printer,
 ) -> Result<()> {
     // 远端服务器：核心下载、校验、（安装器类变体的）安装器执行全部在对端
-    if let Some(outcome) = install_remote(name, version, printer)? {
-        return Ok(outcome);
+    if let Some(installed) = install_remote(name, version, printer)? {
+        return printer.print_installed(&installed.version, installed.size, &installed.destination);
     }
     let registry = bootstrap::open_registry()?;
     let srv = registry.get(name).with_context(|| {
@@ -60,39 +74,58 @@ pub(crate) async fn run(
 
 /// 远端安装：目标落在远端时整段转发到对端
 ///
-/// 返回 `Ok(Some(()))` 表示已由远端处理（含输出）；`Ok(None)` 表示本地条目，
-/// 调用方继续走本地路径。未限定来源时与其它命令同一口径：本地优先，其次唯一
-/// 同名远端（多台重名报歧义）。失败时不重试——下载 / 校验失败是对端的事实，
-/// 重试语义由用户再次执行决定。
+/// 返回 `Ok(Some(..))` 表示已由远端处理；`Ok(None)` 表示本地条目，调用方继续走
+/// 本地路径。未限定来源时与其它命令同一口径：本地优先，其次唯一同名远端（多台
+/// 重名报歧义）。失败时不重试——下载 / 校验失败是对端的事实，重试语义由用户
+/// 再次执行决定。
+///
+/// 进度：与本地同一个 [`InstallSession`]，对端经 `Response::Task` 帧回传阶段、
+/// 字节进度与安装器输出，本地只负责画。
 ///
 /// # Errors
 ///
 /// 服务器不存在（3）、远端拒绝或传输失败（5）、未授权（6）时返回错误
-fn install_remote(name: &str, version: Option<&str>, printer: Printer) -> Result<Option<()>> {
+fn install_remote(
+    name: &str,
+    version: Option<&str>,
+    printer: Printer,
+) -> Result<Option<Installed>> {
     let lang = printer.lang();
     let Some(target) = super::origin::remote_target(name, lang)? else {
         return Ok(None);
     };
-    // 未给版本时沿用在册版本：远端没有「列版本」帧，交互选择会变成一次
-    // 不可见的等待；沿用记录既能重试失败的核心安装，也不会悄悄换版本
+    // 未给版本时沿用在册版本：让重试失败的核心安装不会悄悄换版本
     let version = version.unwrap_or_else(|| target.meta.version.as_str());
-    let meta = target
+    let message = crate::i18n::pick(
+        lang,
+        format!(
+            "在 {} 安装 {} {version}",
+            target.member.name, target.meta.name
+        ),
+        format!(
+            "installing {} {version} on {}",
+            target.meta.name, target.member.name
+        ),
+    );
+    let session = InstallSession::new(message, printer.is_human());
+    let result = target
         .member
         .servers
-        .install(target.meta.name.as_str(), version)
-        .with_context(|| {
-            crate::i18n::pick(
-                lang,
-                format!(
-                    "在 {} 安装 {} 的核心失败",
-                    target.member.name, target.meta.name
-                ),
-                format!(
-                    "failed to install the core of {} on {}",
-                    target.meta.name, target.member.name
-                ),
-            )
-        })?;
+        .install_with(target.meta.name.as_str(), version, &session);
+    session.finish();
+    let meta = result.with_context(|| {
+        crate::i18n::pick(
+            lang,
+            format!(
+                "在 {} 安装 {} 的核心失败",
+                target.member.name, target.meta.name
+            ),
+            format!(
+                "failed to install the core of {} on {}",
+                target.meta.name, target.member.name
+            ),
+        )
+    })?;
     let Some(jar) = meta.jar.as_ref() else {
         return Err(anyhow::anyhow!(
             "{}",
@@ -104,8 +137,11 @@ fn install_remote(name: &str, version: Option<&str>, printer: Printer) -> Result
         ));
     };
     let destination = server_dir_of(&target.member, &meta)?;
-    printer.print_installed(&meta.version, jar.size, &destination)?;
-    Ok(Some(()))
+    Ok(Some(Installed {
+        version: meta.version,
+        size: jar.size,
+        destination,
+    }))
 }
 
 /// 远端服务器的目录展示口径：`{workspace path}/servers/{rel_dir}` 在对端的
@@ -230,7 +266,6 @@ pub(crate) async fn download_jar(
         Some(mcsup::service::InstallerContext {
             java_bin,
             runner: Arc::new(mcsup::runtime::LocalInstallerRunner::new()),
-            output: Some(session.installer_output()),
         })
     } else {
         None
@@ -244,7 +279,6 @@ pub(crate) async fn download_jar(
             &installer,
             &inspector,
             installer_ctx.as_ref(),
-            Some(&session),
             Some(&session),
             session.cancel(),
         )
