@@ -25,8 +25,37 @@ use domain::server::settings::ServerSettings;
 use domain::server::version::VersionId;
 use domain::workspace::{Workspace, WorkspaceId, WorkspaceName};
 use port::{Origin, RepositoryError, Sourced};
+use protocol::remote::wire::WirePropUpdate;
 use protocol::remote::{Request, Response};
 use std::path::Path;
+
+/// 远端「按整合包创建」的结果
+///
+/// 与 `ModpackApplied` 帧一一对应；`meta` 是已经装好加载器核心的对端记录，
+/// 客户端据此渲染创建行与后续提示。
+#[derive(Debug, Clone)]
+pub struct RemoteModpackResult {
+    /// 对端上的服务器记录
+    pub meta: ServerMeta,
+    /// 整合包项目 ID
+    pub project_id: String,
+    /// 版本 ID
+    pub version_id: String,
+    /// 版本号
+    pub version_number: String,
+    /// 清单声明的 Minecraft 版本
+    pub minecraft: String,
+    /// 加载器展示文本
+    pub loader: Option<String>,
+    /// 实际安装的服务端文件数
+    pub files: usize,
+    /// 本次下载的字节数
+    pub downloaded_bytes: u64,
+    /// 已存在而复用的文件数
+    pub reused: usize,
+    /// 仅客户端、已跳过的文件数
+    pub skipped_client_only: usize,
+}
 
 /// 工作目录镜像
 #[derive(Debug, Clone)]
@@ -264,6 +293,126 @@ impl RemoteServerRepository {
         }
     }
 
+    /// 在对端按整合包创建服务器并完成布置
+    ///
+    /// 清单要在对端读：MC 版本与加载器变体由对端从整合包元数据里取，客户端
+    /// 只给项目与（可选）版本。一次调用即完成登记 + 装加载器 + 铺文件。
+    ///
+    /// # Errors
+    ///
+    /// 对端拒绝（项目 / 版本不存在、名称冲突…）或传输失败时返回 [`RepositoryError`]
+    pub fn create_modpack(
+        &self,
+        workspace: Option<&str>,
+        name: &str,
+        project: &str,
+        version: Option<&str>,
+    ) -> Result<RemoteModpackResult, RepositoryError> {
+        let response = self.link.expect(
+            &Request::ServerCreateModpack {
+                workspace: workspace.map(str::to_owned),
+                name: name.to_owned(),
+                project: project.to_owned(),
+                version: version.map(str::to_owned),
+            },
+            "modpack_applied",
+        )?;
+        match response {
+            Response::ModpackApplied {
+                server,
+                project_id,
+                version_id,
+                version_number,
+                minecraft,
+                loader,
+                files,
+                downloaded_bytes,
+                reused,
+                skipped_client_only,
+            } => Ok(RemoteModpackResult {
+                meta: ServerMeta::try_from(server)?,
+                project_id,
+                version_id,
+                version_number,
+                minecraft,
+                loader,
+                files,
+                downloaded_bytes,
+                reused,
+                skipped_client_only,
+            }),
+            other => Err(unexpected(other, "server.create_modpack")),
+        }
+    }
+
+    /// 读取对端的 `server.properties` 原文
+    ///
+    /// # Errors
+    ///
+    /// 对端拒绝或传输失败时返回 [`RepositoryError`]
+    pub fn props(&self, server_id: &str) -> Result<(String, String), RepositoryError> {
+        let response = self.link.expect(
+            &Request::PropsGet {
+                server_id: server_id.to_owned(),
+            },
+            "props",
+        )?;
+        match response {
+            Response::Props { path, text } => Ok((path, text)),
+            other => Err(unexpected(other, "server.props.get")),
+        }
+    }
+
+    /// 写入对端的 `server.properties`，返回写入后的路径与原文
+    ///
+    /// # Errors
+    ///
+    /// 对端拒绝（键 / 值非法、写入失败…）或传输失败时返回 [`RepositoryError`]
+    pub fn set_props(
+        &self,
+        server_id: &str,
+        updates: &[(String, String)],
+    ) -> Result<(String, String), RepositoryError> {
+        let response = self.link.expect(
+            &Request::PropsSet {
+                server_id: server_id.to_owned(),
+                updates: updates.iter().map(WirePropUpdate::from).collect(),
+            },
+            "props",
+        )?;
+        match response {
+            Response::Props { path, text } => Ok((path, text)),
+            other => Err(unexpected(other, "server.props.set")),
+        }
+    }
+
+    /// 设置对端服务器的一项服务属性，返回规范化后的值与完整属性集
+    ///
+    /// # Errors
+    ///
+    /// 对端拒绝（值非法、大版本未注册…）或传输失败时返回 [`RepositoryError`]
+    pub fn set_setting(
+        &self,
+        server_id: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<(ServerSettings, String), RepositoryError> {
+        let response = self.link.expect(
+            &Request::SettingsSet {
+                server_id: server_id.to_owned(),
+                key: key.to_owned(),
+                value: value.to_owned(),
+            },
+            "settings_changed",
+        )?;
+        match response {
+            Response::SettingsChanged { value, settings } => {
+                Ok((ServerSettings::try_from(settings)?, value))
+            }
+            other => Err(unexpected(other, "server.set")),
+        }
+    }
+
     /// 注销对端的服务器；`purge` 时对端一并删盘
     ///
     /// # Errors
@@ -398,6 +547,55 @@ impl RemoteJavaRepository {
                 Ok(out)
             }
             other => Err(unexpected(other, "java.scan")),
+        }
+    }
+
+    /// 在对端安装 Java；返回对端登记的全部运行时（新增项也在其中）
+    ///
+    /// # Errors
+    ///
+    /// 来源不可达、下载 / 解压失败、对端拒绝或传输失败时返回 [`RepositoryError`]
+    pub fn install(
+        &self,
+        major: i64,
+        jre: bool,
+        vendor: Option<&str>,
+    ) -> Result<Vec<JavaRuntime>, RepositoryError> {
+        let response = self.link.expect(
+            &Request::JavaInstall {
+                major,
+                jre,
+                vendor: vendor.map(str::to_owned),
+            },
+            "javas",
+        )?;
+        match response {
+            Response::Javas { items } => {
+                let mut out = Vec::with_capacity(items.len());
+                decode_list("java", items, JavaRuntime::try_from, &mut out)?;
+                Ok(out)
+            }
+            other => Err(unexpected(other, "java.install")),
+        }
+    }
+
+    /// 在对端卸载 `path` 指向的运行时；返回（路径，是否删除了磁盘文件）
+    ///
+    /// # Errors
+    ///
+    /// 对端拒绝或传输失败时返回 [`RepositoryError`]
+    pub fn uninstall(&self, path: &Path) -> Result<(std::path::PathBuf, bool), RepositoryError> {
+        let response = self.link.expect(
+            &Request::JavaUninstall {
+                path: path.to_string_lossy().into_owned(),
+            },
+            "java_uninstalled",
+        )?;
+        match response {
+            Response::JavaUninstalled { path, managed } => {
+                Ok((std::path::PathBuf::from(path), managed))
+            }
+            other => Err(unexpected(other, "java.uninstall")),
         }
     }
 }
@@ -578,6 +776,77 @@ mod tests {
         // 扫描是对端动作：对端登记 0 条 JVM 时正常返回空列表（不报错）
         let scanned = java.scan().expect("scan");
         assert!(scanned.is_empty());
+    }
+
+    #[test]
+    fn java_install_and_uninstall_roundtrip_over_real_tls() {
+        let harness = PairingHarness::spawn();
+        let java = RemoteJavaRepository::new(harness.link(), origin());
+        let runtimes = java.install(21, false, None).expect("install");
+        assert_eq!(runtimes.len(), 1);
+        assert_eq!(runtimes[0].major.as_i64(), 21);
+        assert!(runtimes[0].managed);
+
+        let (path, managed) = java.uninstall(&runtimes[0].path).expect("uninstall");
+        assert_eq!(path, PathBuf::from("/opt/java/21"));
+        assert!(managed, "垫片按 managed 删除回帧");
+    }
+
+    #[test]
+    fn server_install_updates_the_peer_record() {
+        let harness = PairingHarness::spawn();
+        let servers = RemoteServerRepository::new(harness.link(), origin());
+        let _ = servers
+            .create(None, "web", "1.21.1", "vanilla", None)
+            .expect("create");
+        let updated = servers.install("web", "1.21.4").expect("install");
+        assert_eq!(updated.version.as_str(), "1.21.4");
+        assert_eq!(updated.updated_at, 2);
+    }
+
+    #[test]
+    fn server_create_modpack_decodes_the_applied_frame() {
+        let harness = PairingHarness::spawn();
+        let servers = RemoteServerRepository::new(harness.link(), origin());
+        let result = servers
+            .create_modpack(None, "atm", "all-the-mods", None)
+            .expect("create modpack");
+        assert_eq!(result.project_id, "all-the-mods");
+        assert_eq!(result.version_id, "v1", "缺省版本由对端决定");
+        assert_eq!(result.minecraft, "1.21.1");
+        assert_eq!(result.loader.as_deref(), Some("fabric 0.16.9"));
+        assert_eq!(result.files, 3);
+        assert_eq!(result.downloaded_bytes, 1024);
+        // 记录已落在对端，客户端的镜像立即可见
+        assert_eq!(servers.list().expect("list").len(), 1);
+    }
+
+    #[test]
+    fn props_roundtrip_keeps_the_raw_text() {
+        let harness = PairingHarness::spawn();
+        let servers = RemoteServerRepository::new(harness.link(), origin());
+        let (path, text) = servers.props("any-id").expect("props");
+        assert_eq!(path, "/srv/mc/server.properties");
+        assert!(text.is_empty(), "还没有写入过");
+
+        let updates = [
+            ("motd".to_owned(), "hello".to_owned()),
+            ("max-players".to_owned(), "20".to_owned()),
+        ];
+        let (path, text) = servers.set_props("any-id", &updates).expect("set props");
+        assert_eq!(path, "/srv/mc/server.properties");
+        assert_eq!(text, "motd=hello\nmax-players=20\n");
+    }
+
+    #[test]
+    fn settings_set_decodes_the_normalized_value() {
+        let harness = PairingHarness::spawn();
+        let servers = RemoteServerRepository::new(harness.link(), origin());
+        let (settings, value) = servers
+            .set_setting("any-id", "ram", "2G")
+            .expect("set setting");
+        assert_eq!(value, "2G");
+        assert_eq!(settings, ServerSettings::default());
     }
 
     #[test]

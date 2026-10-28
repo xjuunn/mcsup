@@ -508,6 +508,8 @@ pub(crate) enum JavaAction {
             help = crate::meta::java_install_vendor_arg()
         )]
         vendor: Option<String>,
+        #[arg(long, value_name = "ORIGIN", help = crate::meta::origin_target_arg())]
+        origin: Option<String>,
     },
     #[command(
         arg_required_else_help = true,
@@ -519,6 +521,8 @@ pub(crate) enum JavaAction {
         target: Option<String>,
         #[arg(long, value_name = "PATH", help = crate::meta::java_uninstall_dir_arg())]
         dir: Option<PathBuf>,
+        #[arg(long, value_name = "ORIGIN", help = crate::meta::origin_target_arg())]
+        origin: Option<String>,
     },
 }
 

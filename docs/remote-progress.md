@@ -17,8 +17,65 @@
 | 8 | `RemoteBackend`：远端 supervisor（`RemoteSupervisor` + `RoutingSupervisor`） | 完成 |
 | 9 | 远端备份（元数据帧路由）+ 远端日志尾部 | 完成（流式进度未做） |
 | 10 | CLI `remote` 命令与 `--origin`（含 SSH 接入） | 完成（局域网发现待实现） |
+| 11 | 远端能力对等：props / set / console / version / install / modpack / java install·uninstall | 完成 |
 
 ## 已完成
+
+### 阶段 11：远端能力对等
+
+此前远端只覆盖「协议已定义的帧」，`server props` / `set` / `console` /
+`version` / `install`、`server create --modpack` 与 `java install/uninstall`
+只能在本机使用。本阶段把这些命令补齐到与本地一致的语义。
+
+#### 协议与线格式
+
+- 请求：`ServerCreateModpack` / `PropsGet` / `PropsSet` / `SettingsSet` /
+  `JavaInstall` / `JavaUninstall`；响应：`ModpackApplied` / `Props` /
+  `SettingsChanged` / `JavaUninstalled`。
+- `Props` 传**原文**而不是键值表：注释、顺序与空行属于用户文件内容，键值表
+  无法无损表达；两端复用同一份 `Properties::parse`，`render()` 规范化行尾。
+- `WirePropUpdate { key, value }` 用结构体而非二元组：帧是 JSON，字段名让
+  审计日志与抓包都能直接读懂。
+- 权限：`PropsGet` / `Version` 归读；`PropsSet` / `SettingsSet` /
+  `ServerCreateModpack` / `JavaInstall` / `JavaUninstall` 归写。
+- `ServerCreateModpack` 一帧完成本地「选版本 → 登记 → 装加载器 → 铺
+  overrides」，因为清单要在对端读，客户端无法预先知道 MC 版本与加载器变体。
+
+#### agent 分发（`crates/mcsup/src/remote/ops.rs`）
+
+所有新帧转发给与本地 CLI **同一份** `service`：props 用 `ServerPropsService`、
+设置用 `ServerSettingsService`、整合包用 `ModpackService::prepare + apply`、
+Java 用 `JavaService::install/uninstall`。失败按领域错误分类映射
+`ErrorKind`（not_found / invalid / io / busy），不按文案判级。
+
+#### 客户端（`crates/backend/src/remote/mirror.rs`）
+
+镜像仓库新增与帧一一对应的显式方法：`create_modpack` / `props` /
+`set_props` / `set_setting`、`RemoteJavaRepository::install/uninstall`。
+`RemoteModpackResult` 与 `ModpackApplied` 一一对应，供入口渲染同一份创建行。
+
+#### CLI（Thin Entry Point）
+
+- `commands/origin.rs` 新增 `RemoteTarget` 与 `remote_target()`：一次解析出
+  成员、对端 id 与对端注册记录，props / settings / console / logs / install /
+  java 统一复用。判定「本地优先 / 唯一远端 / 多远端重名报歧义」是纯函数
+  `pick_hit`，可单测。
+- `server props`：`Backend::{Local, Remote}`，远端原文进出。
+- `server set`：`Target::{Local, Remote}`，交互默认值取对端记录，
+  `java-version` 候选取对端已注册运行时。
+- `server console`：日志走 `LogsFollow` 长轮询，注入与探活按**对端 id**
+  走 `SendLine` / `StatusMany`——同名本地服务器不会被误注入。
+- `server version`：改用 `open_registry_with_remotes()` 的 `get`，不新增帧。
+- `server install`：裸名指向唯一远端；缺 `--version` 沿用在册版本（远端没有
+  「列版本」帧）。
+- `server create --modpack --origin`：对端执行 `prepare + 登记 + 核心安装 +
+  apply`，返回布置统计；`--modpack` 与只选加载器的 `--variant` 互斥。
+- `java install/uninstall --origin`：目标解析用对端运行时列表；`server start`
+  缺 Java 且目标在远端时，装到对端。
+
+测试：协议新帧往返与权限；backend 真 TLS 垫片覆盖 `create_modpack` /
+`install` / props 往返 / `set_setting` / java install+uninstall；CLI 侧
+`pick_hit` 4 用例（本地优先、唯一远端、跨远端歧义、限定不回落）。
 
 ### 阶段 9：远端备份与远端日志尾部
 

@@ -146,10 +146,27 @@ async fn java(action: JavaAction, printer: Printer) -> Result<()> {
             version,
             jre,
             vendor,
-        } => java::install(version.as_deref(), jre, vendor.as_deref(), printer).await,
-        JavaAction::Uninstall { target, dir } => {
-            java::uninstall(target.as_deref(), dir.as_deref(), printer)
+            origin,
+        } => {
+            java::install(
+                version.as_deref(),
+                jre,
+                vendor.as_deref(),
+                origin.as_deref(),
+                printer,
+            )
+            .await
         }
+        JavaAction::Uninstall {
+            target,
+            dir,
+            origin,
+        } => java::uninstall(
+            target.as_deref(),
+            dir.as_deref(),
+            origin.as_deref(),
+            printer,
+        ),
     }
 }
 

@@ -1,5 +1,4 @@
 use crate::bootstrap;
-use crate::diagnostic::AppDiagnostic;
 use crate::output::Printer;
 use crate::progress::{InstallSession, TaskSpinner};
 use crate::prompts;
@@ -59,51 +58,38 @@ pub(crate) async fn run(
     printer.print_installed(&version_id, size, &destination)
 }
 
-/// 远端安装：按来源查组合注册表，远端条目整段转发到对端
+/// 远端安装：目标落在远端时整段转发到对端
 ///
 /// 返回 `Ok(Some(()))` 表示已由远端处理（含输出）；`Ok(None)` 表示本地条目，
-/// 调用方继续走本地路径。失败时不重试——下载 / 校验失败是对端的事实，重试
-/// 语义由用户再次执行决定。
+/// 调用方继续走本地路径。未限定来源时与其它命令同一口径：本地优先，其次唯一
+/// 同名远端（多台重名报歧义）。失败时不重试——下载 / 校验失败是对端的事实，
+/// 重试语义由用户再次执行决定。
 ///
 /// # Errors
 ///
 /// 服务器不存在（3）、远端拒绝或传输失败（5）、未授权（6）时返回错误
 fn install_remote(name: &str, version: Option<&str>, printer: Printer) -> Result<Option<()>> {
     let lang = printer.lang();
-    let selector = mcsup::service::Selector::parse(name);
-    if selector.origin().is_none_or(mcsup::port::Origin::is_local) {
-        // 未限定或限定本地：按裸名查组合注册表，本地命中即走本地路径
-        return Ok(None);
-    }
-    let Some(origin) = selector.origin().cloned() else {
+    let Some(target) = super::origin::remote_target(name, lang)? else {
         return Ok(None);
     };
-    let cfg = crate::config::ConfigFile::locate(None).load()?;
-    let members = bootstrap::remote_members(&cfg)?;
-    let member = super::origin::member(&members, &origin, lang)?.ok_or_else(|| {
-        AppDiagnostic::not_found(
-            crate::i18n::pick(
-                lang,
-                format!("远端 {} 未就绪（缺凭证或指纹）", origin.as_str()),
-                format!(
-                    "remote {} is not ready (missing credential or fingerprint)",
-                    origin.as_str()
-                ),
-            ),
-            None,
-        )
-    })?;
-    let meta = member
+    // 未给版本时沿用在册版本：远端没有「列版本」帧，交互选择会变成一次
+    // 不可见的等待；沿用记录既能重试失败的核心安装，也不会悄悄换版本
+    let version = version.unwrap_or_else(|| target.meta.version.as_str());
+    let meta = target
+        .member
         .servers
-        .install(selector.name(), version.unwrap_or("latest"))
+        .install(target.meta.name.as_str(), version)
         .with_context(|| {
             crate::i18n::pick(
                 lang,
-                format!("在 {} 安装 {} 的核心失败", origin.as_str(), selector.name()),
+                format!(
+                    "在 {} 安装 {} 的核心失败",
+                    target.member.name, target.meta.name
+                ),
                 format!(
                     "failed to install the core of {} on {}",
-                    selector.name(),
-                    origin.as_str()
+                    target.meta.name, target.member.name
                 ),
             )
         })?;
@@ -117,7 +103,7 @@ fn install_remote(name: &str, version: Option<&str>, printer: Printer) -> Result
             )
         ));
     };
-    let destination = server_dir_of(member, &meta)?;
+    let destination = server_dir_of(&target.member, &meta)?;
     printer.print_installed(&meta.version, jar.size, &destination)?;
     Ok(Some(()))
 }

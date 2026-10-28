@@ -113,22 +113,40 @@ async fn run_start(
                     if !printer.is_interactive() {
                         return Err(err);
                     }
+                    // 目标可能在远端：缺 Java 时要装到「跑服务器的那台」，装在本机没用
+                    let remote = super::origin::remote_target(name, printer.lang())?;
+                    let host = remote
+                        .as_ref()
+                        .map_or_else(|| "本机".to_owned(), |t| t.member.name.to_string());
                     let prompt_text = match missing_major {
-                        Some(major) => format!("本机缺少 Java {major}，是否现在安装？"),
-                        None => "本机未发现任何 Java 运行时，是否现在安装？".to_owned(),
+                        Some(major) => format!("{host} 缺少 Java {major}，是否现在安装？"),
+                        None => format!("{host} 未发现任何 Java 运行时，是否现在安装？"),
                     };
                     if !prompts::confirm_or_yes(printer, &prompt_text, true)? {
                         return Err(anyhow::anyhow!("缺少所需 Java 版本，已中止启动"));
                     }
                     // 安装缺的版本；NoJava 无从点名，装当前 LTS 21 作为起步
                     let major_str = missing_major.map_or("21".to_string(), |m| m.to_string());
-                    crate::commands::java::install_with_outcome(
-                        Some(&major_str),
-                        false,
-                        None,
-                        printer,
-                    )
-                    .await?;
+                    match &remote {
+                        Some(target) => {
+                            crate::commands::java::install_on(
+                                &mcsup::port::Origin::Remote(target.member.name.clone()),
+                                Some(&major_str),
+                                false,
+                                None,
+                                printer,
+                            )?;
+                        }
+                        None => {
+                            crate::commands::java::install_with_outcome(
+                                Some(&major_str),
+                                false,
+                                None,
+                                printer,
+                            )
+                            .await?;
+                        }
+                    }
                     continue;
                 }
 
@@ -336,7 +354,7 @@ pub(crate) fn status(name: &str, printer: Printer) -> Result<()> {
 ///
 /// 行读取本身只负责取一行；控制字符 → 动作在 [`crate::input`] + [`crate::keymap`] 完成。
 /// 注入失败回显走 stderr：stdout 只留服务器输出。
-#[allow(clippy::print_stderr)]
+#[allow(clippy::print_stderr, clippy::too_many_lines)]
 pub(crate) fn console(name: &str, printer: Printer) -> Result<()> {
     if !printer.is_interactive() {
         return Err(AppDiagnostic::usage(
@@ -354,12 +372,26 @@ pub(crate) fn console(name: &str, printer: Printer) -> Result<()> {
         .into());
     }
     let service = lifecycle_service()?;
-    let report = service.describe(name)?;
-    if !report.status.as_ref().is_some_and(|s| s.status.is_alive()) {
+    let lang = printer.lang();
+    // 远端服务器的 `console.log` 在对端：日志走长轮询帧（本地 `LogWatch`
+    // 读的永远是本机文件），注入与探活也按对端 **id** 走帧——名字在本地与
+    // 远端重名时，按名字回落到 service 会悄悄操作到本地那台。
+    let remote = super::origin::remote_target(name, lang)?;
+    let remote_client = remote
+        .as_ref()
+        .map(|target| transport_client(&target.member).map(Arc::new))
+        .transpose()?;
+    let alive = match (&remote, &remote_client) {
+        (Some(target), Some(client)) => remote_alive(client, &target.server_id, lang)?,
+        _ => service
+            .describe(name)?
+            .status
+            .as_ref()
+            .is_some_and(|s| s.status.is_alive()),
+    };
+    if !alive {
         return Err(LifecycleError::NotRunning.into());
     }
-    // 先取历史 + 增量读取器（同一快照为界，不重不漏），再回放，避免附加瞬间丢行
-    let (history, mut watch) = service.log_watch_tail(name, crate::cli::LOG_TAIL_DEFAULT)?;
 
     // Windows 无 EOF 键：Ctrl+D 随整行到达，必须回车才生效
     let detach_hint = if cfg!(windows) {
@@ -376,14 +408,30 @@ pub(crate) fn console(name: &str, printer: Printer) -> Result<()> {
         format!("已附加 {name} 控制台（{detach_hint}，服务器继续运行）"),
         format!("attached to {name} console ({detach_hint}; the server keeps running)"),
     ));
-    for line in &history {
-        print_raw_line(line);
+
+    // 本地先取历史 + 增量读取器（同一快照为界，不重不漏），再回放，避免附加瞬间丢行
+    let mut watch = None;
+    if remote.is_none() {
+        let (history, opened) = service.log_watch_tail(name, crate::cli::LOG_TAIL_DEFAULT)?;
+        for line in &history {
+            print_raw_line(line);
+        }
+        watch = Some(opened);
     }
+
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let injector = match (&remote, &remote_client) {
+        (Some(target), Some(client)) => Inject::Remote {
+            client: Arc::clone(client),
+            server_id: target.server_id.clone(),
+        },
+        _ => Inject::Local {
+            service: Arc::clone(&service),
+            name: name.to_owned(),
+        },
+    };
     {
         let done = Arc::clone(&done);
-        let service = Arc::clone(&service);
-        let name = name.to_owned();
         std::thread::spawn(move || {
             let stdin = std::io::stdin();
             let mut line = String::new();
@@ -396,17 +444,10 @@ pub(crate) fn console(name: &str, printer: Printer) -> Result<()> {
                         let (text, action) = input::split_action(&line);
                         let trimmed = text.trim_end();
                         if !trimmed.is_empty()
-                            && let Err(err) = service.send_line(&name, trimmed)
+                            && let Some((message, keep_going)) = injector.send(trimmed)
                         {
-                            eprintln!(
-                                "{}",
-                                crate::i18n::pick(
-                                    crate::locale::current(),
-                                    format!("注入失败: {err}"),
-                                    format!("injection failed: {err}")
-                                )
-                            );
-                            if matches!(err, LifecycleError::NotRunning) {
+                            eprintln!("{message}");
+                            if !keep_going {
                                 break;
                             }
                         }
@@ -421,9 +462,162 @@ pub(crate) fn console(name: &str, printer: Printer) -> Result<()> {
         });
     }
 
-    let exited = wait_console_exit(&service, name, &mut watch, &done)?;
+    let exited = if let (Some(target), Some(client)) = (&remote, &remote_client) {
+        wait_console_exit_remote(client, &target.server_id, name, &done, lang)?
+    } else if let Some(mut watcher) = watch {
+        wait_console_exit(&service, name, &mut watcher, &done)?
+    } else {
+        // 本地分支在附加前必定打开 watcher；走到这里说明分叉有偏差，如实报错
+        return Err(anyhow::anyhow!(
+            "{}",
+            crate::i18n::pick(
+                lang,
+                "控制台日志通道未打开",
+                "console log watcher was not opened"
+            )
+        ));
+    };
     report_console_exit(name, exited, printer);
     Ok(())
+}
+
+/// 控制台注入通道
+///
+/// 远端按服务器 **id** 注入而非名字：同名本地服务器不会被误注入。
+enum Inject {
+    Local {
+        service: Arc<ServerLifecycleService>,
+        name: String,
+    },
+    Remote {
+        client: Arc<mcsup::transport::Client>,
+        server_id: String,
+    },
+}
+
+impl Inject {
+    /// 注入一行；成功返回 `None`，失败返回（文案，是否还能继续）
+    ///
+    /// 远端不在这里判断「服务器是否已退出」：主循环每两轮探活一次，由它
+    /// 统一收尾；传输抖动只提示、不结束附加。
+    fn send(&self, line: &str) -> Option<(String, bool)> {
+        let lang = crate::locale::current();
+        match self {
+            Self::Local { service, name } => service.send_line(name, line).err().map(|err| {
+                let keep_going = !matches!(err, LifecycleError::NotRunning);
+                (
+                    crate::i18n::pick(
+                        lang,
+                        format!("注入失败: {err}"),
+                        format!("injection failed: {err}"),
+                    ),
+                    keep_going,
+                )
+            }),
+            Self::Remote { client, server_id } => client
+                .call(&mcsup::protocol::remote::Request::SendLine {
+                    server_id: server_id.clone(),
+                    line: line.to_owned(),
+                })
+                .err()
+                .map(|err| {
+                    (
+                        crate::i18n::pick(
+                            lang,
+                            format!("在远端注入失败: {err}"),
+                            format!("remote injection failed: {err}"),
+                        ),
+                        true,
+                    )
+                }),
+        }
+    }
+}
+
+/// 按 id 查对端服务器是否还在运行
+fn remote_alive(
+    client: &mcsup::transport::Client,
+    server_id: &str,
+    lang: crate::locale::Lang,
+) -> Result<bool> {
+    let response = client
+        .call(&mcsup::protocol::remote::Request::StatusMany {
+            ids: vec![server_id.to_owned()],
+        })
+        .with_context(|| {
+            crate::i18n::pick(
+                lang,
+                "查询远端服务器状态失败",
+                "failed to query the remote server status",
+            )
+        })?;
+    let mcsup::protocol::remote::Response::Statuses { items } = response else {
+        return Err(anyhow::anyhow!(
+            "{}",
+            crate::i18n::pick(
+                lang,
+                "对端返回了非预期帧",
+                "the peer returned an unexpected frame"
+            )
+        ));
+    };
+    Ok(items
+        .first()
+        .and_then(|entry| entry.status.clone())
+        .and_then(|wire| mcsup::port::SupervisorStatus::try_from(wire).ok())
+        .is_some_and(|status| status.status.is_alive()))
+}
+
+/// 远端控制台主循环：长轮询取增量 + 周期性探活
+///
+/// 首帧带 `tail` 回放历史，之后只取增量；探活按 id 发 `StatusMany`，
+/// 服务器自行退出时结束附加。
+fn wait_console_exit_remote(
+    client: &mcsup::transport::Client,
+    server_id: &str,
+    name: &str,
+    done: &std::sync::atomic::AtomicBool,
+    lang: crate::locale::Lang,
+) -> Result<bool> {
+    let mut lines = crate::cli::LOG_TAIL_DEFAULT;
+    let mut exited = false;
+    let mut ticks = 0u32;
+    while !done.load(std::sync::atomic::Ordering::Relaxed) {
+        let response = client
+            .call(&mcsup::protocol::remote::Request::LogsFollow {
+                server_id: server_id.to_owned(),
+                lines,
+                timeout_ms: FOLLOW_WAIT_MS,
+            })
+            .with_context(|| {
+                crate::i18n::pick(
+                    lang,
+                    format!("跟随 {name} 的日志失败"),
+                    format!("failed to follow the logs of {name}"),
+                )
+            })?;
+        lines = 0;
+        let mcsup::protocol::remote::Response::LogLines { lines: batch } = response else {
+            return Err(anyhow::anyhow!(
+                "{}",
+                crate::i18n::pick(
+                    lang,
+                    "对端返回了非预期帧",
+                    "the peer returned an unexpected frame"
+                )
+            ));
+        };
+        for line in &batch {
+            print_raw_line(line);
+        }
+        // 长轮询每轮最多等 1.5s，探活每两轮一次：不必跟读日志同频
+        ticks += 1;
+        if ticks.is_multiple_of(2) && !remote_alive(client, server_id, lang)? {
+            exited = true;
+            break;
+        }
+    }
+    Ok(exited)
 }
 
 /// 控制台附加期间的主循环：等分离或服务器退出，返回是否为「服务器已停」
@@ -539,34 +733,13 @@ pub(crate) fn logs(name: &str, tail: usize, follow: bool, printer: Printer) -> R
 /// 服务器不存在（3）、远端不可达（5）或未授权（6）时返回错误
 fn logs_remote(name: &str, tail: usize, follow: bool, printer: Printer) -> Result<Option<()>> {
     let lang = printer.lang();
-    let cfg = crate::config::ConfigFile::locate(None).load()?;
-    let members = bootstrap::remote_members(&cfg)?;
-    if members.is_empty() {
-        return Ok(None);
-    }
-    let reg = bootstrap::open_registry_with_remotes()?;
-    let sourced = match reg.get_sourced(name) {
-        Ok(sourced) => sourced,
-        Err(mcsup::service::ServerRegistryError::NotFound(_)) => return Ok(None),
-        Err(err) => return Err(err.into()),
-    };
-    let mcsup::port::Origin::Remote(remote_name) = &sourced.origin else {
+    let Some(target) = super::origin::remote_target(name, lang)? else {
         return Ok(None);
     };
-    let member = super::origin::member(&members, &sourced.origin, lang)?.ok_or_else(|| {
-        AppDiagnostic::not_found(
-            crate::i18n::pick(
-                lang,
-                format!("远端 {remote_name} 未就绪（缺凭证或指纹）"),
-                format!("remote {remote_name} is not ready (missing credential or fingerprint)"),
-            ),
-            None,
-        )
-    })?;
-    let server_id = sourced.value.meta.id.as_str().to_owned();
+    let server_id = target.server_id.clone();
 
     // 历史：一次 LogsFollow 带 tail；增量：循环带 0
-    let client = transport_client(member)?;
+    let client = transport_client(&target.member)?;
     let mut request = mcsup::protocol::remote::Request::LogsFollow {
         server_id: server_id.clone(),
         lines: tail,
@@ -577,8 +750,8 @@ fn logs_remote(name: &str, tail: usize, follow: bool, printer: Printer) -> Resul
         let response = client.call(&request).with_context(|| {
             crate::i18n::pick(
                 lang,
-                format!("跟随 {} 的日志失败", sourced.value.meta.name),
-                format!("failed to follow the logs of {}", sourced.value.meta.name),
+                format!("跟随 {name} 的日志失败"),
+                format!("failed to follow the logs of {name}"),
             )
         })?;
         let mcsup::protocol::remote::Response::LogLines { lines } = response else {

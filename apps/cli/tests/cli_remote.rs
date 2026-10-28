@@ -428,6 +428,155 @@ fn remote_java_scan_and_list_route_to_the_peer() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn remote_props_set_and_version_route_to_the_peer() {
+    let home = temp_home();
+    let agent = AgentHandle::start();
+    let home_path = home.path();
+
+    assert_ok(
+        &run(
+            home_path,
+            &[
+                "remote",
+                "connect",
+                &agent.addr,
+                "--code",
+                &agent.code,
+                "-y",
+                "--output",
+                "json",
+            ],
+        ),
+        "connect",
+    );
+
+    let ws_dir = agent.dir.path().join("ws");
+    assert_ok(
+        &run(
+            home_path,
+            &[
+                "workspace",
+                "init",
+                "--origin",
+                "test-box",
+                "--dir",
+                ws_dir.to_str().expect("utf8"),
+                "--name",
+                "w1",
+                "--output",
+                "json",
+            ],
+        ),
+        "workspace init --origin",
+    );
+
+    // 登记先于核心下载：核心成败不影响后续属性 / 设置 / 版本
+    let _ = run(
+        home_path,
+        &[
+            "server",
+            "create",
+            "web",
+            "--origin",
+            "test-box",
+            "--version",
+            "1.21.1",
+            "--variant",
+            "vanilla",
+            "--output",
+            "json",
+        ],
+    );
+
+    // 1. props 写入：文件落在对端服务器目录
+    let written = run(
+        home_path,
+        &[
+            "server",
+            "props",
+            "test-box/web",
+            "motd=远端你好",
+            "--output",
+            "json",
+        ],
+    );
+    assert_ok(&written, "remote props set");
+    let payload = json(&written);
+    assert_eq!(payload["name"], "web");
+    assert_eq!(payload["updated"]["motd"], "远端你好");
+    let file = ws_dir.join("servers").join("web").join("server.properties");
+    assert_eq!(
+        std::fs::read_to_string(&file).expect("读对端文件"),
+        "motd=远端你好\n"
+    );
+
+    // 2. props 读取：同一份原文解析出的键值
+    let listed = run(
+        home_path,
+        &["server", "props", "test-box/web", "--output", "json"],
+    );
+    assert_ok(&listed, "remote props list");
+    let rows = json(&listed);
+    let rows = rows.as_array().expect("array");
+    assert!(
+        rows.iter()
+            .any(|row| row["key"] == "motd" && row["value"] == "远端你好"),
+        "{rows:?}"
+    );
+
+    // 3. set：值在对端校验并持久化（ram 规范化）
+    let set = run(
+        home_path,
+        &[
+            "server",
+            "set",
+            "test-box/web",
+            "ram",
+            "2G",
+            "--output",
+            "json",
+        ],
+    );
+    assert_ok(&set, "remote set ram");
+    let set = json(&set);
+    assert_eq!(set["key"], "ram");
+    assert_eq!(set["value"], "2048M");
+    assert_eq!(set["settings"]["ram_mib"], 2048);
+
+    // 4. version：经组合注册表读对端记录
+    let version = run(
+        home_path,
+        &["server", "version", "test-box/web", "--output", "json"],
+    );
+    assert_ok(&version, "remote version");
+    let version = json(&version);
+    assert_eq!(version["name"], "web");
+    assert_eq!(version["version"], "1.21.1");
+    assert_eq!(version["variant"], "vanilla");
+
+    // 5. java uninstall 缺目标：非交互报用法错误（远端路径也走同一道闸）
+    let uninstall = run(
+        home_path,
+        &[
+            "java",
+            "uninstall",
+            "--origin",
+            "test-box",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(!uninstall.status.success());
+    assert_eq!(
+        uninstall.status.code(),
+        Some(2),
+        "缺目标属于用法错误: stderr=[{}]",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+}
+
+#[test]
 fn remote_logs_follow_streams_new_lines() {
     let home = temp_home();
     let agent = AgentHandle::start();
