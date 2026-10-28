@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use thiserror::Error;
 
 /// 凭证存储失败
@@ -49,6 +50,9 @@ pub enum CredentialError {
     /// 该名字没有凭证
     #[error("no credential stored for {0}")]
     NotFound(String),
+    /// 系统钥匙串失败（含索引内容损坏）
+    #[error("keyring: {0}")]
+    Keyring(String),
 }
 
 impl CredentialError {
@@ -251,6 +255,283 @@ impl CredentialStore for FileCredentialStore {
     }
 }
 
+/// 钥匙串底层：一条 entry 的读写
+///
+/// 抽成 trait 是为了让 [`KeyringCredentialStore`] 的核心逻辑（索引维护、JSON
+/// 编解码、幂等删除）能用内存实现测试，不必依赖真实系统钥匙串。
+pub trait KeyringBackend: Send + Sync {
+    /// 写入 / 覆盖一条
+    ///
+    /// # Errors
+    ///
+    /// 底层钥匙串报错时返回 [`CredentialError::Keyring`]
+    fn set(&self, service: &str, account: &str, secret: &str) -> Result<(), CredentialError>;
+
+    /// 读取；不存在返回 `None`
+    ///
+    /// # Errors
+    ///
+    /// 底层钥匙串报错时返回 [`CredentialError::Keyring`]
+    fn get(&self, service: &str, account: &str) -> Result<Option<String>, CredentialError>;
+
+    /// 删除；不存在视为成功（幂等）
+    ///
+    /// # Errors
+    ///
+    /// 底层钥匙串报错时返回 [`CredentialError::Keyring`]
+    fn delete(&self, service: &str, account: &str) -> Result<(), CredentialError>;
+}
+
+/// 系统钥匙串：macOS Keychain / Windows Credential Manager / Linux Secret Service
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemKeyring;
+
+impl SystemKeyring {
+    fn entry(service: &str, account: &str) -> Result<keyring::Entry, CredentialError> {
+        keyring::Entry::new(service, account)
+            .map_err(|err| CredentialError::Keyring(format!("{service}/{account}: {err}")))
+    }
+}
+
+impl KeyringBackend for SystemKeyring {
+    fn set(&self, service: &str, account: &str, secret: &str) -> Result<(), CredentialError> {
+        Self::entry(service, account)?
+            .set_password(secret)
+            .map_err(|err| CredentialError::Keyring(format!("{service}/{account}: {err}")))
+    }
+
+    fn get(&self, service: &str, account: &str) -> Result<Option<String>, CredentialError> {
+        match Self::entry(service, account)?.get_password() {
+            Ok(secret) => Ok(Some(secret)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(err) => Err(CredentialError::Keyring(format!(
+                "{service}/{account}: {err}"
+            ))),
+        }
+    }
+
+    fn delete(&self, service: &str, account: &str) -> Result<(), CredentialError> {
+        match Self::entry(service, account)?.delete_credential() {
+            // 幂等：删不存在的凭证也算成功
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(err) => Err(CredentialError::Keyring(format!(
+                "{service}/{account}: {err}"
+            ))),
+        }
+    }
+}
+
+/// 索引 entry 的 account 名（与远端名隔离在 `{service}:index` 这个 service 下）
+const INDEX_ACCOUNT: &str = "names";
+
+/// 系统钥匙串凭证存储
+///
+/// 每个远端名对应一条 entry（account = 名字，secret = [`StoredCredential`] 的
+/// JSON）。钥匙串不支持枚举，`names()` 由一条独立索引 entry 维护：写入 / 删除
+/// 时同步更新。索引放在另一个 service（`{service}:index`），避免与某个恰好
+/// 叫 `names` 的远端名冲突。
+#[derive(Debug, Clone)]
+pub struct KeyringCredentialStore<B: KeyringBackend = SystemKeyring> {
+    backend: Arc<B>,
+    service: String,
+}
+
+impl<B: KeyringBackend> KeyringCredentialStore<B> {
+    /// 用给定 service 名与后端构造
+    #[must_use]
+    pub fn new(service: impl Into<String>, backend: B) -> Self {
+        Self {
+            backend: Arc::new(backend),
+            service: service.into(),
+        }
+    }
+
+    fn index_service(&self) -> String {
+        format!("{}:index", self.service)
+    }
+
+    fn load_index(&self) -> Result<Vec<String>, CredentialError> {
+        match self.backend.get(&self.index_service(), INDEX_ACCOUNT)? {
+            Some(text) => serde_json::from_str(&text).map_err(|err| {
+                CredentialError::Keyring(format!("credential index is corrupt: {err}"))
+            }),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn save_index(&self, names: &[String]) -> Result<(), CredentialError> {
+        let text = serde_json::to_string(names)
+            .map_err(|err| CredentialError::Keyring(format!("encode credential index: {err}")))?;
+        self.backend
+            .set(&self.index_service(), INDEX_ACCOUNT, &text)
+    }
+
+    fn add_index(&self, name: &str) -> Result<(), CredentialError> {
+        let mut names = self.load_index()?;
+        if !names.iter().any(|existing| existing == name) {
+            names.push(name.to_owned());
+            names.sort();
+            self.save_index(&names)?;
+        }
+        Ok(())
+    }
+
+    fn remove_index(&self, name: &str) -> Result<(), CredentialError> {
+        let mut names = self.load_index()?;
+        let before = names.len();
+        names.retain(|existing| existing != name);
+        if names.len() != before {
+            self.save_index(&names)?;
+        }
+        Ok(())
+    }
+}
+
+impl<B: KeyringBackend> CredentialStore for KeyringCredentialStore<B> {
+    fn put(&self, name: &str, credential: &StoredCredential) -> Result<(), CredentialError> {
+        let secret = serde_json::to_string(credential)
+            .map_err(|err| CredentialError::Keyring(format!("encode credential {name}: {err}")))?;
+        self.backend.set(&self.service, name, &secret)?;
+        self.add_index(name)
+    }
+
+    fn get(&self, name: &str) -> Result<StoredCredential, CredentialError> {
+        let Some(secret) = self.backend.get(&self.service, name)? else {
+            return Err(CredentialError::NotFound(name.to_owned()));
+        };
+        serde_json::from_str(&secret)
+            .map_err(|err| CredentialError::Keyring(format!("credential {name} is corrupt: {err}")))
+    }
+
+    fn remove(&self, name: &str) -> Result<(), CredentialError> {
+        self.backend.delete(&self.service, name)?;
+        self.remove_index(name)
+    }
+
+    fn names(&self) -> Result<Vec<String>, CredentialError> {
+        let mut names = self.load_index()?;
+        names.sort();
+        Ok(names)
+    }
+}
+
+/// 凭证存储选择环境变量：`auto`（缺省）/ `file` / `keyring`
+pub const CREDENTIAL_STORE_ENV: &str = "MCSUP_CREDENTIAL_STORE";
+
+/// 默认钥匙串 service 名
+pub const KEYRING_SERVICE: &str = "mcsup";
+
+/// 显式指定的存储后端（`auto` 返回 `None`）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreChoice {
+    File,
+    Keyring,
+}
+
+/// 解析环境变量取值；`auto` / 非法值都返回 `None`，交给平台能力决定
+fn parse_choice(raw: Option<&str>) -> Option<StoreChoice> {
+    match raw.map(str::trim) {
+        Some("file") => Some(StoreChoice::File),
+        Some("keyring") => Some(StoreChoice::Keyring),
+        _ => None,
+    }
+}
+
+/// `auto` 模式下是否默认使用钥匙串
+///
+/// macOS / Windows 默认使用；其余 Unix 只在存在会话总线 / 运行时目录（说明
+/// 有 Secret Service）时使用，否则直接落到 0600 文件——headless 服务器上
+/// 没有钥匙串，硬试只会每次报错。
+fn auto_prefers_keyring() -> bool {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        true
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some()
+            || std::env::var_os("XDG_RUNTIME_DIR").is_some()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
+/// 平台凭证存储：优先系统钥匙串，无钥匙串时退到 0600 文件
+///
+/// 调用方只见 [`CredentialStore`]；后端由 `MCSUP_CREDENTIAL_STORE` 或平台能力
+/// 决定，换存储不动业务代码。`describe()` 给出后端描述，写进配对记录便于排查
+/// 「凭证到底存在哪」。
+#[derive(Debug, Clone)]
+pub enum CredentialVault {
+    /// 系统钥匙串
+    Keyring(KeyringCredentialStore<SystemKeyring>),
+    /// 0600 文件
+    File(FileCredentialStore),
+}
+
+impl CredentialVault {
+    /// 按环境变量 / 平台能力选择后端
+    #[must_use]
+    pub fn open(file_path: impl Into<PathBuf>) -> Self {
+        let file_path = file_path.into();
+        let choice = parse_choice(std::env::var(CREDENTIAL_STORE_ENV).ok().as_deref())
+            .unwrap_or_else(|| {
+                if auto_prefers_keyring() {
+                    StoreChoice::Keyring
+                } else {
+                    StoreChoice::File
+                }
+            });
+        match choice {
+            StoreChoice::Keyring => {
+                Self::Keyring(KeyringCredentialStore::new(KEYRING_SERVICE, SystemKeyring))
+            }
+            StoreChoice::File => Self::File(FileCredentialStore::new(file_path)),
+        }
+    }
+
+    /// 后端描述：`keyring` 或 `file:<路径>`
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Keyring(_) => "keyring".to_owned(),
+            Self::File(store) => format!("file:{}", store.path().display()),
+        }
+    }
+}
+
+impl CredentialStore for CredentialVault {
+    fn put(&self, name: &str, credential: &StoredCredential) -> Result<(), CredentialError> {
+        match self {
+            Self::Keyring(store) => store.put(name, credential),
+            Self::File(store) => store.put(name, credential),
+        }
+    }
+
+    fn get(&self, name: &str) -> Result<StoredCredential, CredentialError> {
+        match self {
+            Self::Keyring(store) => store.get(name),
+            Self::File(store) => store.get(name),
+        }
+    }
+
+    fn remove(&self, name: &str) -> Result<(), CredentialError> {
+        match self {
+            Self::Keyring(store) => store.remove(name),
+            Self::File(store) => store.remove(name),
+        }
+    }
+
+    fn names(&self) -> Result<Vec<String>, CredentialError> {
+        match self {
+            Self::Keyring(store) => store.names(),
+            Self::File(store) => store.names(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,5 +634,86 @@ mod tests {
         let err = store.names().expect_err("corrupt");
         assert!(err.to_string().contains("credentials.toml"), "{err}");
         assert!(dir.path().exists());
+    }
+
+    /// 内存钥匙串：用同一套（service, account）键空间模拟系统钥匙串
+    #[derive(Debug, Default, Clone)]
+    struct MemoryKeyring {
+        entries: Arc<std::sync::Mutex<BTreeMap<(String, String), String>>>,
+    }
+
+    impl KeyringBackend for MemoryKeyring {
+        fn set(&self, service: &str, account: &str, secret: &str) -> Result<(), CredentialError> {
+            self.entries
+                .lock()
+                .expect("lock")
+                .insert((service.to_owned(), account.to_owned()), secret.to_owned());
+            Ok(())
+        }
+
+        fn get(&self, service: &str, account: &str) -> Result<Option<String>, CredentialError> {
+            Ok(self
+                .entries
+                .lock()
+                .expect("lock")
+                .get(&(service.to_owned(), account.to_owned()))
+                .cloned())
+        }
+
+        fn delete(&self, service: &str, account: &str) -> Result<(), CredentialError> {
+            self.entries
+                .lock()
+                .expect("lock")
+                .remove(&(service.to_owned(), account.to_owned()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn keyring_store_roundtrip_index_and_idempotent_remove() {
+        let store = KeyringCredentialStore::new("mcsup-test", MemoryKeyring::default());
+        assert!(matches!(
+            store.get("prod-box"),
+            Err(CredentialError::NotFound(_))
+        ));
+        assert!(store.names().expect("names").is_empty());
+
+        store.put("prod-box", &credential()).expect("put");
+        assert_eq!(store.get("prod-box").expect("get"), credential());
+        assert_eq!(store.names().expect("names"), vec!["prod-box".to_owned()]);
+
+        // 索引保持升序、put 覆盖不重复登记
+        store.put("alpha", &credential()).expect("put alpha");
+        store.put("prod-box", &credential()).expect("overwrite");
+        assert_eq!(
+            store.names().expect("names"),
+            vec!["alpha".to_owned(), "prod-box".to_owned()]
+        );
+
+        store.remove("prod-box").expect("remove");
+        assert!(matches!(
+            store.get("prod-box"),
+            Err(CredentialError::NotFound(_))
+        ));
+        assert_eq!(store.names().expect("names"), vec!["alpha".to_owned()]);
+        // 幂等：删不存在的不报错
+        store.remove("prod-box").expect("remove again");
+    }
+
+    #[test]
+    fn credential_store_choice_parsing_and_vault_describe() {
+        assert_eq!(parse_choice(None), None);
+        assert_eq!(parse_choice(Some("auto")), None);
+        assert_eq!(parse_choice(Some(" file ")), Some(StoreChoice::File));
+        assert_eq!(parse_choice(Some("keyring")), Some(StoreChoice::Keyring));
+        // 非法值按 auto 处理，不 panic
+        assert_eq!(parse_choice(Some("bogus")), None);
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("credentials.toml");
+        let vault = CredentialVault::File(FileCredentialStore::new(&path));
+        assert!(vault.describe().starts_with("file:"));
+        vault.put("box", &credential()).expect("put via vault");
+        assert_eq!(vault.get("box").expect("get via vault"), credential());
     }
 }

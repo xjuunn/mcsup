@@ -6,6 +6,7 @@ use crate::progress::TaskSpinner;
 use crate::prompts;
 use anyhow::{Context, Result};
 use comfy_table::{Cell, Color, Table};
+use mcsup::domain::server::meta::ServerName;
 use mcsup::domain::server::status::ServerStatus;
 use mcsup::domain::server::version::{ServerVariant, VersionId};
 use mcsup::domain::workspace::{WorkspaceId, WorkspaceName};
@@ -20,7 +21,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::install::{download_jar, pick_version};
+use super::install::{download_jar, pick_version, select_version};
 
 /// 表格状态列着色用，不进 JSON（JSON 行类型在 `protocol::cli`）
 #[derive(Serialize)]
@@ -441,19 +442,30 @@ fn create_remote(
             None,
         )
     })?;
-    let name = name.ok_or_else(|| {
-        AppDiagnostic::usage(
-            crate::i18n::pick(
-                lang,
-                "server create 缺少服务器名称",
-                "server create requires a server name",
-            ),
-            None,
-        )
-    })?;
+    let interactive = printer.is_interactive();
+    // 名称：给定即用；交互缺省则提示输入；非交互缺省是用法错误
+    let name = match name {
+        Some(name) => name.to_owned(),
+        None if interactive => prompt_remote_name(printer)?,
+        None => {
+            return Err(AppDiagnostic::usage(
+                crate::i18n::pick(
+                    lang,
+                    "server create 缺少服务器名称",
+                    "server create requires a server name",
+                ),
+                Some(crate::i18n::pick(
+                    lang,
+                    "非交互模式：mcsup server create <name> --version <VER> --variant <V>",
+                    "non-interactive: mcsup server create <name> --version <VER> --variant <V>",
+                )),
+            )
+            .into());
+        }
+    };
     // 整合包变体既可由 `--modpack` 隐含，也可显式写 `--variant modrinth-modpack`
     if let Some(project) = modpack {
-        return create_remote_modpack(member, name, project, version, variant, workspace, printer);
+        return create_remote_modpack(member, &name, project, version, variant, workspace, printer);
     }
     if variant.is_some_and(is_modpack_flag) {
         return Err(AppDiagnostic::usage(
@@ -470,36 +482,62 @@ fn create_remote(
         )
         .into());
     }
-    let version = version.ok_or_else(|| {
-        AppDiagnostic::usage(
-            crate::i18n::pick(
-                lang,
-                "远端 server create 需要 --version",
-                "remote `server create` requires --version",
-            ),
-            None,
-        )
-    })?;
-    let variant = variant.ok_or_else(|| {
-        AppDiagnostic::usage(
-            crate::i18n::pick(
-                lang,
-                "远端 server create 需要 --variant",
-                "remote `server create` requires --variant",
-            ),
-            None,
-        )
-    })?;
+    // 变体：显式给出就按对端的可用变体校验；交互缺省则从对端列表选
+    let variant = match variant {
+        Some(raw) => {
+            let available = remote_variants(member, printer)?;
+            resolve_flag_variant(raw, &available, lang)?
+        }
+        None if interactive => {
+            let available = remote_variants(member, printer)?;
+            pick_variant(&available, printer)?
+        }
+        None => {
+            return Err(AppDiagnostic::usage(
+                crate::i18n::pick(
+                    lang,
+                    "远端 server create 需要 --variant",
+                    "remote `server create` requires --variant",
+                ),
+                Some(crate::i18n::pick(
+                    lang,
+                    "交互终端下可省略后从对端变体列表选择",
+                    "in a terminal it is picked from the peer's variant list",
+                )),
+            )
+            .into());
+        }
+    };
+    // 版本：显式给出即用；交互缺省则从对端版本列表选
+    let version = match version {
+        Some(version) => version.to_owned(),
+        None if interactive => pick_remote_version(member, &variant, printer)?,
+        None => {
+            return Err(AppDiagnostic::usage(
+                crate::i18n::pick(
+                    lang,
+                    "远端 server create 需要 --version",
+                    "remote `server create` requires --version",
+                ),
+                Some(crate::i18n::pick(
+                    lang,
+                    "交互终端下可省略后从对端版本列表选择",
+                    "in a terminal it is picked from the peer's version list",
+                )),
+            )
+            .into());
+        }
+    };
     let meta = member
         .servers
-        .create(workspace, name, version, variant, None)
+        .create(workspace, &name, &version, variant.as_str(), None)
         .with_context(|| {
             crate::i18n::pick(lang, "在远端创建服务器", "creating the server on the peer")
         })?;
     // 登记成功即装核心：与本地 `server create` 同一条语义（建站 = 登记 + 下载核心）。
     // 安装失败保留登记，提示对端重试——「已登记、可重试」与本地 setup_server 失败
     // 路径的口径完全一致。
-    let installed = member.servers.install(meta.name.as_str(), version);
+    let installed = member.servers.install(meta.name.as_str(), &version);
     let (jar_version, path) = match installed {
         Ok(updated) => match updated.jar.as_ref() {
             Some(_) => (
@@ -563,6 +601,93 @@ fn create_remote(
 
 /// 远端整合包创建：对端读清单 → 登记 → 装加载器 → 铺文件
 ///
+/// 远端创建向导：交互输入服务器名（非空且合法）
+fn prompt_remote_name(printer: Printer) -> Result<String> {
+    let lang = printer.lang();
+    prompts::step(
+        printer,
+        1,
+        3,
+        &crate::i18n::pick(lang, "服务器名称", "server name"),
+    );
+    loop {
+        let input = prompts::input_name(
+            lang,
+            &crate::i18n::pick(lang, "服务器名称", "server name"),
+            "",
+        )?;
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match ServerName::parse(trimmed) {
+            Ok(name) => return Ok(name.as_str().to_owned()),
+            Err(_) => printer.print_warning(&crate::i18n::pick(
+                lang,
+                "名称只能包含字母、数字、-、_，最长 64 字符",
+                "names may only contain letters, digits, - or _, up to 64 characters",
+            )),
+        }
+    }
+}
+
+/// 对端可用变体（解析失败的对端 id 忽略，不让一个未知变体拖垮整张列表）
+fn remote_variants(
+    member: &mcsup::backend::remote::RemoteMember,
+    printer: Printer,
+) -> Result<Vec<ServerVariant>> {
+    let lang = printer.lang();
+    let ids = member.servers.variants().with_context(|| {
+        crate::i18n::pick(lang, "获取对端变体列表", "fetching the peer's variant list")
+    })?;
+    let available: Vec<ServerVariant> = ids
+        .into_iter()
+        .filter_map(|id| ServerVariant::from_id(id).ok())
+        .collect();
+    if available.is_empty() {
+        return Err(anyhow::anyhow!(crate::i18n::pick(
+            lang,
+            "对端没有可用的服务端来源（provider 未注册）",
+            "the peer has no server jar source available (no provider registered)",
+        )));
+    }
+    Ok(available)
+}
+
+/// 远端创建向导：从对端版本列表交互选择版本
+fn pick_remote_version(
+    member: &mcsup::backend::remote::RemoteMember,
+    variant: &ServerVariant,
+    printer: Printer,
+) -> Result<String> {
+    let lang = printer.lang();
+    prompts::step(
+        printer,
+        3,
+        3,
+        &crate::i18n::pick(lang, "服务端版本", "server version"),
+    );
+    let spinner = TaskSpinner::new(
+        crate::i18n::pick(
+            lang,
+            format!("获取 {} 版本列表", variant.as_str()),
+            format!("fetching the {} version list", variant.as_str()),
+        ),
+        printer.is_human(),
+    );
+    let versions = member.servers.versions(variant.as_str()).with_context(|| {
+        crate::i18n::pick(
+            lang,
+            "获取对端版本列表失败",
+            "failed to fetch the peer's version list",
+        )
+    })?;
+    spinner.finish();
+    Ok(select_version(versions, variant.as_str(), printer)?
+        .as_str()
+        .to_owned())
+}
+
 /// `--version` 是整合包版本（可省略取最新正式版），不是 Minecraft 版本；
 /// 清单声明的 MC 版本与加载器变体由对端回传，客户端只做展示。
 fn create_remote_modpack(
@@ -1319,8 +1444,24 @@ pub(crate) fn link(
     path: &Path,
     name: Option<&str>,
     workspace: Option<&str>,
+    origin: Option<&str>,
     printer: Printer,
 ) -> Result<()> {
+    if let Some(origin) = origin {
+        let origin = mcsup::port::Origin::parse(origin).map_err(|err| {
+            AppDiagnostic::usage(
+                crate::i18n::pick(
+                    printer.lang(),
+                    format!("--origin 取值非法: {origin}"),
+                    format!("invalid --origin value: {origin}"),
+                ),
+                Some(err.to_string()),
+            )
+        })?;
+        if !origin.is_local() {
+            return link_remote(&origin, path, name, workspace, printer);
+        }
+    }
     let reg = open_registry()?;
     let selector = workspace_selector(workspace);
     let out = reg.link(path, name, selector.as_deref()).with_context(|| {
@@ -1369,6 +1510,80 @@ pub(crate) fn link(
             variant: out.server.meta.variant.as_str(),
             path: out.server.dir.display().to_string(),
             linked: Some(out.server.linked),
+        },
+    )
+}
+
+/// `server link --origin <remote>`：在对端注册一个已存在的目录
+///
+/// 符号链接、marker 与入库都在对端完成；`path` 是**目标机器**上的路径。
+///
+/// # Errors
+///
+/// 远端未就绪、对端拒绝（目标不存在 / 名称冲突 / 目标在工作区内…）时返回错误
+fn link_remote(
+    origin: &mcsup::port::Origin,
+    path: &Path,
+    name: Option<&str>,
+    workspace: Option<&str>,
+    printer: Printer,
+) -> Result<()> {
+    let lang = printer.lang();
+    let cfg = crate::config::ConfigFile::locate(None).load()?;
+    let members = bootstrap::remote_members(&cfg)?;
+    let member = super::origin::member(&members, origin, lang)?.ok_or_else(|| {
+        AppDiagnostic::usage(
+            crate::i18n::pick(
+                lang,
+                "本地来源不需要远端注册",
+                "local origin does not need a remote link",
+            ),
+            None,
+        )
+    })?;
+    let target = path.to_string_lossy().into_owned();
+    let out = member
+        .servers
+        .link_directory(&target, name, workspace)
+        .with_context(|| {
+            crate::i18n::pick(
+                lang,
+                format!("在远端注册目录 {} 失败", path.display()),
+                format!("failed to register {} on the peer", path.display()),
+            )
+        })?;
+    printer.print_outcome(
+        &if out.linked {
+            crate::i18n::pick(
+                lang,
+                format!(
+                    "已在 {} 链接: {} → {}（目标 {}）",
+                    member.name, out.meta.name, out.target, target
+                ),
+                format!(
+                    "linked on {}: {} → {} (target {})",
+                    member.name, out.meta.name, out.target, target
+                ),
+            )
+        } else {
+            crate::i18n::pick(
+                lang,
+                format!(
+                    "已在 {} 注册工作区内目录: {} → {}（未建符号链接）",
+                    member.name, out.meta.name, out.target
+                ),
+                format!(
+                    "registered an in-workspace directory on {}: {} → {} (no symlink)",
+                    member.name, out.meta.name, out.target
+                ),
+            )
+        },
+        &CreateRow {
+            name: out.meta.name.as_str(),
+            version: out.meta.version.as_str(),
+            variant: out.meta.variant.as_str(),
+            path: out.target,
+            linked: Some(out.linked),
         },
     )
 }

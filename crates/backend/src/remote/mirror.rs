@@ -22,7 +22,7 @@ use domain::java::JavaRuntime;
 use domain::server::launch::LaunchSpec;
 use domain::server::meta::{InstalledJar, ServerMeta, ServerName};
 use domain::server::settings::ServerSettings;
-use domain::server::version::VersionId;
+use domain::server::version::{ServerVersion, VersionId};
 use domain::workspace::{Workspace, WorkspaceId, WorkspaceName};
 use port::{Origin, RepositoryError, Sourced};
 use protocol::remote::wire::WirePropUpdate;
@@ -55,6 +55,21 @@ pub struct RemoteModpackResult {
     pub reused: usize,
     /// 仅客户端、已跳过的文件数
     pub skipped_client_only: usize,
+}
+
+/// `server link --origin` 的结果
+///
+/// 与 `Linked` 帧一一对应：`meta` 是对端注册后的记录，`target` 是对端上
+/// canonicalize 后的真实路径，`linked` 表示是否建立了符号链接（工作区内就地
+/// 注册时为 `false`）。
+#[derive(Debug, Clone)]
+pub struct RemoteLinkResult {
+    /// 对端上的服务器记录
+    pub meta: ServerMeta,
+    /// 对端上的真实目标路径
+    pub target: String,
+    /// 是否建立了符号链接
+    pub linked: bool,
 }
 
 /// 工作目录镜像
@@ -342,6 +357,76 @@ impl RemoteServerRepository {
                 skipped_client_only,
             }),
             other => Err(unexpected(other, "server.create_modpack")),
+        }
+    }
+
+    /// 在对端注册一个已存在的服务器目录（`server link --origin`）
+    ///
+    /// 符号链接、marker 与入库都在对端完成；`target` 是**对端机器**上的路径。
+    ///
+    /// # Errors
+    ///
+    /// 对端拒绝（目标不存在 / 名称冲突 / 目标在工作区内…）或传输失败时返回
+    /// [`RepositoryError`]
+    pub fn link_directory(
+        &self,
+        target: &str,
+        name: Option<&str>,
+        workspace: Option<&str>,
+    ) -> Result<RemoteLinkResult, RepositoryError> {
+        let response = self.link.expect(
+            &Request::ServerLink {
+                target: target.to_owned(),
+                name: name.map(str::to_owned),
+                workspace: workspace.map(str::to_owned),
+            },
+            "linked",
+        )?;
+        match response {
+            Response::Linked {
+                server,
+                target,
+                linked,
+            } => Ok(RemoteLinkResult {
+                meta: ServerMeta::try_from(server)?,
+                target,
+                linked,
+            }),
+            other => Err(unexpected(other, "server.link")),
+        }
+    }
+
+    /// 对端可用的服务端变体标识（`server create --origin` 交互向导用）
+    ///
+    /// # Errors
+    ///
+    /// 传输失败或对端返回非预期载荷时返回 [`RepositoryError`]
+    pub fn variants(&self) -> Result<Vec<String>, RepositoryError> {
+        let response = self.link.expect(&Request::ServerVariants, "variants")?;
+        match response {
+            Response::Variants { items } => Ok(items),
+            other => Err(unexpected(other, "server.variants")),
+        }
+    }
+
+    /// 对端某个变体的版本列表（已按展示顺序排序）
+    ///
+    /// # Errors
+    ///
+    /// 传输失败或对端返回非预期载荷时返回 [`RepositoryError`]
+    pub fn versions(&self, variant: &str) -> Result<Vec<ServerVersion>, RepositoryError> {
+        let response = self.link.expect(
+            &Request::ServerVersions {
+                variant: variant.to_owned(),
+            },
+            "versions",
+        )?;
+        match response {
+            Response::Versions { items } => items
+                .into_iter()
+                .map(ServerVersion::try_from)
+                .collect::<Result<Vec<_>, _>>(),
+            other => Err(unexpected(other, "server.versions")),
         }
     }
 
@@ -847,6 +932,33 @@ mod tests {
             .expect("set setting");
         assert_eq!(value, "2G");
         assert_eq!(settings, ServerSettings::default());
+    }
+
+    #[test]
+    fn server_link_registers_on_the_peer() {
+        let harness = PairingHarness::spawn();
+        let servers = RemoteServerRepository::new(harness.link(), origin());
+        let result = servers
+            .link_directory("/srv/mc/external", Some("ext"), None)
+            .expect("link");
+        assert_eq!(result.meta.name.as_str(), "ext");
+        assert_eq!(result.target, "/srv/mc/external");
+        assert!(result.linked, "垫片按「建立符号链接」回帧");
+        // 注册即在对端可见
+        assert_eq!(servers.list().expect("list").len(), 1);
+    }
+
+    #[test]
+    fn server_variants_and_versions_decode_from_the_peer() {
+        let harness = PairingHarness::spawn();
+        let servers = RemoteServerRepository::new(harness.link(), origin());
+        let variants = servers.variants().expect("variants");
+        assert_eq!(variants, vec!["vanilla".to_owned(), "paper".to_owned()]);
+
+        let versions = servers.versions("paper").expect("versions");
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].id.as_str(), "1.21.1");
+        assert!(matches!(versions[0].variant, ServerVariant::Paper));
     }
 
     #[test]

@@ -139,7 +139,7 @@ mcsup
 │   ├── init (in|new) [--dir <path>] [--name <name>] [--origin <名字>]
 │   ├── list (ls) [--origin <o>] / use (sw) [<name>] / remove (rm) <name> [--purge] / doctor (doc)
 ├── server (srv)              # 单台服务：生命周期 + 属主内容
-│   ├── list (ls) [--origin <o>] / create (cr) [--origin <名字>] [--modpack <项目>] / link (ln) / install (in)
+│   ├── list (ls) [--origin <o>] / create (cr) [--origin <名字>] [--modpack <项目>] / link (ln) [--origin <名字>] / install (in)
 │   ├── start (up) / stop (down) / restart (rs)
 │   ├── status (st) / console (con) / send (snd) / logs (log)
 │   ├── props (prop) / set (cfg) / remove (rm) / version (ver)
@@ -169,7 +169,7 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | 子命令 | 用法 | 说明 |
 | --- | --- | --- |
 | `list` | `mcsup server list [--origin <all\|local\|remote\|名字>]` | 列出所有服务与状态；`--origin` 按来源过滤（缺省 `all`），见 `docs/remote.md` |
-| `create` | `mcsup server create [<name>] [--version <ver>] [--variant <v>] [--workspace <名或路径>] [--workspace-name <名>] [--workspace-dir <路径>] [--origin <名字>] [--modpack <项目>]` | 建站并下载核心 JAR；`--origin <远端>` 在对端创建（普通变体：登记 + 下载核心；`--modpack`：对端读清单、装加载器、铺 overrides，一次调用完成），本地缺省行为不变（变体从可用能力列选，缺省 vanilla；版本交互从列表选，也接受 `latest` / `lts` / `latest-snapshot` 别名，`lts` 等价 `latest`）。`--modpack` 隐含整合包流程，`--version` 此时是整合包版本（可省略取最新正式版），与只会选加载器的 `--variant` 互斥（同用 → 退出码 2）；只给 `--variant modrinth-modpack` 而缺 `--modpack` → 2。`--workspace` 命中已有工作区直接使用，未命中时配合 `--workspace-name` / `--workspace-dir` 新建；名称与路径不一致 → 退出码 2。TTY 缺名/缺版本进向导（名称重输直到唯一，步骤回显 `[n/3]`，参数给定则跳过对应步）；无工作区且可交互时先复用 `workspace init` 向导再继续；非 TTY 缺 `--version` 或缺名 → 退出码 2；显式变体未知/未支持 → 2 并列出可用变体；下载失败保留已注册结果，提示 `mcsup server install <name>` 重试。`--variant forge` 走「下载安装器 + 运行 `--installServer`」两步；`neoforge` 同理 |
+| `create` | `mcsup server create [<name>] [--version <ver>] [--variant <v>] [--workspace <名或路径>] [--workspace-name <名>] [--workspace-dir <路径>] [--origin <名字>] [--modpack <项目>]` | 建站并下载核心 JAR；`--origin <远端>` 在对端创建（普通变体：登记 + 下载核心；`--modpack`：对端读清单、装加载器、铺 overrides，一次调用完成；TTY 下缺 `--variant` / `--version` 时从对端变体 / 版本列表交互补齐），本地缺省行为不变（变体从可用能力列选，缺省 vanilla；版本交互从列表选，也接受 `latest` / `lts` / `latest-snapshot` 别名，`lts` 等价 `latest`）。`--modpack` 隐含整合包流程，`--version` 此时是整合包版本（可省略取最新正式版），与只会选加载器的 `--variant` 互斥（同用 → 退出码 2）；只给 `--variant modrinth-modpack` 而缺 `--modpack` → 2。`--workspace` 命中已有工作区直接使用，未命中时配合 `--workspace-name` / `--workspace-dir` 新建；名称与路径不一致 → 退出码 2。TTY 缺名/缺版本进向导（名称重输直到唯一，步骤回显 `[n/3]`，参数给定则跳过对应步）；无工作区且可交互时先复用 `workspace init` 向导再继续；非 TTY 缺 `--version` 或缺名 → 退出码 2；显式变体未知/未支持 → 2 并列出可用变体；下载失败保留已注册结果，提示 `mcsup server install <name>` 重试。`--variant forge` 走「下载安装器 + 运行 `--installServer`」两步；`neoforge` 同理 |
 | `install` | `mcsup server install [<name>] [--version <ver>]` | 给既有服务安装/更换服务端核心（JAR），校验后落盘；交互无 `--version` 从版本列表选择（Release/Snapshot/旧版标注），非 TTY 缺省 `latest` 解析为 manifest 当前稳定版；服务器不存在 → 退出码 3。目标在对端时下载、校验、安装器执行全部在对端，支持裸名指向唯一远端；此时未给 `--version` 沿用在册版本（远端没有「列版本」帧，避免不可见的交互等待）。变体为 `forge` / `neoforge` 时要先运行安装器，缺可用 Java → 退出码 3 并提示先装 Java |
 | `start` | `mcsup server start [<name>] [--accept-eula]` | 经后台 supervisor 拉起 JVM（`server set java-version` 绑定了大版本则用该版本，否则取已注册 Java 最高大版本；核心 JAR 取已安装项；堆上限 `server set ram` 优先、缺省 2048 MiB），返回 supervisor PID；EULA 未同意时 TTY 询问，非交互缺 `--accept-eula` → 退出码 2；已在运行 → 4；无核心 / 无 Java / 绑定大版本无运行时 → 3；spawn / IPC 失败 → 5 |
 | `stop` | `mcsup server stop [<name>] [--grace <sec>] [--force]` | 先优雅停机（默认宽限 30s），宽限后 `--force` 强杀；未在运行幂等成功（exit 0）；超时未 `--force` → 退出码 1 并提示 `--force` |
@@ -180,7 +180,7 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | `logs` | `mcsup server logs [<name>] [--tail <n>] [--follow]` | 查看日志（`--tail` 默认 30），`--follow` 持续跟踪（JSON 模式 JSONL，一行一个对象） |
 | `props` | `mcsup server props [<name>] [key=value ...]` | 无参列出 `server.properties`（TTY 下随后进入交互：选键改值、逐项写入、Esc 退出）；`key=value` 直接写入并提醒重启生效；单独 `key` 缺值时 TTY 交互输入、非 TTY → 退出码 2；键 / 值非法 → 2。服务器在对端时文件经帧读写：传原文、两端各自解析，注释与顺序保留 |
 | `set` | `mcsup server set [<name>] [<key>] [<value>]` | 设置服务属性，见下表；TTY 下缺 key 从键列表选、缺 value 按类型补齐（java-version 从已注册大版本选、ram 输入、autostart 二选一）；非 TTY 缺参 → 退出码 2；`java-version` 绑定无运行时的大版本 → 3。服务器在对端时值在对端校验并持久化，`java-version` 候选取对端已注册运行时 |
-| `link` | `mcsup server link <path> [--name <name>] [--workspace <ws>]` | 注册服务器目录：外部目录建符号链接进工作区（目标不能在任一工作区 `servers/` 内）；目标是某工作区 `servers/` 的直接子目录时不建链接、就地注册（恢复注册丢失的服务器，名称必须与目录名一致，`--workspace` 必须与目录归属一致）；带 `mcsup.json` 时复用其身份 |
+| `link` | `mcsup server link <path> [--name <name>] [--workspace <ws>] [--origin <名字>]` | 注册服务器目录：外部目录建符号链接进工作区（目标不能在任一工作区 `servers/` 内）；目标是某工作区 `servers/` 的直接子目录时不建链接、就地注册（恢复注册丢失的服务器，名称必须与目录名一致，`--workspace` 必须与目录归属一致）；带 `mcsup.json` 时复用其身份。`--origin <远端>` 时 `<path>` 是**目标机器**上的路径，链接、marker 与入库全在对端完成 |
 | `remove` | `mcsup server remove [<name>] [--purge] [--origin <名字>]` | `--origin <远端>` 在对端注销（可选删盘）。缺名称时交互选择要删除的服务器；默认注销保留磁盘；交互下询问是否删除磁盘数据（默认不删），同意后红色警示并要求输入服务器名称确认（`-y` 跳过这两道确认）；`--purge` 跳过询问直接删目录（链接服务器拒绝 `--purge`，仅移除链接）；非交互不询问；终端工作目录就在该服务器目录内时拒绝（退出码 4，cd 出去后重试）；删盘的前置条件在确认框之前就校验，不满足立刻报错；JSON 同时输出 `purged`（请求了删盘）与 `disk_purged`（磁盘真的删了），目录本就不存在时后者为 `false` |
 | `version` | `mcsup server version [<name>]` | 当前安装的版本、变体、来源（provider 名）、核心大小与校验和；未安装核心提示 `server install` |
 

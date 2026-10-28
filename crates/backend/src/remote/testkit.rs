@@ -278,6 +278,27 @@ pub(crate) mod mcsup_agent_shim {
                     }
                     Response::Removed { disk_purged: false }
                 }
+                Request::ServerLink { target, name, .. } => {
+                    let name = name.clone().unwrap_or_else(|| "linked".to_owned());
+                    let wire = encoding::wire_server(&name, "", "vanilla", None);
+                    self.servers.lock().expect("lock").push(wire.clone());
+                    Response::Linked {
+                        server: wire,
+                        target: target.clone(),
+                        linked: true,
+                    }
+                }
+                Request::ServerVariants => Response::Variants {
+                    items: vec!["vanilla".to_owned(), "paper".to_owned()],
+                },
+                Request::ServerVersions { variant } => Response::Versions {
+                    items: vec![protocol::remote::wire::WireVersion {
+                        id: "1.21.1".to_owned(),
+                        kind: "release".to_owned(),
+                        variant: variant.clone(),
+                        java_major: Some(21),
+                    }],
+                },
                 Request::JavaList | Request::JavaScan => Response::Javas { items: Vec::new() },
                 // ---- 写入类帧：内存垫片按最小语义回帧 ----
                 Request::ServerInstall { name, version } => {

@@ -89,6 +89,8 @@ fn run(home: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
         .env_remove("LC_CTYPE")
         .env_remove("MCSUP_ORIGIN")
         .env("MCSUP_WORKSPACE", "")
+        // 凭证固定走 0600 文件：集成测试不触碰真实系统钥匙串
+        .env("MCSUP_CREDENTIAL_STORE", "file")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

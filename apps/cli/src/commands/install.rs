@@ -278,17 +278,29 @@ pub(crate) async fn pick_version(
         ),
         printer.is_human(),
     );
-    let mut versions = source.versions().await.context(crate::i18n::pick(
+    let versions = source.versions().await.context(crate::i18n::pick(
         printer.lang(),
         "获取版本列表失败",
         "failed to fetch the version list",
     ))?;
     spinner.finish();
+    select_version(versions, variant.as_str(), printer)
+}
+
+/// 从已取回的版本列表里交互选择（本地与远端共用）
+///
+/// 远端向导已经从对端拿到了版本列表，只需要「选择」这一步；抽出来让两端
+/// 排序、标签与过滤开关完全一致，避免远端另写一套选择逻辑。
+pub(crate) fn select_version(
+    mut versions: Vec<ServerVersion>,
+    label: &str,
+    printer: Printer,
+) -> Result<VersionId> {
     if versions.is_empty() {
         anyhow::bail!(crate::i18n::pick(
             printer.lang(),
-            format!("{} 暂无可用版本", variant.as_str()),
-            format!("no versions available for {}", variant.as_str())
+            format!("{label} 暂无可用版本"),
+            format!("no versions available for {label}")
         ));
     }
     // 顺序由领域层统一：各来源给出的顺序不一致（Forge 的 BTreeMap 是串字典序，

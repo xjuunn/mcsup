@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Write};
 use wire::{
     WireClient, WireJava, WirePropUpdate, WireServer, WireSettings, WireSnapshot, WireStartOutcome,
-    WireStatusEntry, WireStop, WireWorkspace,
+    WireStatusEntry, WireStop, WireVersion, WireWorkspace,
 };
 
 /// 远端协议版本；不匹配直接拒绝，禁止猜测兼容
@@ -215,6 +215,25 @@ pub enum Request {
         name: String,
         /// 服务端版本（接受 `latest` 别名）
         version: String,
+    },
+    /// 在对端注册一个已存在的服务器目录（`server link --origin`）
+    ///
+    /// 符号链接、marker 与入库都在对端完成：`target` 是**目标机器**上的路径，
+    /// 客户端拼不出也不能替对端决定目录归属。
+    ServerLink {
+        /// 目标机器上的目录（绝对路径）
+        target: String,
+        /// 注册名；`None` = 取目录名 / `mcsup.json` 里的名字
+        name: Option<String>,
+        /// 工作目录选择器；`None` = 对端当前工作区
+        workspace: Option<String>,
+    },
+    /// 对端可用的服务端变体（`server create --origin` 交互向导用）
+    ServerVariants,
+    /// 对端某个变体的可用版本列表（`server create --origin` 交互向导用）
+    ServerVersions {
+        /// 变体标识
+        variant: String,
     },
     /// 在对端按整合包创建服务器并完成布置
     ///
@@ -410,6 +429,8 @@ impl Request {
             | Self::ServerList
             | Self::JavaList
             | Self::PropsGet { .. }
+            | Self::ServerVariants
+            | Self::ServerVersions { .. }
             | Self::StatusMany { .. } => Some(Permission::Read),
             // 控制台输出可能含玩家名、IP、管理员敲下的命令，比元数据更敏感，
             // 单列 `Logs` 而不是并进 `Read`
@@ -421,6 +442,7 @@ impl Request {
             | Self::ServerCreateModpack { .. }
             | Self::ServerRemove { .. }
             | Self::ServerInstall { .. }
+            | Self::ServerLink { .. }
             | Self::PropsSet { .. }
             | Self::SettingsSet { .. }
             | Self::JavaScan
@@ -461,6 +483,9 @@ impl Request {
             Self::ServerCreateModpack { .. } => "server.create_modpack",
             Self::ServerRemove { .. } => "server.remove",
             Self::ServerInstall { .. } => "server.install",
+            Self::ServerLink { .. } => "server.link",
+            Self::ServerVariants => "server.variants",
+            Self::ServerVersions { .. } => "server.versions",
             Self::PropsGet { .. } => "server.props.get",
             Self::PropsSet { .. } => "server.props.set",
             Self::SettingsSet { .. } => "server.set",
@@ -573,6 +598,25 @@ pub enum Response {
     Removed {
         /// 磁盘目录是否被本次调用实际删除
         disk_purged: bool,
+    },
+    /// `server link` 结果
+    Linked {
+        /// 注册后的服务器记录
+        server: WireServer,
+        /// 对端上的真实目标路径（canonicalize 后）
+        target: String,
+        /// 是否建立了符号链接（`false` = 工作区内就地注册）
+        linked: bool,
+    },
+    /// 对端可用变体列表（顺序与对端注册顺序一致）
+    Variants {
+        /// 变体标识
+        items: Vec<String>,
+    },
+    /// 对端版本列表
+    Versions {
+        /// 版本
+        items: Vec<WireVersion>,
     },
     /// `server.properties` 原文
     Props {
@@ -956,6 +1000,15 @@ mod tests {
                 name: "web".to_owned(),
                 purge: false,
             },
+            Request::ServerLink {
+                target: "/srv/mc/external".to_owned(),
+                name: Some("ext".to_owned()),
+                workspace: Some("w1".to_owned()),
+            },
+            Request::ServerVariants,
+            Request::ServerVersions {
+                variant: "paper".to_owned(),
+            },
             Request::ServerCreateModpack {
                 workspace: Some("w1".to_owned()),
                 name: "modded".to_owned(),
@@ -1095,6 +1148,22 @@ mod tests {
                 lines: vec!["[12:00:00] done".to_owned()],
             },
             Response::Removed { disk_purged: true },
+            Response::Linked {
+                server: server_wire(),
+                target: "/srv/mc/external".to_owned(),
+                linked: true,
+            },
+            Response::Variants {
+                items: vec!["vanilla".to_owned(), "paper".to_owned()],
+            },
+            Response::Versions {
+                items: vec![WireVersion {
+                    id: "1.21.1".to_owned(),
+                    kind: "release".to_owned(),
+                    variant: "paper".to_owned(),
+                    java_major: Some(21),
+                }],
+            },
             Response::Props {
                 path: "/srv/mc/web/server.properties".to_owned(),
                 text: "motd=hello\npvp=true\n".to_owned(),
@@ -1180,6 +1249,32 @@ mod tests {
         }
     }
 
+    /// `WireVersion` 与领域版本往返一致（含种类与 Java 大版本）
+    #[test]
+    fn wire_version_roundtrips_to_domain() {
+        use domain::java::JavaMajor;
+        use domain::server::version::{ServerVersion, VersionId, VersionKind};
+
+        let original = ServerVersion {
+            id: VersionId::new("1.21.1"),
+            kind: VersionKind::Release,
+            variant: domain::server::version::ServerVariant::Paper,
+            java_major: Some(JavaMajor::parse(21).expect("major")),
+        };
+        let wire = WireVersion::from(&original);
+        let back = ServerVersion::try_from(wire).expect("decode");
+        assert_eq!(back, original);
+
+        // 未知种类按损坏处理，而不是静默当成 release
+        let bad = WireVersion {
+            id: "x".to_owned(),
+            kind: "weird".to_owned(),
+            variant: "vanilla".to_owned(),
+            java_major: None,
+        };
+        assert!(ServerVersion::try_from(bad).is_err());
+    }
+
     #[test]
     fn version_mismatch_is_rejected() {
         let mut cursor = Cursor::new(b"{\"v\":99,\"op\":\"ping\"}\n".to_vec());
@@ -1243,6 +1338,18 @@ mod tests {
             .required_permission(),
             Some(Permission::Read)
         );
+        // 变体 / 版本列表是元数据读取：viewer 也应能看不该能写
+        assert_eq!(
+            Request::ServerVariants.required_permission(),
+            Some(Permission::Read)
+        );
+        assert_eq!(
+            Request::ServerVersions {
+                variant: "paper".to_owned()
+            }
+            .required_permission(),
+            Some(Permission::Read)
+        );
         for request in [
             Request::PropsSet {
                 server_id: "id".to_owned(),
@@ -1266,6 +1373,11 @@ mod tests {
                 name: "web".to_owned(),
                 project: "pack".to_owned(),
                 version: None,
+            },
+            Request::ServerLink {
+                target: "/srv/mc/external".to_owned(),
+                name: None,
+                workspace: None,
             },
         ] {
             assert_eq!(

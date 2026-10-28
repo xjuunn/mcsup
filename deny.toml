@@ -16,6 +16,15 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
+# keyring 的 Linux Secret Service 后端（zbus → zvariant / zbus_names）被标记为
+# unmaintained：上游已把它们并入 zbus 6，但 keyring 4 的 v1 兼容层尚未跟进，
+# 且没有可安全升级的版本。这些 crate 只在 Linux 上编译（macOS / Windows 走
+# Keychain / Credential Manager，不构建它们）；等 keyring 跟进 zbus 6 后移除。
+ignore = [
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0371",
+    "RUSTSEC-2026-0372",
+]
 
 [licenses]
 version = 2

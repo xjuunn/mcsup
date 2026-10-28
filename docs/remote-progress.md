@@ -18,6 +18,7 @@
 | 9 | 远端备份（元数据帧路由）+ 远端日志尾部 | 完成（流式进度未做） |
 | 10 | CLI `remote` 命令与 `--origin`（含 SSH 接入） | 完成（局域网发现待实现） |
 | 11 | 远端能力对等：props / set / console / version / install / modpack / java install·uninstall | 完成 |
+| 12 | `server link` 远端化、`server create --origin` 交互向导、系统钥匙串 | 完成（跨机器真机仍待手工） |
 
 ## 已完成
 
@@ -76,6 +77,57 @@ Java 用 `JavaService::install/uninstall`。失败按领域错误分类映射
 测试：协议新帧往返与权限；backend 真 TLS 垫片覆盖 `create_modpack` /
 `install` / props 往返 / `set_setting` / java install+uninstall；CLI 侧
 `pick_hit` 4 用例（本地优先、唯一远端、跨远端歧义、限定不回落）。
+
+### 阶段 12：本地命令远端化补全与系统钥匙串
+
+#### `server link --origin`
+
+- 协议：`Request::ServerLink` / `Response::Linked`（`server` / `target` /
+  `linked`）。`target` 是**对端机器**上的路径，客户端拼不出也不该拼。
+- agent：转发给与本地 CLI 同一份 `ServerRegistry::link`，符号链接 / marker /
+  入库全在对端；`registry_failure` 负责 `not_found` / `already_exists` /
+  `invalid` 分类。
+- 客户端：`RemoteServerRepository::link_directory`（不与既有的
+  `link() -> RemoteLink` 重名）。
+- CLI：`server link <path> --origin <name>`，`<path>` 是对端路径；本地路径
+  行为不变。
+
+#### `server create --origin` 交互向导
+
+- 协议新增两个只读帧：`ServerVariants`（对端可用变体）与
+  `ServerVersions { variant }`（对端某变体的版本列表，含 `WireVersion`）。
+  权限归 `Read`：变体 / 版本是元数据，viewer 可看不可写。
+- agent：变体来自 `core.jar_sources`（去重保序）；版本走同一份
+  `ServerJarSource::versions`，排序复用领域层
+  `ServerVersion::sort_display_order`，与本地向导顺序一致。
+- CLI：`create_remote` 在 TTY 下缺 `--variant` / `--version` 时从对端列表
+  交互补齐（名称缺失也可交互输入）；非交互仍要求显式参数。选择逻辑抽取为
+  `install::select_version`，本地与远端共用。
+- 整合包变体仍要求显式 `--modpack`：清单要在对端读，远端侧不提供交互式
+  整合包搜索。
+
+#### 系统钥匙串
+
+- `auth::credential` 新增 `KeyringCredentialStore<B: KeyringBackend>`：每个
+  远端名一条 entry（secret 是 `StoredCredential` 的 JSON）；钥匙串不能枚举，
+  `names()` 由独立索引 entry（`{service}:index`）维护。
+- `KeyringBackend` 抽象出读写删，`SystemKeyring` 用 `keyring` crate（v1 兼容
+  层）覆盖 macOS / Windows / Linux；`MemoryKeyring`（测试）驱动核心逻辑。
+- `CredentialVault` 选择后端：`MCSUP_CREDENTIAL_STORE=auto|keyring|file`，
+  `auto` 在 macOS / Windows 用钥匙串，其余 Unix 仅在存在会话总线 / 运行时
+  目录时使用，否则落到 `0600` 文件。`describe()` 写进配对记录的
+  `credential` 字段（`keyring` 或 `file:<路径>`）。
+- CLI 的 `credential_store()` 一律返回 `CredentialVault`；集成测试用
+  `MCSUP_CREDENTIAL_STORE=file` 保持无桌面依赖。
+
+#### 测试
+
+- 协议：3 个新请求 / 3 个新响应的往返、权限映射、`WireVersion` 领域往返。
+- backend 真 TLS 垫片：`link_directory`、`variants`、`versions`。
+- agent 集成：真实 agent 上跑 link / variants / versions（`agent_roundtrip`）。
+- CLI 集成：`connect → workspace init --origin → server link --origin →
+  server ls --origin`（真 agent + 真 CLI）。
+- auth：钥匙串存储的往返 / 索引 / 幂等删除，后端选择解析与 vault 委派。
 
 ### 阶段 9：远端备份与远端日志尾部
 
@@ -240,7 +292,8 @@ roundtrip 全量权限覆盖补 `BackupList` 样例（`Permission::Backup` 豁�
 - `token.rs`：`ClientId`、`Permission`、`Role`（Admin / Operator / Viewer）、
   `RevocationList`、带 TTL 的 token。
 - `credential.rs`：`CredentialStore` trait + `FileCredentialStore`（权限
-  `0600`）。钥匙串后续以同一 trait 的另一实现补上，本次不引入 `keyring`。
+  `0600`）。钥匙串已在阶段 12 以同一 trait 的另一实现（`KeyringCredentialStore`
+  / `CredentialVault`）补上。
 
 ### 阶段 4：`protocol` 远端帧
 
@@ -471,5 +524,7 @@ disconnect`、`server create/list/status/remove --origin`、`java scan --origin`
 - `apps/cli/tests/cli_e2e.rs` 隔离 `HOME`，靠宿主 `PATH` 找 java，跑测试前需把
   该 `bin` 目录加进 `PATH`。
 - 远端链路的自动化验证：`apps/cli/tests/cli_remote.rs` 在本机起真 agent +
-  真 CLI，覆盖配对、来源过滤、远端建站 / 删站、远端 Java 扫描与断开。跨机器
-  真机验证（两台物理机 + 局域网地址 + 远端备份）仍待手工执行。
+  真 CLI，覆盖配对、来源过滤、远端建站 / 删站、`server link --origin`、远端
+  Java 扫描与断开；`agent_roundtrip` 覆盖 link / variants / versions 三个新帧。
+  跨机器真机验证（两台物理机 + 局域网地址 + 远端备份）仍待手工执行——本机
+  自动化只能验证协议与业务链路，不能替代真实的网络 / 防火墙 / 多网卡验证。

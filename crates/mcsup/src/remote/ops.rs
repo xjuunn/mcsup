@@ -10,10 +10,10 @@
 use super::Agent;
 use domain::java::{JavaMajor, JavaPackageType, JavaVendor};
 use domain::server::settings::SettingKey;
-use domain::server::version::{ServerVariant, VersionId};
+use domain::server::version::{ServerVariant, ServerVersion, VersionId};
 use file::FileCoreInspector;
 use protocol::remote::wire::{
-    WirePropUpdate, WireServer, WireSettings, WireSnapshot, WireStatusEntry,
+    WirePropUpdate, WireServer, WireSettings, WireSnapshot, WireStatusEntry, WireVersion,
 };
 use protocol::remote::{ErrorKind, Request, Response};
 use service::{
@@ -43,6 +43,9 @@ impl Agent {
             | Request::ServerCreateModpack { .. }
             | Request::ServerRemove { .. }
             | Request::ServerInstall { .. }
+            | Request::ServerLink { .. }
+            | Request::ServerVariants
+            | Request::ServerVersions { .. }
             | Request::PropsGet { .. }
             | Request::PropsSet { .. }
             | Request::SettingsSet { .. } => self.server_op(request),
@@ -222,6 +225,29 @@ impl Agent {
                 }
             }
             Request::ServerInstall { name, version } => self.server_install(name, version),
+            Request::ServerLink {
+                target,
+                name,
+                workspace,
+            } => match self.core.registry.link(
+                std::path::Path::new(target),
+                name.as_deref(),
+                workspace.as_deref(),
+            ) {
+                Ok(outcome) => match WireServer::try_from(&outcome.server.meta) {
+                    Ok(server) => Response::Linked {
+                        server,
+                        target: outcome.target.to_string_lossy().into_owned(),
+                        linked: outcome.server.linked,
+                    },
+                    Err(err) => failure(ErrorKind::IO, err),
+                },
+                Err(err) => registry_failure(&err),
+            },
+            Request::ServerVariants => Response::Variants {
+                items: available_variants(&self.core.jar_sources),
+            },
+            Request::ServerVersions { variant } => self.server_versions(variant),
             Request::ServerCreateModpack {
                 workspace,
                 name,
@@ -475,6 +501,38 @@ impl Agent {
         match runtime.block_on(self.install_core_async(name, version, &variant)) {
             Ok(item) => Response::Servers { items: vec![item] },
             Err(response) => *response,
+        }
+    }
+
+    /// 对端某个变体的版本列表（`server create --origin` 交互向导用）
+    ///
+    /// 与本地 `pick_version` 走同一份 `ServerJarSource::versions`，排序也复用
+    /// 领域层的 [`ServerVersion::sort_display_order`]：两端顺序一致，用户在
+    /// 远端向导里看到的同样是「新在前」。
+    fn server_versions(&self, variant: &str) -> Response {
+        let variant = match ServerVariant::from_id(variant.to_owned()) {
+            Ok(variant) => variant,
+            Err(err) => return failure(ErrorKind::INVALID, err),
+        };
+        let Some(source) = pick_source(&self.core.jar_sources, &variant) else {
+            return RemoteFailure::new(
+                ErrorKind::INVALID,
+                format!("no server jar source for variant {}", variant.as_str()),
+            )
+            .into_response();
+        };
+        let runtime = match current_thread_runtime() {
+            Ok(runtime) => runtime,
+            Err(err) => return failure(ErrorKind::IO, err),
+        };
+        match runtime.block_on(source.versions()) {
+            Ok(mut versions) => {
+                ServerVersion::sort_display_order(&mut versions);
+                Response::Versions {
+                    items: versions.iter().map(WireVersion::from).collect(),
+                }
+            }
+            Err(err) => failure(ErrorKind::IO, err),
         }
     }
 
@@ -1066,6 +1124,24 @@ fn backup_failure(err: &service::BackupError) -> Response {
         Some(_) | None => ErrorKind::IO,
     };
     failure(kind, err)
+}
+
+/// 可用变体标识：来源 `variant()` 去重，保持注册顺序
+///
+/// 与本地 `bootstrap::available_variants` 的口径一致（去重、保序），但**不含**
+/// 整合包变体：整合包没有 `ServerJarSource`，其版本必须走清单，远端向导把它
+/// 留给显式的 `--modpack`，不在「变体 → 版本」两步里混入。
+fn available_variants(sources: &[std::sync::Arc<dyn port::ServerJarSource>]) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut out: Vec<String> = Vec::new();
+    for source in sources {
+        let id = source.variant().as_str().to_owned();
+        if !seen.contains(&id) {
+            seen.push(id.clone());
+            out.push(id);
+        }
+    }
+    out
 }
 
 /// 变体 → 来源；`Unknown` 兜底到 vanilla（与本地 CLI 同一规则）
