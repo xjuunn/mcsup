@@ -7,7 +7,7 @@
 //!
 //! - `GET /search`：搜索（[`SearchResults`] / [`SearchHit`]）
 //! - `GET /project/{id|slug}`：项目详情（[`Project`]）
-//! - `POST /projects`：批量项目详情（同一 [`Project`] 列表）
+//! - `GET /projects?ids=`：批量项目详情（同一 [`Project`] 列表）
 //! - `GET /project/{id|slug}/version`：版本列表（[`Version`]）
 //! - `GET /version/{id}`：单版本（[`Version`]）
 //! - `GET /versions?ids=`：批量版本（[`Version`] 列表）

@@ -11,7 +11,7 @@
 //! ```text
 //! GET  /search
 //! GET  /project/{id|slug}
-//! POST /projects                       # 批量项目
+//! GET  /projects?ids=[...]             # 批量项目
 //! GET  /project/{id|slug}/version
 //! GET  /version/{id}
 //! GET  /versions?ids=[...]
@@ -429,22 +429,18 @@ impl ModrinthSource {
         self.get(&url).await
     }
 
-    /// 批量读取项目详情（`POST /projects`）
+    /// 批量读取项目详情（`GET /projects?ids=[...]`）
     ///
-    /// 上游按请求的 id 顺序不易保证，也不拒绝部分缺失；返回的列表可能短于
-    /// 请求列表，调用方应按 `id` 自行索引。
+    /// `ids` 必须是 JSON 数组字符串（上游要求），不是逗号分隔。上游按请求的
+    /// id 顺序不易保证，也不拒绝部分缺失；返回的列表可能短于请求列表，调用方
+    /// 应按 `id` 自行索引。
     ///
     /// # Errors
     ///
     /// 上游不可达、状态码异常或响应无法解析时返回 [`port::SourceError`]
     pub async fn projects(&self, ids: &[String]) -> Result<Vec<Project>, port::SourceError> {
-        let body = serde_json::to_string(ids).map_err(|e| {
-            port::SourceError::Decode(Box::new(std::io::Error::other(format!(
-                "encode project ids: {e}"
-            ))))
-        })?;
-        let url = self.endpoint("/projects");
-        post_json(&self.http, &url, &body).await
+        let url = self.endpoint(&format!("/projects?ids={}", urlencode(&json_array(ids))));
+        self.get(&url).await
     }
 
     /// 列出某项目的版本

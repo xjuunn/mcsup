@@ -171,7 +171,7 @@ where
 
 /// POST 一段 JSON body 并反序列化 JSON 响应
 ///
-/// 供 Modrinth 的批量端点使用（`POST /projects`）。错误归类与 [`get_json`]
+/// 供 Modrinth 的批量端点使用（`POST /version_files`）。错误归类与 [`get_json`]
 /// 一致。`body` 是调用方已序列化好的 JSON 文本，而不是任意 `Serialize`
 /// 值：`reqwest` 的 `.json()` 要求启用它的 `serde` feature，而本 crate 的
 /// `reqwest` 只开了 `json`（响应侧），手工 `serde_json::to_string` 再以

@@ -210,17 +210,24 @@ fn ssh_connect_then_every_command_rebuilds_the_tunnel() {
     assert_eq!(payload["fingerprint"], agent.fingerprint.as_str());
 
     // 2. 记录落盘为 ssh 接入，且不含 token 本体
-    let config = std::fs::read_to_string(home_path.join("share").join("mcsup").join("config.toml"))
-        .or_else(|_| {
-            std::fs::read_to_string(
-                home_path
-                    .join("AppData")
-                    .join("Roaming")
-                    .join("mcsup")
-                    .join("config.toml"),
-            )
-        })
-        .expect("config.toml");
+    // `dirs::data_dir()` 按平台落到不同位置：Linux 走 XDG_DATA_HOME，
+    // Windows 走 AppData\Roaming，macOS 走 Library/Application Support。
+    let config = [
+        home_path.join("share").join("mcsup").join("config.toml"),
+        home_path
+            .join("AppData")
+            .join("Roaming")
+            .join("mcsup")
+            .join("config.toml"),
+        home_path
+            .join("Library")
+            .join("Application Support")
+            .join("mcsup")
+            .join("config.toml"),
+    ]
+    .into_iter()
+    .find_map(|path| std::fs::read_to_string(path).ok())
+    .expect("config.toml");
     assert!(config.contains("via = \"ssh\""), "{config}");
     assert!(config.contains("target = \"me@ssh-box\""), "{config}");
     assert!(!config.contains(&agent.code), "{config}");

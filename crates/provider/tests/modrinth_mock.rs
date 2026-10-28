@@ -296,14 +296,14 @@ async fn project_uses_path_segment() {
     );
 }
 
-/// 批量项目：POST + JSON 数组请求体
+/// 批量项目：GET + `ids` 查询参数（JSON 数组字符串）
 #[tokio::test]
-async fn projects_posts_json_array() {
+async fn projects_gets_ids_query() {
     if !enabled() {
         return;
     }
     let body = format!("[{PROJECT}]");
-    let mock = Mock::start(vec![("POST", "/v2/projects", 200, body)]).await;
+    let mock = Mock::start(vec![("GET", "/v2/projects", 200, body)]).await;
     let source = source_for(&mock);
     let projects = source
         .projects(&["AABBCCDD".to_owned()])
@@ -311,8 +311,13 @@ async fn projects_posts_json_array() {
         .expect("projects");
     assert_eq!(projects.len(), 1);
     let request = &mock.requests()[0];
-    assert_eq!(request.method, "POST");
-    assert_eq!(request.body, r#"["AABBCCDD"]"#);
+    assert_eq!(request.method, "GET");
+    assert!(
+        request.body.is_empty(),
+        "GET 不应带请求体: {}",
+        request.body
+    );
+    assert_eq!(request.target, "/v2/projects?ids=%5B%22AABBCCDD%22%5D");
 }
 
 /// 版本列表：`loaders` / `game_versions` 是 JSON 数组字符串，`featured` 与 changelog 开关都下发
@@ -462,6 +467,15 @@ fn project_body(id: &str, server_side: &str) -> String {
     )
 }
 
+/// 从 `GET ...?ids=<json array>` 的请求 target 里解出 id 集合
+fn ids_from_target(target: &str) -> HashSet<String> {
+    let query = target.split_once('?').map_or("", |(_, query)| query);
+    let (_, ids) = url::form_urlencoded::parse(query.as_bytes())
+        .find(|(key, _)| key == "ids")
+        .expect("批量项目应带 ids 查询参数");
+    serde_json::from_str(&ids).expect("ids 应为 JSON 数组字符串")
+}
+
 /// 仅客户端判定：批量反查 → 项目详情，只标记 `server_side=unsupported`。
 ///
 /// 用回环 mock 而不是真实上游，因此默认执行（不打外部网络）。
@@ -481,7 +495,7 @@ async fn client_only_hashes_marks_unsupported_projects() {
     );
     let mock = Mock::start(vec![
         ("POST", "/v2/version_files", 200, versions),
-        ("POST", "/v2/projects", 200, projects),
+        ("GET", "/v2/projects", 200, projects),
     ])
     .await;
     let source = ModrinthModpackSource::from_source(source_for(&mock));
@@ -512,13 +526,12 @@ async fn client_only_hashes_marks_unsupported_projects() {
         "请求体应带上全部哈希：{}",
         requests[0].body
     );
-    let ids: HashSet<String> =
-        serde_json::from_str(&requests[1].body).expect("项目详情 body 应为 ID 数组");
+    let ids = ids_from_target(&requests[1].target);
     assert_eq!(
         ids,
         HashSet::from(["P-CLIENT".to_owned(), "P-SERVER".to_owned()]),
         "同一个项目的多个文件只查一次：{}",
-        requests[1].body
+        requests[1].target
     );
 }
 
@@ -598,7 +611,7 @@ async fn client_only_hashes_propagates_project_error() {
     let versions = format!(r#"{{"clienthash":{}}}"#, version_body("V1", "P-CLIENT"));
     let mock = Mock::start(vec![
         ("POST", "/v2/version_files", 200, versions),
-        ("POST", "/v2/projects", 404, "{}".to_owned()),
+        ("GET", "/v2/projects", 404, "{}".to_owned()),
     ])
     .await;
     let source = ModrinthModpackSource::from_source(source_for(&mock));

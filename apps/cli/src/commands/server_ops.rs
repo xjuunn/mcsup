@@ -588,7 +588,7 @@ fn create_remote_modpack(
         )
         .into());
     }
-    let spinner = crate::progress::TaskSpinner::new(
+    let spinner = TaskSpinner::new(
         crate::i18n::pick(
             lang,
             format!("正在 {} 按整合包 {project} 创建 {name}…", member.name),
