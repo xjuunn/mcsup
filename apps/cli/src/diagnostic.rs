@@ -49,6 +49,16 @@ impl AppDiagnostic {
         }
     }
 
+    /// 状态冲突（退出码 4）：要做的动作与当前状态矛盾（如已在运行）
+    #[must_use]
+    pub(crate) fn conflict(message: impl Into<String>, help: Option<String>) -> Self {
+        Self {
+            exit_code: 4,
+            message: message.into(),
+            help,
+        }
+    }
+
     /// 目标不存在（退出码 3）
     #[must_use]
     pub(crate) fn not_found(message: impl Into<String>, help: Option<String>) -> Self {

@@ -533,21 +533,27 @@ pub(crate) enum RemoteAction {
     #[command(about = crate::meta::remote_serve())]
     #[command(visible_alias = "sv")]
     Serve {
+        #[command(subcommand)]
+        action: ServeAction,
+    },
+    #[command(about = crate::meta::remote_code())]
+    #[command(visible_alias = "cd")]
+    Code {
+        /// 有效期秒数
         #[arg(
             long,
-            value_name = "ADDR",
-            default_value = "127.0.0.1:7681",
-            help = crate::meta::remote_listen_arg()
+            value_name = "SECS",
+            default_value_t = mcsup::auth::DEFAULT_ON_DEMAND_TTL_SECS,
+            value_parser = clap::value_parser!(u64)
+                .range(mcsup::auth::MIN_TTL_SECS..=mcsup::auth::MAX_TTL_SECS),
+            help = crate::meta::remote_code_ttl_arg()
         )]
-        listen: String,
-        #[arg(long, value_name = "NAME", help = crate::meta::remote_name_arg())]
-        name: Option<String>,
-        /// 按 pid 文件停止本机前台 agent（不经过网络）
-        #[arg(long, conflicts_with_all = ["name", "status"])]
-        stop: bool,
-        /// 查看本机服务状态（身份、指纹、已配对客户端）
-        #[arg(long, conflicts_with = "name")]
-        status: bool,
+        ttl: u64,
+        /// 作废当前配对码（不再生成新的）
+        #[arg(long, conflicts_with = "ttl", help = crate::meta::remote_code_clear_arg())]
+        clear: bool,
+        #[arg(long, value_name = "PATH", help = crate::meta::remote_data_dir_arg())]
+        data_dir: Option<PathBuf>,
     },
     #[command(about = crate::meta::remote_connect())]
     #[command(visible_alias = "con")]
@@ -592,6 +598,48 @@ pub(crate) enum RemoteAction {
         /// 本机名
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
+    },
+}
+
+// `remote serve` 的生命周期动作。
+//
+// 拆成子命令而不是 `--stop` / `--status` 开关：动作总在名字前
+// （`docs/cli-commands.md`），三个动作互斥由语法表达，不靠 `conflicts_with` 补。
+// 这里刻意用行注释：`///` 会被 clap 当成 about 打进帮助。
+#[derive(Debug, Subcommand)]
+pub(crate) enum ServeAction {
+    #[command(about = crate::meta::remote_serve_start())]
+    #[command(visible_alias = "up")]
+    Start {
+        #[arg(
+            long,
+            value_name = "ADDR",
+            default_value = "127.0.0.1:7681",
+            help = crate::meta::remote_listen_arg()
+        )]
+        listen: String,
+        #[arg(long, value_name = "NAME", help = crate::meta::remote_local_name_arg())]
+        name: Option<String>,
+        /// 前台运行并打印日志（调试用）
+        #[arg(long, help = crate::meta::remote_foreground_arg())]
+        foreground: bool,
+        #[arg(long, value_name = "PATH", help = crate::meta::remote_data_dir_arg())]
+        data_dir: Option<PathBuf>,
+    },
+    #[command(about = crate::meta::remote_serve_stop())]
+    #[command(visible_alias = "down")]
+    Stop {
+        /// 直接杀掉，不等待在跑的任务收尾
+        #[arg(long)]
+        force: bool,
+        #[arg(long, value_name = "PATH", help = crate::meta::remote_data_dir_arg())]
+        data_dir: Option<PathBuf>,
+    },
+    #[command(about = crate::meta::remote_serve_status())]
+    #[command(visible_alias = "st")]
+    Status {
+        #[arg(long, value_name = "PATH", help = crate::meta::remote_data_dir_arg())]
+        data_dir: Option<PathBuf>,
     },
 }
 
@@ -800,9 +848,22 @@ mod tests {
     #[test]
     fn remote_subcommands_parse() {
         for args in [
-            vec!["mcsup", "remote", "serve", "--listen", "127.0.0.1:0"],
-            vec!["mcsup", "remote", "serve", "--stop"],
-            vec!["mcsup", "remote", "serve", "--status"],
+            vec!["mcsup", "remote", "serve", "start"],
+            vec![
+                "mcsup",
+                "remote",
+                "serve",
+                "start",
+                "--listen",
+                "127.0.0.1:0",
+            ],
+            vec!["mcsup", "remote", "serve", "start", "--foreground"],
+            vec!["mcsup", "remote", "serve", "stop"],
+            vec!["mcsup", "remote", "serve", "stop", "--force"],
+            vec!["mcsup", "remote", "serve", "status"],
+            vec!["mcsup", "remote", "code"],
+            vec!["mcsup", "remote", "code", "--ttl", "600"],
+            vec!["mcsup", "remote", "code", "--clear"],
             vec![
                 "mcsup",
                 "remote",
@@ -822,10 +883,42 @@ mod tests {
         }
     }
 
-    /// `serve --stop` 与 `--status` 互斥，避免一次做两件事
+    /// `serve` 必须带生命周期动作：动作总在名字前，不再用开关选动作
     #[test]
-    fn serve_stop_and_status_conflict() {
-        let err = Cli::try_parse_from(["mcsup", "remote", "serve", "--stop", "--status"])
+    fn serve_requires_an_action() {
+        let err = Cli::try_parse_from(["mcsup", "remote", "serve"]).expect_err("missing action");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
+        // 旧的开关形态必须被拒绝，否则用户会以为它还有效
+        for stale in [
+            vec!["mcsup", "remote", "serve", "--stop"],
+            vec!["mcsup", "remote", "serve", "--status"],
+        ] {
+            assert!(
+                Cli::try_parse_from(&stale).is_err(),
+                "{stale:?} 应被拒绝（改用子命令）"
+            );
+        }
+    }
+
+    /// `--ttl` 有界：超界的值在解析期就拒绝，不靠运行期报错
+    #[test]
+    fn code_ttl_is_bounded_at_parse_time() {
+        assert!(Cli::try_parse_from(["mcsup", "remote", "code", "--ttl", "300"]).is_ok());
+        for bad in ["29", "3601"] {
+            assert!(
+                Cli::try_parse_from(["mcsup", "remote", "code", "--ttl", bad]).is_err(),
+                "--ttl {bad} 应被拒绝"
+            );
+        }
+    }
+
+    /// `--clear` 与 `--ttl` 互斥：一个是作废，一个是发新码
+    #[test]
+    fn code_clear_conflicts_with_ttl() {
+        let err = Cli::try_parse_from(["mcsup", "remote", "code", "--clear", "--ttl", "600"])
             .expect_err("conflict");
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }

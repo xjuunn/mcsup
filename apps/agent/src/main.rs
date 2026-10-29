@@ -35,46 +35,58 @@ fn main() -> ExitCode {
 }
 
 /// 解析参数并阻塞服务
+///
+/// 常驻进程用**按需**发码策略：启动时不持有任何配对码，端口开着也没有码可猜。
+/// 需要配对时在本机跑 `mcsup remote code` 生成一枚（`docs/remote.md`「安全」）。
 fn run() -> anyhow::Result<()> {
     let args = Args::parse(std::env::args().skip(1))?;
-    let agent = std::sync::Arc::new(mcsup::remote::Agent::open(&args.data_dir, &args.name)?);
-
-    // 先发码再绑定：绑定失败时用户也能看到「码已生成但没起来」之前的真正原因，
-    // 而不是先看到一个没有码的启动失败
-    let code = agent.issue_pairing_code()?;
+    let agent = std::sync::Arc::new(mcsup::remote::Agent::open_with(
+        &args.data_dir,
+        &args.name,
+        mcsup::remote::PairingPolicy::OnDemand,
+    )?);
     let server = agent.bind(&args.listen)?;
     let addr = server.local_addr()?;
 
-    announce(&agent, &args, addr);
-    report_pairing_code(&code);
-
-    // 轮换线程只在码自然过期时换新：用掉或锁死都保持关闭（限速不能失效）
-    let watch = mcsup::remote::Agent::watch_pairing_code(&agent, report_pairing_code);
+    announce(&agent, &args, addr, &code_hint(&args));
     let result = server.run();
-    drop(watch);
     result?;
     Ok(())
 }
 
 /// 启动信息：用户第一次看到它就要能照抄出 `remote connect`
 #[allow(clippy::print_stdout)]
-fn announce(agent: &mcsup::remote::Agent, args: &Args, addr: std::net::SocketAddr) {
+fn announce(
+    agent: &mcsup::remote::Agent,
+    args: &Args,
+    addr: std::net::SocketAddr,
+    code_hint: &str,
+) {
     println!("mcsup 已开始监听");
     println!("  名称    {}", args.name);
     println!("  地址    {addr}");
     println!("  指纹    {}", agent.fingerprint());
     println!("  数据    {}", args.data_dir.display());
+    println!();
+    println!("  配对码  未生成（按需发放，启动时不持有）");
+    println!("          需要配对时在本机运行：{code_hint}");
     if addr.ip().is_loopback() {
         println!("  提示    只监听本机；其他机器连进来需 --listen 0.0.0.0:7681 并放行防火墙");
     }
 }
 
-/// 配对码：带分组显示，并说明有效期
+/// 配对码提示：**不打印码**，只说明怎么取
+///
+/// 按需策略下码不在这个进程里：它由 `remote code` 写到同一个数据目录的
+/// `remote/grant.toml`（只存摘要），agent 兑换时读那份文件。
 #[allow(clippy::print_stdout)]
-fn report_pairing_code(code: &mcsup::auth::PairingCode) {
-    println!();
-    println!("  配对码  {}", code.display_form());
-    println!("          10 分钟内有效，成功配对后自动更换");
+fn code_hint(args: &Args) -> String {
+    // 只在数据目录不是默认值时提示，避免让用户以为必须带参数
+    if args.data_dir == mcsup::service::Config::default_data_dir() {
+        "mcsup remote code".to_owned()
+    } else {
+        format!("mcsup remote code --data-dir {}", args.data_dir.display())
+    }
 }
 
 /// 错误与提示写 stderr

@@ -7,7 +7,7 @@
 //! 才 `enroll` 换 token。把「确认」放在两步之间，是因为 TOFU 的信任锚就是
 //! 用户看到的那个指纹——先配对再展示等于让用户事后追认。
 
-use crate::cli::RemoteAction;
+use crate::cli::{RemoteAction, ServeAction};
 use crate::config::ConfigFile;
 use crate::diagnostic::AppDiagnostic;
 use crate::locale::Lang;
@@ -19,7 +19,7 @@ use mcsup::auth::{ClientId, ClientRegistry, CredentialStore, CredentialVault, St
 use mcsup::port::{Origin, RemoteName};
 use mcsup::protocol::cli::{
     RemoteConnectJson, RemoteDisconnectJson, RemoteListJson, RemotePingJson, RemoteRevokeJson,
-    RemoteRow, RemoteServeJson,
+    RemoteRow,
 };
 use mcsup::protocol::remote::{Capability, Request, Response};
 use mcsup::service::{RemoteRecord, RemoteVia};
@@ -45,12 +45,15 @@ pub(crate) fn run(action: RemoteAction, printer: Printer) -> Result<()> {
                 crate::i18n::pick(printer.lang(), "SSH 引导 agent", "serving over ssh")
             })
         }
-        RemoteAction::Serve {
-            listen,
-            name,
-            stop,
-            status,
-        } => serve(&listen, name.as_deref(), stop, status, printer),
+        RemoteAction::Serve { action } => serve(action, printer),
+        RemoteAction::Code {
+            ttl,
+            clear,
+            data_dir,
+        } => {
+            let dir = data_dir.unwrap_or_else(crate::config::platform_data_dir);
+            code(&dir, ttl, clear, printer)
+        }
         RemoteAction::Connect {
             target,
             name,
@@ -73,111 +76,203 @@ pub(crate) fn run(action: RemoteAction, printer: Printer) -> Result<()> {
     }
 }
 
-/// `remote serve`：前台运行 agent，或 `--stop` / `--status`
-fn serve(
+/// `remote serve start|stop|status`：后台常驻 agent 的生命周期
+///
+/// 三个动作都是本机操作（不经网络）。后台形态用**按需**发码策略：启动不持有
+/// 任何配对码，需要配对时另跑 `remote code`（见 [`code`]）。
+fn serve(action: ServeAction, printer: Printer) -> Result<()> {
+    match action {
+        ServeAction::Start {
+            listen,
+            name,
+            foreground,
+            data_dir,
+        } => {
+            let dir = data_dir.unwrap_or_else(crate::config::platform_data_dir);
+            if foreground {
+                return serve_foreground(&dir, &listen, name.as_deref(), printer);
+            }
+            serve_start(&dir, &listen, name.as_deref(), printer)
+        }
+        ServeAction::Stop { force, data_dir } => {
+            let dir = data_dir.unwrap_or_else(crate::config::platform_data_dir);
+            serve_stop(&dir, force, printer)
+        }
+        ServeAction::Status { data_dir } => {
+            let dir = data_dir.unwrap_or_else(crate::config::platform_data_dir);
+            serve_status(&dir, printer)
+        }
+    }
+}
+
+/// `remote serve start`：拉起后台 agent 等它就绪
+///
+/// 单实例靠锁判定，不是「pid 文件存在」：先看锁，没被持有才拉起。子进程自己
+/// 也会再取一次锁（`--foreground` 路径），所以即使两个 `start` 同时跑，也只有
+/// 一个能真正监听。
+fn serve_start(data_dir: &Path, listen: &str, name: Option<&str>, printer: Printer) -> Result<()> {
+    let lang = printer.lang();
+    if crate::daemon::InstanceLock::is_held(data_dir).unwrap_or(false) {
+        return Err(AppDiagnostic::conflict(
+            crate::i18n::pick(
+                lang,
+                "本机 agent 已在运行；先 remote serve stop 再启动，或用 remote serve status 查看",
+                "the agent is already running; run `remote serve stop` first, or `remote serve status`",
+            ),
+            None,
+        )
+        .into());
+    }
+
+    let exe = std::env::current_exe().context(crate::i18n::pick(
+        lang,
+        "定位 mcsup 可执行文件",
+        "locating the mcsup executable",
+    ))?;
+    // 就绪 = 子进程已拿到锁（说明装配完成、正在 bind 或已 bind）。
+    // 不以「端口可连」判定：TLS 监听接进来也无法握手，反而更难判。
+    let pid = crate::daemon::spawn_background(&exe, data_dir, listen, name, |dir| {
+        crate::daemon::InstanceLock::is_held(dir).unwrap_or(false)
+    })
+    .context(crate::i18n::pick(
+        lang,
+        "启动后台 agent",
+        "starting the agent",
+    ))?;
+
+    let addr = read_listen_addr(data_dir).unwrap_or_else(|| listen.to_owned());
+    let fingerprint = read_fingerprint(data_dir);
+    let payload = serde_json::json!({
+        "running": true,
+        "pid": pid,
+        "listen": addr,
+        "fingerprint": fingerprint,
+        "log": crate::daemon::log_path(data_dir).display().to_string(),
+        "pairing_code": null,
+    });
+    if printer.is_human() {
+        let mut lines = vec![
+            "mcsup 已在后台监听".to_owned(),
+            format!("  名称    {}", name.map_or_else(host_name, str::to_owned)),
+            format!("  地址    {addr}"),
+            format!("  进程    {pid}"),
+            format!("  日志    {}", crate::daemon::log_path(data_dir).display()),
+        ];
+        if let Some(fingerprint) = &fingerprint {
+            lines.insert(3, format!("  指纹    {fingerprint}"));
+        }
+        printer.print_section(&lines.join("\n"));
+        printer.print_section(&crate::i18n::pick(
+            lang,
+            "  配对码  未生成（按需发放）\n          需要配对时运行：mcsup remote code",
+            "  pairing code none yet (on demand)\n              run `mcsup remote code` when you need one",
+        ));
+        if let Ok(parsed) = addr.parse() {
+            warn_exposure(&parsed, printer);
+        }
+    } else {
+        printer.print_outcome("", &payload)?;
+    }
+    Ok(())
+}
+
+/// `remote serve start --foreground`：前台跑 agent（调试用）
+///
+/// 这是后台形态的**本体**：`serve start` 用同一个可执行文件拉起这个入口。
+/// 它自己取单实例锁，因此无论从哪条路径进来都只有一个在监听。
+fn serve_foreground(
+    data_dir: &Path,
     listen: &str,
     name: Option<&str>,
-    stop: bool,
-    status: bool,
     printer: Printer,
 ) -> Result<()> {
-    let data_dir = crate::config::platform_data_dir();
-    if status {
-        return serve_status(&data_dir, printer);
-    }
-    if stop {
-        return serve_stop(&data_dir, printer);
-    }
+    let lang = printer.lang();
+    let Some(_lock) = crate::daemon::InstanceLock::acquire(data_dir)? else {
+        return Err(AppDiagnostic::conflict(
+            crate::i18n::pick(
+                lang,
+                "本机 agent 已在运行（另一个进程持有实例锁）",
+                "the agent is already running (another process holds the instance lock)",
+            ),
+            None,
+        )
+        .into());
+    };
 
     let name = name.map_or_else(host_name, str::to_owned);
     let agent = Arc::new(
-        mcsup::remote::Agent::open(&data_dir, &name).with_context(|| {
-            crate::i18n::pick(printer.lang(), "启动 agent", "starting the agent")
-        })?,
+        mcsup::remote::Agent::open_with(data_dir, &name, mcsup::remote::PairingPolicy::OnDemand)
+            .with_context(|| crate::i18n::pick(lang, "启动 agent", "starting the agent"))?,
     );
-    let code = agent.issue_pairing_code().context(crate::i18n::pick(
-        printer.lang(),
-        "生成配对码",
-        "generating a pairing code",
-    ))?;
     let server = agent
         .bind(listen)
-        .with_context(|| crate::i18n::pick(printer.lang(), "绑定监听", "binding the listener"))?;
+        .with_context(|| crate::i18n::pick(lang, "绑定监听", "binding the listener"))?;
     let addr = server.local_addr().context(crate::i18n::pick(
-        printer.lang(),
+        lang,
         "读取监听地址",
         "reading the listen address",
     ))?;
 
-    write_pid(&data_dir, std::process::id())?;
-    report_serve(&agent, &name, addr, &code, printer);
-    // 监听所有网卡时提醒暴露面：仅配对码保护，防火墙需用户自行处理
-    if addr.ip().is_unspecified() && printer.is_human() {
-        printer.print_warning(&crate::i18n::pick(
-            printer.lang(),
-            format!(
-                "正在监听所有网卡（{addr}）；仅配对码保护，请自行用防火墙限制可达范围，或改用 --listen 127.0.0.1:{} 只开本机",
-                addr.port()
-            ),
-            format!(
-                "listening on all interfaces ({addr}); it is protected only by the pairing code. Restrict access with a firewall, or bind loopback with `--listen 127.0.0.1:{}`",
-                addr.port()
-            ),
-        ));
-    }
+    write_pid(data_dir, std::process::id())?;
+    write_listen_addr(data_dir, &addr.to_string());
+    report_serve(&agent, &name, addr, printer);
+    warn_exposure(&addr, printer);
 
-    // 码自然过期时轮换：屏幕上始终有当前有效码。JSON 模式下每次变化打一行
-    // JSONL，stdout 仍是纯数据。
-    let watch = mcsup::remote::Agent::watch_pairing_code(&agent, move |code| {
-        report_pairing_code(code, printer);
-    });
+    // 不启动轮换线程：按需策略下码由 `remote code` 生成，agent 自动补码会
+    // 让"不需要时无码"永远做不到（见 `PairingPolicy::keeps_code_on_screen`）。
     let result = server.run();
-    drop(watch);
-    remove_pid(&data_dir);
-    result.context(crate::i18n::pick(
-        printer.lang(),
-        "agent 退出",
-        "the agent exited",
-    ))?;
+    remove_pid(data_dir);
+    result.context(crate::i18n::pick(lang, "agent 退出", "the agent exited"))?;
     Ok(())
+}
+
+/// 监听所有网卡时提醒暴露面
+fn warn_exposure(addr: &std::net::SocketAddr, printer: Printer) {
+    if !printer.is_human() {
+        return;
+    }
+    let parsed = *addr;
+    if !parsed.ip().is_unspecified() {
+        return;
+    }
+    printer.print_warning(&crate::i18n::pick(
+        printer.lang(),
+        format!(
+            "正在监听所有网卡（{addr}）；端口长期开放，仅配对码保护。请用防火墙限制可达范围，或改用 --listen 127.0.0.1:{} 只开本机（跨机请优先用 SSH 隧道或 VPN）",
+            parsed.port()
+        ),
+        format!(
+            "listening on all interfaces ({addr}); the port stays open and is protected only by the pairing code. Restrict it with a firewall, or bind loopback with `--listen 127.0.0.1:{}` (prefer an SSH tunnel or VPN across machines)",
+            parsed.port()
+        ),
+    ));
 }
 
 fn report_serve(
     agent: &mcsup::remote::Agent,
     name: &str,
     addr: std::net::SocketAddr,
-    code: &mcsup::auth::PairingCode,
     printer: Printer,
 ) {
     let lang = printer.lang();
-    let payload = RemoteServeJson {
-        name,
-        listen: &addr.to_string(),
-        fingerprint: agent.fingerprint().as_str(),
-        pairing_code: Some(&code.display_form()),
-    };
     if printer.is_human() {
         printer.print_section(&crate::i18n::pick(
             lang,
             format!(
-                "mcsup 已开始监听\n  名称    {name}\n  地址    {addr}\n  指纹    {}",
-                agent.fingerprint()
+                "mcsup 已开始监听\n  名称    {name}\n  地址    {addr}\n  指纹    {}\n  数据    {}",
+                agent.fingerprint(),
+                crate::config::platform_data_dir().display()
             ),
             format!(
-                "mcsup is listening\n  name        {name}\n  address     {addr}\n  fingerprint {}",
-                agent.fingerprint()
+                "mcsup is listening\n  name        {name}\n  address     {addr}\n  fingerprint {}\n  data        {}",
+                agent.fingerprint(),
+                crate::config::platform_data_dir().display()
             ),
         ));
         printer.print_section(&crate::i18n::pick(
             lang,
-            format!(
-                "  配对码  {}\n          10 分钟内有效，成功配对后自动更换",
-                code.display_form()
-            ),
-            format!(
-                "  pairing code {}\n               valid for 10 minutes, rotated after each pairing",
-                code.display_form()
-            ),
+            "  配对码  未生成（按需发放）\n          需要配对时运行：mcsup remote code",
+            "  pairing code none yet (on demand)\n              run `mcsup remote code` when you need one",
         ));
         if addr.ip().is_loopback() {
             printer.print_section(&crate::i18n::pick(
@@ -187,25 +282,82 @@ fn report_serve(
             ));
         }
     } else {
-        // JSON 模式：启动信息一行，后续配对码变化各一行 JSONL
+        let payload = serde_json::json!({
+            "name": name,
+            "listen": addr.to_string(),
+            "fingerprint": agent.fingerprint().as_str(),
+            "pairing_code": null,
+        });
         let _ = printer.print_outcome("", &payload);
     }
 }
 
-fn report_pairing_code(code: &mcsup::auth::PairingCode, printer: Printer) {
+/// `remote code`：在本机生成一枚一次性配对码
+///
+/// 码写到 `{data_dir}/remote/grant.toml`（**只存摘要**），agent 在兑换时读它。
+/// 因此本命令不需要 agent 在跑，也不需要与它通信——这是选落盘方案而非本地
+/// IPC 的全部理由（见 `auth::grant` 的模块注释）。
+///
+/// 明文码只在这里出现一次：丢掉就重发，旧码自动失效。
+fn code(data_dir: &Path, ttl: u64, clear: bool, printer: Printer) -> Result<()> {
+    let lang = printer.lang();
+    let grant = mcsup::auth::PairingGrant::new(data_dir, mcsup::auth::PairingWindow::default());
+    if clear {
+        grant.clear().context(crate::i18n::pick(
+            lang,
+            "作废配对码",
+            "clearing the pairing code",
+        ))?;
+        return printer.print_outcome(
+            &crate::i18n::pick(lang, "已作废当前配对码", "the pairing code was cleared"),
+            &serde_json::json!({ "cleared": true, "pairing_code": null }),
+        );
+    }
+
+    let code = grant
+        .issue(mcsup::remote::now_secs(), ttl)
+        .context(crate::i18n::pick(
+            lang,
+            "生成配对码（--ttl 需在 30..=3600 秒内）",
+            "minting a pairing code (--ttl must be 30..=3600 seconds)",
+        ))?;
+    let running = crate::daemon::InstanceLock::is_held(data_dir).unwrap_or(false);
     if printer.is_human() {
         printer.print_section(&crate::i18n::pick(
-            printer.lang(),
-            format!("配对码  {}", code.display_form()),
-            format!("pairing code {}", code.display_form()),
+            lang,
+            format!(
+                "配对码  {}\n        {} 分钟内有效，只能用一次；本命令只显示这一次",
+                code.display_form(),
+                ttl / 60
+            ),
+            format!(
+                "pairing code {}\n             valid for {} minutes, single use; shown only once",
+                code.display_form(),
+                ttl / 60
+            ),
         ));
+        if !running {
+            printer.print_warning(&crate::i18n::pick(
+                lang,
+                "本机 agent 未在运行；码已保存，启动 agent 后仍可用（到期即失效）",
+                "the agent is not running; the code is stored and stays valid once it starts (until it expires)",
+            ));
+        }
     } else {
-        let payload = serde_json::json!({ "pairing_code": code.display_form() });
-        let _ = printer.print_outcome("", &payload);
+        printer.print_outcome(
+            "",
+            &serde_json::json!({
+                "pairing_code": code.display_form(),
+                "expires_in": ttl,
+            }),
+        )?;
     }
+    Ok(())
 }
 
-/// `remote serve --status`：离线读身份、名册与 pid
+/// `remote serve status`：离线读身份、名册、实例锁与配对码 TTL
+///
+/// 全程不连网络：状态查询不该因为 agent 卡住而卡住。
 fn serve_status(data_dir: &Path, printer: Printer) -> Result<()> {
     let lang = printer.lang();
     let identity_dir = mcsup::remote::identity_dir(data_dir);
@@ -229,89 +381,86 @@ fn serve_status(data_dir: &Path, printer: Printer) -> Result<()> {
         "读取客户端名册",
         "reading the client registry",
     ))?;
+    // 存活判定看实例锁，不看 pid：pid 会被系统复用（`is_mcsup_process` 只能兜底）
+    let running = crate::daemon::InstanceLock::is_held(data_dir).unwrap_or(false);
     let pid = read_pid(data_dir);
-    let running = pid.is_some_and(|pid| is_alive(pid) && is_mcsup_process(pid));
+    let addr = read_listen_addr(data_dir);
+    let grant = mcsup::auth::PairingGrant::new(data_dir, mcsup::auth::PairingWindow::default());
+    let status = grant
+        .status(mcsup::remote::now_secs())
+        .context(crate::i18n::pick(
+            lang,
+            "读取配对码状态",
+            "reading the pairing state",
+        ))?;
 
     if printer.is_human() {
-        printer.print_section(&crate::i18n::pick(
-            lang,
-            format!(
-                "本机服务\n  指纹    {}\n  进程    {}\n  客户端  {}",
-                identity.fingerprint(),
-                pid.map_or_else(|| "未运行".to_owned(), |pid| pid.to_string()),
-                records.len()
-            ),
-            format!(
-                "local service\n  fingerprint {}\n  process     {}\n  clients     {}",
-                identity.fingerprint(),
-                pid.map_or_else(|| "not running".to_owned(), |pid| pid.to_string()),
-                records.len()
-            ),
-        ));
-        if !records.is_empty() {
-            let mut table = Table::new();
-            table.set_header([
-                crate::i18n::text(lang, "客户端", "client"),
-                crate::i18n::text(lang, "名称", "name"),
-                crate::i18n::text(lang, "角色", "role"),
-            ]);
-            for record in &records {
-                table.add_row([
-                    record.client_id.as_str().to_owned(),
-                    record.name.clone(),
-                    record.role.to_string(),
-                ]);
-            }
-            printer.print_table(&table);
-        }
-        if !running && pid.is_some() {
-            printer.print_warning(&crate::i18n::pick(
-                lang,
-                "pid 文件存在但进程已不在，可运行 remote serve --stop 清理",
-                "the pid file is stale; run `remote serve --stop` to clean it up",
-            ));
-        }
+        render_serve_status(
+            &identity,
+            &records,
+            running,
+            pid,
+            addr.as_deref(),
+            status,
+            printer,
+        );
     } else {
         let payload = serde_json::json!({
-            "fingerprint": identity.fingerprint().as_str(),
             "running": running,
+            "address": addr,
+            "fingerprint": identity.fingerprint().as_str(),
             "pid": pid,
             "clients": records.iter().map(|record| serde_json::json!({
                 "client_id": record.client_id.as_str(),
                 "name": record.name,
                 "role": record.role.to_string(),
             })).collect::<Vec<_>>(),
+            "pairing": status.map(|status| serde_json::json!({
+                "expires_in": status.remaining_secs,
+                "cooling_down": status.cooling_down,
+            })),
         });
         printer.print_outcome("", &payload)?;
     }
     Ok(())
 }
 
-/// `remote serve --stop`：按 pid 文件终止前台 agent
-fn serve_stop(data_dir: &Path, printer: Printer) -> Result<()> {
+/// `remote serve stop`：结束后台 agent
+///
+/// 三步：先按 pid 发信号，再等实例锁释放（真正的退出判据），最后清理 pid 文件。
+/// 不把「信号发出去了」当成功：进程可能还在收尾在跑的任务。
+fn serve_stop(data_dir: &Path, force: bool, printer: Printer) -> Result<()> {
     let lang = printer.lang();
+    let held = crate::daemon::InstanceLock::is_held(data_dir).unwrap_or(false);
     let Some(pid) = read_pid(data_dir) else {
-        return Err(AppDiagnostic::failure(
-            crate::i18n::pick(
-                lang,
-                "本机没有正在运行的 agent（无 pid 文件）",
-                "no agent is running on this machine (no pid file)",
-            ),
-            None,
-        )
-        .into());
+        // 没有 pid 文件但锁被持有：状态不一致，如实说清而不是假装成功
+        if held {
+            return Err(AppDiagnostic::failure(
+                crate::i18n::pick(
+                    lang,
+                    "实例锁被持有但没有 pid 文件；无法安全定位进程，请手动检查",
+                    "the instance lock is held but there is no pid file; find the process manually",
+                ),
+                None,
+            )
+            .into());
+        }
+        // 已在停止状态：幂等成功，与 `server stop` 同口径
+        return printer.print_outcome(
+            &crate::i18n::pick(lang, "本机 agent 未在运行", "the agent is not running"),
+            &serde_json::json!({ "stopped": false, "pid": null }),
+        );
     };
     if !is_alive(pid) {
         remove_pid(data_dir);
-        return Err(AppDiagnostic::failure(
-            crate::i18n::pick(
+        return printer.print_outcome(
+            &crate::i18n::pick(
                 lang,
                 format!("agent 进程 {pid} 已不在，已清理陈旧 pid 文件"),
                 format!("agent process {pid} is gone; removed the stale pid file"),
             ),
-            None,
-        )
-        .into());
+            &serde_json::json!({ "stopped": false, "pid": pid }),
+        );
     }
     // pid 会被系统复用：文件里的数字活着，不代表还是当初那个 agent
     if !is_mcsup_process(pid) {
@@ -326,22 +475,122 @@ fn serve_stop(data_dir: &Path, printer: Printer) -> Result<()> {
         )
         .into());
     }
-    terminate(pid).with_context(|| {
+
+    terminate(pid, force).with_context(|| {
         crate::i18n::pick(
             lang,
             format!("终止 agent 进程 {pid}"),
             format!("terminating agent process {pid}"),
         )
     })?;
-    remove_pid(data_dir);
-    printer.print_outcome(
-        &crate::i18n::pick(
+
+    // 等锁释放才是「真的停了」：SIGTERM 之后进程还要收尾
+    let deadline = std::time::Instant::now() + STOP_WAIT;
+    while std::time::Instant::now() < deadline {
+        if !crate::daemon::InstanceLock::is_held(data_dir).unwrap_or(false) {
+            remove_pid(data_dir);
+            return printer.print_outcome(
+                &crate::i18n::pick(
+                    lang,
+                    format!("已停止 agent（pid {pid}）"),
+                    format!("stopped the agent (pid {pid})"),
+                ),
+                &serde_json::json!({ "stopped": true, "pid": pid }),
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Err(AppDiagnostic::failure(
+        crate::i18n::pick(
             lang,
-            format!("已停止 agent（pid {pid}）"),
-            format!("stopped the agent (pid {pid})"),
+            format!("agent（pid {pid}）在 {STOP_WAIT:?} 内没有退出；用 --force 强杀"),
+            format!("the agent (pid {pid}) did not exit within {STOP_WAIT:?}; retry with --force"),
         ),
-        &serde_json::json!({ "stopped": true, "pid": pid }),
+        None,
     )
+    .into())
+}
+
+/// 等 agent 自行退出的上限
+const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `serve status` 的人类可读渲染
+///
+/// 抽出来只为让 `serve_status` 保持线性；两段文案（中 / 英）本来就长。
+fn render_serve_status(
+    identity: &mcsup::transport::ServerIdentity,
+    records: &[mcsup::auth::ClientRecord],
+    running: bool,
+    pid: Option<u32>,
+    addr: Option<&str>,
+    status: Option<mcsup::auth::GrantStatus>,
+    printer: Printer,
+) {
+    let lang = printer.lang();
+    let code_line = match status {
+        Some(status) => crate::i18n::pick(
+            lang,
+            format!(
+                "{} 分 {} 秒后过期{}",
+                status.remaining_secs / 60,
+                status.remaining_secs % 60,
+                if status.cooling_down {
+                    "（猜码冷却中）"
+                } else {
+                    ""
+                }
+            ),
+            format!(
+                "expires in {}m {}s{}",
+                status.remaining_secs / 60,
+                status.remaining_secs % 60,
+                if status.cooling_down {
+                    " (cooling down)"
+                } else {
+                    ""
+                }
+            ),
+        ),
+        None => crate::i18n::pick(lang, "无".to_owned(), "none".to_owned()),
+    };
+    printer.print_section(&crate::i18n::pick(
+        lang,
+        format!(
+            "本机服务\n  状态    {}\n  地址    {}\n  指纹    {}\n  进程    {}\n  客户端  {}\n  配对码  {}",
+            if running { "运行中" } else { "未运行" },
+            addr.unwrap_or("-"),
+            identity.fingerprint(),
+            pid.map_or_else(|| "-".to_owned(), |pid| pid.to_string()),
+            records.len(),
+            code_line
+        ),
+        format!(
+            "local service\n  state       {}\n  address     {}\n  fingerprint {}\n  process     {}\n  clients     {}\n  pairing     {}",
+            if running { "running" } else { "stopped" },
+            addr.unwrap_or("-"),
+            identity.fingerprint(),
+            pid.map_or_else(|| "-".to_owned(), |pid| pid.to_string()),
+            records.len(),
+            code_line
+        ),
+    ));
+    if records.is_empty() {
+        return;
+    }
+    let mut table = Table::new();
+    table.set_header([
+        crate::i18n::text(lang, "客户端", "client"),
+        crate::i18n::text(lang, "名称", "name"),
+        crate::i18n::text(lang, "角色", "role"),
+    ]);
+    for record in records {
+        table.add_row([
+            record.client_id.as_str().to_owned(),
+            record.name.clone(),
+            record.role.to_string(),
+        ]);
+    }
+    printer.print_table(&table);
 }
 
 /// `remote connect`：probe → 确认指纹 → enroll → 落盘
@@ -1214,6 +1463,36 @@ fn write_pid(data_dir: &Path, pid: u32) -> Result<()> {
         .with_context(|| format!("写入 pid 文件 {}", path.display()))
 }
 
+/// 监听地址文件名（`{data_dir}/remote/agent.addr`）
+///
+/// 只用于 `serve status` / `serve start` 回显：真实地址由 bind 决定（缺省端口
+/// 固定，所以不是必需，但 `--listen :0` 时没有它就查不到）。
+const AGENT_ADDR: &str = "agent.addr";
+
+fn write_listen_addr(data_dir: &Path, addr: &str) {
+    let path = data_dir.join("remote").join(AGENT_ADDR);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // 只作展示：写不进去不影响服务本身
+    let _ = std::fs::write(path, addr);
+}
+
+fn read_listen_addr(data_dir: &Path) -> Option<String> {
+    std::fs::read_to_string(data_dir.join("remote").join(AGENT_ADDR))
+        .ok()
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty())
+}
+
+/// 本机证书指纹（读身份文件；没有身份时返回 `None`）
+fn read_fingerprint(data_dir: &Path) -> Option<String> {
+    let dir = mcsup::remote::identity_dir(data_dir);
+    mcsup::transport::ServerIdentity::load(&dir)
+        .ok()
+        .map(|identity| identity.fingerprint().to_string())
+}
+
 fn read_pid(data_dir: &Path) -> Option<u32> {
     std::fs::read_to_string(pid_path(data_dir))
         .ok()
@@ -1294,15 +1573,24 @@ fn is_mcsup_process(pid: u32) -> bool {
 }
 
 /// 终止进程
-fn terminate(pid: u32) -> Result<()> {
+///
+/// Unix 默认发 `SIGTERM`（让 agent 收尾），`force` 才 `SIGKILL`；Windows 的
+/// `taskkill` 不带 `/F` 是「请求关闭」，带 `/F` 是强杀，语义与 Unix 对齐。
+fn terminate(pid: u32, force: bool) -> Result<()> {
     #[cfg(unix)]
     let status = std::process::Command::new("kill")
+        .arg(if force { "-9" } else { "-15" })
         .arg(pid.to_string())
         .status();
     #[cfg(windows)]
-    let status = std::process::Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/F"])
-        .status();
+    let status = {
+        let mut command = std::process::Command::new("taskkill");
+        command.args(["/PID", &pid.to_string()]);
+        if force {
+            command.arg("/F");
+        }
+        command.status()
+    };
     #[cfg(not(any(unix, windows)))]
     let status: std::io::Result<std::process::ExitStatus> = Err(std::io::Error::other(
         "terminating a process is not supported on this platform",
@@ -1432,7 +1720,7 @@ mod tests {
         assert!(!is_mcsup_process(u32::MAX), "无效 pid 不应被判为 mcsup");
     }
 
-    /// `serve --stop` 的 pid 文件读写往返
+    /// `serve stop` 的 pid 文件读写往返
     #[test]
     fn pid_file_round_trips() {
         let dir = tempfile::tempdir().expect("temp dir");

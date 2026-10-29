@@ -24,8 +24,8 @@ mod supervise;
 
 use crate::bootstrap::{BootstrapError, Mcsup};
 use auth::{
-    ClientId, ClientRecord, ClientRegistry, PairingCode, PairingCodeError, PairingCodeStore,
-    PairingWindow, Role, Token,
+    ClientId, ClientRecord, ClientRegistry, DEFAULT_ON_DEMAND_TTL_SECS, GrantStatus, PairingCode,
+    PairingCodeError, PairingCodeStore, PairingGrant, PairingWindow, Role, Token,
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -137,6 +137,36 @@ fn write_ssh_line<T: serde::Serialize>(payload: &T) -> Result<(), AgentError> {
 /// [`auth::code::DEFAULT_TTL_SECS`]，用户不会看到过期的码。
 pub const PAIRING_ROTATE_INTERVAL: Duration = Duration::from_secs(5);
 
+/// 配对码的发放策略：**同一份兑换判定，两种发码方式**
+///
+/// 差别只在「谁决定发码、码住在哪」，短时有效 / 单次使用 / 限速冷却三条
+/// 不变量由 `auth::code::PairingSlot` 统一回答，不随策略分叉。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairingPolicy {
+    /// **连续**：码在进程内存里，屏幕上总有当前有效码，过期自动轮换
+    ///
+    /// 用于 SSH 引导与前台调试：agent 的寿命由那次会话决定，码跟着会话走，
+    /// 不需要用户额外管理。
+    Continuous,
+    /// **按需**：启动时**不持有任何码**，只有管理员在本机显式发码才生成一枚
+    ///
+    /// 用于后台常驻（`remote serve start`、`mcsup-agent`）：长期监听的端口
+    /// 不该配一枚长期存在的码。码落在 `{data_dir}/remote/grant.toml`
+    /// （只存摘要、0600），由 `remote code` 生成、由 agent 兑换。
+    OnDemand,
+}
+
+impl PairingPolicy {
+    /// 该策略下「屏幕上是否需要一直显示码」
+    ///
+    /// 入口据此决定是否启动轮换线程：按需策略下轮换线程必须不起，否则它会在
+    /// 码过期后自动补一枚新的，"不需要时无码" 就永远做不到。
+    #[must_use]
+    pub fn keeps_code_on_screen(self) -> bool {
+        matches!(self, Self::Continuous)
+    }
+}
+
 /// 身份文件目录（`cert.pem` / `key.pem`）
 #[must_use]
 pub fn identity_dir(data_dir: &Path) -> PathBuf {
@@ -165,6 +195,9 @@ pub enum AgentError {
     /// 系统随机源不可用
     #[error(transparent)]
     Pairing(#[from] PairingCodeError),
+    /// 按需授权文件读写失败（`.grant.toml`）
+    #[error(transparent)]
+    Grant(#[from] auth::GrantError),
     /// SSH 引导握手写 stdout 失败（会话已断）
     #[error("failed to write the ssh handshake: {0}")]
     SshOutput(#[source] std::io::Error),
@@ -177,8 +210,8 @@ pub struct Agent {
     core: Mcsup,
     identity: ServerIdentity,
     clients: ClientRegistry,
-    /// 配对窗口：单码、单次使用、限速（`auth::code`）
-    pairing: Mutex<PairingCodeStore>,
+    /// 配对码：内存态（连续）或落盘态（按需），判定同源
+    pairing: Pairing,
     /// 名册写入串行化：`insert` / `revoke` 是读-改-写，并发会丢更新
     registry_lock: Mutex<()>,
     /// 本机名（`remote connect` 的缺省远端名）
@@ -191,6 +224,27 @@ pub struct Agent {
     started: Instant,
     /// 停止句柄：`Shutdown` 帧用；绑定监听后才可用
     stop: OnceLock<StopHandle>,
+}
+
+/// 配对码的两种存放形态
+///
+/// 判定不在这里：两个分支各自调用 `auth` 的同名方法，`auth::code::PairingSlot`
+/// 是唯一一处规则实现。
+enum Pairing {
+    /// 码在进程内存里（连续策略）
+    Memory(Mutex<PairingCodeStore>),
+    /// 码在 `{data_dir}/remote/grant.toml`（按需策略）
+    Granted(PairingGrant),
+}
+
+impl std::fmt::Debug for Pairing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 只报形态，不带任何码相关字段
+        match self {
+            Self::Memory(_) => f.write_str("Pairing::Memory"),
+            Self::Granted(grant) => write!(f, "Pairing::Granted({})", grant.path().display()),
+        }
+    }
 }
 
 impl std::fmt::Debug for Agent {
@@ -217,15 +271,35 @@ impl Agent {
     ///
     /// 仓库打开、身份读写或目录创建失败时返回 [`AgentError`]
     pub fn open(data_dir: &Path, server_name: impl Into<String>) -> Result<Self, AgentError> {
+        Self::open_with(data_dir, server_name, PairingPolicy::Continuous)
+    }
+
+    /// 按数据目录与发码策略装配
+    ///
+    /// 策略只影响「码存在哪」，不影响任何判定。
+    ///
+    /// # Errors
+    ///
+    /// 同 [`Agent::open`]
+    pub fn open_with(
+        data_dir: &Path,
+        server_name: impl Into<String>,
+        policy: PairingPolicy,
+    ) -> Result<Self, AgentError> {
         let core = Mcsup::open(data_dir)?;
         let identity = ServerIdentity::load_or_create(&identity_dir(data_dir))?;
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let supervisor_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("mcsup"));
+        let window = PairingWindow::default();
+        let pairing = match policy {
+            PairingPolicy::Continuous => Pairing::Memory(Mutex::new(PairingCodeStore::new(window))),
+            PairingPolicy::OnDemand => Pairing::Granted(PairingGrant::new(data_dir, window)),
+        };
         Ok(Self {
             core,
             identity,
             clients: ClientRegistry::new(clients_path(data_dir)),
-            pairing: Mutex::new(PairingCodeStore::new(PairingWindow::default())),
+            pairing,
             registry_lock: Mutex::new(()),
             server_name: server_name.into(),
             supervisor_exe,
@@ -271,31 +345,86 @@ impl Agent {
 
     /// 当前有效配对码
     ///
+    /// 只有**连续**策略能读出明文码；按需策略的码不在这台进程里（也不该在），
+    /// 因此一律返回 `None`（用 [`Self::pairing_status`] 查有没有码）。
+    ///
     /// # Errors
     ///
     /// 配对窗口锁被 poison 时返回 [`AgentError::PairingPoisoned`]
     pub fn current_pairing_code(&self) -> Result<Option<PairingCode>, AgentError> {
-        Ok(self.pairing()?.current(now_secs()).cloned())
+        Ok(match &self.pairing {
+            Pairing::Memory(store) => store
+                .lock()
+                .map_err(|_| AgentError::PairingPoisoned)?
+                .current(now_secs())
+                .cloned(),
+            Pairing::Granted(_) => None,
+        })
+    }
+
+    /// 当前是否有一枚可用码、还剩多久（两种策略都支持，**永不回显码**）
+    ///
+    /// # Errors
+    ///
+    /// 落盘态读盘失败或锁被 poison 时返回 [`AgentError`]
+    pub fn pairing_status(&self) -> Result<Option<GrantStatus>, AgentError> {
+        let now = now_secs();
+        Ok(match &self.pairing {
+            Pairing::Memory(store) => {
+                let store = store.lock().map_err(|_| AgentError::PairingPoisoned)?;
+                store.current(now).map(|_| GrantStatus {
+                    remaining_secs: store.remaining_secs(now).unwrap_or(0),
+                    cooling_down: store.cooling_down(now),
+                })
+            }
+            Pairing::Granted(grant) => grant.status(now)?,
+        })
+    }
+
+    /// 发码策略
+    #[must_use]
+    pub fn pairing_policy(&self) -> PairingPolicy {
+        match self.pairing {
+            Pairing::Memory(_) => PairingPolicy::Continuous,
+            Pairing::Granted(_) => PairingPolicy::OnDemand,
+        }
     }
 
     /// 发一枚新配对码（旧码立即作废）
     ///
+    /// 按需策略下写的是 `{data_dir}/remote/grant.toml`；**agent 自己不需要发码**
+    /// （发码发生在 `remote code`），保留本方法只为让两种策略共用一个入口测试。
+    ///
     /// # Errors
     ///
-    /// 随机源不可用或锁被 poison 时返回 [`AgentError`]
+    /// 随机源不可用、落盘失败或锁被 poison 时返回 [`AgentError`]
     pub fn issue_pairing_code(&self) -> Result<PairingCode, AgentError> {
-        let mut store = self.pairing()?;
-        Ok(store.issue(now_secs())?)
+        let now = now_secs();
+        Ok(match &self.pairing {
+            Pairing::Memory(store) => store
+                .lock()
+                .map_err(|_| AgentError::PairingPoisoned)?
+                .issue(now)?,
+            Pairing::Granted(grant) => grant.issue(now, DEFAULT_ON_DEMAND_TTL_SECS)?,
+        })
     }
 
     /// 码自然过期时轮换；未过期返回 `None`
+    ///
+    /// 只对**连续**策略有意义：按需策略永不自动补码，否则"不需要时无码"就
+    /// 做不到。这里显式返回 `None` 而不是静默跳过，让调用方看到语义差别。
     ///
     /// # Errors
     ///
     /// 随机源不可用或锁被 poison 时返回 [`AgentError`]
     pub fn rotate_pairing_code(&self) -> Result<Option<PairingCode>, AgentError> {
-        let mut store = self.pairing()?;
-        Ok(store.rotate_if_expired(now_secs())?)
+        let Pairing::Memory(store) = &self.pairing else {
+            return Ok(None);
+        };
+        Ok(store
+            .lock()
+            .map_err(|_| AgentError::PairingPoisoned)?
+            .rotate_if_expired(now_secs())?)
     }
 
     /// 绑定监听并返回可运行的服务器
@@ -360,11 +489,6 @@ impl Agent {
             stopped,
             join: Some(join),
         }
-    }
-
-    /// 取配对窗口
-    fn pairing(&self) -> Result<std::sync::MutexGuard<'_, PairingCodeStore>, AgentError> {
-        self.pairing.lock().map_err(|_| AgentError::PairingPoisoned)
     }
 }
 
@@ -433,7 +557,7 @@ impl AgentServer {
 
     /// 可跨线程持有的停止句柄
     ///
-    /// `run` 会消费 `self`，句柄必须先取出来：`remote serve --stop` 与测试
+    /// `run` 会消费 `self`，句柄必须先取出来：`remote serve stop` 与测试
     /// 都需要在 `run` 阻塞之后才决定何时停。
     ///
     /// # Errors
@@ -481,19 +605,36 @@ impl Handler for Agent {
             ));
         }
 
-        {
-            let mut store = self.pairing().map_err(|err| {
-                RemoteFailure::new(protocol::remote::ErrorKind::IO, err.to_string())
-            })?;
-            store.redeem(pairing_code, now_secs()).map_err(|err| {
-                // 对外不区分「过期」「用掉」「猜错太多次」：那等于告诉猜码的人离成功多近
-                tracing::warn!(%err, client = %name, "remote enroll rejected");
-                RemoteFailure::unauthorized("pairing code is not usable")
-            })?;
-            // 成功即换新码：屏幕上始终有当前有效码，不必重启 agent 才能配对第二台
-            store.issue(now_secs()).map_err(|err| {
-                RemoteFailure::new(protocol::remote::ErrorKind::IO, err.to_string())
-            })?;
+        // 兑换：两种策略共用同一份判定（`auth::code::PairingSlot`）。
+        // 对外不区分「过期」「用掉」「猜错太多次」——那等于告诉猜码的人离成功多近。
+        let now = now_secs();
+        let redeem_error = |err: &dyn std::fmt::Display| {
+            tracing::warn!(err = %err, client = %name, "remote enroll rejected");
+            RemoteFailure::unauthorized("pairing code is not usable")
+        };
+        match &self.pairing {
+            Pairing::Memory(store) => {
+                let mut store = store.lock().map_err(|_| {
+                    RemoteFailure::new(
+                        protocol::remote::ErrorKind::IO,
+                        AgentError::PairingPoisoned.to_string(),
+                    )
+                })?;
+                store
+                    .redeem(pairing_code, now)
+                    .map_err(|err| redeem_error(&err))?;
+                // 连续形态：成功即换新码，屏幕上始终有当前有效码
+                store.issue(now).map_err(|err| {
+                    RemoteFailure::new(protocol::remote::ErrorKind::IO, err.to_string())
+                })?;
+            }
+            Pairing::Granted(grant) => {
+                // 按需形态：成功即销毁，**不补发**。下一枚只能由管理员
+                // 在本机跑 `remote code` 生成。
+                grant
+                    .redeem(pairing_code, now)
+                    .map_err(|err| redeem_error(&err))?;
+            }
         }
 
         let token = Token::generate()
@@ -604,7 +745,16 @@ impl Agent {
 }
 
 /// 当前 Unix 秒（配对窗口的时间口径）
-fn now_secs() -> u64 {
+/// 取当前 Unix 秒（门面导出版本给入口用）
+///
+/// 时钟由入口传入而不是库内隐式读取，这样「过期」「冷却」能在测试里确定性地
+/// 打穿；入口自身只需要这一个薄包装。
+#[must_use]
+pub fn now_secs() -> u64 {
+    unix_secs()
+}
+
+fn unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())

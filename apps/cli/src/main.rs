@@ -3,6 +3,7 @@ mod cli;
 mod commands;
 mod completions;
 mod config;
+mod daemon;
 mod diagnostic;
 mod help;
 mod i18n;

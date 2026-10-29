@@ -128,7 +128,7 @@ restart / status / console / send / logs / props / set / remove / version`、
 | `server backup` | `cr` create · `ls` list · `rt` restore · `rm` delete · `vf` verify · `pr` prune |
 | `server mod` | `ls` list · `in` install · `rm` remove · `up` update · `od` outdated |
 | `java` | `ls` list · `sc` scan · `in` install · `un` / `rm` uninstall |
-| `remote` | `ls` list · `sv` serve · `con` connect · `st` status · `pg` ping · `dc` disconnect · `rv` revoke |
+| `remote` | `ls` list · `sv` serve · `cd` code · `con` connect · `st` status · `pg` ping · `dc` disconnect · `rv` revoke |
 | `config` | `ls` show · `st` set · `us` unset · `ed` edit |
 
 ## 命令层级
@@ -148,7 +148,7 @@ mcsup
 ├── java (jv)                 # 机器级 JVM 运行时
 │   └── list (ls) [--origin <o>] / scan (sc) [--origin <名字>] / install (in) [--origin <名字>] / uninstall (un|rm) [--origin <名字>]
 ├── remote (rmt)              # 远端执行位置（Backend）
-│   ├── serve (sv) [--listen <addr>] [--name <n>] / serve --stop / serve --status
+│   ├── serve (sv) start [--listen <addr>] [--name <n>] [--foreground] / stop [--force] / status
 │   ├── connect (con) [<user@host> | <host[:port]>] [--name <n>] [--read-only]
 │   └── list (ls) / status (st) / ping (pg) / disconnect (dc) / revoke (rv)
 └── doctor (doc) / config (cfg) / update (up)
@@ -318,8 +318,9 @@ JVM 安装在平台数据目录 `{data_dir}/mcsup/java/`，不属于任何工作
 
 ## mcsup remote（远端执行位置 = Backend）
 
-接入只需两侧各一条命令：被连接端 `mcsup remote serve`（前台进程，系统服务
-注册未实现），连接端 `mcsup remote connect <host[:port]> --code <配对码>`。
+接入只需两侧各两条命令：被连接端 `mcsup remote serve start` 后再按需
+`mcsup remote code`（后台进程，配对码按需发放；系统服务注册未实现），连接端
+`mcsup remote connect <host[:port]> --code <配对码>`。
 之后 `workspace` / `server` / `java` / `backup` 命令不变，远端资源以
 `ORIGIN` 列出现在原有列表中。接入有两条路：`user@host` 走 SSH 引导（经
 SSH 起远端 agent + 本地 `ssh -L` 隧道，每条命令临时建立），
@@ -328,9 +329,10 @@ SSH 起远端 agent + 本地 `ssh -L` 隧道，每条命令临时建立），
 
 | 子命令 | 用法 | 说明 |
 | --- | --- | --- |
-| `serve` | `mcsup remote serve [--listen <addr>] [--name <n>]` | 本机作为被连接端：前台运行 agent，打印名称 / 地址 / 指纹 / 配对码（码过期自动轮换） |
-| `serve --stop` | `mcsup remote serve --stop` | 按 `{data_dir}/remote/agent.pid` 终止前台进程 |
-| `serve --status` | `mcsup remote serve --status` | 离线读本机身份、指纹、pid 与已配对客户端 |
+| `serve start` | `mcsup remote serve start [--listen <addr>] [--name <n>] [--foreground]` | 本机作为被连接端：**后台**启动 agent 并打印名称 / 地址 / 指纹 / 日志路径；`--foreground` 留前台调试。启动**不生成配对码** |
+| `serve stop` | `mcsup remote serve stop [--force]` | 发 `SIGTERM` 并等实例锁释放；`--force` 强杀；未运行时幂等成功 |
+| `serve status` | `mcsup remote serve status` | 离线读是否运行、地址、指纹、pid、已配对客户端、配对码剩余时间（**不回显码**） |
+| `code` | `mcsup remote code [--ttl <秒>] [--clear]` | 在本机生成一枚一次性配对码（缺省 300 秒，范围 30–3600，只显示这一次）；`--clear` 作废当前码 |
 | `connect` | `mcsup remote connect <host[:port]> [--name <名>] [--code <码>] [-y]` | 直连配对：probe 捕获指纹 → 展示确认（非交互需 `-y`）→ 交互命名（默认最小空闲序号 `r1` / `r2` …，`--name` 跳过）→ `Enroll` → 写配置与凭证 |
 | `reconnect` | `mcsup remote reconnect <name>` | 复用记录重新认证；指纹变化要求重新 connect |
 | `list` | `mcsup remote list` | 已配对远端、连接状态（`ok` / `unreachable` / `unauthorized`）、角色、agent 版本 |

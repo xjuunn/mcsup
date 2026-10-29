@@ -119,7 +119,7 @@ impl Server {
             .map_err(|err| TransportError::io("read listener address", err))
     }
 
-    /// 停止标志：置位后 [`Self::run`] 退出（`remote serve --stop` 用）
+    /// 停止标志：置位后 [`Self::run`] 退出（`remote serve stop` 与 `Shutdown` 帧用）
     ///
     /// 只置位不会唤醒阻塞在 `accept` 上的 [`Self::run`]；要真正停下来用
     /// [`Self::request_stop`]。

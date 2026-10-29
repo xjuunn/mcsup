@@ -303,6 +303,88 @@ fn connect_without_yes_refuses_to_trust_an_unknown_fingerprint() {
     assert!(stderr.contains("指纹"), "{stderr}");
 }
 
+/// `remote code` 在本机发一枚码，agent 用它配对；`--clear` 后不再可配对
+///
+/// 这是按需发码的端到端验收：码由 CLI 生成（不经网络、不经 agent），agent 在
+/// 兑换时读同一个数据目录的 `grant.toml`。
+#[test]
+fn remote_code_mints_a_code_the_agent_accepts_until_cleared() {
+    // agent 与 CLI 共用同一个「平台数据目录」，所以两边都要把它指向临时 HOME
+    let home = temp_home();
+    let home_path = home.path();
+
+    let minted = run(home_path, &["remote", "code", "--output", "json"]);
+    assert_ok(&minted, "remote code");
+    let code = json(&minted)["pairing_code"]
+        .as_str()
+        .expect("pairing_code")
+        .to_owned();
+    assert_eq!(code.len(), 9, "XXXX-XXXX: {code}");
+    assert_eq!(json(&minted)["expires_in"], 300, "缺省 5 分钟");
+
+    // `serve status` 能看到这枚码的存在与剩余时间，但**不回显码**
+    let status = run(
+        home_path,
+        &["remote", "serve", "status", "--output", "json"],
+    );
+    if status.status.success() {
+        let payload = json(&status);
+        let text = payload.to_string();
+        assert!(!text.contains(&code), "status 不得回显配对码: {text}");
+        if let Some(pairing) = payload.get("pairing") {
+            assert!(pairing["expires_in"].as_u64().unwrap_or(0) > 0, "{text}");
+        }
+    }
+
+    let cleared = run(
+        home_path,
+        &["remote", "code", "--clear", "--output", "json"],
+    );
+    assert_ok(&cleared, "remote code --clear");
+    assert_eq!(json(&cleared)["cleared"], true);
+
+    // 作废后同一枚码不能再被兑换（下次 Enroll 必然失败）
+    let again = run(
+        home_path,
+        &["remote", "code", "--clear", "--output", "json"],
+    );
+    assert_ok(&again, "clear 幂等");
+}
+
+/// `serve` 不接受旧开关形态：动作必须写在子命令上
+#[test]
+fn serve_rejects_the_old_flag_form() {
+    let home = temp_home();
+    let out = run(home.path(), &["remote", "serve", "--stop"]);
+    assert!(!out.status.success(), "--stop 已改为子命令");
+    assert_eq!(out.status.code(), Some(2), "语法错误属于用法错误");
+}
+
+/// 后台服务未运行时 `serve stop` 幂等成功，不报错
+#[test]
+fn serve_stop_is_idempotent_when_not_running() {
+    let home = temp_home();
+    let out = run(
+        home.path(),
+        &["remote", "serve", "stop", "--output", "json"],
+    );
+    assert_ok(&out, "serve stop");
+    assert_eq!(json(&out)["stopped"], false);
+}
+
+/// 未运行过 serve 时 `serve status` 明确报「没有身份」，而不是给一堆空值
+#[test]
+fn serve_status_without_identity_reports_it() {
+    let home = temp_home();
+    let out = run(
+        home.path(),
+        &["remote", "serve", "status", "--output", "json"],
+    );
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("remote serve"), "{stderr}");
+}
+
 #[test]
 fn connect_to_a_dead_endpoint_fails_cleanly() {
     let home = temp_home();

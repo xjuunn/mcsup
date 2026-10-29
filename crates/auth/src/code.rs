@@ -95,15 +95,16 @@ impl PairingCode {
         Ok(Self(digits))
     }
 
+    /// 去掉分隔符的 8 位数字（摘要用）
+    #[must_use]
+    pub fn digits(&self) -> &str {
+        &self.0
+    }
+
     /// 展示形态 `XXXX-XXXX`（给用户读）
     #[must_use]
     pub fn display_form(&self) -> String {
         format!("{}-{}", &self.0[..4], &self.0[4..])
-    }
-
-    /// 比较：常量时间，避免按字节提前返回泄漏前缀
-    fn matches(&self, other: &Self) -> bool {
-        crate::token::ct_eq(self.0.as_bytes(), other.0.as_bytes())
     }
 }
 
@@ -131,24 +132,178 @@ impl Default for PairingWindow {
     }
 }
 
-/// 当前有效的配对码及其剩余额度
+/// 一枚码的判定状态：**本模块唯一一份**过期 / 单次使用 / 限速逻辑
 ///
-/// 三态收敛在 [`Self::redeem`] 一处：过期、超次数、已用掉都返回同一个
+/// 抽出来是因为配对码有两种存放形态（见 [`crate::grant`]）：
+///
+/// - 内存态 [`PairingCodeStore`]：码在进程里（SSH 引导与前台调试）；
+/// - 落盘态 [`crate::grant::PairingGrant`]：码在 0600 文件里（后台常驻，
+///   发码发生在命令行、兑换发生在 agent，两个进程）。
+///
+/// 形态不同，**判定必须相同**：否则「猜错多少次才冷却」「过期还认不认」会
+/// 随运行方式漂移。所以判定收敛在这里，两侧只负责「怎么把状态存下来」。
+///
+/// 三态收敛在 [`Self::attempt`] 一处：过期、超次数、已用掉都得到同一个
+/// [`Redeem::Expired`] / [`Redeem::Exhausted`]，调用方再统一映射成
 /// [`PairingCodeError::Unusable`]——对猜码的人不该区分「过期了」还是
 /// 「猜错太多次」，那只会告诉他离成功有多近。
-#[derive(Debug, Clone)]
-pub struct PairingCodeStore {
-    window: PairingWindow,
-    active: Option<ActiveCode>,
-}
-
-#[derive(Debug, Clone)]
-struct ActiveCode {
-    code: PairingCode,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingSlot {
+    /// 码的摘要（十六进制），**不是**明文
+    ///
+    /// 内存态也需要摘要：落盘态与内存态共用同一份比较代码，顺便保证内存态
+    /// 的诊断输出（`Debug`）不会带出明文码。
+    digest: String,
     issued_at: u64,
     attempts: u32,
     /// 冷却截止时刻；冷却期间拒绝一切尝试，但码本身不作废
     blocked_until: u64,
+}
+
+impl PairingSlot {
+    /// 以「明文码 + 签发时刻」构造（尚无失败）
+    ///
+    /// 只在此处接受明文：之后状态里只留摘要。
+    #[must_use]
+    pub fn new(code: &PairingCode, issued_at: u64) -> Self {
+        Self {
+            digest: crate::token::sha256_hex(code.digits().as_bytes()),
+            issued_at,
+            attempts: 0,
+            blocked_until: 0,
+        }
+    }
+
+    /// 从落盘字段还原（读回授权文件时用）
+    #[must_use]
+    pub fn restore(digest: String, issued_at: u64, attempts: u32, blocked_until: u64) -> Self {
+        Self {
+            digest,
+            issued_at,
+            attempts,
+            blocked_until,
+        }
+    }
+
+    /// 摘要（十六进制），落盘用
+    #[must_use]
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    /// 签发时刻
+    #[must_use]
+    pub fn issued_at(&self) -> u64 {
+        self.issued_at
+    }
+
+    /// 已累计的失败次数
+    #[must_use]
+    pub fn attempts(&self) -> u32 {
+        self.attempts
+    }
+
+    /// 冷却截止时刻（`0` 表示不在冷却）
+    #[must_use]
+    pub fn blocked_until(&self) -> u64 {
+        self.blocked_until
+    }
+
+    /// 此刻是否仍在有效期内
+    ///
+    /// 时钟回拨按「已过期」处理：宁可让用户重开一次，也不让码活得比预期久。
+    #[must_use]
+    pub fn is_live(&self, window: PairingWindow, now: u64) -> bool {
+        now.checked_sub(self.issued_at)
+            .is_some_and(|elapsed| elapsed < window.ttl_secs)
+    }
+
+    /// 剩余有效秒数（已过期或尚未生效时为 `None`）
+    #[must_use]
+    pub fn remaining(&self, window: PairingWindow, now: u64) -> Option<u64> {
+        self.is_live(window, now)
+            .then(|| window.ttl_secs - (now - self.issued_at))
+    }
+
+    /// 此刻是否处于猜码冷却
+    #[must_use]
+    pub fn cooling_down(&self, now: u64) -> bool {
+        now < self.blocked_until
+    }
+
+    /// 兑换尝试的结果：调用方据此决定「保留还是销毁」这条状态
+    ///
+    /// 把「状态怎么变」交回调用方，是为了让落盘形态能在**同一次**加锁里
+    /// 完成读-改-写；判定本身仍只有这一处。
+    #[must_use]
+    pub fn attempt(&self, presented: &str, window: PairingWindow, now: u64) -> Redeem {
+        if !self.is_live(window, now) {
+            return Redeem::Expired;
+        }
+        if self.cooling_down(now) {
+            return Redeem::CoolingDown;
+        }
+        let Ok(presented) = PairingCode::parse(presented) else {
+            return Redeem::Malformed;
+        };
+        if crate::token::ct_eq(
+            self.digest.as_bytes(),
+            crate::token::sha256_hex(presented.digits().as_bytes()).as_bytes(),
+        ) {
+            return Redeem::Matched;
+        }
+        let attempts = self.attempts + 1;
+        if attempts >= window.max_attempts {
+            Redeem::Exhausted
+        } else {
+            Redeem::Mismatch(attempts)
+        }
+    }
+
+    /// 记录一次猜错；达上限时转入冷却（**不作废码**）
+    ///
+    /// 暂停而不是作废：作废等于把「关掉别人配对窗口」的能力交给任何能连到
+    /// 端口的人（见 [`ATTEMPT_COOLDOWN_SECS`]）。
+    pub fn record_guess(&mut self, attempts: u32) {
+        self.attempts = attempts;
+        self.blocked_until = 0;
+    }
+
+    /// 猜错次数用尽：清零并进入冷却
+    pub fn enter_cooldown(&mut self, now: u64) {
+        self.attempts = 0;
+        self.blocked_until = now.saturating_add(ATTEMPT_COOLDOWN_SECS);
+    }
+}
+
+/// [`PairingSlot::attempt`] 的判定结果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Redeem {
+    /// 码正确，应当销毁这条状态
+    Matched,
+    /// 码错了，累计到 `attempts` 次（尚未达上限）
+    Mismatch(u32),
+    /// 码错了且用尽次数，应进入冷却
+    Exhausted,
+    /// 已过期，应销毁这条状态
+    Expired,
+    /// 处于冷却期，状态原样保留
+    CoolingDown,
+    /// 输入形态非法，不计数（形态错不算猜码，否则手抖也能锁死窗口）
+    Malformed,
+}
+
+/// 内存态的配对码：SSH 引导与前台调试用
+///
+/// 「屏幕上总有当前有效码」由调用方轮询 [`Self::rotate_if_expired`] 维持；
+/// 后台常驻形态**不使用**本类型（见 [`crate::grant`]）。
+///
+/// 判定全部委托给 [`PairingSlot`]，本类型只负责持有明文码并把它交给展示方。
+#[derive(Debug, Clone)]
+pub struct PairingCodeStore {
+    window: PairingWindow,
+    active: Option<PairingCode>,
+    slot: Option<PairingSlot>,
 }
 
 impl PairingCodeStore {
@@ -158,6 +313,7 @@ impl PairingCodeStore {
         Self {
             window,
             active: None,
+            slot: None,
         }
     }
 
@@ -168,22 +324,19 @@ impl PairingCodeStore {
     /// 系统随机源不可用时返回 [`PairingCodeError::Random`]
     pub fn issue(&mut self, now: u64) -> Result<PairingCode, PairingCodeError> {
         let code = PairingCode::generate()?;
-        self.active = Some(ActiveCode {
-            code: code.clone(),
-            issued_at: now,
-            attempts: 0,
-            blocked_until: 0,
-        });
+        self.slot = Some(PairingSlot::new(&code, now));
+        self.active = Some(code.clone());
         Ok(code)
     }
 
     /// 当前有效码（供 serve 端展示；无有效码时为 `None`）
     #[must_use]
     pub fn current(&self, now: u64) -> Option<&PairingCode> {
-        self.active
-            .as_ref()
-            .filter(|active| self.is_live(active, now))
-            .map(|active| &active.code)
+        self.active.as_ref().filter(|_| {
+            self.slot
+                .as_ref()
+                .is_some_and(|slot| slot.is_live(self.window, now))
+        })
     }
 
     /// 兑换：成功即作废；失败计数，达上限后进入冷却（不作废码）
@@ -193,41 +346,42 @@ impl PairingCodeStore {
     /// 没有有效码 / 输入形态非法 / 码不对 / 处于冷却期时返回
     /// [`PairingCodeError`]
     pub fn redeem(&mut self, presented: &str, now: u64) -> Result<(), PairingCodeError> {
-        // 先判定存活再取可变借用：过期与冷却都归到同一个 Unusable
-        match self.active.as_ref() {
-            Some(active) if self.is_live(active, now) => {
-                if now < active.blocked_until {
-                    return Err(PairingCodeError::Unusable);
-                }
-            }
-            Some(_) => {
-                self.active = None;
-                return Err(PairingCodeError::Unusable);
-            }
-            None => return Err(PairingCodeError::Unusable),
-        }
-        let active = self.active.as_mut().ok_or(PairingCodeError::Unusable)?;
-
-        let presented = PairingCode::parse(presented)?;
-        if presented.matches(&active.code) {
-            // 单次使用：成功即销毁，不给重放留窗口
-            self.active = None;
-            return Ok(());
-        }
-
-        active.attempts += 1;
-        if active.attempts >= self.window.max_attempts {
-            // 暂停而不是作废：作废等于把「关掉别人配对窗口」的能力交给任何
-            // 能连到端口的人（见 ATTEMPT_COOLDOWN_SECS）
-            active.attempts = 0;
-            active.blocked_until = now.saturating_add(ATTEMPT_COOLDOWN_SECS);
+        let Some(slot) = self.slot.clone() else {
+            return Err(PairingCodeError::Unusable);
+        };
+        if !slot.is_live(self.window, now) {
+            self.clear();
             return Err(PairingCodeError::Unusable);
         }
-        Err(PairingCodeError::Mismatch)
+        if slot.cooling_down(now) {
+            return Err(PairingCodeError::Unusable);
+        }
+        match slot.attempt(presented, self.window, now) {
+            Redeem::Matched => {
+                self.clear();
+                Ok(())
+            }
+            Redeem::Mismatch(attempts) => {
+                if let Some(slot) = self.slot.as_mut() {
+                    slot.record_guess(attempts);
+                }
+                Err(PairingCodeError::Mismatch)
+            }
+            Redeem::Exhausted => {
+                if let Some(slot) = self.slot.as_mut() {
+                    slot.enter_cooldown(now);
+                }
+                Err(PairingCodeError::Unusable)
+            }
+            Redeem::Malformed => Err(PairingCodeError::Malformed),
+            // 上面两个分支已先行返回，这里仅为穷尽匹配
+            Redeem::Expired | Redeem::CoolingDown => Err(PairingCodeError::Unusable),
+        }
     }
 
-    /// 作废当前码（`serve --stop` / 重新 issue 前的显式清理）
+    /// 作废当前码
     pub fn clear(&mut self) {
+        self.slot = None;
         self.active = None;
     }
 
@@ -239,14 +393,14 @@ impl PairingCodeStore {
     /// 因为轮换被提前放行。
     #[must_use]
     pub fn expired(&self, now: u64) -> bool {
-        self.active
+        self.slot
             .as_ref()
-            .is_some_and(|active| !self.is_live(active, now))
+            .is_some_and(|slot| !slot.is_live(self.window, now))
     }
 
     /// 过期则轮换：发一枚新码并返回，未过期返回 `None`
     ///
-    /// 只在自然过期时轮换（见 [`Self::expired`]）。常驻 agent 靠它维持
+    /// 只在自然过期时轮换（见 [`Self::expired`]）。**连续形态**靠它维持
     /// 「屏幕上总有当前有效码」，同时不削弱单码的限速与单次使用。
     ///
     /// # Errors
@@ -259,17 +413,26 @@ impl PairingCodeStore {
         self.issue(now).map(Some)
     }
 
+    /// 剩余有效秒数（无有效码时为 `None`）
+    #[must_use]
+    pub fn remaining_secs(&self, now: u64) -> Option<u64> {
+        self.slot
+            .as_ref()
+            .and_then(|slot| slot.remaining(self.window, now))
+    }
+
+    /// 此刻是否处于猜码冷却
+    #[must_use]
+    pub fn cooling_down(&self, now: u64) -> bool {
+        self.slot
+            .as_ref()
+            .is_some_and(|slot| slot.cooling_down(now))
+    }
+
     /// 窗口参数
     #[must_use]
     pub fn window(&self) -> PairingWindow {
         self.window
-    }
-
-    /// 是否仍在有效期内
-    fn is_live(&self, active: &ActiveCode, now: u64) -> bool {
-        // 时钟回拨按「已过期」处理：宁可让用户重开一次，也不让码活得比预期久
-        now.checked_sub(active.issued_at)
-            .is_some_and(|elapsed| elapsed < self.window.ttl_secs)
     }
 }
 

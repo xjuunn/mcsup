@@ -352,7 +352,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// SHA-256 十六进制
-fn sha256_hex(input: &[u8]) -> String {
+pub(crate) fn sha256_hex(input: &[u8]) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, input);
     hex(digest.as_ref())
 }
