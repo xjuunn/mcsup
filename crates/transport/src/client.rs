@@ -17,10 +17,18 @@ use protocol::remote::{self, Request, Response};
 use rustls::{ClientConfig, ClientConnection, StreamOwned};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// 建连超时：局域网内建连失败通常立刻返回，这个上限只兜「对端不响应」
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 建连失败后的冷却窗口
+///
+/// 一个命令里往往对同一远端发多帧（`ws ls` 要拉工作区与服务器两份列表）。
+/// 对端离线时每次都重新等满 `CONNECT_TIMEOUT`，会把单条命令拖成 N×10s。
+/// 首次建连失败后在窗口内直接快速失败，只让第一帧承担超时；进程退出即失效，
+/// 不影响下一次命令的重新尝试。
+pub const UNREACHABLE_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// 单次请求的读写超时
 ///
@@ -53,6 +61,8 @@ pub struct Client {
     token: Option<String>,
     /// 当前连接；断线后置空
     conn: Mutex<Option<Conn>>,
+    /// 冷却截止时刻：最近一次建连失败后，在此前不再重试建连
+    unreachable_until: Mutex<Option<Instant>>,
 }
 
 impl std::fmt::Debug for Client {
@@ -74,6 +84,7 @@ impl Client {
             fingerprint,
             token: None,
             conn: Mutex::new(None),
+            unreachable_until: Mutex::new(None),
         }
     }
 
@@ -364,9 +375,51 @@ impl Client {
     }
 
     /// 建一条新连接（已完成 TLS 握手）
+    ///
+    /// 最近一次建连失败后进入冷却：窗口内直接快速失败，避免同一命令里每个
+    /// 请求都重新等满 `CONNECT_TIMEOUT`（离线远端上的多帧命令会被拖成 N×10s）。
     fn connect(&self) -> Result<Conn, TransportError> {
+        if self.in_cooldown() {
+            return Err(TransportError::io(
+                format!("connect {}", self.target),
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "remote was unreachable moments ago; not retrying yet",
+                ),
+            ));
+        }
         let config = tls::client_config(&self.fingerprint)?;
-        connect_with(&self.target, &config)
+        match connect_with(&self.target, &config) {
+            Ok(conn) => {
+                self.clear_cooldown();
+                Ok(conn)
+            }
+            Err(err) => {
+                self.start_cooldown();
+                Err(err)
+            }
+        }
+    }
+
+    /// 是否处于建连失败后的冷却窗口内
+    fn in_cooldown(&self) -> bool {
+        self.unreachable_until
+            .lock()
+            .ok()
+            .and_then(|guard| *guard)
+            .is_some_and(|until| Instant::now() < until)
+    }
+
+    fn start_cooldown(&self) {
+        if let Ok(mut guard) = self.unreachable_until.lock() {
+            *guard = Some(Instant::now() + UNREACHABLE_COOLDOWN);
+        }
+    }
+
+    fn clear_cooldown(&self) {
+        if let Ok(mut guard) = self.unreachable_until.lock() {
+            *guard = None;
+        }
     }
 
     /// 取连接锁
@@ -560,6 +613,18 @@ mod tests {
         let err = client.call(&Request::Ping).expect_err("refused");
         assert!(matches!(err, TransportError::Io { .. }), "{err:?}");
         assert!(err.is_retryable());
+    }
+
+    /// 建连失败后进入冷却：同一命令里的后续请求不再各自等满超时
+    #[test]
+    fn failed_connect_starts_the_cooldown() {
+        let client =
+            Client::new("127.0.0.1:1", Fingerprint::of_der(b"cert")).with_token("a".repeat(64));
+        assert!(!client.in_cooldown(), "初始不在冷却");
+        client
+            .call(&Request::Ping)
+            .expect_err("closed port must fail");
+        assert!(client.in_cooldown(), "建连失败后应进入冷却");
     }
 
     /// 建连失败不重试：没有断掉的连接可重建，重试只会把等待翻倍

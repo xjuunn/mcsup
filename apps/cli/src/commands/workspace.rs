@@ -17,6 +17,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub(crate) fn run(action: WorkspaceAction, printer: Printer) -> Result<()> {
+    // `--origin local`：只读本地，完全不装配/探测远端（省掉所有远端往返与凭证读取）
+    if let WorkspaceAction::List { origin } = &action {
+        let filter = super::origin::filter(origin.as_deref(), printer.lang())?;
+        if matches!(filter, mcsup::service::OriginFilter::LocalOnly) {
+            let local = bootstrap::open_store()?;
+            let svc = WorkspaceService::new(local.clone(), local.clone());
+            let reg = ServerRegistry::new(local.clone(), local.clone());
+            return list(&svc, &reg, &filter, printer);
+        }
+    }
     let reg = bootstrap::open_registry_with_remotes()?;
     let local = bootstrap::open_store()?;
     // 组合仓库版工作区服务：远端工作区出现在 list，本地 init / use / remove
@@ -450,19 +460,22 @@ fn list(
         .into_iter()
         .filter(|sourced| filter.matches(&sourced.origin))
         .collect();
+    // 服务器数：一次取全量再按工作区计数，避免每行各拉一次服务器列表
+    // （远端列表是 RPC，逐行调用会退化成 M×N 次往返 / 建连等待）
+    let counts = reg.counts_by_workspace()?;
     let rows: Vec<WorkspaceRow<'_>> = all
         .iter()
         .map(|sourced| {
             let ws = &sourced.value;
-            Ok(WorkspaceRow {
+            WorkspaceRow {
                 origin: super::origin::label(&sourced.origin),
                 name: ws.name.as_str(),
                 path: ws.path.display().to_string(),
-                servers: reg.count_in(&ws.id)?,
+                servers: counts.get(&ws.id).copied().unwrap_or(0),
                 current: ws.is_current,
-            })
+            }
         })
-        .collect::<Result<_>>()?;
+        .collect();
     let lang = printer.lang();
     printer.print_rows(
         &rows,

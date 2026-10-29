@@ -1066,6 +1066,26 @@ impl ServerRegistry {
             .count())
     }
 
+    /// 一次读取服务器列表，按工作区统计数量
+    ///
+    /// 列表页需要对每个工作区显示服务器数；逐行调用 [`Self::count_in`] 会把
+    /// 同一份服务器列表（远端还要走 RPC）重复拉 M 次，离线远端上退化成
+    /// M×N 次建连等待。这里只读一次，调用方按 id 查表。
+    ///
+    /// # Errors
+    ///
+    /// 注册表失败时返回 [`ServerRegistryError`]
+    pub fn counts_by_workspace(
+        &self,
+    ) -> Result<std::collections::HashMap<WorkspaceId, usize>, ServerRegistryError> {
+        let mut counts: std::collections::HashMap<WorkspaceId, usize> =
+            std::collections::HashMap::new();
+        for meta in self.servers.list()? {
+            *counts.entry(meta.workspace_id).or_insert(0) += 1;
+        }
+        Ok(counts)
+    }
+
     fn resolve_workspace(&self, selector: Option<&str>) -> Result<Workspace, ServerRegistryError> {
         match selector {
             Some(sel) => {
@@ -1357,13 +1377,20 @@ mod tests {
 
     struct MemServers {
         items: std::sync::Mutex<Vec<ServerMeta>>,
+        /// `list()` 被调用的次数（回归测试用：批量计数只能读一次）
+        list_calls: std::sync::atomic::AtomicUsize,
     }
 
     impl MemServers {
         fn new() -> Self {
             Self {
                 items: std::sync::Mutex::new(Vec::new()),
+                list_calls: std::sync::atomic::AtomicUsize::new(0),
             }
+        }
+
+        fn list_calls(&self) -> usize {
+            self.list_calls.load(std::sync::atomic::Ordering::Relaxed)
         }
     }
 
@@ -1388,6 +1415,8 @@ mod tests {
                 .ok_or_else(|| RepositoryError::NotFound(name.as_str().to_owned()))
         }
         fn list(&self) -> Result<Vec<ServerMeta>, RepositoryError> {
+            self.list_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut items = self.items.lock().expect("lock").clone();
             items.sort_by(|a, b| a.name.cmp(&b.name));
             Ok(items)
@@ -1642,6 +1671,49 @@ mod tests {
             created_at: 1_700_000_000,
             updated_at: 1_700_000_000,
         }
+    }
+
+    /// 列表页用的批量计数：一次读取按工作区分组，结果与逐行 `count_in` 一致
+    #[test]
+    fn counts_by_workspace_matches_per_workspace_totals() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let servers = Arc::new(MemServers::new());
+        let ws1 = ws_fixture(tmp.path());
+        let ws2 = ws2_fixture(tmp.path());
+        let reg = ServerRegistry::new(servers.clone(), Arc::new(MemWorkspaces::new(ws1.clone())));
+
+        let meta = |name: &str, ws: &Workspace, n: u8| ServerMeta {
+            id: ServerId::parse(&format!("550e8400-e29b-41d4-a716-44665544000{n}")).expect("id"),
+            name: ServerName::parse(name).expect("name"),
+            workspace_id: ws.id.clone(),
+            rel_dir: PathBuf::from(name),
+            version: VersionId::new("1.21.1"),
+            variant: ServerVariant::Vanilla,
+            jar: None,
+            launch: None,
+            settings: ServerSettings::default(),
+            java_major: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+        servers.create(&meta("a", &ws1, 1)).expect("a");
+        servers.create(&meta("b", &ws1, 2)).expect("b");
+        servers.create(&meta("c", &ws2, 3)).expect("c");
+
+        let counts = reg.counts_by_workspace().expect("counts");
+        assert_eq!(counts.get(&ws1.id).copied(), Some(2));
+        assert_eq!(counts.get(&ws2.id).copied(), Some(1));
+        // 批量计数只读一次服务器列表（回归：逐行 count_in 会读 M 次）
+        assert_eq!(
+            servers.list_calls(),
+            1,
+            "counts_by_workspace 只能拉一次列表"
+        );
+        // 与逐行口径一致
+        assert_eq!(
+            counts.get(&ws1.id).copied(),
+            Some(reg.count_in(&ws1.id).expect("count_in"))
+        );
     }
 
     #[cfg(unix)]
