@@ -127,7 +127,7 @@ CLI 又为远端提前分流、根本不装配 `InstallSession`。本阶段把�
   对端黑洞时确实可能长时间等待，权衡后保留。
 - **`NOT_FOUND` → `SupervisorError::Unreachable`**：`service` 侧把「不存在」与
   「不可达」都按「目标不可用」渲染，统一归 `Unreachable`，不额外区分。
-- **默认监听 `0.0.0.0:7681`**：直连接入需要局域网可达；已用运行时提醒引导
+- **默认监听 `127.0.0.1:7681`**：只开回环；对外直连需显式 `--listen 0.0.0.0:7681`；已用运行时提醒引导
   用户收紧防火墙或改绑回环。
 - **`server link` / `workspace init --origin` 接受任意绝对路径**：远端管理员
   的既有能力（`Write` 权限），不引入白名单以免阻断合法布局。
@@ -501,10 +501,17 @@ roundtrip 全量权限覆盖补 `BackupList` 样例（`Permission::Backup` 豁�
 
 ### 阶段 10：CLI（已完成的部分）
 
-- `remote serve`：前台运行 `mcsup::remote::Agent`，打印名称 / 地址 / 指纹 /
-  配对码；码过期自动轮换。`--status` 离线读身份、名册与 pid；`--stop` 按
-  `{data_dir}/remote/agent.pid` 终止前台进程。**系统服务注册（systemd /
-  launchd）尚未实现**，`serve` 目前是前台进程。
+- `remote serve start|stop|status`：后台常驻 agent（`start` 用当前可执行文件
+  拉起 `--foreground` 子进程，父进程等实例锁被持有后返回）。单实例靠
+  `{data_dir}/remote/agent.lock` 的**内核文件锁**判定，不是「pid 文件存在即
+  占位」；pid 文件只用于停止与展示。日志追加进 `{data_dir}/remote/agent.log`，
+  启动时超过 5 MiB 滚到 `.1`。`stop` 发 `SIGTERM` 后等锁释放才算停（`--force`
+  强杀）；未运行时幂等成功。`--foreground` 保留前台调试。**系统服务注册
+  （systemd / launchd）仍未实现**，开机自启与崩溃重启需用户自行托管。
+- `remote code`：**按需发码**——`serve start` 后不持有任何配对码，只有本命令
+  生成一枚，落盘 `{data_dir}/remote/grant.toml`（`0600`，只存 SHA-256 摘要），
+  兑换即删、到期即无。缺省 300 秒、范围 30–3600 秒，`--clear` 作废。这是为了
+  解决「后台常驻 + 屏幕上总有码 = 长期存在一枚可被猜的码」。
 - `remote connect <host[:port]>`：`Client::probe` 捕获 TLS 指纹 → 展示并确认
   （非交互需 `-y`）→ `Enroll` → 写 `credentials.toml`（0600）与
   `config.toml [remotes.*]` → 打印同步摘要。交互确认指纹后提示命名（默认
@@ -561,6 +568,12 @@ CLI 二进制，覆盖 `connect user@host → list → ping → reconnect →
 workspace init/ls --origin → disconnect`，以及 SSH 失败时的握手错误与 `list`
 降级。示例只在测试时按需编译，不进 `cargo install` 的产物。
 
+按需发码的验收测试：`crates/mcsup/tests/pairing_on_demand.rs` 锁定「启动即无
+码」「无码时 Enroll 必被拒」「一码一用」「过期码不可兑换」「按需形态不自动
+补码」「连续形态不受影响」；`apps/cli/tests/cli_serve_daemon.rs` 用真进程覆盖
+`serve start → status → stop`、重复 start 报冲突（退出码 4）、停止后端口不可
+连，以及「后台 agent 接受本机 `remote code` 生成的码并只出现一次」。
+
 测试：`apps/cli/tests/cli_remote.rs` 用真 agent + 真 CLI 覆盖
 `connect → list → workspace init --origin → workspace ls --origin → ping →
 disconnect`、`server create/list/status/remove --origin`、`java scan --origin`，
@@ -572,8 +585,13 @@ disconnect`、`server create/list/status/remove --origin`、`java scan --origin`
 
 - `connect` 无参数目前报用法错误；局域网发现需要 mDNS/SSDP 或端口扫描，
   并处理多网卡、防火墙与同名冲突。
-- 系统服务注册（systemd unit / launchd plist）未做，`serve` 仍是前台进程。
-  SSH 接入不需要它（每条命令临时起 agent），直连接入才需要常驻。
+- 系统服务注册（systemd unit / launchd plist）未做：`serve start` 只覆盖
+  「现在就要用」，开机自启与崩溃重启仍需用户自行托管。SSH 接入不需要它
+  （每条命令临时起 agent），直连接入才需要常驻。
+- **按来源 IP 的连接上限未做**：当前只有全局 32 条上限，单个 IP 可以占满槽位
+  让合法管理员连不进来；`transport::Handler` 也还拿不到对端地址，因此失败
+  Enroll 无法按来源计数。后台常驻把暴露时间拉长后，这两条从理论问题变成实际
+  风险，是下一项该补的。
 - SSH 接入已落地，见「阶段 10：SSH 接入」；跨机器真机验证（两台物理机 +
   局域网地址）仍待手工执行。
 

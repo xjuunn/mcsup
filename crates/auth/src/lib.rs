@@ -20,13 +20,19 @@
 
 pub mod code;
 pub mod credential;
+pub mod grant;
 pub mod registry;
 pub mod token;
 
-pub use code::{PairingCode, PairingCodeError, PairingCodeStore, PairingWindow};
+pub use code::{
+    PairingCode, PairingCodeError, PairingCodeStore, PairingSlot, PairingWindow, Redeem,
+};
 pub use credential::{
     CREDENTIAL_STORE_ENV, CredentialError, CredentialStore, CredentialVault, FileCredentialStore,
     KEYRING_SERVICE, KeyringBackend, KeyringCredentialStore, StoredCredential, SystemKeyring,
+};
+pub use grant::{
+    DEFAULT_ON_DEMAND_TTL_SECS, GrantError, GrantStatus, MAX_TTL_SECS, MIN_TTL_SECS, PairingGrant,
 };
 pub use registry::{ClientRecord, ClientRegistry, RegistryError};
 pub use token::{ClientId, Permission, RevocationList, Role, Token, TokenDigest, TokenError};

@@ -163,7 +163,7 @@ pub enum Request {
     },
     /// 连通性 / 版本 / 能力探测
     Ping,
-    /// 通知 agent 在空载后退出（`remote serve --stop` 用）
+    /// 通知 agent 在空载后退出（`remote serve stop` 走信号，本帧供程序化停机）
     Shutdown,
 
     /// 列出工作目录

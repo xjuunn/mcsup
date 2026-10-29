@@ -107,8 +107,69 @@ pub(crate) fn remote() -> &'static str {
 #[must_use]
 pub(crate) fn remote_serve() -> &'static str {
     t(
-        "本机作为被连接端：启动 agent 并打印配对信息",
-        "serve this machine: start the agent and print pairing info",
+        "本机作为被连接端：后台启动 / 停止 / 查看监听",
+        "serve this machine: start, stop or inspect the listener",
+    )
+}
+
+#[must_use]
+pub(crate) fn remote_serve_start() -> &'static str {
+    t(
+        "后台启动 agent 并开始监听（启动时不生成配对码）",
+        "start the agent in the background (no pairing code is created)",
+    )
+}
+
+#[must_use]
+pub(crate) fn remote_serve_stop() -> &'static str {
+    t(
+        "停止本机 agent（不经过网络）",
+        "stop the local agent (no network involved)",
+    )
+}
+
+#[must_use]
+pub(crate) fn remote_serve_status() -> &'static str {
+    t(
+        "查看监听状态：地址、指纹、客户端、配对码剩余时间",
+        "inspect the listener: address, fingerprint, clients, pairing code lifetime",
+    )
+}
+
+#[must_use]
+pub(crate) fn remote_code() -> &'static str {
+    t(
+        "在本机生成一枚一次性配对码（5 分钟有效，只显示这一次）",
+        "mint a one-shot pairing code on this machine (valid 5 minutes, shown once)",
+    )
+}
+
+#[must_use]
+pub(crate) fn remote_code_ttl_arg() -> &'static str {
+    t(
+        "有效期秒数（30..=3600，缺省 300）",
+        "lifetime in seconds (30..=3600, default 300)",
+    )
+}
+
+#[must_use]
+pub(crate) fn remote_code_clear_arg() -> &'static str {
+    t("作废当前配对码", "revoke the current pairing code")
+}
+
+#[must_use]
+pub(crate) fn remote_foreground_arg() -> &'static str {
+    t(
+        "前台运行并打印日志（调试用，Ctrl-C 结束）",
+        "stay in the foreground and log to the terminal (debugging)",
+    )
+}
+
+#[must_use]
+pub(crate) fn remote_data_dir_arg() -> &'static str {
+    t(
+        "数据目录（缺省为平台数据目录）",
+        "data directory (defaults to the platform data directory)",
     )
 }
 
@@ -186,6 +247,14 @@ pub(crate) fn remote_listen_arg() -> &'static str {
     t(
         "监听地址（缺省 127.0.0.1:7681，只监听本机；其他机器要连请显式写 0.0.0.0:7681）",
         "listen address (default 127.0.0.1:7681, loopback only; use 0.0.0.0:7681 to accept other machines)",
+    )
+}
+
+#[must_use]
+pub(crate) fn remote_local_name_arg() -> &'static str {
+    t(
+        "本机名（客户端连接时的缺省远端名，缺省取系统主机名）",
+        "the name for this machine (becomes the client's default remote name; defaults to the host name)",
     )
 }
 

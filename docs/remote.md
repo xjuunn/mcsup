@@ -68,29 +68,42 @@ mcsup 的远程能力：一台机器上的 `mcsup` 可以像管理本地资源�
 
 ### 被连接端（远端主机）
 
-只需要一条命令：
+只需要两条命令：一条把 agent 放到后台，一条在需要配对时取码。
 
 ```
-$ mcsup remote serve --listen 0.0.0.0:7681
-mcsup 已开始接受连接
+$ mcsup remote serve start --listen 0.0.0.0:7681
+mcsup 已在后台监听
   名称    prod-box
-  地址    0.0.0.0:7681      （同一局域网可自动发现）
-  配对码  4821-9375        （10 分钟内有效）
+  地址    0.0.0.0:7681
+  指纹    3f:a1:...:9c
+  进程    41207
+  日志    ~/.local/share/mcsup/remote/agent.log
+  配对码  未生成（按需发放）
+          需要配对时运行：mcsup remote code
+
+$ mcsup remote code
+配对码  4821-9375
+        5 分钟内有效，只能用一次；本命令只显示这一次
 ```
 
 缺省监听 `127.0.0.1:7681`，只接受本机连接（SSH 引导足够用）。
 要让同一网络里的其他机器直连，必须显式 `--listen 0.0.0.0:7681` 并自行
 放行防火墙——对外开端口是用户的决定，不该由缺省值代劳。
 
-它当前是**前台进程**（与 `mcsup-agent` 同一份实现）；系统服务注册
-（systemd / launchd）尚未实现，需要用户自行用 `nohup` / `tmux` / 服务管理器
-托管。
+**配对码按需发放**：`serve start` 之后没有码。码只在 `remote code` 时生成，
+落盘为 `{data_dir}/remote/grant.toml`（`0600`，**只存摘要**），兑换一次即删除，
+到期自动失效。所以端口长期开着也不存在「一直有一枚可以被猜的码」。
+
+后台进程由单实例锁（`{data_dir}/remote/agent.lock`，内核文件锁）保证唯一；
+pid 文件只用于停止与展示。系统服务注册（systemd / launchd）尚未实现——开机
+自启与崩溃重启仍需用户自行用服务管理器托管，`serve start` 只覆盖「现在就要用」。
 
 | 命令 | 说明 |
 | --- | --- |
-| `mcsup remote serve [--listen <addr>] [--name <n>]` | 前台运行 agent，打印名称、地址、指纹、配对码；缺省只听 `127.0.0.1:7681`，对外直连需显式 `--listen 0.0.0.0:7681` |
-| `mcsup remote serve --status` | 离线查看本机身份指纹、pid 与已配对客户端 |
-| `mcsup remote serve --stop` | 按 `{data_dir}/remote/agent.pid` 终止前台进程；pid 已被别的程序复用时拒绝误杀并清理陈旧文件 |
+| `mcsup remote serve start [--listen <addr>] [--name <n>] [--foreground]` | 后台启动 agent；缺省只听 `127.0.0.1:7681`，对外直连需显式 `--listen 0.0.0.0:7681`；`--foreground` 留在前台打日志（调试） |
+| `mcsup remote serve status` | 离线查看状态：是否运行、地址、指纹、pid、已配对客户端、配对码剩余时间（**不回显码**） |
+| `mcsup remote serve stop [--force]` | 按 pid 发 `SIGTERM` 并等实例锁释放；`--force` 强杀。未运行时幂等成功 |
+| `mcsup remote code [--ttl <secs>] [--clear]` | 生成一枚一次性配对码（缺省 300 秒，范围 30–3600）；`--clear` 作废当前码 |
 | `mcsup remote revoke <client>` | 离线撤销某个客户端（删除名册记录，立即失效） |
 
 ### 连接端（本地主机）
@@ -310,9 +323,19 @@ error: “web” 存在于多个位置
 - **配对码**：短时有效、单次使用、限速尝试。连续猜错达上限后进入 60 秒
   冷却：**不作废码**，否则任何能连到端口的人猜 5 次就能关掉合法用户的配对
   窗口（窗口轮换后还能继续关），构成远程拒绝服务。
+- **发码策略**：两种运行形态共用同一份兑换判定，差别只在谁决定发码。
+  **连续**（SSH 引导、`serve start --foreground` 调试）码在进程内存里，屏幕上
+  总有当前码；**按需**（`serve start`、`mcsup-agent`）启动不持有任何码，只由
+  本机 `remote code` 生成，落盘只存摘要、兑换即删、到期即无。
+- **码不出本机**：发码只经本机命令行输出，**不进入网络协议**——已配对的
+  viewer 不能为自己或他人造码。
 - **暴露面**：缺省只听回环；对外监听必须显式传 `--listen`。TCP 连接数有上限，
   且握手阶段（TLS + `Hello` + 认证）有 10 秒独立超时——连上不发数据的扫描器
   不能占着连接槽位等业务超时。
+  按需发码把「可被猜中的时间」从「agent 活多久」压到「管理员主动要码的那几分钟」，
+  但它**不改变端口长期开放这件事**：无码时攻击者仍能握手、扫端口、占连接槽位
+  （全局 32 条，按来源 IP 的上限尚未实现）。因此跨机接入优先用 SSH 引导
+  （不开口）或 VPN / 隧道，直连对外监听只建议在可信内网使用。
 - **权限**：默认 operator，可 `--read-only`（viewer）。`Admin` 目前没有
   配对入口，`Manage` 权限的 `Shutdown` / `ClientList` / `ClientRevoke` 帧
   保留但**当前不可达**。
