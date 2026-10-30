@@ -413,11 +413,13 @@ roundtrip 全量权限覆盖补 `BackupList` 样例（`Permission::Backup` 豁�
   本地仓库**——能到达组合仓库的写只有 service 的本地操作（`init` /
   `set_current` / `create` / `upsert` / `update_core` …），远端写由路由层
   分派给镜像显式方法，不经组合仓库。
-- CLI 装配：`remote_members` 读 `config.toml [remotes.*]` +
-  `FileCredentialStore` 构造成员表，过滤非法名 / 非 `direct` / 缺指纹 /
-  缺凭证（逐台跳过不阻塞）；`open_mcsup_with_remotes` 经 `McsupBuilder`
-  注入三个组合仓库，`open_registry_with_remotes` / `open_java_service` /
-  `workspace` 命令同口径。无已配对远端时与原装配完全等价。
+- CLI 装配：`remote_members` 读 `config.toml [remotes.*]` 构造成员表，过滤
+  非法名 / 缺指纹（逐台跳过不阻塞）；**凭证不在装配期解封**，
+  `RemoteLink::deferred` 把读钥匙串推到首次发帧（`server ls` 因此零钥匙串
+  访问，见「凭证只在首次建连时解封」）。`open_mcsup_with_remotes` 经
+  `McsupBuilder` 注入三个组合仓库，`open_registry_with_remotes` /
+  `open_java_service` / `workspace` 命令同口径。无已配对远端时与原装配
+  完全等价。
 - 测试：backend 侧 9 个（真 TLS 垫片 agent + 组合层行为），CLI 侧 6 个
   （成员装配过滤规则）。
 
