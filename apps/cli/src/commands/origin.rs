@@ -61,6 +61,29 @@ pub(crate) fn label(origin: &Origin) -> String {
     origin.as_str().to_owned()
 }
 
+/// 来源标签 + 离线标记（人类模式显示用）
+///
+/// `offline` 是数据新鲜度，不是来源身份：`--origin prod-box` 仍然命中这些
+/// 条目，写命令也仍然路由到那台机器（能不能连上是它自己的事）。标记只在
+/// 人类模式出现，JSON 里的 `origin` 保持纯标识符。
+#[must_use]
+pub(crate) fn label_marked(origin: &Origin, offline: bool, never_synced: bool) -> String {
+    match origin {
+        // 本地没有「离线」这回事
+        Origin::Local => label(origin),
+        Origin::Remote(name) => {
+            let _ = name;
+            if never_synced {
+                format!("{} (never synced)", label(origin))
+            } else if offline {
+                format!("{} (offline)", label(origin))
+            } else {
+                label(origin)
+            }
+        }
+    }
+}
+
 /// 按来源取远端成员；本地来源返回 `None`
 ///
 /// # Errors

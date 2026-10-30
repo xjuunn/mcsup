@@ -110,6 +110,13 @@ pub(crate) enum Command {
     #[command(about = crate::meta::version())]
     #[command(visible_alias = "ver")]
     Version,
+    /// 隐藏入口：为某台远端刷新本地缓存（由读命令在后台拉起）
+    #[command(name = "__remote-refresh", hide = true, about = "刷新远端缓存")]
+    RemoteRefresh {
+        /// 远端名（配置键）
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
     #[command(name = "__supervise", hide = true, about = crate::meta::supervise())]
     Supervise {
         #[arg(long, value_name = "PATH", help = crate::meta::supervise_dir_arg())]

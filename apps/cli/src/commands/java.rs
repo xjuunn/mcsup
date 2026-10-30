@@ -55,6 +55,8 @@ pub(crate) fn list(filter: &mcsup::service::OriginFilter, printer: Printer) -> R
             let rt = &item.value;
             JavaRow {
                 origin: super::origin::label(&item.origin),
+                offline: item.offline,
+                never_synced: never_synced(&item.origin),
                 major: rt.major.as_i64(),
                 version: rt.version.as_str(),
                 vendor: rt.vendor.as_str(),
@@ -86,7 +88,11 @@ pub(crate) fn list(filter: &mcsup::service::OriginFilter, printer: Printer) -> R
                 let rt = &item.value;
                 table.add_row([
                     rt.major.to_string(),
-                    super::origin::label(&item.origin),
+                    super::origin::label_marked(
+                        &item.origin,
+                        item.offline,
+                        never_synced(&item.origin),
+                    ),
                     rt.version.clone(),
                     rt.vendor.as_str().to_owned(),
                     if rt.managed {
@@ -100,6 +106,14 @@ pub(crate) fn list(filter: &mcsup::service::OriginFilter, printer: Printer) -> R
             table
         },
     )
+}
+
+/// 该来源是否从未同步成功过（只有远端会有这个状态）
+fn never_synced(origin: &mcsup::port::Origin) -> bool {
+    match origin {
+        mcsup::port::Origin::Local => false,
+        mcsup::port::Origin::Remote(name) => crate::remote_cache::never_synced(name),
+    }
 }
 
 pub(crate) fn scan(printer: Printer) -> Result<()> {

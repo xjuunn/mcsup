@@ -9,14 +9,18 @@
 //!
 //! - [`link`]：一条远端连接的网关（`RemoteLink`），错误映射的唯一出口
 //! - [`mirror`]：三个只读镜像仓库（workspace / server / java）
+//! - [`cache`]：镜像结果的本地缓存（离线读命令不再等建连超时）
+//! - [`refresh`]：一次完整同步（拉四份列表 → 原子写缓存）
 //!
 //! [`RemoteBackend`] 是 `port::Backend` 的远端实现：supervisor 走 RPC
 //! （[`RemoteSupervisor`]），installer 在 Installer 帧落地前不可用。
 
 pub mod backup;
+pub mod cache;
 pub mod combined;
 pub mod link;
 pub mod mirror;
+pub mod refresh;
 pub mod router;
 pub mod supervisor;
 
@@ -31,6 +35,7 @@ mod supervisor_tests;
 pub(crate) mod testkit;
 
 pub use backup::{RemoteBackups, RoutingBackups};
+pub use cache::{RefreshLock, RemoteCache, Snapshot, SyncState, TTL, now_secs};
 pub use combined::{
     CombinedJavaRepository, CombinedServerRepository, CombinedWorkspaceRepository, RemoteMember,
     RemoteMembers,

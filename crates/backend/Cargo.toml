@@ -12,6 +12,8 @@ domain = { version = "0.1.0", path = "../domain" }
 port = { version = "0.1.0", path = "../port" }
 protocol = { version = "0.1.0", path = "../protocol" }
 runtime = { version = "0.1.0", path = "../runtime" }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 transport = { version = "0.1.0", path = "../transport" }

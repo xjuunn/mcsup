@@ -467,12 +467,15 @@ fn list(
         .iter()
         .map(|sourced| {
             let ws = &sourced.value;
+            let never = matches!(sourced.origin, mcsup::port::Origin::Remote(ref name) if crate::remote_cache::never_synced(name));
             WorkspaceRow {
                 origin: super::origin::label(&sourced.origin),
                 name: ws.name.as_str(),
                 path: ws.path.display().to_string(),
                 servers: counts.get(&ws.id).copied().unwrap_or(0),
                 current: ws.is_current,
+                offline: sourced.offline,
+                never_synced: never,
             }
         })
         .collect();
@@ -496,7 +499,7 @@ fn list(
             for (sourced, row) in all.iter().zip(&rows) {
                 table.add_row([
                     sourced.value.name.as_str().to_owned(),
-                    row.origin.clone(),
+                    super::origin::label_marked(&sourced.origin, row.offline, row.never_synced),
                     row.path.clone(),
                     row.servers.to_string(),
                     if row.current { "*" } else { "" }.to_owned(),

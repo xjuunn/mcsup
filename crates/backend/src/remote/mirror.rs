@@ -1,6 +1,11 @@
 //! 远端只读镜像仓库：`port` 仓库 trait 的远端实现
 //!
 //! 三个实现都持有 [`RemoteLink`]，读路径直接把对端的 `list` 结果解回领域对象。
+//!
+//! 装配层传入 [`RemoteCache`] 时，读改走「本地缓存」：`list` 只读盘，一次
+//! 网络往返都不发（`docs/remote.md`「数据与同步」）。缓存过期与否由调用方
+//! 决定——它去起后台刷新；镜像侧只负责把旧值标成 `offline`。不传缓存时行为
+//! 与从前一致（每次都问对端），测试与探针路径用这个口径。
 //! 客户端不维护第二套注册表——「本地缓存 + TTL 刷新」留给装配层（组合仓库）
 //! 做，镜像本身永远说真话：能读到的是对端此刻的状态，读不到就报错。
 //!
@@ -17,6 +22,7 @@
 //! 单来源实现默认全部标 [`Origin::Local`]，镜像覆写成 [`Origin::Remote`]——
 //! 这是「组合仓库给合并列表标注来源」机制下，远端一方的真实标注。
 
+use super::cache::RemoteCache;
 use super::link::RemoteLink;
 use domain::java::JavaRuntime;
 use domain::server::launch::LaunchSpec;
@@ -28,6 +34,7 @@ use port::{Origin, RepositoryError, Sourced};
 use protocol::remote::wire::WirePropUpdate;
 use protocol::remote::{Request, Response};
 use std::path::Path;
+use std::sync::Arc;
 
 /// 远端「按整合包创建」的结果
 ///
@@ -77,13 +84,30 @@ pub struct RemoteLinkResult {
 pub struct RemoteWorkspaceRepository {
     link: RemoteLink,
     origin: Origin,
+    cache: Option<Arc<RemoteCache>>,
 }
 
 impl RemoteWorkspaceRepository {
     /// 构造；`origin` 是这台远端的来源标注
+    ///
+    /// 不带缓存：读即问对端（探针与测试口径）。
     #[must_use]
     pub fn new(link: RemoteLink, origin: Origin) -> Self {
-        Self { link, origin }
+        Self {
+            link,
+            origin,
+            cache: None,
+        }
+    }
+
+    /// 带缓存构造：读走本地缓存，不再访问对端
+    #[must_use]
+    pub fn with_cache(link: RemoteLink, origin: Origin, cache: Arc<RemoteCache>) -> Self {
+        Self {
+            link,
+            origin,
+            cache: Some(cache),
+        }
     }
 
     /// 在对端创建工作目录（`dir` 是**对端**机器上的路径）
@@ -106,7 +130,9 @@ impl RemoteWorkspaceRepository {
                 let wire = items.pop().ok_or_else(|| {
                     RepositoryError::Corrupt("workspace.init returned no record".to_owned())
                 })?;
-                Workspace::try_from(wire)
+                let ws = Workspace::try_from(wire)?;
+                self.write_through();
+                Ok(ws)
             }
             other => Err(unexpected(other, "workspace.init")),
         }
@@ -132,7 +158,9 @@ impl RemoteWorkspaceRepository {
                 let wire = items.pop().ok_or_else(|| {
                     RepositoryError::Corrupt("workspace.use returned no record".to_owned())
                 })?;
-                Workspace::try_from(wire)
+                let ws = Workspace::try_from(wire)?;
+                self.write_through();
+                Ok(ws)
             }
             other => Err(unexpected(other, "workspace.use")),
         }
@@ -152,7 +180,10 @@ impl RemoteWorkspaceRepository {
             "removed",
         )?;
         match response {
-            Response::Removed { disk_purged } => Ok(disk_purged),
+            Response::Removed { disk_purged } => {
+                self.write_through();
+                Ok(disk_purged)
+            }
             other => Err(unexpected(other, "workspace.remove")),
         }
     }
@@ -180,14 +211,9 @@ impl port::WorkspaceRepository for RemoteWorkspaceRepository {
     }
 
     fn list(&self) -> Result<Vec<Workspace>, RepositoryError> {
-        let response = self.link.expect(&Request::WorkspaceList, "workspaces")?;
-        match response {
-            Response::Workspaces { items } => {
-                let mut out = Vec::with_capacity(items.len());
-                decode_list("workspace", items, Workspace::try_from, &mut out)?;
-                Ok(out)
-            }
-            other => Err(unexpected(other, "workspace.list")),
+        match self.cache.as_deref() {
+            Some(cache) => decode_wires("workspace", cache.workspaces()?),
+            None => self.list_live(),
         }
     }
 
@@ -219,11 +245,56 @@ impl port::WorkspaceRepository for RemoteWorkspaceRepository {
     }
 
     fn list_sourced(&self) -> Result<Vec<Sourced<Workspace>>, RepositoryError> {
-        Ok(self
-            .list()?
+        let (items, offline) = self.read_sourced()?;
+        Ok(items
             .into_iter()
-            .map(|ws| Sourced::new(self.origin.clone(), ws))
+            .map(|ws| {
+                let sourced = Sourced::new(self.origin.clone(), ws);
+                if offline { sourced.offline() } else { sourced }
+            })
             .collect())
+    }
+}
+
+impl RemoteWorkspaceRepository {
+    /// 这台远端的缓存句柄（未装配缓存时为 `None`）
+    #[must_use]
+    pub fn cache(&self) -> Option<&Arc<RemoteCache>> {
+        self.cache.as_ref()
+    }
+
+    /// 写成功后回写缓存（best-effort）
+    ///
+    /// 写本身已经成功，缓存没跟上不该让命令失败：只记日志，等下一次后台刷新
+    /// 校正。重拉一份而不是本地改一条——列表口径（创建时间、对端的当前工作
+    /// 区…）只有对端说得准。
+    fn write_through(&self) {
+        let Some(cache) = self.cache.as_deref() else {
+            return;
+        };
+        if let Err(err) = super::refresh::store_workspaces(&self.link, cache) {
+            tracing::warn!(remote = cache.name().as_str(), %err, "workspace cache write-through failed");
+        }
+    }
+
+    /// 直接问对端（探针、刷新与无缓存装配用）
+    fn list_live(&self) -> Result<Vec<Workspace>, RepositoryError> {
+        let response = self.link.expect(&Request::WorkspaceList, "workspaces")?;
+        match response {
+            Response::Workspaces { items } => decode_wires("workspace", items),
+            other => Err(unexpected(other, "workspace.list")),
+        }
+    }
+
+    /// 列表 + 是否离线：读缓存时顺带取一次新鲜度元信息
+    fn read_sourced(&self) -> Result<(Vec<Workspace>, bool), RepositoryError> {
+        match self.cache.as_deref() {
+            Some(cache) => Ok((
+                decode_wires("workspace", cache.workspaces()?)?,
+                cache.is_offline(),
+            )),
+            None => Ok((self.list_live()?, false)),
+        }
     }
 }
 
@@ -232,6 +303,7 @@ impl port::WorkspaceRepository for RemoteWorkspaceRepository {
 pub struct RemoteServerRepository {
     link: RemoteLink,
     origin: Origin,
+    cache: Option<Arc<RemoteCache>>,
 }
 
 impl RemoteServerRepository {
@@ -242,9 +314,35 @@ impl RemoteServerRepository {
     }
 
     /// 构造；`origin` 是这台远端的来源标注
+    ///
+    /// 不带缓存：读即问对端（探针与测试口径）。
     #[must_use]
     pub fn new(link: RemoteLink, origin: Origin) -> Self {
-        Self { link, origin }
+        Self {
+            link,
+            origin,
+            cache: None,
+        }
+    }
+
+    /// 带缓存构造：读走本地缓存，不再访问对端
+    #[must_use]
+    pub fn with_cache(link: RemoteLink, origin: Origin, cache: Arc<RemoteCache>) -> Self {
+        Self {
+            link,
+            origin,
+            cache: Some(cache),
+        }
+    }
+
+    /// 写成功后回写缓存（best-effort，见 `RemoteWorkspaceRepository::write_through`）
+    fn write_through(&self) {
+        let Some(cache) = self.cache.as_deref() else {
+            return;
+        };
+        if let Err(err) = super::refresh::store_servers(&self.link, cache) {
+            tracing::warn!(remote = cache.name().as_str(), %err, "server cache write-through failed");
+        }
     }
 
     /// 在对端创建服务器登记（不下载核心；核心安装是对端的事）
@@ -275,7 +373,9 @@ impl RemoteServerRepository {
                 let wire = items.pop().ok_or_else(|| {
                     RepositoryError::Corrupt("server.create returned no record".to_owned())
                 })?;
-                ServerMeta::try_from(wire)
+                let meta = ServerMeta::try_from(wire)?;
+                self.write_through();
+                Ok(meta)
             }
             other => Err(unexpected(other, "server.create")),
         }
@@ -319,7 +419,9 @@ impl RemoteServerRepository {
                 let wire = items.pop().ok_or_else(|| {
                     RepositoryError::Corrupt("server.install returned no record".to_owned())
                 })?;
-                ServerMeta::try_from(wire)
+                let meta = ServerMeta::try_from(wire)?;
+                self.write_through();
+                Ok(meta)
             }
             other => Err(unexpected(other, "server.install")),
         }
@@ -363,18 +465,22 @@ impl RemoteServerRepository {
                 downloaded_bytes,
                 reused,
                 skipped_client_only,
-            } => Ok(RemoteModpackResult {
-                meta: ServerMeta::try_from(server)?,
-                project_id,
-                version_id,
-                version_number,
-                minecraft,
-                loader,
-                files,
-                downloaded_bytes,
-                reused,
-                skipped_client_only,
-            }),
+            } => {
+                let result = RemoteModpackResult {
+                    meta: ServerMeta::try_from(server)?,
+                    project_id,
+                    version_id,
+                    version_number,
+                    minecraft,
+                    loader,
+                    files,
+                    downloaded_bytes,
+                    reused,
+                    skipped_client_only,
+                };
+                self.write_through();
+                Ok(result)
+            }
             other => Err(unexpected(other, "server.create_modpack")),
         }
     }
@@ -406,11 +512,15 @@ impl RemoteServerRepository {
                 server,
                 target,
                 linked,
-            } => Ok(RemoteLinkResult {
-                meta: ServerMeta::try_from(server)?,
-                target,
-                linked,
-            }),
+            } => {
+                let result = RemoteLinkResult {
+                    meta: ServerMeta::try_from(server)?,
+                    target,
+                    linked,
+                };
+                self.write_through();
+                Ok(result)
+            }
             other => Err(unexpected(other, "server.link")),
         }
     }
@@ -485,7 +595,10 @@ impl RemoteServerRepository {
             "props",
         )?;
         match response {
-            Response::Props { path, text } => Ok((path, text)),
+            Response::Props { path, text } => {
+                self.write_through();
+                Ok((path, text))
+            }
             other => Err(unexpected(other, "server.props.set")),
         }
     }
@@ -511,7 +624,9 @@ impl RemoteServerRepository {
         )?;
         match response {
             Response::SettingsChanged { value, settings } => {
-                Ok((ServerSettings::try_from(settings)?, value))
+                let settings = ServerSettings::try_from(settings)?;
+                self.write_through();
+                Ok((settings, value))
             }
             other => Err(unexpected(other, "server.set")),
         }
@@ -531,7 +646,10 @@ impl RemoteServerRepository {
             "removed",
         )?;
         match response {
-            Response::Removed { disk_purged } => Ok(disk_purged),
+            Response::Removed { disk_purged } => {
+                self.write_through();
+                Ok(disk_purged)
+            }
             other => Err(unexpected(other, "server.remove")),
         }
     }
@@ -552,15 +670,10 @@ impl port::ServerRepository for RemoteServerRepository {
     }
 
     fn list(&self) -> Result<Vec<ServerMeta>, RepositoryError> {
-        let response = self.link.expect(&Request::ServerList, "servers")?;
-        match response {
-            Response::Servers { items } => {
-                let mut out = Vec::with_capacity(items.len());
-                decode_list("server", items, ServerMeta::try_from, &mut out)?;
-                Ok(out)
-            }
-            other => Err(unexpected(other, "server.list")),
+        if let Some(cache) = self.cache.as_deref() {
+            return decode_wires("server", cache.servers()?);
         }
+        self.list_live()
     }
 
     fn update_core(
@@ -612,11 +725,36 @@ impl port::ServerRepository for RemoteServerRepository {
     }
 
     fn list_sourced(&self) -> Result<Vec<Sourced<ServerMeta>>, RepositoryError> {
-        Ok(self
-            .list()?
+        let (items, offline) = self.read_sourced()?;
+        Ok(items
             .into_iter()
-            .map(|meta| Sourced::new(self.origin.clone(), meta))
+            .map(|meta| {
+                let sourced = Sourced::new(self.origin.clone(), meta);
+                if offline { sourced.offline() } else { sourced }
+            })
             .collect())
+    }
+}
+
+impl RemoteServerRepository {
+    /// 直接问对端（探针、刷新与无缓存装配用）
+    fn list_live(&self) -> Result<Vec<ServerMeta>, RepositoryError> {
+        let response = self.link.expect(&Request::ServerList, "servers")?;
+        match response {
+            Response::Servers { items } => decode_wires("server", items),
+            other => Err(unexpected(other, "server.list")),
+        }
+    }
+
+    /// 列表 + 是否离线
+    fn read_sourced(&self) -> Result<(Vec<ServerMeta>, bool), RepositoryError> {
+        match self.cache.as_deref() {
+            Some(cache) => Ok((
+                decode_wires("server", cache.servers()?)?,
+                cache.is_offline(),
+            )),
+            None => Ok((self.list_live()?, false)),
+        }
     }
 }
 
@@ -628,13 +766,40 @@ impl port::ServerRepository for RemoteServerRepository {
 pub struct RemoteJavaRepository {
     link: RemoteLink,
     origin: Origin,
+    cache: Option<Arc<RemoteCache>>,
 }
 
 impl RemoteJavaRepository {
     /// 构造；`origin` 是这台远端的来源标注
+    ///
+    /// 不带缓存：读即问对端（探针与测试口径）。
     #[must_use]
     pub fn new(link: RemoteLink, origin: Origin) -> Self {
-        Self { link, origin }
+        Self {
+            link,
+            origin,
+            cache: None,
+        }
+    }
+
+    /// 带缓存构造：读走本地缓存，不再访问对端
+    #[must_use]
+    pub fn with_cache(link: RemoteLink, origin: Origin, cache: Arc<RemoteCache>) -> Self {
+        Self {
+            link,
+            origin,
+            cache: Some(cache),
+        }
+    }
+
+    /// 写成功后回写缓存（best-effort，见 `RemoteWorkspaceRepository::write_through`）
+    fn write_through(&self) {
+        let Some(cache) = self.cache.as_deref() else {
+            return;
+        };
+        if let Err(err) = super::refresh::store_javas(&self.link, cache) {
+            tracing::warn!(remote = cache.name().as_str(), %err, "java cache write-through failed");
+        }
     }
 
     /// 让对端扫一遍本机 JVM 并登记（`force = true`）
@@ -648,6 +813,7 @@ impl RemoteJavaRepository {
             Response::Javas { items } => {
                 let mut out = Vec::with_capacity(items.len());
                 decode_list("java", items, JavaRuntime::try_from, &mut out)?;
+                self.write_through();
                 Ok(out)
             }
             other => Err(unexpected(other, "java.scan")),
@@ -693,6 +859,7 @@ impl RemoteJavaRepository {
             Response::Javas { items } => {
                 let mut out = Vec::with_capacity(items.len());
                 decode_list("java", items, JavaRuntime::try_from, &mut out)?;
+                self.write_through();
                 Ok(out)
             }
             other => Err(unexpected(other, "java.install")),
@@ -713,6 +880,7 @@ impl RemoteJavaRepository {
         )?;
         match response {
             Response::JavaUninstalled { path, managed } => {
+                self.write_through();
                 Ok((std::path::PathBuf::from(path), managed))
             }
             other => Err(unexpected(other, "java.uninstall")),
@@ -728,14 +896,9 @@ impl port::JavaRuntimeRepository for RemoteJavaRepository {
     }
 
     fn list(&self) -> Result<Vec<JavaRuntime>, RepositoryError> {
-        let response = self.link.expect(&Request::JavaList, "javas")?;
-        match response {
-            Response::Javas { items } => {
-                let mut out = Vec::with_capacity(items.len());
-                decode_list("java", items, JavaRuntime::try_from, &mut out)?;
-                Ok(out)
-            }
-            other => Err(unexpected(other, "java.list")),
+        match self.cache.as_deref() {
+            Some(cache) => decode_wires("java", cache.javas()?),
+            None => self.list_live(),
         }
     }
 
@@ -764,12 +927,52 @@ impl port::JavaRuntimeRepository for RemoteJavaRepository {
     }
 
     fn list_sourced(&self) -> Result<Vec<Sourced<JavaRuntime>>, RepositoryError> {
-        Ok(self
-            .list()?
+        let (items, offline) = self.read_sourced()?;
+        Ok(items
             .into_iter()
-            .map(|rt| Sourced::new(self.origin.clone(), rt))
+            .map(|rt| {
+                let sourced = Sourced::new(self.origin.clone(), rt);
+                if offline { sourced.offline() } else { sourced }
+            })
             .collect())
     }
+}
+
+impl RemoteJavaRepository {
+    /// 直接问对端（探针、刷新与无缓存装配用）
+    fn list_live(&self) -> Result<Vec<JavaRuntime>, RepositoryError> {
+        let response = self.link.expect(&Request::JavaList, "javas")?;
+        match response {
+            Response::Javas { items } => decode_wires("java", items),
+            other => Err(unexpected(other, "java.list")),
+        }
+    }
+
+    /// 列表 + 是否离线
+    fn read_sourced(&self) -> Result<(Vec<JavaRuntime>, bool), RepositoryError> {
+        match self.cache.as_deref() {
+            Some(cache) => Ok((decode_wires("java", cache.javas()?)?, cache.is_offline())),
+            None => Ok((self.list_live()?, false)),
+        }
+    }
+}
+
+/// 把线格式列表解成领域对象；任何一条解不出来都按记录损坏上报
+///
+/// 与 [`decode_list`] 同义，只是入参已经是 `Vec<Wire*>`（缓存路径：盘上存的
+/// 就是线格式），省掉一次「先解帧再转领域」的中间层。
+fn decode_wires<T, U>(what: &'static str, items: Vec<T>) -> Result<Vec<U>, RepositoryError>
+where
+    T: TryInto<U, Error = RepositoryError>,
+{
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        match item.try_into() {
+            Ok(value) => out.push(value),
+            Err(err) => return Err(RepositoryError::Corrupt(format!("{what}: {err}"))),
+        }
+    }
+    Ok(out)
 }
 
 /// 把载荷列表解成领域对象；任何一条解不出来都按记录损坏上报
@@ -799,7 +1002,9 @@ fn unexpected(response: Response, op: &'static str) -> RepositoryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote::link::RemoteLink;
     use crate::remote::testkit::{PairingHarness, encoding};
+    use crate::remote::{cache::RemoteCache, cache::now_secs};
     use domain::server::version::ServerVariant;
     use port::JavaRuntimeRepository as _;
     use port::ServerRepository as _;
@@ -845,6 +1050,44 @@ mod tests {
         // agent 的空数据目录：还没有工作区
         assert!(workspaces.is_empty());
         assert!(repo.current().expect("current").is_none());
+    }
+
+    #[test]
+    fn cached_list_survives_an_unreachable_peer_and_marks_offline() {
+        let mut harness = PairingHarness::spawn();
+        let link = harness.link();
+        let dir = tempfile::tempdir().expect("tmp");
+        let cache = Arc::new(RemoteCache::new(
+            dir.path(),
+            port::RemoteName::parse("test-box").expect("name"),
+        ));
+        let repo =
+            RemoteWorkspaceRepository::with_cache(link.clone(), origin(), Arc::clone(&cache));
+        repo.init(&harness.agent_data.join("srv"), Some("w1"))
+            .expect("init on the peer");
+        super::super::refresh::refresh(&link, &cache).expect("首次刷新");
+        assert!(!cache.is_offline(), "刚同步成功不算离线");
+
+        // 对端掉线。刷新进程每次都新建连接（空连接池），因此这里也换一条新
+        // 连接来模拟：进程内池化连接在监听停掉后仍然存活，不算「掉线」
+        harness.agent.shutdown();
+        let dead = RemoteLink::new(
+            harness.agent.target(),
+            harness.agent.fingerprint.clone(),
+            &harness.agent.token,
+        );
+        let err = super::super::refresh::refresh(&dead, &cache).expect_err("掉线必然失败");
+        super::super::refresh::record_failure(&cache, &err.to_string());
+
+        let items = repo.list_sourced().expect("离线也要能列");
+        assert_eq!(items.len(), 1, "缓存条目必须保留");
+        assert_eq!(items[0].value.name.as_str(), "w1");
+        assert!(items[0].offline, "来源要标成离线");
+        assert!(cache.is_offline());
+        assert!(
+            !cache.is_stale(now_secs()),
+            "离线不等于过期：刚失败过，别再拉刷新"
+        );
     }
 
     #[test]

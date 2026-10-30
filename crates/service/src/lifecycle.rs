@@ -546,6 +546,41 @@ impl ServerLifecycleService {
         Ok(out)
     }
 
+    /// 只探测指定名字的服务器（`server list` 用）
+    ///
+    /// 与 [`Self::statuses`] 的差别只在取样范围：远端条目的状态可以从客户端的
+    /// 缓存里读，只有本地条目必须实时问 supervisor。用 [`Self::statuses`] 会把
+    /// 每台远端也探一遍，离线远端上正好把「列表秒出」又还回去。
+    ///
+    /// 不在注册表里的名字被忽略（调用方给集合，不是单台，缺了不必报错）。
+    ///
+    /// # Errors
+    ///
+    /// 仅注册表失败时返回错误；supervisor 单台失败在值里
+    pub fn statuses_for(
+        &self,
+        names: &std::collections::HashSet<String>,
+    ) -> Result<HashMap<String, Result<Option<SupervisorStatus>, SupervisorError>>, LifecycleError>
+    {
+        let servers: Vec<_> = self
+            .registry
+            .list()?
+            .into_iter()
+            .filter(|srv| names.contains(srv.meta.name.as_str()))
+            .collect();
+        if servers.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let refs: Vec<_> = servers.iter().map(|srv| srv.server_ref()).collect();
+        let results = self.backend.supervisor().status_many(&refs);
+        debug_assert_eq!(results.len(), servers.len(), "status_many 必须保持入参顺序");
+        let mut out = HashMap::with_capacity(servers.len());
+        for (srv, result) in servers.iter().zip(results) {
+            out.insert(srv.meta.name.as_str().to_owned(), result);
+        }
+        Ok(out)
+    }
+
     /// 向服务端 stdin 注入一行
     ///
     /// # Errors

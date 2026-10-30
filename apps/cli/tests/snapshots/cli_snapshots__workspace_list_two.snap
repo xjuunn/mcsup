@@ -6,6 +6,8 @@ expression: shape(&listed)
   {
     "current": "bool",
     "name": "string",
+    "never_synced": "bool",
+    "offline": "bool",
     "origin": "string",
     "path": "string",
     "servers": "number"
@@ -13,6 +15,8 @@ expression: shape(&listed)
   {
     "current": "bool",
     "name": "string",
+    "never_synced": "bool",
+    "offline": "bool",
     "origin": "string",
     "path": "string",
     "servers": "number"

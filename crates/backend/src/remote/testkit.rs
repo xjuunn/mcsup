@@ -82,6 +82,16 @@ pub(crate) mod mcsup_agent_shim {
         pub(crate) fn target(&self) -> String {
             self.target.clone()
         }
+
+        /// 停掉监听并等线程退出（模拟「远端掉线」）
+        ///
+        /// 重复调用安全：`join` 已被取走时只再请求一次停止。
+        pub(crate) fn shutdown(&mut self) {
+            self.stop.request_stop();
+            if let Some(join) = self.join.take() {
+                let _ = join.join();
+            }
+        }
     }
 
     impl Drop for AgentHandle {

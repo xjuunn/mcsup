@@ -320,6 +320,8 @@ dependencies = [
  "port",
  "protocol",
  "runtime",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tracing",
