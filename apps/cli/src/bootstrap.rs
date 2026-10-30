@@ -252,10 +252,11 @@ pub(crate) fn join_variants(available: &[ServerVariant], lang: Lang) -> String {
 /// 读 `[remotes.*]` + 凭证存储，装配全部可达远端的成员表
 ///
 /// 任何一台远端连不上都只是跳过（warn），不阻塞本地命令——离线是常态而非
-/// 异常（`docs/remote.md`「设计原则 4」）。配置记录缺凭证同样跳过：可能是
-/// 配对到一半被中断，入口命令会在用到该远端时报「未认证」。
+/// 异常（`docs/remote.md`「设计原则 4」）。凭证**不在这里解封**：只装一个
+/// 延迟解析器，真正发帧时才读（见 [`RemoteLink::deferred`]）。只读命令
+/// （`server ls`）因此完全不碰钥匙串。
 pub(crate) fn remote_members(cfg: &mcsup::service::Config) -> RemoteMembers {
-    let credentials = credential_store();
+    let credentials: Arc<dyn mcsup::auth::CredentialStore> = Arc::new(credential_store());
     let mut members = RemoteMembers::empty();
     for (name, record) in &cfg.remotes {
         let Some(member) = build_member(name, record, &credentials) else {
@@ -280,10 +281,18 @@ pub(crate) fn remote_members(cfg: &mcsup::service::Config) -> RemoteMembers {
 /// 刷新本身就是「去问对端」，挂缓存会自我循环；探针要的是真实连通性，读缓存
 /// 等于自问自答。
 pub(crate) fn remote_members_live(cfg: &mcsup::service::Config) -> RemoteMembers {
-    let credentials = credential_store();
+    let credentials: Arc<dyn mcsup::auth::CredentialStore> = Arc::new(credential_store());
+    remote_members_live_with(cfg, &credentials)
+}
+
+/// [`remote_members_live`] 的可注入形态（测试用：证明装配不读凭证）
+fn remote_members_live_with(
+    cfg: &mcsup::service::Config,
+    credentials: &Arc<dyn mcsup::auth::CredentialStore>,
+) -> RemoteMembers {
     let mut members = RemoteMembers::empty();
     for (name, record) in &cfg.remotes {
-        if let Some(member) = build_member(name, record, &credentials) {
+        if let Some(member) = build_member(name, record, credentials) {
             members.push(member);
         }
     }
@@ -292,8 +301,10 @@ pub(crate) fn remote_members_live(cfg: &mcsup::service::Config) -> RemoteMembers
 
 /// 单台远端 → 成员；任何一步不满足都返回 `None`（跳过该台，不阻塞其余）
 ///
-/// 过滤顺序：名字合法 → 接入方式已实现 → 有指纹 → 有凭证。拆出来是为了可测——
-/// 过滤规则不碰文件系统，凭证经 trait 注入。
+/// 过滤顺序：名字合法 → 有指纹。拆出来是为了可测——过滤规则不碰文件系统，
+/// 凭证经 trait 注入且**延迟读取**：装配期读到的是「凭证是否可用」这件事本身
+/// 就要求解封密钥，而读镜像列表并不需要它。凭证缺失 / 损坏留到首次建连时报
+/// 错（`docs/remote.md`「离线不阻塞」），不影响远端条目的展示。
 ///
 /// SSH 记录连的是**隧道地址**，而隧道每次命令才建：这里只装一个延迟解析器，
 /// 不在这里起 ssh 子进程。装配发生在每个命令的开头，本地命令不该为远端付
@@ -301,7 +312,7 @@ pub(crate) fn remote_members_live(cfg: &mcsup::service::Config) -> RemoteMembers
 fn build_member(
     name: &str,
     record: &mcsup::service::RemoteRecord,
-    credentials: &dyn mcsup::auth::CredentialStore,
+    credentials: &Arc<dyn mcsup::auth::CredentialStore>,
 ) -> Option<RemoteMember> {
     let remote_name = match RemoteName::parse(name) {
         Ok(name) => name,
@@ -323,23 +334,24 @@ fn build_member(
             return None;
         }
     };
-    let credential = match credentials.get(name) {
-        Ok(cred) => cred,
-        Err(err) => {
-            tracing::warn!(remote = %name, %err, "no usable credential; skipping");
-            return None;
-        }
+    // 只在首次发帧时解封：同一条远端在整个进程里读过一次就够
+    let token: mcsup::backend::remote::TokenResolver = {
+        let store = Arc::clone(credentials);
+        let account = name.to_owned();
+        Arc::new(move || {
+            store
+                .get(&account)
+                .map(|credential| credential.token)
+                .map_err(|err| format!("{err}"))
+        })
     };
     let link = match record.via {
-        RemoteVia::Direct => {
-            RemoteLink::new(record.target.as_str(), fingerprint, &credential.token)
-        }
+        RemoteVia::Direct => RemoteLink::deferred(record.target.as_str(), fingerprint, token),
         RemoteVia::Ssh => {
             let target = record.target.clone();
-            RemoteLink::lazy(
+            RemoteLink::deferred_lazy(
                 target.clone(),
                 fingerprint,
-                &credential.token,
                 // 隧道在第一次真正发帧时才建；失败信息进传输层错误链
                 move || {
                     crate::ssh::endpoint_for(&target).map_err(|err| {
@@ -349,6 +361,7 @@ fn build_member(
                         }
                     })
                 },
+                token,
             )
         }
     };
@@ -510,6 +523,33 @@ mod remote_tests {
         }
     }
 
+    /// 测试用凭证句柄（trait 对象；客户端侧装配只持有这个）
+    fn store(map: BTreeMap<String, StoredCredential>) -> Arc<dyn mcsup::auth::CredentialStore> {
+        Arc::new(MemCredentials(map))
+    }
+
+    /// 每次读取都失败的凭证存储：证明装配期根本不读凭证
+    struct UnreadableCredentials;
+
+    impl mcsup::auth::CredentialStore for UnreadableCredentials {
+        fn put(
+            &self,
+            _name: &str,
+            _cred: &StoredCredential,
+        ) -> Result<(), mcsup::auth::CredentialError> {
+            unimplemented!()
+        }
+        fn get(&self, name: &str) -> Result<StoredCredential, mcsup::auth::CredentialError> {
+            Err(mcsup::auth::CredentialError::NotFound(name.to_owned()))
+        }
+        fn remove(&self, _name: &str) -> Result<(), mcsup::auth::CredentialError> {
+            unimplemented!()
+        }
+        fn names(&self) -> Result<Vec<String>, mcsup::auth::CredentialError> {
+            Ok(Vec::new())
+        }
+    }
+
     fn credential(token: &str) -> StoredCredential {
         StoredCredential {
             token: token.to_owned(),
@@ -534,7 +574,7 @@ mod remote_tests {
     /// 正常记录 + 有凭证 → 一名成员
     #[test]
     fn valid_record_builds_member() {
-        let creds = MemCredentials(BTreeMap::from([("box".to_owned(), credential("a"))]));
+        let creds = store(BTreeMap::from([("box".to_owned(), credential("a"))]));
         let cfg = mcsup::service::Config {
             data_dir: None,
             remotes: BTreeMap::from([("box".to_owned(), record("127.0.0.1:7681", Some(FPR)))]),
@@ -547,23 +587,27 @@ mod remote_tests {
     /// 缺指纹 → 跳过（TOFU 未完成配对）
     #[test]
     fn missing_fingerprint_skips() {
-        let creds = MemCredentials(BTreeMap::from([("box".to_owned(), credential("a"))]));
+        let creds = store(BTreeMap::from([("box".to_owned(), credential("a"))]));
         let rec = record("127.0.0.1:7681", None);
         assert!(build_member("box", &rec, &creds).is_none());
     }
 
-    /// 缺凭证 → 跳过（配对到一半）
+    /// 缺凭证 → 仍然装配成员，认证留到首次建连
+    ///
+    /// 装配期读凭证等于要求解封密钥（macOS 钥匙串是一次用户确认），而 `ls`
+    /// 只读本地镜像。凭证缺失 / 损坏在第一次发帧时报错，入口提示「未认证」。
     #[test]
-    fn missing_credential_skips() {
-        let creds = MemCredentials(BTreeMap::new());
+    fn missing_credential_still_builds_member() {
+        let creds: Arc<dyn mcsup::auth::CredentialStore> = Arc::new(UnreadableCredentials);
         let rec = record("127.0.0.1:7681", Some(FPR));
-        assert!(build_member("box", &rec, &creds).is_none());
+        let member = build_member("box", &rec, &creds).expect("member");
+        assert_eq!(member.name.as_str(), "box");
     }
 
     /// ssh 接入也装配成成员：地址延迟解析，装配期不起 ssh 子进程
     #[test]
     fn ssh_via_builds_member_without_connecting() {
-        let creds = MemCredentials(BTreeMap::from([("box".to_owned(), credential("a"))]));
+        let creds = store(BTreeMap::from([("box".to_owned(), credential("a"))]));
         let mut rec = record("user@host", Some(FPR));
         rec.via = RemoteVia::Ssh;
         let member = build_member("box", &rec, &creds).expect("member");
@@ -575,9 +619,23 @@ mod remote_tests {
     /// 非法远端名 → 跳过
     #[test]
     fn invalid_name_skips() {
-        let creds = MemCredentials(BTreeMap::from([("b/ad".to_owned(), credential("a"))]));
+        let creds = store(BTreeMap::from([("b/ad".to_owned(), credential("a"))]));
         let rec = record("127.0.0.1:7681", Some(FPR));
         assert!(build_member("b/ad", &rec, &creds).is_none());
+    }
+
+    /// 装配成员表不等于读凭证
+    ///
+    /// `server ls` 装配四次成员、每次两台远端，装配期读一次就是一次钥匙串
+    /// 访问（macOS 上是用户确认框）。凭证必须留到首次发帧。
+    #[test]
+    fn assembling_members_does_not_read_credentials() {
+        let mut cfg = mcsup::service::Config::default();
+        cfg.remotes
+            .insert("box".to_owned(), record("127.0.0.1:7681", Some(FPR)));
+        let credentials: Arc<dyn mcsup::auth::CredentialStore> = Arc::new(UnreadableCredentials);
+        let members = remote_members_live_with(&cfg, &credentials);
+        assert_eq!(members.all().len(), 1, "缺凭证也要能装配出成员");
     }
 
     /// 成员表空判定：过滤后一台不剩时走纯本地路径

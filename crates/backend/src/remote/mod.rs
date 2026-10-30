@@ -40,7 +40,7 @@ pub use combined::{
     CombinedJavaRepository, CombinedServerRepository, CombinedWorkspaceRepository, RemoteMember,
     RemoteMembers,
 };
-pub use link::RemoteLink;
+pub use link::{RemoteLink, TokenResolver};
 pub use mirror::{
     RemoteJavaRepository, RemoteModpackResult, RemoteServerRepository, RemoteWorkspaceRepository,
 };

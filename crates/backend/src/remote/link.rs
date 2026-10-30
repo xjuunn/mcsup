@@ -8,11 +8,35 @@
 //! 错误映射是协议的一部分（`ops.rs` 的镜像操作）：`not_found` →
 //! [`RepositoryError::NotFound`] 等。按 `kind` 映射而不是解析消息，与 agent
 //! 侧的分类纪律一致。
+//!
+//! # 凭证只在真正建连时解封
+//!
+//! 远端成员在装配期只需要「名字 + 地址 + 指纹」，token 是**第一次发帧**才
+//! 用得上的东西。读 token 不是无副作用的：操作系统钥匙串可能把它实现成一次
+//! 用户确认（macOS 对未签名二进制的每次访问都会弹窗）。因此装配期只装一个
+//! [`TokenResolver`]，`server ls` 这类只读本地镜像的命令一次都不碰钥匙串，
+//! 后台刷新进程也只为它真正要刷的那一台解封一次。
 
 use port::{RepositoryError, TaskObserver};
 use protocol::remote::{ErrorKind, Request, Response};
 use std::sync::{Arc, Mutex};
 use transport::{Client, Fingerprint, TransportError};
+
+/// 延迟取 token 的闭包：第一次真正建连时才调用
+///
+/// 失败用 `String` 而不是具体错误类型：`backend` 不依赖凭证存储实现，
+/// 解析失败的**分类**属于入口，这里只负责把消息带进传输错误链。
+pub type TokenResolver = Arc<dyn Fn() -> Result<String, String> + Send + Sync>;
+
+/// token 的来历
+enum Token {
+    /// 已解封（`remote connect` 刚交换完，或调用方自带）
+    Ready(String),
+    /// 第一次建连时才解封
+    Deferred(TokenResolver),
+    /// 没有 token（仅连通性探测）
+    None,
+}
 
 /// 远端地址的来历
 ///
@@ -46,7 +70,7 @@ struct Inner {
     label: String,
     address: Address,
     fingerprint: Fingerprint,
-    token: Option<String>,
+    token: Token,
     /// 已解析出的客户端（同一进程内复用其连接池）
     client: Mutex<Option<Arc<Client>>>,
 }
@@ -60,7 +84,10 @@ impl std::fmt::Debug for RemoteLink {
 }
 
 impl RemoteLink {
-    /// 用已保存的 token 构造（日常路径）
+    /// 已解封 token 的构造
+    ///
+    /// 只有「token 刚拿到手」的路径该用它（`remote connect` 兑换后立即探测）。
+    /// 日常装配一律走 [`Self::deferred`]：读钥匙串可能是一次用户确认。
     #[must_use]
     pub fn new(target: impl Into<String>, fingerprint: Fingerprint, token: &str) -> Self {
         let target = target.into();
@@ -69,26 +96,47 @@ impl RemoteLink {
                 label: target.clone(),
                 address: Address::Fixed(target),
                 fingerprint,
-                token: Some(token.to_owned()),
+                token: Token::Ready(token.to_owned()),
                 client: Mutex::new(None),
             }),
         }
     }
 
-    /// 延迟解析地址的构造：`label` 只用于日志，`resolve` 在第一次发帧时调用
+    /// 直连 + 延迟解封 token 的构造
+    ///
+    /// 装配期不读凭证；`token` 在第一次发帧时调用一次（失败不缓存，下次重试）。
     #[must_use]
-    pub fn lazy(
+    pub fn deferred(
+        target: impl Into<String>,
+        fingerprint: Fingerprint,
+        token: TokenResolver,
+    ) -> Self {
+        let target = target.into();
+        Self {
+            inner: Arc::new(Inner {
+                label: target.clone(),
+                address: Address::Fixed(target),
+                fingerprint,
+                token: Token::Deferred(token),
+                client: Mutex::new(None),
+            }),
+        }
+    }
+
+    /// SSH 接入 + 延迟解封 token 的构造：地址与 token 都在第一次发帧时解析
+    #[must_use]
+    pub fn deferred_lazy(
         label: impl Into<String>,
         fingerprint: Fingerprint,
-        token: &str,
         resolve: impl Fn() -> Result<String, TransportError> + Send + Sync + 'static,
+        token: TokenResolver,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 label: label.into(),
                 address: Address::Lazy(Arc::new(resolve)),
                 fingerprint,
-                token: Some(token.to_owned()),
+                token: Token::Deferred(token),
                 client: Mutex::new(None),
             }),
         }
@@ -103,7 +151,7 @@ impl RemoteLink {
                 label: target.clone(),
                 address: Address::Fixed(target),
                 fingerprint,
-                token: None,
+                token: Token::None,
                 client: Mutex::new(None),
             }),
         }
@@ -131,8 +179,17 @@ impl RemoteLink {
             Address::Fixed(target) => target.clone(),
             Address::Lazy(resolve) => resolve()?,
         };
+        let token = match &self.inner.token {
+            Token::None => None,
+            Token::Ready(token) => Some(token.clone()),
+            // 解封在锁内做：两个线程同时打到同一条远端时，只应有一次用户确认
+            Token::Deferred(resolve) => Some(resolve().map_err(|message| TransportError::Io {
+                context: format!("read the credential for {}", self.inner.label),
+                source: std::io::Error::other(message),
+            })?),
+        };
         let mut client = Client::new(target, self.inner.fingerprint.clone());
-        if let Some(token) = self.inner.token.as_deref() {
+        if let Some(token) = token.as_deref() {
             client = client.with_token(token);
         }
         let client = Arc::new(client);
@@ -293,14 +350,15 @@ mod tests {
         let target = harness.agent.target.clone();
         let resolves = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&resolves);
-        let link = RemoteLink::lazy(
+        let token = harness.agent.token.clone();
+        let link = RemoteLink::deferred_lazy(
             "ssh-box",
             harness.agent.fingerprint.clone(),
-            &harness.agent.token,
             move || {
                 counter.fetch_add(1, Ordering::SeqCst);
                 Ok(target.clone())
             },
+            Arc::new(move || Ok(token.clone())),
         );
 
         link.client_call(&Request::Ping).expect("first ping");
@@ -327,16 +385,17 @@ mod tests {
         let target = harness.agent.target.clone();
         let attempts = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&attempts);
-        let link = RemoteLink::lazy(
+        let token = harness.agent.token.clone();
+        let link = RemoteLink::deferred_lazy(
             "ssh-box",
             harness.agent.fingerprint.clone(),
-            &harness.agent.token,
             move || {
                 if counter.fetch_add(1, Ordering::SeqCst) == 0 {
                     return Err(TransportError::Protocol("tunnel failed".to_owned()));
                 }
                 Ok(target.clone())
             },
+            Arc::new(move || Ok(token.clone())),
         );
 
         let first = link.client_call(&Request::Ping);
@@ -346,6 +405,77 @@ mod tests {
             attempts.load(Ordering::SeqCst),
             2,
             "失败后必须重新解析，而不是把失败结果缓存下来"
+        );
+    }
+
+    /// 延迟解封：装配期一次不读，第一次发帧后只读一次
+    ///
+    /// 只读命令（`server ls`）走的是本地镜像，装配成员时不该碰钥匙串——
+    /// macOS 对未签名二进制的每次访问都会弹窗，一次命令弹十几次就是这么来的。
+    #[test]
+    fn deferred_token_is_not_unsealed_during_assembly() {
+        let harness = PairingHarness::spawn();
+        let token = harness.agent.token.clone();
+        let unseals = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&unseals);
+        let link = RemoteLink::deferred(
+            harness.agent.target.clone(),
+            harness.agent.fingerprint.clone(),
+            Arc::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(token.clone())
+            }),
+        );
+
+        // 装配期的动作：日志名、克隆、Debug——都不该解封
+        assert_eq!(link.target(), harness.agent.target);
+        let _ = link.clone();
+        let _ = format!("{link:?}");
+        assert_eq!(
+            unseals.load(Ordering::SeqCst),
+            0,
+            "装配期不该读凭证（钥匙串访问可能是一次用户确认）"
+        );
+
+        link.client_call(&Request::Ping).expect("ping");
+        link.client_call(&Request::Ping).expect("ping");
+        assert_eq!(
+            unseals.load(Ordering::SeqCst),
+            1,
+            "客户端已缓存，同一条远端只应解封一次"
+        );
+    }
+
+    /// 解封失败进传输错误链，且不缓存：下次重试
+    #[test]
+    fn deferred_token_failure_is_reported_and_retried() {
+        let harness = PairingHarness::spawn();
+        let target = harness.agent.target.clone();
+        let fingerprint = harness.agent.fingerprint.clone();
+        let token = harness.agent.token.clone();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&attempts);
+        let link = RemoteLink::deferred(
+            target,
+            fingerprint,
+            Arc::new(move || {
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err("keychain is locked".to_owned());
+                }
+                Ok(token.clone())
+            }),
+        );
+
+        let err = link.client_call(&Request::Ping).expect_err("首次必失败");
+        assert!(
+            matches!(err, TransportError::Io { .. }),
+            "凭证读取失败要带上下文进 Io 链: {err:?}"
+        );
+        link.client_call(&Request::Ping).expect("重试成功");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "解封失败不能缓存，否则远端就永久判死了"
         );
     }
 }
