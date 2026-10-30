@@ -21,8 +21,66 @@
 | 12 | `server link` 远端化、`server create --origin` 交互向导、系统钥匙串 | 完成（跨机器真机仍待手工） |
 | 13 | 健壮性/安全修复：错误分类、重试幂等、TTL、撤销即时性、SSH、keyring 探测等 | 完成 |
 | 14 | 统一进度通道：`port::TaskObserver` + `Response::Task` 中间帧，本地与远端同一套渲染 | 完成 |
+| 15 | 只读镜像缓存：TTL 30 秒 + 后台刷新进程 + 离线标记，列表命令零网络 | 完成 |
 
 ## 已完成
+
+### 阶段 15：只读镜像缓存（列表命令零网络）
+
+背景：两台远端 `r1` / `r2` 不可达时，每次 `mcsup ws ls` 都要等约 10 秒
+建连超时，且 `r2` 的条目在不同次运行间时有时无——列表结果取决于「这次
+连没连上」，而不是「对端有什么」。
+
+#### 设计（已确认：方案 A，TTL 30 秒，离线条目标 `offline`）
+
+- 读只读本地缓存，写直连远端。缓存目录 `{data_dir}/remotes/<name>/`，
+  四份列表 + `state.json`（`last_sync` / `last_error`）+ `refresh.lock`。
+- 列表内容复用 `protocol::remote::wire` 类型落盘：`domain` 不依赖 serde，
+  缓存格式因此不另起一套 DTO。
+- 写盘一律「临时文件 + rename + fsync（含父目录）」，任何时刻被强杀都只会
+  看到完整的旧文件或完整的新文件。
+- TTL 30 秒；读命令发现过期 / 从未同步 / 上次失败时拉起**脱离进程**
+  `mcsup __remote-refresh <name>`，三路标准流全丢弃，前台立刻继续。
+- 刷新抢 `refresh.lock` 去重：抢不到即退出；锁由文件句柄持有，进程退出内核
+  自动释放（含被强杀），不存在锁残留死局。
+- 刷新**全有或全无**：四份列表都拿到才整体写盘——半新半旧的缓存比一份旧
+  的完整快照更容易误导人。
+- 离线：保留缓存条目并标 `offline`，人类模式渲染 `origin (offline)`；
+  从未同步过额外标 `(never synced)`；`server list` 的状态列离线时渲染
+  `unknown`。
+- 写命令成功后回写对应缓存（重新拉一份，不在本地改一条），同时前移新鲜度
+  并摘掉离线标记；回写失败只记 warn，写本身已成功。
+- 刷新带代次守卫（`SyncState::generation`）：拉数据前记代次，写回前比对，
+  期间有人写过就丢弃整轮结果。`server remove` 的 e2e 暴露过这个竞态——慢
+  刷新会把刚删掉的服务器写回缓存。
+- `remote connect` / `reconnect` 成功时顺手播种四份列表。
+
+#### 落点
+
+- `backend::remote::cache`：`RemoteCache`（读写、TTL、锁）、`SyncState`、
+  `Snapshot`，9 个单元测试。
+- `backend::remote::refresh`：`refresh`（四份列表全有或全无）、
+  `store_workspaces/servers/javas`（写穿）、`record_failure`，2 个单元测试。
+- `port::origin::Sourced` 增加 `offline` 字段与 `offline()` / `is_offline()`。
+- `backend::remote::mirror`：三个仓库加 `cache` 与 `with_cache`，
+  `list()` 走缓存、`list_live()` 保留原网络路径、写方法加写穿。
+- `backend::remote::combined`：`RemoteMember::with_cache`、`cache()`。
+- `apps/cli/src/remote_cache.rs`：`cache_for` / `spawn_refresh_if_stale`
+  （进程内按名去重）/ `run_refresh` / `cached_statuses` / `never_synced`。
+- `apps/cli`：隐藏子命令 `__remote-refresh`；`bootstrap::remote_members`
+  挂缓存并触发后台刷新，新增 `remote_members_live` 供刷新与探针；
+  `workspace/server/java list` 读缓存并渲染离线标记。
+- `service::ServerLifecycleService::statuses_for`：只探指定的（本地）服务器，
+  `server list` 不再为每台远端各发一次 RPC。
+- 行 DTO（`WorkspaceRow` / `ServerRow` / `JavaRow`）新增 `offline` /
+  `never_synced`（附加字段，旧字段不变）。
+
+#### 语义边界
+
+- 离线是数据新鲜度，不是来源身份：`--origin` 过滤与写命令路由都不看它。
+- 连通性探针只剩 `remote ls` / `remote ping`，其余命令的耗时与远端是否可达
+  无关。
+- 不做双向同步，无版本向量 / 冲突合并 / 最后写入获胜；唯一真相源在对端。
 
 ### 阶段 14：统一进度通道（本地与远端同一套流程）
 

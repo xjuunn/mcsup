@@ -224,13 +224,13 @@ pub(crate) fn spawn_background(
 /// `mcsup` 门面没有导出，而这里只差几行 FFI 常量，为此把一个内部函数提成
 /// 公开 API 不划算。
 #[cfg(unix)]
-fn detach(command: &mut Command) {
+pub(crate) fn detach(command: &mut Command) {
     use std::os::unix::process::CommandExt as _;
     command.process_group(0);
 }
 
 #[cfg(windows)]
-fn detach(command: &mut Command) {
+pub(crate) fn detach(command: &mut Command) {
     use std::os::windows::process::CommandExt as _;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
@@ -238,7 +238,7 @@ fn detach(command: &mut Command) {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn detach(_command: &mut Command) {}
+pub(crate) fn detach(_command: &mut Command) {}
 
 #[cfg(test)]
 mod tests {

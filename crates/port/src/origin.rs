@@ -161,6 +161,12 @@ pub struct Sourced<T> {
     pub origin: Origin,
     /// 资源本体
     pub value: T,
+    /// 本条是否只是本地缓存的旧值（来源当前不可达）
+    ///
+    /// 与 `origin` 分开：来源仍是那台机器（过滤、限定名、写路由都不变），
+    /// 变的只是「这份数据是刚问来的还是上次留下的」。入口据此渲染
+    /// `(offline)`，而不是把条目藏起来——藏起来会让用户以为资源没了。
+    pub offline: bool,
 }
 
 /// 客户端视角的「当前工作区」选择
@@ -186,13 +192,18 @@ impl<T> Sourced<T> {
         Self {
             origin: Origin::Local,
             value,
+            offline: false,
         }
     }
 
     /// 指定来源
     #[must_use]
     pub fn new(origin: Origin, value: T) -> Self {
-        Self { origin, value }
+        Self {
+            origin,
+            value,
+            offline: false,
+        }
     }
 
     /// 换掉值，保留来源
@@ -201,7 +212,21 @@ impl<T> Sourced<T> {
         Sourced {
             origin: self.origin,
             value: f(self.value),
+            offline: self.offline,
         }
+    }
+
+    /// 标成「来自离线来源的缓存值」
+    #[must_use]
+    pub const fn offline(mut self) -> Self {
+        self.offline = true;
+        self
+    }
+
+    /// 是否是离线缓存值
+    #[must_use]
+    pub const fn is_offline(&self) -> bool {
+        self.offline
     }
 }
 
@@ -273,6 +298,8 @@ mod tests {
         let sourced = Sourced::new(remote.clone(), 1u8).map(|value| value + 1);
         assert_eq!(sourced.origin, remote);
         assert_eq!(sourced.value, 2);
+        assert!(!sourced.is_offline());
+        assert!(Sourced::local(1u8).offline().is_offline());
         assert_eq!(Sourced::local(7u8).origin, Origin::Local);
     }
 }

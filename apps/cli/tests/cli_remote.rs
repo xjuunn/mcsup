@@ -96,6 +96,16 @@ impl AgentHandle {
     }
 }
 
+impl AgentHandle {
+    /// 停掉监听并等线程退出（模拟「远端掉线」）
+    fn shutdown(&mut self) {
+        self.stop.request_stop();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
 impl Drop for AgentHandle {
     fn drop(&mut self) {
         self.stop.request_stop();
@@ -533,6 +543,79 @@ fn remote_server_create_list_and_remove_route_to_the_peer() {
     let after = run(home_path, &["server", "ls", "--output", "json"]);
     assert_ok(&after, "server ls after remove");
     assert_eq!(json(&after).as_array().expect("array").len(), 0);
+}
+
+/// 远端掉线后 `ls` 仍然秒出：读缓存，不建连
+///
+/// 这是整套缓存的核心承诺。用「对端已经关掉」来验证比计时更可靠：真的去连
+/// 会失败（条目消失、退出码非零），读缓存才会原样给出旧条目。计时只作为
+/// 附加信号——真去连时这里会卡到十秒级的连接超时。
+#[test]
+fn ls_stays_instant_after_the_peer_goes_away() {
+    let home = temp_home();
+    let mut agent = AgentHandle::start();
+    let home_path = home.path();
+
+    let connected = run(
+        home_path,
+        &[
+            "remote",
+            "connect",
+            &agent.addr,
+            "--code",
+            &agent.code,
+            "--name",
+            "test-box",
+            "-y",
+            "--output",
+            "json",
+        ],
+    );
+    assert_ok(&connected, "remote connect");
+
+    let ws_dir = agent.dir.path().join("ws");
+    let created = run(
+        home_path,
+        &[
+            "workspace",
+            "init",
+            "--origin",
+            "test-box",
+            "--dir",
+            ws_dir.to_str().expect("utf8"),
+            "--name",
+            "w1",
+            "--output",
+            "json",
+        ],
+    );
+    assert_ok(&created, "workspace init --origin");
+
+    // 缓存里有 w1 了；现在把对端关掉
+    agent.shutdown();
+
+    let started = std::time::Instant::now();
+    let listed = run(home_path, &["workspace", "ls", "--output", "json"]);
+    let elapsed = started.elapsed();
+    assert_ok(&listed, "掉线后 workspace ls 仍必须成功");
+    let items = json(&listed);
+    let items = items.as_array().expect("array");
+    assert_eq!(items.len(), 1, "缓存条目必须保留: {items:?}");
+    assert_eq!(items[0]["name"], "w1");
+    assert_eq!(items[0]["origin"], "test-box");
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "读缓存不该为离线远端付建连代价，实际耗时 {elapsed:?}"
+    );
+
+    // 服务器列表同样不该失败
+    let servers = run(home_path, &["server", "ls", "--output", "json"]);
+    assert_ok(&servers, "掉线后 server ls 仍必须成功");
+    assert_eq!(
+        json(&servers).as_array().expect("array").len(),
+        0,
+        "对端本来就没有服务器"
+    );
 }
 
 /// `workspace use <remote>/<ws>` 只改本机 current；之后的 `server create`

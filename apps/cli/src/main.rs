@@ -14,6 +14,7 @@ mod meta;
 mod output;
 mod progress;
 mod prompts;
+mod remote_cache;
 mod ssh;
 mod verbosity;
 

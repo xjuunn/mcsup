@@ -258,6 +258,31 @@ pub(crate) fn remote_members(cfg: &mcsup::service::Config) -> RemoteMembers {
     let credentials = credential_store();
     let mut members = RemoteMembers::empty();
     for (name, record) in &cfg.remotes {
+        let Some(member) = build_member(name, record, &credentials) else {
+            continue;
+        };
+        // 入口命令一律只读本地缓存：远端在线与否都不该让 `ls` 等建连超时。
+        // 刷新由后台进程（`mcsup __remote-refresh`）另起，见 `remote_cache`。
+        let cached = RemoteMember::with_cache(
+            member.servers_link(),
+            member.name.clone(),
+            Arc::new(crate::remote_cache::cache_for(&member.name)),
+        );
+        // 缓存过期 / 从未同步：拉起一次后台刷新，前台立刻继续
+        crate::remote_cache::spawn_refresh_if_stale(&member.name);
+        members.push(cached);
+    }
+    members
+}
+
+/// 只装配连接、不挂缓存（后台刷新与探针用）
+///
+/// 刷新本身就是「去问对端」，挂缓存会自我循环；探针要的是真实连通性，读缓存
+/// 等于自问自答。
+pub(crate) fn remote_members_live(cfg: &mcsup::service::Config) -> RemoteMembers {
+    let credentials = credential_store();
+    let mut members = RemoteMembers::empty();
+    for (name, record) in &cfg.remotes {
         if let Some(member) = build_member(name, record, &credentials) {
             members.push(member);
         }

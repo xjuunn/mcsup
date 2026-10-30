@@ -1108,6 +1108,9 @@ fn report_connected(
     let workspaces = count(&client, &Request::WorkspaceList)?;
     let servers = count(&client, &Request::ServerList)?;
     let java = count(&client, &Request::JavaList)?;
+    // 连接成功正好是「刚问过对端」的时刻：顺手把四份列表落进缓存，
+    // 接下来的 `ls` 立刻有内容，不必等第一次后台刷新
+    seed_cache(name, endpoint, fingerprint)?;
 
     let payload = RemoteConnectJson {
         name: name.as_str(),
@@ -1132,6 +1135,21 @@ fn report_connected(
     } else {
         printer.print_outcome("", &payload)
     }
+}
+
+/// 把刚连上的远端整份写进缓存（失败只记日志）
+///
+/// 连接已经成功，缓存没写上不该让 `remote connect` 报错——下一次读命令会
+/// 再拉起后台刷新补上。
+fn seed_cache(name: &RemoteName, endpoint: &str, fingerprint: &Fingerprint) -> Result<()> {
+    let cache = crate::remote_cache::cache_for(name);
+    let credential = credential_store().get(name.as_str())?;
+    let link =
+        mcsup::backend::remote::RemoteLink::new(endpoint, fingerprint.clone(), &credential.token);
+    if let Err(err) = mcsup::backend::remote::refresh::refresh(&link, &cache) {
+        tracing::warn!(remote = name.as_str(), %err, "failed to seed the remote cache");
+    }
+    Ok(())
 }
 
 /// 数一下某类资源有多少条

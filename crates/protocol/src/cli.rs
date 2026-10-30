@@ -33,6 +33,10 @@ pub struct ServerRow<'a> {
     pub linked: bool,
     /// 领域状态口径；无 supervisor 时为 `stopped`
     pub status: String,
+    /// 条目来自离线来源的本地缓存（`origin` 不变，状态可能是旧的）
+    pub offline: bool,
+    /// 该来源从未同步成功过
+    pub never_synced: bool,
 }
 
 /// `server create` / `server link` 结果
@@ -243,6 +247,10 @@ pub struct WorkspaceRow<'a> {
     pub servers: usize,
     /// 是否当前工作区
     pub current: bool,
+    /// 条目来自离线来源的本地缓存（`origin` 不变，数据可能是旧的）
+    pub offline: bool,
+    /// 该来源从未同步成功过（此时 `offline` 也为真，但连旧数据都没有）
+    pub never_synced: bool,
 }
 
 /// `workspace init` 结果
@@ -330,6 +338,10 @@ pub struct JavaRow<'a> {
     pub managed: bool,
     /// JVM home 路径
     pub path: String,
+    /// 条目来自离线来源的本地缓存
+    pub offline: bool,
+    /// 该来源从未同步成功过
+    pub never_synced: bool,
 }
 
 /// `java scan` 结果
@@ -676,6 +688,8 @@ mod tests {
             jar: None,
             linked: false,
             status: "stopped".to_owned(),
+            offline: false,
+            never_synced: false,
         };
         let json = serde_json::to_string(&row).expect("serialize");
         for field in [

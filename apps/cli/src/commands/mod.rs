@@ -32,6 +32,11 @@ pub(crate) async fn run(cli: Cli, cfg: &ConfigFile, lang: Lang) -> Result<()> {
         Command::Doctor { only, strict } => doctor::run(cfg, &only, strict, printer).await,
         Command::Config { action } => config::run(action, printer),
         Command::Update => err("update"),
+        // 隐藏入口：读命令在后台拉起的缓存刷新进程，输出一律丢弃
+        Command::RemoteRefresh { name } => {
+            let code = crate::remote_cache::run_refresh(&name)?;
+            std::process::exit(code);
+        }
         Command::Supervise {
             dir,
             java,

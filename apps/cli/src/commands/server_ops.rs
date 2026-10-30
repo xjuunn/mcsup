@@ -1,4 +1,5 @@
 use crate::bootstrap;
+use crate::config::ConfigFile;
 use crate::diagnostic::AppDiagnostic;
 use crate::locale::Lang;
 use crate::output::Printer;
@@ -135,6 +136,7 @@ pub(crate) fn require_text(
     )
 }
 
+#[allow(clippy::too_many_lines)] // 一张表 + 一次状态合并，拆开只会更难读
 pub(crate) fn list(filter: &mcsup::service::OriginFilter, printer: Printer) -> Result<()> {
     let reg = bootstrap::open_registry_with_remotes()?;
     let all = reg.list_sourced().context(crate::i18n::pick(
@@ -147,14 +149,37 @@ pub(crate) fn list(filter: &mcsup::service::OriginFilter, printer: Printer) -> R
         .filter(|sourced| filter.matches(&sourced.origin))
         .collect();
     let ws_names = workspace_names()?;
-    let statuses = super::lifecycle::lifecycle_service()?.statuses()?;
+    // 远端条目的状态读缓存，本地条目才实时探测：一次 `statuses()` 会给每台
+    // 远端各发一次 RPC，离线远端上正好把「列表秒出」又还回去。
+    let members = bootstrap::remote_members(&ConfigFile::locate(None).load()?);
+    let cached = crate::remote_cache::cached_statuses(&members);
+    // 只探本地：远端状态从缓存读，离线远端不该在这里付建连代价
+    let local_names: std::collections::HashSet<String> = all
+        .iter()
+        .filter(|sourced| sourced.origin.is_local())
+        .map(|sourced| sourced.value.meta.name.as_str().to_owned())
+        .collect();
+    let statuses = super::lifecycle::lifecycle_service()?.statuses_for(&local_names)?;
     let rows: Vec<ServerRowView<'_>> = all
         .iter()
         .map(|sourced| {
             let srv = &sourced.value;
+            let is_remote = matches!(sourced.origin, mcsup::port::Origin::Remote(_));
             // 单台探测失败记 unknown，不拖死整个列表
-            let probe = statuses.get(srv.meta.name.as_str());
-            let view = probe.and_then(|p| p.as_ref().ok()).and_then(Option::as_ref);
+            let probe = if is_remote {
+                None
+            } else {
+                statuses.get(srv.meta.name.as_str())
+            };
+            let cached_view = if is_remote {
+                cached.get(srv.meta.name.as_str()).and_then(Option::as_ref)
+            } else {
+                None
+            };
+            let view = probe
+                .and_then(|p| p.as_ref().ok())
+                .and_then(Option::as_ref)
+                .or(cached_view);
             let unreachable = probe.is_some_and(Result::is_err);
             ServerRowView {
                 row: ServerRow {
@@ -171,12 +196,17 @@ pub(crate) fn list(filter: &mcsup::service::OriginFilter, printer: Printer) -> R
                     linked: srv.linked,
                     status: if unreachable {
                         "unknown".to_owned()
+                    } else if is_remote && sourced.offline {
+                        // 离线远端连旧状态都可能是错的：明确说「不知道」
+                        "unknown".to_owned()
                     } else {
                         view.map_or_else(
                             || ServerStatus::Stopped.as_str().to_owned(),
                             |s| s.status.as_str().to_owned(),
                         )
                     },
+                    offline: sourced.offline,
+                    never_synced: matches!(sourced.origin, mcsup::port::Origin::Remote(ref name) if crate::remote_cache::never_synced(name)),
                 },
                 running: view.is_some_and(|s| s.status.is_alive()),
             }
@@ -201,7 +231,7 @@ pub(crate) fn list(filter: &mcsup::service::OriginFilter, printer: Printer) -> R
                 crate::i18n::text(lang, "状态", "status"),
                 crate::i18n::text(lang, "路径", "path"),
             ]);
-            for row in &rows {
+            for (sourced, row) in all.iter().zip(&rows) {
                 let status = if row.running {
                     Cell::new(crate::i18n::text(lang, "运行中", "running")).fg(Color::Green)
                 } else {
@@ -209,7 +239,12 @@ pub(crate) fn list(filter: &mcsup::service::OriginFilter, printer: Printer) -> R
                 };
                 table.add_row([
                     Cell::new(row.row.name),
-                    Cell::new(&row.row.origin),
+                    // `(offline)` 只出现在人类可读的表格里，JSON 的 origin 保持纯标识符
+                    Cell::new(super::origin::label_marked(
+                        &sourced.origin,
+                        row.row.offline,
+                        row.row.never_synced,
+                    )),
                     Cell::new(&row.row.workspace),
                     Cell::new(row.row.version),
                     Cell::new(row.row.variant),
@@ -535,7 +570,7 @@ fn create_remote(
     printer: Printer,
 ) -> Result<()> {
     let lang = printer.lang();
-    let cfg = crate::config::ConfigFile::locate(None).load()?;
+    let cfg = ConfigFile::locate(None).load()?;
     let members = bootstrap::remote_members(&cfg);
     let member = super::origin::member(&members, origin, lang)?.ok_or_else(|| {
         AppDiagnostic::usage(
@@ -1649,7 +1684,7 @@ fn link_remote(
     printer: Printer,
 ) -> Result<()> {
     let lang = printer.lang();
-    let cfg = crate::config::ConfigFile::locate(None).load()?;
+    let cfg = ConfigFile::locate(None).load()?;
     let members = bootstrap::remote_members(&cfg);
     let member = super::origin::member(&members, origin, lang)?.ok_or_else(|| {
         AppDiagnostic::usage(
@@ -1863,7 +1898,7 @@ pub(crate) fn remove_remote(
     printer: Printer,
 ) -> Result<()> {
     let lang = printer.lang();
-    let cfg = crate::config::ConfigFile::locate(None).load()?;
+    let cfg = ConfigFile::locate(None).load()?;
     let members = bootstrap::remote_members(&cfg);
     let member = super::origin::member(&members, origin, lang)?.ok_or_else(|| {
         AppDiagnostic::usage(

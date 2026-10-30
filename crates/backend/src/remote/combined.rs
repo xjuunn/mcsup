@@ -8,9 +8,11 @@
 //! # 读与写的分工
 //!
 //! 读（`list` / `get` / `list_sourced`）：本地查本地仓库，每台远端查
-//! 自己的镜像仓库，合并返回。远端不可达时降级为空集并记 warn——离线不阻塞
-//! 本地操作（`docs/remote.md`「设计原则 4」），离线缓存的 `(offline)` 标记
-//! 由入口渲染层负责。
+//! 自己的镜像仓库，合并返回。挂了缓存的成员（`with_cache`，入口命令走的
+//! 就是这条）读的是本地文件，远端在不在线都不影响返回值，离线条目由镜像
+//! 标成 [`Sourced::offline`] 供入口渲染 `(offline)`；未挂缓存的成员（探针
+//! 与后台刷新）仍直连对端，不可达时降级为空集并记 warn——离线不阻塞本地
+//! 操作（`docs/remote.md`「设计原则 4」）。
 //!
 //! 写：**委托本地**。能到达组合仓库的写调用只有两类：service 的本地操作
 //! （`WorkspaceService::init`、`JavaService` 扫描登记……）与本地注册表维护，
@@ -21,8 +23,9 @@
 //!
 //! # 线程模型
 //!
-//! 每次读逐台远端串行请求：远端是低频管理操作，串行让失败定位与日志阅读
-//! 都简单；等远端数量成为问题时再并行化，接口不变。
+//! 每次读逐台远端串行遍历：远端是低频管理操作，串行让失败定位与日志阅读
+//! 都简单。挂了缓存时每台只是一次本地文件读，串行没有代价；未挂缓存时是
+//! 真网络请求，等远端数量成为问题时再并行化，接口不变。
 
 use crate::remote::mirror::{
     RemoteJavaRepository, RemoteServerRepository, RemoteWorkspaceRepository,
@@ -59,7 +62,7 @@ impl RemoteMember {
         self.servers.link()
     }
 
-    /// 用一条连接装配三个镜像
+    /// 用一条连接装配三个镜像（读即问对端，不缓存）
     #[must_use]
     pub fn new(link: crate::remote::RemoteLink, name: RemoteName) -> Self {
         let origin = Origin::Remote(name.clone());
@@ -69,6 +72,39 @@ impl RemoteMember {
             java: Arc::new(RemoteJavaRepository::new(link, origin)),
             name,
         }
+    }
+
+    /// 带缓存装配：三个镜像的读都只读本地缓存
+    ///
+    /// 入口命令全部走这条路径——只有探针（`remote ls` / `remote ping`）与后台
+    /// 刷新才需要真的问对端。
+    #[must_use]
+    pub fn with_cache(
+        link: crate::remote::RemoteLink,
+        name: RemoteName,
+        cache: Arc<super::cache::RemoteCache>,
+    ) -> Self {
+        let origin = Origin::Remote(name.clone());
+        Self {
+            workspaces: Arc::new(RemoteWorkspaceRepository::with_cache(
+                link.clone(),
+                origin.clone(),
+                Arc::clone(&cache),
+            )),
+            servers: Arc::new(RemoteServerRepository::with_cache(
+                link.clone(),
+                origin.clone(),
+                Arc::clone(&cache),
+            )),
+            java: Arc::new(RemoteJavaRepository::with_cache(link, origin, cache)),
+            name,
+        }
+    }
+
+    /// 这台远端的缓存句柄（入口起后台刷新时用）
+    #[must_use]
+    pub fn cache(&self) -> Option<&Arc<super::cache::RemoteCache>> {
+        self.workspaces.cache()
     }
 }
 
