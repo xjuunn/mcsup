@@ -38,7 +38,7 @@ Auth、Audit、Automation 等能力。目标是在生产环境长期稳定运行
 mcsup/
 ├── apps/
 │   ├── cli/                        # [已落地] CLI / TUI 程序入口，bin 名为 mcsup
-│   ├── agent/                      # [目标] Remote Agent 程序入口，bin 名为 mcsup-agent
+│   ├── agent/                      # [已落地] Remote Agent 程序入口，bin 名为 mcsup-agent
 │   ├── server/                     # [目标] API（HTTP / REST / WebSocket）入口，bin 名为 mcsup-server
 │   ├── mcp/                        # [目标] MCP Server 入口，bin 名为 mcsup-mcp
 │   ├── dev/                        # [已落地] 开发辅助工具
@@ -58,11 +58,11 @@ mcsup/
 │   ├── modkit/                     # [目标] Mod / Modpack 管理
 │   ├── java/                       # [已落地] Java 检测、安装和版本管理
 │   ├── protocol/                   # [已落地] RPC 消息和协议定义
-│   ├── transport/                  # [目标] RPC / gRPC 通信实现
+│   ├── transport/                  # [已落地] RPC 通信实现（TLS + 长度前缀帧）
 │   ├── api/                        # [目标] REST DTO / API Contract / OpenAPI
-│   └── auth/                       # [目标] Authentication / Authorization
+│   └── auth/                       # [已落地] Authentication / Authorization
 │
-├── tests/                        # 跨模块集成测试
+├── tests/                        # 跨模块集成测试（现有跨 crate 用例在各 crate 的 tests/）
 ├── docs/                         # 项目文档
 ├── scripts/                      # 构建、开发和发布脚本
 │
@@ -195,12 +195,21 @@ Domain 不涉及 CLI、HTTP、REST、TUI、MCP、数据库、RPC / gRPC，必须
 
 Service 不负责 CLI 输出、HTTP Router、HTML、TUI 渲染、MCP 协议细节。
 
-**同步 / 异步契约**：`service` 的编排接口是同步的（文件 IO、进程探测）。
-纯异步入口（`java::install`、平台自检）内部已用 `spawn_blocking` 把重
-文件 IO 移出执行器。**同步接口不得在长驻异步运行时（`apps/server` 等）的
-请求任务里直接调用**，调用方须自行 `spawn_blocking`；CLI 是单命令进程，
-阻塞即本任务的全部工作，可直接调用。这是入口的职责，不把 `service`
-改造成 async。
+**同步 / 异步契约**：`service` 同时存在两种编排接口，边界按「有没有网络
+IO」划分，不按模块划分：
+
+| 接口类别 | 例子 | 约束 |
+| --- | --- | --- |
+| 同步（主流，140+ 个） | 注册表、生命周期、备份、属性、设置 | 不得在长驻异步运行时的请求任务里直接调用，调用方自行 `spawn_blocking` |
+| async（12 个） | `java::install`、`content`、`modpack` 的取回 / 应用、平台自检 | 需要调用方持有 tokio 运行时；内部用 `spawn_blocking` 把重文件 IO 移出执行器 |
+
+CLI 是单命令进程，阻塞即本任务的全部工作，两种都能直接调用。同步宿主
+（Qt / Swing 等）需要同步形态的网络能力时，应经门面提供的阻塞包装，
+不要在库内部 `block_on` 一个共享运行时。
+
+> 早期版本把「`service` 的编排接口是同步的」写成绝对规则；实际落地时
+> 网络编排（下载 / 解包 / 安装器）留在 async，硬改成同步会把 `block_on`
+> 推进库内部。此表是当前约定，新增 async 接口时同步更新。
 
 # Backend
 
@@ -387,7 +396,11 @@ Object`），相同内容只存一次；Snapshot 记录各文件到哈希的映�
 
 Protocol 定义传输什么（`StartServerRequest` / `StartServerResponse` /
 `LogEvent` / `FileChunk` / `BackupProgress` 等消息类型）；Transport 定义怎么传
-（gRPC / tonic / prost / streaming）。禁止把具体 gRPC 实现污染到 Domain。
+（TLS 之上的长度前缀 JSON 帧 + 每请求一连接）。禁止把具体实现污染到 Domain。
+
+> 早期设计写的是 gRPC / tonic / prost；实际落地的是自研帧层（`crates/transport`），
+> 理由见 `docs/remote.md`：本地 supervisor 的进程 IPC 与远端 RPC 共用
+> `protocol` 的帧与版本纪律，gRPC 会额外引入 tonic 的运行时与本地端口。
 
 长任务的观察者（`TaskStage` / `TaskEvent` / `TaskObserver`）定义在 `port` 而不是
 各入口：`service` 只往它上面抛事件，本地入口接到终端渲染，远端把事件装进

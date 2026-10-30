@@ -10,8 +10,8 @@
 
 use crate::remote::RemoteLink;
 use port::{
-    ServerRef, StopOutcome, StopSpec, SupervisorError, SupervisorPort, SupervisorStartOutcome,
-    SupervisorStartRequest, SupervisorStatus,
+    RemoteFailureKind, ServerRef, StopOutcome, StopSpec, SupervisorError, SupervisorPort,
+    SupervisorStartOutcome, SupervisorStartRequest, SupervisorStatus,
 };
 use protocol::remote::wire::WireStatusEntry;
 use protocol::remote::{ErrorKind, Request, Response};
@@ -19,16 +19,24 @@ use protocol::remote::{ErrorKind, Request, Response};
 /// `ErrorKind` → `SupervisorError`：远端 supervisor 的错误出口只有这一个
 ///
 /// `busy`（含 `StopTimedOut` 的分类）→ `AlreadyRunning` 不成立——`BUSY` 也
-/// 可能是「还在运行无法删除」这类状态冲突，按文案归 [`SupervisorError::Remote`]，
+/// 可能是「还在运行无法删除」这类状态冲突，按种类归 [`SupervisorError::Remote`]，
 /// 由 `service` 的 `LifecycleError` 映射层再细分；这里只拆「确实能归位」的：
 /// `not_found` / 协议错误 / 其余统一远端错误。
 pub(crate) fn remote_supervisor_error(err: transport::TransportError) -> SupervisorError {
     match err {
-        transport::TransportError::Remote { kind, message } => match kind.as_str() {
-            ErrorKind::NOT_FOUND => SupervisorError::Unreachable(format!("not found: {message}")),
-            ErrorKind::PROTOCOL => SupervisorError::Protocol(message),
-            _ => SupervisorError::Remote { kind, message },
-        },
+        transport::TransportError::Remote { kind, message } => {
+            let kind = RemoteFailureKind::from_wire(&kind);
+            match kind {
+                RemoteFailureKind::NotFound => {
+                    SupervisorError::Unreachable(format!("not found: {message}"))
+                }
+                RemoteFailureKind::Protocol => SupervisorError::Protocol(message),
+                other => SupervisorError::Remote {
+                    kind: other,
+                    message,
+                },
+            }
+        }
         other => SupervisorError::Unreachable(other.to_string()),
     }
 }
@@ -58,7 +66,10 @@ impl RemoteSupervisor {
             .client_call(request)
             .map_err(remote_supervisor_error)?;
         match response {
-            Response::Error { kind, message } => Err(SupervisorError::Remote { kind, message }),
+            Response::Error { kind, message } => Err(SupervisorError::Remote {
+                kind: RemoteFailureKind::from_wire(&kind),
+                message,
+            }),
             other => Ok(other),
         }
     }
@@ -219,11 +230,11 @@ fn entry_into_status(entry: WireStatusEntry) -> Result<Option<SupervisorStatus>,
                 // 结构化 kind 判定，不解析 message 文案
                 Some(ErrorKind::NOT_FOUND) => SupervisorError::Unreachable(message),
                 Some(other) => SupervisorError::Remote {
-                    kind: other.to_owned(),
+                    kind: RemoteFailureKind::from_wire(other),
                     message,
                 },
                 None => SupervisorError::Remote {
-                    kind: ErrorKind::IO.to_owned(),
+                    kind: RemoteFailureKind::Io,
                     message,
                 },
             };

@@ -80,7 +80,10 @@ pub(crate) fn probe_status(server_dir: &Path) -> Result<Option<SupervisorStatus>
                 exit_code,
             }))
         }
-        Response::Error { kind, message } => Err(SupervisorError::Remote { kind, message }),
+        Response::Error { kind, message } => Err(SupervisorError::Remote {
+            kind: port::RemoteFailureKind::from_wire(&kind),
+            message,
+        }),
         other => Err(SupervisorError::Protocol(format!(
             "unexpected response: {other:?}"
         ))),
@@ -126,7 +129,10 @@ pub(crate) fn wait_gone(server_dir: &Path, total: Duration) {
 /// 把 [`Response`] 里的错误信封展开成 `Err`（`Ok` 变体直接返回）
 pub(crate) fn unwrap_ok(response: Response) -> Result<Response, SupervisorError> {
     match response {
-        Response::Error { kind, message } => Err(SupervisorError::Remote { kind, message }),
+        Response::Error { kind, message } => Err(SupervisorError::Remote {
+            kind: port::RemoteFailureKind::from_wire(&kind),
+            message,
+        }),
         other => Ok(other),
     }
 }

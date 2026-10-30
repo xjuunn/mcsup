@@ -195,16 +195,6 @@ fn default_version_source(has_jar: bool, interactive: bool) -> VersionSource {
     }
 }
 
-/// 该变体是否要先运行安装器（因而必须有 Java）
-///
-/// 与 `port::InstallKind::Installer` 是同一批变体，但入口在拿到 artifact 之前
-/// 就要决定要不要组建 `InstallerContext`，只能按变体判。`_` 兜底覆盖
-/// `#[non_exhaustive]` 将来新增的变体：默认按「不需要」处理，避免把
-/// 直接可运行的来源也拦在 Java 检查上。
-fn needs_installer_java(variant: &ServerVariant) -> bool {
-    matches!(variant, ServerVariant::Forge | ServerVariant::NeoForge)
-}
-
 /// 下载并登记服务端核心；不打印结果行（由调用方输出，保证 JSON 单行契约）
 ///
 /// 经 lifecycle 编排：运行中换核心被拒绝（Linux 上 rename 会成功但 JVM
@@ -248,7 +238,7 @@ pub(crate) async fn download_jar(
     // 安装器类来源才需要 java。这里**不能**把失败吞成 `None`：service 会把
     // 「没给上下文」报成笼统的 `NoJavaForInstaller`，用户永远看不到真正原因
     // 是「本机没装 Java」还是「装的 Java 与大版本要求不符」。
-    let installer_ctx = if needs_installer_java(&variant) {
+    let installer_ctx = if variant.needs_installer() {
         // 先把名字取出来：闭包会在 `variant` 之后还要读它，直接捕获会与
         // `lifecycle` 的借用冲突
         let variant_name = variant.as_str().to_owned();

@@ -205,7 +205,7 @@ impl SupervisorPort for FakeSupervisor {
         drop(inner);
         if fail_on == Some(attempt) {
             return Err(SupervisorError::Remote {
-                kind: "injected".to_owned(),
+                kind: port::RemoteFailureKind::Other("injected".to_owned()),
                 message: format!("send_line #{attempt} failed on purpose"),
             });
         }

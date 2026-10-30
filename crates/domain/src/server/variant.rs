@@ -146,6 +146,20 @@ impl ServerVariant {
         }
     }
 
+    /// 该变体的下载物是安装器，必须先运行一次才能得到可启动的核心
+    ///
+    /// `Forge` / `NeoForge` 发布的是 installer，不是服务端 JAR。入口在拿到
+    /// artifact 之前就要决定「要不要先挑 Java 跑安装器」，因此这条判定必须在
+    /// 领域层可回答，不能由入口按变体名重写一份。
+    ///
+    /// 与 `port::InstallKind` 的关系：来源解析出的 artifact 上带的安装类型是
+    /// 运行期权威值（artifact 已经拿到时以它为准）；本方法是同一事实在领域侧
+    /// 的投影，供「解析之前」的编排使用。新增安装器型变体时两处一起改。
+    #[must_use]
+    pub fn needs_installer(&self) -> bool {
+        matches!(self, Self::Forge | Self::NeoForge)
+    }
+
     /// 由机器名构造，内置名归一为内置项
     ///
     /// 内置名 → 对应内置项；其余名字作为第三方变体接受。需要「只认内置集合」

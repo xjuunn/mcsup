@@ -392,10 +392,9 @@ impl BackupService {
             .supervisor()
             .send_line(&server.server_ref(), line)
         {
-            Err(port::SupervisorError::Remote { kind, .. }) if kind == "not_running" => {
-                Err(BackupError::Lifecycle(LifecycleError::NotRunning))
-            }
-            Err(other) => Err(BackupError::Lifecycle(LifecycleError::Supervisor(other))),
+            Err(err) => Err(BackupError::Lifecycle(
+                LifecycleError::from_supervisor_send(err),
+            )),
             Ok(()) => Ok(()),
         }
     }
@@ -608,13 +607,12 @@ impl BackupService {
         tracing::warn!(server = %server, error = %err, "remote backup failed");
         BackupError::Supervisor(port::SupervisorError::Remote {
             kind: match err {
-                port::RemoteBackupError::NotFound(_) => "not_found",
-                port::RemoteBackupError::Invalid(_) => "invalid",
-                port::RemoteBackupError::Unreachable(_) => "unreachable",
-                port::RemoteBackupError::Protocol(_) => "protocol",
-                port::RemoteBackupError::Io(_) | _ => "io",
-            }
-            .to_owned(),
+                port::RemoteBackupError::NotFound(_) => port::RemoteFailureKind::NotFound,
+                port::RemoteBackupError::Invalid(_) => port::RemoteFailureKind::Invalid,
+                port::RemoteBackupError::Unreachable(_) => port::RemoteFailureKind::Unreachable,
+                port::RemoteBackupError::Protocol(_) => port::RemoteFailureKind::Protocol,
+                port::RemoteBackupError::Io(_) | _ => port::RemoteFailureKind::Io,
+            },
             message: err.to_string(),
         })
     }

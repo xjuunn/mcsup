@@ -478,4 +478,4 @@ service ──TaskObserver──▶ 本地：apps/cli/src/progress.rs
 | origin | 资源来源：`local` 或某个远端名 |
 | 被连接端 / serve 端 | 运行 `mcsup remote serve` 的机器 |
 | 连接端 / 客户端 | 运行 `mcsup remote connect` 的机器 |
-| 只读镜像 | 远端仓库只供读（本地缓存待实现） |
+| 只读镜像 | 远端仓库只供读，结果落到本地缓存（`backend::remote::cache`） |

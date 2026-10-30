@@ -1051,6 +1051,81 @@ pub enum StopOutcome {
     },
 }
 
+/// 远端失败种类：协议 `Response::Error` 的 `kind` 的类型化视图
+///
+/// 线上仍然是字符串——种类词表属于协议，对端可能是更新的版本。因此未知
+/// 种类进 [`Self::Other`] 原样保留，不降级成「未知错误」后丢掉排障信息。
+/// 判定方（`service`）按变体匹配，词表拼错不再是运行时问题。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RemoteFailureKind {
+    /// 服务器没在运行（幂等停机 / 附加已退出）
+    NotRunning,
+    /// 目标不存在
+    NotFound,
+    /// 名称冲突
+    AlreadyExists,
+    /// 状态冲突（如服务器在运行）
+    Busy,
+    /// 参数非法
+    Invalid,
+    /// 未认证 / token 失效 / 权限不足
+    Unauthorized,
+    /// 协议 / 版本不匹配
+    Protocol,
+    /// 连接不可达（装配错误：有远端条目却没有连接）
+    Unreachable,
+    /// 对端 IO / 存储失败
+    Io,
+    /// 未登记的种类（保留原文，只用于排障）
+    Other(String),
+}
+
+impl RemoteFailureKind {
+    /// 线上字符串 → 种类
+    ///
+    /// 词表与 `protocol::remote::ErrorKind` 的常量一一对应。映射只能写在这一侧：
+    /// `protocol` 依赖本 crate，反向引用会成环。
+    #[must_use]
+    pub fn from_wire(raw: &str) -> Self {
+        match raw {
+            "not_running" => Self::NotRunning,
+            "not_found" => Self::NotFound,
+            "already_exists" => Self::AlreadyExists,
+            "busy" => Self::Busy,
+            "invalid" => Self::Invalid,
+            "unauthorized" => Self::Unauthorized,
+            "protocol" => Self::Protocol,
+            "unreachable" => Self::Unreachable,
+            "io" => Self::Io,
+            other => Self::Other(other.to_owned()),
+        }
+    }
+
+    /// 种类 → 线上字符串（未知种类原样回写，保证往返无损）
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::NotRunning => "not_running",
+            Self::NotFound => "not_found",
+            Self::AlreadyExists => "already_exists",
+            Self::Busy => "busy",
+            Self::Invalid => "invalid",
+            Self::Unauthorized => "unauthorized",
+            Self::Protocol => "protocol",
+            Self::Unreachable => "unreachable",
+            Self::Io => "io",
+            Self::Other(raw) => raw,
+        }
+    }
+}
+
+impl std::fmt::Display for RemoteFailureKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// supervisor 交互失败
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -1069,7 +1144,12 @@ pub enum SupervisorError {
     Protocol(String),
     /// 远端（supervisor 侧）返回的业务错误
     #[error("{kind}: {message}")]
-    Remote { kind: String, message: String },
+    Remote {
+        /// 类型化的失败种类
+        kind: RemoteFailureKind,
+        /// 人类可读消息（只用于日志与调试）
+        message: String,
+    },
     /// 本地 IO 失败
     #[error(transparent)]
     Io(#[from] std::io::Error),

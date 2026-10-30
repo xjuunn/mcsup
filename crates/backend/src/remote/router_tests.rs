@@ -91,7 +91,7 @@ impl SupervisorPort for MemSupervisor {
             Ok(())
         } else {
             Err(SupervisorError::Remote {
-                kind: "not_found".to_owned(),
+                kind: port::RemoteFailureKind::NotFound,
                 message: "not running".to_owned(),
             })
         }

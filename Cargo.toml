@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
-# crates/mcsup 是唯一发布单元。第一个 app 落地时在这里补上 "apps/*"：
+# crates/mcsup 是唯一发布单元；apps/* 是并行 bin 入口，不进 crates.io。
+# 新增成员时同步 scripts/check-architecture.sh 的允许集合表。
 members = ["apps/agent","apps/cli","apps/dev","crates/auth","crates/backend","crates/backup","crates/domain", "crates/file","crates/java", "crates/mcsup", "crates/port", "crates/protocol", "crates/provider", "crates/runtime", "crates/service", "crates/storage", "crates/testkit", "crates/transport"]
 
 [workspace.package]
