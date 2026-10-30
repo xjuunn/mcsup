@@ -120,7 +120,13 @@ fn send_line_fails_when_not_running() {
         .send_line(&server_ref(&id), "say hi")
         .expect_err("not running");
     assert!(
-        matches!(err, SupervisorError::Remote { ref kind, .. } if kind == "not_found"),
+        matches!(
+            err,
+            SupervisorError::Remote {
+                kind: port::RemoteFailureKind::NotFound,
+                ..
+            }
+        ),
         "{err:?}"
     );
 

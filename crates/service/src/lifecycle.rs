@@ -136,6 +136,22 @@ pub enum BusyOp {
 }
 
 impl LifecycleError {
+    /// supervisor 注入失败 → 领域错误
+    ///
+    /// 「对端明确说没在运行」是幂等语义，归 [`Self::NotRunning`]；其余原样
+    /// 包装。`backup` 的控制台注入与 `lifecycle` 的 `send_line` 共用这一份
+    /// 判定，避免两处各写一个 `kind` 比较。
+    #[must_use]
+    pub(crate) fn from_supervisor_send(err: SupervisorError) -> Self {
+        match err {
+            SupervisorError::Remote {
+                kind: port::RemoteFailureKind::NotRunning,
+                ..
+            } => Self::NotRunning,
+            other => Self::Supervisor(other),
+        }
+    }
+
     /// 面向用户展示的分类；结构化错误不带文案，入口按此渲染提示
     #[must_use]
     pub fn kind(&self) -> Option<LifecycleErrorKind<'_>> {
@@ -601,10 +617,7 @@ impl ServerLifecycleService {
             .supervisor()
             .send_line(&server.server_ref(), line)
         {
-            Err(SupervisorError::Remote { kind, .. }) if kind == "not_running" => {
-                Err(LifecycleError::NotRunning)
-            }
-            Err(other) => Err(LifecycleError::Supervisor(other)),
+            Err(err) => Err(LifecycleError::from_supervisor_send(err)),
             Ok(()) => Ok(()),
         }
     }
@@ -2083,7 +2096,7 @@ mod tests {
         let fixture = Fixture::new(true);
         let supervisor = Arc::new(FakeSupervisor::running());
         *supervisor.send_error.lock().expect("lock") = Some(SupervisorError::Remote {
-            kind: "not_running".to_owned(),
+            kind: port::RemoteFailureKind::NotRunning,
             message: "not running".to_owned(),
         });
         let svc = service(

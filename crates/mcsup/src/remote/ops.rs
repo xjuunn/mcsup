@@ -519,13 +519,13 @@ impl Agent {
             Ok(srv) => srv.meta.variant,
             Err(err) => return registry_failure(&err),
         };
-        let runtime = match current_thread_runtime() {
-            Ok(runtime) => runtime,
-            Err(err) => return failure(ErrorKind::IO, err),
-        };
-        match runtime.block_on(self.install_core_async(name, version, &variant, progress)) {
-            Ok(item) => Response::Servers { items: vec![item] },
-            Err(response) => *response,
+        let installed = with_dispatch_runtime(|runtime| {
+            runtime.block_on(self.install_core_async(name, version, &variant, progress))
+        });
+        match installed {
+            Ok(Ok(item)) => Response::Servers { items: vec![item] },
+            Ok(Err(response)) => *response,
+            Err(err) => failure(ErrorKind::IO, err),
         }
     }
 
@@ -546,17 +546,14 @@ impl Agent {
             )
             .into_response();
         };
-        let runtime = match current_thread_runtime() {
-            Ok(runtime) => runtime,
-            Err(err) => return failure(ErrorKind::IO, err),
-        };
-        match runtime.block_on(source.versions()) {
-            Ok(mut versions) => {
+        match with_dispatch_runtime(|runtime| runtime.block_on(source.versions())) {
+            Ok(Ok(mut versions)) => {
                 ServerVersion::sort_display_order(&mut versions);
                 Response::Versions {
                     items: versions.iter().map(WireVersion::from).collect(),
                 }
             }
+            Ok(Err(err)) => failure(ErrorKind::IO, err),
             Err(err) => failure(ErrorKind::IO, err),
         }
     }
@@ -617,95 +614,96 @@ impl Agent {
         version: Option<&str>,
         progress: &dyn TaskObserver,
     ) -> Response {
-        let runtime = match current_thread_runtime() {
-            Ok(runtime) => runtime,
-            Err(err) => return failure(ErrorKind::IO, err),
-        };
-        runtime.block_on(async {
-            // 每次创建用唯一暂存目录：多台远端命令可能并发创建整合包，
-            // 共享 `temp/mcsup-modpack-staging` 会互相删暂存文件
-            let staging = unique_staging_dir();
-            if let Err(err) = std::fs::create_dir_all(&staging) {
-                return failure(ErrorKind::IO, err);
-            }
-            // 守卫保证任何提前返回都会清理暂存目录
-            let _staging_guard = StagingGuard(staging.clone());
-            let mut options =
-                ModpackInstallOptions::new(&staging).progress(progress as &dyn port::ProgressSink);
-            if let Some(version) = version {
-                options = options.version(version);
-            }
-            let cancel = port::CancellationToken::new();
-            let prepared = match self.core.modpack.prepare(project, options, &cancel).await {
-                Ok(prepared) => prepared,
-                Err(err) => return modpack_failure(&err),
-            };
-            // 加载器与 MC 版本必须在登记前确定：注册表存加载器对应的变体，
-            // 而不是 `modrinth-modpack`（后者只是「走整合包流程」的标记，
-            // 没有可下载的核心来源）
-            let variant = match prepared.require_loader() {
-                Ok(variant) => variant,
-                Err(err) => return modpack_failure(&err),
-            };
-            let minecraft = match prepared.minecraft_version() {
-                Ok(version) => version.to_owned(),
-                Err(err) => return modpack_failure(&err),
-            };
-            let dir = match self.core.registry.create(
-                workspace,
-                name,
-                &VersionId::new(minecraft.clone()),
-                variant.clone(),
-                None,
-            ) {
-                Ok(srv) => srv.dir,
-                Err(err) => return registry_failure(&err),
-            };
-            // 先装核心再铺文件：失败留在「已登记」状态，重试入口是 `server install`
-            if let Err(response) = self
-                .install_core_async(name, &minecraft, &variant, progress)
-                .await
-            {
-                return *response;
-            }
-            let applied = match self
-                .core
-                .modpack
-                .apply(
-                    &prepared,
-                    &dir,
-                    Some(progress as &dyn port::ProgressSink),
-                    &cancel,
-                )
-                .await
-            {
-                Ok(applied) => applied,
-                Err(err) => return modpack_failure(&err),
-            };
-            // `.mrpack` 暂存目录由 `StagingGuard` 在作用域结束时删除
-            let updated = match self.core.registry.get(name) {
-                Ok(srv) => srv,
-                Err(err) => return registry_failure(&err),
-            };
-            match WireServer::try_from(&updated.meta) {
-                Ok(server) => Response::ModpackApplied {
-                    server,
-                    project_id: prepared.resolved.project_id.clone(),
-                    version_id: prepared.resolved.version_id.clone(),
-                    version_number: prepared.resolved.version_number.clone(),
-                    minecraft,
-                    loader: prepared
-                        .index
-                        .loader()
-                        .map(|(loader, version)| format!("{loader} {version}")),
-                    files: applied.file_count,
-                    downloaded_bytes: applied.downloaded_bytes,
-                    reused: applied.reused,
-                    skipped_client_only: applied.skipped_client_only,
-                },
-                Err(err) => failure(ErrorKind::IO, err),
-            }
-        })
+        match with_dispatch_runtime(|runtime| {
+            runtime.block_on(async {
+                // 每次创建用唯一暂存目录：多台远端命令可能并发创建整合包，
+                // 共享 `temp/mcsup-modpack-staging` 会互相删暂存文件
+                let staging = unique_staging_dir();
+                if let Err(err) = std::fs::create_dir_all(&staging) {
+                    return failure(ErrorKind::IO, err);
+                }
+                // 守卫保证任何提前返回都会清理暂存目录
+                let _staging_guard = StagingGuard(staging.clone());
+                let mut options = ModpackInstallOptions::new(&staging)
+                    .progress(progress as &dyn port::ProgressSink);
+                if let Some(version) = version {
+                    options = options.version(version);
+                }
+                let cancel = port::CancellationToken::new();
+                let prepared = match self.core.modpack.prepare(project, options, &cancel).await {
+                    Ok(prepared) => prepared,
+                    Err(err) => return modpack_failure(&err),
+                };
+                // 加载器与 MC 版本必须在登记前确定：注册表存加载器对应的变体，
+                // 而不是 `modrinth-modpack`（后者只是「走整合包流程」的标记，
+                // 没有可下载的核心来源）
+                let variant = match prepared.require_loader() {
+                    Ok(variant) => variant,
+                    Err(err) => return modpack_failure(&err),
+                };
+                let minecraft = match prepared.minecraft_version() {
+                    Ok(version) => version.to_owned(),
+                    Err(err) => return modpack_failure(&err),
+                };
+                let dir = match self.core.registry.create(
+                    workspace,
+                    name,
+                    &VersionId::new(minecraft.clone()),
+                    variant.clone(),
+                    None,
+                ) {
+                    Ok(srv) => srv.dir,
+                    Err(err) => return registry_failure(&err),
+                };
+                // 先装核心再铺文件：失败留在「已登记」状态，重试入口是 `server install`
+                if let Err(response) = self
+                    .install_core_async(name, &minecraft, &variant, progress)
+                    .await
+                {
+                    return *response;
+                }
+                let applied = match self
+                    .core
+                    .modpack
+                    .apply(
+                        &prepared,
+                        &dir,
+                        Some(progress as &dyn port::ProgressSink),
+                        &cancel,
+                    )
+                    .await
+                {
+                    Ok(applied) => applied,
+                    Err(err) => return modpack_failure(&err),
+                };
+                // `.mrpack` 暂存目录由 `StagingGuard` 在作用域结束时删除
+                let updated = match self.core.registry.get(name) {
+                    Ok(srv) => srv,
+                    Err(err) => return registry_failure(&err),
+                };
+                match WireServer::try_from(&updated.meta) {
+                    Ok(server) => Response::ModpackApplied {
+                        server,
+                        project_id: prepared.resolved.project_id.clone(),
+                        version_id: prepared.resolved.version_id.clone(),
+                        version_number: prepared.resolved.version_number.clone(),
+                        minecraft,
+                        loader: prepared
+                            .index
+                            .loader()
+                            .map(|(loader, version)| format!("{loader} {version}")),
+                        files: applied.file_count,
+                        downloaded_bytes: applied.downloaded_bytes,
+                        reused: applied.reused,
+                        skipped_client_only: applied.skipped_client_only,
+                    },
+                    Err(err) => failure(ErrorKind::IO, err),
+                }
+            })
+        }) {
+            Ok(response) => response,
+            Err(err) => failure(ErrorKind::IO, err),
+        }
     }
 
     /// 读取对端 `server.properties` 原文
@@ -786,20 +784,19 @@ impl Agent {
             JavaPackageType::Jdk
         };
         let vendor = vendor.map(JavaVendor::parse_fuzzy);
-        let runtime = match current_thread_runtime() {
-            Ok(runtime) => runtime,
-            Err(err) => return failure(ErrorKind::IO, err),
-        };
-        let outcome = runtime.block_on(self.core.java.install(
-            major,
-            package,
-            vendor,
-            Some(progress),
-            &port::CancellationToken::new(),
-        ));
+        let outcome = with_dispatch_runtime(|runtime| {
+            runtime.block_on(self.core.java.install(
+                major,
+                package,
+                vendor,
+                Some(progress),
+                &port::CancellationToken::new(),
+            ))
+        });
         match outcome {
-            Ok(_) => self.java_list(),
-            Err(err) => java_failure(&err),
+            Ok(Ok(_)) => self.java_list(),
+            Ok(Err(err)) => java_failure(&err),
+            Err(err) => failure(ErrorKind::IO, err),
         }
     }
 
@@ -1045,13 +1042,31 @@ fn failure(kind: &'static str, err: impl std::fmt::Display) -> Response {
 /// 同步分发线程上跑 async 安装 / 整合包编排
 ///
 /// `install_jar_checked` 与整合包取回都走 HTTP（async），而分发线程是同步的。
-/// 远端命令本就是「一请求一连接一线程」，在当前线程上建一个 current-thread
-/// runtime 阻塞执行即可；transport 的 600s 读写超时与下载时长同一量级，
-/// 不构成额外约束。
-fn current_thread_runtime() -> std::io::Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
+/// 远端命令是「一请求一连接一线程」，同一线程会串行处理该连接的每一条请求，
+/// 因此 runtime 按线程复用一次而不是每请求重建：它不是业务状态，只是执行器
+/// 资源（IO / 定时器驱动），不参与任何判定。transport 的 600s 读写超时与下载
+/// 时长同一量级，不构成额外约束。
+fn with_dispatch_runtime<T>(
+    work: impl FnOnce(&tokio::runtime::Runtime) -> T,
+) -> std::io::Result<T> {
+    DISPATCH_RUNTIME.with(|cell| {
+        if cell.get().is_none() {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            // `set` 失败只可能是同一线程重入（不会发生）；保留首次创建的那个
+            let _ = cell.set(runtime);
+        }
+        cell.get()
+            .map(work)
+            .ok_or_else(|| std::io::Error::other("dispatch runtime was not initialized"))
+    })
+}
+
+thread_local! {
+    /// 本线程的分发 runtime（首次使用时创建）
+    static DISPATCH_RUNTIME: std::cell::OnceCell<tokio::runtime::Runtime> =
+        const { std::cell::OnceCell::new() };
 }
 
 /// 一次整合包创建用的唯一暂存目录

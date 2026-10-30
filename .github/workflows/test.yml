@@ -99,7 +99,7 @@ jobs:
           LC_ALL: ${{ matrix.lc_all }}
           MCSUP_LANG: ""
         run: cargo test --workspace --all-features
-      # 端到端单独成步：`cargo test --workspace` 虽会顺带跑 tests/cli_e2e.rs，
+      # 端到端单独成步：`cargo test --workspace` 虽会顺带跑 apps/cli/tests/cli_e2e.rs，
       # 但那是「碰巧」，不是约定。这里显式跑 check.sh 调用的同一个脚本，
       # 保证本地与 CI 跑的是同一组用例、同一套结论。
       - name: e2e

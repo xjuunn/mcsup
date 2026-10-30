@@ -37,25 +37,27 @@ crates/mcsup/               门面 package mcsup（唯一入口与发布主体�
 │                           src/lib.rs：feature → pub use 重导出
 ├── 已落地（内层 crate + 门面同名 feature）：
 │   ├── domain/             领域模型、值对象、状态机、领域错误（无依赖）
-│   ├── port/               能力 trait：Backend / ProcessSpawner /
-│   │                       JavaResolver / ServerRepository / ConsoleSink /
-│   │                       EventSink / Clock（依赖 domain）
-│   ├── protocol/           消息和结果类型（唯一契约来源，依赖 domain）
-│   ├── service/            用例编排：start / stop / status / backup
+│   ├── port/               能力 trait（29 个，随能力分组在 `port::backup` /
+│   │                       `port::content` / `port::modpack` / `port::task` /
+│   │                       `port::origin` / `port::backend` 与 `lib.rs`），
+│   │                       依赖 domain
+│   ├── protocol/           消息和结果类型（唯一契约来源，依赖 domain / port / auth）
+│   ├── service/            用例编排：start / stop / status / backup / content / modpack
 │   ├── file/               文件系统和文件传输
 │   ├── java/               Java 检测与版本管理（实现 port）
 │   ├── provider/           外部资源和第三方 API
 │   ├── storage/            元数据持久化（实现 port::ServerRepository）
 │   ├── runtime/            Minecraft / JVM 进程运行（实现 port，依赖 protocol）
 │   ├── backup/             CAS / Snapshot / Restore（实现 port::ContentStore 等）
+│   ├── transport/          RPC 通信：TLS + 长度前缀帧（client / server / handler）
 │   └── backend/            Local 执行位置与备份数据（实现 port::Backend 与
 │                           port::BackupStore；唯一允许组合实现层的 crate）
-└── 待建（同样建 crate 并在门面加 feature；cli 为门面内模块）：
-    ├── cli/                CLI 命令语义和渲染（feature = "cli"，门面内模块）
+└── 待建（同样建 crate 并在门面加 feature）：
     ├── modkit/             Mod / Modpack
-    ├── transport/          RPC 通信（RemoteBackend 使用）
-    ├── api/                REST DTO / OpenAPI（apps/server 使用）
-    └── auth/               认证与授权（apps/server 使用）
+    └── api/                REST DTO / OpenAPI（apps/server 使用）
+
+apps/cli 不是门面内模块：CLI 命令语义与渲染在 `apps/cli`，通过门面
+`bootstrap` 组合根取服务，不额外建 `cli` crate。
 ```
 
 依赖方向：入口只依赖 `service`；`service` 只依赖 `port` 和 `domain`；
@@ -75,15 +77,17 @@ crates/mcsup/               门面 package mcsup（唯一入口与发布主体�
 - `domain` 不依赖本仓库任何其他模块，也不依赖任何 IO / 并发 / 存储类
   crate。允许纯过程的依赖（如 `thiserror` 派生错误类型），因为它不引入
   平台能力，也不让领域类型泄漏实现细节。
-- `port` 只定义 trait，实现交给调用方或 `service` 的组合根。
+- `port` 只定义 trait 与契约类型，实现交给调用方或 `service` 的组合根。
 - `service` 不得依赖任何具体实现模块（runtime / storage / java / …）。
   它只通过 `port` 的 trait 工作。
 - CLI 不得绕过 `service` 直接调用实现层。
+- 错误分类必须类型化：跨层的「种类」用枚举（如 `port::RemoteFailureKind`），
+  不在协议线上按字符串比较。
 
 分层在多 crate 形态下由 Cargo manifest 直接表达（实现层只声明 domain / port
 等依赖）。`scripts/check-architecture.sh` 校验包命名、app 互依赖、
-`domain` 不依赖其他 workspace 包与门面 feature ↔ `pub use` 对应；
-crate 级依赖方向断言（实现层之间不互相依赖）尚待补入该脚本。
+`domain` 不依赖其他 workspace 包、门面 feature ↔ `pub use` 对应，以及
+crate 级与模块级依赖方向（实现层之间不互相依赖）。
 
 ## Port / Adapter
 
