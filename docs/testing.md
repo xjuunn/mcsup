@@ -163,7 +163,7 @@ crate 的 `tests/` 引用。
 
 # AI 开发硬性约束
 
-以下四条对本项目所有 AI 辅助开发生效，违背即视为未完成。
+以下五条对本项目所有 AI 辅助开发生效，违背即视为未完成。
 
 ## 1. 失败信息自证
 
@@ -205,7 +205,30 @@ testkit::assert_invariant(page.total == 0, || {
 
 `#[ignore]` 必须带原因字符串。CI 里用 `--ignored` 显式执行的组只有手动触发的深度检查 job。
 
-## 4. 修复循环收敛
+## 4. 文案断言必须钉住语言
+
+集成测试里断言面向人的文案（中文或英文）时，必须在命令里显式给 `--lang`
+（或显式设置 `MCSUP_LANG`），不能用「机器默认值」：
+
+```rust
+// 禁止：断言中文却让语言随机器漂移
+assert!(stderr.contains("指纹"), "{stderr}");
+
+// 必须
+run(home, &["remote", "connect", &addr, "--code", &code, "--output", "json", "--lang", "zh"]);
+assert!(stderr.contains("指纹"), "{stderr}");
+```
+
+原因是三平台取 locale 的方式不同：Linux 读 `LANG` / `LC_ALL` / `LC_MESSAGES`，
+macOS 读系统偏好（`CFLocaleCopyPreferredLanguages`，不读 `LANG`），Windows 读
+系统设置。测试的 `run` 辅助函数为避免用户环境影响，会 `env_remove` 掉这些变量，
+于是 Linux 上 `sys_locale` 返回 `None`、语言回退英文，macOS 上仍读得到中文——
+**同一份断言本地绿、CI 红**。这类失败不会在开发机上暴露，只能靠这条约定避免。
+
+只断言机器可读内容（JSON 字段、退出码、路径、`--version` 版本号）时不需要钉住
+语言：`--output json` 的 stdout、错误分类与退出码与语言无关。
+
+## 5. 修复循环收敛
 
 测试失败后的循环是：读失败信息 → 定位是「实现错」还是「测试错」→ 改一处
 → 重跑。

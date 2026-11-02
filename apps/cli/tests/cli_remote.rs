@@ -305,6 +305,11 @@ fn connect_without_yes_refuses_to_trust_an_unknown_fingerprint() {
             &agent.code,
             "--output",
             "json",
+            // 断言中文文案就必须显式点名语言：`run` 清掉了 LANG / LC_ALL /
+            // MCSUP_LANG，Linux 上 `sys_locale` 拿不到任何值会回退英文，
+            // 而 macOS 读系统偏好（中文）——不写死就随机器漂移。
+            "--lang",
+            "zh",
         ],
     );
     assert!(!out.status.success(), "非交互且无 -y 必须拒绝");
