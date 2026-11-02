@@ -72,9 +72,10 @@ git branch -d <分支>
 
 ## CI 只能手动触发
 
-`.github/workflows/test.yml` **不监听 `push` 和 `pull_request`**，只保留
-`workflow_dispatch`。原因是 GitHub Actions 额度有限，自动触发会让每次提交都跑满
-os × locale 矩阵，额度很快用光。
+`.github/workflows/test.yml` **不监听 `push`、`pull_request` 和 `schedule`**，
+只保留 `workflow_dispatch`。原因是 GitHub Actions 额度有限，自动触发会让每次提交
+都跑满 os × locale 矩阵，深度检查（变异测试、联网探测）也会每天自动消耗一次，
+额度很快用光。
 
 需要 CI 信号时手动跑一次，指向要验证的分支：
 

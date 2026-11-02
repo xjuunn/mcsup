@@ -244,6 +244,26 @@ pub(crate) fn detach(_command: &mut Command) {}
 mod tests {
     use super::*;
 
+    /// 等锁真正释放，返回是否在期限内等到
+    ///
+    /// 不能只探测一次：`flock` 的锁挂在 open file description 上，同进程里别的
+    /// 线程 `fork` 出的子进程在 `exec` 之前继承同一个描述符，于是「本进程已经
+    /// drop」到「子进程 exec」之间存在一段窗口，探测仍会报被持有。`O_CLOEXEC`
+    /// 只在 `exec` 时生效，挡不住这段窗口；测试并行跑时几乎必然撞上。
+    /// 所以按 deadline 轮询，而不是把它当成一次性判定。
+    fn wait_until_released(dir: &Path) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if !InstanceLock::is_held(dir).expect("probe") {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn second_instance_cannot_take_the_lock() {
         let dir = tempfile::tempdir().expect("tmp");
@@ -257,7 +277,10 @@ mod tests {
         );
         assert!(InstanceLock::is_held(dir.path()).expect("probe"));
         drop(first);
-        assert!(!InstanceLock::is_held(dir.path()).expect("probe"));
+        assert!(
+            wait_until_released(dir.path()),
+            "drop 之后锁应当释放（等待期间允许别的 fork 子进程短暂持有）"
+        );
     }
 
     #[test]

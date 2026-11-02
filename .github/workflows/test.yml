@@ -3,12 +3,10 @@ name: Test
 # 只手动触发（workflow_dispatch）：GitHub Actions 额度有限，自动触发会让每次
 # 提交都跑满 os × locale 矩阵，额度很快用光。需要 CI 信号时到 Actions 页面
 # 手动 Run workflow，或 `gh workflow run test.yml --ref <分支>`。
-# 同理不监听 push / pull_request，避免任何提交自动消耗额度。
+# 同理不监听 push / pull_request / schedule，避免任何自动运行消耗额度：
+# 深度检查（变异测试、联网探测）也只在手动触发时执行。
 on:
   workflow_dispatch:
-  # 夜间：跑白天的门禁装不下的深度检查（变异测试、联网探测）
-  schedule:
-    - cron: "0 18 * * *"
 
 # 同一分支重复手动触发取消旧的运行，避免占用额度：group 仍按 ref 收敛。
 concurrency:
@@ -229,12 +227,11 @@ jobs:
             exit 1
           fi
 
-  # ---- 夜间深度检查：不进 PR 门禁（太慢），靠 cron 每天跑一次 ----
+  # ---- 深度检查：不进常规门禁（太慢），只在手动 Run workflow 时执行 ----
 
   # 变异测试：检查「测试能不能发现实现被改坏」。基线阶段只报告，不卡阈值。
   mutants:
     name: mutants
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 240
     steps:
@@ -268,11 +265,10 @@ jobs:
           path: mutants.out
           retention-days: 14
 
-  # 真实网络探测：`#[ignore]` 的那组用例。白天门禁永远不跑它们，
-  # 只有这里（夜间）显式执行，失败说明上游改了契约。
+  # 真实网络探测：`#[ignore]` 的那组用例。常规门禁永远不跑它们，
+  # 只有这里（手动触发）显式执行，失败说明上游改了契约。
   net:
     name: net (ignored tests)
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
