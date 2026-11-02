@@ -49,10 +49,54 @@ if [ -z "$manifests" ]; then
 fi
 
 # workspace 加载失败就停，否则后面每个包都会误报「无法解析」。
-if ! cargo metadata --format-version 1 --no-deps >/dev/null; then
+#
+# 顺带把整个依赖图取回来：原来每个包要跑两次 `cargo tree`（18 个包 → 36 次
+# 进程 + 每次重新解析 workspace），实测整步 6 秒里绝大部分是这些重复调用。
+# `cargo metadata --no-deps` 一次就给全内部依赖边，与 `cargo tree -p X
+# --depth 1 -e normal,build` 同一口径：它列的是 manifest 里声明的直接依赖
+# （含 build 依赖、不含 dev 依赖），只是把 N 次进程变成 1 次。
+metadata_json="${TMPDIR:-/tmp}/mcsup-arch-metadata-$$.json"
+if ! cargo metadata --format-version 1 --no-deps >"$metadata_json"; then
+	rm -f "$metadata_json"
 	printf '架构检查失败: workspace 无法加载，请修正上面的 cargo 错误\n' >&2
 	exit 1
 fi
+trap 'rm -f "$metadata_json"' EXIT INT TERM
+
+# 输出「包名<TAB>内部依赖名」的边表，供下面几处检查复用。
+#
+# 只保留指向本仓库内包的边：registry 依赖（serde、tokio）不看方向。
+# `kind` 为 `dev` 的排除在外——dev-dependency 允许任意方向，这是本脚本
+# 第 5/5b 项本来就写明的口径。
+dep_edges="${TMPDIR:-/tmp}/mcsup-arch-edges-$$.txt"
+trap 'rm -f "$metadata_json" "$dep_edges"' EXIT INT TERM
+python3 - "$metadata_json" >"$dep_edges" <<'PY'
+import json, sys
+
+meta = json.load(open(sys.argv[1], encoding="utf-8"))
+ids = {p["id"]: p["name"] for p in meta["packages"]}
+internal = set(ids.values())
+for pkg in meta["packages"]:
+    name = pkg["name"]
+    for dep in pkg["dependencies"]:
+        if dep.get("kind") == "dev":
+            continue
+        if dep.get("path") is None:
+            continue
+        target = dep["name"]
+        if target in internal:
+            print(f"{name}\t{target}")
+PY
+
+# 某个包在依赖图里存在（= 被 cargo 解析成功）
+pkg_resolves() {
+	grep -q "\"name\":\"$1\"" "$metadata_json"
+}
+
+# 某个包的直接内部依赖（normal + build，不含 dev）
+pkg_deps() {
+	awk -F'\t' -v want="$1" '$1 == want { print $2 }' "$dep_edges"
+}
 
 # 2 / 3 / 4: 命名与成员覆盖
 
@@ -77,7 +121,7 @@ for manifest in $manifests; do
 	fi
 
 	# 包不在 members 里就既不编译也不测试，CI 仍然全绿。
-	if ! cargo tree -p "$name" --depth 0 >/dev/null 2>&1; then
+	if ! pkg_resolves "$name"; then
 		fail "$manifest: 包 $name 无法被 cargo 解析，请检查 Cargo.toml 的 members 与本包的 manifest"
 	fi
 
@@ -126,11 +170,7 @@ for manifest in $manifests; do
 	pkg=$(pkg_name "$manifest")
 	[ -n "$pkg" ] || continue
 
-	deps=$(cargo tree -p "$pkg" --depth 1 --prefix none -e normal,build) || {
-		fail "cargo tree -p $pkg 执行失败"
-		continue
-	}
-	deps=$(printf '%s\n' "$deps" | tail -n +2 | cut -d' ' -f1)
+	deps=$(pkg_deps "$pkg")
 
 	for dep in $deps; do
 		if contains "$dep" "$app_names"; then
@@ -167,7 +207,7 @@ for manifest in $manifests; do
 		continue
 	fi
 
-	deps=$(cargo tree -p "$pkg" --depth 1 --prefix none -e normal,build 2>/dev/null | tail -n +2 | cut -d' ' -f1)
+	deps=$(pkg_deps "$pkg")
 
 	for dep in $deps; do
 		# 只检查本仓库内部包

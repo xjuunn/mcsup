@@ -19,4 +19,6 @@ cd "$root"
 mcsup_use_shared_target
 
 printf '\n==> e2e（CLI 端到端）\n'
-cargo test -p cli --test cli_e2e --all-features
+# 与 `test` 步同一套并行执行器，只是目标限定为 cli_e2e；单独跑时也只编这一个
+# 目标，不额外付整棵 workspace 的编译。
+sh scripts/test-parallel.sh cli_e2e

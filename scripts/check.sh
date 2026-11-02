@@ -70,7 +70,11 @@ run 'architecture' sh scripts/check-architecture.sh
 run 'fmt' cargo fmt --all -- --check
 run 'check' cargo check --workspace --all-targets --all-features
 run 'clippy' cargo clippy --workspace --all-targets --all-features -- -D warnings
-run 'test' cargo test --workspace --all-features
+# 测试用并行脚本跑：`cargo test` 串行执行每个测试二进制，而本项目最慢的几个
+# 各自十几秒、彼此不争抢资源（大量时间在等子进程 / IO / 超时），并行能把等待
+# 叠起来。编译、feature 组合与 `cargo test` 完全一致（同一次 --no-run），
+# 失败仍是非零退出，见 scripts/test-parallel.sh。
+run 'test' sh scripts/test-parallel.sh
 
 # 端到端单独成步：失败时要一眼看出是契约测试挂的还是真实进程链路挂的。
 # 只改文档 / 注释时可 MCSUP_SKIP_E2E=1 跳过，CI 不跳过。
@@ -99,11 +103,28 @@ if want 'feature powerset'; then
 fi
 
 # 审计类，不影响构建，缺工具就跳过并提示——静默跳过会让本地绿灯 ≠ CI 绿灯。
+#
+# 网络不可达时回退 `--offline`：`cargo deny` 默认每次都去拉 RustSec advisory
+# 数据库，连不上 github 就直接非零退出。那与「依赖有漏洞或许可证不合规」是
+# 两件事，却都表现为门禁红——结果是网络一抖动就把整道门禁跳过，反而更危险。
+# 回退前先确认失败原因确实是取数据库失败（输出里有 fetch 相关报错），
+# 真正的策略违规仍然照常失败。
 if want 'deny'; then
 	if cargo deny --version >/dev/null 2>&1; then
 		printf '\n==> deny\n'
+		deny_log="${TMPDIR:-/tmp}/mcsup-deny-$$.log"
 		status=0
-		cargo deny check || status=$?
+		cargo deny check >"$deny_log" 2>&1 || status=$?
+		if [ "$status" -ne 0 ]; then
+			# 只在「取不到 advisory 数据库」时回退，其余失败原样报出。
+			if grep -qiE 'failed to (fetch|update)|Couldn.t connect|Failed to connect|network|Operation timed out|recv failure' "$deny_log"; then
+				printf '提示：advisory 数据库不可达，改用 --offline（本地缓存的数据库）\n' >&2
+				status=0
+				cargo deny --offline check >"$deny_log" 2>&1 || status=$?
+			fi
+		fi
+		cat "$deny_log"
+		rm -f "$deny_log"
 		if [ "$status" -ne 0 ]; then
 			printf '失败于：deny（%s）\n' "$status" >&2
 			printf '许可与 advisory 见 deny.toml。\n' >&2

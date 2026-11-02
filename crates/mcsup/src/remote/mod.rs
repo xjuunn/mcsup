@@ -309,6 +309,45 @@ impl Agent {
         })
     }
 
+    /// 用自定义组合根装配：注入服务端来源、下载器、supervisor 等
+    ///
+    /// `open_with` 走默认组合根（真实网络来源）。宿主嵌入 agent 时往往要换掉
+    /// 下载来源——离线环境、自建镜像、以及测试里让下载**确定失败**而不是等
+    /// 真实外网超时。与 [`crate::bootstrap::McsupBuilder`] 同一套注入口，
+    /// 不另开旁路。
+    ///
+    /// # Errors
+    ///
+    /// 组合根装配、身份读写或目录创建失败时返回 [`AgentError`]
+    pub fn open_with_builder(
+        builder: crate::bootstrap::McsupBuilder,
+        data_dir: &Path,
+        server_name: impl Into<String>,
+        policy: PairingPolicy,
+    ) -> Result<Self, AgentError> {
+        let core = builder.build(data_dir)?;
+        let identity = ServerIdentity::load_or_create(&identity_dir(data_dir))?;
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let supervisor_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("mcsup"));
+        let window = PairingWindow::default();
+        let pairing = match policy {
+            PairingPolicy::Continuous => Pairing::Memory(Mutex::new(PairingCodeStore::new(window))),
+            PairingPolicy::OnDemand => Pairing::Granted(PairingGrant::new(data_dir, window)),
+        };
+        Ok(Self {
+            core,
+            identity,
+            clients: ClientRegistry::new(clients_path(data_dir)),
+            pairing,
+            registry_lock: Mutex::new(()),
+            server_name: server_name.into(),
+            supervisor_exe,
+            cwd,
+            started: Instant::now(),
+            stop: OnceLock::new(),
+        })
+    }
+
     /// 指定拉起远端 supervisor 的可执行文件
     ///
     /// 只有宿主把 agent 逻辑嵌进自己的二进制时才需要：那时 `current_exe()`
