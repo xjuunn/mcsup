@@ -13,6 +13,51 @@ use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use tempfile::TempDir;
 
+/// 立刻失败的 jar 来源：让 `server create` 不必等真实外网
+///
+/// 远端 create 会在**本进程的 agent 里**装配核心（见 `ops::install_core_async`），
+/// 真实来源要打 `piston-meta.mojang.com`。CI 与外网受限时这条请求要么慢、
+/// 要么结果随网络漂移；而这些用例断言的是「登记是否路由到对端」「核心成败
+/// 时列表口径」——与下载本身无关。用立即报错的来源把「成败」钉成确定值。
+struct FailingJarSource {
+    variant: mcsup::domain::server::version::ServerVariant,
+}
+
+#[async_trait::async_trait]
+impl mcsup::port::ServerJarSource for FailingJarSource {
+    fn variant(&self) -> mcsup::domain::server::version::ServerVariant {
+        self.variant.clone()
+    }
+
+    async fn versions(
+        &self,
+    ) -> Result<Vec<mcsup::domain::server::version::ServerVersion>, mcsup::port::SourceError> {
+        Err(mcsup::port::SourceError::NotFound(
+            mcsup::domain::server::version::VersionId::new("offline"),
+        ))
+    }
+
+    async fn artifact(
+        &self,
+        version: &mcsup::domain::server::version::VersionId,
+    ) -> Result<mcsup::port::ResolvedArtifact, mcsup::port::SourceError> {
+        Err(mcsup::port::SourceError::NotFound(version.clone()))
+    }
+
+    fn name(&self) -> &'static str {
+        "offline-test"
+    }
+}
+
+/// agent 的离线组合根：来源换成立刻失败，其余装配不变
+fn offline_builder() -> mcsup::bootstrap::McsupBuilder {
+    use mcsup::domain::server::version::ServerVariant;
+    mcsup::bootstrap::McsupBuilder::new()
+        .jar_sources(vec![Arc::new(FailingJarSource {
+            variant: ServerVariant::Vanilla,
+        }) as Arc<dyn mcsup::port::ServerJarSource>])
+}
+
 /// 隔离用临时 HOME（与 `cli_e2e` 同口径）
 fn temp_home() -> TempDir {
     let home = TempDir::new().expect("tempdir");
@@ -23,10 +68,22 @@ fn temp_home() -> TempDir {
     home
 }
 
+/// 不可达代理：让下载**确定失败**，不等真实外网
+///
+/// 与 `cli_e2e` 同一手法（reqwest 读标准代理变量）。本地 `server create`
+/// 的核心下载发生在 CLI 子进程里，不走 agent 的组合根，所以注入来源到不了；
+/// 这里改从环境上断网，把「成败」钉成确定值。
+const DEAD_PROXY: &str = "http://127.0.0.1:1";
+
 /// 跑一次 mcsup（非 TTY、隔离 HOME）
 fn run(home: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_mcsup"))
-        .args(args)
+    run_with_proxy(home, args, true)
+}
+
+/// 同 [`run`]，但可关闭出网（`offline = true` 时指向死代理）
+fn run_with_proxy(home: &Path, args: &[&str], offline: bool) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mcsup"));
+    cmd.args(args)
         .env("HOME", home)
         .env("USERPROFILE", home)
         .env("XDG_DATA_HOME", home.join("share"))
@@ -41,9 +98,17 @@ fn run(home: &Path, args: &[&str]) -> Output {
         .env("MCSUP_CREDENTIAL_STORE", "file")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("运行 mcsup")
+        .stderr(Stdio::piped());
+    // 继承来的代理会让下载行为随环境漂移，一律先清掉再由用例显式决定
+    for key in ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"] {
+        cmd.env_remove(key);
+    }
+    if offline {
+        for key in ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"] {
+            cmd.env(key, DEAD_PROXY);
+        }
+    }
+    cmd.output().expect("运行 mcsup")
 }
 
 fn json(out: &Output) -> serde_json::Value {
@@ -78,7 +143,16 @@ struct AgentHandle {
 impl AgentHandle {
     fn start() -> Self {
         let dir = tempfile::tempdir().expect("agent dir");
-        let agent = Arc::new(mcsup::remote::Agent::open(dir.path(), "test-box").expect("agent"));
+        // 离线组合根：核心下载立即失败，用例不必等真实外网（见 `offline_builder`）
+        let agent = Arc::new(
+            mcsup::remote::Agent::open_with_builder(
+                offline_builder(),
+                dir.path(),
+                "test-box",
+                mcsup::remote::PairingPolicy::Continuous,
+            )
+            .expect("agent"),
+        );
         let code = agent.issue_pairing_code().expect("pairing code");
         let server = agent.bind("127.0.0.1:0").expect("bind");
         let addr = server.local_addr().expect("addr").to_string();

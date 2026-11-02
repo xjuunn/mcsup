@@ -6,6 +6,12 @@
 //!
 //! 失败反例会写进 `proptest-regressions/`：那个文件是**测试资产**，必须随
 //! 修复一起提交（门禁 G3）。
+//!
+//! 每个 case 都要真实落盘（CAS 写入带 `sync_all`），单次 put 约 4ms。默认
+//! 256 个 case 下本文件光同步写就二十秒，而它断言的是**去重与哈希语义**，
+//! 与「落盘多少次」无关。32 个 case 已足够覆盖这些性质：真正需要大样本的是
+//! 输入空间巨大的解析类判定（见 `domain/tests/backup_properties.rs`，那里保持
+//! 默认值），这里的输入空间是「几次写同样/不同的字节」。
 
 #![allow(clippy::expect_used)]
 
@@ -24,6 +30,9 @@ fn put(cas: &CasStore, bytes: &[u8]) -> (domain::backup::ContentHash, u64) {
 }
 
 proptest! {
+    // 见文件头：本文件每个 case 都真实落盘，压小样本量换运行时间
+    #![proptest_config(ProptestConfig { cases: 32, ..ProptestConfig::default() })]
+
     /// 任意字节往返：取回来的内容与大小都与写入一致
     #[test]
     fn arbitrary_bytes_round_trip(bytes in proptest::collection::vec(any::<u8>(), 0..4096)) {

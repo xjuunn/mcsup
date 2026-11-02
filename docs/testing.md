@@ -99,6 +99,29 @@ let store = FailingContentStore::new(Arc::new(CasStore::new(root)), CasOp::Put);
 
 `scripts/check.sh` 是唯一入口。跑子集不等于门禁通过，提交前必须跑全量。
 
+`scripts/check-architecture.sh` 只用**一次** `cargo metadata` 取全部内部依赖边，
+不在每个包上反复跑 `cargo tree`。后者原先共 67 次 cargo 进程、累计 6 秒，占掉
+这一步的大部分时间；依赖方向的判定口径不变（manifest 声明的直接依赖，含
+build 依赖、不含 dev 依赖），改的只是取数方式。
+
+测试一步走 `scripts/test-parallel.sh`，不是直接 `cargo test`：后者把每个测试
+目标编译成独立二进制后**串行**执行，而本项目最慢的几个目标各自十几秒、彼此
+又在等不同的东西（子进程、IO、超时），串行时总耗时就是它们的和。并行执行器
+用同一次 `cargo test --no-run` 产出目标清单，再并发跑，编译与 feature 组合
+与 `cargo test --workspace --all-features` 完全一致，失败同样是非零退出。
+
+写测试时**不要依赖外网**。本地 `server create` 的核心下载、远端 create 在
+agent 侧的核心装配都会打真实 HTTP：CI 上要么慢、要么结果随网络漂移。两种
+既定手法：
+
+- 子进程侧断网：给 CLI 子进程设 `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`
+  指向 `http://127.0.0.1:1`（见 `cli_e2e`、`cli_remote` 的 `run`）
+- 进程内换来源：用 `McsupBuilder::jar_sources` 注入立即失败的来源
+  （见 `cli_remote` 的 `offline_builder`，经 `Agent::open_with_builder` 装配）
+
+两者都把「核心下载成功与否」钉成确定值。断言要写成对两种结果都成立的形状
+（例如「create 退出码必须与核心登记状态一致」），而不是假设下载会成功。
+
 ## G2 变异测试
 
 只对 `domain` 与 `service` 开，配置在 `.cargo/mutants.toml`。成本是每个变异体

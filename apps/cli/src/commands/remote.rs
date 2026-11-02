@@ -129,10 +129,19 @@ fn serve_start(data_dir: &Path, listen: &str, name: Option<&str>, printer: Print
         "定位 mcsup 可执行文件",
         "locating the mcsup executable",
     ))?;
-    // 就绪 = 子进程已拿到锁（说明装配完成、正在 bind 或已 bind）。
+    // 就绪 = 子进程已拿到锁**且身份文件、监听地址都已落盘**。
+    //
+    // 只看锁不够：`serve_foreground` 依次做「取锁 → 生成身份 → bind → 写 pid
+    // 与地址」，`start` 返回后立刻 `serve status` 是常见操作，中间任何一步没
+    // 完成都会读到残缺状态（没有身份文件、或 address 为空而退回 `:0`）。
+    // 地址文件最后写，它存在即说明前面几步都已完成。
     // 不以「端口可连」判定：TLS 监听接进来也无法握手，反而更难判。
     let pid = crate::daemon::spawn_background(&exe, data_dir, listen, name, |dir| {
         crate::daemon::InstanceLock::is_held(dir).unwrap_or(false)
+            && mcsup::remote::identity_dir(dir)
+                .join(mcsup::transport::identity::CERT_FILE)
+                .exists()
+            && read_listen_addr(dir).is_some()
     })
     .context(crate::i18n::pick(
         lang,
@@ -1714,7 +1723,10 @@ mod tests {
     #[test]
     fn probe_row_carries_config_fields() {
         let fp = Fingerprint::of_der(b"x");
-        let rec = record("10.0.0.5:7681", Some(fp.as_str()));
+        // 本机回环的 1 端口：连接立刻被拒（同 `probe_state_is_unreachable_*`）。
+        // 这里断言的是字段映射，不是连通性；用不可路由的地址会让每个 case
+        // 白等满 `CONNECT_TIMEOUT`（10s）。
+        let rec = record("127.0.0.1:1", Some(fp.as_str()));
         let cred = StoredCredential {
             token: "a".repeat(64),
             client_id: "0f0e0d0c-0b0a-49d8-a716-446655440000".to_owned(),
@@ -1723,7 +1735,7 @@ mod tests {
         let store = MemCreds(Some(cred));
         let row = probe_row("prod-box", &rec, &store, Lang::Zh);
         assert_eq!(row.name, "prod-box");
-        assert_eq!(row.target, "10.0.0.5:7681");
+        assert_eq!(row.target, "127.0.0.1:1");
         assert_eq!(row.via, "direct");
         assert_eq!(row.role.as_deref(), Some("viewer"));
         assert_eq!(row.fingerprint.as_deref(), Some(fp.as_str()));
