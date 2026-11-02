@@ -88,12 +88,12 @@ let store = FailingContentStore::new(Arc::new(CasStore::new(root)), CasOp::Put);
 | 门禁 | 内容 | 何时跑 | 失败含义 |
 | --- | --- | --- | --- |
 | G1 | `scripts/check.sh` | 每次提交、每次 CI | 常规门禁未过 |
-| G2 | 变异测试 `cargo mutants` | 夜间 job | 测试发现不了被改坏的实现 |
+| G2 | 变异测试 `cargo mutants` | 手动触发的深度检查 job | 测试发现不了被改坏的实现 |
 | G3 | 属性测试反例固化 | 每次提交（`proptest-regressions/` 入库） | 已知反例未纳入回归 |
 | G4 | 快照 `insta` | CI `snapshots` job | 机器契约发生了未经确认的变化 |
 | G5 | diff 覆盖率 | CI | 新增代码没有被测到 |
 | G6 | 失败可复现 | 人工约定 | 失败信息不足以复现 |
-| G7 | `cargo-fuzz` | 夜间 job | 解析器在畸形输入上崩溃 |
+| G7 | `cargo-fuzz` | 手动触发的深度检查 job | 解析器在畸形输入上崩溃 |
 
 ## G1 常规门禁
 
@@ -139,7 +139,7 @@ let store = FailingContentStore::new(Arc::new(CasStore::new(root)), CasOp::Put);
 
 ## G7 cargo-fuzz
 
-解析器类模块（Provider 响应、JSON 元数据、路径解析）进 fuzz target，夜间跑。
+解析器类模块（Provider 响应、JSON 元数据、路径解析）进 fuzz target，手动触发时跑。
 能 panic 的输入先进 `proptest` 反例，再进 fuzz 语料。
 
 # 测试基础设施：`crates/testkit`
@@ -203,7 +203,7 @@ testkit::assert_invariant(page.total == 0, || {
 
 ## 3. 跳过必须显式
 
-`#[ignore]` 必须带原因字符串。CI 里用 `--ignored` 显式执行的组只有夜间 job。
+`#[ignore]` 必须带原因字符串。CI 里用 `--ignored` 显式执行的组只有手动触发的深度检查 job。
 
 ## 4. 修复循环收敛
 
