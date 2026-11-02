@@ -92,9 +92,16 @@ jobs:
       # 断言测试不依赖运行机器的 locale：显式给出语言环境，结果必须仍然全绿。
       # 未设置 locale 的 Ubuntu 默认 C.UTF-8，中文用例会走回退路径，故显式指定。
       # 与本地同一个并行执行器：编译与 feature 组合等同于
-      # `cargo test --workspace --all-features`，只是把串行的多个测试二进制
-      # 并发起来（CI runner 的 CPU 有限，收益比本地小，但不会更慢）。
+      # `cargo test --workspace --all-features`（含 doctest），只是把串行的
+      # 多个测试二进制并发起来。并发数按 CPU 与可用内存自适应，因此在
+      # 2 核 / 7GB 的 runner 上不会超订。
+      #
+      # `shell: bash` 必须显式给：Windows runner 的默认 shell 是 pwsh，
+      # 那样 `sh` 与脚本里的 xargs / awk 都不可用。给了 bash 之后，脚本
+      # 自己的 Windows 分支会再回退成串行 `cargo test`（xargs 会吞掉
+      # Windows 路径的反斜杠，并行在那边不成立）。
       - name: cargo test
+        shell: bash
         env:
           LANG: ${{ matrix.lang }}
           LC_ALL: ${{ matrix.lc_all }}
@@ -104,6 +111,7 @@ jobs:
       # 但那是「碰巧」，不是约定。这里显式跑 check.sh 调用的同一个脚本，
       # 保证本地与 CI 跑的是同一组用例、同一套结论。
       - name: e2e
+        shell: bash
         env:
           LANG: ${{ matrix.lang }}
           LC_ALL: ${{ matrix.lc_all }}

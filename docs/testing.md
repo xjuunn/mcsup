@@ -110,6 +110,31 @@ build 依赖、不含 dev 依赖），改的只是取数方式。
 用同一次 `cargo test --no-run` 产出目标清单，再并发跑，编译与 feature 组合
 与 `cargo test --workspace --all-features` 完全一致，失败同样是非零退出。
 
+### 覆盖等价性（改这个脚本时必须守住）
+
+脚本必须跑出与 `cargo test --workspace --all-features` **相同的**用例集合。
+它以 `profile.test == true` 挑选产物，这个判据容易踩两个坑：
+
+- 按 `kind` 排除 `bin` 会丢掉 bin 的单元测试。`mcsup` 有 208 个、
+  `mcsup_dev_tools` 有 25 个单元测试写在 `main.rs` 里，那样会静默少跑
+  233 个用例，而门禁照绿。cargo 对 bin 目标产出两份产物：`test=false`
+  是真二进制（用户执行的那个），`test=true` 才是带 harness 的副本。
+- doctest **不在** `--no-run` 的产物清单里（由 rustdoc 驱动，没有独立
+  可执行文件），必须单独一条 `cargo test --doc` 补上，否则静默少 4 个。
+
+改动后核对一次总数：两边 `passed` 之和必须相等（当前 1407）。
+
+### 低端设备与 CI
+
+并发数自适应，不写死：`< 4` 核不超订（小机器上争抢的代价高于等待的收益），
+否则取 1.5 倍核数；再按可用内存封顶，每个并发任务按 64MB 计（实测满载 41
+个目标的峰值增量只有 211MB，留了 3 倍余量）。可用 `MCSUP_TEST_JOBS` 覆盖。
+
+Windows 上直接回退到串行 `cargo test`，两个硬性原因：`xargs` 会把
+`D:\a\mcsup` 里的反斜杠当转义吃掉（变成 `D:amcsup`），且 `xargs -P` /
+`awk` / `getconf` 在 pwsh 下不保证存在。CI 的那两个步骤因此显式写了
+`shell: bash`；回退不降低覆盖，只是慢。
+
 写测试时**不要依赖外网**。本地 `server create` 的核心下载、远端 create 在
 agent 侧的核心装配都会打真实 HTTP：CI 上要么慢、要么结果随网络漂移。两种
 既定手法：
