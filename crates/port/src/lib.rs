@@ -646,6 +646,31 @@ pub trait WorkspaceRepository: Send + Sync {
         }
     }
 
+    /// 本地最近一次被设为当前的工作区
+    ///
+    /// 当前选择可以指向远端，本方法保留「切到远端之前用的是哪个本地工作区」，
+    /// 供远端配对被移除时撤回到本地。单来源仓库没有远端选择，默认返回 `None`。
+    ///
+    /// # Errors
+    ///
+    /// 底层失败返回 [`RepositoryError::Storage`]
+    fn last_local_selection(&self) -> Result<Option<WorkspaceId>, RepositoryError> {
+        Ok(None)
+    }
+
+    /// 清空当前选择
+    ///
+    /// 远端配对被移除、本地又没有可回退的工作区时用它：让后续命令明确报
+    /// 「无当前」，而不是留一个指向已消失来源的悬空指针。默认实现是空操作——
+    /// 单来源仓库的指针只可能指向本地，不存在指向远端后再悬空的中间态。
+    ///
+    /// # Errors
+    ///
+    /// 底层失败返回 [`RepositoryError::Storage`]
+    fn clear_current_selection(&self) -> Result<(), RepositoryError> {
+        Ok(())
+    }
+
     /// 当前工作区；尚无注册时为 `None`
     ///
     /// # Errors

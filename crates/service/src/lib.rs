@@ -67,8 +67,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
 pub use workspace::{
-    InitOutcome, MARKER_FILE, NOISE_ENTRIES, RemoveOutcome, WorkspaceError, WorkspaceErrorKind,
-    WorkspaceService, absolute_path, resolve_selector,
+    DetachOutcome, InitOutcome, MARKER_FILE, NOISE_ENTRIES, RemoveOutcome, WorkspaceError,
+    WorkspaceErrorKind, WorkspaceService, absolute_path, resolve_selector,
 };
 
 /// 安装任务失败

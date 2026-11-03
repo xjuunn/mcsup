@@ -3,8 +3,9 @@
 //! 目录布局（`{root}` = `{data_dir}/mcsup/db`）：
 //!
 //! ```text
-//! {root}/workspaces/state.json      {"version":2,"current":{"origin":"local","workspace":"<uuid>"}|null}
+//! {root}/workspaces/state.json      {"version":3,"current":{...}|null,"last_local":{...}|null}
 //!                                   v1 `{"current":"<uuid>"}` 读作本地选择
+//!                                   v2 无 `last_local`，读作「未记录」
 //! {root}/workspaces/<uuid>.json     一条工作目录
 //! {root}/servers/<uuid>.json        一台服务器
 //! {root}/java/state.json            {"version":1,"scanned_at":<unix 秒>|null}
@@ -47,7 +48,9 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 /// `state.json` 的格式版本
 ///
 /// v2 把裸 uuid 换成 `{origin, workspace}`：当前工作区可以指向远端。
-const WORKSPACE_STATE_VERSION: u32 = 2;
+/// v3 增加 `last_local`：记住切换到远端之前用的是哪个本地工作区，远端配对
+/// 被移除时凭它撤回本地。
+const WORKSPACE_STATE_VERSION: u32 = 3;
 /// Java 集合的 `state.json` 仍是 v1（只有扫描时间）
 const JAVA_STATE_VERSION: u32 = 1;
 /// 记录文件扩展名
@@ -66,6 +69,12 @@ struct WorkspaceState {
     /// 本机视角的当前工作区。指向已删除 / 损坏 / 不可达来源时读取视为「无当前」。
     #[serde(default)]
     current: Option<CurrentPointer>,
+    /// 最近一次被设为当前的**本地**工作区。
+    ///
+    /// 只用于远端配对被移除时撤回本地：它指向的记录可能已经被删除，
+    /// 读取方按「没有回退目标」处理。v2 及更早的文件没有这个字段。
+    #[serde(default)]
+    last_local: Option<CurrentPointer>,
 }
 
 /// `current` 的线上形态：兼容 v1 的裸 uuid
@@ -96,6 +105,7 @@ impl WorkspaceState {
         Self {
             version: WORKSPACE_STATE_VERSION,
             current: None,
+            last_local: None,
         }
     }
 
@@ -111,6 +121,28 @@ impl WorkspaceState {
             origin,
             workspace: WorkspaceId::parse(&workspace).ok()?,
         })
+    }
+
+    /// 本地选择指针的线上形态
+    fn local_pointer(id: &str) -> CurrentPointer {
+        CurrentPointer::Scoped {
+            origin: LOCAL_NAME.to_owned(),
+            workspace: id.to_owned(),
+        }
+    }
+
+    /// 最近一次的本地选择；坏值 / 非本地来源视为「未记录」
+    fn last_local_id(&self) -> Option<WorkspaceId> {
+        let (origin, workspace) = match self.last_local.as_ref()? {
+            CurrentPointer::Bare(id) => (Origin::Local, id.clone()),
+            CurrentPointer::Scoped { origin, workspace } => {
+                (Origin::parse(origin).ok()?, workspace.clone())
+            }
+        };
+        origin
+            .is_local()
+            .then(|| WorkspaceId::parse(&workspace).ok())
+            .flatten()
     }
 
     /// 本地 current 指针：只有 origin 为本地时才参与本地记录的 `is_current`
@@ -737,10 +769,8 @@ impl WorkspaceRepository for JsonStore {
         // 崩溃只会留下「已登记但不是当前」，不会留下两个当前
         if ws.is_current {
             let mut state = self.load_workspace_state()?;
-            state.current = Some(CurrentPointer::Scoped {
-                origin: LOCAL_NAME.to_owned(),
-                workspace: ws.id.to_string(),
-            });
+            state.current = Some(WorkspaceState::local_pointer(ws.id.as_str()));
+            state.last_local = Some(WorkspaceState::local_pointer(ws.id.as_str()));
             self.write_state(Collection::Workspaces, &state)?;
         }
         Ok(())
@@ -798,6 +828,20 @@ impl WorkspaceRepository for JsonStore {
         Ok(self.selection_pointer())
     }
 
+    fn last_local_selection(&self) -> Result<Option<WorkspaceId>, RepositoryError> {
+        Ok(self.load_workspace_state()?.last_local_id())
+    }
+
+    fn clear_current_selection(&self) -> Result<(), RepositoryError> {
+        let _guard = self.lock()?;
+        let mut state = self.load_workspace_state()?;
+        if state.current.is_none() {
+            return Ok(());
+        }
+        state.current = None;
+        self.write_state(Collection::Workspaces, &state)
+    }
+
     fn set_current(&self, id: &WorkspaceId) -> Result<(), RepositoryError> {
         let _guard = self.lock()?;
         if self
@@ -807,10 +851,8 @@ impl WorkspaceRepository for JsonStore {
             return Err(RepositoryError::NotFound(id.as_str().to_owned()));
         }
         let mut state = self.load_workspace_state()?;
-        state.current = Some(CurrentPointer::Scoped {
-            origin: LOCAL_NAME.to_owned(),
-            workspace: id.to_string(),
-        });
+        state.current = Some(WorkspaceState::local_pointer(id.as_str()));
+        state.last_local = Some(WorkspaceState::local_pointer(id.as_str()));
         self.write_state(Collection::Workspaces, &state)
     }
 
@@ -835,6 +877,10 @@ impl WorkspaceRepository for JsonStore {
             origin: selection.origin.as_str().to_owned(),
             workspace: selection.workspace.to_string(),
         });
+        // 指向远端时保留 `last_local`：它就是「断开后撤回到哪」的依据
+        if selection.origin.is_local() {
+            state.last_local = Some(WorkspaceState::local_pointer(selection.workspace.as_str()));
+        }
         self.write_state(Collection::Workspaces, &state)
     }
 
@@ -847,10 +893,18 @@ impl WorkspaceRepository for JsonStore {
             return Err(RepositoryError::NotFound(id.as_str().to_owned()));
         }
         self.remove_record(Collection::Workspaces, id.as_str())?;
-        // 删的正是本机的当前项：清指针。另有剩余项的移交由 service 层完成
+        // 删的正是本机的当前项：清指针。另有剩余项的移交由 service 层完成。
+        // `last_local` 指向被删记录时一并清掉：留着只会让撤回逻辑多一次无效查找
         let mut state = self.load_workspace_state()?;
-        if state.local_id().as_deref() == Some(id.as_str()) {
+        let clears_current = state.local_id().as_deref() == Some(id.as_str());
+        let clears_last = state.last_local_id().as_ref() == Some(id);
+        if clears_current {
             state.current = None;
+        }
+        if clears_last {
+            state.last_local = None;
+        }
+        if clears_current || clears_last {
             self.write_state(Collection::Workspaces, &state)?;
         }
         Ok(())
@@ -1754,6 +1808,110 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&text).expect("json");
         assert_eq!(value["current"]["origin"], "r1");
         assert_eq!(value["current"]["workspace"], WS02);
+    }
+
+    /// 切到远端不覆盖本地最后选择：断开后要靠它撤回本地
+    #[test]
+    fn remote_selection_keeps_last_local() {
+        let store = JsonStore::open_in_memory().expect("open");
+        add_ws(&store, &sample_ws("ws01", "/tmp/ws01", WS01));
+        add_ws(&store, &sample_ws("ws02", "/tmp/ws02", WS02));
+        let id01 = WorkspaceId::parse(WS01).expect("uuid");
+        let id02 = WorkspaceId::parse(WS02).expect("uuid");
+        WorkspaceRepository::set_current(&store, &id01).expect("current ws01");
+        assert_eq!(
+            WorkspaceRepository::last_local_selection(&store).expect("last"),
+            Some(WorkspaceId::parse(WS01).expect("uuid"))
+        );
+
+        let remote = WorkspaceSelection {
+            origin: Origin::Remote(port::RemoteName::parse("r1").expect("name")),
+            workspace: id02.clone(),
+        };
+        WorkspaceRepository::set_current_selection(&store, &remote).expect("remote");
+        assert_eq!(
+            WorkspaceRepository::last_local_selection(&store).expect("last"),
+            Some(id01.clone()),
+            "远端选择不能盖掉本地最后选择"
+        );
+
+        // 切回本地时跟随
+        WorkspaceRepository::set_current_selection(
+            &store,
+            &WorkspaceSelection {
+                origin: Origin::Local,
+                workspace: id02.clone(),
+            },
+        )
+        .expect("local");
+        assert_eq!(
+            WorkspaceRepository::last_local_selection(&store).expect("last"),
+            Some(id02)
+        );
+
+        let text = std::fs::read_to_string(store.state_path(Collection::Workspaces)).expect("read");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(value["version"], 3);
+        assert_eq!(value["last_local"]["origin"], "local");
+        assert_eq!(value["last_local"]["workspace"], WS02);
+    }
+
+    /// v2 文件没有 `last_local`：读作「未记录」，不报错
+    #[test]
+    fn v2_state_without_last_local_reads_as_none() {
+        let store = store_with_ws();
+        std::fs::write(
+            store.state_path(Collection::Workspaces),
+            format!(r#"{{"version":2,"current":{{"origin":"local","workspace":"{WS01}"}}}}"#),
+        )
+        .expect("seed");
+        assert_eq!(
+            WorkspaceRepository::current_selection(&store).expect("selection"),
+            Some(WorkspaceSelection {
+                origin: Origin::Local,
+                workspace: WorkspaceId::parse(WS01).expect("uuid"),
+            })
+        );
+        assert_eq!(
+            WorkspaceRepository::last_local_selection(&store).expect("last"),
+            None
+        );
+    }
+
+    /// 清空选择只动 `current`，`last_local` 留着——下次撤回仍有目标
+    #[test]
+    fn clear_current_selection_keeps_last_local() {
+        let store = store_with_ws();
+        let id01 = WorkspaceId::parse(WS01).expect("uuid");
+        WorkspaceRepository::set_current(&store, &id01).expect("current");
+        WorkspaceRepository::clear_current_selection(&store).expect("clear");
+        assert!(
+            WorkspaceRepository::current_selection(&store)
+                .expect("selection")
+                .is_none()
+        );
+        assert!(
+            WorkspaceRepository::current(&store)
+                .expect("current")
+                .is_none()
+        );
+        assert_eq!(
+            WorkspaceRepository::last_local_selection(&store).expect("last"),
+            Some(id01)
+        );
+    }
+
+    /// 删除的正是 `last_local` 指向的记录：一并清掉，避免下次撤回拿到悬空 id
+    #[test]
+    fn remove_clears_last_local_pointer() {
+        let store = store_with_ws();
+        let id01 = WorkspaceId::parse(WS01).expect("uuid");
+        WorkspaceRepository::set_current(&store, &id01).expect("current");
+        WorkspaceRepository::remove(&store, &id01).expect("remove");
+        assert_eq!(
+            WorkspaceRepository::last_local_selection(&store).expect("last"),
+            None
+        );
     }
 
     /// 新建即当前时写 v2 本地指针

@@ -535,6 +535,12 @@ pub struct RemoteDisconnectJson<'a> {
     pub name: &'a str,
     /// 是否删除了本地配对记录（幂等：本来就没有时为 `false`）
     pub removed: bool,
+    /// 断开后撤回到的本地工作区名
+    ///
+    /// 只在「当前选择正指向这台远端、且本地有可回退的工作区」时有值。
+    pub restored_workspace: Option<&'a str>,
+    /// 当前选择指向这台远端、但本地没有可回退的工作区，选择已被清空
+    pub workspace_cleared: bool,
 }
 
 /// `remote serve` 结果（常驻进程启动时打印一次）

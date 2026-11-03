@@ -1045,17 +1045,65 @@ fn disconnect(file: &ConfigFile, name: &str, printer: Printer) -> Result<()> {
     if removed {
         file.save(&cfg)?;
     }
-    printer.print_outcome(
-        &crate::i18n::pick(
+    // 当前选择可能正指向这台远端。断开后指针留在远端，之后每条缺省落点命令
+    // 都会报「来源不可用」，所以要当场撤回本地最后使用的工作区
+    let restored = detach_workspace(&remote_name, lang)?;
+    let (restored_name, cleared) = match &restored {
+        mcsup::service::DetachOutcome::Restored(ws) => (Some(ws), false),
+        mcsup::service::DetachOutcome::Cleared => (None, true),
+        mcsup::service::DetachOutcome::Untouched => (None, false),
+    };
+    let mut message = crate::i18n::pick(
+        lang,
+        format!("已断开 {name}（远端服务未受影响）"),
+        format!("disconnected {name} (the remote service is unaffected)"),
+    );
+    if let Some(ws) = restored_name {
+        message.push_str(&crate::i18n::pick(
             lang,
-            format!("已断开 {name}（远端服务未受影响）"),
-            format!("disconnected {name} (the remote service is unaffected)"),
-        ),
+            format!(
+                "\n当前工作区已切回本地 {}（{}）",
+                ws.name,
+                ws.path.display()
+            ),
+            format!(
+                "\ncurrent workspace switched back to local {} ({})",
+                ws.name,
+                ws.path.display()
+            ),
+        ));
+    } else if cleared {
+        message.push_str(&crate::i18n::pick(
+            lang,
+            "\n当前工作区已清空：本地没有可回退的工作区，先运行 mcsup workspace init".to_owned(),
+            "\ncurrent workspace cleared: no local workspace to fall back to; run `mcsup workspace init`".to_owned(),
+        ));
+    }
+    printer.print_outcome(
+        &message,
         &RemoteDisconnectJson {
             name: remote_name.as_str(),
             removed,
+            restored_workspace: restored_name.map(|ws| ws.name.as_str()),
+            workspace_cleared: cleared,
         },
     )
+}
+
+/// 断开后把本机 current 从该来源撤回本地
+///
+/// 装配的仓库**只含本地**：断开路径不该再向对端发起任何请求，也没必要为一次
+/// 指针改写去读缓存。
+fn detach_workspace(remote: &RemoteName, lang: Lang) -> Result<mcsup::service::DetachOutcome> {
+    let store = crate::bootstrap::open_store()?;
+    let workspaces = mcsup::service::WorkspaceService::new(store.clone(), store);
+    workspaces
+        .detach_origin(&Origin::Remote(remote.clone()))
+        .context(crate::i18n::pick(
+            lang,
+            "撤回当前工作区",
+            "restoring the current workspace",
+        ))
 }
 
 /// `remote revoke`：在 serve 端本机离线删除客户端记录

@@ -235,6 +235,15 @@ impl WorkspaceRepository for CombinedWorkspaceRepository {
         self.local.current_selection()
     }
 
+    /// 撤回目标也是本机状态：只有本地臂记得「切到远端之前用的哪个工作区」
+    fn last_local_selection(&self) -> Result<Option<WorkspaceId>, RepositoryError> {
+        self.local.last_local_selection()
+    }
+
+    fn clear_current_selection(&self) -> Result<(), RepositoryError> {
+        self.local.clear_current_selection()
+    }
+
     fn set_current_selection(&self, selection: &WorkspaceSelection) -> Result<(), RepositoryError> {
         self.local.set_current_selection(selection)
     }

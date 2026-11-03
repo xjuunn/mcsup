@@ -202,6 +202,20 @@ impl RemoveOutcome {
     }
 }
 
+/// 来源被移除后当前选择的去向
+///
+/// 远端配对断开 / 撤销时，本机 current 可能正指向该来源的工作区。留着这个指针
+/// 会让之后每条缺省落点命令都报「来源不可用」，所以必须当场撤回本地。
+#[derive(Debug, Clone)]
+pub enum DetachOutcome {
+    /// 当前选择不指向被移除的来源（或本来就没有选择），未改动
+    Untouched,
+    /// 已撤回到本地工作区
+    Restored(Workspace),
+    /// 本地没有可回退的工作区，选择已清空（后续报 [`WorkspaceError::NoCurrent`]）
+    Cleared,
+}
+
 impl WorkspaceService {
     /// 删盘前的前置校验：该工作区现在能否执行 `remove` 的删盘部分
     ///
@@ -444,6 +458,58 @@ impl WorkspaceService {
         let mut ws = picked.value;
         ws.is_current = true;
         Ok(ws)
+    }
+
+    /// 某个来源被移除后撤回当前选择
+    ///
+    /// `remote disconnect` 之后调用：本机 current 若正指向该来源的工作区，就地
+    /// 撤回到**本地最后一次被设为当前**的工作区；那条记录已被删除时退到现存本地
+    /// 里按名称排序的第一个（与 [`Self::remove`] 移交当前标记的口径一致）；本地
+    /// 一个都没有则清空选择。留着悬空指针会让之后每条缺省落点命令都报
+    /// [`WorkspaceError::CurrentOriginUnavailable`]。
+    ///
+    /// # Errors
+    ///
+    /// 注册表读写失败时返回 [`WorkspaceError`]
+    pub fn detach_origin(&self, origin: &Origin) -> Result<DetachOutcome, WorkspaceError> {
+        // 本地来源不会被「移除」，调用方传本地名时什么都不做
+        if origin.is_local() {
+            return Ok(DetachOutcome::Untouched);
+        }
+        let Some(selection) = self.repo.current_selection()? else {
+            return Ok(DetachOutcome::Untouched);
+        };
+        if &selection.origin != origin {
+            return Ok(DetachOutcome::Untouched);
+        }
+        let Some(mut ws) = self.local_fallback()? else {
+            self.repo.clear_current_selection()?;
+            return Ok(DetachOutcome::Cleared);
+        };
+        self.repo.set_current_selection(&WorkspaceSelection {
+            origin: Origin::Local,
+            workspace: ws.id.clone(),
+        })?;
+        ws.is_current = true;
+        Ok(DetachOutcome::Restored(ws))
+    }
+
+    /// 撤回本地的目标：最近的本地选择 → 现存本地按名称第一个
+    ///
+    /// 读 `last_local_selection` 而不是 `current`：后者此刻指向的正是要被移除的
+    /// 那个来源。最近的选择可能已被删除，因此要按现存记录校验一次。
+    fn local_fallback(&self) -> Result<Option<Workspace>, WorkspaceError> {
+        let mut locals: Vec<Workspace> = self
+            .repo
+            .list_sourced()?
+            .into_iter()
+            .filter(|item| item.origin.is_local())
+            .map(|item| normalize_workspace(item.value))
+            .collect();
+        locals.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+        let preferred = self.repo.last_local_selection()?;
+        let chosen = preferred.and_then(|id| locals.iter().find(|ws| ws.id == id).cloned());
+        Ok(chosen.or_else(|| locals.into_iter().next()))
     }
 
     /// 注销工作目录；`purge` 时一并删除磁盘目录
@@ -815,13 +881,22 @@ mod tests {
 
     struct MemRepo {
         items: std::sync::Mutex<Vec<Workspace>>,
+        /// 显式的本机选择（可指向远端）；`None` 时按 `current()` 推导
+        selection: std::sync::Mutex<Option<WorkspaceSelection>>,
+        last_local: std::sync::Mutex<Option<WorkspaceId>>,
     }
 
     impl MemRepo {
         fn new() -> Self {
             Self {
                 items: std::sync::Mutex::new(Vec::new()),
+                selection: std::sync::Mutex::new(None),
+                last_local: std::sync::Mutex::new(None),
             }
+        }
+
+        fn remember_local(&self, id: &WorkspaceId) {
+            *self.last_local.lock().expect("lock") = Some(id.clone());
         }
     }
 
@@ -839,7 +914,17 @@ mod tests {
                     w.is_current = false;
                 }
             }
+            let created_current = ws.is_current;
+            let created_id = ws.id.clone();
             items.push(ws.clone());
+            drop(items);
+            if created_current {
+                *self.selection.lock().expect("lock") = Some(WorkspaceSelection {
+                    origin: Origin::Local,
+                    workspace: created_id.clone(),
+                });
+                self.remember_local(&created_id);
+            }
             Ok(())
         }
         fn get(&self, id: &WorkspaceId) -> Result<Workspace, RepositoryError> {
@@ -882,6 +967,50 @@ mod tests {
             for w in items.iter_mut() {
                 w.is_current = &w.id == id;
             }
+            drop(items);
+            *self.selection.lock().expect("lock") = Some(WorkspaceSelection {
+                origin: Origin::Local,
+                workspace: id.clone(),
+            });
+            self.remember_local(id);
+            Ok(())
+        }
+
+        fn current_selection(&self) -> Result<Option<WorkspaceSelection>, RepositoryError> {
+            if let Some(selection) = self.selection.lock().expect("lock").clone() {
+                return Ok(Some(selection));
+            }
+            Ok(self.current()?.map(|ws| WorkspaceSelection {
+                origin: Origin::Local,
+                workspace: ws.id,
+            }))
+        }
+
+        fn set_current_selection(
+            &self,
+            selection: &WorkspaceSelection,
+        ) -> Result<(), RepositoryError> {
+            if selection.origin.is_local() {
+                self.set_current(&selection.workspace)?;
+            } else {
+                // 远端选择只存指针：本地记录不带 current 标记
+                for w in self.items.lock().expect("lock").iter_mut() {
+                    w.is_current = false;
+                }
+            }
+            *self.selection.lock().expect("lock") = Some(selection.clone());
+            Ok(())
+        }
+
+        fn last_local_selection(&self) -> Result<Option<WorkspaceId>, RepositoryError> {
+            Ok(self.last_local.lock().expect("lock").clone())
+        }
+
+        fn clear_current_selection(&self) -> Result<(), RepositoryError> {
+            for w in self.items.lock().expect("lock").iter_mut() {
+                w.is_current = false;
+            }
+            *self.selection.lock().expect("lock") = None;
             Ok(())
         }
         fn remove(&self, id: &WorkspaceId) -> Result<(), RepositoryError> {
@@ -890,6 +1019,14 @@ mod tests {
             items.retain(|w| &w.id != id);
             if items.len() == before {
                 return Err(RepositoryError::NotFound(id.as_str().to_owned()));
+            }
+            drop(items);
+            if self.last_local.lock().expect("lock").as_ref() == Some(id) {
+                *self.last_local.lock().expect("lock") = None;
+            }
+            let mut selection = self.selection.lock().expect("lock");
+            if selection.as_ref().is_some_and(|sel| &sel.workspace == id) {
+                *selection = None;
             }
             Ok(())
         }
@@ -1196,6 +1333,108 @@ mod tests {
         let ws = svc.set_current("ws02").expect("use");
         assert!(ws.is_current);
         assert_eq!(svc.current_workspace().expect("cur").name.as_str(), "ws02");
+    }
+
+    /// 远端断连：当前选择指向被移除的来源时，撤回到本地最后使用的工作区
+    ///
+    /// 这就是「切到远端 ws → 断开 → 本地状态仍停在远端」那个缺陷的回归点：
+    /// 断开后必须留下一个可用的本地 current，而不是悬空指针。
+    #[test]
+    fn detach_origin_restores_last_local_workspace() {
+        let repo = Arc::new(MemRepo::new());
+        let svc = WorkspaceService::new(repo.clone(), Arc::new(MemServers::new()));
+        let tmp = tempfile::tempdir().expect("tmp");
+        svc.init(&tmp.path().join("a"), Some("ws01")).expect("a");
+        svc.init(&tmp.path().join("b"), Some("ws02")).expect("b");
+        svc.set_current("ws02").expect("use ws02");
+
+        let remote = Origin::Remote(port::RemoteName::parse("r1").expect("name"));
+        let remote_ws = WorkspaceId::parse("550e8400-e29b-41d4-a716-446655440099").expect("uuid");
+        repo.set_current_selection(&WorkspaceSelection {
+            origin: remote.clone(),
+            workspace: remote_ws,
+        })
+        .expect("select remote");
+
+        let DetachOutcome::Restored(ws) = svc.detach_origin(&remote).expect("detach") else {
+            unreachable!("expected Restored")
+        };
+        assert_eq!(ws.name.as_str(), "ws02");
+        assert_eq!(
+            svc.current_workspace().expect("current").name.as_str(),
+            "ws02"
+        );
+    }
+
+    /// 撤回目标的记录已不在：退到现存本地里按名称排序的第一个
+    #[test]
+    fn detach_origin_falls_back_to_first_local() {
+        let repo = Arc::new(MemRepo::new());
+        let svc = WorkspaceService::new(repo.clone(), Arc::new(MemServers::new()));
+        let tmp = tempfile::tempdir().expect("tmp");
+        svc.init(&tmp.path().join("a"), Some("ws01")).expect("a");
+        svc.init(&tmp.path().join("b"), Some("ws02")).expect("b");
+        svc.set_current("ws02").expect("use ws02");
+        // 库被外部改过：最后使用的工作区已经不在了
+        let ws02 = svc.resolve("ws02").expect("resolve").id;
+        repo.remove(&ws02).expect("remove");
+
+        let remote = Origin::Remote(port::RemoteName::parse("r1").expect("name"));
+        repo.set_current_selection(&WorkspaceSelection {
+            origin: remote.clone(),
+            workspace: WorkspaceId::parse("550e8400-e29b-41d4-a716-446655440099").expect("uuid"),
+        })
+        .expect("select remote");
+
+        let DetachOutcome::Restored(ws) = svc.detach_origin(&remote).expect("detach") else {
+            unreachable!("expected Restored")
+        };
+        assert_eq!(ws.name.as_str(), "ws01");
+    }
+
+    /// 当前选择不指向被移除的来源：保持原样
+    #[test]
+    fn detach_origin_ignores_other_origin() {
+        let repo = Arc::new(MemRepo::new());
+        let svc = WorkspaceService::new(repo.clone(), Arc::new(MemServers::new()));
+        let tmp = tempfile::tempdir().expect("tmp");
+        svc.init(&tmp.path().join("a"), Some("ws01")).expect("a");
+
+        let remote = Origin::Remote(port::RemoteName::parse("r1").expect("name"));
+        assert!(matches!(
+            svc.detach_origin(&remote).expect("detach"),
+            DetachOutcome::Untouched
+        ));
+        assert_eq!(
+            svc.current_workspace().expect("current").name.as_str(),
+            "ws01"
+        );
+    }
+
+    /// 本地没有可回退的工作区：清空选择，之后缺省落点报 `NoCurrent`
+    #[test]
+    fn detach_origin_clears_when_no_local() {
+        let repo = Arc::new(MemRepo::new());
+        let svc = WorkspaceService::new(repo.clone(), Arc::new(MemServers::new()));
+        let remote = Origin::Remote(port::RemoteName::parse("r1").expect("name"));
+        repo.set_current_selection(&WorkspaceSelection {
+            origin: remote.clone(),
+            workspace: WorkspaceId::parse("550e8400-e29b-41d4-a716-446655440099").expect("uuid"),
+        })
+        .expect("select remote");
+
+        assert!(matches!(
+            svc.detach_origin(&remote).expect("detach"),
+            DetachOutcome::Cleared
+        ));
+        assert!(
+            repo.current_selection().expect("selection").is_none(),
+            "清空后不能留悬空指针"
+        );
+        assert!(matches!(
+            svc.current_workspace().expect_err("no current"),
+            WorkspaceError::NoCurrent
+        ));
     }
 
     #[test]

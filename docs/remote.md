@@ -174,7 +174,7 @@ $ mcsup remote connect host:port --code 4821-9375
 | `mcsup remote list` | 已配对远端、连接状态、角色、agent 版本 |
 | `mcsup remote status [<name>]` | 单个远端的详细信息（缺名等价 list） |
 | `mcsup remote ping <name>` | 连通性 / 版本 / 能力，供脚本使用 |
-| `mcsup remote disconnect <name>` | 删除本地配对与凭证，远端不受影响 |
+| `mcsup remote disconnect <name>` | 删除本地配对与凭证，远端不受影响；当前工作区指向该远端时切回本地最后使用的工作区 |
 
 `connect` 幂等：重复执行等于重新握手并刷新 token 与指纹。
 
@@ -304,6 +304,9 @@ error: “web” 存在于多个位置
 - 连通性探针只有 `remote ls` / `remote ping`：其余命令一律读缓存，因此
   `ls` 的耗时与远端是否可达无关。
 - `mcsup remote disconnect <name>` 删除本地配对记录与凭证；远端服务继续运行。
+  当前工作区若正指向该远端，断开后自动切回本地最后使用的工作区（记录已不在时
+  退到现存本地里按名称第一个；本地一个都没有则清空选择，后续缺省落点报
+  「无当前」）。断开只改本机指针，不访问对端。
 - `mcsup remote revoke <client>` 在 serve 端离线删除名册记录，立即失效该
   客户端的 token。
 - 未配对或 token 失效：命令报「未授权」（退出码 6），不自动降级到本地。

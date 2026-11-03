@@ -1230,3 +1230,100 @@ fn remote_logs_follow_streams_new_lines() {
     assert_ok(&tail, "remote logs tail 1");
     assert!(String::from_utf8_lossy(&tail.stdout).contains("line-3"));
 }
+
+/// 切到远端工作区后断开：本机 current 必须回到本地最后使用的工作区
+///
+/// 回归点：断开只删配对与凭证，指针留在远端，之后每条缺省落点命令都报
+/// 「来源不可用」，用户看到的就是「断开后状态仍在远端」。
+#[test]
+fn disconnect_restores_last_local_workspace() {
+    let home = temp_home();
+    let agent = AgentHandle::start();
+    let home_path = home.path();
+
+    // 本地工作区：断开后的回退目标
+    let local_dir = home_path.join("local-ws");
+    let local = run(
+        home_path,
+        &[
+            "workspace",
+            "init",
+            "--dir",
+            local_dir.to_str().expect("utf8"),
+            "--name",
+            "l1",
+            "--output",
+            "json",
+        ],
+    );
+    assert_ok(&local, "workspace init local");
+    assert_eq!(json(&local)["name"], "l1");
+
+    // 配对远端，并在对端建一个工作区
+    let connected = run(
+        home_path,
+        &[
+            "remote",
+            "connect",
+            &agent.addr,
+            "--code",
+            &agent.code,
+            "--name",
+            "test-box",
+            "-y",
+            "--output",
+            "json",
+        ],
+    );
+    assert_ok(&connected, "remote connect");
+
+    let ws_dir = agent.dir.path().join("ws");
+    let created = run(
+        home_path,
+        &[
+            "workspace",
+            "init",
+            "--origin",
+            "test-box",
+            "--dir",
+            ws_dir.to_str().expect("utf8"),
+            "--name",
+            "w1",
+            "--output",
+            "json",
+        ],
+    );
+    assert_ok(&created, "workspace init --origin");
+
+    // 切到远端工作区：本机 current 指向 test-box
+    let used = run(
+        home_path,
+        &["workspace", "use", "test-box/w1", "--output", "json"],
+    );
+    assert_ok(&used, "workspace use remote");
+
+    // 断开：配对清掉，current 撤回本地 l1
+    let disconnected = run(
+        home_path,
+        &["remote", "disconnect", "test-box", "--output", "json"],
+    );
+    assert_ok(&disconnected, "remote disconnect");
+    let payload = json(&disconnected);
+    assert_eq!(payload["removed"], true);
+    assert_eq!(payload["restored_workspace"], "l1", "{payload}");
+    assert_eq!(payload["workspace_cleared"], false);
+
+    // 列表里只剩本地那条，且它就是 current
+    let after = run(home_path, &["workspace", "ls", "--output", "json"]);
+    assert_ok(&after, "workspace ls after disconnect");
+    let rows = json(&after);
+    let rows = rows.as_array().expect("array");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["origin"], "local");
+    assert_eq!(rows[0]["name"], "l1");
+    assert_eq!(rows[0]["current"], true);
+
+    // 缺省落点命令能用 current：不再报「来源不可用」
+    let servers = run(home_path, &["server", "ls", "--output", "json"]);
+    assert_ok(&servers, "server ls after disconnect");
+}
