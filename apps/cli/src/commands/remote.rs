@@ -124,24 +124,29 @@ fn serve_start(data_dir: &Path, listen: &str, name: Option<&str>, printer: Print
         .into());
     }
 
+    // 清掉上一轮可能残留的地址文件：它现在是唯一的就绪信号，留着旧内容会
+    // 让 `start` 误判「已就绪」而立刻返回一个根本没起来的 agent。
+    // 进程崩溃 / 被强杀时走不到 `serve_foreground` 的清理，所以这里也要清。
+    remove_listen_addr(data_dir);
+
     let exe = std::env::current_exe().context(crate::i18n::pick(
         lang,
         "定位 mcsup 可执行文件",
         "locating the mcsup executable",
     ))?;
-    // 就绪 = 子进程已拿到锁**且身份文件、监听地址都已落盘**。
+    // 就绪 = 地址文件已落盘。
     //
-    // 只看锁不够：`serve_foreground` 依次做「取锁 → 生成身份 → bind → 写 pid
-    // 与地址」，`start` 返回后立刻 `serve status` 是常见操作，中间任何一步没
-    // 完成都会读到残缺状态（没有身份文件、或 address 为空而退回 `:0`）。
-    // 地址文件最后写，它存在即说明前面几步都已完成。
-    // 不以「端口可连」判定：TLS 监听接进来也无法握手，反而更难判。
+    // `serve_foreground` 的顺序是「取锁 → 生成身份 → bind → 写 pid → 写地址」，
+    // 地址文件最后写，它存在即说明前面每一步都已完成，所以单看它就够。
+    //
+    // **不能**在就绪判定里探实例锁。`InstanceLock::is_held` 是靠 `try_lock`
+    // 实现的——它为了「能不能拿到」必须真的去拿一次。于是父进程每 50ms 的探测
+    // 都会短暂独占那把锁，而子进程此时正在 `acquire`：一旦撞上，子进程看到
+    // 「已被别人持有」就直接退出，`start` 随后在超时里报出一句
+    // 「本机 agent 已在运行」，而实际上并没有任何 agent 在跑。探针与被探测者
+    // 争同一把锁，这个竞态是结构性的，不是调小概率就能解决。
     let pid = crate::daemon::spawn_background(&exe, data_dir, listen, name, |dir| {
-        crate::daemon::InstanceLock::is_held(dir).unwrap_or(false)
-            && mcsup::remote::identity_dir(dir)
-                .join(mcsup::transport::identity::CERT_FILE)
-                .exists()
-            && read_listen_addr(dir).is_some()
+        read_listen_addr(dir).is_some()
     })
     .context(crate::i18n::pick(
         lang,
@@ -231,6 +236,7 @@ fn serve_foreground(
     // 让"不需要时无码"永远做不到（见 `PairingPolicy::keeps_code_on_screen`）。
     let result = server.run();
     remove_pid(data_dir);
+    remove_listen_addr(data_dir);
     result.context(crate::i18n::pick(lang, "agent 退出", "the agent exited"))?;
     Ok(())
 }
@@ -1505,6 +1511,10 @@ fn write_listen_addr(data_dir: &Path, addr: &str) {
     let _ = std::fs::write(path, addr);
 }
 
+fn remove_listen_addr(data_dir: &Path) {
+    let _ = std::fs::remove_file(data_dir.join("remote").join(AGENT_ADDR));
+}
+
 fn read_listen_addr(data_dir: &Path) -> Option<String> {
     std::fs::read_to_string(data_dir.join("remote").join(AGENT_ADDR))
         .ok()
@@ -1601,8 +1611,17 @@ fn is_mcsup_process(pid: u32) -> bool {
 
 /// 终止进程
 ///
-/// Unix 默认发 `SIGTERM`（让 agent 收尾），`force` 才 `SIGKILL`；Windows 的
-/// `taskkill` 不带 `/F` 是「请求关闭」，带 `/F` 是强杀，语义与 Unix 对齐。
+/// Unix 默认发 `SIGTERM`，`force` 才 `SIGKILL`。
+///
+/// Windows **一律** `/F`：不带 `/F` 的 `taskkill` 只是向窗口投递关闭请求，
+/// 而 agent 是用 `DETACHED_PROCESS` 拉起的，既无窗口也无控制台，没有可投递的
+/// 对象，`taskkill` 会直接失败并报「只能强制终止」。也就是说 Windows 上不存在
+/// 与 `SIGTERM` 对应的「可捕获的礼貌退出」，`force` 在这里没有第二条路可选。
+///
+/// 这不损失可收尾性：agent 进程不注册任何信号处理器（见 `apps/agent`），Unix
+/// 上 `SIGTERM` 走的也是默认终止，与 `SIGKILL` 一样不给收尾机会。真正的
+/// 「是否真的停了」由调用方等实例锁释放来判定——那是内核锁，进程无论怎么
+/// 死都会释放。
 fn terminate(pid: u32, force: bool) -> Result<()> {
     #[cfg(unix)]
     let status = std::process::Command::new("kill")
@@ -1611,11 +1630,11 @@ fn terminate(pid: u32, force: bool) -> Result<()> {
         .status();
     #[cfg(windows)]
     let status = {
+        // `force` 在这里没有第二条路可走（见上）：显式吞掉以免 Windows 上
+        // 报 unused variable，而 `-D warnings` 会让它变成编译失败
+        let _ = force;
         let mut command = std::process::Command::new("taskkill");
-        command.args(["/PID", &pid.to_string()]);
-        if force {
-            command.arg("/F");
-        }
+        command.args(["/PID", &pid.to_string(), "/F"]);
         command.status()
     };
     #[cfg(not(any(unix, windows)))]

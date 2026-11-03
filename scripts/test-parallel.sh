@@ -220,12 +220,20 @@ else
 fi
 
 MCSUP_TEST_OUTDIR="$outdir" xargs -P "$jobs" -n 2 sh "$0" <"$numbered" || true
-wait
 
+# 必须先 `wait "$doc_pid"` 再 `wait`。
+#
+# 裸 `wait` 会回收**所有**子进程，包括 doctest 那个；之后再 `wait "$doc_pid"`
+# 时它已经不是「待回收的子进程」，sh 返回 127（`not a child of this shell`）。
+# 于是 doctest 明明全通过（`4 passed; 0 failed`），退出码却是 127，门禁永远红
+# ——而摘要那行恰恰只打印 passed/failed 计数，看起来像「通过了却报失败」。
+#
+# 先取 doctest 的退出码，再裸 `wait` 收尾其余进程。
 doc_status=0
 if [ -n "$doc_pid" ]; then
 	wait "$doc_pid" || doc_status=$?
 fi
+wait
 
 # 汇总：通过的只打一行摘要，失败的在末尾打印完整输出
 failed=0
