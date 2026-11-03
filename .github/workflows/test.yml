@@ -117,6 +117,13 @@ jobs:
           LC_ALL: ${{ matrix.lc_all }}
           MCSUP_LANG: ""
         run: sh scripts/check-e2e.sh
+      # 下面两步都要用 `target/debug/mcsup`，而 `cargo test` 只构建测试
+      # 目标、不产出 bin。单独一步构建，让「二进制从哪来」有唯一答案：
+      # 靠上一步的副作用拿二进制，平台矩阵一改就变成 127（macOS 上正是
+      # 如此——构建曾写在只在 Linux 跑的那一步里）。
+      - name: build binary
+        if: runner.os != 'Windows'
+        run: cargo build -p cli
       # 语言矩阵下再验一次二进制本身：帮助必须能按环境给出正确语言。
       #
       # 只在 Linux 跑：`sys_locale` 在 Linux 读 LANG，在 macOS 读
@@ -126,8 +133,6 @@ jobs:
       - name: help follows platform locale
         if: runner.os == 'Linux'
         run: |
-          # cargo test 只构建测试目标，二进制要单独构建
-          cargo build -p cli
           help=$(target/debug/mcsup --help 2>&1)
           case "$LANG" in
             zh*) expected='用法:' ;;
@@ -154,16 +159,35 @@ jobs:
   msrv:
     name: msrv
     runs-on: ubuntu-latest
+    # 本 job 只写一处版本号：两个引用点都取自这里。写字面量两次的后果是
+    # 改了一处忘了另一处，而漏改 RUSTUP_TOOLCHAIN 会让 job 静默跑
+    # rust-toolchain.toml 的 1.98.1、绿得毫无意义。
+    env:
+      MSRV: "1.89"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.88
+          toolchain: ${{ env.MSRV }}
       - uses: Swatinem/rust-cache@v2
+      # 版本漂移是这道门禁唯一会静默失效的方式：Cargo.toml 升到 1.90 而本
+      # job 仍钉 1.89 时，检查会通过但低估了真实 MSRV；反之本 job 低于
+      # Cargo.toml 时 cargo 报的是「这些包要求 X」而不是兼容性结论，红得
+      # 没有信息量。两边必须同值，所以在这里显式比对。
+      - name: MSRV 声明一致
+        run: |
+          set -eu
+          want_msrv=$(grep -E '^rust-version[[:space:]]*=' Cargo.toml | head -1 | sed -E 's/.*"(.*)".*/\1/')
+          clippy_msrv=$(sed -nE 's/^msrv[[:space:]]*=[[:space:]]*"(.*)"/\1/p' clippy.toml)
+          printf 'workflow=%s Cargo.toml=%s clippy.toml=%s\n' "$MSRV" "$want_msrv" "$clippy_msrv"
+          if [ "$want_msrv" != "$MSRV" ] || [ "$clippy_msrv" != "$MSRV" ]; then
+            printf '::error::MSRV 不一致：Cargo.toml 的 rust-version、clippy.toml 的 msrv、本 job 的 MSRV 必须同为 %s（见 docs/development-workflow.md）\n' "$MSRV"
+            exit 1
+          fi
       # 必须覆盖 RUSTUP_TOOLCHAIN，否则根目录的 rust-toolchain.toml 会让本 job 静默跑 1.98.1。
       - name: cargo check
         env:
-          RUSTUP_TOOLCHAIN: 1.88
+          RUSTUP_TOOLCHAIN: ${{ env.MSRV }}
         run: cargo check --workspace --all-targets --all-features
 
   # 要发布的库，文档警告等同缺陷。
