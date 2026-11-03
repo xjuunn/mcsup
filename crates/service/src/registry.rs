@@ -567,7 +567,7 @@ impl ServerRegistry {
                 )));
             }
             // 链接不是目录：删掉的是链接本身，目标目录仍在磁盘上
-            std::fs::remove_file(&srv.dir).map_err(|err| ServerRegistryError::io(&srv.dir, err))?;
+            remove_symlink(&srv.dir).map_err(|err| ServerRegistryError::io(&srv.dir, err))?;
         } else if purge {
             // 前置闸：目录本就不存在时放行（没有可删的对象，注销登记即可，幂等）。
             // 不能报成删成功，也不能因此拒绝——记录才是要清理的东西。
@@ -638,9 +638,7 @@ impl ServerRegistry {
         let mut out = Vec::new();
         for meta in self.servers.list()? {
             let dir = self.absolute_dir(&meta)?;
-            let linked = dir
-                .symlink_metadata()
-                .is_ok_and(|m| m.file_type().is_symlink());
+            let linked = is_linked(&dir);
             out.push(RegisteredServer { meta, dir, linked });
         }
         Ok(out)
@@ -662,9 +660,7 @@ impl ServerRegistry {
             let meta = sourced.value;
             let (dir, linked) = if origin.is_local() {
                 let dir = self.absolute_dir(&meta)?;
-                let linked = dir
-                    .symlink_metadata()
-                    .is_ok_and(|m| m.file_type().is_symlink());
+                let linked = is_linked(&dir);
                 (dir, linked)
             } else {
                 (PathBuf::new(), false)
@@ -720,9 +716,7 @@ impl ServerRegistry {
             .get(&name)
             .map_err(|_| ServerRegistryError::NotFound(name.as_str().to_owned()))?;
         let dir = self.absolute_dir(&meta)?;
-        let linked = dir
-            .symlink_metadata()
-            .is_ok_and(|m| m.file_type().is_symlink());
+        let linked = is_linked(&dir);
         Ok(RegisteredServer { meta, dir, linked })
     }
 
@@ -751,9 +745,7 @@ impl ServerRegistry {
             updated_at,
         )?;
         let dir = self.absolute_dir(&meta)?;
-        let linked = dir
-            .symlink_metadata()
-            .is_ok_and(|m| m.file_type().is_symlink());
+        let linked = is_linked(&dir);
         Ok(RegisteredServer { meta, dir, linked })
     }
 
@@ -773,9 +765,7 @@ impl ServerRegistry {
             .servers
             .update_settings(&name, settings, crate::util::unix_now())?;
         let dir = self.absolute_dir(&meta)?;
-        let linked = dir
-            .symlink_metadata()
-            .is_ok_and(|m| m.file_type().is_symlink());
+        let linked = is_linked(&dir);
         Ok(RegisteredServer { meta, dir, linked })
     }
 
@@ -1354,12 +1344,72 @@ fn symlink_dir(target: &Path, link: &Path) -> Result<(), ServerRegistryError> {
     )))
 }
 
+/// 目录当前是否为链接（`linked` 标记的唯一来源）
+///
+/// 只问「这个路径指向别处吗」，与 [`is_link_like`] 同口径。判定分散在多处
+/// 各写一遍 `is_symlink()` 的后果是：某处改了、别处没改，于是「删的时候
+/// 认为是链接、列表的时候认为不是」。
+fn is_linked(dir: &Path) -> bool {
+    dir.symlink_metadata().is_ok_and(|meta| is_link_like(&meta))
+}
+
+/// 条目是否为符号链接（`linked` 标记与删除共用的唯一口径）
+///
+/// 只认 `is_symlink()`，**不**按「重解析点」判定：Windows 上
+/// `FILE_ATTRIBUTE_REPARSE_POINT` 不只标记符号链接与 junction，OneDrive 这类
+/// 云占位目录也带这个属性。按它判定会把一个真实的服务器目录当成链接，随后
+/// `remove` 走删链接的路径把它摘掉——为覆盖一个 `server link` 本来就不会
+/// 创建的形态（junction），换来一个删数据的可能，不划算。
+///
+/// junction 因此落入「普通目录」分支：只注销登记、不碰磁盘。保守但安全。
+fn is_link_like(meta: &std::fs::Metadata) -> bool {
+    meta.file_type().is_symlink()
+}
+
+/// 删除符号链接本身，绝不触碰目标
+///
+/// Windows 上「目录符号链接」是目录重解析点：`DeleteFileW`（`remove_file`）
+/// 对目录一律失败，必须走 `RemoveDirectoryW`（`remove_dir`）；Unix 与
+/// 「文件符号链接」则只有 `remove_file` 可用，`remove_dir` 一定报
+/// `NotADirectory`。因此不能按平台硬编，先试文件再试目录：两条分支互斥，
+/// 失败时保留第一次的错误（那才是调用方想看到的「为什么删不掉」）。
+///
+/// 先判类型再删是必须的，不能省：登记的 `linked` 只是元数据里的一句话，
+/// 链接可能已被换成真实目录，此时 `remove_dir` 会把一个空目录删掉。删链接
+/// 的方法绝不允许变成删数据的路径。
+///
+/// 悬空链接在这里同样成立：`symlink_metadata` 拿得到、目标不存在。
+fn remove_symlink(path: &Path) -> std::io::Result<()> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        // 链接已不在（并发清理、手工删除）：目的已达成，注销要能继续
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    if !is_link_like(&meta) {
+        return Err(std::io::Error::other(format!(
+            "{} 不是符号链接（可能已被替换成真实目录），拒绝删除以免丢数据",
+            path.display()
+        )));
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(file_err) if file_err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(file_err) => match std::fs::remove_dir(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            // 报第一次的错误：`remove_file` 的失败原因才是调用方关心的那个
+            Err(_) => Err(file_err),
+        },
+    }
+}
+
 fn remove_link_or_dir(path: &Path) -> std::io::Result<()> {
     let Ok(meta) = std::fs::symlink_metadata(path) else {
         return Ok(());
     };
-    if meta.file_type().is_symlink() {
-        std::fs::remove_file(path)
+    if is_link_like(&meta) {
+        remove_symlink(path)
     } else {
         std::fs::remove_dir_all(path)
     }
@@ -2028,7 +2078,16 @@ mod tests {
         reg.ensure_purgeable("alpha", tmp.path()).expect("放行");
     }
 
-    #[cfg(unix)]
+    /// 删除链接后登记必须一起清掉，且目标目录原样保留
+    ///
+    /// 回归：删除分支原先是 `std::fs::remove_file`。Windows 的目录符号链接
+    /// 是目录重解析点，`DeleteFileW` 对它必然失败（`ERROR_ACCESS_DENIED`），
+    /// 于是 `server remove` 永远报 `io error on <link>`，链接与登记都清不掉。
+    /// Unix 上该分支一直是通的，所以这条用例必须在 Windows 上也能跑，不能
+    /// 像旧用例那样 `#[cfg(unix)]`——否则同一个缺陷不会在 CI 里暴露。
+    ///
+    /// 没有创建目录符号链接的权限（Windows 需开发者模式）时跳过：那是环境
+    /// 限制，不是被测行为。
     #[test]
     fn remove_linked_drops_link_but_keeps_target() {
         let tmp = tempfile::tempdir().expect("tmp");
@@ -2036,17 +2095,99 @@ mod tests {
         let external = tmp.path().join("external");
         std::fs::create_dir_all(&external).expect("mkdir");
         std::fs::write(external.join("keep.txt"), "data").expect("file");
-        reg.link(&external, Some("ext"), None).expect("link");
+        let Ok(linked) = reg.link(&external, Some("ext"), None) else {
+            eprintln!("跳过：本机不允许创建目录符号链接（Windows 需开发者模式或管理员权限）");
+            return;
+        };
+        assert!(linked.server.linked);
 
         reg.remove("ext", false, tmp.path()).expect("remove");
 
         assert!(reg.get("ext").is_err());
-        assert!(external.join("keep.txt").is_file());
+        assert!(external.join("keep.txt").is_file(), "目标目录不能被删");
         assert!(
             tmp.path()
                 .join("ws/servers/ext")
                 .symlink_metadata()
-                .is_err()
+                .is_err(),
+            "链接本身必须被删掉"
+        );
+    }
+
+    /// 链接被手工删掉之后，登记仍然要能清掉
+    ///
+    /// `remove` 会重新从磁盘判定 `linked`（[`is_linked`]），链接已不在时它落到
+    /// 「普通目录、不 purge」分支：只清登记、不碰磁盘。这条用例锁住这个结果——
+    /// 用户手工 `rm` 过链接之后，登记不能变成清不掉的孤儿。
+    ///
+    /// 注意它**不**经过 `remove_symlink` 的 `NotFound` 分支（那条路只有
+    /// 「判定与删除之间链接消失」的竞态才走得到，由
+    /// `remove_symlink_refuses_real_directory` 的末尾断言直接覆盖）。
+    #[test]
+    fn remove_after_link_deleted_manually_still_unregisters() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let reg = registry_with_ws(tmp.path());
+        let external = tmp.path().join("external");
+        std::fs::create_dir_all(&external).expect("mkdir");
+        let Ok(linked) = reg.link(&external, Some("ext"), None) else {
+            eprintln!("跳过：本机不允许创建目录符号链接（Windows 需开发者模式或管理员权限）");
+            return;
+        };
+        remove_symlink(&linked.server.dir).expect("手工删掉链接");
+
+        reg.remove("ext", false, tmp.path()).expect("remove");
+
+        assert!(reg.get("ext").is_err(), "登记必须清掉");
+        assert!(external.is_dir(), "目标目录不能被删");
+    }
+
+    /// 链接被换成真实目录时只注销登记，绝不删目录
+    ///
+    /// 登记的 `linked` 只是元数据里的一句话，磁盘上的实际形态可能已经变了
+    /// （用户把链接删掉、在原地建了真目录）。此时必须退回「普通目录、不
+    /// purge」的语义：清登记、留磁盘。删链接的方法一旦退化成认路径就删，
+    /// `server remove` 就成了删数据的入口。
+    #[test]
+    fn remove_keeps_real_directory_that_replaced_the_link() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let reg = registry_with_ws(tmp.path());
+        let external = tmp.path().join("external");
+        std::fs::create_dir_all(&external).expect("mkdir");
+        let Ok(linked) = reg.link(&external, Some("ext"), None) else {
+            eprintln!("跳过：本机不允许创建目录符号链接（Windows 需开发者模式或管理员权限）");
+            return;
+        };
+        // 把链接换成真实目录，里面放一个文件：删了就是丢数据
+        remove_symlink(&linked.server.dir).expect("摘掉链接");
+        std::fs::create_dir_all(linked.server.dir.join("payload")).expect("mkdir");
+        std::fs::write(linked.server.dir.join("payload/precious.txt"), "data").expect("file");
+
+        reg.remove("ext", false, tmp.path()).expect("remove");
+
+        assert!(reg.get("ext").is_err(), "登记要清掉");
+        assert!(
+            linked.server.dir.join("payload/precious.txt").is_file(),
+            "真实目录里的文件绝不能被动过"
+        );
+    }
+
+    /// `remove_symlink` 只删链接：面对真实目录必须报错
+    ///
+    /// 这是上一条的兜底层。`remove` 走的是「先 `get` 重判 `linked`」，
+    /// 而判定与删除之间存在窗口（TOCTOU）；删除函数自己也不能把真实目录
+    /// 当链接处理，否则窗口内一次并发替换就能删掉数据。
+    #[test]
+    fn remove_symlink_refuses_real_directory() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dir = tmp.path().join("real");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("precious.txt"), "data").expect("file");
+
+        assert!(remove_symlink(&dir).is_err(), "真实目录必须拒绝");
+        assert!(dir.join("precious.txt").is_file(), "文件不能被删");
+        assert!(
+            remove_symlink(&dir.join("absent")).is_ok(),
+            "不存在即已达成"
         );
     }
 

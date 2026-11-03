@@ -2,7 +2,7 @@
 
 ## 开发环境
 
-- Rust 1.98.1（`rust-toolchain.toml` 固定），MSRV 1.88
+- Rust 1.98.1（`rust-toolchain.toml` 固定），MSRV 1.89
 - Windows / macOS / Linux 任一平台
 - Git Bash 或 WSL（`scripts/` 下的 shell 脚本依赖 `sh`）
 

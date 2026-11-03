@@ -135,6 +135,12 @@ powerset / deny。fmt 只检查不修改（`cargo fmt --all -- --check`）；
 deny 缺 cargo-deny 时静默跳过（本地绿灯 ≠ CI 绿灯，建议安装）；其余
 任一失败即中止并报出步骤名。
 
+MSRV 声明在三处：`[workspace.package] rust-version`、`clippy.toml` 的
+`msrv`、`test.yml` 的 `msrv` job（其 `env.MSRV`，工具链与
+`RUSTUP_TOOLCHAIN` 都取自它）。三者必须同值；升版本时一起改，漏改会让
+msrv job 报「rustc X 不被这些包支持」而不是给出兼容性结论。CI 的 `msrv`
+job 里有一步显式比对这三处，不一致当场失败。
+
 `e2e` 单独成步（`scripts/check-e2e.sh`），跑 `apps/cli/tests/cli_e2e.rs`：真实
 二进制 + 真实临时目录，断言命令串起来之后注册表与磁盘是否一致。只改文档时可
 `MCSUP_SKIP_E2E=1` 跳过，其余情况不许跳。
