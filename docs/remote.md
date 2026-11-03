@@ -102,9 +102,18 @@ pid 文件只用于停止与展示。系统服务注册（systemd / launchd）�
 | --- | --- |
 | `mcsup remote serve start [--listen <addr>] [--name <n>] [--foreground]` | 后台启动 agent；缺省只听 `127.0.0.1:7681`，对外直连需显式 `--listen 0.0.0.0:7681`；`--foreground` 留在前台打日志（调试） |
 | `mcsup remote serve status` | 离线查看状态：是否运行、地址、指纹、pid、已配对客户端、配对码剩余时间（**不回显码**） |
-| `mcsup remote serve stop [--force]` | 按 pid 发 `SIGTERM` 并等实例锁释放；`--force` 强杀。未运行时幂等成功 |
+| `mcsup remote serve stop [--force]` | 按 pid 发 `SIGTERM` 并等实例锁释放；`--force` 强杀（Windows 上恒为强杀，见下）。未运行时幂等成功 |
 | `mcsup remote code [--ttl <secs>] [--clear]` | 生成一枚一次性配对码（缺省 300 秒，范围 30–3600）；`--clear` 作废当前码 |
 | `mcsup remote revoke <client>` | 离线撤销某个客户端（删除名册记录，立即失效） |
+
+所谓「等实例锁释放」不是等 pid 消失：锁由内核持有（见 `storage::DirLock`），
+进程无论正常退出还是被强杀都会释放，因此它是「真的停了」的唯一可靠判据。
+
+Windows 上 `serve stop` **总是**强杀，`--force` 在该平台不改变行为。原因是没有
+与 `SIGTERM` 对应的机制：不带 `/F` 的 `taskkill` 只能向窗口投递关闭请求，而
+agent 以 `DETACHED_PROCESS` 拉起，无窗口也无控制台，没有可投递的对象，调用会
+直接失败。agent 本身也不注册信号处理器，Unix 上 `SIGTERM` 走的同样是默认终止，
+所以这在可收尾性上没有损失。
 
 ### 连接端（本地主机）
 

@@ -60,6 +60,10 @@ jobs:
   test:
     name: test (${{ matrix.os }}, ${{ matrix.lang }})
     runs-on: ${{ matrix.os }}
+    # 卡住的测试要尽快暴露，而不是无声烧掉 GitHub 的 6 小时默认上限：
+    # 曾经 `cli_serve_daemon` 在 Windows 上等一个永不关闭的管道，整个 job
+    # 只能靠人工取消。冒烟预算是实测最慢平台的数倍，正常跑远远用不到。
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
