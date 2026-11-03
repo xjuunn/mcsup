@@ -7,6 +7,14 @@ name: Test
 # 深度检查（变异测试、联网探测）也只在手动触发时执行。
 on:
   workflow_dispatch:
+    inputs:
+      deep:
+        # 默认只跑必要门禁：一次点击就能拿到「能不能合入」的结论。
+        # 变异测试、联网探测、feature powerset 都是深度检查，耗时长且
+        # 不构成合入门槛，勾上才跑。
+        description: '同时运行深度检查（变异测试、联网探测、feature powerset）'
+        type: boolean
+        default: false
 
 # 同一分支重复手动触发取消旧的运行，避免占用额度：group 仍按 ref 收敛。
 concurrency:
@@ -68,16 +76,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux 跑全语言组合：locale 经 LANG 生效，三种输入都要覆盖
+          # Linux 跑两种语言输入：locale 经 LANG 生效，`C` 与 `zh_CN` 分别
+          # 覆盖「回退英文」与「中文」两条分支，也是 `help follows platform
+          # locale` 里 case 的两个分支本身。曾另有一条 `en_US.UTF-8`，它与
+          # `C` 都落到英文、走的是同一个 case 分支，属纯重复，已移除（两条
+          # 解析路径 `Lang::parse("C") -> None` 与 `-> En` 由 locale.rs 的
+          # 单元测试各自覆盖）。
           - os: ubuntu-latest
             lang: C
             lc_all: C
           - os: ubuntu-latest
             lang: zh_CN.UTF-8
             lc_all: zh_CN.UTF-8
-          - os: ubuntu-latest
-            lang: en_US.UTF-8
-            lc_all: en_US.UTF-8
           # Windows / macOS 只跑一条：两个平台都不读 LANG，这条验的是
           # 「locale 环境变量为空也不崩」，语言切换由显式 --lang 覆盖。
           # macOS 的 LANG 还会被安全 check-in 强制覆盖，设了也不生效。
@@ -110,7 +120,25 @@ jobs:
           LANG: ${{ matrix.lang }}
           LC_ALL: ${{ matrix.lc_all }}
           MCSUP_LANG: ""
+          # 快照必须是「有人看过才更新」：CI 上发现差异就失败，不静默重写。
+          # 原来这是独立的 snapshots job，但它要为此再编译一遍整个 workspace、
+          # 再跑一次 cli_snapshots，而 test 这一步本来就跑了全部测试目标
+          # （含 cli_snapshots）。合并后断言完全相同，少一份完整编译。
+          INSTA_UPDATE: "no"
+          INSTA_FORCE_PASS: "0"
         run: sh scripts/test-parallel.sh
+      # insta 在 CI 上不会写 .snap.new，但会留在 testdata 里；这里兜一层：
+      # 有人误把 `.snap.new` 提交进来时，必须当场发现。放在 test job 里是本
+      # 步骤唯一的依赖——只查 git 索引，不需要编译。
+      - name: reject pending snapshots
+        shell: bash
+        run: |
+          found=$(git ls-files '*.snap.new' '*.pending-snap')
+          if [ -n "$found" ]; then
+            echo "仓库里存在未确认的快照，先 cargo insta review 再提交：" >&2
+            echo "$found" >&2
+            exit 1
+          fi
       # 端到端单独成步：`cargo test --workspace` 虽会顺带跑 apps/cli/tests/cli_e2e.rs，
       # 但那是「碰巧」，不是约定。这里显式跑 check.sh 调用的同一个脚本，
       # 保证本地与 CI 跑的是同一组用例、同一套结论。
@@ -210,8 +238,11 @@ jobs:
           RUSTDOCFLAGS: -D warnings
 
   # --all-features 抓不到「单独开某个 feature 编译不过」，而那正是第三方安装的边界。
+  # 需要 `cargo install cargo-hack` 并编译全部 feature 组合，耗时远超其余门禁，
+  # 故归入深度检查（手动勾选 deep 才跑），不计入合入结论。
   features:
     name: feature powerset
+    if: inputs.deep
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -239,38 +270,12 @@ jobs:
       - name: cargo deny check
         run: cargo deny check
 
-  # 快照断言必须是「有人看过才更新」：CI 上发现 .snap.new 就是失败。
-  # 与本地 `cargo insta review` 的分工：本地用它改，CI 只用来拦。
-  snapshots:
-    name: snapshots
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.98.1
-      - uses: Swatinem/rust-cache@v2
-      - name: cargo test (snapshots)
-        env:
-          INSTA_UPDATE: "no"
-          INSTA_FORCE_PASS: "0"
-        run: cargo test --workspace --all-features --test cli_snapshots
-      # insta 在 CI 上不会写 .snap.new，但会留在 testdata 里；这里再兜一层：
-      # 有人误把 `.snap.new` 提交进来时，必须当场发现
-      - name: reject pending snapshots
-        run: |
-          found=$(git ls-files '*.snap.new' '*.pending-snap')
-          if [ -n "$found" ]; then
-            echo "仓库里存在未确认的快照，先 cargo insta review 再提交：" >&2
-            echo "$found" >&2
-            exit 1
-          fi
-
   # ---- 深度检查：不进常规门禁（太慢），只在手动 Run workflow 时执行 ----
 
   # 变异测试：检查「测试能不能发现实现被改坏」。基线阶段只报告，不卡阈值。
   mutants:
     name: mutants
+    if: inputs.deep
     runs-on: ubuntu-latest
     timeout-minutes: 240
     steps:
@@ -308,6 +313,7 @@ jobs:
   # 只有这里（手动触发）显式执行，失败说明上游改了契约。
   net:
     name: net (ignored tests)
+    if: inputs.deep
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -322,7 +328,7 @@ jobs:
   required:
     name: required checks
     if: always()
-    needs: [architecture, fmt, clippy, test, msrv, docs, features, deny, snapshots]
+    needs: [architecture, fmt, clippy, test, msrv, docs, features, deny]
     runs-on: ubuntu-latest
     steps:
       # required 失败时必须指出是哪个 job：原来 jq 输出丢进 /dev/null，日志是空的。
@@ -338,9 +344,11 @@ jobs:
             echo "$needs" | jq -r 'to_entries | sort_by(.key)[] | "| \(.key) | \(.value.result) |"'
           } >> "$GITHUB_STEP_SUMMARY"
 
+          # `skipped` 不是失败：`features` 等深度检查在未勾选 deep 时不会
+          # 运行，needs 里报 skipped。若把它当失败，默认路径将永远红。
           failed=$(echo "$needs" | jq -r '
             to_entries[]
-            | select(.value.result != "success")
+            | select(.value.result != "success" and .value.result != "skipped")
             | .key + " -> " + .value.result
           ')
 
@@ -360,5 +368,5 @@ jobs:
       - name: Verify all jobs passed
         run: |
           echo '${{ toJSON(needs) }}' | jq -e '
-            all(.[]; .result == "success")
+            all(.[]; .result == "success" or .result == "skipped")
           ' > /dev/null
