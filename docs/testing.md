@@ -90,7 +90,7 @@ let store = FailingContentStore::new(Arc::new(CasStore::new(root)), CasOp::Put);
 | G1 | `scripts/check.sh` | 每次提交、每次 CI | 常规门禁未过 |
 | G2 | 变异测试 `cargo mutants` | 手动触发的深度检查 job | 测试发现不了被改坏的实现 |
 | G3 | 属性测试反例固化 | 每次提交（`proptest-regressions/` 入库） | 已知反例未纳入回归 |
-| G4 | 快照 `insta` | CI `snapshots` job | 机器契约发生了未经确认的变化 |
+| G4 | 快照 `insta` | CI `test` job（`cli_snapshots` 目标） | 机器契约发生了未经确认的变化 |
 | G5 | diff 覆盖率 | CI | 新增代码没有被测到 |
 | G6 | 失败可复现 | 人工约定 | 失败信息不足以复现 |
 | G7 | `cargo-fuzz` | 手动触发的深度检查 job | 解析器在畸形输入上崩溃 |

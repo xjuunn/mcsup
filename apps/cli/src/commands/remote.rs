@@ -1544,11 +1544,12 @@ fn remove_pid(data_dir: &Path) {
 fn is_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
+        // `output()` 而非 `status()`：探测不该往调用方的 stdout 写任何东西
         std::process::Command::new("kill")
             .arg("-0")
             .arg(pid.to_string())
-            .status()
-            .is_ok_and(|status| status.success())
+            .output()
+            .is_ok_and(|output| output.status.success())
     }
     #[cfg(windows)]
     {
@@ -1623,29 +1624,43 @@ fn is_mcsup_process(pid: u32) -> bool {
 /// 「是否真的停了」由调用方等实例锁释放来判定——那是内核锁，进程无论怎么
 /// 死都会释放。
 fn terminate(pid: u32, force: bool) -> Result<()> {
+    // 一律 `output()` 而不是 `status()`：`status()` 让子进程继承本进程的
+    // stdout/stderr，而 `taskkill` 成功时也会打印
+    // `SUCCESS: The process with PID 7624 has been terminated.`——它会直接混进
+    // `--output json` 的 stdout，把「纯数据」契约打破（CI 上正是这么红的：
+    // 测试拿到的第一行不是 JSON）。`output()` 把两路都收进管道，既不污染
+    // 调用方的流，又能在失败时把 stderr 带进错误信息，比只有退出码更有用。
     #[cfg(unix)]
-    let status = std::process::Command::new("kill")
+    let output = std::process::Command::new("kill")
         .arg(if force { "-9" } else { "-15" })
         .arg(pid.to_string())
-        .status();
+        .output();
     #[cfg(windows)]
-    let status = {
+    let output = {
         // `force` 在这里没有第二条路可走（见上）：显式吞掉以免 Windows 上
         // 报 unused variable，而 `-D warnings` 会让它变成编译失败
         let _ = force;
         let mut command = std::process::Command::new("taskkill");
         command.args(["/PID", &pid.to_string(), "/F"]);
-        command.status()
+        command.output()
     };
     #[cfg(not(any(unix, windows)))]
-    let status: std::io::Result<std::process::ExitStatus> = Err(std::io::Error::other(
+    let output: std::io::Result<std::process::Output> = Err(std::io::Error::other(
         "terminating a process is not supported on this platform",
     ));
-    let status = status?;
-    if status.success() {
-        Ok(())
-    } else {
+    let output = output?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let status = output.status;
+    let detail = String::from_utf8_lossy(&output.stderr);
+    let detail = detail.trim();
+    if detail.is_empty() {
         Err(anyhow::anyhow!("terminate {pid} exited with {status}"))
+    } else {
+        Err(anyhow::anyhow!(
+            "terminate {pid} exited with {status}: {detail}"
+        ))
     }
 }
 

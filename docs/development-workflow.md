@@ -84,6 +84,16 @@ gh workflow run test.yml --ref <分支名>
 gh run watch
 ```
 
+默认只跑构成合入结论的那几个 job（architecture / fmt / clippy / test / msrv /
+docs / deny）。深度检查（变异测试、联网探测、feature powerset）要在页面上勾选
+`deep` 才执行；命令行对应：
+
+```
+gh workflow run test.yml --ref <分支名> -f deep=true
+```
+
+`deep` 未勾选时这些 job 是 `skipped`，`required` 把 `skipped` 视为通过。
+
 或在 GitHub 的 Actions 页面选择 Test → Run workflow。分支必须先推到
 `origin`，`workflow_dispatch` 只能引用远端已有的 ref：
 
