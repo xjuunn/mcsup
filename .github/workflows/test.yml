@@ -12,7 +12,7 @@ on:
         # 默认只跑必要门禁：一次点击就能拿到「能不能合入」的结论。
         # 变异测试、联网探测、feature powerset 都是深度检查，耗时长且
         # 不构成合入门槛，勾上才跑。
-        description: '同时运行深度检查（变异测试、联网探测、feature powerset）'
+        description: '深度检查'
         type: boolean
         default: false
 
