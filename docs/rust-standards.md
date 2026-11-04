@@ -55,6 +55,20 @@ impl LifecycleError {
 `#[non_exhaustive]` 的枚举在下游 `match` 必须带兜底分支；兜底不得静默丢弃，
 至少沿用英文措辞。
 
+### 哪些枚举加 `#[non_exhaustive]`
+
+看「加变体时应不应该让下游编译失败」：
+
+| 类型 | 加 | 理由 |
+| --- | --- | --- |
+| 跨进程 / 跨版本的线上契约（`protocol::Request` / `Response` 等） | 加 | 对端可能比本端新，未知帧要能显式报错而不是崩 |
+| 会被第三方按 feature 依赖的对外错误（`CredentialError`、`ScanError` 等） | 加 | 加变体不应破坏下游编译 |
+| 开放词表（`ServerVariant`、`Modrinth` 的 `ProjectType` / `SearchIndex` 等） | 加 | 上游会新增取值 |
+| 封闭判定（`RestoreTarget`、`SettingKey`、`Permission`、`Role`、`TaskEvent`、`StopOutcome`、`ConfigKey`、`Severity`、各 `Picks` / `Wire*` 线格式） | **不加** | 穷尽 `match` 本身就是安全属性：新增变体时必须让每个分支重新审视，兜底会静默走错分支 |
+
+判断顺序：先问「漏掉一个变体，静默兜底会不会导致错误行为」。会 → 不加，
+让编译器拦住；不会（只是少一条提示 / 多一个未知值）→ 加。
+
 ## 进程级状态
 
 界面相关的一次性设置（如界面语言）可以放进程级状态，但必须同时满足：

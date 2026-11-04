@@ -106,8 +106,9 @@ crate 级与模块级依赖方向（实现层之间不互相依赖）。
 `store`（具体连接）/ `server_repository` + `workspace_repository`（按
 trait 换仓库实现）/ `jar_sources`，每个字段都是 `Option`，不注入就用
 内置实现。CLI 与库侧共用同一个组合根（`apps/cli` 已改走
-`mcsup::bootstrap`），不再各拼一套。待补：同步入口（`start_blocking`）
-与事件注入（EventSink）。
+`mcsup::bootstrap`），不再各拼一套。事件注入已落地（`McsupBuilder::events`
+接收 `Arc<dyn port::EventSink>`，缺省 `NoopEventSink`）；待补：同步入口
+（`start_blocking`）。
 
 默认 supervisor 约束：`LocalSupervisor` 经 mcsup CLI 的 `__supervise`
 子命令拉起子进程，`server start` 必须在 `StartOptions::supervisor_exe`
@@ -181,7 +182,12 @@ CLI 既是人类工具，也是第三方（非 Rust）的编程接口。两者�
 - `--output json` 显式开关，不用 TTY 自动检测。
 - stdout 只出数据，stderr 只出日志。
 - 退出码稳定映射：0 成功 / 1 通用失败 / 2 用法错误 / 3 未找到 /
-  4 状态冲突 / 5 后端失败 / 6 未授权（token 失效、权限不足、证书指纹变化）。
+  4 状态冲突 / 5 后端失败 / 6 未授权（token 失效、权限不足、证书指纹变化）/
+  130 用户取消。
+- 130 = 128 + `SIGINT`：只由「Ctrl-C 协作取消」这一条来路产生，表示清理已走完
+  （中间文件、暂存目录都已收尾）而不是半途被杀。入口对 130 **不渲染错误消息**
+  ——用户自己按的 Ctrl-C 不是错误，再打一行红字只是噪音。它与「后端失败 5」
+  严格区分：脚本据此判断是「用户主动放弃」还是「系统出错」。
 - `--follow` 输出 JSONL（一行一个事件对象），用于实时日志和状态推送。
 - `server send <id> <command>` 支持把宿主输入接到服务器 stdin。
 - 无交互：不依赖 TTY 输入，不等待确认，需要确认的走显式 `--yes`。
@@ -217,6 +223,18 @@ crates.io
 ├── crates/mcsup/           门面；内层现为 publish = false 的 path 依赖
 └── apps/cli/ ...           bin，装出 mcsup / mcsup-agent / mcsup-server
 ```
+
+发布顺序（被依赖者先发，`.github/workflows/publish.yml` 的 matrix 即此顺序）：
+
+```
+domain → auth → port → protocol
+       → service / file / java / provider / storage / backup / transport / runtime
+       → backend → mcsup
+```
+
+必须覆盖门面能 feature 拉入的**每一个**内层 crate：漏一个，门面发布时
+crates.io 找不到该依赖，整个版本发不出去。`backend` 排在实现层之后，
+因为它是唯一允许组合具体实现的 crate。
 
 `apps/` 不发布到 crates.io。它们通过 `--path` 或 `--git` 安装：
 
@@ -262,13 +280,20 @@ Cargo 禁止同一 workspace 内出现同名 package，所以发布库叫 `mcsup
 ```
 domain   = ["dep:domain"]
 port     = ["dep:port", "domain"]
-protocol = ["dep:protocol", "domain"]
+protocol = ["dep:protocol", "auth", "port"]
 service  = ["dep:service", "port"]
+backup   = ["dep:backup", "port"]
+backend  = ["dep:backend", "port"]
 file     = ["dep:file", "port"]
 java     = ["dep:java", "port"]
 provider = ["dep:provider", "port"]
 storage  = ["dep:storage", "port"]
 runtime  = ["dep:runtime", "port", "protocol"]
+transport = ["dep:transport", "protocol"]
+auth     = ["dep:auth"]
+bootstrap = ["storage", "service", "backup", "backend", "file", "java",
+             "provider", "runtime", "port", "protocol", "transport"]
+remote    = ["bootstrap", "transport", "runtime", "auth", "service", "protocol"]
 ```
 
 级联规则：feature 引用同级 feature，被引用者带出其可选依赖——只要
@@ -278,10 +303,9 @@ runtime  = ["dep:runtime", "port", "protocol"]
 feature 级联、`lib.rs` 的 `pub use`。内层 manifest 一律
 `xxx.workspace = true` 继承，禁止再写版本字面量。
 
-组合 feature（`minimal` / `full`）尚未声明：`check-architecture.sh` 的
-feature_bundles 目前只豁免 `default`，新增组合 feature 时同步豁免。
-已声明的组合 feature 是 `bootstrap`（默认组合根，见下），允许集合已
-加入 `facade_allow`。
+组合 feature 现有两个：`bootstrap`（默认组合根，见下）与 `remote`（被连接端）。
+两者都已加入 `facade_allow`，`check-architecture.sh` 的 feature_bundles 会一并
+校验。`minimal` / `full` 尚未声明，新增时同样要入表。
 
 feature 语义必须机器校验。如果 `file` 硬依赖 `provider`，那
 `features = ["file"]` 会把 `reqwest` 拉进来，这个 feature 就是假的。

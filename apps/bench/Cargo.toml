@@ -1,0 +1,33 @@
+[package]
+name = "bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "MCSUP 高成本路径的基准测试（CAS / 扫描 / 序列化 / Provider 解析）"
+
+# 只有 benchmark 目标：没有用户可见的命令行入口。
+# lib 只放样本构造，不给它套 harness（否则 `cargo bench` 会拿 criterion 的
+# 参数去跑普通 test 目标，报 "Unrecognized option"）。
+[lib]
+test = false
+bench = false
+doctest = false
+
+[[bench]]
+name = "hot_paths"
+harness = false
+doc = false
+
+[dependencies]
+mcsup = { version = "0.1.0", path = "../../crates/mcsup", features = ["bootstrap", "backup"] }
+
+[dev-dependencies]
+criterion = { version = "0.8.0", default-features = false, features = ["cargo_bench_support"] }
+serde_json.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

@@ -1,4 +1,6 @@
 /target
+# fuzz 是独立 workspace（cargo-fuzz 要求），自带一份 target
+/fuzz/target
 **/*.rs.bk
 *.pdb
 

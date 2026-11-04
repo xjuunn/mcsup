@@ -27,6 +27,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// 请求：一次连接一个请求，一问一答后关闭
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Request {
     /// 查询实时状态
     Status,
@@ -46,6 +47,7 @@ pub enum Request {
 /// 响应
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Response {
     /// 状态查询结果（`status` 为 [`ServerStatus::as_str`] 口径）
     Status {

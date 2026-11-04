@@ -84,6 +84,10 @@ pub struct ServerMeta {
     pub name: ServerName,
     pub workspace_id: WorkspaceId,
     /// 相对工作目录 `servers/` 下的目录名
+    ///
+    /// 必须是**单层**名字（见 [`is_single_segment`]）：绝对路径、`..` 或含
+    /// 分隔符的值会让「工作目录拼接 `rel_dir`」指向工作区之外。写入方
+    /// （`storage`）在落盘前校验，读侧不必再防。
     pub rel_dir: PathBuf,
     pub version: super::version::VersionId,
     pub variant: ServerVariant,
@@ -148,5 +152,55 @@ mod tests {
         // 内置集合里的新变体都已登记；不在内置集合的名字仍然判错
         assert_eq!(ServerVariant::parse("quilt"), Ok(ServerVariant::Quilt));
         assert!(ServerVariant::parse("not-a-variant").is_err());
+    }
+}
+
+/// `rel_dir` 是否为单层名字：工作目录拼接它之后必须仍落在 `servers/` 下
+///
+/// 只认一个 `Component::Normal`，因此绝对路径、`..`、`.` 与任何带分隔符的
+/// 值都不合法。写入方（`storage`）在落盘前调用它——校验必须发生在写入路径上，
+/// 而不是等到 `doctor` 事后体检：一旦落盘，之后每次 `absolute_dir()` 都会
+/// 指向工作区之外，`backup` / `remove --purge` 全都按那个路径操作。
+#[must_use]
+pub fn is_single_segment(rel_dir: &std::path::Path) -> bool {
+    let mut components = rel_dir.components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    )
+}
+
+#[cfg(test)]
+mod rel_dir_tests {
+    use super::is_single_segment;
+    use std::path::Path;
+
+    /// 正常目录名
+    ///
+    /// `a/` 归一化后就是单层 `Normal("a")`（尾随分隔符不产生额外 component），
+    /// 拼接后仍落在 `servers/` 下，因此不算逃逸。
+    #[test]
+    fn accepts_single_normal_segment() {
+        for raw in ["alpha", "server-1", "a_b.c", "a/"] {
+            assert!(is_single_segment(Path::new(raw)), "{raw}");
+        }
+    }
+
+    /// 逃逸形态一律拒绝
+    #[test]
+    fn rejects_escaping_shapes() {
+        for raw in ["..", ".", "../outside", "a/b", "/abs", "a/../b", ""] {
+            assert!(!is_single_segment(Path::new(raw)), "{raw:?}");
+        }
+    }
+
+    /// Windows 分隔符与盘符：在 Unix 上 `a\b` 是单个 component，
+    /// 但仍必须拒绝，因为同一个库产物可能在 Windows 上落盘
+    #[cfg(windows)]
+    #[test]
+    fn rejects_windows_separators() {
+        for raw in ["a\\b", "C:\\abs", "..\\outside"] {
+            assert!(!is_single_segment(Path::new(raw)), "{raw:?}");
+        }
     }
 }

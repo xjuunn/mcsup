@@ -18,6 +18,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
 
+/// 凭证文件跨进程锁的等待上限
+const LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 同一进程内并发写时区分临时文件名
+static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// 凭证存储失败
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -53,6 +59,14 @@ pub enum CredentialError {
     /// 系统钥匙串失败（含索引内容损坏）
     #[error("keyring: {0}")]
     Keyring(String),
+    /// 跨进程锁在超时内没拿到
+    #[error("credential file {path} is locked by another process (waited {waited:?})")]
+    LockBusy {
+        /// 锁文件路径
+        path: PathBuf,
+        /// 等待时长
+        waited: std::time::Duration,
+    },
 }
 
 impl CredentialError {
@@ -68,7 +82,7 @@ impl CredentialError {
 ///
 /// 只放「够用就好」的字段：token 本体、客户端身份、角色。远端地址与 target
 /// 在 `config.toml` 的配对记录里，不重复存——两处都存就会分叉。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct StoredCredential {
     /// 明文 token
@@ -77,6 +91,20 @@ pub struct StoredCredential {
     pub client_id: String,
     /// 角色（`viewer` / `operator` / `admin`）
     pub role: String,
+}
+
+/// 手写 [`Debug`]：`token` 必须脱敏
+///
+/// 与 [`crate::token::Token`] 同一口径。派生 `Debug` 会让 `tracing::debug!(?cred)`
+/// 或任何 `{:?}` 把明文 token 写进日志——一次误用即泄漏，且在评审时看不出来。
+impl std::fmt::Debug for StoredCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredCredential")
+            .field("token", &"***")
+            .field("client_id", &self.client_id)
+            .field("role", &self.role)
+            .finish()
+    }
 }
 
 /// 凭证存储：按名字读写 token
@@ -148,12 +176,85 @@ impl FileCredentialStore {
     }
 
     /// 原子写回并保证 0600
+    ///
+    /// 调用方必须已持有 [`FileLock`]：这里是读-改-写的后半段，单独调用会让
+    /// 并发写者的更新互相覆盖。
     fn save(&self, file: &CredentialFile) -> Result<(), CredentialError> {
         let text = toml::to_string_pretty(file).map_err(|err| CredentialError::Corrupt {
             path: self.path.clone(),
             reason: err.to_string(),
         })?;
         write_private(&self.path, &text)
+    }
+
+    /// 读-改-写：整段持锁，避免并发写者丢失更新
+    fn mutate<F>(&self, change: F) -> Result<(), CredentialError>
+    where
+        F: FnOnce(&mut CredentialFile),
+    {
+        let _lock = self.lock()?;
+        let mut file = self.load()?;
+        change(&mut file);
+        self.save(&file)
+    }
+
+    /// 取跨进程锁；锁文件与数据文件同目录
+    ///
+    /// 与 [`crate::grant`] 同一口径（`try_lock` + 超时 + 退避）。凭证文件是
+    /// 「整个文件一个 map」的形态，任何读-改-写都必须独占，否则两个
+    /// `mcsup remote connect` 并发时会丢掉一条凭证。
+    fn lock(&self) -> Result<FileLock, CredentialError> {
+        let lock_path = self.path.with_extension("lock");
+        FileLock::acquire(&lock_path)
+    }
+}
+
+/// 跨进程文件锁句柄：关闭（含进程崩溃）即释放
+struct FileLock {
+    /// 只用于保活；drop 时操作系统自动解锁
+    _file: std::fs::File,
+}
+
+impl FileLock {
+    /// 在 `path` 上取排他锁，最多等 [`LOCK_TIMEOUT`]
+    ///
+    /// 锁文件永不删除：删掉会让等待者在新旧 inode 上各持一把锁。
+    fn acquire(path: &Path) -> Result<Self, CredentialError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| CredentialError::io(parent, err))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|err| CredentialError::io(path, err))?;
+        let deadline = std::time::Instant::now() + LOCK_TIMEOUT;
+        let mut delay = std::time::Duration::from_millis(2);
+        loop {
+            match file.try_lock() {
+                Ok(()) => {
+                    let _ = file.set_len(0);
+                    let mut handle = &file;
+                    let _ = writeln!(handle, "{}", std::process::id());
+                    return Ok(Self { _file: file });
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(CredentialError::LockBusy {
+                            path: path.to_path_buf(),
+                            waited: LOCK_TIMEOUT,
+                        });
+                    }
+                    std::thread::sleep(delay);
+                    delay = (delay * 2).min(std::time::Duration::from_millis(50));
+                }
+                Err(std::fs::TryLockError::Error(err)) => {
+                    return Err(CredentialError::io(path, err));
+                }
+            }
+        }
     }
 }
 
@@ -177,7 +278,13 @@ pub(crate) fn write_private(path: &Path, text: &str) -> Result<(), CredentialErr
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|err| CredentialError::io(parent, err))?;
     }
-    let tmp = path.with_extension("toml.tmp");
+    // 临时文件名带 pid + 序号：即使调用方漏了锁，两个写者也不会共用同一个
+    // 临时文件而把内容交错写坏
+    let tmp = path.with_extension(format!(
+        "toml.{}.{}.tmp",
+        std::process::id(),
+        TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     {
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create(true).truncate(true);
@@ -229,9 +336,10 @@ fn restrict(path: &Path) -> Result<(), CredentialError> {
 
 impl CredentialStore for FileCredentialStore {
     fn put(&self, name: &str, credential: &StoredCredential) -> Result<(), CredentialError> {
-        let mut file = self.load()?;
-        file.0.insert(name.to_owned(), credential.clone());
-        self.save(&file)
+        let owned = credential.clone();
+        self.mutate(move |file| {
+            file.0.insert(name.to_owned(), owned);
+        })
     }
 
     fn get(&self, name: &str) -> Result<StoredCredential, CredentialError> {
@@ -243,11 +351,11 @@ impl CredentialStore for FileCredentialStore {
     }
 
     fn remove(&self, name: &str) -> Result<(), CredentialError> {
-        let mut file = self.load()?;
-        if file.0.remove(name).is_some() {
-            self.save(&file)?;
-        }
-        Ok(())
+        // 删除是不存在的名字时也持锁：读-改-写本身就是临界区，跳过它就等于
+        // 允许一个并发 put 与本删除交错
+        self.mutate(|file| {
+            file.0.remove(name);
+        })
     }
 
     fn names(&self) -> Result<Vec<String>, CredentialError> {
@@ -473,14 +581,23 @@ pub enum CredentialVault {
 }
 
 impl CredentialVault {
-    /// 按环境变量 / 平台能力选择后端
+    /// 按平台能力选择后端（不读环境变量）
+    ///
+    /// 库不读环境：宿主进程里的一个变量就能静默改变密钥存放位置，而调用方
+    /// 无从得知。需要显式指定后端时用 [`Self::open_with`]，取值由 app 层决定。
     #[must_use]
     pub fn open(file_path: impl Into<PathBuf>) -> Self {
+        Self::open_with(file_path, None)
+    }
+
+    /// 按显式指定 + 平台能力选择后端
+    ///
+    /// `choice` 是 `Some("keyring")` / `Some("file")` 时强制该后端，`None` /
+    /// `Some("auto")` / 无法识别的取值按「钥匙串可用则用它，否则退文件」。
+    #[must_use]
+    pub fn open_with(file_path: impl Into<PathBuf>, choice: Option<&str>) -> Self {
         let file_path = file_path.into();
-        let choice = choose_backend(
-            std::env::var(CREDENTIAL_STORE_ENV).ok().as_deref(),
-            keyring_available(),
-        );
+        let choice = choose_backend(choice, keyring_available());
         match choice {
             StoreChoice::Keyring => {
                 Self::Keyring(KeyringCredentialStore::new(KEYRING_SERVICE, SystemKeyring))
@@ -547,6 +664,46 @@ mod tests {
         (dir, store)
     }
 
+    /// 明文 token 绝不能出现在 `Debug` 输出里
+    ///
+    /// `Token` 通过不实现 `Debug` 保证这一点；本结构体是落盘形态，必须实现
+    /// 才能被测试与日志用，因此改为手写脱敏。
+    #[test]
+    fn debug_redacts_token() {
+        let cred = credential();
+        let rendered = format!("{cred:?}");
+        assert!(
+            !rendered.contains(&cred.token),
+            "Debug 泄漏了明文 token: {rendered}"
+        );
+        assert!(rendered.contains("***"), "{rendered}");
+        assert!(
+            rendered.contains("operator"),
+            "非敏感字段应保留: {rendered}"
+        );
+    }
+
+    /// 读-改-写持锁：并发 put 不得丢失更新
+    #[test]
+    fn concurrent_puts_do_not_lose_updates() {
+        let (_dir, store) = store();
+        let store = Arc::new(store);
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let store = Arc::clone(&store);
+            handles.push(std::thread::spawn(move || {
+                store
+                    .put(&format!("remote-{i}"), &credential())
+                    .expect("put");
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("join");
+        }
+        let names = store.names().expect("names");
+        assert_eq!(names.len(), 8, "并发写入丢了更新: {names:?}");
+    }
+
     #[test]
     fn put_get_remove_roundtrip() {
         let (_dir, store) = store();
@@ -594,14 +751,26 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600, "凭证文件必须是 0600");
-        let tmp = store.path().with_extension("toml.tmp");
-        assert!(!tmp.exists(), "临时文件应已 rename");
-        let entries: Vec<_> = std::fs::read_dir(dir.path())
+        // 临时文件名带 pid + 序号，用前缀扫目录确认没有残留
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .expect("read_dir")
             .flatten()
             .map(|entry| entry.file_name())
+            .filter(|name| name.to_string_lossy().contains(".tmp"))
             .collect();
-        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert!(leftovers.is_empty(), "临时文件应已 rename: {leftovers:?}");
+        // 目录里只应有凭证文件与锁文件（锁文件永不删除，见 FileLock::acquire）
+        let mut entries: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read_dir")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        entries.sort();
+        assert_eq!(
+            entries,
+            ["credentials.lock", "credentials.toml"],
+            "{entries:?}"
+        );
     }
 
     /// 权限被放宽时必须拒绝读取，而不是假装保护生效

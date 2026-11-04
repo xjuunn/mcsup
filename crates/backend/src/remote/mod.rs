@@ -78,7 +78,31 @@ impl port::Backend for RemoteBackend {
         &self.supervisor
     }
 
+    /// 远端安装器尚未实现：返回一个「调用即报错」的执行器
+    ///
+    /// 不用 `unreachable!()`：`Backend` 是 `service` 的依赖，panic 会把
+    /// 「远端还没做安装」变成进程 abort。入口拿到一条普通失败即可提示用户。
     fn installer(&self) -> &dyn port::InstallerRunner {
-        unreachable!("remote installer is not available until the Installer frames land")
+        &UnsupportedInstaller
+    }
+}
+
+/// 远端尚无安装器 RPC 时的占位执行器
+///
+/// 一旦 Installer 帧落地就换成真正的远端执行器。
+struct UnsupportedInstaller;
+
+impl port::InstallerRunner for UnsupportedInstaller {
+    fn run_installer(
+        &self,
+        _java_bin: &std::path::Path,
+        _installer: &std::path::Path,
+        dir: &std::path::Path,
+        _output: Option<&dyn port::InstallerOutputSink>,
+        _cancel: &port::CancellationToken,
+    ) -> Result<(), port::InstallerError> {
+        Err(port::InstallerError::NoOutput {
+            dir: dir.to_path_buf(),
+        })
     }
 }

@@ -42,6 +42,21 @@ impl ContentHash {
         }
     }
 
+    /// 从 32 字节 SHA-256 摘要构造
+    ///
+    /// 校验器和摘要器手上是字节而不是文本；先格式化成十六进制再 `parse` 回来，
+    /// 只会逼出一个「解析不可能失败」的 `unwrap`/`unreachable`。这里直接把字节
+    /// 编成规范形式，不经过失败路径。
+    #[must_use]
+    pub fn from_digest(bytes: &[u8; 32]) -> Self {
+        let mut hex = String::with_capacity(Self::HEX_LEN);
+        for byte in bytes {
+            // 写进 String 不可能失败
+            let _ = fmt::Write::write_fmt(&mut hex, format_args!("{byte:02x}"));
+        }
+        Self(hex)
+    }
+
     /// 十六进制文本
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -621,12 +636,49 @@ pub struct RestoreWhileRunning;
 
 /// 保留策略：`--keep N` 与 `--older-than 7d` 二选一
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RetentionPolicy {
     /// 保留最近 N 份，其余删除
     Keep(usize),
     /// 删除早于该秒数的所有快照
     OlderThan(u64),
 }
+
+/// 保留策略的原始输入：两个可选项，由 [`RetentionInput::resolve`] 判成策略
+///
+/// 判定只在这里做一次。CLI 与远端 RPC 都握有「两个可选项」而不是
+/// [`RetentionPolicy`]：两个都给时必须一致地判为冲突，而不是各写一套
+/// `match`——一处报错、一处静默取 `keep` 就是同输入两种语义。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetentionInput {
+    /// `--keep N`
+    pub keep: Option<usize>,
+    /// `--older-than` 换算后的秒数
+    pub older_than_secs: Option<u64>,
+}
+
+impl RetentionInput {
+    /// 两个可选策略 → 至多一个有效策略
+    ///
+    /// 都不给返回 `Ok(None)`：调用方据此只做 GC、不删快照。
+    ///
+    /// # Errors
+    ///
+    /// 两个同时给出时返回 [`ConflictingRetention`]
+    pub fn resolve(self) -> Result<Option<RetentionPolicy>, ConflictingRetention> {
+        match (self.keep, self.older_than_secs) {
+            (Some(_), Some(_)) => Err(ConflictingRetention),
+            (Some(keep), None) => Ok(Some(RetentionPolicy::Keep(keep))),
+            (None, Some(secs)) => Ok(Some(RetentionPolicy::OlderThan(secs))),
+            (None, None) => Ok(None),
+        }
+    }
+}
+
+/// 保留策略冲突：`--keep` 与 `--older-than` 同时给出
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("keep and older-than are mutually exclusive")]
+pub struct ConflictingRetention;
 
 impl RetentionPolicy {
     /// 选出应删除的快照（不改入参顺序：`snapshots` 已按时间升序）

@@ -138,6 +138,7 @@ impl From<Capability> for Capabilities {
 /// 客户端 → agent 的一帧
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Request {
     /// 首帧：声明协议版本与客户端版本
     Hello {
@@ -542,6 +543,7 @@ impl Request {
 /// agent → 客户端的一帧
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Response {
     /// 握手结果
     Hello {

@@ -115,14 +115,15 @@ build 依赖、不含 dev 依赖），改的只是取数方式。
 脚本必须跑出与 `cargo test --workspace --all-features` **相同的**用例集合。
 它以 `profile.test == true` 挑选产物，这个判据容易踩两个坑：
 
-- 按 `kind` 排除 `bin` 会丢掉 bin 的单元测试。`mcsup` 有 208 个、
-  `mcsup_dev_tools` 有 25 个单元测试写在 `main.rs` 里，那样会静默少跑
-  233 个用例，而门禁照绿。cargo 对 bin 目标产出两份产物：`test=false`
-  是真二进制（用户执行的那个），`test=true` 才是带 harness 的副本。
+- 按 `kind` 排除 `bin` 会丢掉 bin 的单元测试。`mcsup` 有 210 个、
+  `mcsup_dev_tools` 有 25 个、`mcsup-agent` 有 6 个单元测试写在 `main.rs`
+  里，那样会静默少跑 241 个用例，而门禁照绿。cargo 对 bin 目标产出两份
+  产物：`test=false` 是真二进制（用户执行的那个），`test=true` 才是带
+  harness 的副本。
 - doctest **不在** `--no-run` 的产物清单里（由 rustdoc 驱动，没有独立
   可执行文件），必须单独一条 `cargo test --doc` 补上，否则静默少 4 个。
 
-改动后核对一次总数：两边 `passed` 之和必须相等（当前 1407）。
+改动后核对一次总数：两边 `passed` 之和必须相等（当前 1437）。
 
 ### 低端设备与 CI
 
@@ -177,6 +178,10 @@ agent 侧的核心装配都会打真实 HTTP：CI 上要么慢、要么结果随
 
 ## G5 diff 覆盖率
 
+CI 落地在 `test.yml` 的 `coverage` job（`if: inputs.deep` 手动触发）：
+`cargo llvm-cov` 出 lcov 并上传 artifact。当前只报告不拦——基线数字稳定后
+再改硬门槛，否则第一次开就会红。
+
 本地用 `cargo llvm-cov` 看分支覆盖，CI 只对本次 diff 覆盖的新增行设门槛。
 覆盖率的用途是**找漏测**，不是刷数字：把没有断言的 `expect` 调用算进覆盖，
 是在制造虚假安全感。
@@ -189,6 +194,19 @@ agent 侧的核心装配都会打真实 HTTP：CI 上要么慢、要么结果随
 
 解析器类模块（Provider 响应、JSON 元数据、路径解析）进 fuzz target，手动触发时跑。
 能 panic 的输入先进 `proptest` 反例，再进 fuzz 语料。
+
+落地形态：`fuzz/` 是**独立 workspace**（cargo-fuzz 要求它自己是 workspace 根，
+且依赖 nightly），不挂在主 workspace 里——否则 MSRV 与 clippy 都会被拖累。
+现有目标：`parse_rel_path` / `parse_snapshot_id` / `parse_content_hash`，断言
+「不 panic 且接受下来的值能往返」。
+
+```
+cargo +nightly fuzz run parse_rel_path -- -max_total_time=60
+```
+
+CI 在 `test.yml` 的 `fuzz` job 跑同样三个目标各 60 秒并上传语料与崩溃样本。
+`scripts/check.sh` 只校验 `fuzz/` 的格式（`cargo fmt --manifest-path fuzz/Cargo.toml`），
+不跑 fuzz 本身。
 
 # 测试基础设施：`crates/testkit`
 
@@ -309,3 +327,20 @@ Backup、File Transfer、RPC、Runtime、Storage 等涉及数据和系统资源�
 Backup、CAS、Snapshot、Hashing、Restore、File Transfer、Serialization、RPC、
 Provider Parsing 等高成本模块必须有 Benchmark，能回答 Throughput、Latency、
 Memory、CPU、Allocation。不能只声称「性能很好」。
+
+## 落地形态
+
+基准在 `apps/bench`（`publish = false`，无 bin 目标，只有 `[[bench]]`）：
+
+```
+cargo bench -p bench                     # 全部
+cargo bench -p bench -- cas_put          # 按名过滤
+```
+
+已覆盖 `cas_put`（64 KiB / 1 MiB，按字节计吞吐）、`cas_get`（恢复热路径）、
+`scan_tree`（32 / 256 文件）、`manifest_json`（100 / 1000 条快照记录）。
+样本构造放在 `apps/bench/src/lib.rs`，各 bench 文件共用——各写一份会让「同一
+份数据」的假设悄悄分叉，数字就不可比。
+
+基准不进 `scripts/check.sh`：它耗时且结果依赖机器，无法作为「过 / 不过」的
+判据。改动热路径时手动跑一次，把前后数字写进 PR 描述。

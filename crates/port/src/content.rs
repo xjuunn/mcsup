@@ -17,7 +17,6 @@
 use async_trait::async_trait;
 use domain::server::artifact::Checksum;
 use domain::server::content::{ContentCandidate, ContentKind};
-use std::path::Path;
 use url::Url;
 
 use crate::SourceError;
@@ -313,18 +312,11 @@ pub fn safe_filename(filename: &str) -> Result<String, SourceError> {
     Ok(name.to_owned())
 }
 
-/// 安装目标：服务端目录 + 内容类别 → 具体落点
-///
-/// 只算路径，不建目录。
-#[must_use]
-pub fn install_path(server_dir: &Path, kind: ContentKind, filename: &str) -> std::path::PathBuf {
-    server_dir.join(kind.install_dir()).join(filename)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use domain::server::artifact::ChecksumAlgorithm;
+    use std::path::Path;
 
     #[test]
     fn safe_filename_strips_directories() {
@@ -352,11 +344,11 @@ mod tests {
     fn install_path_joins_kind_dir() {
         let dir = Path::new("/srv/mc");
         assert_eq!(
-            install_path(dir, ContentKind::Mod, "sodium.jar"),
+            dir.join(ContentKind::Mod.install_dir()).join("sodium.jar"),
             Path::new("/srv/mc/mods/sodium.jar")
         );
         assert_eq!(
-            install_path(dir, ContentKind::Plugin, "ess.jar"),
+            dir.join(ContentKind::Plugin.install_dir()).join("ess.jar"),
             Path::new("/srv/mc/plugins/ess.jar")
         );
     }

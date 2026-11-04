@@ -43,6 +43,7 @@ pub(crate) const OFFICIAL_API: &str = "https://api.leafmc.one/v2";
 
 /// 挑选 build 的口径
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum Picks {
     /// 该版本最新 build（列表末项）
     #[default]

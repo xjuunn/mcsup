@@ -52,8 +52,6 @@ impl CasStore {
         reader: &mut dyn Read,
         mut sink: impl FnMut(&[u8]) -> std::io::Result<()>,
     ) -> Result<(ContentHash, u64), CasError> {
-        use std::fmt::Write as _;
-
         let mut hasher = Sha256::new();
         let mut buffer = vec![0u8; BUFFER_SIZE];
         let mut total: u64 = 0;
@@ -72,15 +70,9 @@ impl CasStore {
             })?;
             total = total.saturating_add(read as u64);
         }
-        let mut hex = String::with_capacity(ContentHash::HEX_LEN);
-        for byte in hasher.finalize() {
-            // 写进 String 不可能失败；忽略返回值比 unwrap 更安全
-            let _ = write!(hex, "{byte:02x}");
-        }
-        let hash = ContentHash::parse(&hex).map_err(|_| CasError::Corrupt {
-            hash: ContentHash::parse(&"0".repeat(64)).unwrap_or_else(|_| unreachable!()),
-            reason: format!("computed digest {hex} is not a valid sha256 hex"),
-        })?;
+        // 摘要器直接给 32 字节，构造哈希不必经过「解析可能失败」的路径
+        let digest = hasher.finalize();
+        let hash = ContentHash::from_digest(digest.as_ref());
         Ok((hash, total))
     }
 
@@ -190,11 +182,15 @@ impl ContentStore for CasStore {
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).map_err(|err| BackupIoError::io(parent, err))?;
         }
+        // 与 `put_reader` 同一口径：先写同目录临时文件，fsync 后再 rename。
+        // 直接写 `dest` 会在恢复中途崩溃时留下截断文件，而 `dest` 往往就是
+        // 服务端目录里的最终位置（`--to` 分支没有暂存区）。
+        let parent = dest.parent().unwrap_or(&self.root);
+        let mut staging = tempfile::Builder::new()
+            .prefix(".restore-")
+            .tempfile_in(parent)
+            .map_err(|err| BackupIoError::io(parent, err))?;
         let mut reader = std::io::BufReader::with_capacity(BUFFER_SIZE, source);
-        let mut writer = std::io::BufWriter::with_capacity(
-            BUFFER_SIZE,
-            fs::File::create(dest).map_err(|err| BackupIoError::io(dest, err))?,
-        );
         let mut size: u64 = 0;
         let mut buffer = vec![0u8; BUFFER_SIZE];
         loop {
@@ -204,12 +200,19 @@ impl ContentStore for CasStore {
             if read == 0 {
                 break;
             }
-            writer
+            staging
+                .as_file_mut()
                 .write_all(&buffer[..read])
-                .map_err(|err| BackupIoError::io(dest, err))?;
+                .map_err(|err| BackupIoError::io(staging.path(), err))?;
             size = size.saturating_add(read as u64);
         }
-        writer.flush().map_err(|err| BackupIoError::io(dest, err))?;
+        staging
+            .as_file_mut()
+            .sync_all()
+            .map_err(|err| BackupIoError::io(staging.path(), err))?;
+        staging
+            .persist(dest)
+            .map_err(|err| BackupIoError::io(dest, err.error))?;
         Ok(size)
     }
 

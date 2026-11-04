@@ -42,6 +42,6 @@ pub use fault::store::{CasOp, FailingContentStore};
 pub use fault::supervisor::{CommandLog, FakeSupervisor};
 pub use fixture::{
     MemServerRepo, ServerFixture, ServiceFixture, SingleWorkspaceRepo, assert_absent,
-    assert_present, server_meta,
+    assert_present, server_meta, temp_dir,
 };
 pub use http::{HttpServer, Response};

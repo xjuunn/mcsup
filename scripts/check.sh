@@ -68,6 +68,9 @@ run() {
 
 run 'architecture' sh scripts/check-architecture.sh
 run 'fmt' cargo fmt --all -- --check
+# fuzz 是独立 workspace（cargo-fuzz 要求），`cargo fmt --all` 覆盖不到它。
+# 不检查的话 target 里的代码会悄悄腐化，等 CI 手动触发时才炸。
+run 'fmt (fuzz)' cargo fmt --manifest-path fuzz/Cargo.toml --check
 run 'check' cargo check --workspace --all-targets --all-features
 run 'clippy' cargo clippy --workspace --all-targets --all-features -- -D warnings
 # 测试用并行脚本跑：`cargo test` 串行执行每个测试二进制，而本项目最慢的几个

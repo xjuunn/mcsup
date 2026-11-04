@@ -4,7 +4,9 @@
 //! [`Picks`]（第三方镜像与自定义版本策略）。
 //!
 //! 只有服务端 installer 的解析与下载地址，不涉及安装器执行（由 service 承担）
-//! 与启动方式（由 runtime 承担）。
+//! 与启动方式（由 runtime 承担）。安装器**产物**的磁盘布局见
+//! `domain::server::launch`：那是 `service` / `runtime` 共用的判定，
+//! `provider` 不依赖它，故不放在这里。
 //!
 //! # 内置实例与扩展点
 //!

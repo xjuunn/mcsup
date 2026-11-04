@@ -82,3 +82,44 @@ proptest! {
         prop_assert_eq!(first.as_str().len(), domain::backup::ContentHash::HEX_LEN);
     }
 }
+
+#[cfg(test)]
+mod strategy_self_check {
+    use super::*;
+
+    /// 属性用的字节策略确实会产出跨缓冲区的大样本
+    ///
+    /// 只查大端：`0..4096` 的均匀采样几乎不会产出空内容，用「采到过空」当
+    /// 判据会变成偶发失败。空内容由下面那条单独的用例直接钉住。
+    ///
+    /// 没有这条自检，策略若被改小，上面的属性就会在小数据上空转通过——
+    /// 哈希与去重恰恰在跨缓冲区边界时才容易出错。
+    #[test]
+    fn byte_strategy_reaches_across_buffer_boundaries() {
+        let mut runner = proptest::test_runner::TestRunner::deterministic();
+        // 闭包是 `Fn`，用 `Cell` 累计命中情况
+        let saw_large = std::cell::Cell::new(false);
+        runner
+            .run(&proptest::collection::vec(any::<u8>(), 0..4096), |bytes| {
+                saw_large.set(saw_large.get() || bytes.len() > 2048);
+                Ok(())
+            })
+            .expect("策略必须有效");
+        assert!(saw_large.get(), "策略没有覆盖跨缓冲区的较大输入");
+    }
+
+    /// 空内容是独立边界：采样覆盖不到，必须直接测
+    ///
+    /// 空文件是真实存在的（新工作区的空 `data/`、被截断的配置），且是哈希与
+    /// 去重最容易出错的一端——它没有分块、大小字段为 0。
+    #[test]
+    fn empty_content_round_trips() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cas = CasStore::new(dir.path());
+        let (hash, size) = put(&cas, b"");
+        assert_eq!(size, 0, "空内容大小必须是 0");
+        let dest = dir.path().join("empty.out");
+        cas.get(&hash, &dest).expect("get");
+        assert_eq!(std::fs::read(&dest).expect("read"), Vec::<u8>::new());
+    }
+}

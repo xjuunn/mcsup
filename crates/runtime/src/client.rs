@@ -27,6 +27,15 @@ pub(crate) fn rpc(
             let mut stream =
                 interprocess::local_socket::Stream::connect(endpoint::endpoint_name(&dir)?)
                     .map_err(|err| SupervisorError::Unreachable(err.to_string()))?;
+            // 套接字读写也必须自带超时：外层 `recv_timeout` 到期只是让调用方
+            // 返回，这个线程仍在阻塞读上，会连同 socket 一起泄漏。supervisor
+            // 卡住时（长 GC、`save-all flush`）每次调用都漏一个线程。
+            stream
+                .set_recv_timeout(Some(timeout))
+                .map_err(|err| transport(&err))?;
+            stream
+                .set_send_timeout(Some(timeout))
+                .map_err(|err| transport(&err))?;
             protocol::write_frame(&mut stream, &request).map_err(|err| transport(&err))?;
             let response: Response = protocol::read_frame(&mut BufReader::new(stream))
                 .map_err(|err| frame_error(&err))?;

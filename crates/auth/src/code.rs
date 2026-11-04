@@ -35,6 +35,7 @@ pub const ATTEMPT_COOLDOWN_SECS: u64 = 60;
 
 /// 配对码操作失败
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum PairingCodeError {
     /// 没有可用配对码（未生成 / 已用掉 / 已过期 / 已锁死）
     #[error("no usable pairing code")]
@@ -278,6 +279,7 @@ impl PairingSlot {
 
 /// [`PairingSlot::attempt`] 的判定结果
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Redeem {
     /// 码正确，应当销毁这条状态
     Matched,

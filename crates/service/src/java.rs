@@ -152,7 +152,7 @@ impl JavaService {
                 skipped: 0,
             });
         }
-        let now = crate::util::unix_now();
+        let now = crate::atomic::unix_now();
         let mut registered = 0usize;
         let mut skipped = 0usize;
         // 去重是扫描器的契约（见 port::JavaScanner）：service 不再维护 seen，
@@ -373,7 +373,7 @@ impl JavaService {
             return Err(JavaError::Download(port::DownloadError::Cancelled));
         }
 
-        let now = crate::util::unix_now();
+        let now = crate::atomic::unix_now();
         let runtime = JavaRuntime {
             id: dir_name,
             path: home,

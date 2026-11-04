@@ -118,6 +118,17 @@ pub enum LifecycleError {
     /// 文件读写失败
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// 远端镜像条目没有增量日志流（对端只支持一次性 tail）
+    #[error("server {0} is remote: log streaming is not supported")]
+    RemoteLogStream(String),
+    /// `status_many` 返回的条数与入参不符（实现违约，会导致状态错位）
+    #[error("status_many returned {got} result(s) for {expected} server(s)")]
+    StatusCountMismatch {
+        /// 入参条数
+        expected: usize,
+        /// 实际返回条数
+        got: usize,
+    },
 }
 
 /// 因服务器正在运行而被拒绝的操作
@@ -160,7 +171,8 @@ impl LifecycleError {
             | Self::Java(_)
             | Self::Supervisor(_)
             | Self::InstallJar(_)
-            | Self::Io(_) => return None,
+            | Self::Io(_)
+            | Self::StatusCountMismatch { .. } => return None,
             Self::NoJar { name } => LifecycleErrorKind::NoJar { name },
             Self::EulaRequired => LifecycleErrorKind::EulaRequired,
             Self::NoJava => LifecycleErrorKind::NoJava,
@@ -172,6 +184,7 @@ impl LifecycleError {
             Self::NotRunning => LifecycleErrorKind::NotRunning,
             Self::Busy { name, op } => LifecycleErrorKind::Busy { name, op: *op },
             Self::StopTimedOut { waited } => LifecycleErrorKind::StopTimedOut { waited: *waited },
+            Self::RemoteLogStream(name) => LifecycleErrorKind::RemoteLogStream { name },
         };
         Some(kind)
     }
@@ -200,6 +213,8 @@ pub enum LifecycleErrorKind<'a> {
     Busy { name: &'a str, op: BusyOp },
     /// 停机超时
     StopTimedOut { waited: Duration },
+    /// 远端条目无增量日志
+    RemoteLogStream { name: &'a str },
 }
 
 /// 服务器生命周期编排
@@ -546,7 +561,8 @@ impl ServerLifecycleService {
     ///
     /// # Errors
     ///
-    /// 仅注册表失败时返回错误；supervisor 单台失败在值里
+    /// 注册表失败、或 `status_many` 条数与入参不符时返回错误；
+    /// supervisor 单台失败在值里
     pub fn statuses(
         &self,
     ) -> Result<HashMap<String, Result<Option<SupervisorStatus>, SupervisorError>>, LifecycleError>
@@ -554,7 +570,14 @@ impl ServerLifecycleService {
         let servers = self.registry.list()?;
         let refs: Vec<_> = servers.iter().map(|srv| srv.server_ref()).collect();
         let results = self.backend.supervisor().status_many(&refs);
-        debug_assert_eq!(results.len(), servers.len(), "status_many 必须保持入参顺序");
+        // 长度不符说明实现违反了 `status_many` 的契约。release 下 `zip` 会
+        // 静默截断，让尾部服务器的状态凭空消失且不留日志——宁可报错。
+        if results.len() != servers.len() {
+            return Err(LifecycleError::StatusCountMismatch {
+                expected: servers.len(),
+                got: results.len(),
+            });
+        }
         let mut out = HashMap::with_capacity(servers.len());
         for (srv, result) in servers.iter().zip(results) {
             out.insert(srv.meta.name.as_str().to_owned(), result);
@@ -572,7 +595,8 @@ impl ServerLifecycleService {
     ///
     /// # Errors
     ///
-    /// 仅注册表失败时返回错误；supervisor 单台失败在值里
+    /// 注册表失败、或 `status_many` 条数与入参不符时返回错误；
+    /// supervisor 单台失败在值里
     pub fn statuses_for(
         &self,
         names: &std::collections::HashSet<String>,
@@ -589,7 +613,14 @@ impl ServerLifecycleService {
         }
         let refs: Vec<_> = servers.iter().map(|srv| srv.server_ref()).collect();
         let results = self.backend.supervisor().status_many(&refs);
-        debug_assert_eq!(results.len(), servers.len(), "status_many 必须保持入参顺序");
+        // 长度不符说明实现违反了 `status_many` 的契约。release 下 `zip` 会
+        // 静默截断，让尾部服务器的状态凭空消失且不留日志——宁可报错。
+        if results.len() != servers.len() {
+            return Err(LifecycleError::StatusCountMismatch {
+                expected: servers.len(),
+                got: results.len(),
+            });
+        }
         let mut out = HashMap::with_capacity(servers.len());
         for (srv, result) in servers.iter().zip(results) {
             out.insert(srv.meta.name.as_str().to_owned(), result);
@@ -643,11 +674,18 @@ impl ServerLifecycleService {
 
     /// 打开 `console.log` 的增量读取器（定位到当前末尾）
     ///
+    /// 远端条目没有增量日志能力（对端只提供 `LogsTail` 一次性读取），这里
+    /// **明确拒绝**而不是照本地路径打开：远端条目的 `dir` 是空的，按它拼路径
+    /// 会得到一个相对 CWD 的 `console.log`，静默读错文件比报错更糟。
+    ///
     /// # Errors
     ///
-    /// 注册表失败
+    /// 注册表失败、条目是远端镜像，或日志打开失败
     pub fn log_watch(&self, name: &str) -> Result<LogWatch, LifecycleError> {
         let server = self.registry.get(name)?;
+        if server.is_remote() {
+            return Err(LifecycleError::RemoteLogStream(name.to_owned()));
+        }
         Ok(LogWatch::open(console_log_path(&server.dir)))
     }
 
@@ -658,13 +696,16 @@ impl ServerLifecycleService {
     ///
     /// # Errors
     ///
-    /// 注册表失败或日志读取失败
+    /// 注册表失败、条目是远端镜像，或日志读取失败
     pub fn log_watch_tail(
         &self,
         name: &str,
         lines: usize,
     ) -> Result<(Vec<String>, LogWatch), LifecycleError> {
         let server = self.registry.get(name)?;
+        if server.is_remote() {
+            return Err(LifecycleError::RemoteLogStream(name.to_owned()));
+        }
         let (watch, history) = LogWatch::open_tail(console_log_path(&server.dir), lines)?;
         Ok((history, watch))
     }
@@ -883,6 +924,10 @@ impl LogWatch {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unreachable,
+        reason = "测试替身用 unreachable! 标记不该被调用的分支"
+    )]
     use super::*;
     use domain::java::{JavaMajor, JavaRuntime, JavaVendor, java_bin_under};
     use domain::server::artifact::{Checksum, ChecksumAlgorithm};
@@ -1242,6 +1287,7 @@ mod tests {
         fn supervisor(&self) -> &dyn SupervisorPort {
             self.supervisor.as_ref()
         }
+
         fn installer(&self) -> &dyn InstallerRunner {
             &NoopInstaller
         }

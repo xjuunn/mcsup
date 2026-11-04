@@ -211,7 +211,12 @@ impl SnapshotIndex {
         let marker = dir.join(PARTIAL_FILE);
         let mut file = fs::File::create(&marker).map_err(|err| storage(&marker, err))?;
         file.write_all(now_marker().as_bytes())
-            .map_err(|err| storage(&marker, err))
+            .map_err(|err| storage(&marker, err))?;
+        // 标记必须真的落盘：否则掉电后目录里既没有记录也没有标记，
+        // 一份「正在写」的快照会被当成完整快照
+        file.sync_all().map_err(|err| storage(&marker, err))?;
+        sync_dir(&dir);
+        Ok(())
     }
 
     /// 标记完成：写记录后删除 `.partial`
@@ -224,9 +229,15 @@ impl SnapshotIndex {
     /// 记录写入或标记删除失败时返回 [`SnapshotStoreError::Storage`]
     pub fn complete(&self, snapshot: &Snapshot) -> Result<(), SnapshotStoreError> {
         self.save(snapshot)?;
-        let marker = self.dir_of(&snapshot.id).join(PARTIAL_FILE);
+        let dir = self.dir_of(&snapshot.id);
+        let marker = dir.join(PARTIAL_FILE);
         match fs::remove_file(&marker) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // 删除也必须落盘：否则掉电后标记「回来」，完整快照会被
+                // `load` 改判为 failed 而不可恢复
+                sync_dir(&dir);
+                Ok(())
+            }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(storage(&marker, err)),
         }
@@ -400,8 +411,22 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), SnapshotStoreError>
         .sync_all()
         .map_err(|err| storage(path, err))?;
     file.persist(path).map_err(|err| storage(path, err.error))?;
+    // rename 本身原子，但目录项要单独落盘，否则掉电后可能「记录不见了」
+    sync_dir(dir);
     Ok(())
 }
+
+/// 让目录项落盘（Unix）；Windows 由 NTFS 日志保证
+#[cfg(unix)]
+fn sync_dir(dir: &Path) {
+    if let Ok(handle) = fs::File::open(dir) {
+        let _ = handle.sync_all();
+    }
+}
+
+/// Windows 无法对目录 fsync
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) {}
 
 #[cfg(test)]
 mod tests {

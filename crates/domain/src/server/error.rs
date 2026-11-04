@@ -52,6 +52,7 @@ pub struct InvalidPropertyValue {
 
 /// `server.properties` 写入失败：键或值不满足写入规则
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum PropertySetError {
     /// 键非法
     #[error(transparent)]

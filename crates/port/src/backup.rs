@@ -1,3 +1,4 @@
+use crate::CancellationToken;
 use domain::backup::{BackupScope, ContentHash, RelPath, RetentionPolicy, Snapshot, SnapshotId};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -291,6 +292,9 @@ pub enum ScanError {
     /// CAS 写入失败
     #[error(transparent)]
     Cas(#[from] CasError),
+    /// 用户取消，扫描已中止（已写入的 CAS 对象保留，无半成品快照）
+    #[error("backup scan was cancelled")]
+    Cancelled,
 }
 
 /// 目录扫描器：把服务器目录转成「相对路径 → 内容哈希」并写入 CAS
@@ -305,15 +309,20 @@ pub trait Scanner: Send + Sync {
     ///
     /// `on_file` 在每个文件处理完时回调（已处理文件数），供入口画进度。
     ///
+    /// `cancel` 必须在每个文件之间检查：几个 G 的存档扫描要几分钟，不做
+    /// 协作取消的话 Ctrl-C 只能杀掉入口，扫描线程继续读盘直到结束。
+    ///
     /// # Errors
     ///
-    /// 目录不可读、路径非法或 CAS 写入失败时返回 [`ScanError`]
+    /// 目录不可读、路径非法或 CAS 写入失败时返回 [`ScanError`]；
+    /// `cancel` 已请求时返回 [`ScanError::Cancelled`]
     fn scan(
         &self,
         root: &Path,
         store: &dyn ContentStore,
         rules: &ScanRules,
         on_file: &mut dyn FnMut(usize),
+        cancel: &CancellationToken,
     ) -> Result<ScanOutcome, ScanError>;
 }
 

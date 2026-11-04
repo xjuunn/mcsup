@@ -61,14 +61,25 @@ fn make_spinner(enable: bool, message: String) -> ProgressBar {
 /// 避免用户以为卡死。
 pub(crate) struct TaskSpinner {
     bar: ProgressBar,
+    /// Ctrl-C 取消令牌：长任务把它传给 service，取消才有实际效果
+    cancel: CancellationToken,
 }
 
 impl TaskSpinner {
     /// `enable` 为 false（JSON 模式）时隐藏，stdout 保持纯数据
+    ///
+    /// 同时装上 Ctrl-C 处理器：长任务（备份扫描、恢复）要能协作取消，
+    /// 否则 Ctrl-C 只杀入口，后台线程继续读盘直到结束。
     pub(crate) fn new(message: impl Into<String>, enable: bool) -> Self {
-        Self {
-            bar: make_spinner(enable, message.into()),
-        }
+        let bar = make_spinner(enable, message.into());
+        let cancel = CancellationToken::new();
+        install_ctrl_c_handler(cancel.clone(), bar.clone());
+        Self { bar, cancel }
+    }
+
+    /// Ctrl-C 取消令牌：传给 service 的长任务
+    pub(crate) fn cancel(&self) -> &CancellationToken {
+        &self.cancel
     }
 
     /// 换当前步骤文案

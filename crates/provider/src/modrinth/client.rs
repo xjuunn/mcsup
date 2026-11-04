@@ -58,6 +58,7 @@ pub(crate) const OFFICIAL_API: &str = "https://api.modrinth.com/v2";
 /// 覆盖本项目要下载的全部资源类型。上游未来可能新增类型，[`Self::Other`]
 /// 承载未知值，不拒绝解析——判定逻辑按需 `match`，未知值落到兜底分支。
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ProjectType {
     /// 模组
     Mod,
@@ -115,6 +116,7 @@ impl fmt::Display for ProjectType {
 ///
 /// 上游可能新增渠道，[`Self::Other`] 承载未知值。
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum VersionChannel {
     /// 正式版
     Release,
@@ -207,6 +209,7 @@ impl SearchQuery {
 
 /// 搜索排序口径
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum SearchIndex {
     /// 相关度（默认）
     #[default]
@@ -285,6 +288,7 @@ impl VersionFilter {
 
 /// 按哈希反查版本时使用的哈希算法
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HashAlgorithm {
     /// SHA-1（上游默认）
     Sha1,

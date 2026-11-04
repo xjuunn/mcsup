@@ -53,6 +53,7 @@ pub(crate) const OFFICIAL_FILES: &str = "https://files.minecraftforge.net";
 /// [`Fixed`](Self::Fixed) 目前只能通过 [`ForgeSource::builder`] 注入，
 /// 没有配置项驱动。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum Picks {
     /// 官方推荐 build（`recommended` 优先，其次 `latest`），都没有时取该 MC
     /// 下最新 build

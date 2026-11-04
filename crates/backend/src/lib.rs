@@ -103,6 +103,7 @@ mod tests {
                 cas.as_ref(),
                 &port::ScanRules::default(),
                 &mut |_| {},
+                &port::CancellationToken::new(),
             )
             .expect("scan");
         assert!(outcome.entries.is_empty());

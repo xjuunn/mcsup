@@ -29,7 +29,8 @@ fn add_server(store: &JsonStore, workspace_id: &WorkspaceId) {
         id: ServerId::parse("550e8400-e29b-41d4-a716-4466554400b1").expect("uuid"),
         name: ServerName::parse("test").expect("valid"),
         workspace_id: WorkspaceId::parse(workspace_id.as_str()).expect("uuid"),
-        rel_dir: PathBuf::from("servers/test"),
+        // rel_dir 是 `servers/` 之下的一层目录名，不是相对工作区的路径
+        rel_dir: PathBuf::from("test"),
         version: VersionId::new("1.21.1"),
         variant: ServerVariant::Vanilla,
         jar: None,

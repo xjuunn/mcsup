@@ -201,17 +201,9 @@ fn service(source: FakeSource, downloader: FakeDownloader) -> ContentService {
     )
 }
 
-fn temp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "mcsup-content-{name}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("tempdir");
-    dir
+/// 本文件的临时目录统一带 `content` 前缀（实现见 `testkit::temp_dir`）
+fn scratch(name: &str) -> PathBuf {
+    testkit::temp_dir(&format!("content-{name}"))
 }
 
 /// 挑版本：加载器与游戏版本都匹配的正式版胜出
@@ -226,7 +218,7 @@ async fn picks_release_matching_loader_and_game() {
         .with_resolved(resolved("fabric", "mod.jar", 4));
     let downloader = FakeDownloader::ok(4);
     let service = service(source, downloader);
-    let dir = temp_dir("pick");
+    let dir = scratch("pick");
 
     let install = service
         .install(
@@ -253,7 +245,7 @@ async fn explicit_version_skips_ranking() {
     let seen = source.seen_requests.clone();
     let downloader = FakeDownloader::ok(4);
     let service = service(source, downloader);
-    let dir = temp_dir("explicit");
+    let dir = scratch("explicit");
 
     let install = service
         .install(
@@ -276,7 +268,7 @@ async fn download_request_is_sanitized() {
     let downloader = FakeDownloader::ok(4);
     let seen = downloader.requests.clone();
     let service = service(source, downloader);
-    let dir = temp_dir("sanitize");
+    let dir = scratch("sanitize");
 
     let install = service
         .install(
@@ -304,7 +296,7 @@ async fn reuses_existing_same_size_file() {
     let downloader = FakeDownloader::ok(4);
     let seen = downloader.requests.clone();
     let service = service(source, downloader);
-    let dir = temp_dir("reuse");
+    let dir = scratch("reuse");
     let mods = dir.join("mods");
     std::fs::create_dir_all(&mods).expect("mkdir");
     std::fs::write(mods.join("mod.jar"), b"xxxx").expect("seed");
@@ -330,7 +322,7 @@ async fn replaces_existing_when_size_differs() {
     let downloader = FakeDownloader::ok(6);
     let seen = downloader.requests.clone();
     let service = service(source, downloader);
-    let dir = temp_dir("replace");
+    let dir = scratch("replace");
     let mods = dir.join("mods");
     std::fs::create_dir_all(&mods).expect("mkdir");
     std::fs::write(mods.join("mod.jar"), b"old").expect("seed");
@@ -355,7 +347,7 @@ async fn rejects_client_only_kind() {
     let source = FakeSource::new("fake");
     let seen = source.seen_requests.clone();
     let service = service(source, FakeDownloader::ok(1));
-    let dir = temp_dir("shader");
+    let dir = scratch("shader");
 
     let err = service
         .install(
@@ -376,7 +368,7 @@ async fn rejects_client_only_kind() {
 async fn no_candidate_reports_filters() {
     let source = FakeSource::new("fake");
     let service = service(source, FakeDownloader::ok(1));
-    let dir = temp_dir("nocand");
+    let dir = scratch("nocand");
 
     let err = service
         .install(
@@ -428,7 +420,7 @@ async fn unknown_and_missing_source() {
 async fn download_failure_propagates() {
     let source = FakeSource::new("fake").with_resolved(resolved("V", "mod.jar", 4));
     let service = service(source, FakeDownloader::failing());
-    let dir = temp_dir("fail");
+    let dir = scratch("fail");
 
     let err = service
         .install(
@@ -448,7 +440,7 @@ async fn download_failure_propagates() {
 async fn resolve_failure_propagates() {
     let source = FakeSource::new("fake").with_resolved(resolved("V", "mod.jar", 4));
     let service = service(source, FakeDownloader::ok(4));
-    let dir = temp_dir("resolve");
+    let dir = scratch("resolve");
 
     let err = service
         .install(
@@ -470,7 +462,7 @@ async fn modpack_lands_in_dedicated_dir() {
         .with_candidates(vec![candidate("V", "release", &[], &[])])
         .with_resolved(resolved("V", "pack.mrpack", 4));
     let service = service(source, FakeDownloader::ok(4));
-    let dir = temp_dir("modpack");
+    let dir = scratch("modpack");
 
     let install = service
         .install_modpack("P", InstallOptions::new(&dir), &CancellationToken::new())
@@ -514,7 +506,7 @@ async fn progress_sink_is_accepted() {
     let source = FakeSource::new("fake").with_resolved(resolved("V", "mod.jar", 4));
     let progress = Counting(AtomicUsize::new(0));
     let service = service(source, FakeDownloader::ok(4));
-    let dir = temp_dir("progress");
+    let dir = scratch("progress");
     let _ = service
         .install(
             "P",

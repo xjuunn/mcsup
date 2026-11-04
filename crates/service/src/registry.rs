@@ -25,8 +25,6 @@ const SERVER_JAR: &str = "server.jar";
 const STAGING_JAR: &str = ".server.jar.installing";
 /// 安装器暂存文件名：安装器下载到这里，运行完即删除（不留在服务器目录）
 const STAGING_INSTALLER: &str = ".forge-installer.jar";
-/// Forge 安装器产出的首个启动参数文件（[`LaunchSpec::Args`] 的第一项）
-const FORGE_USER_ARGS: &str = "user_jvm_args.txt";
 
 /// 服务器注册操作失败
 #[derive(Debug, Error)]
@@ -231,9 +229,8 @@ impl RegisteredServer {
 
     /// 远端实现用的身份引用（只带 id，不带目录）
     ///
-    /// # Panics
-    ///
-    /// 本地条目调用（目录非空）：远端引用只对镜像条目有意义
+    /// 对本地条目调用也安全，只是结果不含目录：本方法**不**校验条目来源，
+    /// 需要区分时先看 [`Self::is_remote`]。
     #[must_use]
     pub fn remote_ref(&self) -> port::ServerRef<'_> {
         port::ServerRef::remote(&self.meta.id)
@@ -321,7 +318,7 @@ impl ServerRegistry {
         variant: ServerVariant,
         java_major: Option<domain::java::JavaMajor>,
     ) -> Result<RegisteredServer, ServerRegistryError> {
-        let now = crate::util::unix_now();
+        let now = crate::atomic::unix_now();
         let name = ServerName::parse(name)?;
         let ws = self.resolve_workspace(workspace_selector)?;
 
@@ -424,7 +421,7 @@ impl ServerRegistry {
         name: Option<&str>,
         workspace_selector: Option<&str>,
     ) -> Result<LinkedServer, ServerRegistryError> {
-        let now = crate::util::unix_now();
+        let now = crate::atomic::unix_now();
         let target =
             std::fs::canonicalize(target).map_err(|err| ServerRegistryError::io(target, err))?;
         if !target.is_dir() {
@@ -763,7 +760,7 @@ impl ServerRegistry {
             ServerName::parse(name).map_err(|_| ServerRegistryError::NotFound(name.to_owned()))?;
         let meta = self
             .servers
-            .update_settings(&name, settings, crate::util::unix_now())?;
+            .update_settings(&name, settings, crate::atomic::unix_now())?;
         let dir = self.absolute_dir(&meta)?;
         let linked = is_linked(&dir);
         Ok(RegisteredServer { meta, dir, linked })
@@ -869,7 +866,7 @@ impl ServerRegistry {
             &jar,
             Some(&launch),
             out.java_major,
-            crate::util::unix_now(),
+            crate::atomic::unix_now(),
         )?;
         Ok(InstalledServerJar {
             server: srv,
@@ -941,7 +938,7 @@ impl ServerRegistry {
             &jar,
             Some(&launch),
             out.java_major,
-            crate::util::unix_now(),
+            crate::atomic::unix_now(),
         )?;
         Ok(Some(InstalledServerJar {
             destination: dir.join(&files[0]),
@@ -954,88 +951,10 @@ impl ServerRegistry {
 
 /// 安装器产出的启动参数文件（相对服务器目录，按展开顺序）
 ///
-/// `Forge` 与 `NeoForge` 的安装器都会写出 `user_jvm_args.txt` 与平台专属的
-/// `win_args.txt` / `unix_args.txt`，但 Maven 坐标不同：
-///
-/// - `Forge`：`libraries/net/minecraftforge/forge/{build}`
-/// - `NeoForge`：`libraries/net/neoforged/neoforge/{build}`
-///
-/// 只返回磁盘上**确实存在**的那些，缺第一个（用户参数文件）视为安装失败。
-/// 平台参数文件路径由变体对应的坐标推出；不存在时再扫一遍 `libraries` 兜底，
-/// 容忍上游路径变化。
-///
-/// 兜底**只认所在目录名等于本 build 的**：一个目录里可能同时存在多个版本的
-/// `win_args.txt`（升级后旧版本目录不会自动清理），随便取第一个会拉起到旧版本。
+/// 布局判定在 `domain::server::launch`：那是「该变体怎么启动」，`runtime` 也要
+/// 用同一份。`service` 只做委托，不内置一份「Forge 目录长什么样」的副本。
 fn loader_args_files(variant: &ServerVariant, build: &str, dir: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    if !dir.join(FORGE_USER_ARGS).is_file() {
-        return files;
-    }
-    files.push(PathBuf::from(FORGE_USER_ARGS));
-
-    let platform = if cfg!(windows) {
-        "win_args.txt"
-    } else {
-        "unix_args.txt"
-    };
-    if let Some(base) = loader_maven_base(variant) {
-        let relative = format!("{base}/{build}/{platform}");
-        if dir.join(&relative).is_file() {
-            files.push(PathBuf::from(relative));
-            return files;
-        }
-    }
-    // 兜底：上游若改了坐标或版本目录命名，仍要求所在目录就是本 build
-    if let Some(rel) = find_args_file(&dir.join("libraries"), platform, build) {
-        files.push(rel);
-    }
-    files
-}
-
-/// 安装器类变体的 Maven 坐标前缀（相对服务器目录，不含 build 段）
-///
-/// 只有走 `@参数文件` 启动的变体才有值；其余（含未来新增的）返回 `None`，
-/// 由 [`loader_args_files`] 的兜底扫描决定能否找到。
-fn loader_maven_base(variant: &ServerVariant) -> Option<&'static str> {
-    match variant {
-        ServerVariant::Forge => Some("libraries/net/minecraftforge/forge"),
-        ServerVariant::NeoForge => Some("libraries/net/neoforged/neoforge"),
-        _ => None,
-    }
-}
-
-/// 在 `root` 下递归找本 build 的平台参数文件，返回相对服务器目录的路径。
-///
-/// 命中条件是「文件名匹配 **且** 所在目录名等于 `build`」——宁可找不到（由上层
-/// 报 Layout 错误）也不要拉起到另一个版本。深度受限，避免扫遍整个 libraries。
-fn find_args_file(root: &Path, name: &str, build: &str) -> Option<PathBuf> {
-    fn walk(dir: &Path, name: &str, build: &str, depth: usize) -> Option<PathBuf> {
-        if depth == 0 {
-            return None;
-        }
-        let entries = std::fs::read_dir(dir).ok()?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if let Some(found) = walk(&path, name, build, depth - 1) {
-                    return Some(found);
-                }
-            } else if path.file_name().and_then(|n| n.to_str()) == Some(name)
-                && path
-                    .parent()
-                    .and_then(|p| p.file_name())
-                    .and_then(|n| n.to_str())
-                    == Some(build)
-            {
-                return Some(path);
-            }
-        }
-        None
-    }
-    let found = walk(root, name, build, 8)?;
-    // 转成相对服务器目录：root 是 `{dir}/libraries`，取其父
-    let server_dir = root.parent()?;
-    found.strip_prefix(server_dir).ok().map(PathBuf::from)
+    domain::server::launch::installer_args_files(variant, build, dir)
 }
 
 impl ServerRegistry {
@@ -1106,11 +1025,10 @@ impl ServerRegistry {
     ) -> Result<(), ServerRegistryError> {
         for ws in self.workspaces.list()? {
             let servers_dir = ws.path.join("servers");
-            if let Ok(servers_dir) = std::fs::canonicalize(&servers_dir) {
-                if target.starts_with(&servers_dir) {
-                    return Err(ServerRegistryError::TargetInsideWorkspace(servers_dir));
-                }
-            } else if target.starts_with(&servers_dir) {
+            // 与 `workspace remove --purge` 同一份包含判定：各写一份就会出现
+            // 一处解析符号链接、另一处不解析，`/var` 与 `/private/var` 被当成
+            // 两个目录，防环检查形同虚设
+            if crate::workspace::is_within(target, &servers_dir) {
                 return Err(ServerRegistryError::TargetInsideWorkspace(servers_dir));
             }
         }
@@ -1246,7 +1164,7 @@ fn write_server_marker(dir: &Path, marker: &ServerMarkerJson) -> Result<(), Serv
     let text = serde_json::to_string_pretty(marker)
         .map_err(|err| ServerRegistryError::marker(path.clone(), err.to_string()))?;
     // 原子替换：marker 被截断等于服务器身份丢失，`server link` 再也接不回来
-    crate::util::write_atomic(&path, &text)?;
+    crate::atomic::write_atomic(&path, &text)?;
     Ok(())
 }
 
@@ -1420,6 +1338,10 @@ fn remove_link_or_dir(path: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unreachable,
+        reason = "测试替身用 unreachable! 标记不该被调用的分支"
+    )]
     use super::*;
     use domain::workspace::{Workspace, WorkspaceId, WorkspaceName};
     use port::{ProgressSink, ServerRepository, WorkspaceRepository};
@@ -2384,7 +2306,7 @@ mod tests {
     fn forge_args_files_resolve_under_full_build_dir() {
         let tmp = tempfile::tempdir().expect("tmp");
         let dir = tmp.path();
-        std::fs::write(dir.join(FORGE_USER_ARGS), b"#").expect("user args");
+        std::fs::write(dir.join(domain::server::launch::USER_ARGS), b"#").expect("user args");
         let build_dir = dir.join("libraries/net/minecraftforge/forge/26.3-66.1.0");
         std::fs::create_dir_all(&build_dir).expect("build dir");
         let platform = if cfg!(windows) {
@@ -2398,7 +2320,7 @@ mod tests {
         assert_eq!(
             files,
             vec![
-                PathBuf::from(FORGE_USER_ARGS),
+                PathBuf::from(domain::server::launch::USER_ARGS),
                 PathBuf::from(format!(
                     "libraries/net/minecraftforge/forge/26.3-66.1.0/{platform}"
                 )),
@@ -2408,7 +2330,10 @@ mod tests {
 
         // 只给 MC 版本（旧口径）时找不到平台参数文件——正是当初的 bug 形态
         let stale = loader_args_files(&ServerVariant::Forge, "26.3", dir);
-        assert_eq!(stale, vec![PathBuf::from(FORGE_USER_ARGS)]);
+        assert_eq!(
+            stale,
+            vec![PathBuf::from(domain::server::launch::USER_ARGS)]
+        );
     }
 
     /// `NeoForge` 的参数文件在自己的 Maven 坐标下，不能套用 `Forge` 的路径
@@ -2419,7 +2344,7 @@ mod tests {
     fn neoforge_args_files_use_own_maven_coordinates() {
         let tmp = tempfile::tempdir().expect("tmp");
         let dir = tmp.path();
-        std::fs::write(dir.join(FORGE_USER_ARGS), b"#").expect("user args");
+        std::fs::write(dir.join(domain::server::launch::USER_ARGS), b"#").expect("user args");
         let build_dir = dir.join("libraries/net/neoforged/neoforge/26.3.0.99");
         std::fs::create_dir_all(&build_dir).expect("build dir");
         let platform = if cfg!(windows) {
@@ -2433,7 +2358,7 @@ mod tests {
         assert_eq!(
             files,
             vec![
-                PathBuf::from(FORGE_USER_ARGS),
+                PathBuf::from(domain::server::launch::USER_ARGS),
                 PathBuf::from(format!(
                     "libraries/net/neoforged/neoforge/26.3.0.99/{platform}"
                 )),

@@ -374,8 +374,23 @@ fn credential_store() -> mcsup::auth::CredentialVault {
 }
 
 /// [`credential_store`] 的公开口径：远端跟随日志等命令要按名读回 token
+///
+/// 环境变量的读取留在入口层：库不读环境，后端取值必须由 app 决定后传入。
 pub(crate) fn open_credential_store() -> mcsup::auth::CredentialVault {
-    mcsup::auth::CredentialVault::open(config::platform_data_dir().join("credentials.toml"))
+    credential_vault_at(config::platform_data_dir().join("credentials.toml"))
+}
+
+/// 按 `MCSUP_CREDENTIAL_STORE` 选择凭证后端
+///
+/// 取值 `auto`（缺省）/ `file` / `keyring`；无法识别按 `auto` 处理，
+/// 与库侧 `open_with` 的口径一致。
+pub(crate) fn credential_vault_at(path: PathBuf) -> mcsup::auth::CredentialVault {
+    mcsup::auth::CredentialVault::open_with(
+        path,
+        std::env::var(mcsup::auth::CREDENTIAL_STORE_ENV)
+            .ok()
+            .as_deref(),
+    )
 }
 
 /// `open_mcsup` 的带远端版本：有已配对远端时注入组合仓库
@@ -442,42 +457,23 @@ pub(crate) fn open_mcsup_with_remotes() -> Result<Mcsup> {
 }
 
 /// 装配 `ServerRegistry`（组合仓库版：本地 + 已配对远端）
+///
+/// 同样只经组合根，理由见 [`workspace_service_with_remotes`]。
 pub(crate) fn open_registry_with_remotes() -> Result<Arc<mcsup::service::ServerRegistry>> {
-    let store = open_store()?;
-    let cfg = ConfigFile::locate(None).load()?;
-    let members = remote_members(&cfg);
-    let servers: Arc<dyn mcsup::port::ServerRepository> = if members.is_empty() {
-        store.clone()
-    } else {
-        Arc::new(CombinedServerRepository::new(
-            store.clone(),
-            members.clone(),
-        ))
-    };
-    let workspaces: Arc<dyn mcsup::port::WorkspaceRepository> = if members.is_empty() {
-        store.clone()
-    } else {
-        Arc::new(CombinedWorkspaceRepository::new(store.clone(), members))
-    };
-    Ok(Arc::new(mcsup::service::ServerRegistry::new(
-        servers, workspaces,
-    )))
+    Ok(open_mcsup_with_remotes()?.registry)
 }
 
 /// 装配组合仓库版 `WorkspaceService`（本地 + 已配对远端）
 ///
 /// `workspace ls` / `server ls` 展示名字、`workspace use` 解析限定名都用它；
 /// 写入仍委托本地（`current` 是本机状态）。
+///
+/// 装配**只经**组合根：这里先构建一个完整 [`Mcsup`] 再交出其中的
+/// `Workspaces`，等价于「宿主注入三个仓库后的组合根」。禁止在这里另拼
+/// `WorkspaceService::new(仓库, store)`——那会成为第二套装配口径，默认实现
+/// 一改就与 `Mcsup::open` 分叉。
 pub(crate) fn workspace_service_with_remotes() -> Result<mcsup::service::WorkspaceService> {
-    let store = open_store()?;
-    let cfg = ConfigFile::locate(None).load()?;
-    let members = remote_members(&cfg);
-    let workspaces: Arc<dyn mcsup::port::WorkspaceRepository> = if members.is_empty() {
-        store.clone()
-    } else {
-        Arc::new(CombinedWorkspaceRepository::new(store.clone(), members))
-    };
-    Ok(mcsup::service::WorkspaceService::new(workspaces, store))
+    Ok(open_mcsup_with_remotes()?.workspaces)
 }
 
 /// 库侧默认组合根（`mcsup::bootstrap`）：CLI 全部命令的统一装配口径。

@@ -24,5 +24,10 @@ pub trait Backend: Send + Sync {
     fn supervisor(&self) -> &dyn SupervisorPort;
 
     /// 服务端安装器（Forge / `NeoForge`）
+    ///
+    /// 返回执行器而不是 `Option`：安装能力由 `service` 直接调用，**该位置
+    /// 不支持时必须由 [`InstallerRunner::run_installer`] 返回错误**，不在
+    /// 这里 panic——`Backend` 是 `service` 的依赖，一个 `unreachable!()` 会把
+    /// 「远端还没实现安装」变成进程 abort，而不是一条可恢复的失败。
     fn installer(&self) -> &dyn InstallerRunner;
 }

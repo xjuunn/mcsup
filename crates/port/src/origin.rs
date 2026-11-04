@@ -26,6 +26,7 @@ pub const MAX_NAME_LEN: usize = 64;
 
 /// 来源名非法
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum OriginError {
     /// 空名字
     #[error("origin name is empty")]

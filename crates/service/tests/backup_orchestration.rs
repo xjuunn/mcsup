@@ -1,3 +1,7 @@
+#![allow(
+    clippy::unreachable,
+    reason = "测试替身用 unreachable! 标记不该被调用的分支"
+)]
 //! 备份编排：`save-on` 兜底、故障路径的清理、跨服务器 GC
 //!
 //! 这一层测的是**时序与收场**，不是单个函数：每条用例都要求「无论第几步
@@ -11,8 +15,11 @@
 #![allow(clippy::expect_used)]
 
 use backup::CasStore;
-use domain::backup::{BackupScope, ContentHash, Page, RelPath, RestoreTarget, RetentionPolicy};
-use port::{Backend, ContentStore, InstallerRunner, Scanner, SnapshotRepository, SupervisorPort};
+use domain::backup::{BackupScope, ContentHash, Page, RelPath, RestoreTarget, RetentionInput};
+use port::{
+    Backend, CancellationToken, ContentStore, InstallerRunner, Scanner, SnapshotRepository,
+    SupervisorPort,
+};
 use service::{BackupError, BackupService, CreateOptions, CreateOutcome, ServerRegistry};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -38,7 +45,7 @@ impl InstallerRunner for NoopInstaller {
         _installer: &Path,
         _dir: &Path,
         _output: Option<&dyn port::InstallerOutputSink>,
-        _cancel: &port::CancellationToken,
+        _cancel: &CancellationToken,
     ) -> Result<(), port::InstallerError> {
         unreachable!("not used")
     }
@@ -48,6 +55,7 @@ impl Backend for TestBackend {
     fn supervisor(&self) -> &dyn SupervisorPort {
         self.supervisor.as_ref()
     }
+
     fn installer(&self) -> &dyn InstallerRunner {
         &NoopInstaller
     }
@@ -129,6 +137,7 @@ fn create_now(service: &BackupService) -> Result<CreateOutcome, BackupError> {
             flush_wait_ms: Some(0),
             ..CreateOptions::default()
         },
+        &CancellationToken::new(),
     )
 }
 
@@ -179,6 +188,7 @@ fn save_on_is_sent_when_scope_is_empty() {
                 flush_wait_ms: Some(0),
                 ..CreateOptions::default()
             },
+            &CancellationToken::new(),
         )
         .expect_err("empty scope");
     assert_invariant(matches!(err, BackupError::EmptyScope), || {
@@ -316,7 +326,7 @@ fn prune_keeps_objects_referenced_by_other_servers() {
 
     let alpha = create_now(&service).expect("alpha backup");
     let beta = service
-        .create("beta", &CreateOptions::default())
+        .create("beta", &CreateOptions::default(), &CancellationToken::new())
         .expect("beta backup");
 
     // 两台服务器的 mcsup.json 内容不同，shared.bin 相同
@@ -331,7 +341,14 @@ fn prune_keeps_objects_referenced_by_other_servers() {
     );
 
     service
-        .prune("alpha", Some(RetentionPolicy::Keep(0)), false)
+        .prune(
+            "alpha",
+            RetentionInput {
+                keep: Some(0),
+                older_than_secs: None,
+            },
+            false,
+        )
         .expect("prune alpha");
 
     // beta 的快照必须仍然完整可校验
@@ -360,7 +377,9 @@ fn prune_without_policy_only_collects_garbage() {
         .put(&mut cursor, &RelPath::parse("orphan").expect("rel"))
         .expect("put");
 
-    let pruned = service.prune("alpha", None, false).expect("prune");
+    let pruned = service
+        .prune("alpha", RetentionInput::default(), false)
+        .expect("prune");
     assert_invariant(
         pruned.removed.is_empty() && pruned.objects_reclaimed == 1,
         || {
@@ -400,6 +419,7 @@ fn empty_scope_failure_cleans_placeholder() {
                 flush_wait_ms: Some(0),
                 ..CreateOptions::default()
             },
+            &CancellationToken::new(),
         )
         .expect_err("empty");
     assert_invariant(matches!(err, BackupError::EmptyScope), || {
@@ -546,6 +566,7 @@ fn cas_get_failure_aborts_restore_and_keeps_original() {
             "alpha",
             outcome.snapshot.id.as_str(),
             &RestoreTarget::InPlace,
+            &CancellationToken::new(),
         )
         .expect_err("get 注入失败");
     assert_invariant(matches!(err, BackupError::Cas(_)), || {
@@ -567,6 +588,69 @@ fn cas_get_failure_aborts_restore_and_keeps_original() {
     );
 }
 
+/// `--to` 恢复失败后不得留下落点半成品，且必须允许重试
+///
+/// 回归：`--to` 曾直接写最终目录，中途失败留下半成品后，`restore` 的
+/// `TargetExists` 检查会拒绝下一次尝试——用户必须手工删目录才能再来一次。
+#[test]
+fn failed_restore_to_new_server_leaves_no_target_and_allows_retry() {
+    let fixture = ServiceFixture::with_server("alpha");
+    fixture.server("alpha").write("world/level.dat", b"v1");
+    let log = CommandLog::stopped();
+
+    let healthy = service(&fixture, &log);
+    let outcome = create_now(&healthy).expect("create");
+
+    // 第一次：CAS 读取注入失败
+    let (broken, _store) = service_with_cas_fault(&fixture, &log, CasOp::Get, 1);
+    let target = RestoreTarget::NewServer {
+        name: domain::server::meta::ServerName::parse("restored").expect("name"),
+    };
+    let err = broken
+        .restore(
+            "alpha",
+            outcome.snapshot.id.as_str(),
+            &target,
+            &CancellationToken::new(),
+        )
+        .expect_err("get 注入失败");
+    assert_invariant(matches!(err, BackupError::Cas(_)), || {
+        Failure::invariant("CAS 读取失败必须原样上报")
+            .expected("BackupError::Cas")
+            .actual(err.to_string())
+    });
+
+    let dest = fixture.root().join("servers/restored");
+    assert_absent(&dest, "失败后不得留下落点目录");
+    // 暂存目录也必须清理干净
+    let leftovers: Vec<_> = std::fs::read_dir(fixture.root().join("servers"))
+        .expect("read servers")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".mcsup-restore"))
+        .collect();
+    assert_invariant(leftovers.is_empty(), || {
+        Failure::invariant("失败后不得残留暂存目录")
+            .expected("[]")
+            .actual(format!("{leftovers:?}"))
+    });
+
+    // 第二次：同一落点必须能重试成功
+    let healed = service(&fixture, &log);
+    healed
+        .restore(
+            "alpha",
+            outcome.snapshot.id.as_str(),
+            &target,
+            &CancellationToken::new(),
+        )
+        .expect("重试必须成功");
+    assert_eq!(
+        std::fs::read(dest.join("world/level.dat")).expect("read"),
+        b"v1"
+    );
+}
+
 /// CAS `list` 失败时 GC 必须中止，不能当成「没有对象」把快照全删了
 #[test]
 fn cas_list_failure_aborts_prune_instead_of_deleting_everything() {
@@ -579,7 +663,7 @@ fn cas_list_failure_aborts_prune_instead_of_deleting_everything() {
 
     let (broken, _store) = service_with_cas_fault(&fixture, &log, CasOp::List, 1);
     let err = broken
-        .prune("alpha", None, false)
+        .prune("alpha", RetentionInput::default(), false)
         .expect_err("list 注入失败");
     assert_invariant(matches!(err, BackupError::Cas(_)), || {
         Failure::invariant("CAS 列举失败必须原样上报")
@@ -623,7 +707,7 @@ fn cas_remove_failure_is_not_reported_as_reclaimed() {
     drop(orphan_path);
 
     let err = service
-        .prune("alpha", None, false)
+        .prune("alpha", RetentionInput::default(), false)
         .expect_err("remove 注入失败");
     assert_invariant(matches!(err, BackupError::Cas(_)), || {
         Failure::invariant("CAS 删除失败必须原样上报")

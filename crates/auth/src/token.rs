@@ -168,6 +168,7 @@ impl std::fmt::Display for Role {
 
 /// 校验失败
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum TokenError {
     /// 客户端身份不是合法 UUID
     #[error("invalid client id: {0}")]

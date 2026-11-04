@@ -1475,7 +1475,7 @@ fn host_name() -> String {
 
 /// 客户端凭证存储：优先系统钥匙串，无钥匙串时退到 `{data_dir}/credentials.toml`
 fn credential_store() -> CredentialVault {
-    CredentialVault::open(crate::config::platform_data_dir().join("credentials.toml"))
+    crate::bootstrap::open_credential_store()
 }
 
 fn capability_name(capability: Capability) -> &'static str {
@@ -1520,6 +1520,8 @@ fn response_label(response: &Response) -> &'static str {
         Response::Pruned { .. } => "pruned",
         Response::Task { .. } => "task",
         Response::Error { .. } => "error",
+        // 对端可能比本端新：未知帧只用于日志
+        _ => "unknown",
     }
 }
 
@@ -1720,6 +1722,10 @@ fn origin_label(origin: &Origin) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unreachable,
+        reason = "测试替身用 unreachable! 标记不该被调用的分支"
+    )]
     use super::*;
 
     #[test]

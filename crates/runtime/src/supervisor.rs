@@ -31,6 +31,11 @@ const TICK: Duration = Duration::from_millis(100);
 const LINGER: Duration = Duration::from_secs(5);
 /// 强杀后等待退出的时间
 const KILL_WAIT: Duration = Duration::from_secs(5);
+/// 单条 IPC 连接上单次读写的上限
+///
+/// 客户端侧最大等待是 `wait_up` 的 5 秒轮询，这里留出余量即可；超时只影响
+/// 「连上却不说话」的连接，正常请求远快于此。
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 运行视图（所有字段只在锁内读写）
 struct View {
@@ -209,6 +214,10 @@ fn handle_connection(
     shared: &Shared,
     shutdown: &AtomicBool,
 ) {
+    // 每连接一个线程，因此连上却不发帧的客户端会永久占住一个线程。
+    // 读写都设上限：握手超时的连接直接放弃，不再等待。
+    let _ = stream.set_recv_timeout(Some(CONNECTION_TIMEOUT));
+    let _ = stream.set_send_timeout(Some(CONNECTION_TIMEOUT));
     let response = {
         let mut reader = BufReader::new(&mut stream);
         match protocol::read_frame::<_, Request>(&mut reader) {
@@ -270,6 +279,11 @@ fn fulfill(request: Request, shared: &Shared, shutdown: &AtomicBool) -> Response
             shutdown.store(true, Ordering::Relaxed);
             Response::Ok
         }
+        // 协议新增请求而本端不认识：显式报错，不能静默当成功
+        other => Response::Error {
+            kind: "protocol".to_owned(),
+            message: format!("unsupported request: {other:?}"),
+        },
     }
 }
 
