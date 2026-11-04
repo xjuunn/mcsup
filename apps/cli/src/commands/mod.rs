@@ -272,8 +272,11 @@ async fn server(action: ServerAction, cfg: &ConfigFile, printer: Printer) -> Res
             origin,
         } => {
             let name = server_ops::require_server_name(name.as_deref(), "server remove", printer)?;
-            if let Some(origin) = origin {
-                let origin = mcsup::port::Origin::parse(&origin).map_err(|err| {
+            // 显式 `--origin` 时按它分派；没给时**先看来源**再决定——
+            // 直接落到本地会让远端条目报 `not found`（本地注册表里当然没有），
+            // 而 `server ls` 明明列着它：同一个名字两处结论不一致。
+            let explicit = match origin {
+                Some(origin) => Some(mcsup::port::Origin::parse(&origin).map_err(|err| {
                     AppDiagnostic::usage(
                         crate::i18n::pick(
                             printer.lang(),
@@ -282,10 +285,20 @@ async fn server(action: ServerAction, cfg: &ConfigFile, printer: Printer) -> Res
                         ),
                         Some(err.to_string()),
                     )
-                })?;
+                })?),
+                None => None,
+            };
+            if let Some(origin) = explicit {
                 if !origin.is_local() {
                     return server_remote::remove_remote(&origin, &name, purge, printer);
                 }
+            } else if let Some(target) = origin::remote_target(&name, printer.lang())? {
+                return server_remote::remove_remote(
+                    &mcsup::port::Origin::Remote(target.member.name.clone()),
+                    &name,
+                    purge,
+                    printer,
+                );
             }
             server_ops::remove(&name, purge, printer)
         }

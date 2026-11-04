@@ -218,10 +218,16 @@ impl RegisteredServer {
         port::ServerRef::local(&self.meta.id, &self.dir)
     }
 
-    /// 是否为远端镜像条目
+    /// 是否为远端镜像条目（按**目录是否为空**推断）
     ///
-    /// 组合仓库的镜像侧把远端条目的 `dir` 置空（路径是对端本机的，客户端
-    /// 侧拼不出绝对目录），本地条目必有目录。
+    /// 只对 [`ServerRegistry::list_sourced`] 产出的条目成立：那里对非本地来源
+    /// 一律把 `dir` 置空。
+    ///
+    /// **不要用它判断 [`ServerRegistry::get`] 的结果**：`get` 用工作区 `path`
+    /// 拼目录（`absolute_dir`），而远端工作区
+    /// 的 `path` 是对端的真实路径（如 `/root/ws`），在客户端上并不存在却是
+    /// 非空字符串——据此判断会把远端条目当成本地条目。要判定来源请用
+    /// [`ServerRegistry::get_sourced`] 的 `origin`。
     #[must_use]
     pub fn is_remote(&self) -> bool {
         self.dir.as_os_str().is_empty()

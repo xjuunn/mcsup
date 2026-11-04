@@ -282,51 +282,84 @@ impl ServerLifecycleService {
         on_first_scan: &mut dyn FnMut(),
         on_found: &mut dyn FnMut(&ScannedJava),
     ) -> Result<SupervisorStartOutcome, LifecycleError> {
-        let server = self.registry.get(name)?;
-        if let Some(status) = self.backend.supervisor().status(&server.server_ref())?
+        // 按**来源**取条目，不能用 `get`：后者经 `absolute_dir` 用工作区路径拼
+        // 出目录，而远端工作区的 `path` 是**对端**的真实路径（如 `/root/ws`），
+        // 在客户端上并不存在。据此做的「核心是否存在」检查必然失败，会把好端端
+        // 的远端服务器误报成 `NoJar`。`get_sourced` 走 `list_sourced`，那里对
+        // 远端条目一律把 `dir` 置空，来源也可判定。
+        let sourced = self.registry.get_sourced(name)?;
+        let remote = !sourced.origin.is_local();
+        let server = sourced.value;
+        // 远端条目只带身份：`server_ref()` 会填 `ServerRef::local(dir)`，而远端
+        // 的 `dir` 是空的（来源判定见上）。让引用如实反映来源，避免下游误读空目录。
+        let server_ref = if remote {
+            server.remote_ref()
+        } else {
+            server.server_ref()
+        };
+        if let Some(status) = self.backend.supervisor().status(&server_ref)?
             && status.status.is_alive()
         {
             return Err(LifecycleError::AlreadyRunning);
         }
 
         // 启动方式：优先用安装时记录的 `LaunchSpec`；旧库记录（无 launch）
-        // 回退到历史口径——`server.jar`。核心文件是否存在按 spec 的主文件判定：
-        // `Jar` 是那个 JAR，`Args` 是第一个参数文件（安装器总会产出它）。
+        // 回退到历史口径——`server.jar`。
         let launch = server
             .meta
             .launch
             .clone()
             .unwrap_or_else(|| domain::server::launch::LaunchSpec::jar("server.jar"));
-        let primary = server.dir.join(launch.primary_file());
-        if launch.is_empty() || !primary.is_file() {
-            return Err(LifecycleError::NoJar {
-                name: name.to_owned(),
-            });
-        }
 
-        ensure_eula(&server.dir, opts.accept_eula)?;
+        // 远端条目：磁盘、Java 运行时、EULA 全在对端，本地无从预检。核心是否
+        // 存在、用哪个 Java、EULA 写没写，都由对端在收到 `Start` 后按同一段
+        // `lifecycle.start` 重新判定——判定不复制到客户端，两端各写一套必然分叉。
+        let settings = server.meta.settings.clone();
+        // 优先级：显式选项 > 服务属性（server set ram）> 平台默认
+        let ram_mib = opts.ram_mib.or(settings.ram_mib).unwrap_or(DEFAULT_RAM_MIB);
 
-        let settings = server.meta.settings;
-        let runtimes = self.java.list_or_scan(on_first_scan, on_found)?;
-        let runtime = pick_runtime(
-            &runtimes,
-            settings.java_major,
-            meta_java_major(server.meta.java_major, server.meta.version.as_str()),
-            name,
-        )?;
-
-        let request = SupervisorStartRequest {
-            server_id: server.meta.id.clone(),
-            server_dir: server.dir.clone(),
-            java_bin: java_bin_under(&runtime.path),
-            launch,
-            // 优先级：显式选项 > 服务属性（server set ram）> 平台默认
-            ram_mib: Some(opts.ram_mib.or(settings.ram_mib).unwrap_or(DEFAULT_RAM_MIB)),
-            supervisor_exe: opts.supervisor_exe.clone(),
-            supervisor_args: opts.supervisor_args.clone(),
-            // EULA 已在上方 ensure_eula 写入；带上只是让远端实现拿到一致意图
-            accept_eula: opts.accept_eula,
+        let request = if remote {
+            SupervisorStartRequest {
+                server_id: server.meta.id.clone(),
+                // 对端用自己的注册表重新算出这两个字段，这里明确留空表示「本端不知道」
+                server_dir: PathBuf::new(),
+                java_bin: PathBuf::new(),
+                launch,
+                ram_mib: Some(ram_mib),
+                supervisor_exe: opts.supervisor_exe.clone(),
+                supervisor_args: opts.supervisor_args.clone(),
+                accept_eula: opts.accept_eula,
+            }
+        } else {
+            // 核心文件是否存在按 spec 的主文件判定：`Jar` 是那个 JAR，
+            // `Args` 是第一个参数文件（安装器总会产出它）。
+            let primary = server.dir.join(launch.primary_file());
+            if launch.is_empty() || !primary.is_file() {
+                return Err(LifecycleError::NoJar {
+                    name: name.to_owned(),
+                });
+            }
+            ensure_eula(&server.dir, opts.accept_eula)?;
+            let runtimes = self.java.list_or_scan(on_first_scan, on_found)?;
+            let runtime = pick_runtime(
+                &runtimes,
+                settings.java_major,
+                meta_java_major(server.meta.java_major, server.meta.version.as_str()),
+                name,
+            )?;
+            SupervisorStartRequest {
+                server_id: server.meta.id.clone(),
+                server_dir: server.dir.clone(),
+                java_bin: java_bin_under(&runtime.path),
+                launch,
+                ram_mib: Some(ram_mib),
+                supervisor_exe: opts.supervisor_exe.clone(),
+                supervisor_args: opts.supervisor_args.clone(),
+                // EULA 已在上方 ensure_eula 写入；带上只是让远端实现拿到一致意图
+                accept_eula: opts.accept_eula,
+            }
         };
+
         let outcome = self
             .backend
             .supervisor()
@@ -954,13 +987,23 @@ mod tests {
 
     struct MemServers {
         items: Mutex<Vec<domain::server::meta::ServerMeta>>,
+        /// `Some` 时把 `list_sourced` 的条目标成该远端来源（模拟镜像条目）
+        origin: Mutex<Option<port::Origin>>,
     }
 
     impl MemServers {
         fn new() -> Self {
             Self {
                 items: Mutex::new(Vec::new()),
+                origin: Mutex::new(None),
             }
+        }
+
+        /// 把后续 `list_sourced` 的结果都标成远端来源
+        fn set_remote_origin(&self, remote: &str) {
+            *self.origin.lock().expect("lock") = Some(port::Origin::Remote(
+                port::RemoteName::parse(remote).expect("remote name"),
+            ));
         }
     }
 
@@ -983,6 +1026,19 @@ mod tests {
         }
         fn list(&self) -> Result<Vec<domain::server::meta::ServerMeta>, RepositoryError> {
             Ok(self.items.lock().expect("lock").clone())
+        }
+        fn list_sourced(
+            &self,
+        ) -> Result<Vec<port::Sourced<domain::server::meta::ServerMeta>>, RepositoryError> {
+            let items = self.items.lock().expect("lock").clone();
+            let origin = self.origin.lock().expect("lock").clone();
+            Ok(items
+                .into_iter()
+                .map(|meta| match origin.clone() {
+                    Some(origin) => port::Sourced::new(origin, meta),
+                    None => port::Sourced::local(meta),
+                })
+                .collect())
         }
         fn update_core(
             &self,
@@ -1424,8 +1480,11 @@ mod tests {
     /// 建好 workspace + 服务器 + （可选）jar 与 eula 的完整夹具
     struct Fixture {
         registry: Arc<ServerRegistry>,
+        /// 与 `registry` 共用的条目仓库（测试里改来源标注用）
+        servers: Arc<MemServers>,
         server_dir: PathBuf,
         name: String,
+        id: domain::server::meta::ServerId,
         _tmp: tempfile::TempDir,
     }
 
@@ -1433,8 +1492,9 @@ mod tests {
         fn new(with_jar: bool) -> Self {
             let tmp = tempfile::tempdir().expect("tmp");
             let ws = ws_fixture(tmp.path());
+            let servers = Arc::new(MemServers::new());
             let registry = Arc::new(ServerRegistry::new(
-                Arc::new(MemServers::new()),
+                Arc::clone(&servers) as Arc<dyn ServerRepository>,
                 Arc::new(MemWorkspaces::new(ws)),
             ));
             let server = registry
@@ -1464,10 +1524,13 @@ mod tests {
                     .expect("jar");
             }
             let name = server.meta.name.as_str().to_owned();
+            let id = server.meta.id.clone();
             Self {
                 registry,
+                servers,
                 server_dir: server.dir,
                 name,
+                id,
                 _tmp: tmp,
             }
         }
@@ -1543,6 +1606,50 @@ mod tests {
         let err = start(&svc, &fixture.name, true).expect_err("must fail");
         assert!(matches!(err, LifecycleError::NoJar { .. }), "{err:?}");
         assert!(!fixture.server_dir.join(EULA_FILE).exists());
+    }
+
+    #[test]
+    fn start_routes_remote_entry_without_touching_local_disk() {
+        // 远端条目的工作区路径是对端的（如 /root/ws），本机不存在。修复前
+        // `start` 用 `registry.get` 拼出这个假路径做「核心存在」检查，于是把
+        // 好端端的远端服务器报成 `NoJar`。
+        let fixture = Fixture::new(false); // 本地刻意没有 jar
+        fixture.servers.set_remote_origin("box");
+        let supervisor = Arc::new(FakeSupervisor::default());
+        let svc = service(
+            &fixture,
+            java_service(MemJavaRepo::new(vec![], false), vec![]),
+            Arc::clone(&supervisor),
+        );
+        start(&svc, &fixture.name, true).expect("remote start must not require a local jar");
+
+        let calls = supervisor.starts();
+        assert_eq!(calls.len(), 1, "远端条目应发一帧 Start");
+        let request = &calls[0];
+        assert!(
+            request.server_dir.as_os_str().is_empty(),
+            "本地拼不出的目录必须留空，由对端自行解析: {request:?}"
+        );
+        assert!(
+            request.java_bin.as_os_str().is_empty(),
+            "Java 运行时在对端，本端不该决定: {request:?}"
+        );
+        assert_eq!(request.server_id, fixture.id);
+    }
+
+    #[test]
+    fn start_still_rejects_local_entry_without_jar() {
+        // 远端免检不能顺手放过本地条目：本地缺核心仍须报 NoJar。
+        let fixture = Fixture::new(false);
+        let supervisor = Arc::new(FakeSupervisor::default());
+        let svc = service(
+            &fixture,
+            java_service(MemJavaRepo::new(vec![], true), vec![]),
+            Arc::clone(&supervisor),
+        );
+        let err = start(&svc, &fixture.name, true).expect_err("local must still fail");
+        assert!(matches!(err, LifecycleError::NoJar { .. }), "{err:?}");
+        assert!(supervisor.starts().is_empty());
     }
 
     #[test]

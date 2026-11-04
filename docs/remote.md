@@ -290,7 +290,8 @@ error: “web” 存在于多个位置
 | `server install` | `ServerInstall`；支持裸名指向唯一远端，缺版本时沿用在册版本 |
 | `server props` / `set` | `PropsGet` / `PropsSet`（原文进出）/ `SettingsSet`；判定与持久化在对端 |
 | `server console` / `logs` | `LogsFollow` 长轮询 + `SendLine` / `StatusMany`（按对端 id，不按名字） |
-| `server start` / `stop` / `restart` / `status` / `send` | 生命周期帧，经 `RoutingSupervisor` 按来源分派 |
+| `server start` / `stop` / `restart` / `status` / `send` | 生命周期帧，经 `RoutingSupervisor` 按来源分派；远端条目的核心 / Java / EULA 预检在**对端**执行，客户端不得用本地路径判定（见下「预检在哪里跑」） |
+| `server remove` | `ServerRemove`（可选 `--purge` 删盘），判定与删盘在对端；未给 `--origin` 时先解析来源——远端条目不会被当成本地条目（本地有同名则仍本地优先） |
 | `server version` | 组合注册表 `get`（不新增帧） |
 | `server backup ...` | 备份帧族（快照元数据跨线，CAS 在对端） |
 | `java scan` / `install` / `uninstall` | `JavaScan` / `JavaInstall` / `JavaUninstall`，下载与登记在对端 |
@@ -301,6 +302,20 @@ error: “web” 存在于多个位置
 仍只有本地实现的：`server mod`、`modpack` 的独立子命令（尚未提供）。
 `server create --origin` 的整合包变体仍要求显式 `--modpack`（清单要在对端读，
 远端侧不提供交互式整合包搜索）。
+
+#### 预检在哪里跑
+
+远端条目的**核心存在性 / Java 运行时 / EULA** 三项预检一律在**对端**执行。
+客户端不得拿本地拼出的路径做判断：远端工作区记的是对端的真实路径
+（如 `/root/ws`），在客户端上并不存在，据此判定必然得到「没有核心」，
+把一个能正常运行的远端服务器报成 `NoJar`。
+
+判定因此只写一份——对端收到 `Start` 后跑的就是本机那条 `lifecycle.start`。
+客户端侧的「预检」全部属于**本机**语义（本机路径、本机 Java、本机文件），
+在远端起不到校验作用，只会误判。
+
+同理，`server remove` 未给 `--origin` 时必须先解析来源再分派；直接落到本地
+会让远端条目报 `not found`，而 `server ls` 又明明列着它。
 
 ### 离线、断开与撤销
 
