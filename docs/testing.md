@@ -115,15 +115,15 @@ build 依赖、不含 dev 依赖），改的只是取数方式。
 脚本必须跑出与 `cargo test --workspace --all-features` **相同的**用例集合。
 它以 `profile.test == true` 挑选产物，这个判据容易踩两个坑：
 
-- 按 `kind` 排除 `bin` 会丢掉 bin 的单元测试。`mcsup` 有 213 个、
+- 按 `kind` 排除 `bin` 会丢掉 bin 的单元测试。`mcsup` 有 215 个、
   `mcsup_dev_tools` 有 25 个、`mcsup-agent` 有 6 个单元测试写在 `main.rs`
-  里，那样会静默少跑 244 个用例，而门禁照绿。cargo 对 bin 目标产出两份
+  里，那样会静默少跑 246 个用例，而门禁照绿。cargo 对 bin 目标产出两份
   产物：`test=false` 是真二进制（用户执行的那个），`test=true` 才是带
   harness 的副本。
 - doctest **不在** `--no-run` 的产物清单里（由 rustdoc 驱动，没有独立
   可执行文件），必须单独一条 `cargo test --doc` 补上，否则静默少 4 个。
 
-改动后核对一次总数：两边 `passed` 之和必须相等（当前 1452）。
+改动后核对一次总数：两边 `passed` 之和必须相等（当前 1454）。
 
 ### 低端设备与 CI
 
