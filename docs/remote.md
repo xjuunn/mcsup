@@ -70,6 +70,12 @@ mcsup 的远程能力：一台机器上的 `mcsup` 可以像管理本地资源�
 
 只需要两条命令：一条把 agent 放到后台，一条在需要配对时取码。
 
+`--listen` 只需在**第一次**指定：之后 `serve start` / `serve stop` / 再
+`serve start` 都沿用这个地址（存在 `{data_dir}/remote/agent.last-listen`）。
+这是为了避免一个具体的坑——配好端口映射的机器上，映射把公网流量转到**本机
+网卡地址**，而 agent 若退回只绑回环，外部一律 `Connection refused`，看起来
+和「agent 没启动」「防火墙挡了」完全一样。想换地址就再显式传一次 `--listen`。
+
 ```
 $ mcsup remote serve start --listen 0.0.0.0:7681
 mcsup 已在后台监听
@@ -100,7 +106,7 @@ pid 文件只用于停止与展示。系统服务注册（systemd / launchd）�
 
 | 命令 | 说明 |
 | --- | --- |
-| `mcsup remote serve start [--listen <addr>] [--name <n>] [--foreground]` | 后台启动 agent；缺省只听 `127.0.0.1:7681`，对外直连需显式 `--listen 0.0.0.0:7681`；`--foreground` 留在前台打日志（调试） |
+| `mcsup remote serve start [--listen <addr>] [--name <n>] [--foreground]` | 后台启动 agent。省略 `--listen` 时**沿用上次显式指定的地址**，从未指定过才用 `127.0.0.1:7681`（只监听本机）；对外直连需显式 `--listen 0.0.0.0:7681`；`--foreground` 留在前台打日志（调试） |
 | `mcsup remote serve status` | 离线查看状态：是否运行、地址、指纹、pid、已配对客户端、配对码剩余时间（**不回显码**） |
 | `mcsup remote serve stop [--force]` | 按 pid 发 `SIGTERM` 并等实例锁释放；`--force` 强杀（Windows 上恒为强杀，见下）。未运行时幂等成功 |
 | `mcsup remote code [--ttl <secs>] [--clear]` | 生成一枚一次性配对码（缺省 300 秒，范围 30–3600）；`--clear` 作废当前码 |

@@ -89,6 +89,14 @@ fn serve(action: ServeAction, printer: Printer) -> Result<()> {
             data_dir,
         } => {
             let dir = data_dir.unwrap_or_else(crate::config::platform_data_dir);
+            // 没给 `--listen` 就沿用上次用过的地址，而不是每次回落到回环。
+            //
+            // 回落回环是「安全默认」，但对**已经配好端口映射**的机器是陷阱：
+            // 映射指向的端口在公网可用，agent 却只绑 127.0.0.1，外部流量到
+            // 内网地址后被拒，客户端只看到 Connection refused，与「agent 没
+            // 启动」无从区分。管理员停一次、不带参数起一次，对外服务就悄悄
+            // 退化成只在本机可用。
+            let listen = resolve_listen(&dir, listen);
             if foreground {
                 return serve_foreground(&dir, &listen, name.as_deref(), printer);
             }
@@ -128,6 +136,10 @@ fn serve_start(data_dir: &Path, listen: &str, name: Option<&str>, printer: Print
     // 让 `start` 误判「已就绪」而立刻返回一个根本没起来的 agent。
     // 进程崩溃 / 被强杀时走不到 `serve_foreground` 的清理，所以这里也要清。
     remove_listen_addr(data_dir);
+
+    // 子进程真正 bind 成功后会再写一次（写入实际地址，`--listen :0` 时要靠它
+    // 才知道端口）。这里先落盘用户的意图，崩溃在半路也不丢「上次用哪个地址」。
+    remember_listen(data_dir, listen);
 
     let exe = std::env::current_exe().context(crate::i18n::pick(
         lang,
@@ -183,6 +195,7 @@ fn serve_start(data_dir: &Path, listen: &str, name: Option<&str>, printer: Print
         ));
         if let Ok(parsed) = addr.parse() {
             warn_exposure(&parsed, printer);
+            warn_loopback_on_mapped_host(&parsed, printer);
         }
     } else {
         printer.print_outcome("", &payload)?;
@@ -241,6 +254,33 @@ fn serve_foreground(
     Ok(())
 }
 
+/// 监听回环时提醒「这台机器可能并不是只在本地用」
+///
+/// 只监听本机是安全默认，但它与「已经配好端口映射」的用法直接冲突：映射把
+/// 公网流量转到本机网卡地址，回环绑定一律拒绝。此时外部只能看到
+/// Connection refused，与被防火墙挡住、agent 没启动都无从区分——本次排查就
+/// 卡在这里。提示一次比让人对着 refused 猜一小时划算。
+fn warn_loopback_on_mapped_host(addr: &std::net::SocketAddr, printer: Printer) {
+    if !printer.is_human() || !addr.ip().is_loopback() {
+        return;
+    }
+    printer.print_section(&crate::i18n::pick(
+        printer.lang(),
+        format!(
+            "  提示    只监听本机；其他机器要连请 --listen 0.0.0.0:{} 并放行防火墙\n           \
+             （配了端口映射的机器尤其注意：映射转发到内网后到达的是本机网卡地址，\n           \
+             只绑回环会让外部一律 Connection refused）",
+            addr.port()
+        ),
+        format!(
+            "  hint    loopback only; use --listen 0.0.0.0:{} and open the firewall to accept other machines\n           \
+             (this matters on a port-mapped host: the mapping forwards to this machine's NIC\n           \
+             address, so a loopback bind turns every external attempt into a Connection refused)",
+            addr.port()
+        ),
+    ));
+}
+
 /// 监听所有网卡时提醒暴露面
 fn warn_exposure(addr: &std::net::SocketAddr, printer: Printer) {
     if !printer.is_human() {
@@ -289,13 +329,7 @@ fn report_serve(
             "  配对码  未生成（按需发放）\n          需要配对时运行：mcsup remote code",
             "  pairing code none yet (on demand)\n              run `mcsup remote code` when you need one",
         ));
-        if addr.ip().is_loopback() {
-            printer.print_section(&crate::i18n::pick(
-                lang,
-                "  提示    只监听本机；其他机器要连请 --listen 0.0.0.0:7681 并放行防火墙",
-                "  hint    loopback only; use --listen 0.0.0.0:7681 and open the firewall to accept other machines",
-            ));
-        }
+        warn_loopback_on_mapped_host(&addr, printer);
     } else {
         let payload = serde_json::json!({
             "name": name,
@@ -1572,6 +1606,43 @@ fn read_listen_addr(data_dir: &Path) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
+/// 上次成功监听过的地址（`{data_dir}/remote/agent.last-listen`）
+///
+/// 与 [`AGENT_ADDR`] 分开：那个是**本次**运行的就绪信号与回显源，`start` 会
+/// 在拉起子进程前删掉它；这个跨启动保留，用来让不带 `--listen` 的 `start`
+/// 沿用管理员上次显式指定的地址。
+const AGENT_LAST_LISTEN: &str = "agent.last-listen";
+
+/// 记住本次使用的监听地址（只对「显式指定」生效，见 [`resolve_listen`]）
+fn remember_listen(data_dir: &Path, listen: &str) {
+    let path = data_dir.join("remote").join(AGENT_LAST_LISTEN);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // 只影响「下次不带参数时的默认值」：写不进去不该让本次启动失败
+    let _ = std::fs::write(path, listen);
+}
+
+fn read_last_listen(data_dir: &Path) -> Option<String> {
+    std::fs::read_to_string(data_dir.join("remote").join(AGENT_LAST_LISTEN))
+        .ok()
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty())
+}
+
+/// 没给 `--listen` 时的地址：沿用上次显式指定的，否则用安全默认
+///
+/// 优先级是「显式 > 上次显式 > 回环」。只在用户**显式**指定过的时候才记住，
+/// 避免把内部的默认值当成用户意图固化下来。
+fn resolve_listen(data_dir: &Path, requested: Option<String>) -> String {
+    requested
+        .or_else(|| read_last_listen(data_dir))
+        .unwrap_or_else(|| DEFAULT_LISTEN.to_owned())
+}
+
+/// 安全默认：只监听回环
+const DEFAULT_LISTEN: &str = "127.0.0.1:7681";
+
 /// 本机证书指纹（读身份文件；没有身份时返回 `None`）
 fn read_fingerprint(data_dir: &Path) -> Option<String> {
     let dir = mcsup::remote::identity_dir(data_dir);
@@ -1727,6 +1798,47 @@ mod tests {
         reason = "测试替身用 unreachable! 标记不该被调用的分支"
     )]
     use super::*;
+
+    /// 不带 `--listen` 时要沿用上次显式指定的地址
+    ///
+    /// 回归：默认值曾写死在 clap 的 `default_value` 里，于是「配好端口映射的
+    /// 机器停一次再起」就悄悄退回只监听回环，外部只看到 Connection refused。
+    #[test]
+    fn listen_falls_back_to_last_explicit_choice() {
+        let dir = tempdir();
+        // 从没指定过 → 安全默认（只监听本机）
+        assert_eq!(resolve_listen(&dir, None), DEFAULT_LISTEN);
+
+        // 显式指定一次后要记住
+        remember_listen(&dir, "0.0.0.0:7681");
+        assert_eq!(resolve_listen(&dir, None), "0.0.0.0:7681");
+
+        // 本次显式指定的优先于记忆
+        assert_eq!(
+            resolve_listen(&dir, Some("127.0.0.1:9000".to_owned())),
+            "127.0.0.1:9000"
+        );
+    }
+
+    /// 记忆文件损坏 / 为空时退回默认，不能把空串当地址
+    #[test]
+    fn blank_remembered_listen_is_ignored() {
+        let dir = tempdir();
+        remember_listen(&dir, "   ");
+        assert_eq!(resolve_listen(&dir, None), DEFAULT_LISTEN);
+    }
+
+    /// 建一个只属于本用例的临时 `data_dir`，避免写进用户的真实目录
+    fn tempdir() -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "mcsup-listen-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("remote")).expect("create temp data dir");
+        base
+    }
 
     #[test]
     fn target_gets_default_port_when_missing() {

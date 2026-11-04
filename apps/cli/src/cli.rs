@@ -618,13 +618,8 @@ pub(crate) enum ServeAction {
     #[command(about = crate::meta::remote_serve_start())]
     #[command(visible_alias = "up")]
     Start {
-        #[arg(
-            long,
-            value_name = "ADDR",
-            default_value = "127.0.0.1:7681",
-            help = crate::meta::remote_listen_arg()
-        )]
-        listen: String,
+        #[arg(long, value_name = "ADDR", help = crate::meta::remote_listen_arg())]
+        listen: Option<String>,
         #[arg(long, value_name = "NAME", help = crate::meta::remote_local_name_arg())]
         name: Option<String>,
         /// 前台运行并打印日志（调试用）
