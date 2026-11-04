@@ -337,6 +337,50 @@ fn server_link_variants_and_versions_run_on_the_agent() {
 /// 撤销立即失效：同一个 token 再连必须被拒
 ///
 /// 撤销需要 `Manage`（operator 没有），所以先在本机把管理员升到 `admin`：
+/// 客户端可以删掉自己的名册记录，且不需要 Manage 权限
+///
+/// 这是 `remote disconnect` 的服务端一半：默认角色是 `operator`，若要求
+/// `Manage` 就等于逼用户为自己的机器提权。删自己不改变他人的可达性。
+#[test]
+fn a_client_can_remove_itself_without_manage_permission() {
+    let harness = Harness::start();
+    // 默认角色（operator），刻意不提升
+    let client = harness.paired("laptop", false);
+    let client_id = client.authenticate().expect("auth").client_id;
+    assert_eq!(harness.agent.clients().load().expect("load").len(), 1);
+
+    let response = client
+        .call(&Request::ClientSelfRevoke)
+        .expect("self revoke");
+    assert!(matches!(response, Response::Ok), "{response:?}");
+
+    // 记录已删除
+    let remaining = harness.agent.clients().load().expect("load");
+    assert!(
+        !remaining.iter().any(|record| record.client_id == client_id),
+        "{remaining:?}"
+    );
+}
+
+/// 自撤销只删自己，不会波及别人
+#[test]
+fn self_revoke_leaves_other_clients_alone() {
+    let harness = Harness::start();
+    let victim = harness.paired("laptop", false);
+    let bystander = harness.paired("desk", false);
+
+    let response = victim
+        .call(&Request::ClientSelfRevoke)
+        .expect("self revoke");
+    assert!(matches!(response, Response::Ok), "{response:?}");
+
+    let remaining = harness.agent.clients().load().expect("load");
+    assert_eq!(remaining.len(), 1, "{remaining:?}");
+    assert_eq!(remaining[0].name, "desk");
+    // 旁观者仍然可用
+    assert!(bystander.authenticate().is_ok());
+}
+
 /// 角色提升只能发生在 agent 这台机器上，正是「远程不能自己给自己提权」的体现。
 #[test]
 fn revoking_a_client_invalidates_its_token() {

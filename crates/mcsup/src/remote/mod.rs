@@ -770,7 +770,7 @@ impl Agent {
         request: &protocol::remote::Request,
         progress: &dyn port::TaskObserver,
     ) -> protocol::remote::Response {
-        let response = self.dispatch_with(request, progress);
+        let response = self.dispatch_with(session, request, progress);
         let ok = !matches!(response, protocol::remote::Response::Error { .. });
         // 审计：调用方、操作、结果。参数不进日志（可能含路径与控制台输入）
         tracing::info!(
