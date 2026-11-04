@@ -12,7 +12,12 @@ use thiserror::Error;
 #[non_exhaustive]
 pub enum TransportError {
     /// TCP / TLS 读写失败
-    #[error("{context}: {source}")]
+    ///
+    /// `Display` **不**内嵌 `source`：入口用 `anyhow` 的 `{:#}` 打印错误链，
+    /// 那时 `source` 会被再拼一次，得到「… : unexpected end of file:
+    /// unexpected end of file」。`#[source]` 让错误链自己携带原因，这里的
+    /// `Display` 只回答「正在做什么」。
+    #[error("{context}")]
     Io {
         /// 正在做什么（`connect 10.0.0.5:7681` / `read frame` …）
         context: String,
@@ -48,7 +53,9 @@ pub enum TransportError {
     },
 
     /// 身份文件读写失败
-    #[error("{path}: {source}")]
+    ///
+    /// 同 [`Self::Io`]：原因交给 `#[source]` 链，`Display` 只说哪个文件。
+    #[error("{path}")]
     Identity {
         /// 身份文件路径
         path: PathBuf,
