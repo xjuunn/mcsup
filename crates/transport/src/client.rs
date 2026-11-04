@@ -431,26 +431,81 @@ impl Client {
 }
 
 /// 按目标地址与 TLS 配置建一条已握手的连接
+///
+/// 解析可能给出多个地址（双栈主机、多 A 记录）：逐个尝试，只有全部失败才算
+/// 连不上。原来只取 `next()`，一个 IPv6 地址排在前面而本机没有 IPv6 路由时，
+/// 明明 IPv4 通着也直接报错——用户看到的却是「连接失败」，无从判断是解析
+/// 顺序的问题。
 fn connect_with(target: &str, config: &Arc<ClientConfig>) -> Result<Conn, TransportError> {
-    let addr = target
+    let addrs: Vec<_> = target
         .to_socket_addrs()
         .map_err(|err| TransportError::io(format!("resolve {target}"), err))?
-        .next()
-        .ok_or_else(|| {
-            TransportError::io(
-                format!("resolve {target}"),
-                std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no address resolved"),
-            )
-        })?;
-    let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
-        .map_err(|err| TransportError::io(format!("connect {target}"), err))?;
-    configure(&stream)?;
+        .collect();
+    if addrs.is_empty() {
+        return Err(TransportError::io(
+            format!("resolve {target}"),
+            std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no address resolved"),
+        ));
+    }
 
+    let mut last: Option<TransportError> = None;
+    for addr in &addrs {
+        match connect_one(target, *addr, config) {
+            Ok(conn) => return Ok(conn),
+            Err(err) => last = Some(err),
+        }
+    }
+    Err(last.unwrap_or_else(|| TransportError::Protocol(format!("no usable address for {target}"))))
+}
+
+/// 连一个地址并完成 TLS 握手
+fn connect_one(
+    target: &str,
+    addr: std::net::SocketAddr,
+    config: &Arc<ClientConfig>,
+) -> Result<Conn, TransportError> {
     let server_name = rustls_pki_types::ServerName::try_from("mcsup.local")
         .map_err(|err| TransportError::Protocol(format!("server name: {err}")))?
         .to_owned();
-    let connection = ClientConnection::new(Arc::clone(config), server_name)?;
+    let mut connection = ClientConnection::new(Arc::clone(config), server_name)?;
+
+    // 在这里把 TLS 握手做完，而不是留给第一帧顺手驱动。
+    //
+    // rustls 是惰性的：`ClientConnection::new` 一个字节都不发，握手要等第一次
+    // `write`/`read` 才被推动。那样一来「对端在 TLS 阶段就断」会被记成
+    // `send hello frame: unexpected end of file`——把人引向帧格式或协议版本，
+    // 而真实原因是对端根本没在跑 mcsup-agent（端口映射指错、中间盒拦下
+    // 握手、对方防火墙只放 TCP 不放 TLS）。分开报，看日志的人才知道去查哪。
+    let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+        .map_err(|err| TransportError::io(format!("connect {target} ({addr})"), err))?;
+    configure(&stream)?;
+    while connection.is_handshaking() {
+        match connection.complete_io(&mut stream) {
+            Ok(_) => {}
+            Err(err) => return Err(tls_handshake_error(target, err)),
+        }
+    }
     Ok(Session::new(StreamOwned::new(connection, stream)))
+}
+
+/// TLS 握手阶段的失败：把「对端没说 TLS」与「证书不被接受」分开
+///
+/// 前者几乎总是环境问题（连错端口、代理拦截、对端不是 mcsup-agent），后者
+/// 才是身份问题。混成一条 `unexpected end of file` 会让两种完全不同的处置
+/// （去查网络 vs 去核对指纹）长成同一个样子。
+fn tls_handshake_error(target: &str, err: std::io::Error) -> TransportError {
+    if matches!(
+        err.kind(),
+        std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+    ) {
+        return TransportError::Protocol(format!(
+            "TLS handshake with {target} was closed by the peer before completing; \
+             the port is reachable but nothing that speaks TLS answered — check that \
+             the mapped port really points at mcsup-agent, and that no proxy is \
+             intercepting the connection"
+        ));
+    }
+    TransportError::io(format!("TLS handshake with {target}"), err)
 }
 
 /// 取 TLS 握手期间捕获的指纹
@@ -587,6 +642,57 @@ fn should_retry(err: &TransportError, reused: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 对端接受 TCP 却在 TLS 阶段关闭：必须报「握手被关」，不是「发帧失败」
+    ///
+    /// 回归：握手曾由第一帧惰性驱动，于是端口映射指错 / 中间盒拦握手都被报成
+    /// `send hello frame: unexpected end of file`，把排查引向帧格式。
+    #[test]
+    fn peer_closing_during_handshake_is_reported_as_tls_not_frame() {
+        use std::io::Read as _;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            // 读掉 ClientHello 再关闭：真实中间盒 / 错端口就是这样
+            for mut stream in listener.incoming().flatten() {
+                let mut scratch = [0u8; 4096];
+                let _ = stream.read(&mut scratch);
+            }
+        });
+
+        let err = Client::probe(&addr.to_string()).expect_err("必须失败");
+        let text = err.to_string();
+        assert!(
+            text.contains("TLS handshake") && text.contains("closed by the peer"),
+            "应报 TLS 握手被关闭，实际：{text}"
+        );
+        assert!(
+            !text.contains("send hello frame"),
+            "不得把握手失败报成发帧失败：{text}"
+        );
+    }
+
+    /// 失败的上下文里带上具体地址，双栈主机才知道试的是哪一个
+    #[test]
+    fn tls_handshake_error_names_the_target() {
+        let err = tls_handshake_error(
+            "example.invalid:1234",
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "eof"),
+        );
+        assert!(err.to_string().contains("example.invalid:1234"), "{err}");
+    }
+
+    /// 非 EOF 的握手失败（如超时）仍归 Io，可重试
+    #[test]
+    fn handshake_timeout_stays_retryable_io() {
+        let err = tls_handshake_error(
+            "example.invalid:1234",
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, "timeout"),
+        );
+        assert!(matches!(err, TransportError::Io { .. }), "{err:?}");
+        assert!(err.is_retryable());
+    }
 
     #[test]
     fn client_keeps_target_and_fingerprint() {

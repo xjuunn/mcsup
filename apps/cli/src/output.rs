@@ -322,6 +322,11 @@ fn structured_message(err: &anyhow::Error, lang: Lang) -> Option<String> {
         {
             return Some(crate::i18n::workspace(&kind, lang));
         }
+        if let Some(transport) = cause.downcast_ref::<mcsup::transport::TransportError>()
+            && let Some(message) = crate::i18n::transport(transport, lang)
+        {
+            return Some(message);
+        }
     }
     None
 }

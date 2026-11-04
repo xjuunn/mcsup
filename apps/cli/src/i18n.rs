@@ -510,6 +510,50 @@ pub(crate) fn registry(kind: &ServerRegistryErrorKind<'_>, lang: Lang) -> String
 
 /// 工作区错误提示
 #[must_use]
+/// 传输层失败的可读文案
+///
+/// 只翻译**能给出处置建议**的那几类；其余返回 `None`，由调用方沿用库侧的
+/// 英文 `Display`（含底层 IO 原因，比一句笼统的「连接失败」有用）。
+///
+/// `Protocol` 里混着两种完全不同的情况：握手阶段被对端关掉（环境问题：端口
+/// 映射指错、代理拦截、对端不是 mcsup-agent），以及帧内容不合协议（版本不
+/// 匹配）。前者给排查方向，后者只说「对端没按协议说话」——把两者都翻成
+/// 「连接失败」就等于什么都没说。
+pub(crate) fn transport(err: &mcsup::transport::TransportError, lang: Lang) -> Option<String> {
+    use mcsup::transport::TransportError as T;
+    match err {
+        T::Unauthorized(_) => Some(match lang {
+            Lang::Zh => "未授权：凭证已失效或权限不足，请重新配对".to_owned(),
+            Lang::En => "unauthorized: the credential is no longer valid, pair again".to_owned(),
+        }),
+        T::FingerprintMismatch { expected, actual } => Some(match lang {
+            Lang::Zh => format!(
+                "证书指纹不匹配：本地记录 {expected}，对端出示 {actual}。\
+                 对端重装过或有人中途拦截，确认后重新配对"
+            ),
+            Lang::En => format!(
+                "certificate fingerprint mismatch: expected {expected}, got {actual}; \
+                 the peer was reinstalled or something is intercepting the connection"
+            ),
+        }),
+        T::Protocol(message) if message.contains("TLS handshake") => Some(match lang {
+            Lang::Zh => "TLS 握手未完成：端口能连上，但对端没有回应 TLS。\
+                 请确认端口映射指向的确实是 mcsup-agent 的监听端口，\
+                 并检查本机是否有代理 / TUN 接管了这条连接"
+                .to_owned(),
+            Lang::En => "the TLS handshake did not complete: the port accepts TCP but \
+                 nothing answered TLS; check that the mapped port really points at \
+                 mcsup-agent and that no local proxy is intercepting the connection"
+                .to_owned(),
+        }),
+        // 其余沿用库侧英文 Display：它带着底层 IO 原因，比笼统的
+        // 「连接失败」更能定位问题
+        //
+        // `#[non_exhaustive]`：将来新增的变体同样沿用英文 Display
+        _ => None,
+    }
+}
+
 pub(crate) fn workspace(kind: &WorkspaceErrorKind<'_>, lang: Lang) -> String {
     match kind {
         WorkspaceErrorKind::NotEmpty { path } => match lang {
@@ -722,6 +766,48 @@ mod tests {
             settings(&err.kind().expect("kind"), Lang::En),
             "Java 17 is not registered; run `mcsup java install 17`"
         );
+    }
+
+    /// 握手失败的文案必须给出排查方向，而不是笼统的「连接失败」
+    #[test]
+    fn transport_handshake_message_points_at_the_environment() {
+        let err = mcsup::transport::TransportError::Protocol(
+            "TLS handshake with host:1 was closed by the peer".to_owned(),
+        );
+        let zh = transport(&err, Lang::Zh).expect("必须给出中文文案");
+        assert!(zh.contains("TLS"), "{zh}");
+        assert!(zh.contains("端口映射"), "{zh}");
+        let en = transport(&err, Lang::En).expect("必须给出英文文案");
+        assert!(en.contains("TLS"), "{en}");
+    }
+
+    /// 纯 IO 失败不翻译：底层原因（超时 / 拒绝连接）比笼统文案有用
+    #[test]
+    fn transport_io_failure_keeps_library_wording() {
+        let err = mcsup::transport::TransportError::Io {
+            context: "connect host:1".to_owned(),
+            source: std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out"),
+        };
+        assert!(transport(&err, Lang::Zh).is_none());
+        assert!(transport(&err, Lang::En).is_none());
+    }
+
+    /// 未授权与指纹不匹配要分别给出各自的处置
+    #[test]
+    fn transport_auth_failures_are_distinguished() {
+        let unauthorized = mcsup::transport::TransportError::Unauthorized("expired".to_owned());
+        assert!(
+            transport(&unauthorized, Lang::Zh)
+                .unwrap()
+                .contains("重新配对")
+        );
+
+        let mismatch = mcsup::transport::TransportError::FingerprintMismatch {
+            expected: "sha256:aa".to_owned(),
+            actual: "sha256:bb".to_owned(),
+        };
+        let zh = transport(&mismatch, Lang::Zh).unwrap();
+        assert!(zh.contains("sha256:aa") && zh.contains("sha256:bb"), "{zh}");
     }
 
     #[test]
