@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use domain::backup::{
-    BackupScope, ContentHash, Page, RelPath, RestoreTarget, RetentionPolicy, Snapshot, SnapshotId,
+    BackupScope, ContentHash, Page, RelPath, RestoreTarget, RetentionInput, Snapshot, SnapshotId,
     SnapshotStatus, ensure_restore_stopped,
 };
 use port::{
@@ -37,8 +37,8 @@ use port::{
 };
 use thiserror::Error;
 
+use crate::atomic::unix_now;
 use crate::registry::{RegisteredServer, ServerRegistry, ServerRegistryError};
-use crate::util::unix_now;
 use crate::{FsError, LifecycleError};
 
 /// 运行中备份前发送的关盘命令
@@ -121,6 +121,9 @@ pub enum BackupError {
     /// 保留策略非法（`--keep` 与 `--older-than` 同时给出）
     #[error("keep and older-than are mutually exclusive")]
     ConflictingRetention,
+    /// 恢复被用户取消（暂存区已清理，原目录不变）
+    #[error("restore was cancelled")]
+    RestoreCancelled,
     /// 快照内同一路径重复（生成逻辑错误）
     #[error(transparent)]
     DuplicatePath(#[from] domain::backup::DuplicatePath),
@@ -155,6 +158,7 @@ impl BackupError {
             Self::VerifyFailed { id, broken } => BackupErrorKind::VerifyFailed { id, broken },
             Self::InvalidLabel { raw } => BackupErrorKind::InvalidLabel { raw },
             Self::ConflictingRetention => BackupErrorKind::ConflictingRetention,
+            Self::RestoreCancelled => BackupErrorKind::RestoreCancelled,
         };
         Some(kind)
     }
@@ -202,6 +206,8 @@ pub enum BackupErrorKind<'a> {
     },
     /// 保留策略冲突
     ConflictingRetention,
+    /// 恢复被取消
+    RestoreCancelled,
 }
 
 /// `backup create` 的选项
@@ -417,6 +423,7 @@ impl BackupService {
         &self,
         name: &str,
         options: &CreateOptions,
+        cancel: &port::CancellationToken,
     ) -> Result<CreateOutcome, BackupError> {
         // 远端：整段转发（扫描与 CAS 都在对端），只回传元数据
         if let Some((server_id, remote)) = self.route_remote(name)? {
@@ -440,7 +447,7 @@ impl BackupService {
                 skipped: outcome.skipped,
             });
         }
-        match self.create_inner(name, options) {
+        match self.create_inner(name, options, cancel) {
             Ok(outcome) => Ok(outcome),
             Err(err) => {
                 // 失败也是事实：让消费者能统计失败率 / 告警
@@ -458,6 +465,7 @@ impl BackupService {
         &self,
         name: &str,
         options: &CreateOptions,
+        cancel: &port::CancellationToken,
     ) -> Result<CreateOutcome, BackupError> {
         let layout = self.resolve(name)?;
         if !layout.dir.is_dir() {
@@ -504,23 +512,24 @@ impl BackupService {
         };
 
         let now = unix_now();
-        let id = next_snapshot_id(now);
+        let id = next_snapshot_id(now)?;
         layout.index.begin(&id)?;
         // 占位目录建立之后的任何失败都必须清掉它：否则每失败一次就在
         // `snapshots/` 里留下一个空的 `.partial`，越积越多，且下次 list 会
         // 读到一条永远无法完成的记录。
-        let outcome =
-            match self
-                .store
-                .scanner()
-                .scan(&layout.dir, layout.cas.as_ref(), &rules, &mut |_| {})
-            {
-                Ok(outcome) => outcome,
-                Err(err) => {
-                    let _ = layout.index.remove(&id);
-                    return Err(err.into());
-                }
-            };
+        let outcome = match self.store.scanner().scan(
+            &layout.dir,
+            layout.cas.as_ref(),
+            &rules,
+            &mut |_| {},
+            cancel,
+        ) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                let _ = layout.index.remove(&id);
+                return Err(err.into());
+            }
+        };
         if outcome.entries.is_empty() {
             // 空快照没有恢复价值，删掉占位目录后报错
             let _ = layout.index.remove(&id);
@@ -678,6 +687,7 @@ impl BackupService {
         name: &str,
         snapshot_id: &str,
         target: &RestoreTarget,
+        cancel: &port::CancellationToken,
     ) -> Result<RestoreOutcome, BackupError> {
         // 远端：对端写盘，`--to` 的目标也创建在对端
         if let Some((server_id, remote)) = self.route_remote(name)? {
@@ -727,6 +737,7 @@ impl BackupService {
                         label: Some(format!("pre-restore-{}", snapshot.id.as_str())),
                         ..CreateOptions::default()
                     },
+                    cancel,
                 )?;
                 Some(outcome.snapshot.id)
             }
@@ -749,7 +760,7 @@ impl BackupService {
                 dest
             }
         };
-        let outcome = materialize(&layout, &snapshot, &destination, target)?;
+        let outcome = materialize(&layout, &snapshot, &destination, target, cancel)?;
         // `--to` 复制的是内容，不是身份：快照里的 `mcsup.json` 属于源服务器，
         // 沿用会让新目录与源服务器撞 id，`server link` 必然失败。恢复完成后
         // 立即写一份新身份，目录才真的能被注册。
@@ -864,21 +875,27 @@ impl BackupService {
 
     /// 按保留策略清理快照并回收无引用的 CAS 对象
     ///
-    /// `policy` 为 `None` 时只做 GC，不删任何快照（清理陈旧对象）。
-    /// `dry_run` 为真时只统计，不动磁盘。
+    /// `retention` 两个字段都不给时只做 GC，不删任何快照（清理陈旧对象）；
+    /// 两个都给判定为冲突（[`BackupError::ConflictingRetention`]），不会被
+    /// 静默地择一执行。`dry_run` 为真时只统计，不动磁盘。
     ///
     /// 引用计数跨**整个工作区**统计：CAS 按工作区共享，只看当前服务器会
     /// 删掉别的服务器正在用的对象。
     ///
     /// # Errors
     ///
-    /// 服务器不存在、索引读写失败或对象删除失败时返回 [`BackupError`]
+    /// 保留策略冲突、服务器不存在、索引读写失败或对象删除失败时返回
+    /// [`BackupError`]
     pub fn prune(
         &self,
         name: &str,
-        policy: Option<RetentionPolicy>,
+        retention: RetentionInput,
         dry_run: bool,
     ) -> Result<PruneOutcome, BackupError> {
+        // 判定收在此处：本地与远端入口都只递交原始输入，冲突口径只有一份
+        let policy = retention
+            .resolve()
+            .map_err(|_| BackupError::ConflictingRetention)?;
         // 远端：策略判定与 GC 都在对端（快照与 CAS 都在那边）
         if let Some((server_id, remote)) = self.route_remote(name)? {
             let outcome = remote
@@ -1068,14 +1085,16 @@ fn normalize_label(raw: Option<&str>) -> Result<Option<String>, BackupError> {
 ///
 /// 时间前缀让字典序即时间序（`list` 不另维护排序键）；后缀避免同秒并发
 /// （定时备份与手动备份撞在同一秒）产生同名目录。
-fn next_snapshot_id(now: i64) -> SnapshotId {
+///
+/// # Errors
+///
+/// 时间戳字符集与 [`SnapshotId`] 的白名单不一致时返回
+/// [`InvalidSnapshotId`]——宁可报错也不 panic：字符集是两处约定（本函数的
+/// 格式串 + 领域的白名单），任一处改动都应该表现为可读的错误。
+fn next_snapshot_id(now: i64) -> Result<SnapshotId, domain::backup::InvalidSnapshotId> {
     let stamp = utc_stamp(now);
     let suffix = uuid::Uuid::new_v4().simple().to_string();
-    let raw = format!("{stamp}-{}", &suffix[..6]);
-    SnapshotId::parse(&raw).unwrap_or_else(|_| {
-        // 理论不可达（字符集已受控）；退化为纯时间戳仍可排序
-        SnapshotId::parse(&format!("{stamp}-0")).unwrap_or_else(|_| unreachable!())
-    })
+    SnapshotId::parse(&format!("{stamp}-{}", &suffix[..6]))
 }
 
 /// Unix 秒 → `YYYYMMDDTHHMMSS`（UTC，小写 `t` 与 `SnapshotId` 字符集一致）
@@ -1247,20 +1266,39 @@ fn materialize(
     snapshot: &Snapshot,
     destination: &Path,
     target: &RestoreTarget,
+    cancel: &port::CancellationToken,
 ) -> Result<Materialized, BackupError> {
     match target {
         RestoreTarget::NewServer { .. } => {
-            std::fs::create_dir_all(destination).map_err(|err| FsError::io(destination, err))?;
-            // `--to` 也不信任落点：目标目录可能是用户预先建好的，里面可能有
-            // 指向目录外的符号链接。
-            let mut guard = Containment::new(destination)?;
+            // 先在同级暂存目录里写全，再整体 rename 到落点。
+            //
+            // 直接写最终目录时，中途失败会留下半成品，而 `restore` 的
+            // `TargetExists` 检查会拒绝重试——用户必须手工删目录才能再来一次。
+            // 暂存目录放在同一父目录下，保证 rename 不跨设备。
+            let parent = destination.parent().unwrap_or(destination);
+            std::fs::create_dir_all(parent).map_err(|err| FsError::io(parent, err))?;
+            let staging = parent.join(format!(".mcsup-restore-{}", uuid::Uuid::new_v4().simple()));
+            std::fs::create_dir_all(&staging).map_err(|err| FsError::io(&staging, err))?;
+            // 暂存目录是「未完成的恢复」的墓碑：任何退出路径都要清掉它
+            let _guard = StagingGuard::new(&staging);
+
+            // `--to` 也不信任落点：暂存目录里可能有（继承来的）指向目录外的
+            // 符号链接，逐个条目仍走 `Containment`。
+            let mut guard = Containment::new(&staging)?;
             let mut files = 0;
             let mut bytes = 0u64;
             for (path, hash) in snapshot.content.entries() {
+                // 逐文件检查：几个 G 的恢复要几分钟，不可取消等于 Ctrl-C 无效
+                if cancel.is_cancelled() {
+                    return Err(BackupError::RestoreCancelled);
+                }
                 let sink = guard.writable(path)?;
                 bytes += layout.cas.get(hash, &sink)?;
                 files += 1;
             }
+            drop(guard);
+            // 内容齐全后才出现在落点上：要么没有目录，要么是完整副本
+            std::fs::rename(&staging, destination).map_err(|err| FsError::io(destination, err))?;
             Ok(Materialized {
                 destination: destination.to_path_buf(),
                 files,
@@ -1284,6 +1322,9 @@ fn materialize(
             let mut files = 0;
             let mut bytes = 0u64;
             for (path, hash) in snapshot.content.entries() {
+                if cancel.is_cancelled() {
+                    return Err(BackupError::RestoreCancelled);
+                }
                 bytes += layout
                     .cas
                     .get(hash, &staging.join(path.to_platform_path()))?;
@@ -1492,6 +1533,10 @@ fn remove_untracked(destination: &Path, snapshot: &Snapshot) -> Result<usize, Ba
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unreachable,
+        reason = "测试替身用 unreachable! 标记不该被调用的分支"
+    )]
     use super::*;
     use crate::registry::ServerRegistry;
     use backup::CasStore;
@@ -1500,6 +1545,7 @@ mod tests {
     use domain::server::status::ServerStatus;
     use domain::server::version::{ServerVariant, VersionId};
     use domain::workspace::{Workspace, WorkspaceId, WorkspaceName};
+    use port::CancellationToken;
     use port::{
         Backend, InstallerRunner, RepositoryError, Scanner, ServerRepository, StopOutcome,
         StopSpec, SupervisorError, SupervisorPort, SupervisorStartOutcome, SupervisorStartRequest,
@@ -1719,7 +1765,7 @@ mod tests {
             _installer: &Path,
             _dir: &Path,
             _output: Option<&dyn port::InstallerOutputSink>,
-            _cancel: &port::CancellationToken,
+            _cancel: &CancellationToken,
         ) -> Result<(), port::InstallerError> {
             unreachable!("not used")
         }
@@ -1729,6 +1775,7 @@ mod tests {
         fn supervisor(&self) -> &dyn SupervisorPort {
             self.supervisor.as_ref()
         }
+
         fn installer(&self) -> &dyn InstallerRunner {
             &NoopInstaller
         }
@@ -1831,7 +1878,11 @@ mod tests {
 
         fn create(&self) -> CreateOutcome {
             self.service
-                .create("alpha", &CreateOptions::default())
+                .create(
+                    "alpha",
+                    &CreateOptions::default(),
+                    &CancellationToken::new(),
+                )
                 .expect("create")
         }
     }
@@ -1872,6 +1923,7 @@ mod tests {
                     scope: Some(BackupScope::from_entries(["nonexistent"]).expect("scope")),
                     ..CreateOptions::default()
                 },
+                &CancellationToken::new(),
             )
             .expect_err("empty");
         assert!(matches!(err, BackupError::EmptyScope), "{err}");
@@ -1914,6 +1966,7 @@ mod tests {
                     scope: Some(BackupScope::all()),
                     ..CreateOptions::default()
                 },
+                &CancellationToken::new(),
             )
             .expect("create");
         // world + plugins + mcsup.json
@@ -2005,6 +2058,7 @@ mod tests {
                     flush_wait_ms: Some(0),
                     ..CreateOptions::default()
                 },
+                &CancellationToken::new(),
             )
             .expect("create");
         assert!(outcome.snapshot.server_online);
@@ -2032,6 +2086,7 @@ mod tests {
                     flush_wait_ms: Some(0),
                     ..CreateOptions::default()
                 },
+                &CancellationToken::new(),
             )
             .expect_err("empty");
         assert!(matches!(err, BackupError::EmptyScope), "{err}");
@@ -2056,6 +2111,7 @@ mod tests {
                     label: Some("  before-upgrade  ".to_owned()),
                     ..CreateOptions::default()
                 },
+                &CancellationToken::new(),
             )
             .expect("create");
         assert_eq!(outcome.snapshot.label.as_deref(), Some("before-upgrade"));
@@ -2069,6 +2125,7 @@ mod tests {
                     label: Some(too_long),
                     ..CreateOptions::default()
                 },
+                &CancellationToken::new(),
             )
             .expect_err("label");
         assert!(matches!(err, BackupError::InvalidLabel { .. }), "{err}");
@@ -2086,6 +2143,7 @@ mod tests {
                     label: Some("   ".to_owned()),
                     ..CreateOptions::default()
                 },
+                &CancellationToken::new(),
             )
             .expect("create");
         assert!(outcome.snapshot.label.is_none());
@@ -2157,6 +2215,7 @@ mod tests {
                     flush_wait_ms: Some(0),
                     ..CreateOptions::default()
                 },
+                &CancellationToken::new(),
             )
             .expect("create");
 
@@ -2166,6 +2225,7 @@ mod tests {
                 "alpha",
                 outcome.snapshot.id.as_str(),
                 &RestoreTarget::InPlace,
+                &CancellationToken::new(),
             )
             .expect_err("running");
         assert!(
@@ -2188,7 +2248,12 @@ mod tests {
 
         let restored = fx
             .service
-            .restore("alpha", id.as_str(), &RestoreTarget::InPlace)
+            .restore(
+                "alpha",
+                id.as_str(),
+                &RestoreTarget::InPlace,
+                &CancellationToken::new(),
+            )
             .expect("restore");
         assert_eq!(fx.read("world/level.dat"), b"v1");
         assert_eq!(fx.read("server.properties"), b"motd=old");
@@ -2213,7 +2278,12 @@ mod tests {
 
         let restored = fx
             .service
-            .restore("alpha", first.snapshot.id.as_str(), &RestoreTarget::InPlace)
+            .restore(
+                "alpha",
+                first.snapshot.id.as_str(),
+                &RestoreTarget::InPlace,
+                &CancellationToken::new(),
+            )
             .expect("restore");
         assert_eq!(restored.deleted, 1);
         assert!(!fx.server_dir.join("world/new.dat").exists());
@@ -2235,6 +2305,7 @@ mod tests {
                 &RestoreTarget::NewServer {
                     name: ServerName::parse("copy").expect("name"),
                 },
+                &CancellationToken::new(),
             )
             .expect("restore");
         // 原服务器不动
@@ -2281,6 +2352,7 @@ mod tests {
                 &RestoreTarget::NewServer {
                     name: ServerName::parse("alpha").expect("name"),
                 },
+                &CancellationToken::new(),
             )
             .expect_err("exists");
         assert!(matches!(err, BackupError::TargetExists { .. }), "{err}");
@@ -2304,6 +2376,7 @@ mod tests {
                 &RestoreTarget::NewServer {
                     name: ServerName::parse("copy").expect("name"),
                 },
+                &CancellationToken::new(),
             )
             .expect_err("exists");
         assert!(matches!(err, BackupError::TargetExists { .. }), "{err}");
@@ -2336,6 +2409,7 @@ mod tests {
                 "alpha",
                 outcome.snapshot.id.as_str(),
                 &RestoreTarget::InPlace,
+                &CancellationToken::new(),
             )
             .expect_err("escapes");
         assert!(
@@ -2379,6 +2453,7 @@ mod tests {
                 &RestoreTarget::NewServer {
                     name: ServerName::parse("copy").expect("name"),
                 },
+                &CancellationToken::new(),
             )
             .expect_err("dir exists");
         assert!(matches!(err, BackupError::TargetExists(_)), "{err}");
@@ -2389,14 +2464,24 @@ mod tests {
         let fx = Fixture::new(FakeSupervisor::stopped());
         let err = fx
             .service
-            .restore("alpha", "20990101t000000-aaaaaa", &RestoreTarget::InPlace)
+            .restore(
+                "alpha",
+                "20990101t000000-aaaaaa",
+                &RestoreTarget::InPlace,
+                &CancellationToken::new(),
+            )
             .expect_err("missing");
         assert!(matches!(err, BackupError::SnapshotNotFound(_)), "{err}");
 
         // 非法 id 也按「不存在」处理，不做路径猜测
         let err = fx
             .service
-            .restore("alpha", "../../etc", &RestoreTarget::InPlace)
+            .restore(
+                "alpha",
+                "../../etc",
+                &RestoreTarget::InPlace,
+                &CancellationToken::new(),
+            )
             .expect_err("invalid");
         assert!(matches!(err, BackupError::SnapshotNotFound(_)), "{err}");
     }
@@ -2509,7 +2594,14 @@ mod tests {
 
         let outcome = fx
             .service
-            .prune("alpha", Some(RetentionPolicy::Keep(1)), false)
+            .prune(
+                "alpha",
+                RetentionInput {
+                    keep: Some(1),
+                    older_than_secs: None,
+                },
+                false,
+            )
             .expect("prune");
         assert_eq!(outcome.removed.len(), 2);
         assert!(!outcome.dry_run);
@@ -2523,6 +2615,31 @@ mod tests {
     }
 
     #[test]
+    fn prune_rejects_conflicting_retention() {
+        let fx = Fixture::new(FakeSupervisor::stopped());
+        fx.write("f", b"v0");
+        fx.create();
+
+        // 两个都给：必须报冲突，且**一份都不删**（不能静默择一执行）
+        let err = fx
+            .service
+            .prune(
+                "alpha",
+                RetentionInput {
+                    keep: Some(1),
+                    older_than_secs: Some(3600),
+                },
+                false,
+            )
+            .expect_err("conflict must be rejected");
+        assert!(matches!(err, BackupError::ConflictingRetention), "{err:?}");
+        assert!(err.kind().is_some(), "入口需要 kind() 才能本地化文案");
+
+        let page = fx.service.list("alpha", Page::new(1, 10)).expect("list");
+        assert_eq!(page.total, 1, "冲突时不得删除任何快照");
+    }
+
+    #[test]
     fn prune_dry_run_changes_nothing() {
         let fx = Fixture::new(FakeSupervisor::stopped());
         fx.write("f", b"v0");
@@ -2533,7 +2650,14 @@ mod tests {
 
         let outcome = fx
             .service
-            .prune("alpha", Some(RetentionPolicy::Keep(1)), true)
+            .prune(
+                "alpha",
+                RetentionInput {
+                    keep: Some(1),
+                    older_than_secs: None,
+                },
+                true,
+            )
             .expect("prune");
         assert!(outcome.dry_run);
         assert_eq!(outcome.removed.len(), 1);
@@ -2574,14 +2698,21 @@ mod tests {
 
         let beta = fx
             .service
-            .create("beta", &CreateOptions::default())
+            .create("beta", &CreateOptions::default(), &CancellationToken::new())
             .expect("beta backup");
         // beta 读到 shared.bin + 自己的 mcsup.json（内容与 alpha 的不同）
         assert_eq!(beta.snapshot.added, 2);
 
         // 删掉 alpha 的全部快照并 GC
         fx.service
-            .prune("alpha", Some(RetentionPolicy::Keep(0)), false)
+            .prune(
+                "alpha",
+                RetentionInput {
+                    keep: Some(0),
+                    older_than_secs: None,
+                },
+                false,
+            )
             .expect("prune");
         // beta 的对象必须还在，且 beta 的快照仍可校验通过
         let report = fx
@@ -2603,7 +2734,10 @@ mod tests {
             .put(&mut cursor, &RelPath::parse("orphan").expect("rel"))
             .expect("put");
 
-        let pruned = fx.service.prune("alpha", None, false).expect("prune");
+        let pruned = fx
+            .service
+            .prune("alpha", RetentionInput::default(), false)
+            .expect("prune");
         assert!(pruned.removed.is_empty());
         assert_eq!(pruned.objects_reclaimed, 1);
         assert!(cas.stat(&orphan).expect("stat").is_none());
@@ -2636,7 +2770,14 @@ mod tests {
 
         let err = fx
             .service
-            .prune("alpha", Some(RetentionPolicy::Keep(0)), false)
+            .prune(
+                "alpha",
+                RetentionInput {
+                    keep: Some(0),
+                    older_than_secs: None,
+                },
+                false,
+            )
             .expect_err("损坏记录必须让 prune fail closed");
         assert!(matches!(err, BackupError::Store(_)), "{err}");
         let cas = CasStore::new(&fx.backups_root());
@@ -2654,7 +2795,14 @@ mod tests {
         // 一小时前之前的所有快照（刚刚创建的不会被删）
         let outcome = fx
             .service
-            .prune("alpha", Some(RetentionPolicy::OlderThan(3600)), false)
+            .prune(
+                "alpha",
+                RetentionInput {
+                    keep: None,
+                    older_than_secs: Some(3600),
+                },
+                false,
+            )
             .expect("prune");
         assert!(outcome.removed.is_empty());
     }
@@ -2663,12 +2811,12 @@ mod tests {
 
     #[test]
     fn snapshot_id_is_sortable_and_lowercase() {
-        let id = next_snapshot_id(1_700_000_000);
+        let id = next_snapshot_id(1_700_000_000).expect("id");
         assert!(id.as_str().starts_with("2023111"), "{}", id.as_str());
         assert!(id.as_str().contains('t'));
         assert!(SnapshotId::parse(id.as_str()).is_ok());
         // 同秒不同 id：随机后缀避免撞名
-        assert_ne!(id, next_snapshot_id(1_700_000_000));
+        assert_ne!(id, next_snapshot_id(1_700_000_000).expect("id"));
     }
 
     #[test]
@@ -2782,6 +2930,7 @@ mod tests {
                     scope: Some(BackupScope::from_entries(["nonexistent"]).expect("scope")),
                     ..CreateOptions::default()
                 },
+                &CancellationToken::new(),
             )
             .expect_err("empty");
         assert!(matches!(err, BackupError::EmptyScope), "{err}");

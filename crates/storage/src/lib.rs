@@ -476,9 +476,10 @@ impl JsonStore {
         };
         let state: T = serde_json::from_slice(&bytes)
             .map_err(|err| RepositoryError::Corrupt(format!("{}: {err}", self.display(&path))))?;
-        if state.state_version() != JAVA_STATE_VERSION {
+        let expected = T::expected_version();
+        if state.state_version() != expected {
             return Err(RepositoryError::Corrupt(format!(
-                "{}: version {}, expected {JAVA_STATE_VERSION}",
+                "{}: version {}, expected {expected}",
                 self.display(&path),
                 state.state_version()
             )));
@@ -564,20 +565,34 @@ impl RecordId for JavaRuntimeEntry {
     }
 }
 
-/// `state.json` 能自报格式版本
+/// `state.json` 能自报格式版本，也知道自己该是哪个版本
+///
+/// 版本常量由类型自己给出（[`Self::expected_version`]），调用方不再猜。
+/// 原来 `load_state` 的泛型校验里写死了 `JAVA_STATE_VERSION`，于是任何非
+/// Java 集合都会被拿去和 Java 的版本号比对：`WorkspaceState`（版本 2）读
+/// java 的 1，直接被判 `Corrupt`。
 trait StateVersion {
+    /// 文件里记录的版本
     fn state_version(&self) -> u32;
+    /// 当前代码期望的版本
+    fn expected_version() -> u32;
 }
 
 impl StateVersion for WorkspaceState {
     fn state_version(&self) -> u32 {
         self.version
     }
+    fn expected_version() -> u32 {
+        WORKSPACE_STATE_VERSION
+    }
 }
 
 impl StateVersion for JavaState {
     fn state_version(&self) -> u32 {
         self.version
+    }
+    fn expected_version() -> u32 {
+        JAVA_STATE_VERSION
     }
 }
 
@@ -634,6 +649,17 @@ fn sync_parent(_path: &Path) {}
 /// 安全前提是**单层**：`collection_dir()/id.json` 中 `id` 不含 `/`、`\` 或就是
 /// `..` 时不可能离开集合目录；`state.json` 由调用侧单独排除（见
 /// [`JsonStore::record_id_of`]）。
+/// 校验 `rel_dir` 是单层目录名，否则拒绝写入
+fn check_rel_dir(rel_dir: &Path) -> Result<(), RepositoryError> {
+    if domain::server::meta::is_single_segment(rel_dir) {
+        Ok(())
+    } else {
+        Err(RepositoryError::InvalidRelDir {
+            rel_dir: rel_dir.to_path_buf(),
+        })
+    }
+}
+
 fn is_safe_record_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 128 && id != "." && id != ".." && !id.contains(['/', '\\', '\0'])
 }
@@ -887,6 +913,9 @@ impl WorkspaceRepository for JsonStore {
 impl ServerRepository for JsonStore {
     fn create(&self, meta: &ServerMeta) -> Result<(), RepositoryError> {
         let _guard = self.lock()?;
+        // 落盘前校验：绝对路径 / `..` / 分隔符一旦写入，之后每次由
+        // workspace + rel_dir 拼出的绝对路径都会指向工作区之外
+        check_rel_dir(&meta.rel_dir)?;
         let entry = ServerEntry::from(meta);
         // 工作目录必须已登记：文件系统没有外键，只能在这里显式检查
         if self
@@ -1009,6 +1038,8 @@ impl ServerRepository for JsonStore {
         {
             return Err(RepositoryError::NotFound(workspace_id.as_str().to_owned()));
         }
+        // 边界校验前移到写入路径：`doctor` 的事后体检拦不住已经落盘的坏值
+        check_rel_dir(rel_dir)?;
         let mut entry = self.find_server_entry(name)?;
         let target_workspace = workspace_id.as_str().to_owned();
         let mut candidate = entry.clone();
@@ -1137,6 +1168,52 @@ mod tests {
     use domain::server::artifact::{Checksum, ChecksumAlgorithm};
     use domain::server::meta::{InstalledJar, ServerId};
     use domain::server::version::ServerVariant;
+
+    /// 每个集合按自己的版本号校验，不串用别的集合的常量
+    ///
+    /// 回归：`load_state` 的泛型校验曾写死 `JAVA_STATE_VERSION`，于是
+    /// `WorkspaceState`（版本 2）被拿 java 的 1 比对，一律判 `Corrupt`。
+    #[test]
+    fn each_state_uses_its_own_version() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = JsonStore::open(dir.path()).expect("open");
+
+        // 写入版本 2 的工作区状态，读回必须成功（而不是被 java 的 1 否掉）
+        let mut state = WorkspaceState::new();
+        state.version = WORKSPACE_STATE_VERSION;
+        store
+            .write_state(Collection::Workspaces, &state)
+            .expect("write");
+        let read = store
+            .load_state(Collection::Workspaces, WorkspaceState::new)
+            .expect("工作区状态必须按工作区版本校验");
+        assert_eq!(read.version, WORKSPACE_STATE_VERSION);
+
+        // java 状态同理：版本 1 读回成功
+        let java = JavaState::new();
+        store
+            .write_state(Collection::Java, &java)
+            .expect("write java");
+        store
+            .load_state(Collection::Java, JavaState::new)
+            .expect("java 状态必须按 java 版本校验");
+    }
+
+    /// 版本不匹配时仍然拒绝（修 bug 不能把校验一起去掉）
+    #[test]
+    fn wrong_state_version_is_still_corrupt() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = JsonStore::open(dir.path()).expect("open");
+        let mut state = WorkspaceState::new();
+        state.version = WORKSPACE_STATE_VERSION + 1;
+        store
+            .write_state(Collection::Workspaces, &state)
+            .expect("write");
+        let err = store
+            .load_state(Collection::Workspaces, WorkspaceState::new)
+            .expect_err("未来版本必须拒绝");
+        assert!(matches!(err, RepositoryError::Corrupt(_)), "{err:?}");
+    }
 
     const WS01: &str = "550e8400-e29b-41d4-a716-446655440001";
     const WS02: &str = "550e8400-e29b-41d4-a716-446655440002";
@@ -1405,6 +1482,46 @@ mod tests {
         )
         .expect("relink");
         assert_eq!(moved.workspace_id, ws_id02);
+    }
+
+    /// `rel_dir` 逃逸必须在**写入时**被拒，而不是等 `doctor` 事后体检
+    ///
+    /// 回归：曾直接落盘，之后每次由 workspace + `rel_dir` 拼出的绝对路径都
+    /// 指向工作区之外，`backup` / `remove --purge` 全按那个路径操作。
+    #[test]
+    fn relink_rejects_escaping_rel_dir() {
+        let store = store_with_ws();
+        let ws_id = WorkspaceId::parse(WS01).expect("uuid");
+        let name = ServerName::parse("alpha").expect("valid");
+        add_server(&store, &sample_meta("alpha"));
+
+        for bad in ["../outside", "/abs", "a/b", ".."] {
+            let err = ServerRepository::relink(&store, &name, &ws_id, Path::new(bad), 1)
+                .expect_err("must reject");
+            assert!(
+                matches!(err, RepositoryError::InvalidRelDir { .. }),
+                "{bad:?} → {err:?}"
+            );
+        }
+
+        // 拒绝后记录未被改动
+        let unchanged = ServerRepository::get(&store, &name).expect("get");
+        assert_eq!(unchanged.rel_dir, Path::new("alpha"));
+    }
+
+    /// `create` 同样拒绝逃逸的 `rel_dir`
+    #[test]
+    fn create_rejects_escaping_rel_dir() {
+        let store = JsonStore::open_in_memory().expect("open");
+        add_ws(&store, &sample_ws("ws01", "/tmp/ws01", WS01));
+        let mut meta = sample_meta("alpha");
+        meta.rel_dir = PathBuf::from("../outside");
+        let err = ServerRepository::create(&store, &meta).expect_err("must reject");
+        assert!(
+            matches!(err, RepositoryError::InvalidRelDir { .. }),
+            "{err:?}"
+        );
+        assert_eq!(file_count(&store, Collection::Servers), 0, "失败不得落盘");
     }
 
     #[test]

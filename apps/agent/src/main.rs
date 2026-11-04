@@ -187,3 +187,64 @@ fn print_usage() {
     println!("  --data-dir <PATH>   数据目录，缺省为平台数据目录");
     println!("  --name <NAME>       本机名，缺省取系统主机名");
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use super::Args;
+
+    /// 只给 `--name` 时其余取缺省：`--listen` 用内置地址，`--data-dir` 用平台目录
+    #[test]
+    fn parse_keeps_defaults_for_unspecified_flags() {
+        let args = Args::parse(["--name", "node-a"]).expect("parse");
+        assert_eq!(args.name, "node-a");
+        assert_eq!(args.listen, super::DEFAULT_LISTEN);
+        assert_eq!(args.data_dir, mcsup::service::Config::default_data_dir());
+    }
+
+    /// 三个参数都能被覆盖，且 `--data-dir` 转成程序路径
+    #[test]
+    fn parse_accepts_every_flag() {
+        let args = Args::parse([
+            "--listen",
+            "0.0.0.0:9443",
+            "--data-dir",
+            "/tmp/agent-data",
+            "--name",
+            "node-b",
+        ])
+        .expect("parse");
+        assert_eq!(args.listen, "0.0.0.0:9443");
+        assert_eq!(args.data_dir, std::path::PathBuf::from("/tmp/agent-data"));
+        assert_eq!(args.name, "node-b");
+    }
+
+    /// 空名字必须拒绝：它会成为客户端的缺省远端名，空值无法被引用
+    #[test]
+    fn parse_rejects_blank_name() {
+        let err = Args::parse(["--name", "   "]).expect_err("must reject");
+        assert!(err.to_string().contains("--name"), "{err}");
+    }
+
+    /// 未知参数报用法错误，而不是被静默忽略
+    #[test]
+    fn parse_rejects_unknown_flag() {
+        let err = Args::parse(["--nope", "x"]).expect_err("must reject");
+        assert!(err.to_string().contains("--nope"), "{err}");
+    }
+
+    /// 缺取值的尾随参数要指出是哪一个
+    #[test]
+    fn parse_rejects_missing_value() {
+        let err = Args::parse(["--listen"]).expect_err("must reject");
+        assert!(err.to_string().contains("--listen"), "{err}");
+    }
+
+    /// 多次给出同一参数时后者生效（与常见 CLI 一致，不报错）
+    #[test]
+    fn parse_last_value_wins() {
+        let args = Args::parse(["--name", "first", "--name", "second"]).expect("parse");
+        assert_eq!(args.name, "second");
+    }
+}

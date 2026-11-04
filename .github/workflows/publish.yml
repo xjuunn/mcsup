@@ -42,7 +42,8 @@ jobs:
       - name: verify packageable
         run: |
           set -e
-          for pkg in domain port protocol service file java provider storage runtime mcsup; do
+          # 与 publish matrix 保持同一份清单：少一个就少验一个
+          for pkg in domain auth port protocol service file java provider storage backup transport runtime backend mcsup; do
             if cargo publish -p "$pkg" --dry-run >/dev/null 2>&1; then
               echo "$pkg: packageable"
             else
@@ -58,9 +59,25 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: true
-      # 依赖拓扑序：被依赖者先发。发布顺序即列表顺序（jobs 间用 needs 链）
+      # 依赖拓扑序：被依赖者先发。发布顺序即列表顺序（jobs 间用 needs 链）。
+      # 必须覆盖门面能 feature 拉入的**每一个**内层 crate：漏一个，门面发布时
+      # crates.io 找不到该依赖，整个版本发不出去（见 docs/embedding.md 分发形态）。
+      # 顺序：叶子契约 → 编排 → 实现层 → 门面。
       matrix:
-        crate: [domain, port, protocol, service, file, java, provider, storage, runtime]
+        crate:
+          - domain
+          - auth
+          - port
+          - protocol
+          - service
+          - file
+          - java
+          - provider
+          - storage
+          - backup
+          - transport
+          - runtime
+          - backend
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master

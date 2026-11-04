@@ -10,7 +10,8 @@
 
 use domain::backup::RelPath;
 use port::{
-    ContentStore, RUNTIME_ENTRIES, ScanError, ScanOutcome, ScanRules, Scanner, SkipReason, Skipped,
+    CancellationToken, ContentStore, RUNTIME_ENTRIES, ScanError, ScanOutcome, ScanRules, Scanner,
+    SkipReason, Skipped,
 };
 use std::fs;
 use std::path::Path;
@@ -27,10 +28,14 @@ pub fn scan_tree(
     store: &dyn ContentStore,
     rules: &ScanRules,
     on_file: &mut dyn FnMut(usize),
+    cancel: &CancellationToken,
 ) -> Result<ScanOutcome, ScanError> {
     let mut outcome = ScanOutcome::default();
     let mut pending = vec![root.to_path_buf()];
     while let Some(dir) = pending.pop() {
+        if cancel.is_cancelled() {
+            return Err(ScanError::Cancelled);
+        }
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
             // 目录在扫描途中消失（另一进程清理）：跳过而非整体失败
@@ -186,8 +191,9 @@ impl Scanner for DirectoryScanner {
         store: &dyn ContentStore,
         rules: &ScanRules,
         on_file: &mut dyn FnMut(usize),
+        cancel: &CancellationToken,
     ) -> Result<ScanOutcome, ScanError> {
-        scan_tree(root, store, rules, on_file)
+        scan_tree(root, store, rules, on_file, cancel)
     }
 }
 
@@ -217,7 +223,39 @@ mod tests {
     }
 
     fn scan(root: &Path, store: &CasStore, rules: &ScanRules) -> ScanOutcome {
-        scan_tree(root, store, rules, &mut |_| {}).expect("scan")
+        scan_tree(root, store, rules, &mut |_| {}, &CancellationToken::new()).expect("scan")
+    }
+
+    /// 已请求取消时立即返回 `Cancelled`，一个文件都不读
+    ///
+    /// 回归：`scan` 曾无法取消，几个 G 的存档扫到一半 Ctrl-C 只能杀入口，
+    /// 后台线程继续读盘直到结束。
+    #[test]
+    fn cancelled_scan_stops_before_reading_anything() {
+        let (server, _store_dir, store) = fixture();
+        write(server.path(), "world/level.dat", b"level");
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let err = scan_tree(
+            server.path(),
+            &store,
+            &ScanRules::default(),
+            &mut |_| {},
+            &cancel,
+        )
+        .expect_err("must cancel");
+        assert!(matches!(err, ScanError::Cancelled), "{err:?}");
+    }
+
+    /// 未取消的扫描不受影响（令牌默认未取消）
+    #[test]
+    fn fresh_token_does_not_block_scan() {
+        let (server, _store_dir, store) = fixture();
+        write(server.path(), "world/level.dat", b"level");
+        let outcome = scan(server.path(), &store, &ScanRules::default());
+        assert_eq!(outcome.entries.len(), 1);
     }
 
     #[test]
@@ -371,9 +409,15 @@ mod tests {
         write(server.path(), "b", b"2");
 
         let mut seen = Vec::new();
-        scan_tree(server.path(), &store, &ScanRules::default(), &mut |done| {
-            seen.push(done);
-        })
+        scan_tree(
+            server.path(),
+            &store,
+            &ScanRules::default(),
+            &mut |done| {
+                seen.push(done);
+            },
+            &CancellationToken::new(),
+        )
         .expect("scan");
         assert_eq!(seen, [1, 2]);
     }

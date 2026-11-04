@@ -14,7 +14,7 @@ MCSUP（Minecraft Server Utility Platform）是专业级 Minecraft Server 管理
 
 MCSUP 使用 Rust 构建，采用 Cargo Workspace + Monorepo 架构。
 
-MCSUP 面向三个入口：CLI（含 TUI）、API（REST / WebSocket，由 `apps/server`
+MCSUP 面向三个入口：CLI、API（REST / WebSocket，由 `apps/server`
 承载）、MCP。支持本地与远程 Server、Remote Agent，以及 Java / Minecraft
 Runtime、Provider、File、World、Backup、Mod、Player、Scheduler、Monitoring、
 Auth、Audit、Automation 等能力。目标是在生产环境长期稳定运行，可跨平台、高
@@ -37,12 +37,12 @@ Auth、Audit、Automation 等能力。目标是在生产环境长期稳定运行
 ```
 mcsup/
 ├── apps/
-│   ├── cli/                        # [已落地] CLI / TUI 程序入口，bin 名为 mcsup
+│   ├── cli/                        # [已落地] CLI 程序入口，bin 名为 mcsup
 │   ├── agent/                      # [已落地] Remote Agent 程序入口，bin 名为 mcsup-agent
 │   ├── server/                     # [目标] API（HTTP / REST / WebSocket）入口，bin 名为 mcsup-server
 │   ├── mcp/                        # [目标] MCP Server 入口，bin 名为 mcsup-mcp
 │   ├── dev/                        # [已落地] 开发辅助工具
-│   └── bench/                      # [目标] 性能基准测试程序
+│   └── bench/                      # [已落地] 性能基准（criterion，无 bin 目标）
 │
 ├── crates/
 │   ├── mcsup/                      # [已落地] 门面：feature 级联重导出内层，唯一发布单元
@@ -190,7 +190,7 @@ Domain 不涉及 CLI、HTTP、REST、TUI、MCP、数据库、RPC / gRPC，必须
 
 # Service
 
-`service` 是统一业务入口，CLI（含 TUI）、API、MCP 都经它调用。它负责
+`service` 是统一业务入口，CLI（TUI 落地后同样如此）、API、MCP 都经它调用。它负责
 业务流程、跨模块协调、权限检查入口、Domain Event，并统一 Local / Remote。
 
 Service 不负责 CLI 输出、HTTP Router、HTML、TUI 渲染、MCP 协议细节。
@@ -396,7 +396,7 @@ Object`），相同内容只存一次；Snapshot 记录各文件到哈希的映�
 
 Protocol 定义传输什么（`StartServerRequest` / `StartServerResponse` /
 `LogEvent` / `FileChunk` / `BackupProgress` 等消息类型）；Transport 定义怎么传
-（TLS 之上的长度前缀 JSON 帧 + 每请求一连接）。禁止把具体实现污染到 Domain。
+（TLS 之上的长度前缀 JSON 帧；本地 supervisor 的 IPC 每请求一个连接，远端 RPC 复用长连接）。禁止把具体实现污染到 Domain。
 
 > 早期设计写的是 gRPC / tonic / prost；实际落地的是自研帧层（`crates/transport`），
 > 理由见 `docs/remote.md`：本地 supervisor 的进程 IPC 与远端 RPC 共用
@@ -455,8 +455,10 @@ CLI 必须非常薄：`Parse → Validate → Call Service → Display → Exit 
 
 # TUI
 
-TUI 是 CLI 入口的一部分（与 CLI 同一个 app），基于 ratatui / crossterm，只负责
-Input / Rendering / Interaction。业务统一进入 Service，禁止复制 CLI 的业务逻辑。
+[目标] TUI 是 CLI 入口的一部分（与 CLI 同一个 app），基于 ratatui / crossterm，
+只负责 Input / Rendering / Interaction。业务统一进入 Service，禁止复制 CLI 的
+业务逻辑。当前尚未实现：`apps/cli` 只有交互选择器（`input.rs` 用 crossterm 的
+raw mode 读键位），没有任何全屏 TUI 模块。
 
 # MCP
 

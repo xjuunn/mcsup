@@ -166,6 +166,7 @@ impl fmt::Display for Selector {
 
 /// 跨来源解析失败
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum ResolveError {
     /// 限定名点名的来源没有配对
     #[error("origin '{0}' is not paired")]

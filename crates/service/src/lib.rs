@@ -1,3 +1,4 @@
+mod atomic;
 mod backup;
 mod content;
 mod doctor;
@@ -11,7 +12,6 @@ mod platform_doctor;
 mod props;
 mod registry;
 mod settings;
-mod util;
 mod workspace;
 
 /// `workspace doctor` 的检查项标识清单（`--only` 校验与帮助文案共用）
@@ -42,7 +42,8 @@ pub use modpack::{
 };
 pub use origin::{OriginFilter, ResolveError, Selector, resolve_index};
 pub use platform_config::{
-    Config, ConfigKey, ConfigValueError, FEATURE_HEADER, RemoteRecord, RemoteVia, lexical_normalize,
+    Config, ConfigKey, ConfigValueError, ConfigValueErrorKind, FEATURE_HEADER, RemoteRecord,
+    RemoteVia, lexical_normalize,
 };
 pub use platform_doctor::{PlatformCheck, PlatformDoctor, PlatformFinding, PlatformReport};
 /// Java 源聚合端口（定义在 `port`，此处转出便于既有调用方）

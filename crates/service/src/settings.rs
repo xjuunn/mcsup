@@ -150,6 +150,10 @@ impl ServerSettingsService {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unreachable,
+        reason = "测试替身用 unreachable! 标记不该被调用的分支"
+    )]
     use super::*;
     use domain::java::{JavaRuntime, JavaVendor};
     use domain::server::meta::{InstalledJar, ServerName};

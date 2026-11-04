@@ -562,6 +562,8 @@ fn response_name(response: &Response) -> &'static str {
         Response::Pruned { .. } => "pruned",
         Response::Task { .. } => "task",
         Response::Error { .. } => "error",
+        // 对端可能比本端新：未知帧只用于日志，不能静默当成成功
+        _ => "unknown",
     }
 }
 

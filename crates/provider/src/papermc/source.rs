@@ -55,6 +55,7 @@ pub(crate) const OFFICIAL_FILL: &str = "https://fill.papermc.io";
 /// 「项目 id / 变体 / 中文名」三件事的唯一口径。新增 Paper 系分支（上游再出
 /// 一个 fork）只需在这里加一项，来源实现不必改。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PaperProject {
     /// Paper：高性能服务端
     Paper,
@@ -107,6 +108,7 @@ impl fmt::Display for PaperProject {
 
 /// 挑选 build 的口径
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum Picks {
     /// 稳定渠道（`STABLE`）最新 build；没有稳定版时退回该版本首条
     #[default]

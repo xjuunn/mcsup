@@ -371,6 +371,12 @@ impl RemoteBackupPort for RemoteBackups {
             Some(domain::backup::RetentionPolicy::Keep(n)) => (Some(n), None),
             Some(domain::backup::RetentionPolicy::OlderThan(secs)) => (None, Some(secs)),
             None => (None, None),
+            // 新增保留口径时必须显式决定怎么发给对端，不能静默当成「无策略」
+            Some(_) => {
+                return Err(RemoteBackupError::Invalid(
+                    "this retention policy is not supported over the wire".to_owned(),
+                ));
+            }
         };
         let response = self.call(&Request::BackupPrune {
             server_id: server_id.as_str().to_owned(),

@@ -3,9 +3,9 @@
 //! 解析与渲染规则在 `domain::server::props`，本层只负责定位与 IO；
 //! 判定不分叉，入口（CLI / API / MCP）不直接碰文件。
 
+use crate::atomic::write_atomic;
 use crate::fs_error::FsError;
 use crate::registry::{RegisteredServer, ServerRegistry, ServerRegistryError};
-use crate::util::write_atomic;
 use domain::server::props::{PROPERTIES_FILE, Properties};
 use std::io::ErrorKind;
 use std::path::PathBuf;
@@ -107,6 +107,10 @@ impl ServerPropsService {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unreachable,
+        reason = "测试替身用 unreachable! 标记不该被调用的分支"
+    )]
     use super::*;
     use domain::server::version::{ServerVariant, VersionId};
     use domain::workspace::{Workspace, WorkspaceId, WorkspaceName};

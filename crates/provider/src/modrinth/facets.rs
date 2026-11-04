@@ -27,6 +27,7 @@ use std::fmt::Write as _;
 /// 上游支持的比较符以等号为主；`>=` / `<=` 等用于数值（下载量、关注数）与
 /// 时间戳。字符串比较默认用 `=`（等价于 `:`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FacetOp {
     /// 等于（`=`，等价于 `:`）
     Eq,

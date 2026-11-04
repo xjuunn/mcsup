@@ -45,6 +45,7 @@ pub(crate) const OFFICIAL_API: &str = "https://api.purpurmc.org/v2";
 
 /// 挑选 build 的口径
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum Picks {
     /// 该版本的最新 build（`builds.latest`）
     #[default]

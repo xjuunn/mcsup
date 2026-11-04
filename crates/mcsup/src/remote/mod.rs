@@ -142,6 +142,7 @@ pub const PAIRING_ROTATE_INTERVAL: Duration = Duration::from_secs(5);
 /// 差别只在「谁决定发码、码住在哪」，短时有效 / 单次使用 / 限速冷却三条
 /// 不变量由 `auth::code::PairingSlot` 统一回答，不随策略分叉。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PairingPolicy {
     /// **连续**：码在进程内存里，屏幕上总有当前有效码，过期自动轮换
     ///

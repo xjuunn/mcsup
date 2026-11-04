@@ -151,8 +151,13 @@ for manifest in $manifests; do
 			}
 		' "$manifest")
 		if [ -z "$bin_names" ]; then
-			# 无显式 [[bin]] 时 Cargo 用 package 名
-			bin_names="$name"
+			# 无显式 [[bin]] 时 Cargo 用 package 名。
+			# 例外：bench 只有 benchmark 目标（[lib] + [[bench]]），不产出可执行
+			# 文件，也就没有 PATH 命名问题，不能按 package 名推断 bin。
+			case "$name" in
+			bench) ;;
+			*) bin_names="$name" ;;
+			esac
 		fi
 		for bin in $bin_names; do
 			case "$bin" in

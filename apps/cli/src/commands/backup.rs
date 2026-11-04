@@ -14,9 +14,10 @@ use crate::prompts;
 use anyhow::{Context, Result};
 use comfy_table::{ContentArrangement, Table};
 use mcsup::domain::backup::{
-    BackupScope, ContentHash, Page, RestoreTarget, RetentionPolicy, Snapshot, SnapshotId, parse_age,
+    BackupScope, ContentHash, Page, RestoreTarget, RetentionInput, Snapshot, SnapshotId, parse_age,
 };
 use mcsup::domain::server::meta::ServerName;
+use mcsup::domain::server::settings::parse_backup_scope;
 use mcsup::protocol::cli::{
     BackupCreateJson, BackupDeleteJson, BackupListJson, BackupPruneJson, BackupRestoreJson,
     BackupRow, BackupVerifyJson,
@@ -82,7 +83,9 @@ pub(crate) async fn create(
         printer.is_human(),
     );
     let owned = name.to_owned();
-    let result = tokio::task::spawn_blocking(move || service.create(&owned, &options))
+    // 令牌来自 spinner：Ctrl-C 已在 `TaskSpinner` 里接管，扫描随即中止
+    let cancel = spinner.cancel().clone();
+    let result = tokio::task::spawn_blocking(move || service.create(&owned, &options, &cancel))
         .await
         .context(crate::i18n::pick(printer.lang(), "备份任务", "backup task"))?;
     spinner.finish();
@@ -229,13 +232,15 @@ pub(crate) async fn restore(
         printer.is_human(),
     );
     let owned = name.to_owned();
-    let result = tokio::task::spawn_blocking(move || service.restore(&owned, &id, &target))
-        .await
-        .context(crate::i18n::pick(
-            printer.lang(),
-            "恢复任务",
-            "restore task",
-        ))?;
+    let cancel = spinner.cancel().clone();
+    let result =
+        tokio::task::spawn_blocking(move || service.restore(&owned, &id, &target, &cancel))
+            .await
+            .context(crate::i18n::pick(
+                printer.lang(),
+                "恢复任务",
+                "restore task",
+            ))?;
     spinner.finish();
     let outcome = result?;
 
@@ -472,8 +477,8 @@ pub(crate) fn prune(
     printer: Printer,
 ) -> Result<()> {
     let service = backup_service()?;
-    let policy = parse_policy(printer.lang(), keep, older_than)?;
-    let outcome = service.prune(name, policy, dry_run)?;
+    let retention = parse_retention(printer.lang(), keep, older_than)?;
+    let outcome = service.prune(name, retention, dry_run)?;
 
     let removed: Vec<&str> = outcome.removed.iter().map(|s| s.id.as_str()).collect();
     let payload = BackupPruneJson {
@@ -550,9 +555,12 @@ fn row_of(snapshot: &Snapshot) -> BackupRow<'_> {
 }
 
 /// `--scope` 解析：逗号分隔的顶层项
+///
+/// 转交 `domain::parse_backup_scope`——`server set backup-scope` 与 `--scope`
+/// 必须接受同一套写法（含 `all` / `-` / 空表示全部），本层只负责把错误渲染成
+/// 用法提示。
 fn parse_scope(lang: crate::locale::Lang, raw: &str) -> Result<BackupScope> {
-    let entries = raw.split(',').map(str::trim).filter(|s| !s.is_empty());
-    BackupScope::from_entries(entries).map_err(|err| {
+    parse_backup_scope(raw).map_err(|err| {
         AppDiagnostic::usage(
             crate::i18n::pick(
                 lang,
@@ -571,48 +579,37 @@ fn parse_scope(lang: crate::locale::Lang, raw: &str) -> Result<BackupScope> {
     })
 }
 
-/// `--keep` / `--older-than` → 保留策略；都不给时为 `None`（只做 GC）
-fn parse_policy(
+/// `--keep` / `--older-than` → 保留策略的原始输入
+///
+/// 只做字面量到秒数的换算（文案需要 `--older-than` 的原文），**两个都给出
+/// 的冲突判定交给 `service`**：远端 RPC 拿到的是同一对字段，判定写两处就会
+/// 一处报错一处静默择一。
+fn parse_retention(
     lang: crate::locale::Lang,
     keep: Option<usize>,
     older_than: Option<&str>,
-) -> Result<Option<RetentionPolicy>> {
-    match (keep, older_than) {
-        (Some(_), Some(_)) => Err(AppDiagnostic::usage(
-            crate::i18n::pick(
-                lang,
-                "--keep 与 --older-than 不能同时使用",
-                "--keep and --older-than cannot be used together",
-            ),
-            Some(crate::i18n::pick(
-                lang,
-                "二选一：--keep N 保留最近 N 份，或 --older-than 7d 删除更早的",
-                "pick one: --keep N keeps the newest N, or --older-than 7d drops older ones",
-            )),
-        )
-        .into()),
-        (Some(n), None) => Ok(Some(RetentionPolicy::Keep(n))),
-        (None, Some(raw)) => {
-            let secs = parse_age(raw).map_err(|err| {
-                AppDiagnostic::usage(
-                    crate::i18n::pick(
-                        lang,
-                        format!("时长非法：{raw}"),
-                        format!("invalid age: {raw}"),
-                    ),
-                    Some(crate::i18n::pick(
-                        lang,
-                        format!("用带单位的时长，如 30s / 15m / 12h / 7d / 4w（{err}）"),
-                        format!(
-                            "use a duration with a unit, e.g. 30s / 15m / 12h / 7d / 4w ({err})"
-                        ),
-                    )),
-                )
-            })?;
-            Ok(Some(RetentionPolicy::OlderThan(secs)))
-        }
-        (None, None) => Ok(None),
-    }
+) -> Result<RetentionInput> {
+    let older_than_secs = match older_than {
+        Some(raw) => Some(parse_age(raw).map_err(|err| {
+            AppDiagnostic::usage(
+                crate::i18n::pick(
+                    lang,
+                    format!("时长非法：{raw}"),
+                    format!("invalid age: {raw}"),
+                ),
+                Some(crate::i18n::pick(
+                    lang,
+                    format!("用带单位的时长，如 30s / 15m / 12h / 7d / 4w（{err}）"),
+                    format!("use a duration with a unit, e.g. 30s / 15m / 12h / 7d / 4w ({err})"),
+                )),
+            )
+        })?),
+        None => None,
+    };
+    Ok(RetentionInput {
+        keep,
+        older_than_secs,
+    })
 }
 
 /// 交互选择快照：标签带时间与大小，回映到 id
@@ -715,27 +712,58 @@ mod tests {
         assert_eq!(Printer::exit_code(&err), 2);
     }
 
+    /// `--scope all` 与 `server set backup-scope all` 同义
+    ///
+    /// 回归：CLI 曾自行按逗号切分，`all` 被当成名为 `all` 的顶层项，得到空范围，
+    /// 随后以「范围内没有可备份内容」收场——错误信息不指向真正原因。
     #[test]
-    fn parse_policy_requires_one_of_keep_or_older_than() {
-        assert_eq!(
-            parse_policy(crate::locale::Lang::Zh, Some(3), None).expect("keep"),
-            Some(RetentionPolicy::Keep(3))
-        );
-        assert_eq!(
-            parse_policy(crate::locale::Lang::Zh, None, Some("7d")).expect("age"),
-            Some(RetentionPolicy::OlderThan(7 * 24 * 3600))
-        );
-        assert_eq!(
-            parse_policy(crate::locale::Lang::Zh, None, None).expect("none"),
-            None
-        );
-        let err = parse_policy(crate::locale::Lang::Zh, Some(1), Some("7d")).expect_err("both");
-        assert_eq!(Printer::exit_code(&err), 2);
+    fn parse_scope_all_matches_settings_semantics() {
+        for raw in ["all", "ALL", "-", "", "  "] {
+            let scope = parse_scope(crate::locale::Lang::Zh, raw).expect("all scope");
+            assert!(scope.is_all(), "--scope {raw:?} 应表示全部");
+        }
     }
 
     #[test]
-    fn parse_policy_rejects_age_without_unit() {
-        let err = parse_policy(crate::locale::Lang::Zh, None, Some("7")).expect_err("bad age");
+    fn parse_retention_maps_each_option() {
+        assert_eq!(
+            parse_retention(crate::locale::Lang::Zh, Some(3), None).expect("keep"),
+            RetentionInput {
+                keep: Some(3),
+                older_than_secs: None
+            }
+        );
+        assert_eq!(
+            parse_retention(crate::locale::Lang::Zh, None, Some("7d")).expect("age"),
+            RetentionInput {
+                keep: None,
+                older_than_secs: Some(7 * 24 * 3600)
+            }
+        );
+        assert_eq!(
+            parse_retention(crate::locale::Lang::Zh, None, None).expect("none"),
+            RetentionInput::default()
+        );
+    }
+
+    /// 冲突不在 CLI 判定：两个都给出时照常递交，由 `service` 统一拒绝
+    ///
+    /// 这条断言的是「CLI 不自行择一」——若这里回退成本地报错，远端 RPC 就会
+    /// 再次与本地分叉。
+    #[test]
+    fn parse_retention_defers_conflict_to_service() {
+        let input = parse_retention(crate::locale::Lang::Zh, Some(1), Some("7d")).expect("passes");
+        assert_eq!(input.keep, Some(1));
+        assert_eq!(input.older_than_secs, Some(7 * 24 * 3600));
+        assert!(
+            input.resolve().is_err(),
+            "冲突必须由 domain 的 resolve 判出"
+        );
+    }
+
+    #[test]
+    fn parse_retention_rejects_age_without_unit() {
+        let err = parse_retention(crate::locale::Lang::Zh, None, Some("7")).expect_err("bad age");
         assert_eq!(Printer::exit_code(&err), 2);
     }
 

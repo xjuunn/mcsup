@@ -170,6 +170,7 @@ impl TryFrom<WireJar> for InstalledJar {
 /// 不必在读取侧补一堆「`kind = jar` 却带了 `files`」的判断。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum WireLaunch {
     /// 单个可运行 JAR
     Jar {
@@ -543,6 +544,7 @@ impl TryFrom<WireStatus> for SupervisorStatus {
 /// 停机结果的线格式
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum WireStop {
     /// 宽限内正常退出
     Stopped {

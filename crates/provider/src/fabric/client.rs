@@ -45,6 +45,7 @@ pub(crate) const OFFICIAL_META: &str = "https://meta.fabricmc.net";
 /// 口径，[`Fixed`](Self::Fixed) 目前只能通过 [`FabricSource::builder`] 注入，
 /// 没有配置项驱动。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum Picks {
     /// 最新稳定版；无稳定版时退回列表首项（最新）
     #[default]

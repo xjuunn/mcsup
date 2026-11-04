@@ -144,30 +144,62 @@ impl std::fmt::Display for ConfigKey {
 }
 
 /// 配置值非法
+///
+/// `Display` 只给英文短语：库产出的文案由入口层决定（`docs/rust-standards.md`
+/// 的「判定与文案分离」）。面向用户的中文说明由入口用 [`Self::kind`] 与各字段
+/// 自行拼装。
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ConfigValueError {
     /// 路径为空或无法归一化
-    #[error("{key} 不是可用路径: {value}")]
+    #[error("{key} is not a usable path: {value} ({reason})")]
     Path {
         /// 键名
         key: &'static str,
         /// 原始输入
         value: String,
-        /// 具体原因
-        reason: String,
+        /// 具体原因（英文短语，由本 crate 给出）
+        reason: &'static str,
     },
 }
 
 impl ConfigValueError {
-    /// 面向用户的完整说明（含可用取值）
+    /// 错误种类：入口据此选择本地化文案
     #[must_use]
-    pub fn describe(&self) -> String {
+    pub fn kind(&self) -> ConfigValueErrorKind {
         match self {
-            Self::Path { key, value, reason } => {
-                format!("{key} 不是可用路径: {value}（{reason}）")
-            }
+            Self::Path { .. } => ConfigValueErrorKind::Path,
         }
     }
+}
+
+/// [`ConfigValueError`] 的可本地化种类
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigValueErrorKind {
+    /// 路径不可用
+    Path,
+}
+
+/// 整份配置文本无法解析
+///
+/// 与 [`ConfigValueError`]（单个键的取值问题）分开：调用方对「整份文件读不懂」
+/// 与「某个键的值不对」的处置不同，混成一个 `String` 就再也分不开。
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ConfigDocumentError {
+    /// TOML 语法错误
+    #[error("config file is not valid TOML: {reason}")]
+    Syntax {
+        /// 解析器给出的说明
+        reason: String,
+    },
+    /// 某个键的取值非法
+    #[error("{0}")]
+    Value(#[from] ConfigValueError),
+    /// 远端名不可用作配置键
+    #[error("remote name {name:?} is not usable as a config key")]
+    RemoteName {
+        /// 原始键名
+        name: String,
+    },
 }
 
 impl Config {
@@ -242,18 +274,21 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// TOML 非法、未知键或取值非法时返回说明
-    pub fn parse_document(text: &str) -> Result<Self, String> {
-        let mut cfg: Self = toml::from_str(text).map_err(|err| err.to_string())?;
+    /// 返回 `ConfigDocumentError`：TOML 非法、未知键或取值非法
+    pub fn parse_document(text: &str) -> Result<Self, ConfigDocumentError> {
+        let mut cfg: Self = toml::from_str(text).map_err(|err| ConfigDocumentError::Syntax {
+            reason: err.to_string(),
+        })?;
         // 逐项重跑设置校验：手改文件同样要过键表（路径归一化、枚举取值）
         for key in ConfigKey::ALL {
             if let Some(raw) = cfg.raw(*key) {
-                cfg.set(*key, &raw).map_err(|err| err.describe())?;
+                cfg.set(*key, &raw)?;
             }
         }
         // 远端名是配置键，手改文件同样要过同一套校验
         for name in cfg.remotes.keys() {
-            RemoteName::parse(name).map_err(|err| format!("remotes.{name}: {err}"))?;
+            RemoteName::parse(name)
+                .map_err(|_| ConfigDocumentError::RemoteName { name: name.clone() })?;
         }
         Ok(cfg)
     }
@@ -306,10 +341,10 @@ fn parse_path(key: &'static str, value: &str) -> Result<PathBuf, ConfigValueErro
         return Err(ConfigValueError::Path {
             key,
             value: value.to_owned(),
-            reason: "路径为空".to_owned(),
+            reason: "path is empty",
         });
     }
-    let err = |reason: String| ConfigValueError::Path {
+    let err = |reason: &'static str| ConfigValueError::Path {
         key,
         value: value.to_owned(),
         reason,
@@ -319,12 +354,12 @@ fn parse_path(key: &'static str, value: &str) -> Result<PathBuf, ConfigValueErro
         expanded
     } else {
         std::env::current_dir()
-            .map_err(|e| err(e.to_string()))?
+            .map_err(|_| err("cannot resolve the current directory"))?
             .join(expanded)
     };
     let normalized = lexical_normalize(&absolute);
     if normalized.exists() && !normalized.is_dir() {
-        return Err(err("该路径已存在且不是目录".to_owned()));
+        return Err(err("path exists and is not a directory"));
     }
     Ok(normalized)
 }
@@ -427,7 +462,13 @@ mod tests {
         let err = cfg
             .set(ConfigKey::DataDir, &file.to_string_lossy())
             .expect_err("文件不是目录");
-        assert!(err.describe().contains("不是目录"), "{}", err.describe());
+        assert_eq!(err.kind(), ConfigValueErrorKind::Path);
+        assert!(err.to_string().contains("not a usable path"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("path exists and is not a directory"),
+            "{err}"
+        );
         let _ = std::fs::remove_file(&file);
     }
 
@@ -512,7 +553,11 @@ mod tests {
     fn invalid_remote_names_are_rejected_on_load() {
         let text = "[remotes.\"a/b\"]\ntarget = \"host\"\nvia = \"ssh\"\n";
         let err = Config::parse_document(text).expect_err("名字含 / 必须拒绝");
-        assert!(err.contains("remotes.a/b"), "{err}");
+        // 结构化错误：不再是「整份说明字符串里找子串」，而是能直接取到那个键
+        let ConfigDocumentError::RemoteName { name } = &err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert_eq!(name, "a/b");
 
         let text = "[remotes.all]\ntarget = \"host\"\nvia = \"ssh\"\n";
         assert!(Config::parse_document(text).is_err(), "保留字必须拒绝");

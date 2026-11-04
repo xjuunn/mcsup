@@ -1,3 +1,7 @@
+#![allow(
+    clippy::unreachable,
+    reason = "测试替身用 unreachable! 标记不该被调用的分支"
+)]
 //! 备份路由：远端条目整段转发到 `RemoteBackupPort`，本地照旧走本地存储
 //!
 //! 用最小夹具：`MemServerRepo` 外套一个「按名字标远端来源」的组合仓库 +
@@ -6,12 +10,12 @@
 
 #![allow(clippy::expect_used)]
 
-use domain::backup::{Page, RestoreTarget, RetentionPolicy};
+use domain::backup::{Page, RestoreTarget, RetentionInput, RetentionPolicy};
 use domain::server::meta::{ServerId, ServerName};
 use port::{
-    RemoteBackupCreate, RemoteBackupError, RemoteBackupPort, RemoteCreateOutcome,
-    RemoteDeleteOutcome, RemotePruneOutcome, RemoteRestoreOutcome, RemoteSnapshotPage,
-    RemoteVerifyOutcome, RepositoryError, Sourced,
+    CancellationToken, RemoteBackupCreate, RemoteBackupError, RemoteBackupPort,
+    RemoteCreateOutcome, RemoteDeleteOutcome, RemotePruneOutcome, RemoteRestoreOutcome,
+    RemoteSnapshotPage, RemoteVerifyOutcome, RepositoryError, Sourced,
 };
 use service::{BackupService, CreateOptions, ServerRegistry};
 use std::sync::{Arc, Mutex};
@@ -118,6 +122,7 @@ impl port::Backend for LocalBackendFixture {
     fn supervisor(&self) -> &dyn port::SupervisorPort {
         &self.supervisor
     }
+
     fn installer(&self) -> &dyn port::InstallerRunner {
         &NoopInstaller
     }
@@ -131,7 +136,7 @@ impl port::InstallerRunner for NoopInstaller {
         _installer: &std::path::Path,
         _dir: &std::path::Path,
         _output: Option<&dyn port::InstallerOutputSink>,
-        _cancel: &port::CancellationToken,
+        _cancel: &CancellationToken,
     ) -> Result<(), port::InstallerError> {
         unreachable!("not used")
     }
@@ -283,6 +288,7 @@ fn remote_entries_forward_to_executor() {
                 flush_wait_ms: Some(0),
                 ..CreateOptions::default()
             },
+            &CancellationToken::new(),
         )
         .expect_err("mock always fails");
     assert!(err.to_string().contains("not found"), "{err}");
@@ -292,7 +298,12 @@ fn remote_entries_forward_to_executor() {
     let err = svc.list("bravo", Page::new(1, 10)).expect_err("mock");
     assert!(err.to_string().contains("not found"), "{err}");
     let err = svc
-        .restore("bravo", "snap", &RestoreTarget::InPlace)
+        .restore(
+            "bravo",
+            "snap",
+            &RestoreTarget::InPlace,
+            &CancellationToken::new(),
+        )
         .expect_err("mock");
     assert!(err.to_string().contains("not found"), "{err}");
     let err = svc.delete("bravo", "snap").expect_err("mock");
@@ -302,7 +313,14 @@ fn remote_entries_forward_to_executor() {
         .expect_err("mock");
     assert!(err.to_string().contains("not found"), "{err}");
     let err = svc
-        .prune("bravo", Some(RetentionPolicy::Keep(1)), true)
+        .prune(
+            "bravo",
+            RetentionInput {
+                keep: Some(1),
+                older_than_secs: None,
+            },
+            true,
+        )
         .expect_err("mock");
     assert!(err.to_string().contains("not found"), "{err}");
     assert_eq!(
@@ -316,7 +334,11 @@ fn remote_without_executor_is_unreachable() {
     let (combined, fixture) = fixture_with_remote();
     let svc = routed_service(&combined, &fixture, None);
     let err = svc
-        .create("bravo", &CreateOptions::default())
+        .create(
+            "bravo",
+            &CreateOptions::default(),
+            &CancellationToken::new(),
+        )
         .expect_err("no executor");
     assert!(err.to_string().contains("unreachable"), "{err}");
     assert!(err.to_string().contains("'edge'"), "错误应带远端名：{err}");
@@ -338,6 +360,7 @@ fn local_entries_never_touch_executor() {
             flush_wait_ms: Some(0),
             ..CreateOptions::default()
         },
+        &CancellationToken::new(),
     );
     assert!(mock.taken().is_empty(), "本地不得走远端执行器");
 }
@@ -352,7 +375,11 @@ fn unknown_server_fails_before_routing() {
         Some(Arc::clone(&mock) as Arc<dyn RemoteBackupPort>),
     );
     let err = svc
-        .create("ghost", &CreateOptions::default())
+        .create(
+            "ghost",
+            &CreateOptions::default(),
+            &CancellationToken::new(),
+        )
         .expect_err("ghost");
     assert!(
         err.to_string().contains("not found") || err.to_string().contains("ghost"),

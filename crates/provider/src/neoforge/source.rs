@@ -58,6 +58,7 @@ pub(crate) const OFFICIAL_MAVEN: &str = "https://maven.neoforged.net";
 /// 给宿主留的扩展点：[`Latest`](Self::Latest) 是默认口径（该 MC 线最新 build），
 /// [`Fixed`](Self::Fixed) 只经 [`NeoForgeSource::builder`] 注入。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum Picks {
     /// 该 MC 线最新 build（列表末项）
     #[default]

@@ -257,7 +257,7 @@ impl WorkspaceService {
     ///
     /// 目录非空、名称冲突、IO / marker / 注册表失败时返回 [`WorkspaceError`]
     pub fn init(&self, dir: &Path, name: Option<&str>) -> Result<InitOutcome, WorkspaceError> {
-        let now = crate::util::unix_now();
+        let now = crate::atomic::unix_now();
         let dir = absolute_path(dir);
 
         if let Some(marker) = read_marker(&dir)? {
@@ -730,7 +730,7 @@ fn write_marker(dir: &Path, marker: &MarkerToml) -> Result<(), WorkspaceError> {
     let text = toml::to_string_pretty(marker)
         .map_err(|err| WorkspaceError::marker(path.clone(), err.to_string()))?;
     // 原子替换：marker 被截断等于工作区身份丢失，`workspace use` 会直接拒绝
-    crate::util::write_atomic(&path, &text)?;
+    crate::atomic::write_atomic(&path, &text)?;
     Ok(())
 }
 
@@ -781,17 +781,26 @@ pub fn absolute_path(dir: &Path) -> PathBuf {
 pub(crate) fn ensure_outside(cwd: &Path, target: &Path) -> Result<(), WorkspaceError> {
     let cwd = normalize_path(&absolute_path(cwd));
     let target = normalize_path(&absolute_path(target));
-    let same_space_cwd = physical_path(&cwd);
-    let same_space_target = physical_path(&target);
-    if same_space_cwd.starts_with(&same_space_target) {
+    if is_within(&cwd, &target) {
         return Err(WorkspaceError::CwdInsideTarget { cwd, target });
     }
     Ok(())
 }
 
 /// 解析符号链接后的物理路径；不存在或不可解析时原样返回
-fn physical_path(path: &Path) -> PathBuf {
+pub(crate) fn physical_path(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// `target` 是否落在 `root` 之内（先解析符号链接再比较）
+///
+/// 路径包含判定的唯一实现：`workspace remove --purge`、`server remove --purge`
+/// 与「目标在 servers/ 子树内就拒绝」三处都用它。各写一份的后果是其中一处忘了
+/// 解析符号链接，于是 `/var/...` 与 `/private/var/...` 被当成两个目录，正在
+/// 使用的目录会被删掉。
+#[must_use]
+pub(crate) fn is_within(target: &Path, root: &Path) -> bool {
+    physical_path(target).starts_with(physical_path(root))
 }
 
 /// 去掉 `.` 组件与多余分隔符
@@ -809,6 +818,10 @@ fn normalize_workspace(mut ws: Workspace) -> Workspace {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unreachable,
+        reason = "测试替身用 unreachable! 标记不该被调用的分支"
+    )]
     use super::*;
     use port::WorkspaceRepository;
     use std::path::Path;

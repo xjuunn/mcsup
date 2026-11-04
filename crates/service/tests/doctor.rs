@@ -245,14 +245,45 @@ fn dangling_symlink_is_an_error() {
 fn rel_dir_outside_servers_is_rejected() {
     let fx = Fixture::new();
     let ws = fx.workspace("ws1");
-    // `..` 会把路径拼到工作区之外，必须先于「磁盘缺失」判出来
-    fx.server(&ws, "alpha", "..");
+    // `storage` 已在写入路径拒绝逃逸的 `rel_dir`，所以这里必须绕开校验、
+    // 直接改记录文件来模拟外部损坏（同上一个用例的做法）
+    let srv = fx.server(&ws, "alpha", "alpha");
+    patch_rel_dir(&fx, &srv.name);
 
     let found = kinds(&fx.doctor());
     assert!(
         found.contains(&"rel-dir-not-direct-child".to_owned()),
         "{found:?}"
     );
+}
+
+/// 把记录里的 `rel_dir` 改写成 `..`，绕开写入校验
+///
+/// 用于模拟「记录被外部改坏」——写入路径已拒绝逃逸值，正常 API 造不出这种记录。
+/// 只替换 JSON 的 `rel_dir` 字段，不动 `name`（否则会先被名字校验拦下）。
+fn patch_rel_dir(fx: &Fixture, name: &ServerName) {
+    let dir = fx.root.join("db/servers");
+    let mut patched = false;
+    for entry in std::fs::read_dir(&dir).expect("read servers").flatten() {
+        let text = std::fs::read_to_string(entry.path()).expect("read record");
+        if !text.contains(name.as_str()) {
+            continue;
+        }
+        // 记录是 `to_vec_pretty` 写的：键与冒号之间有空格
+        let from = "\"rel_dir\"";
+        let idx = text.find(from).expect("记录里应有 rel_dir");
+        let after_key = idx + from.len();
+        let value_start = after_key + text[after_key..].find('"').expect("rel_dir 值起始") + 1;
+        let value_end = value_start + text[value_start..].find('"').expect("rel_dir 值结束");
+        let mut replaced = String::new();
+        replaced.push_str(&text[..value_start]);
+        replaced.push_str("..");
+        replaced.push_str(&text[value_end..]);
+        assert_ne!(text, replaced, "rel_dir 应被改写");
+        std::fs::write(entry.path(), replaced).expect("write record");
+        patched = true;
+    }
+    assert!(patched, "未找到 {name} 的记录");
 }
 
 #[test]

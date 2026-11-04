@@ -437,3 +437,29 @@ pub fn assert_present(path: &Path, invariant: &str) {
             .tree(path.parent().unwrap_or(path))
     });
 }
+
+/// 建一个带唯一后缀的临时目录，返回其路径
+///
+/// `tag` 进目录名，便于排查「哪个测试留下了垃圾」。名字里的 pid + 纳秒后缀
+/// 保证并行测试、同一进程内重复调用都不会撞名。
+///
+/// 用完由调用方自行清理；集成测试通常直接留在系统临时目录里——测试结束即
+/// 无意义，为之引入 `TempDir` 守卫只会让「失败现场」在报错后被删掉。
+///
+/// # Panics
+///
+/// 目录建不出来时 panic：测试环境的临时目录不可用属于环境损坏，
+/// 继续跑只会得到一连串误导性的失败。
+#[must_use]
+pub fn temp_dir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "mcsup-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("tempdir");
+    dir
+}

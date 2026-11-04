@@ -1,0 +1,39 @@
+[package]
+name = "mcsup-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# 独立的 fuzz workspace：cargo-fuzz 要求它自己是一个 workspace 根，
+# 且 nightly 专用，不能挂在主 workspace 里（否则 MSRV 与 clippy 都会被拖累）。
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+mcsup = { version = "0.1.0", path = "../crates/mcsup", features = ["domain"] }
+
+# 解析器类模块进 fuzz：路径、快照 id、内容哈希都是外部输入
+# （快照清单来自磁盘、id 来自 CLI 参数、哈希来自远端帧）。
+[[bin]]
+name = "parse_rel_path"
+path = "fuzz_targets/parse_rel_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_snapshot_id"
+path = "fuzz_targets/parse_snapshot_id.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_content_hash"
+path = "fuzz_targets/parse_content_hash.rs"
+test = false
+doc = false
+bench = false

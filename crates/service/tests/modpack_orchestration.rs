@@ -221,17 +221,9 @@ impl ArtifactDownloader for FakeDownloader {
     }
 }
 
-fn temp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "mcsup-modpack-{name}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("tempdir");
-    dir
+/// 本文件的临时目录统一带 `modpack` 前缀（实现见 `testkit::temp_dir`）
+fn scratch(name: &str) -> PathBuf {
+    testkit::temp_dir(&format!("modpack-{name}"))
 }
 
 fn deps(pairs: &[(&str, &str)]) -> ModpackDependencies {
@@ -346,7 +338,7 @@ async fn applies_files_and_overrides() {
     )
     .expect("index");
     let service = service(index, vec![("pack.meta", b"meta")], FakeDownloader::ok());
-    let dir = temp_dir("apply");
+    let dir = scratch("apply");
 
     let prepared = service
         .prepare(
@@ -392,7 +384,7 @@ async fn skips_server_unsupported_files() {
     )
     .expect("index");
     let service = service(index, Vec::new(), FakeDownloader::ok());
-    let dir = temp_dir("skip");
+    let dir = scratch("skip");
 
     let prepared = service
         .prepare(
@@ -430,7 +422,7 @@ async fn reuses_existing_same_size_file() {
     let downloader = FakeDownloader::ok();
     let seen = downloader.requests.clone();
     let service = service(index, Vec::new(), downloader);
-    let dir = temp_dir("reuse");
+    let dir = scratch("reuse");
     std::fs::create_dir_all(dir.join("mods")).expect("mkdir");
     std::fs::write(dir.join("mods/a.jar"), b"xxxx").expect("seed");
 
@@ -467,7 +459,7 @@ async fn missing_minecraft_is_reported() {
     )
     .expect("index");
     let service = service(index, Vec::new(), FakeDownloader::ok());
-    let dir = temp_dir("nomc");
+    let dir = scratch("nomc");
 
     let prepared = service
         .prepare(
@@ -497,7 +489,7 @@ async fn mrpack_download_failure_propagates() {
     )
     .expect("index");
     let service = service(index, Vec::new(), FakeDownloader::failing());
-    let dir = temp_dir("dlfail");
+    let dir = scratch("dlfail");
 
     let err = service
         .prepare(
@@ -528,7 +520,7 @@ async fn file_download_failure_propagates() {
         vec![("pack.meta", b"meta")],
         FakeDownloader::failing(),
     );
-    let dir = temp_dir("filefail");
+    let dir = scratch("filefail");
 
     let prepared = service
         .prepare(
@@ -585,7 +577,7 @@ async fn skips_upstream_client_only_mods() {
     let downloader = FakeDownloader::ok();
     let seen = downloader.requests.clone();
     let service = service_with_source(index, Vec::new(), downloader, Arc::new(source));
-    let dir = temp_dir("clientonly");
+    let dir = scratch("clientonly");
 
     let prepared = service
         .prepare(
@@ -660,7 +652,7 @@ async fn removes_previously_installed_client_only_mod() {
     let source = FakeModpackSource::new().client_only(&[client_hash.as_str()]);
     let downloader = FakeDownloader::ok();
     let service = service_with_source(index, Vec::new(), downloader, Arc::new(source));
-    let dir = temp_dir("clientonly-stale");
+    let dir = scratch("clientonly-stale");
     std::fs::create_dir_all(dir.join("mods")).expect("mkdir");
     std::fs::write(dir.join("mods/embeddium.jar"), b"stale").expect("seed");
 
@@ -717,7 +709,7 @@ async fn only_mod_jars_are_queried() {
     let source = FakeModpackSource::new();
     let queried = source.queried();
     let service = service_with_source(index, Vec::new(), FakeDownloader::ok(), Arc::new(source));
-    let dir = temp_dir("onlymods");
+    let dir = scratch("onlymods");
 
     let prepared = service
         .prepare(
@@ -765,7 +757,7 @@ async fn metadata_failure_aborts_apply() {
     let downloader = FakeDownloader::ok();
     let seen = downloader.requests.clone();
     let service = service_with_source(index, Vec::new(), downloader, Arc::new(source));
-    let dir = temp_dir("metadatafail");
+    let dir = scratch("metadatafail");
 
     let prepared = service
         .prepare(
@@ -809,7 +801,7 @@ async fn source_without_metadata_keeps_manifest_files() {
     .expect("index");
     let legacy = LegacyModpackSource(FakeModpackSource::new());
     let service = service_with_source(index, Vec::new(), FakeDownloader::ok(), Arc::new(legacy));
-    let dir = temp_dir("legacy");
+    let dir = scratch("legacy");
 
     let prepared = service
         .prepare(
@@ -850,7 +842,7 @@ async fn no_mods_means_no_metadata_query() {
     let source = FakeModpackSource::new();
     let queried = source.queried();
     let service = service_with_source(index, Vec::new(), FakeDownloader::ok(), Arc::new(source));
-    let dir = temp_dir("nomods");
+    let dir = scratch("nomods");
 
     let prepared = service
         .prepare(
@@ -884,7 +876,7 @@ async fn unknown_source_in_prepared_is_reported() {
         vec![file_with_sha1("mods/a.jar", 4, EnvTag::Required, &sha1(50))],
     )
     .expect("index");
-    let dir = temp_dir("ghost");
+    let dir = scratch("ghost");
     let prepared = ModpackPrepared {
         source: "ghost",
         resolved: resolved(),

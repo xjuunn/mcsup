@@ -56,6 +56,7 @@ pub(crate) const OFFICIAL_INSTALLER: &str =
 
 /// 挑选 loader 的口径
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum Picks {
     /// 最新稳定 loader（无 `-` 后缀），没有稳定版时取列表首项
     #[default]

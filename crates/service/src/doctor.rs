@@ -424,11 +424,9 @@ impl DoctorService {
 /// `rel_dir` 必须是单层相对路径：`..`、分隔符、绝对路径都会把路径拼接到
 /// 工作区之外，`servers/` 下的直接子目录比对也就失去意义
 fn is_direct_child(rel_dir: &Path) -> bool {
-    let mut components = rel_dir.components();
-    matches!(
-        (components.next(), components.next()),
-        (Some(std::path::Component::Normal(_)), None)
-    )
+    // 与 storage 写入时的校验共用同一处实现：体检口径与写入口径必须一致，
+    // 两边各写一份就会一边放过、一边报错
+    domain::server::meta::is_single_segment(rel_dir)
 }
 
 #[cfg(test)]

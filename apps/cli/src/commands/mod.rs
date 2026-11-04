@@ -9,6 +9,7 @@ mod origin;
 mod props;
 mod remote;
 mod server_ops;
+mod server_remote;
 mod settings;
 mod workspace;
 
@@ -283,7 +284,7 @@ async fn server(action: ServerAction, cfg: &ConfigFile, printer: Printer) -> Res
                     )
                 })?;
                 if !origin.is_local() {
-                    return server_ops::remove_remote(&origin, &name, purge, printer);
+                    return server_remote::remove_remote(&origin, &name, purge, printer);
                 }
             }
             server_ops::remove(&name, purge, printer)

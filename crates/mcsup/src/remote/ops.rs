@@ -131,6 +131,9 @@ impl Agent {
                 )
                 .into_response()
             }
+            // 协议新增帧而本端不认识：显式报协议错误，不能静默当成功。
+            // `Request` 是 `#[non_exhaustive]`，对端可能比本端新。
+            other => unreachable_frame(other),
         }
     }
 
@@ -846,7 +849,13 @@ impl Agent {
             no_reuse,
             flush_wait_ms,
         };
-        match self.core.backup.create(&name, &options) {
+        // RPC 请求自带超时，不由服务端令牌取消：这里给一个不会被取消的令牌，
+        // 免得 agent 的备份被无关的本地取消信号打断
+        match self
+            .core
+            .backup
+            .create(&name, &options, &port::CancellationToken::new())
+        {
             Ok(outcome) => {
                 let snapshot = match WireSnapshot::try_from(&outcome.snapshot) {
                     Ok(wire) => wire,
@@ -905,7 +914,11 @@ impl Agent {
             },
             None => domain::backup::RestoreTarget::InPlace,
         };
-        match self.core.backup.restore(&name, snapshot, &target) {
+        match self
+            .core
+            .backup
+            .restore(&name, snapshot, &target, &port::CancellationToken::new())
+        {
             Ok(outcome) => {
                 let restored = match WireSnapshot::try_from(&outcome.snapshot) {
                     Ok(wire) => wire,
@@ -984,12 +997,12 @@ impl Agent {
             Ok(name) => name,
             Err(response) => return response,
         };
-        let policy = match (keep, older_than_secs) {
-            (Some(n), _) => Some(domain::backup::RetentionPolicy::Keep(n)),
-            (None, Some(secs)) => Some(domain::backup::RetentionPolicy::OlderThan(secs)),
-            (None, None) => None,
+        // 只递交原始输入：冲突判定在 domain / service，不在这里择一
+        let retention = domain::backup::RetentionInput {
+            keep,
+            older_than_secs,
         };
-        match self.core.backup.prune(&name, policy, dry_run) {
+        match self.core.backup.prune(&name, retention, dry_run) {
             Ok(outcome) => {
                 let removed = outcome
                     .removed

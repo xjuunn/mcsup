@@ -309,6 +309,77 @@ jobs:
           path: mutants.out
           retention-days: 14
 
+  # G5 diff 覆盖率：只看本次改动的新增行，避免「历史遗留拉低整体数字」导致
+  # 谁也不敢动门槛。基线只报告不拦，等数字稳定后再改成硬门槛。
+  coverage:
+    name: coverage (G5)
+    if: inputs.deep
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage
+      - name: install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+      - name: measure
+        run: |
+          cargo llvm-cov --workspace --all-features             --lcov --output-path lcov.info
+          cargo llvm-cov report --summary-only | tee cov.txt
+          echo '## diff 覆盖率（G5）' >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat cov.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+      - name: upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          retention-days: 14
+
+  # G7 cargo-fuzz：解析器类模块（Provider 响应、JSON 元数据、路径解析）在畸形
+  # 输入上不能 panic。fuzz 目标见 fuzz/ 目录，手动触发时每个目标跑固定时长。
+  fuzz:
+    name: fuzz (G7)
+    if: inputs.deep
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [parse_rel_path, parse_snapshot_id, parse_content_hash]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-01-01
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      # 每个目标跑 60 秒：够覆盖常见路径，又不至于把 CI 拖成小时级。
+      # 崩溃产物（crash-*）由下一步上传，供本地复现。
+      - name: fuzz ${{ matrix.target }}
+        run: |
+          cargo fuzz run ${{ matrix.target }} --             -max_total_time=60 -print_final_stats=1
+      - name: upload corpus and crashes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: |
+            fuzz/corpus/${{ matrix.target }}
+            fuzz/artifacts/${{ matrix.target }}
+          retention-days: 14
+
   # 真实网络探测：`#[ignore]` 的那组用例。常规门禁永远不跑它们，
   # 只有这里（手动触发）显式执行，失败说明上游改了契约。
   net:

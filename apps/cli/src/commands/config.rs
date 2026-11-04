@@ -12,7 +12,7 @@ use crate::prompts;
 use anyhow::{Context, Result};
 use comfy_table::Table;
 use mcsup::protocol::cli::{ConfigRow, ConfigSetJson, ConfigShowJson};
-use mcsup::service::ConfigKey;
+use mcsup::service::{ConfigKey, ConfigValueError, ConfigValueErrorKind};
 use std::path::Path;
 
 pub(crate) fn run(action: ConfigAction, printer: Printer) -> Result<()> {
@@ -118,6 +118,22 @@ fn resolve_value(
 ///
 /// # Errors
 ///
+/// 配置取值非法时的用户文案
+///
+/// 判定在 `service`（[`ConfigValueErrorKind`]），文案在这里：库只给英文短语，
+/// 入口按当前语言拼装。
+fn describe_value_error(err: &ConfigValueError) -> String {
+    match err.kind() {
+        ConfigValueErrorKind::Path => {
+            let ConfigValueError::Path {
+                key, value, reason, ..
+            } = err;
+            // 内层 `reason` 是库给出的英文短语，保留原文便于排查
+            format!("{key} 不是可用路径: {value}（{reason}）")
+        }
+    }
+}
+
 /// 键名不在 [`ConfigKey::ALL`] 内时返回用法错误
 fn parse_key(lang: crate::locale::Lang, name: &str) -> Result<ConfigKey> {
     ConfigKey::parse(name).ok_or_else(|| {
@@ -217,7 +233,7 @@ fn set(file: &ConfigFile, key: &str, value: &str, printer: Printer) -> Result<()
     let mut cfg = file.load()?;
     cfg.set(key, value).map_err(|err| {
         AppDiagnostic::usage(
-            err.describe(),
+            describe_value_error(&err),
             Some(crate::i18n::pick(
                 printer.lang(),
                 format!("`mcsup config set {} <值>`", key.as_str()),

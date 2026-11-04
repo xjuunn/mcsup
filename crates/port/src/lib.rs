@@ -480,6 +480,12 @@ pub enum RepositoryError {
     /// 记录内容损坏，无法还原为领域对象
     #[error("corrupt repository record: {0}")]
     Corrupt(String),
+    /// `rel_dir` 不是单层目录名（绝对路径、`..` 或含分隔符）
+    #[error("invalid server directory {rel_dir:?}: must be a single path segment")]
+    InvalidRelDir {
+        /// 被拒的原始值
+        rel_dir: PathBuf,
+    },
     /// 底层存储失败
     #[error("storage error: {0}")]
     Storage(#[source] Box<dyn std::error::Error + Send + Sync>),
