@@ -212,6 +212,21 @@ mod tests {
         }
     }
 
+    /// 删掉自己不需要 Manage：默认角色正是 operator
+    ///
+    /// 回归：`remote disconnect` 若走 `ClientRevoke`，默认 operator 会被
+    /// unauthorized 拒掉，本地断开就得先给自己提权。
+    #[test]
+    fn self_revoke_needs_no_manage_permission() {
+        let operator = session(Role::Operator);
+        assert!(Request::ClientSelfRevoke.required_permission().is_none());
+        assert!(operator.permits(&Request::ClientSelfRevoke));
+        // 但撤销别人仍然要 Manage
+        assert!(!operator.permits(&Request::ClientRevoke {
+            selector: "someone-else".to_owned()
+        }));
+    }
+
     #[test]
     fn failure_maps_to_an_error_frame() {
         let response = RemoteFailure::unauthorized("token revoked").into_response();

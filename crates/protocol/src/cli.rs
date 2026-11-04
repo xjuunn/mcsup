@@ -535,6 +535,11 @@ pub struct RemoteDisconnectJson<'a> {
     pub name: &'a str,
     /// 是否删除了本地配对记录（幂等：本来就没有时为 `false`）
     pub removed: bool,
+    /// 是否已通知远端删除本机那条名册记录
+    ///
+    /// `None` = 无从得知（没有指纹，说明从未真正配对）；`false` = 通知失败，
+    /// 需要在对端手动 `remote revoke`。
+    pub remote_revoked: Option<bool>,
     /// 断开后撤回到的本地工作区名
     ///
     /// 只在「当前选择正指向这台远端、且本地有可回退的工作区」时有值。

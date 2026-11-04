@@ -23,14 +23,24 @@ use service::{
     ServerRegistryError, ServerRegistryErrorKind, ServerSettingsService, SettingsError,
     StartOptions, UninstallOutcome, WorkspaceError, WorkspaceErrorKind,
 };
-use transport::RemoteFailure;
+use transport::{RemoteFailure, SessionInfo};
 
 impl Agent {
     /// 执行一个已认证的操作，并把长任务的阶段 / 进度 / 输出交给 `progress`
     ///
     /// `progress` 由传输层提供：它把每条事件写成 `Response::Task` 中间帧，客户端
     /// 用**同一个**观察者渲染——远端与本地共用一套进度代码，差别只在传输。
-    pub(crate) fn dispatch_with(&self, request: &Request, progress: &dyn TaskObserver) -> Response {
+    ///
+    /// `session` 是已认证的连接身份。绝大多数帧不需要它（目标由帧参数指定），
+    /// 只有「作用于调用方自己」的帧才读——目前是
+    /// [`Request::ClientSelfRevoke`]。让它走参数而不是让帧自带 selector，
+    /// 是为了让「我是谁」只有一个来源：认证结果。客户端传什么都不能改变它。
+    pub(crate) fn dispatch_with(
+        &self,
+        session: &SessionInfo,
+        request: &Request,
+        progress: &dyn TaskObserver,
+    ) -> Response {
         match request {
             Request::Ping => Response::Pong {
                 agent_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -65,6 +75,7 @@ impl Agent {
                 Err(err) => failure(ErrorKind::IO, err),
             },
             Request::ClientRevoke { selector } => self.revoke(selector),
+            Request::ClientSelfRevoke => self.self_revoke(session),
 
             Request::StatusMany { ids } => self.status_many(ids),
             Request::Start {
@@ -316,6 +327,29 @@ impl Agent {
         handle.request_stop();
         tracing::info!("remote shutdown requested");
         Response::Ok
+    }
+
+    /// 删除调用方自己在名册里的记录（`remote disconnect` 的服务端一半）
+    ///
+    /// 只认认证结果里的 `client_id`，不接受任何参数：能删的永远只有「你自己」。
+    /// 记录不存在视为成功——客户端可能重试，或名册已被管理员手工清理过；
+    /// 报「找不到」只会让本地断开卡在一个已经达成的目标上。
+    fn self_revoke(&self, session: &SessionInfo) -> Response {
+        let client_id = session.client_id.clone();
+        let revoked = match self.registry_lock.lock() {
+            Ok(_guard) => self.clients.revoke(&client_id),
+            Err(_) => {
+                return RemoteFailure::new(ErrorKind::IO, "client registry lock is poisoned")
+                    .into_response();
+            }
+        };
+        match revoked {
+            Ok(_) => {
+                tracing::info!(client = %client_id, "remote client removed itself");
+                Response::Ok
+            }
+            Err(err) => failure(ErrorKind::IO, err),
+        }
     }
 
     /// 撤销客户端：先按身份精确匹配，再按名字匹配

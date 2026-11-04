@@ -305,6 +305,17 @@ pub enum Request {
         /// 客户端身份（UUID 文本）或名称
         selector: String,
     },
+    /// 当前连接自行退出名册（`remote disconnect` 时由客户端发起）
+    ///
+    /// 与 [`Self::ClientRevoke`] 分开而不是复用它，有两层理由：
+    ///
+    /// 1. **权限**。`ClientRevoke` 要 `Manage`（能删别人 = 能踢人），而默认
+    ///    客户端角色是 `operator`。让断开操作去要 `Manage` 等于逼每个用户
+    ///    为自己的一台机器提权；而「删掉自己」不改变任何他人的可达性，不构成
+    ///    提权。所以这一帧**不需要权限**，身份只取自已认证的会话。
+    /// 2. **没有 selector**。撤销谁由会话决定，调用方无从指定——传参就多一个
+    ///    被误用成「借他人身份退出」的口子。
+    ClientSelfRevoke,
 
     /// 批量实时状态
     StatusMany {
@@ -428,7 +439,12 @@ impl Request {
     #[must_use]
     pub fn required_permission(&self) -> Option<Permission> {
         match self {
-            Self::Hello { .. } | Self::Enroll { .. } | Self::Authenticate { .. } => None,
+            // `ClientSelfRevoke` 同属此列：删掉自己不改变他人的可达性，不构成
+            // 提权。要求 Manage 会让默认的 `operator` 无法自己退出名册。
+            Self::Hello { .. }
+            | Self::Enroll { .. }
+            | Self::Authenticate { .. }
+            | Self::ClientSelfRevoke => None,
             Self::Ping
             | Self::WorkspaceList
             | Self::ServerList
@@ -525,6 +541,7 @@ impl Request {
             Self::JavaUninstall { .. } => "java.uninstall",
             Self::ClientList => "client.list",
             Self::ClientRevoke { .. } => "client.revoke",
+            Self::ClientSelfRevoke => "client.self.revoke",
             Self::StatusMany { .. } => "status.many",
             Self::Start { .. } => "server.start",
             Self::Stop { .. } => "server.stop",
@@ -1098,6 +1115,7 @@ mod tests {
             Request::ClientRevoke {
                 selector: "laptop".to_owned(),
             },
+            Request::ClientSelfRevoke,
             Request::StatusMany {
                 ids: vec!["550e8400-e29b-41d4-a716-446655440000".to_owned()],
             },

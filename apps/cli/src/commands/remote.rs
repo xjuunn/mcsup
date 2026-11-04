@@ -1062,11 +1062,15 @@ fn ping(file: &ConfigFile, name: &str, printer: Printer) -> Result<()> {
     }
 }
 
-/// `remote disconnect`：删本地配对与凭证
+/// `remote disconnect`：删本地配对与凭证，并通知远端删掉自己那条名册记录
 fn disconnect(file: &ConfigFile, name: &str, printer: Printer) -> Result<()> {
     let lang = printer.lang();
     let remote_name = crate::commands::origin::remote_name(name, lang)?;
     let mut cfg = file.load()?;
+    // 先在**还持有凭证**的时候通知远端删记录：token 一旦删掉就发不出这个请求了。
+    // 结果只影响提示措辞，不影响本地断开——本地这次清理是用户的明确意图，
+    // 不能因为对端暂时连不上就整条命令失败，把人卡在「断不掉」的状态里。
+    let revocation = revoke_self_remote(&cfg, &remote_name, lang);
     let removed = cfg.remove_remote(&remote_name).is_some();
     // 先删凭证（安全优先：宁可留下一条缺凭证的配置记录，也不要留下有效 token）
     credential_store()
@@ -1092,6 +1096,30 @@ fn disconnect(file: &ConfigFile, name: &str, printer: Printer) -> Result<()> {
         format!("已断开 {name}（远端服务未受影响）"),
         format!("disconnected {name} (the remote service is unaffected)"),
     );
+    // 远端那条名册记录的结果如实写出来。不能只说「已断开」——用户下次
+    // `remote serve status` 看到列表里还挂着一条，会以为断开没生效。
+    match &revocation {
+        SelfRevoke::Revoked => message.push_str(&crate::i18n::pick(
+            lang,
+            "\n远端名册中的本机记录已删除",
+            "\nthe record for this client was removed from the remote registry",
+        )),
+        SelfRevoke::AlreadyGone => message.push_str(&crate::i18n::pick(
+            lang,
+            "\n远端名册中已无本机记录",
+            "\nthe remote registry had no record for this client",
+        )),
+        SelfRevoke::Skipped(reason) => message.push_str(&crate::i18n::pick(
+            lang,
+            format!(
+                "\n远端记录未删除：{reason}\n如需清理，在对端运行 mcsup remote revoke <client>"
+            ),
+            format!(
+                "\nthe remote record was not removed: {reason}\n\
+                 to clean it up, run `mcsup remote revoke <client>` on the peer"
+            ),
+        )),
+    }
     if let Some(ws) = restored_name {
         message.push_str(&crate::i18n::pick(
             lang,
@@ -1118,10 +1146,90 @@ fn disconnect(file: &ConfigFile, name: &str, printer: Printer) -> Result<()> {
         &RemoteDisconnectJson {
             name: remote_name.as_str(),
             removed,
+            // 目标都是「远端已无这条记录」，对用户是同一件事
+            remote_revoked: Some(!matches!(revocation, SelfRevoke::Skipped(_))),
             restored_workspace: restored_name.map(|ws| ws.name.as_str()),
             workspace_cleared: cleared,
         },
     )
+}
+
+/// 远端自撤销的结果
+///
+/// 三态而不是 `bool`：`Skipped` 要带原因（连不上 / 缺凭证 / 对端拒绝），
+/// 这些原因决定了用户下一步是「不用管」还是「去对端手动清理」。
+enum SelfRevoke {
+    /// 远端已删除本机记录
+    Revoked,
+    /// 远端本来就没有本机记录（幂等）
+    AlreadyGone,
+    /// 没能通知到远端，附带原因
+    Skipped(String),
+}
+
+/// 通知远端：删掉本机在它名册里的那条记录
+///
+/// **必须在删本地凭证之前调用**——token 是这次请求的唯一凭据。做法是先复制
+/// 出 token，删凭证之后才发请求是不可行的。
+///
+/// 所有失败都收敛成 [`SelfRevoke::Skipped`]：本地断开的意图不该被网络状况
+/// 否决。用户明确要断开，就必须断开；远端留一条不能用的孤儿记录是可以事后
+/// 清理的次要问题，而「命令失败、什么都没变」会让用户反复重试。
+fn revoke_self_remote(
+    cfg: &mcsup::service::Config,
+    remote_name: &RemoteName,
+    lang: Lang,
+) -> SelfRevoke {
+    let Some(record) = cfg.remote(remote_name) else {
+        return SelfRevoke::AlreadyGone;
+    };
+    let Some(fingerprint_text) = record.fingerprint.as_deref() else {
+        // 没有固定指纹就还没真正配对过，远端不可能有名册记录
+        return SelfRevoke::AlreadyGone;
+    };
+    let Ok(fingerprint) = Fingerprint::parse(fingerprint_text) else {
+        return SelfRevoke::Skipped(crate::i18n::pick(
+            lang,
+            "已存指纹无法解析".to_owned(),
+            "the pinned fingerprint cannot be parsed".to_owned(),
+        ));
+    };
+    let credential = match credential_store().get(remote_name.as_str()) {
+        Ok(credential) => credential,
+        Err(err) => {
+            return SelfRevoke::Skipped(crate::i18n::pick(
+                lang,
+                format!("读取凭证失败：{err:#}"),
+                format!("reading the credential failed: {err:#}"),
+            ));
+        }
+    };
+    let endpoint = match crate::ssh::endpoint(record, lang) {
+        Ok(endpoint) => endpoint,
+        Err(err) => {
+            return SelfRevoke::Skipped(crate::i18n::pick(
+                lang,
+                format!("建立连接失败：{err:#}"),
+                format!("connecting failed: {err:#}"),
+            ));
+        }
+    };
+
+    let client = Client::new(&endpoint, fingerprint).with_token(credential.token);
+    match client.call(&Request::ClientSelfRevoke) {
+        Ok(_) => SelfRevoke::Revoked,
+        // 记录已经不在（重试、或管理员手工清理过）：目标已达成，不算失败
+        Err(TransportError::Remote { kind, .. })
+            if kind == mcsup::protocol::remote::ErrorKind::NOT_FOUND =>
+        {
+            SelfRevoke::AlreadyGone
+        }
+        Err(err) => SelfRevoke::Skipped(crate::i18n::pick(
+            lang,
+            format!("{err:#}"),
+            format!("{err:#}"),
+        )),
+    }
 }
 
 /// 断开后把本机 current 从该来源撤回本地
