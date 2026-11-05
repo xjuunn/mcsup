@@ -114,55 +114,56 @@ pub(crate) fn member<'a>(
     })
 }
 
-/// 把 `origin/name` 解析成可交给 service 的裸名
+/// 校验服务器名，并把限定名**原样**交给下游
 ///
-/// service 的 `get(name)` 不认识来源前缀，且组合仓库在重名时按「本地优先」
-/// 返回第一条。因此：
+/// 限定名（`origin/name`）存在的意义就是消掉跨来源同名歧义。因此这里既不
+/// 剥掉前缀、也不在「名字重名」时拒绝：
 ///
-/// - 未限定 → 原样返回；
-/// - 限定本地，或该名字全局唯一 → 返回裸名（service 取到的就是同一条）；
-/// - 限定远端且同名存在于多个来源 → 明确拒绝，避免把操作落到本地同名服务器。
+/// - 未限定 → 原样返回，下游按「本地优先」的既有语义解析；
+/// - 限定 → 先确认来源已配对、目标存在（让错误停在入口，报得比下游更准），
+///   再把 `origin/name` 交给下游。
 ///
-/// 这是「限定名对所有命令生效」在入口侧的落点；真正的跨来源唯一性判定仍在
-/// `service::origin::resolve_index`。
+/// 剥成裸名会**丢掉来源**：service 的 `get` 只认名字，重名时命中本地那条，
+/// 于是 `remote/foo` 反而操作了本地的 `foo`——限定名不但没起作用，还指错了
+/// 机器。真正跨来源的解析在 [`ServerRegistry::get_sourced`]。
 ///
 /// # Errors
 ///
-/// 来源未配对、找不到或重名且无法用裸名唯一表达时返回用法 / 未找到错误
+/// 来源未配对或找不到该服务器时返回用法 / 未找到错误
 pub(crate) fn resolve_server_name(raw: &str, printer: crate::output::Printer) -> Result<String> {
-    if !raw.contains('/') {
-        return Ok(raw.to_owned());
-    }
     let selector = mcsup::service::Selector::parse(raw);
     if selector.origin().is_none() {
         return Ok(raw.to_owned());
     }
+    let lang = printer.lang();
+    // 先探一次：来源没配对 / 目标不存在时在这里就报出来，免得下游拿着限定名
+    // 再解析一遍时报个更绕的错误
     let reg = crate::bootstrap::open_registry_with_remotes()?;
-    let all = reg.list_sourced()?;
-    let candidates: Vec<(Origin, &str)> = all
-        .iter()
-        .map(|sourced| (sourced.origin.clone(), sourced.value.meta.name.as_str()))
-        .collect();
-    let index = mcsup::service::resolve_index(&candidates, &selector, &OriginFilter::All)
-        .map_err(|err| AppDiagnostic::not_found(err.to_string(), None))?;
-    let bare = selector.name();
-    let unique = candidates.iter().filter(|(_, name)| *name == bare).count() == 1;
-    if candidates[index].0.is_local() || unique {
-        return Ok(bare.to_owned());
-    }
-    Err(AppDiagnostic::usage(
-        crate::i18n::pick(
-            printer.lang(),
-            format!(
-                "服务器名在多个来源重复，无法确定远端操作目标: {raw}；请让该名字全局唯一后再重试"
+    reg.get_sourced(raw).map_err(|err| match err {
+        mcsup::service::ServerRegistryError::NotFound(_) => AppDiagnostic::not_found(
+            crate::i18n::pick(
+                lang,
+                format!("找不到服务器 {}", selector.name()),
+                format!("no such server: {}", selector.name()),
             ),
-            format!(
-                "the server name exists in more than one origin, so the remote target is ambiguous: {raw}"
-            ),
+            Some(crate::i18n::pick(
+                lang,
+                "运行 mcsup server list 确认名字与来源".to_owned(),
+                "run mcsup server list to check the name and origin".to_owned(),
+            )),
         ),
-        None,
-    )
-    .into())
+        other => AppDiagnostic::failure(other.to_string(), None),
+    })?;
+    Ok(raw.to_owned())
+}
+
+/// 展示用的裸名：从可能的限定名 `origin/name` 里取 `name`
+///
+/// 回显与 JSON 里的 `name` 一律用它。路由需要来源，但用户看到的名字不该
+/// 带上自己刚敲的前缀——`server status r1/web` 的输出里写 `web` 而不是
+/// `r1/web`，与不限定时保持一致。
+pub(crate) fn display_name(raw: &str) -> String {
+    mcsup::service::Selector::parse(raw).name().to_owned()
 }
 
 /// 解析到远端的服务器目标

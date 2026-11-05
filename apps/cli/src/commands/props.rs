@@ -279,7 +279,7 @@ fn write(
         updated_map.insert(key.clone(), value.clone());
     }
     let payload = PropsWriteJson {
-        name: name.to_owned(),
+        name: super::origin::display_name(name),
         path: report.path,
         updated: updated_map,
     };

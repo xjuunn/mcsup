@@ -1082,8 +1082,34 @@ fn unreachable_frame(request: &Request) -> Response {
 }
 
 /// 通用失败帧（`Display` 只用于日志，客户端按 `kind` 分类）
-fn failure(kind: &'static str, err: impl std::fmt::Display) -> Response {
-    RemoteFailure::new(kind, err.to_string()).into_response()
+///
+/// 消息拼**整条 source 链**：`RepositoryError::Storage` 之类只是
+/// 「存储失败」的包装，真正的原因（marker 拒绝、IO 路径）在链尾。只取最外层
+/// `Display`，对端就只剩一句 `storage error`，无从判断该改什么。
+fn failure(kind: &'static str, err: impl std::error::Error + 'static) -> Response {
+    RemoteFailure::new(kind, chain_text(&err)).into_response()
+}
+
+/// [`failure`] 的借用版本，供各类包装函数（`&T` 入参）使用
+fn failure_ref(kind: &'static str, err: &(dyn std::error::Error + 'static)) -> Response {
+    RemoteFailure::new(kind, chain_text(err)).into_response()
+}
+
+/// 把错误链渲染成一行：`外层: 内层: 更内层`
+///
+/// 各层 `Display` 都不重复内层文本（`thiserror` 的约定），因此直接拼接即可，
+/// 不需要去重。
+fn chain_text(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(link) = current {
+        let text = link.to_string();
+        if !text.is_empty() {
+            parts.push(text);
+        }
+        current = link.source();
+    }
+    parts.join(": ")
 }
 
 /// 同步分发线程上跑 async 安装 / 整合包编排
@@ -1148,7 +1174,7 @@ fn workspace_failure(err: &WorkspaceError) -> Response {
         // 结构化分类缺失（IO / 存储 / 名字非法）与未来新增变体：归到通用 IO
         Some(_) | None => ErrorKind::IO,
     };
-    failure(kind, err)
+    failure_ref(kind, err)
 }
 
 fn registry_failure(err: &ServerRegistryError) -> Response {
@@ -1161,7 +1187,7 @@ fn registry_failure(err: &ServerRegistryError) -> Response {
         ) => ErrorKind::INVALID,
         Some(_) | None => ErrorKind::IO,
     };
-    failure(kind, err)
+    failure_ref(kind, err)
 }
 
 fn java_failure(err: &JavaError) -> Response {
@@ -1169,7 +1195,7 @@ fn java_failure(err: &JavaError) -> Response {
         JavaError::NotFound(_) => ErrorKind::NOT_FOUND,
         _ => ErrorKind::IO,
     };
-    failure(kind, err)
+    failure_ref(kind, err)
 }
 
 /// 属性读写失败 → 错误帧（按领域判定分类，不解析文案）
@@ -1180,7 +1206,7 @@ fn props_failure(err: &PropsError) -> Response {
         // #[non_exhaustive]：IO 与未来新增变体都按通用失败处理
         _ => ErrorKind::IO,
     };
-    failure(kind, err)
+    failure_ref(kind, err)
 }
 
 /// 服务属性写入失败 → 错误帧
@@ -1193,7 +1219,7 @@ fn settings_failure(err: &SettingsError) -> Response {
         // #[non_exhaustive]：Java 查询失败与未来新增变体按通用失败处理
         _ => ErrorKind::IO,
     };
-    failure(kind, err)
+    failure_ref(kind, err)
 }
 
 /// 整合包取回 / 布置失败 → 错误帧
@@ -1210,7 +1236,7 @@ fn modpack_failure(err: &ModpackError) -> Response {
         // #[non_exhaustive]：来源 / 下载 / 解压 / 文件系统失败按通用失败处理
         _ => ErrorKind::IO,
     };
-    failure(kind, err)
+    failure_ref(kind, err)
 }
 
 fn lifecycle_failure(err: &LifecycleError) -> Response {
@@ -1230,7 +1256,7 @@ fn lifecycle_failure(err: &LifecycleError) -> Response {
         ) => ErrorKind::INVALID,
         Some(_) | None => ErrorKind::IO,
     };
-    failure(kind, err)
+    failure_ref(kind, err)
 }
 
 /// 备份失败 → 错误帧：按领域判定分类，不解析文案
@@ -1249,7 +1275,7 @@ fn backup_failure(err: &service::BackupError) -> Response {
         ) => ErrorKind::INVALID,
         Some(_) | None => ErrorKind::IO,
     };
-    failure(kind, err)
+    failure_ref(kind, err)
 }
 
 /// 可用变体标识：来源 `variant()` 去重，保持注册顺序
@@ -1317,5 +1343,36 @@ fn install_failure(err: &InstallJarError) -> Response {
         // #[non_exhaustive]：未来新增变体按通用失败处理
         | _ => ErrorKind::IO,
     };
-    RemoteFailure::new(kind, err.to_string()).into_response()
+    failure_ref(kind, err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 链尾原因必须带到对端，不能被外层包装吞掉
+    ///
+    /// 回归：只取最外层 `Display` 时，对端只收到一句 `storage error`，
+    /// 真正的原因（marker 拒绝、IO 路径）全丢。
+    #[test]
+    fn chain_text_keeps_inner_reason() {
+        let inner = std::io::Error::other("marker /ws/foo: refusing to purge");
+        let outer = port::RepositoryError::Storage(Box::new(inner));
+        let text = chain_text(&outer);
+        assert!(text.contains("storage error"), "{text}");
+        assert!(text.contains("refusing to purge"), "{text}");
+        // 原因只出现一次：`Storage` 的 Display 不再内嵌内层文本
+        assert_eq!(text.matches("refusing to purge").count(), 1, "{text}");
+    }
+
+    /// 多层链按 `外层: 内层` 拼接，顺序稳定
+    #[test]
+    fn chain_text_joins_layers_in_order() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("outer layer")]
+        struct Outer(#[source] std::io::Error);
+
+        let err = Outer(std::io::Error::other("inner layer"));
+        assert_eq!(chain_text(&err), "outer layer: inner layer");
+    }
 }

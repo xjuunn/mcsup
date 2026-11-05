@@ -688,13 +688,14 @@ impl ServerRegistry {
         let selector = crate::origin::Selector::parse(name);
         let want = ServerName::parse(selector.name())
             .map_err(|_| ServerRegistryError::NotFound(name.to_owned()))?;
+        // `local/名称` 是合法限定（`workspace use local/ws` 已有先例），不能
+        // 因为「本地本来就不歧义」就拒绝——限定名在两类来源间必须对称，
+        // 否则用户写 `local/foo` 拿到的是「没找到」而不是那条本地记录。
         let filter = match selector.origin() {
-            Some(origin) => crate::origin::OriginFilter::Named(match origin {
-                port::Origin::Remote(remote_name) => remote_name.clone(),
-                port::Origin::Local => {
-                    return Err(ServerRegistryError::NotFound(name.to_owned()));
-                }
-            }),
+            Some(port::Origin::Remote(remote_name)) => {
+                crate::origin::OriginFilter::Named(remote_name.clone())
+            }
+            Some(port::Origin::Local) => crate::origin::OriginFilter::LocalOnly,
             None => crate::origin::OriginFilter::All,
         };
         for sourced in self.list_sourced()? {
@@ -708,10 +709,17 @@ impl ServerRegistry {
 
     /// 按名解析服务器
     ///
+    /// 接受裸名，也接受 `远端/名称`（`local/名称`）限定名：带来源时交给
+    /// [`Self::get_sourced`]。限定名的**唯一**作用就是消掉跨来源同名歧义，
+    /// 只认名字会让它形同虚设——本地有同名时永远命中本地那条。
+    ///
     /// # Errors
     ///
-    /// 不存在或工作目录缺失时返回 [`ServerRegistryError`]
+    /// 不存在、来源未配对或工作目录缺失时返回 [`ServerRegistryError`]
     pub fn get(&self, name: &str) -> Result<RegisteredServer, ServerRegistryError> {
+        if crate::origin::Selector::parse(name).origin().is_some() {
+            return self.get_sourced(name).map(|sourced| sourced.value);
+        }
         let name =
             ServerName::parse(name).map_err(|_| ServerRegistryError::NotFound(name.to_owned()))?;
         let meta = self
@@ -1350,11 +1358,14 @@ mod tests {
     )]
     use super::*;
     use domain::workspace::{Workspace, WorkspaceId, WorkspaceName};
-    use port::{ProgressSink, ServerRepository, WorkspaceRepository};
+    use port::{Origin, ProgressSink, RemoteName, ServerRepository, WorkspaceRepository};
     use std::path::Path;
 
     struct MemServers {
         items: std::sync::Mutex<Vec<ServerMeta>>,
+        /// 「远端」记录：`list_sourced` 会把它们按另一来源一并返回，
+        /// `list()` 则不含——与真实组合仓库的口径一致
+        remote: std::sync::Mutex<Option<(Origin, Vec<ServerMeta>)>>,
         /// `list()` 被调用的次数（回归测试用：批量计数只能读一次）
         list_calls: std::sync::atomic::AtomicUsize,
     }
@@ -1363,8 +1374,14 @@ mod tests {
         fn new() -> Self {
             Self {
                 items: std::sync::Mutex::new(Vec::new()),
+                remote: std::sync::Mutex::new(None),
                 list_calls: std::sync::atomic::AtomicUsize::new(0),
             }
+        }
+
+        /// 挂一组远端记录；允许与本地同名，这正是限定名要消掉的歧义
+        fn set_remote(&self, origin: Origin, items: Vec<ServerMeta>) {
+            *self.remote.lock().expect("lock") = Some((origin, items));
         }
 
         fn list_calls(&self) -> usize {
@@ -1398,6 +1415,18 @@ mod tests {
             let mut items = self.items.lock().expect("lock").clone();
             items.sort_by(|a, b| a.name.cmp(&b.name));
             Ok(items)
+        }
+        fn list_sourced(&self) -> Result<Vec<Sourced<ServerMeta>>, RepositoryError> {
+            let mut out: Vec<Sourced<ServerMeta>> =
+                self.list()?.into_iter().map(Sourced::local).collect();
+            if let Some((origin, items)) = self.remote.lock().expect("lock").clone() {
+                out.extend(
+                    items
+                        .into_iter()
+                        .map(|meta| Sourced::new(origin.clone(), meta)),
+                );
+            }
+            Ok(out)
         }
         fn update_core(
             &self,
@@ -1554,6 +1583,51 @@ mod tests {
         assert!(out.dir.join("mcsup.json").is_file());
         let got = reg.get("alpha").expect("get");
         assert_eq!(got.meta.id, out.meta.id);
+    }
+
+    /// 限定名必须绕过「本地优先」：本地与远端同名时，`remote/name` 取远端那条
+    ///
+    /// 回归：`get` 曾只认名字，重名时命中本地，导致
+    /// `remote/foo` 操作了本机的 `foo`——限定名不但没生效，还指错了机器。
+    #[test]
+    fn get_with_origin_prefix_picks_that_origin() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let ws = ws_fixture(tmp.path());
+        let servers = Arc::new(MemServers::new());
+        let reg = ServerRegistry::new(servers.clone(), Arc::new(MemWorkspaces::new(ws)));
+        // 本地 alpha
+        reg.create(
+            None,
+            "alpha",
+            &VersionId::new("1.21.1"),
+            ServerVariant::Vanilla,
+            None,
+        )
+        .expect("create");
+        // 远端也有一个 alpha，id 不同
+        let remote = RemoteName::parse("r1").expect("remote name");
+        let mut remote_meta = reg.get("alpha").expect("local alpha").meta.clone();
+        remote_meta.id = ServerId::parse("550e8400-e29b-41d4-a716-4466554400ff").expect("uuid");
+        remote_meta.version = VersionId::new("9.9.9");
+        servers.set_remote(Origin::Remote(remote), vec![remote_meta]);
+
+        // 裸名：本地优先
+        let bare = reg.get("alpha").expect("bare");
+        assert_eq!(bare.meta.version.as_str(), "1.21.1");
+
+        // 限定远端：取远端那条，不能被本地同名挡住
+        let picked = reg.get("r1/alpha").expect("qualified remote");
+        assert_eq!(picked.meta.version.as_str(), "9.9.9");
+
+        // 限定本地：取本地那条
+        let local = reg.get("local/alpha").expect("qualified local");
+        assert_eq!(local.meta.version.as_str(), "1.21.1");
+
+        // 来源里没有这个名字 → NotFound，而不是回落本地
+        assert!(matches!(
+            reg.get("r1/beta"),
+            Err(ServerRegistryError::NotFound(_))
+        ));
     }
 
     #[test]

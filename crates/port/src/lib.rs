@@ -487,7 +487,11 @@ pub enum RepositoryError {
         rel_dir: PathBuf,
     },
     /// 底层存储失败
-    #[error("storage error: {0}")]
+    ///
+    /// 原因只走 `#[source]`，不写进 `Display`：两者都写会让整链渲染把它
+    /// 打印两遍（`storage error: io: ...: io: ...`）。thiserror 的约定是
+    /// `Display` 描述本层、`source` 描述下一层，渲染方按链拼接。
+    #[error("storage error")]
     Storage(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
@@ -1293,6 +1297,24 @@ impl EventSink for NoopEventSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Storage` 的 `Display` 不内嵌内层文本
+    ///
+    /// 回归：写成 `storage error: {0}` 又标 `#[source]` 时，任何按错误链
+    /// 渲染的地方（CLI 的 `{err:#}`、远端的失败帧）都会把原因打印两遍，
+    /// 得到 `storage error: io: ...: io: ...`。
+    #[test]
+    fn storage_display_does_not_embed_source() {
+        let inner = std::io::Error::other("disk on fire");
+        let err = RepositoryError::Storage(Box::new(inner));
+        assert_eq!(err.to_string(), "storage error");
+        assert_eq!(
+            std::error::Error::source(&err)
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("disk on fire")
+        );
+    }
 
     #[test]
     fn retry_classification_is_by_error_kind() {

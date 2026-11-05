@@ -605,17 +605,20 @@ pub(crate) fn remove_remote(
             None,
         )
     })?;
-    let disk_purged = member.servers.remove(name, purge).with_context(|| {
+    // 帧里必须发**裸名**：`RemoteName` 已由 `origin` 单独指定，对端只认自己
+    // 注册表里的名字，认不出 `remote/name` 这种本机限定写法。
+    let bare = mcsup::service::Selector::parse(name).name().to_owned();
+    let disk_purged = member.servers.remove(&bare, purge).with_context(|| {
         crate::i18n::pick(lang, "在远端删除服务器", "removing the server on the peer")
     })?;
     printer.print_outcome(
         &crate::i18n::pick(
             lang,
-            format!("已在 {} 注销服务器 {name}", member.name),
-            format!("removed server {name} on {}", member.name),
+            format!("已在 {} 注销服务器 {bare}", member.name),
+            format!("removed server {bare} on {}", member.name),
         ),
         &RemoveJson {
-            name: name.to_owned(),
+            name: bare,
             path: String::new(),
             purged: purge,
             disk_purged,
