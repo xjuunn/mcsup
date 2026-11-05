@@ -256,11 +256,16 @@ error: “web” 存在于多个位置
 `workspace ls` 的 `CURRENT` 只按**本机** current 标注（至多一个 `*`）；对端机器
 自己的 current 不参与本机判断，`workspace use` 也不会去改它。
 
-限定名已接到所有接受服务器名的命令（`start` / `stop` / `status` / `send` /
-`logs` / `backup` / `install` 等）。仍按裸名交给 `service` 的命令（`start` /
-`stop` / `status` / `send`）在本机与远端同名时会明确拒绝远端限定名（避免落到
-本地同名服务器）；按对端 id 寻址的命令（`install` / `props` / `set` /
-`console` / `logs`）不受影响，可直接用 `prod-box/web` 精确指定远端那台。
+限定名对**所有**接受服务器名的命令生效，包括 `start` / `stop` / `status` /
+`send` 这类最终交给 `service` 的命令。入口把 `origin/name` 原样传下去，由
+`ServerRegistry::get_sourced` 按来源解析——剥成裸名会丢掉来源，`get` 只认名字，
+重名时就命中本地那条，`prod-box/web` 反而操作了本机的 `web`。
+
+按对端 id 寻址的命令（`install` / `props` / `set` / `console` / `logs`）行为
+不变，可直接用 `prod-box/web` 精确指定远端那台。
+
+回显与 JSON 的 `name` 一律是裸名：`server status prod-box/web` 的输出里写
+`web`，与不限定时一致。发往对端的帧也只带裸名（来源由连接本身确定）。
 
 ### 创建落点
 

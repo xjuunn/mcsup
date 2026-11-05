@@ -187,14 +187,16 @@ pub(crate) fn set(
     // 3. 校验 + 持久化（java-version 可能触发首次 Java 扫描，保持回显）
     let change: SettingChange = target.set(name, key, &raw_value, printer)?;
 
+    // 回显只写裸名：用户敲了 `r1/web`，输出里仍应看到 `web`
+    let shown = super::origin::display_name(name);
     printer.print_outcome(
         &crate::i18n::pick(
             printer.lang(),
-            format!("已设置 {name} {key} = {}", change.value),
-            format!("set {name} {key} = {}", change.value),
+            format!("已设置 {shown} {key} = {}", change.value),
+            format!("set {shown} {key} = {}", change.value),
         ),
         &SetJson {
-            name: name.to_owned(),
+            name: shown,
             key: key.as_str().to_owned(),
             value: change.value,
             settings: change.settings.into(),

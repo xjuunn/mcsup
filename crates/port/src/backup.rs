@@ -117,7 +117,10 @@ pub enum SnapshotStoreError {
     #[error("corrupt snapshot record: {0}")]
     Corrupt(String),
     /// 底层存储失败
-    #[error("snapshot storage error: {0}")]
+    ///
+    /// 与 `RepositoryError::Storage` 同理：原因只走 `#[source]`，避免整链
+    /// 渲染时重复。
+    #[error("snapshot storage error")]
     Storage(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
