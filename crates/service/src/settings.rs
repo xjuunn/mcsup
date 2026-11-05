@@ -39,10 +39,14 @@ impl SettingsError {
     #[must_use]
     pub fn kind(&self) -> Option<SettingsErrorKind<'_>> {
         let kind = match self {
-            Self::Registry(_) | Self::Java(_) | Self::InvalidValue(_) => return None,
+            Self::Registry(_) | Self::Java(_) => return None,
             Self::UnknownJavaMajor { name, major } => SettingsErrorKind::UnknownJavaMajor {
                 name,
                 major: *major,
+            },
+            Self::InvalidValue(invalid) => SettingsErrorKind::InvalidValue {
+                key: invalid.key,
+                raw: &invalid.raw,
             },
         };
         Some(kind)
@@ -59,6 +63,13 @@ pub enum SettingsErrorKind<'a> {
         name: &'a str,
         /// 未注册的大版本
         major: JavaMajor,
+    },
+    /// 属性值不满足该键的格式（如 `ram abc`）
+    InvalidValue {
+        /// 属性键
+        key: SettingKey,
+        /// 用户原始输入
+        raw: &'a str,
     },
 }
 

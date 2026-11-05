@@ -667,6 +667,12 @@ fn connect(
         return connect_ssh(file, raw, name, read_only, printer);
     }
 
+    // 显式给了名字就先校验：「名字非法 / 是保留字」是纯本地用法错误，
+    // 不该先花一次 TLS 探测再报。探测失败时会盖掉真正的错因，用户看到的
+    // 是「连不上」而不知道 `--name all` 本身就不合法。
+    if let Some(explicit) = name {
+        crate::commands::origin::remote_name(explicit, lang)?;
+    }
     let target = normalize_target(raw);
     let probe = Client::probe(&target).with_context(|| {
         crate::i18n::pick(

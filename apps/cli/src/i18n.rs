@@ -273,6 +273,22 @@ pub(crate) fn settings(kind: &SettingsErrorKind<'_>, lang: Lang) -> String {
             }
             Lang::En => format!("Java {major} is not registered; run `mcsup java install {major}`"),
         },
+        SettingsErrorKind::InvalidValue { key, raw } => {
+            // 键已经是对的，只需说明该键要什么格式：重复列一遍「可用键」
+            // 会让用户以为键填错了
+            let hint = match lang {
+                Lang::Zh => {
+                    "ram 取 MiB 整数（如 2048），java-version 取大版本号（如 21），autostart 取 true / false，backup-scope 取逗号分隔的顶层项"
+                }
+                Lang::En => {
+                    "ram takes MiB as an integer (e.g. 2048), java-version a major number (e.g. 21), autostart true / false, backup-scope comma-separated top-level entries"
+                }
+            };
+            match lang {
+                Lang::Zh => format!("{key} 的值非法：{raw}\n{hint}"),
+                Lang::En => format!("invalid value for {key}: {raw}\n{hint}"),
+            }
+        }
         _ => "failed to update server settings".to_owned(),
     }
 }

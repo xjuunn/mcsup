@@ -179,7 +179,7 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | `console` | `mcsup server console [<name>]` | 交互附加控制台；附加时先回放 `console.log` 末尾 30 行历史，再持续输出新增；`Ctrl+D` 只分离不断开进程；Windows 无 EOF 键，`Ctrl+D` / `Ctrl+Z` 随行到达、回车生效，Unix 行首 `Ctrl+D` 立即生效；键位表统一在 `keymap`，未绑定的控制字符按文本注入；非 TTY → 退出码 2。服务器在对端时经帧跟随日志、按对端 id 注入与探活（同名本地服务器不会被误注入） |
 | `send` | `mcsup server send [<name>] ["<命令>"]` | 单条命令注入服务端 stdin；未在运行 → 退出码 4 |
 | `logs` | `mcsup server logs [<name>] [--tail <n>] [--follow]` | 查看日志（`--tail` 默认 30），`--follow` 持续跟踪（JSON 模式 JSONL，一行一个对象） |
-| `props` | `mcsup server props [<name>] [key=value ...]` | 无参列出 `server.properties`（TTY 下随后进入交互：选键改值、逐项写入、Esc 退出）；`key=value` 直接写入并提醒重启生效；单独 `key` 缺值时 TTY 交互输入、非 TTY → 退出码 2；键 / 值非法 → 2。服务器在对端时文件经帧读写：传原文、两端各自解析，注释与顺序保留 |
+| `props` | `mcsup server props [<name>] [key=value ...]` | 无参列出 `server.properties`（TTY 下随后进入交互：选键改值、逐项写入、Esc 退出）；`key=value` 直接写入并提醒重启生效；单独 `key` 缺值时 TTY 交互输入、非 TTY → 退出码 2；键 / 值非法 → 2。键不得含 `=`、`:`、`#`、`!`、`\` 或空白（含空格、制表符）：这些字符在 Java `Properties` 里是分隔符 / 注释前缀 / 转义符，写进去服务器读到的键会与我们写的不同（`bad key=v` 在 Java 侧是键 `bad`、值 `key=v`）；值不得含换行。服务器在对端时文件经帧读写：传原文、两端各自解析，注释与顺序保留 |
 | `set` | `mcsup server set [<name>] [<key>] [<value>]` | 设置服务属性，见下表；TTY 下缺 key 从键列表选、缺 value 按类型补齐（java-version 从已注册大版本选、ram 输入、autostart 二选一）；非 TTY 缺参 → 退出码 2；`java-version` 绑定无运行时的大版本 → 3。服务器在对端时值在对端校验并持久化，`java-version` 候选取对端已注册运行时 |
 | `link` | `mcsup server link <path> [--name <name>] [--workspace <ws>] [--origin <名字>]` | 注册服务器目录：外部目录建符号链接进工作区（目标不能在任一工作区 `servers/` 内）；目标是某工作区 `servers/` 的直接子目录时不建链接、就地注册（恢复注册丢失的服务器，名称必须与目录名一致，`--workspace` 必须与目录归属一致）；带 `mcsup.json` 时复用其身份。`--origin <远端>` 时 `<path>` 是**目标机器**上的路径，链接、marker 与入库全在对端完成 |
 | `remove` | `mcsup server remove [<name>] [--purge] [--origin <名字>]` | `--origin <远端>` 在对端注销（可选删盘）。缺名称时交互选择要删除的服务器；默认注销保留磁盘；交互下询问是否删除磁盘数据（默认不删），同意后红色警示并要求输入服务器名称确认（`-y` 跳过这两道确认）；`--purge` 跳过询问直接删目录（链接服务器拒绝 `--purge`，仅移除链接）；非交互不询问；终端工作目录就在该服务器目录内时拒绝（退出码 4，cd 出去后重试）；删盘的前置条件在确认框之前就校验，不满足立刻报错；JSON 同时输出 `purged`（请求了删盘）与 `disk_purged`（磁盘真的删了），目录本就不存在时后者为 `false` |
@@ -209,7 +209,7 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | 子命令 | 用法 | 说明 |
 | --- | --- | --- |
 | `create` | `mcsup server backup create [<name>] [--label <text>] [--scope <a,b>] [--no-reuse]` | 默认全量，有历史时按父快照增量复用未改动文件。运行中的服务器先发 `save-off`，完成后发 `save-on`（不停服）。`--scope` 覆盖服务属性 `backup-scope`，缺省为整个服务器目录。`--no-reuse` 强制重读全部文件 |
-| `list` | `mcsup server backup list [<name>] [--page <n>] [--page-size <n>]` | 分页历史表格：ID、时间、状态、文件数、大小、标签（缺省 20 条/页） |
+| `list` | `mcsup server backup list [<name>] [--page <n>] [--page-size <n>]` | 分页历史表格：ID、时间、状态、文件数、大小、标签（缺省 20 条/页）。`--page` / `--page-size` 必须大于 0，0 是用法错误 → 退出码 2（页码 1 基，不做静默纠正） |
 | `restore` | `mcsup server backup restore [<name>] [<id>] [--to <新名>]` | 恢复。缺 `id` 时交互选择。**原地恢复要求服务器已停止**（运行中返回退出码 4），恢复前自动生成安全快照；`--to` 恢复到新服务，原服务不动：新名必须是合法服务器名、目标目录必须不存在，恢复出的目录带全新身份（`mcsup.json` 新 id），之后可直接 `server link` 注册 |
 | `delete` | `mcsup server backup delete [<name>] [<id>]` | 删除某个快照记录；内容对象不即时删除，交由 `prune` 回收 |
 | `verify` | `mcsup server backup verify [<name>] [<id>]` | 校验快照引用的所有对象存在且哈希匹配；有损坏时返回退出码 1 |

@@ -113,8 +113,14 @@ impl Properties {
     }
 }
 
+/// 键合法性：拒绝一切会被 Java `Properties` 当作语法、导致键被截断或转义错乱的字符
+///
+/// Java 侧键终止于首个未转义的 `=`、`:` 或空白，行首的 `#` / `!` 是注释，
+/// `\` 是转义符。这些字符一旦落进键里，服务器读到的键与我们写下的不是同一个：
+/// `bad key=v` 在 Java 里是键 `bad`、值 `key=v`。Minecraft 自己的键都是
+/// 字母数字加 `-` / `.`，收紧不会误伤真实配置。
 fn validate_key(key: &str) -> Result<(), PropertySetError> {
-    if key.is_empty() || key.contains(['=', '\n', '\r']) {
+    if key.is_empty() || key.contains(|c: char| KEY_FORBIDDEN.contains(&c)) {
         return Err(InvalidPropertyKey {
             raw: key.to_owned(),
         }
@@ -122,6 +128,9 @@ fn validate_key(key: &str) -> Result<(), PropertySetError> {
     }
     Ok(())
 }
+
+/// Java `Properties` 中不可出现在键里的字符
+const KEY_FORBIDDEN: [char; 9] = ['=', ':', '#', '!', '\\', ' ', '\t', '\n', '\r'];
 
 fn validate_value(key: &str, value: &str) -> Result<(), PropertySetError> {
     if value.contains(['\n', '\r']) {
@@ -184,6 +193,41 @@ mod tests {
         assert!(props.set("key", "a\nb").is_err());
         // 失败后文件视图不变
         assert_eq!(props.render(), "motd=old\n");
+    }
+
+    /// 键里混入 Java `Properties` 的语法字符必须拒绝
+    ///
+    /// 这些键写下去不会报错，但 Java 侧读到的键与我们写的不同：
+    /// `bad key=v` 会成为键 `bad`、值 `key=v`。校验只挡 `=` / 换行时，
+    /// 空格、制表符、`:`、`#`、`!`、`\` 全都能落盘，配置与预期不符。
+    #[test]
+    fn set_rejects_java_properties_syntax_chars_in_key() {
+        for key in [
+            "bad key", "bad\tkey", "bad:key", "#comment", "!comment", "bad\\key",
+        ] {
+            let mut props = Properties::parse("motd=old\n");
+            assert!(
+                props.set(key, "v").is_err(),
+                "键 {key:?} 应被拒绝，否则 Java 侧解析出的键会不同"
+            );
+            assert_eq!(props.render(), "motd=old\n", "失败后视图不变: {key:?}");
+        }
+    }
+
+    /// Minecraft 真实键不受影响
+    #[test]
+    fn set_accepts_real_minecraft_keys() {
+        let mut props = Properties::parse("");
+        for key in [
+            "server-port",
+            "motd",
+            "view-distance",
+            "enable-rcon",
+            "level-name",
+        ] {
+            props.set(key, "v").expect("真实键应通过");
+        }
+        assert_eq!(props.len(), 5);
     }
 
     #[test]

@@ -124,8 +124,26 @@ pub(crate) async fn create(
 ///
 /// 服务器不存在或快照索引读取失败时返回错误
 pub(crate) fn list(name: &str, page: usize, page_size: usize, printer: Printer) -> Result<()> {
+    let lang = printer.lang();
+    // 页码 1 基、每页至少 1 条：0 是非法输入。之前用 `max(1)` 悄悄改成 1，
+    // `--page 0` 与 `--page 1` 输出完全一样，脚本拿不到「你传错了」的信号。
+    if page == 0 || page_size == 0 {
+        return Err(AppDiagnostic::usage(
+            crate::i18n::pick(
+                lang,
+                "--page 与 --page-size 都必须大于 0",
+                "--page and --page-size must be greater than 0",
+            ),
+            Some(crate::i18n::pick(
+                lang,
+                "页码从 1 开始，每页条数至少 1",
+                "pages are 1-based and page size is at least 1",
+            )),
+        )
+        .into());
+    }
     let service = backup_service()?;
-    let page = Page::new(page.max(1), page_size.max(1));
+    let page = Page::new(page, page_size);
     let window = service.list(name, page)?;
 
     let rows: Vec<BackupRow<'_>> = window.items.iter().map(row_of).collect();
