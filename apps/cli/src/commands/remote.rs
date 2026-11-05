@@ -1083,6 +1083,14 @@ fn disconnect(file: &ConfigFile, name: &str, printer: Printer) -> Result<()> {
     if removed {
         file.save(&cfg)?;
     }
+    // 缓存里是对端的服务器名、路径、版本与 Java 清单。断开后这些既是数据残留，
+    // 也会让下一次 `connect` 到同名远端时先渲染出过期的旧内容——一并删掉。
+    // 删不掉不算失败：配对与凭证已经清了，缓存只是可重建的副本。
+    if let Err(err) = std::fs::remove_dir_all(crate::remote_cache::cache_for(&remote_name).dir())
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(remote = remote_name.as_str(), %err, "删除远端缓存失败");
+    }
     // 当前选择可能正指向这台远端。断开后指针留在远端，之后每条缺省落点命令
     // 都会报「来源不可用」，所以要当场撤回本地最后使用的工作区
     let restored = detach_workspace(&remote_name, lang)?;

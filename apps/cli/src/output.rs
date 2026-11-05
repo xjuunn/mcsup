@@ -358,7 +358,9 @@ fn lifecycle_exit_code(err: &mcsup::service::LifecycleError) -> u8 {
     match err {
         Life::Registry(reg) => registry_exit_code(reg),
         Life::Java(java) => java_exit_code(java),
-        Life::Supervisor(_) => 5,
+        // 远端 supervisor 的业务拒绝带类型化 kind：未授权必须与「对端崩了」
+        // 区分开（6 vs 5），否则脚本无从判断该不该重新配对。
+        Life::Supervisor(sup) => supervisor_exit_code(sup),
         Life::NoJar { .. } | Life::NoJava | Life::UnknownJavaMajor { .. } => 3,
         Life::EulaRequired => 2,
         // 运行中（含删除 / 换核心被拒）：状态冲突
@@ -496,10 +498,38 @@ fn install_exit_code(err: &mcsup::service::InstallError) -> u8 {
     }
 }
 
+/// supervisor 失败判级
+///
+/// 未授权单列 6（与 `transport_exit_code` 同一口径）：token 失效 / 被撤销
+/// 时脚本应当重新配对，而不是把整台后端判成不可用。
+fn supervisor_exit_code(err: &mcsup::port::SupervisorError) -> u8 {
+    use mcsup::port::{RemoteFailureKind, SupervisorError as Sup};
+    match err {
+        Sup::Remote { kind, .. } => match kind {
+            RemoteFailureKind::Unauthorized => 6,
+            RemoteFailureKind::NotFound => 3,
+            RemoteFailureKind::AlreadyExists | RemoteFailureKind::Busy => 4,
+            RemoteFailureKind::Invalid => 2,
+            _ => 5,
+        },
+        Sup::AlreadyRunning => 4,
+        _ => 5,
+    }
+}
+
 fn repo_exit_code(err: &mcsup::port::RepositoryError) -> u8 {
     match err {
         mcsup::port::RepositoryError::NotFound(_) => 3,
         mcsup::port::RepositoryError::AlreadyExists(_) => 4,
+        // 远端仓库把对端的传输失败原样包进 `Storage`。不下钻就一律落 1，把
+        // 「token 被撤销」和「对端崩了」混成一类——脚本据退出码决定要不要重新
+        // 配对，这里必须给出 6。
+        mcsup::port::RepositoryError::Storage(inner) => {
+            match inner.downcast_ref::<mcsup::transport::TransportError>() {
+                Some(transport) => transport_exit_code(transport),
+                None => 5,
+            }
+        }
         _ => 1,
     }
 }
@@ -560,7 +590,9 @@ fn print_error_line(text: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Printer, structured_message, transport_exit_code};
+    use super::{
+        Printer, repo_exit_code, structured_message, supervisor_exit_code, transport_exit_code,
+    };
     use crate::locale::Lang;
     use anyhow::Context as _;
     use mcsup::domain::server::version::VersionId;
@@ -865,6 +897,45 @@ mod tests {
             }),
             5
         );
+    }
+
+    /// 远端仓库把对端失败包在 `Storage` 里，判级必须下钻到 `TransportError`
+    ///
+    /// 回归：只认 `NotFound` / `AlreadyExists`，**未授权**一律落 1，于是
+    /// `server status <远端>/x` 在 token 被撤销时返回 5，而 `remote ping`
+    /// 返回 6——同一种失败两个退出码，脚本无从判断要不要重新配对。
+    #[test]
+    fn repository_storage_drills_into_transport_error() {
+        use mcsup::port::RepositoryError;
+        use mcsup::transport::TransportError;
+
+        let unauthorized = RepositoryError::Storage(Box::new(TransportError::Remote {
+            kind: mcsup::protocol::remote::ErrorKind::UNAUTHORIZED.to_owned(),
+            message: "token is unknown or revoked".to_owned(),
+        }));
+        assert_eq!(repo_exit_code(&unauthorized), 6);
+
+        // 与本判级无关的存储失败仍是后端失败
+        let io = RepositoryError::Storage(Box::new(std::io::Error::other("disk")));
+        assert_eq!(repo_exit_code(&io), 5);
+    }
+
+    /// 远端 supervisor 的业务拒绝同样按 kind 判级
+    #[test]
+    fn supervisor_remote_kind_maps_to_exit_code() {
+        use mcsup::port::{RemoteFailureKind, SupervisorError};
+
+        let make = |kind| SupervisorError::Remote {
+            kind,
+            message: "x".to_owned(),
+        };
+        assert_eq!(
+            supervisor_exit_code(&make(RemoteFailureKind::Unauthorized)),
+            6
+        );
+        assert_eq!(supervisor_exit_code(&make(RemoteFailureKind::NotFound)), 3);
+        assert_eq!(supervisor_exit_code(&make(RemoteFailureKind::Busy)), 4);
+        assert_eq!(supervisor_exit_code(&make(RemoteFailureKind::Io)), 5);
     }
 
     #[test]
