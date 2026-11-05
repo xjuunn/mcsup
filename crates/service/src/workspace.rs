@@ -72,6 +72,26 @@ pub enum WorkspaceError {
 }
 
 impl WorkspaceError {
+    /// 失败等级
+    ///
+    /// 「当前来源不可用」归未找到：本地记录还在，只是此刻解析不到，与
+    /// `NotFound` 对调用方是同一件事（换个工作区或恢复连接即可）。
+    #[must_use]
+    pub fn category(&self) -> port::ErrorCategory {
+        match self {
+            Self::Fs(err) => err.category(),
+            Self::Repo(err) => err.category(),
+            Self::NotFound(_) | Self::NoCurrent | Self::CurrentOriginUnavailable { .. } => {
+                port::ErrorCategory::NotFound
+            }
+            Self::AlreadyExists(_) | Self::CwdInsideTarget { .. } => port::ErrorCategory::Conflict,
+            Self::NotEmpty(_)
+            | Self::NotAWorkspace(_)
+            | Self::Ambiguous { .. }
+            | Self::InvalidName(_) => port::ErrorCategory::Usage,
+        }
+    }
+
     fn io(path: &Path, source: std::io::Error) -> Self {
         FsError::io(path, source).into()
     }

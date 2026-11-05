@@ -163,6 +163,14 @@ pub enum ConfigValueError {
 }
 
 impl ConfigValueError {
+    /// 失败等级：键的取值不可用，改值即可成功
+    #[must_use]
+    pub fn category(&self) -> port::ErrorCategory {
+        match self {
+            Self::Path { .. } => port::ErrorCategory::Usage,
+        }
+    }
+
     /// 错误种类：入口据此选择本地化文案
     #[must_use]
     pub fn kind(&self) -> ConfigValueErrorKind {
@@ -200,6 +208,17 @@ pub enum ConfigDocumentError {
         /// 原始键名
         name: String,
     },
+}
+
+impl ConfigDocumentError {
+    /// 失败等级：整份配置文本读不懂是调用方写错了文件
+    #[must_use]
+    pub fn category(&self) -> port::ErrorCategory {
+        match self {
+            Self::Value(err) => err.category(),
+            Self::Syntax { .. } | Self::RemoteName { .. } => port::ErrorCategory::Usage,
+        }
+    }
 }
 
 impl Config {

@@ -48,6 +48,14 @@ pub enum OriginError {
     NotConcrete(String),
 }
 
+impl OriginError {
+    /// 失败等级：来源名是调用方输入，六个变体都是「改参数即可成功」
+    #[must_use]
+    pub fn category(&self) -> crate::ErrorCategory {
+        crate::ErrorCategory::Usage
+    }
+}
+
 /// 远端名：已校验，可直接用作配置键与展示名
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RemoteName(String);

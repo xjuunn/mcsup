@@ -554,8 +554,9 @@ mod tests {
         for bad in ["10.0.0.5", "@host", "user@", "user"] {
             let err = parse_user_host(bad, Lang::Zh).expect_err(bad);
             assert_eq!(
-                err.downcast_ref::<AppDiagnostic>().map(|d| d.exit_code),
-                Some(2),
+                err.downcast_ref::<AppDiagnostic>()
+                    .map(AppDiagnostic::category),
+                Some(mcsup::port::ErrorCategory::Usage),
                 "{bad}"
             );
         }

@@ -73,6 +73,30 @@ pub enum TransportError {
     Unauthorized(String),
 }
 
+impl port::StorageFailure for TransportError {
+    /// 失败等级
+    ///
+    /// 远端仓库把传输失败原样装进 `RepositoryError::Storage`，若这一层不给等级，
+    /// 入口只能靠 `downcast_ref` 猜类型，同一种失败会在不同子命令下拿到不同的码
+    /// （`server status <远端>/x` 与 `remote ping` 曾对「token 被撤销」给出 5 和 6）。
+    ///
+    /// 对端拒绝按线上词表判定，走 [`port::RemoteFailureKind::from_wire`] 而不是
+    /// 在这里重写一遍 `match`：词表属于协议，两处各写一份必然分叉。
+    fn category(&self) -> port::ErrorCategory {
+        match self {
+            Self::Unauthorized(_) | Self::FingerprintMismatch { .. } => {
+                port::ErrorCategory::Unauthorized
+            }
+            Self::Remote { kind, .. } => port::RemoteFailureKind::from_wire(kind).category(),
+            Self::Io { .. }
+            | Self::Tls(_)
+            | Self::Protocol(_)
+            | Self::Identity { .. }
+            | Self::IdentityCorrupt(_) => port::ErrorCategory::Backend,
+        }
+    }
+}
+
 impl TransportError {
     /// 构造带上下文的 IO 失败
     pub(crate) fn io(context: impl Into<String>, source: std::io::Error) -> Self {

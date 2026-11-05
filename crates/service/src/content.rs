@@ -71,6 +71,24 @@ pub enum ContentError {
 }
 
 impl ContentError {
+    /// 失败等级
+    ///
+    /// 「来源没配」是配置问题，归用法错误；客户端专属资源（光影）装不进服务端
+    /// 同样是调用方选错了东西。路径逃逸是安全拒绝，不是用法提示。
+    #[must_use]
+    pub fn category(&self) -> port::ErrorCategory {
+        match self {
+            Self::Source(err) => err.category(),
+            Self::Download(err) => err.category(),
+            Self::Fs(err) => err.category(),
+            Self::UnknownSource(_) | Self::NoSource | Self::ClientOnly { .. } => {
+                port::ErrorCategory::Usage
+            }
+            Self::NoCandidate { .. } => port::ErrorCategory::NotFound,
+            Self::Escapes { .. } => port::ErrorCategory::Backend,
+        }
+    }
+
     fn io(path: &Path, source: std::io::Error) -> Self {
         FsError::io(path, source).into()
     }

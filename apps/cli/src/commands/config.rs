@@ -454,7 +454,7 @@ mod tests {
         let diag = err
             .downcast_ref::<AppDiagnostic>()
             .expect("usage diagnostic");
-        assert_eq!(diag.exit_code, 2);
+        assert_eq!(diag.category(), mcsup::port::ErrorCategory::Usage);
     }
 
     #[test]

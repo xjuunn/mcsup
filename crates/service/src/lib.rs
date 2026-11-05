@@ -42,8 +42,8 @@ pub use modpack::{
 };
 pub use origin::{OriginFilter, ResolveError, Selector, resolve_index};
 pub use platform_config::{
-    Config, ConfigKey, ConfigValueError, ConfigValueErrorKind, FEATURE_HEADER, RemoteRecord,
-    RemoteVia, lexical_normalize,
+    Config, ConfigDocumentError, ConfigKey, ConfigValueError, ConfigValueErrorKind, FEATURE_HEADER,
+    RemoteRecord, RemoteVia, lexical_normalize,
 };
 pub use platform_doctor::{PlatformCheck, PlatformDoctor, PlatformFinding, PlatformReport};
 /// Java 源聚合端口（定义在 `port`，此处转出便于既有调用方）
@@ -97,6 +97,29 @@ pub enum InstallError {
          but no Java runtime was found; install one with `mcsup java install`"
     )]
     NoJavaForInstaller,
+}
+
+impl InstallError {
+    /// 失败等级
+    ///
+    /// 包装变体一律**委托**：`Source` / `Download` / `Installer` 各自知道自己是
+    /// 未找到、取消还是后端失败，本层再判一次就必然出现两套口径。
+    #[must_use]
+    pub fn category(&self) -> port::ErrorCategory {
+        match self {
+            Self::Source(err) => err.category(),
+            Self::Download(err) => err.category(),
+            Self::Installer(err) => err.category(),
+            // 状态机流转失败：目标状态与当前状态矛盾，处理状态后可重试
+            Self::Status(_) => port::ErrorCategory::Conflict,
+            // 本机没有可用 Java：与 `LifecycleError::NoJava` 同一种「资源不存在」，
+            // 两处必须同码，否则「装不上」与「起不来」对脚本是两种结论
+            Self::NoJavaForInstaller => port::ErrorCategory::NotFound,
+            // 安装器产出的目录缺启动要素：既不是缺资源也不是后端不可用，
+            // 是「装出来的东西不对」，归通用失败
+            Self::Layout(_) => port::ErrorCategory::Failure,
+        }
+    }
 }
 
 /// 安装成功的结果

@@ -23,6 +23,12 @@ pub enum FsError {
 }
 
 impl FsError {
+    /// 失败等级：文件系统失败一律后端问题（磁盘、权限、占用）
+    #[must_use]
+    pub fn category(&self) -> port::ErrorCategory {
+        port::ErrorCategory::Backend
+    }
+
     /// IO 失败：路径随消息带出，原因走 source 链
     pub(crate) fn io(path: &Path, source: std::io::Error) -> Self {
         Self::Io {

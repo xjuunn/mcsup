@@ -55,6 +55,42 @@ impl LifecycleError {
 `#[non_exhaustive]` 的枚举在下游 `match` 必须带兜底分支；兜底不得静默丢弃，
 至少沿用英文措辞。
 
+## 分类与文案分开
+
+`kind()` 回答「哪个变体 + 什么参数」，供入口按语言渲染文案。它**不**回答
+「这算哪一类失败」——那是另一件事，由 `category()` 返回
+`port::ErrorCategory`（`Failure` / `Usage` / `NotFound` / `Conflict` /
+`Backend` / `Unauthorized` / `Cancelled`）。
+
+两层分开的理由：分类要跨入口共享（CLI 退出码、REST 状态码、MCP 工具错误），
+而文案只有展示层关心。混成一个 `kind()` 会让「新增一种失败」变成「在三个
+入口各改一次映射」，漏一处就是同一种失败三种结论。
+
+```rust
+impl LifecycleError {
+    pub fn category(&self) -> port::ErrorCategory {
+        match self {
+            Self::Registry(err) => err.category(),      // 委托，不重判
+            Self::EulaRequired => port::ErrorCategory::Usage,
+            Self::AlreadyRunning => port::ErrorCategory::Conflict,
+            Self::Io(_) => port::ErrorCategory::Backend,
+        }
+    }
+}
+```
+
+强制约定：
+
+- **包装变体必须委托**。`#[error(transparent)]` 包内层错误时返回内层
+  `category()`，禁止返回 `None` 让调用方沿链重新猜：内层类型不在
+  `anyhow` 的 `chain()` 里，猜不到。
+- `match` 必须穷尽本层所有变体，不加兜底。新增变体时编译器强制表态。
+- 分层单向：`port` 与 `service` 只给分类，**不知道**退出码与 HTTP 状态码；
+  数字只在入口的映射表里出现一次（CLI 见 `apps/cli/src/output/error.rs`）。
+- `ErrorCategory` 本身不加 `#[non_exhaustive]`，理由同上表「封闭判定」。
+- 实现层错误要进 `RepositoryError::Storage` 这类装箱字段时，实现
+  `port::StorageFailure`（`category()` 默认 `Backend`，有明确等级的自己覆写）。
+
 ### 哪些枚举加 `#[non_exhaustive]`
 
 看「加变体时应不应该让下游编译失败」：

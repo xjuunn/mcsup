@@ -634,7 +634,10 @@ impl StateVersion for JavaState {
 /// Windows 的 `rename` 覆盖已存在目标，无需先删除（先删会留下无文件窗口）。
 /// 失败时清掉临时文件并抛出错误，目标文件保持原样。
 fn write_atomically(path: &Path, value: &impl Serialize) -> Result<(), RepositoryError> {
-    let mut bytes = serde_json::to_vec_pretty(value).map_err(storage_err)?;
+    // 序列化失败是「值写不出来」，不是记录损坏（那条在读取侧）：包成 IO 失败
+    // 保持后端等级，同时把真实原因留在错误链里
+    let mut bytes = serde_json::to_vec_pretty(value)
+        .map_err(|err| storage_err(io::Error::other(format!("serialize record: {err}"))))?;
     bytes.push(b'\n');
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(storage_err)?;
@@ -696,7 +699,11 @@ fn is_safe_record_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 128 && id != "." && id != ".." && !id.contains(['/', '\\', '\0'])
 }
 
-fn storage_err(err: impl std::error::Error + Send + Sync + 'static) -> RepositoryError {
+/// 装箱一个实现层失败
+///
+/// 约束要求实现 [`port::StorageFailure`]：入口要靠它拿到等级，接受任意
+/// `Error` 就只能默认后端失败，远端「未授权」会被压成「对端不可用」。
+fn storage_err(err: impl port::StorageFailure) -> RepositoryError {
     RepositoryError::Storage(Box::new(err))
 }
 

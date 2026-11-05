@@ -93,13 +93,32 @@ fn print_version(printer: Printer) -> Result<()> {
         protocol_version: mcsup::protocol::PROTOCOL_VERSION,
     };
     if printer.is_human() {
+        let lang = printer.lang();
+        let label = |zh: &'static str, en: &'static str| {
+            comfy_table::Cell::new(crate::i18n::pick(lang, zh, en))
+        };
         let mut table = comfy_table::Table::new();
-        table.set_header(["项", "值"]);
-        table.add_row(["程序", payload.name]);
-        table.add_row(["版本", payload.version]);
-        table.add_row(["目标平台", payload.target]);
-        table.add_row(["构建", payload.profile]);
-        table.add_row(["协议", &payload.protocol_version.to_string()]);
+        table.set_header([label("项", "field"), label("值", "value")]);
+        table.add_row([
+            label("程序", "program"),
+            comfy_table::Cell::new(payload.name),
+        ]);
+        table.add_row([
+            label("版本", "version"),
+            comfy_table::Cell::new(payload.version),
+        ]);
+        table.add_row([
+            label("目标平台", "target"),
+            comfy_table::Cell::new(payload.target),
+        ]);
+        table.add_row([
+            label("构建", "profile"),
+            comfy_table::Cell::new(payload.profile),
+        ]);
+        table.add_row([
+            label("协议", "protocol"),
+            comfy_table::Cell::new(payload.protocol_version.to_string()),
+        ]);
         crate::output::print_table(&table);
         return Ok(());
     }

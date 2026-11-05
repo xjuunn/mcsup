@@ -34,6 +34,15 @@ pub enum CasError {
 }
 
 impl CasError {
+    /// 失败等级
+    ///
+    /// 三个变体都是本机存储问题：对象缺失（并发 GC 或索引与 CAS 不一致）、
+    /// 内容与哈希不符、写盘失败——调用方改参数也解决不了。
+    #[must_use]
+    pub fn category(&self) -> crate::ErrorCategory {
+        crate::ErrorCategory::Backend
+    }
+
     /// 构造 IO 失败
     #[must_use]
     pub fn io(path: &Path, source: std::io::Error) -> Self {
@@ -121,7 +130,22 @@ pub enum SnapshotStoreError {
     /// 与 `RepositoryError::Storage` 同理：原因只走 `#[source]`，避免整链
     /// 渲染时重复。
     #[error("snapshot storage error")]
-    Storage(#[source] Box<dyn std::error::Error + Send + Sync>),
+    Storage(#[source] Box<dyn crate::StorageFailure>),
+}
+
+impl SnapshotStoreError {
+    /// 失败等级
+    ///
+    /// [`Self::Storage`] **委托**给内层，与 [`crate::RepositoryError::category`]
+    /// 同一口径：备份索引读写走的是同一批远端连接，未授权不能被压成后端失败。
+    #[must_use]
+    pub fn category(&self) -> crate::ErrorCategory {
+        match self {
+            Self::NotFound(_) => crate::ErrorCategory::NotFound,
+            Self::Corrupt(_) => crate::ErrorCategory::Failure,
+            Self::Storage(inner) => inner.category(),
+        }
+    }
 }
 
 /// 快照索引：一份快照一个记录，按服务器查询
@@ -300,6 +324,23 @@ pub enum ScanError {
     Cancelled,
 }
 
+impl ScanError {
+    /// 失败等级
+    ///
+    /// 取消单列 [`crate::ErrorCategory::Cancelled`]：扫描可达数分钟，用户中断
+    /// 后入口静默退出，不留半成品快照也不再报错。
+    #[must_use]
+    pub fn category(&self) -> crate::ErrorCategory {
+        match self {
+            Self::Cancelled => crate::ErrorCategory::Cancelled,
+            Self::InvalidPath(_) => crate::ErrorCategory::Usage,
+            Self::Unreadable { .. } | Self::UnreadableFile { .. } | Self::Cas(_) => {
+                crate::ErrorCategory::Backend
+            }
+        }
+    }
+}
+
 /// 目录扫描器：把服务器目录转成「相对路径 → 内容哈希」并写入 CAS
 ///
 /// 扫描是备份的热路径，实现必须满足的口径（不止一处实现要一致）：
@@ -460,6 +501,22 @@ pub enum RemoteBackupError {
     /// 对端 IO 失败
     #[error("remote io error: {0}")]
     Io(String),
+}
+
+impl RemoteBackupError {
+    /// 失败等级
+    ///
+    /// 对端把这些拒绝送回来时用的就是同一套词汇表，判级与
+    /// [`crate::SupervisorError::category`] 保持一致，本地与远端同一种失败
+    /// 拿到同一个退出码。
+    #[must_use]
+    pub fn category(&self) -> crate::ErrorCategory {
+        match self {
+            Self::NotFound(_) => crate::ErrorCategory::NotFound,
+            Self::Invalid(_) => crate::ErrorCategory::Usage,
+            Self::Unreachable(_) | Self::Protocol(_) | Self::Io(_) => crate::ErrorCategory::Backend,
+        }
+    }
 }
 
 /// 远端创建结果

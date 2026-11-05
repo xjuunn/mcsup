@@ -879,7 +879,11 @@ mod tests {
         let diagnostic = err
             .downcast_ref::<crate::diagnostic::AppDiagnostic>()
             .expect("usage diagnostic");
-        assert_eq!(diagnostic.exit_code, 2, "超过上限是用法错误: {err}");
+        assert_eq!(
+            diagnostic.category(),
+            mcsup::port::ErrorCategory::Usage,
+            "超过上限是用法错误: {err}"
+        );
     }
 
     #[test]

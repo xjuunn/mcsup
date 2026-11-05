@@ -339,8 +339,9 @@ mod tests {
     fn invalid_filter_is_a_usage_error() {
         let err = filter_from(Some("a/b"), None, Lang::Zh).expect_err("slash");
         assert_eq!(
-            err.downcast_ref::<AppDiagnostic>().map(|d| d.exit_code),
-            Some(2)
+            err.downcast_ref::<AppDiagnostic>()
+                .map(AppDiagnostic::category),
+            Some(mcsup::port::ErrorCategory::Usage)
         );
     }
 
@@ -350,8 +351,9 @@ mod tests {
         for bad in ["", "a/b", "all", "local", "remote", "prod box"] {
             let err = remote_name(bad, Lang::Zh).expect_err(bad);
             assert_eq!(
-                err.downcast_ref::<AppDiagnostic>().map(|d| d.exit_code),
-                Some(2),
+                err.downcast_ref::<AppDiagnostic>()
+                    .map(AppDiagnostic::category),
+                Some(mcsup::port::ErrorCategory::Usage),
                 "{bad}"
             );
         }
@@ -368,8 +370,9 @@ mod tests {
         let err =
             member(&members, &Origin::Remote(name("prod-box")), Lang::Zh).expect_err("unpaired");
         assert_eq!(
-            err.downcast_ref::<AppDiagnostic>().map(|d| d.exit_code),
-            Some(2)
+            err.downcast_ref::<AppDiagnostic>()
+                .map(AppDiagnostic::category),
+            Some(mcsup::port::ErrorCategory::Usage)
         );
     }
 

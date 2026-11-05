@@ -727,7 +727,7 @@ mod tests {
     #[test]
     fn parse_scope_rejects_path_separators() {
         let err = parse_scope(crate::locale::Lang::Zh, "world/region").expect_err("invalid");
-        assert_eq!(Printer::exit_code(&err), 2);
+        assert_eq!(output::exit_code_of(&err), 2);
     }
 
     /// `--scope all` 与 `server set backup-scope all` 同义
@@ -782,7 +782,7 @@ mod tests {
     #[test]
     fn parse_retention_rejects_age_without_unit() {
         let err = parse_retention(crate::locale::Lang::Zh, None, Some("7")).expect_err("bad age");
-        assert_eq!(Printer::exit_code(&err), 2);
+        assert_eq!(output::exit_code_of(&err), 2);
     }
 
     #[test]

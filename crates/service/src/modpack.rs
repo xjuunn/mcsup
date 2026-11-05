@@ -76,6 +76,26 @@ pub enum ModpackError {
 }
 
 impl ModpackError {
+    /// 失败等级
+    ///
+    /// 清单本身不可用（缺 Minecraft 版本 / 加载器无核心来源 / 来源没配）都是
+    /// 「这个整合包装不了」，归用法错误；`Extract` 自带细分等级。
+    #[must_use]
+    pub fn category(&self) -> port::ErrorCategory {
+        match self {
+            Self::Source(err) => err.category(),
+            Self::Download(err) => err.category(),
+            Self::Extract(err) => err.category(),
+            Self::Fs(err) => err.category(),
+            Self::Lifecycle(err) => err.category(),
+            Self::UnknownSource(_)
+            | Self::NoSource
+            | Self::MissingMinecraft(_)
+            | Self::UnsupportedLoader(_) => port::ErrorCategory::Usage,
+            Self::Escapes { .. } => port::ErrorCategory::Backend,
+        }
+    }
+
     fn io(path: &Path, source: std::io::Error) -> Self {
         FsError::io(path, source).into()
     }

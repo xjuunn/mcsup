@@ -133,6 +133,36 @@ pub enum BackupError {
 }
 
 impl BackupError {
+    /// 失败等级
+    ///
+    /// 包装变体**委托**给内层（`Store` / `Scan` 自带取消与未找到的区分）。
+    /// 快照不可恢复 / 原地恢复撞上运行中的服务器 / 恢复目标已存在都是状态冲突；
+    /// 空范围、标签与保留策略非法是用法错误；校验发现损坏是「数据确实坏了」，
+    /// 归通用失败——脚本要的是「这份快照不能用来恢复」这个结论。
+    #[must_use]
+    pub fn category(&self) -> port::ErrorCategory {
+        match self {
+            Self::Registry(err) => err.category(),
+            Self::Lifecycle(err) => err.category(),
+            Self::Supervisor(err) => err.category(),
+            Self::Store(err) => err.category(),
+            Self::Cas(err) => err.category(),
+            Self::Scan(err) => err.category(),
+            Self::Fs(err) => err.category(),
+            Self::SnapshotNotFound(_) => port::ErrorCategory::NotFound,
+            Self::NotRestorable { .. }
+            | Self::RestoreWhileRunning { .. }
+            | Self::TargetExists(_) => port::ErrorCategory::Conflict,
+            Self::EmptyScope | Self::InvalidLabel { .. } | Self::ConflictingRetention => {
+                port::ErrorCategory::Usage
+            }
+            Self::RestoreCancelled => port::ErrorCategory::Cancelled,
+            Self::VerifyFailed { .. } | Self::DuplicatePath(_) | Self::InvalidSnapshotId(_) => {
+                port::ErrorCategory::Failure
+            }
+        }
+    }
+
     /// 面向用户展示的分类；结构化错误不带文案，入口按此渲染提示
     ///
     /// 包装类变体（[`Self::Registry`] / [`Self::Lifecycle`] / [`Self::Store`] /

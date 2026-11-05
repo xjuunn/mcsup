@@ -23,6 +23,16 @@ pub enum DoctorError {
     Repo(#[from] RepositoryError),
 }
 
+impl DoctorError {
+    /// 失败等级：注册表都读不出来是后端不可用，不是「体检发现了问题」
+    #[must_use]
+    pub fn category(&self) -> port::ErrorCategory {
+        match self {
+            Self::Repo(err) => err.category(),
+        }
+    }
+}
+
 /// 单项检查的结论
 ///
 /// 每项带结构化字段而不是拼好的字符串：入口要按 kind 做机器判定

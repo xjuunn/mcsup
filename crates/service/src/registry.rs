@@ -143,6 +143,20 @@ pub enum InstallJarError {
 }
 
 impl InstallJarError {
+    /// 失败等级
+    ///
+    /// 包装变体**委托**；世界降级被拒是状态冲突（目标核心与既有世界矛盾，
+    /// 换目标版本才能过），元数据读不出来是后端问题。
+    #[must_use]
+    pub fn category(&self) -> port::ErrorCategory {
+        match self {
+            Self::Registry(err) => err.category(),
+            Self::Install(err) => err.category(),
+            Self::Downgrade { .. } => port::ErrorCategory::Conflict,
+            Self::Inspect(_) => port::ErrorCategory::Backend,
+        }
+    }
+
     /// 面向用户展示的分类；结构化错误不带文案，入口按此渲染提示
     #[must_use]
     pub fn kind(&self) -> Option<InstallJarErrorKind<'_>> {
@@ -185,6 +199,24 @@ pub enum InstallJarErrorKind<'a> {
 }
 
 impl ServerRegistryError {
+    /// 失败等级
+    ///
+    /// 包装变体**委托**给内层；名字非法与「目标在工作区 servers/ 内」是调用方
+    /// 输入问题，名称冲突是状态冲突。
+    #[must_use]
+    pub fn category(&self) -> port::ErrorCategory {
+        match self {
+            Self::Workspace(err) => err.category(),
+            Self::Fs(err) => err.category(),
+            Self::Repo(err) => err.category(),
+            Self::AlreadyExists(_) => port::ErrorCategory::Conflict,
+            Self::NotFound(_) => port::ErrorCategory::NotFound,
+            Self::InvalidName(_)
+            | Self::TargetInsideWorkspace(_)
+            | Self::WorkspaceMismatch { .. } => port::ErrorCategory::Usage,
+        }
+    }
+
     fn io(path: &Path, source: std::io::Error) -> Self {
         FsError::io(path, source).into()
     }
