@@ -388,3 +388,29 @@ fn backup_missing_snapshot_exits_3() {
         assert!(out.stdout.is_empty(), "{sub} 错误路径不得输出数据");
     }
 }
+
+/// `--page 0` / `--page-size 0` 是用法错误，不能悄悄纠正成 1
+///
+/// 回归：入口用 `page.max(1)` 兜底，`--page 0` 与 `--page 1` 输出逐字节相同，
+/// 脚本传错参数拿不到任何信号。
+#[test]
+fn backup_list_rejects_zero_page_and_page_size() {
+    let home = temp_home();
+    init_workspace(&home, "ws");
+
+    for args in [
+        ["ls", "alpha", "--page", "0"],
+        ["ls", "alpha", "--page-size", "0"],
+    ] {
+        let bad = backup(&home, &args);
+        assert_eq!(
+            bad.status.code(),
+            Some(2),
+            "{args:?} 应是用法错误而非静默纠正: {}",
+            stderr(&bad)
+        );
+        // 必须是分页参数本身的错，不能是「服务器不存在」之类的偶然 2
+        let err = stderr(&bad);
+        assert!(err.contains("大于 0"), "{args:?} 错误文案不对: {err}");
+    }
+}

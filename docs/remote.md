@@ -182,6 +182,10 @@ $ mcsup remote connect host:port --code 4821-9375
 | `mcsup remote ping <name>` | 连通性 / 版本 / 能力，供脚本使用 |
 | `mcsup remote disconnect <name>` | 删除本地配对、凭证与只读缓存目录（`{data_dir}/remotes/<name>/`），**并通知远端删掉本机那条客户端记录**；对端连不上时本地照常断开、远端记录保留（会提示如何在 serve 端清理）。当前工作区指向该远端时切回本地最后使用的工作区 |
 
+- `--name` 不合法（含 `/`）或是保留字（`all` / `local` / `remote`）时**先于任何
+  网络动作**报用法错误（退出码 2）：这类错属本地输入，先探测会把真正的错因盖成
+  「连不上」。
+
 `connect` 幂等：重复执行等于重新握手并刷新 token 与指纹。
 
 ### 日常：命令完全不变

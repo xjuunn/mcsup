@@ -307,10 +307,54 @@ fn structured_message(err: &anyhow::Error, lang: Lang) -> Option<String> {
         {
             return Some(crate::i18n::settings(&kind, lang));
         }
+
+        // `PropsError` / `BackupError` / `SettingsError` 的 `Registry` 变体是
+        // transparent 包装：
+        // 既没有 `kind()`，内层 `ServerRegistryError` 也不进 `chain()`。必须
+        // 当场拆开，否则 `server props` / `server set` / `backup ls` 的
+        // 「服务器不存在」会掉回硬编码英文 `Display`，`--lang zh` 下成为英文。
+        for reg in [
+            cause
+                .downcast_ref::<mcsup::service::PropsError>()
+                .and_then(|props| match props {
+                    mcsup::service::PropsError::Registry(reg) => Some(reg),
+                    _ => None,
+                }),
+            cause
+                .downcast_ref::<mcsup::service::BackupError>()
+                .and_then(|backup| match backup {
+                    mcsup::service::BackupError::Registry(reg) => Some(reg),
+                    _ => None,
+                }),
+            cause
+                .downcast_ref::<mcsup::service::SettingsError>()
+                .and_then(|settings| match settings {
+                    mcsup::service::SettingsError::Registry(reg) => Some(reg),
+                    _ => None,
+                }),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(kind) = reg.kind() {
+                return Some(crate::i18n::registry(&kind, lang));
+            }
+        }
         if let Some(backup) = cause.downcast_ref::<mcsup::service::BackupError>()
             && let Some(kind) = backup.kind()
         {
             return Some(crate::i18n::backup(&kind, lang));
+        }
+        // `SourceError::NotFound`（版本不存在）只有英文 `Display`：
+        // `server create --version 9.99.99` 在中文下会混出
+        // `version not found: 9.99.99`。它被 `InstallError` / `InstallJarError`
+        // 两层 transparent 包着，不在 `chain()` 里，必须逐层拆。
+        if let Some(version) = source_not_found(cause) {
+            return Some(crate::i18n::pick(
+                lang,
+                format!("下载源没有版本 {version}"),
+                format!("the source has no version {version}"),
+            ));
         }
         if let Some(reg) = cause.downcast_ref::<mcsup::service::ServerRegistryError>()
             && let Some(kind) = reg.kind()
@@ -327,6 +371,42 @@ fn structured_message(err: &anyhow::Error, lang: Lang) -> Option<String> {
         {
             return Some(message);
         }
+    }
+    None
+}
+
+/// 从透明包装里掏出 `SourceError::NotFound` 的版本号
+///
+/// `InstallJarError::Install(InstallError::Source(..))` 是两层 transparent，
+/// 内层既不在 `chain()` 里，也没有能带出版本的 `kind()`。
+fn source_not_found<'a>(cause: &'a (dyn std::error::Error + 'static)) -> Option<&'a str> {
+    use mcsup::port::SourceError;
+    use mcsup::service::{InstallError, InstallJarError, LifecycleError};
+
+    /// `InstallJarError` 拆到 `SourceError::NotFound` 的版本号
+    fn from_jar(jar: &InstallJarError) -> Option<&str> {
+        match jar {
+            InstallJarError::Install(InstallError::Source(SourceError::NotFound(version))) => {
+                Some(version.as_str())
+            }
+            _ => None,
+        }
+    }
+
+    if let Some(SourceError::NotFound(version)) = cause.downcast_ref::<SourceError>() {
+        return Some(version.as_str());
+    }
+    if let Some(InstallError::Source(SourceError::NotFound(version))) =
+        cause.downcast_ref::<InstallError>()
+    {
+        return Some(version.as_str());
+    }
+    if let Some(jar) = cause.downcast_ref::<InstallJarError>() {
+        return from_jar(jar);
+    }
+    // `create` / `install` 走 `LifecycleError::InstallJar`，比上面多一层
+    if let Some(LifecycleError::InstallJar(jar)) = cause.downcast_ref::<LifecycleError>() {
+        return from_jar(jar);
     }
     None
 }
@@ -619,6 +699,70 @@ mod tests {
         assert_eq!(
             structured_message(&err, Lang::Zh).as_deref(),
             Some("服务器 alpha 不存在")
+        );
+    }
+
+    /// `PropsError` / `BackupError` / `SettingsError` 的 `Registry` 变体
+    /// 是 transparent 包装：内层 `ServerRegistryError` 既没有 `kind()` 也不会
+    /// 出现在 `chain()` 里。回归：`server props nosuch --lang zh` 输出英文
+    /// `server not found: nosuch`，而同目录的 `server status` 是中文。
+    #[test]
+    fn structured_message_drills_into_registry_wrapped_by_transparent_errors() {
+        use mcsup::service::{BackupError, PropsError, ServerRegistryError, SettingsError};
+        let missing = || ServerRegistryError::NotFound("alpha".to_owned());
+
+        let cases: [(&str, anyhow::Error); 3] = [
+            ("props", PropsError::from(missing()).into()),
+            ("backup", BackupError::from(missing()).into()),
+            ("settings", SettingsError::from(missing()).into()),
+        ];
+        for (label, err) in cases {
+            assert_eq!(
+                structured_message(&err, Lang::Zh).as_deref(),
+                Some("服务器 alpha 不存在"),
+                "{label} 中文提示应统一"
+            );
+            assert_eq!(
+                structured_message(&err, Lang::En).as_deref(),
+                Some("server alpha not found"),
+                "{label} 英文提示应统一"
+            );
+        }
+    }
+
+    /// 下载源找不到版本：中文界面不得混出 `version not found`
+    ///
+    /// 回归：`server create --version 9.99.99 --lang zh` 输出
+    /// `安装服务端 x 失败: version not found: 9.99.99`。错误被
+    /// `LifecycleError::InstallJar(InstallJarError::Install(InstallError::Source))`
+    /// 三层 transparent 包着，`chain()` 里只剩最外层，必须逐层拆。
+    #[test]
+    fn source_not_found_is_localized_through_three_wrappers() {
+        use mcsup::domain::server::version::VersionId;
+        use mcsup::port::SourceError;
+        use mcsup::service::{InstallError, InstallJarError, LifecycleError};
+
+        let src = SourceError::NotFound(VersionId::new("9.99.99"));
+        let jar = InstallJarError::from(InstallError::from(src));
+
+        // 直接给出 InstallJarError（`server install` 路径）
+        let direct = anyhow::Error::from(jar).context("安装服务端 x 失败");
+        assert_eq!(
+            structured_message(&direct, Lang::Zh).as_deref(),
+            Some("下载源没有版本 9.99.99")
+        );
+
+        // 经 LifecycleError 再包一层（`server create` 路径）
+        let src = SourceError::NotFound(VersionId::new("1.2.3"));
+        let jar = InstallJarError::from(InstallError::from(src));
+        let wrapped = anyhow::Error::from(LifecycleError::from(jar)).context("安装服务端 x 失败");
+        assert_eq!(
+            structured_message(&wrapped, Lang::Zh).as_deref(),
+            Some("下载源没有版本 1.2.3")
+        );
+        assert_eq!(
+            structured_message(&wrapped, Lang::En).as_deref(),
+            Some("the source has no version 1.2.3")
         );
     }
 
