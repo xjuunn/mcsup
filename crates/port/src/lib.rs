@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod backup;
 pub mod content;
+pub mod error;
 pub mod modpack;
 pub mod origin;
 pub mod task;
@@ -21,6 +22,7 @@ pub use domain::server::status::ServerStatus;
 use domain::server::version::{ServerVariant, ServerVersion, VersionId};
 use domain::server::world::{DataVersion, WorldInfo};
 use domain::workspace::{Workspace, WorkspaceId, WorkspaceName};
+pub use error::{ErrorCategory, StorageFailure};
 pub use origin::{
     LOCAL_NAME, MAX_NAME_LEN, Origin, OriginError, RESERVED_NAMES, RemoteName, Sourced,
     WorkspaceSelection,
@@ -70,6 +72,22 @@ impl SourceError {
             }
             Self::Network(_) => true,
             Self::NotFound(_) | Self::Decode(_) | Self::Init(_) => false,
+        }
+    }
+
+    /// 失败等级
+    ///
+    /// `400` 归 [`ErrorCategory::NotFound`]：它表示「你给的版本组合不存在」，
+    /// 与 [`Self::NotFound`] 同义；其余上游拒绝（5xx 等）是后端失败。
+    #[must_use]
+    pub fn category(&self) -> ErrorCategory {
+        match self {
+            Self::NotFound(_) | Self::Upstream { status: 400, .. } => ErrorCategory::NotFound,
+            Self::Status { .. }
+            | Self::Upstream { .. }
+            | Self::Network(_)
+            | Self::Decode(_)
+            | Self::Init(_) => ErrorCategory::Backend,
         }
     }
 }
@@ -270,6 +288,23 @@ impl DownloadError {
             | Self::Cancelled => false,
         }
     }
+
+    /// 失败等级
+    ///
+    /// 用户取消单列 [`ErrorCategory::Cancelled`]：入口据此静默退出，脚本据此
+    /// 区分「用户放弃」与「下载失败」。
+    #[must_use]
+    pub fn category(&self) -> ErrorCategory {
+        match self {
+            Self::Source(err) => err.category(),
+            Self::Cancelled => ErrorCategory::Cancelled,
+            Self::Io(_)
+            | Self::ChecksumMismatch { .. }
+            | Self::SizeMismatch { .. }
+            | Self::UnsupportedAlgorithm
+            | Self::Timeout => ErrorCategory::Backend,
+        }
+    }
 }
 
 /// 按 URL 打开一个可增量读取的响应体
@@ -380,6 +415,23 @@ pub enum InstallerError {
     },
 }
 
+impl InstallerError {
+    /// 失败等级
+    ///
+    /// 被取消单列 [`ErrorCategory::Cancelled`]：安装器最长跑几分钟，用户按
+    /// Ctrl+C 后入口静默退出，脚本凭退出码区分「放弃」与「失败」。
+    #[must_use]
+    pub fn category(&self) -> ErrorCategory {
+        match self {
+            Self::Cancelled => ErrorCategory::Cancelled,
+            Self::Spawn(_)
+            | Self::Failed { .. }
+            | Self::NoOutput { .. }
+            | Self::TimedOut { .. } => ErrorCategory::Backend,
+        }
+    }
+}
+
 /// 一次安装器调用的全部输入
 ///
 /// 打包成一个结构体而不是继续加参数：形态（[`InstallKind`]）与位置参数
@@ -471,6 +523,14 @@ pub enum InspectError {
 }
 
 impl InspectError {
+    /// 失败等级：读写 / 解析本机文件失败都是后端问题
+    #[must_use]
+    pub fn category(&self) -> ErrorCategory {
+        match self {
+            Self::Io { .. } | Self::Parse { .. } => ErrorCategory::Backend,
+        }
+    }
+
     /// 构造 IO 失败
     #[must_use]
     pub fn io(path: &Path, source: std::io::Error) -> Self {
@@ -535,7 +595,25 @@ pub enum RepositoryError {
     /// 打印两遍（`storage error: io: ...: io: ...`）。thiserror 的约定是
     /// `Display` 描述本层、`source` 描述下一层，渲染方按链拼接。
     #[error("storage error")]
-    Storage(#[source] Box<dyn std::error::Error + Send + Sync>),
+    Storage(#[source] Box<dyn StorageFailure>),
+}
+
+impl RepositoryError {
+    /// 失败等级
+    ///
+    /// [`Self::Storage`] **委托**给内层：远端仓库把对端的传输失败原样装进
+    /// 这一层，未授权（6）与对端不可达（5）的区别只有内层知道。返回 `None`
+    /// 或固定 `Backend` 都会让同一种失败在不同子命令下拿到不同退出码。
+    #[must_use]
+    pub fn category(&self) -> ErrorCategory {
+        match self {
+            Self::NotFound(_) => ErrorCategory::NotFound,
+            Self::AlreadyExists(_) => ErrorCategory::Conflict,
+            Self::InvalidRelDir { .. } => ErrorCategory::Usage,
+            Self::Corrupt(_) => ErrorCategory::Failure,
+            Self::Storage(inner) => inner.category(),
+        }
+    }
 }
 
 /// 服务元数据存储
@@ -1196,6 +1274,23 @@ impl RemoteFailureKind {
             Self::Other(raw) => raw,
         }
     }
+
+    /// 失败等级
+    ///
+    /// 线上错误种类是**跨机器的**词汇表，判定必须落在这里一次，让本地与远端
+    /// 两条路径对同一种拒绝给出同一个等级。
+    #[must_use]
+    pub fn category(&self) -> ErrorCategory {
+        match self {
+            Self::NotFound => ErrorCategory::NotFound,
+            Self::AlreadyExists | Self::Busy => ErrorCategory::Conflict,
+            Self::Invalid => ErrorCategory::Usage,
+            Self::Unauthorized => ErrorCategory::Unauthorized,
+            Self::NotRunning | Self::Protocol | Self::Unreachable | Self::Io | Self::Other(_) => {
+                ErrorCategory::Backend
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for RemoteFailureKind {
@@ -1231,6 +1326,23 @@ pub enum SupervisorError {
     /// 本地 IO 失败
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+impl SupervisorError {
+    /// 失败等级
+    ///
+    /// 对端业务拒绝按 [`RemoteFailureKind`] 判级：同一个 `Remote` 变体里，
+    /// 「token 失效」和「对端崩了」对脚本的含义完全不同，不能压成同一类。
+    #[must_use]
+    pub fn category(&self) -> ErrorCategory {
+        match self {
+            Self::AlreadyRunning => ErrorCategory::Conflict,
+            Self::Remote { kind, .. } => kind.category(),
+            Self::Spawn(_) | Self::Unreachable(_) | Self::Protocol(_) | Self::Io(_) => {
+                ErrorCategory::Backend
+            }
+        }
+    }
 }
 
 /// 服务器 supervisor：拉起 / 停机 / 查询 / 控制台注入

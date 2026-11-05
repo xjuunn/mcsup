@@ -1376,7 +1376,7 @@ mod tests {
     #[test]
     fn new_workspace_dir_without_input_is_usage_error() {
         let err = resolve_new_workspace_dir(Lang::Zh, None, None, None).expect_err("缺名称/目录");
-        assert_eq!(Printer::exit_code(&err), 2);
+        assert_eq!(crate::output::exit_code_of(&err), 2);
     }
 
     #[test]
@@ -1390,7 +1390,7 @@ mod tests {
         // 名字非法（含路径分隔符）→ 用法错误（2），并列出可用变体（help 经
         // miette 渲染携带）
         let unknown = resolve_flag_variant("../evil", &available, Lang::Zh).expect_err("未知变体");
-        assert_eq!(Printer::exit_code(&unknown), 2);
+        assert_eq!(crate::output::exit_code_of(&unknown), 2);
         let msg = unknown.to_string();
         assert!(msg.contains("未知变体"), "{msg}");
         let rendered = format!(
@@ -1403,7 +1403,7 @@ mod tests {
         // `paper` 是内置名，`paperx` 是合法第三方名：两者都走这一分支
         for raw in ["paper", "paperx"] {
             let unsupported = resolve_flag_variant(raw, &available, Lang::Zh).expect_err("未支持");
-            assert_eq!(Printer::exit_code(&unsupported), 2);
+            assert_eq!(crate::output::exit_code_of(&unsupported), 2);
             let msg = unsupported.to_string();
             assert!(msg.contains("暂未支持"), "{msg}");
             let rendered = format!(

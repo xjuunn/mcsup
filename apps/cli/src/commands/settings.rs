@@ -534,7 +534,7 @@ mod tests {
     #[test]
     fn parse_key_unknown_lists_available_keys() {
         let err = parse_key(Lang::Zh, "max-players").expect_err("unknown");
-        assert_eq!(Printer::exit_code(&err), 2);
+        assert_eq!(output::exit_code_of(&err), 2);
         let msg = err.to_string();
         assert!(msg.contains("max-players"), "{msg}");
         let rendered = format!(

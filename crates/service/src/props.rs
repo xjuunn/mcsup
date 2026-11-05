@@ -27,6 +27,20 @@ pub enum PropsError {
     Io(#[from] FsError),
 }
 
+impl PropsError {
+    /// 失败等级
+    ///
+    /// 包装变体**委托**；键或值不满足写入规则是用法错误（改参数即可成功）。
+    #[must_use]
+    pub fn category(&self) -> port::ErrorCategory {
+        match self {
+            Self::Registry(err) => err.category(),
+            Self::Io(err) => err.category(),
+            Self::InvalidSet(_) => port::ErrorCategory::Usage,
+        }
+    }
+}
+
 /// 一次属性读写的结果快照
 #[derive(Debug, Clone)]
 pub struct PropsReport {

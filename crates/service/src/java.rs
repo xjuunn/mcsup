@@ -53,6 +53,21 @@ pub enum JavaError {
 }
 
 impl JavaError {
+    /// 失败等级
+    ///
+    /// 包装变体**委托**；扫描失败是后端问题（磁盘 / 权限），不是「没有 Java」。
+    #[must_use]
+    pub fn category(&self) -> port::ErrorCategory {
+        match self {
+            Self::NotFound(_) => port::ErrorCategory::NotFound,
+            Self::Source(err) => err.category(),
+            Self::Download(err) => err.category(),
+            Self::Repo(err) => err.category(),
+            Self::Fs(err) => err.category(),
+            Self::Scan(_) => port::ErrorCategory::Backend,
+        }
+    }
+
     fn io(path: &Path, source: std::io::Error) -> Self {
         FsError::io(path, source).into()
     }

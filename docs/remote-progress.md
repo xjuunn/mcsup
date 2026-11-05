@@ -216,8 +216,10 @@ CLI 又为远端提前分流、根本不装配 `InstallSession`。本阶段把�
 
 所有新帧转发给与本地 CLI **同一份** `service`：props 用 `ServerPropsService`、
 设置用 `ServerSettingsService`、整合包用 `ModpackService::prepare + apply`、
-Java 用 `JavaService::install/uninstall`。失败按领域错误分类映射
-`ErrorKind`（not_found / invalid / io / busy），不按文案判级。
+Java 用 `JavaService::install/uninstall`。失败由各错误自己的 `category()`
+投影成 `ErrorKind`（not_found / invalid / io / busy），不重判、不按文案：
+投影表只有一张（`ops.rs` 的 `wire_kind`），本地退出码与本机路径取同一个分类，
+否则同一个失败在本地与远端会得到不同结论。
 
 #### 客户端（`crates/backend/src/remote/mirror.rs`）
 
@@ -529,7 +531,7 @@ roundtrip 全量权限覆盖补 `BackupList` 样例（`Permission::Backup` 豁�
   - `mod.rs`：`Agent`（装配、身份、名册、配对码、绑定、服务）、`PairingWatch`、
     `AgentServer`、`AgentError`、`impl Handler for Agent`。
   - `ops.rs`：一帧 `Request` → 一次 `service` 调用 → 一帧 `Response`，以及
-    `ErrorKind` 映射（按各错误的 `kind()` 而非文案）。
+    `ErrorKind` 映射（由 `category()` 投影到线上词表，不重判、不按文案）。
   - `supervise.rs`：`__supervise` 参数解析与入口，与 `mcsup __supervise`
     解析同一份参数形状。
 - `apps/agent`（package `agent`，bin `mcsup-agent`）：薄入口，只做参数解析与

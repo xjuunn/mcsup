@@ -184,6 +184,20 @@ pub enum ResolveError {
     },
 }
 
+impl ResolveError {
+    /// 失败等级
+    ///
+    /// 未配对 / 找不到：要的来源或资源不在；同名多条：选择器不够精确，是
+    /// 调用方能直接补全的用法问题。
+    #[must_use]
+    pub fn category(&self) -> port::ErrorCategory {
+        match self {
+            Self::OriginNotPaired(_) | Self::NotFound(_) => port::ErrorCategory::NotFound,
+            Self::Ambiguous { .. } => port::ErrorCategory::Usage,
+        }
+    }
+}
+
 /// 在候选表里按选择器 + 过滤解析出唯一一条，返回下标
 ///
 /// 语义（与 `docs/remote.md`「限定名」一节一致）：

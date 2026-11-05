@@ -18,10 +18,10 @@ use protocol::remote::wire::{
 };
 use protocol::remote::{ErrorKind, Request, Response};
 use service::{
-    InitOutcome, InstallJarError, InstallerContext, JavaError, LifecycleError, LifecycleErrorKind,
-    ModpackError, ModpackInstallOptions, PropsError, ServerInstaller, ServerPropsService,
-    ServerRegistryError, ServerRegistryErrorKind, ServerSettingsService, SettingsError,
-    StartOptions, UninstallOutcome, WorkspaceError, WorkspaceErrorKind,
+    InitOutcome, InstallJarError, InstallerContext, JavaError, LifecycleError, ModpackError,
+    ModpackInstallOptions, PropsError, ServerInstaller, ServerPropsService, ServerRegistryError,
+    ServerRegistryErrorKind, ServerSettingsService, SettingsError, StartOptions, UninstallOutcome,
+    WorkspaceError, WorkspaceErrorKind,
 };
 use transport::{RemoteFailure, SessionInfo};
 
@@ -1159,123 +1159,82 @@ impl Drop for StagingGuard {
     }
 }
 
+/// 失败分类 → 线上错误词表
+///
+/// 分类由各层错误自己给出（`port::ErrorCategory`），这里只做词表投影，不重判：
+/// 对端与本机跑同一套 `service`，两边各写一张 `match` 必然分叉——同一个错误
+/// 本地给 4、经 agent 给 2，客户端无法判断该不该重试。
+///
+/// 线上词表比分类更细一档（`busy` / `already_exists` 都是冲突），需要区分时
+/// 由调用方在投影前先摘出来。反过来则必然有损：`Failure` 与 `Backend` 都投影
+/// 成 `io`，`Cancelled` 也落 `io`——线协议没有「取消」这一档，对端收到 IO 失败
+/// 时客户端按后端失败处理。本地 Ctrl-C 不经过这里（入口自己就能判 130），
+/// 只有 agent 侧自查到取消才会走到这条路径。
+fn wire_kind(category: port::ErrorCategory) -> &'static str {
+    match category {
+        port::ErrorCategory::NotFound => ErrorKind::NOT_FOUND,
+        port::ErrorCategory::Conflict => ErrorKind::BUSY,
+        port::ErrorCategory::Usage => ErrorKind::INVALID,
+        port::ErrorCategory::Unauthorized => ErrorKind::UNAUTHORIZED,
+        port::ErrorCategory::Backend
+        | port::ErrorCategory::Failure
+        | port::ErrorCategory::Cancelled => ErrorKind::IO,
+    }
+}
+
 fn workspace_failure(err: &WorkspaceError) -> Response {
+    // 名字冲突在线上有专门取值：客户端据此提示「换个名字」，比笼统的 busy 更有用
     let kind = match err.kind() {
-        Some(WorkspaceErrorKind::NotFound { .. } | WorkspaceErrorKind::NoCurrent) => {
-            ErrorKind::NOT_FOUND
-        }
         Some(WorkspaceErrorKind::AlreadyExists { .. }) => ErrorKind::ALREADY_EXISTS,
-        Some(
-            WorkspaceErrorKind::NotEmpty { .. }
-            | WorkspaceErrorKind::NotAWorkspace { .. }
-            | WorkspaceErrorKind::Ambiguous { .. }
-            | WorkspaceErrorKind::CwdInsideTarget { .. },
-        ) => ErrorKind::INVALID,
-        // 结构化分类缺失（IO / 存储 / 名字非法）与未来新增变体：归到通用 IO
-        Some(_) | None => ErrorKind::IO,
+        _ => wire_kind(err.category()),
     };
     failure_ref(kind, err)
 }
 
 fn registry_failure(err: &ServerRegistryError) -> Response {
     let kind = match err.kind() {
-        Some(ServerRegistryErrorKind::NotFound { .. }) => ErrorKind::NOT_FOUND,
         Some(ServerRegistryErrorKind::AlreadyExists { .. }) => ErrorKind::ALREADY_EXISTS,
-        Some(
-            ServerRegistryErrorKind::TargetInsideWorkspace { .. }
-            | ServerRegistryErrorKind::WorkspaceMismatch { .. },
-        ) => ErrorKind::INVALID,
-        Some(_) | None => ErrorKind::IO,
+        _ => wire_kind(err.category()),
     };
     failure_ref(kind, err)
 }
 
 fn java_failure(err: &JavaError) -> Response {
-    let kind = match err {
-        JavaError::NotFound(_) => ErrorKind::NOT_FOUND,
-        _ => ErrorKind::IO,
-    };
-    failure_ref(kind, err)
+    failure_ref(wire_kind(err.category()), err)
 }
 
 /// 属性读写失败 → 错误帧（按领域判定分类，不解析文案）
 fn props_failure(err: &PropsError) -> Response {
-    let kind = match err {
-        PropsError::Registry(inner) => return registry_failure(inner),
-        PropsError::InvalidSet(_) => ErrorKind::INVALID,
-        // #[non_exhaustive]：IO 与未来新增变体都按通用失败处理
-        _ => ErrorKind::IO,
-    };
-    failure_ref(kind, err)
+    if let PropsError::Registry(inner) = err {
+        return registry_failure(inner);
+    }
+    failure_ref(wire_kind(err.category()), err)
 }
 
 /// 服务属性写入失败 → 错误帧
 fn settings_failure(err: &SettingsError) -> Response {
-    let kind = match err {
-        SettingsError::Registry(inner) => return registry_failure(inner),
-        SettingsError::InvalidValue(_) => ErrorKind::INVALID,
-        // 绑定的大版本没有已登记运行时：客户端提示先在对端 `java install`
-        SettingsError::UnknownJavaMajor { .. } => ErrorKind::NOT_FOUND,
-        // #[non_exhaustive]：Java 查询失败与未来新增变体按通用失败处理
-        _ => ErrorKind::IO,
-    };
-    failure_ref(kind, err)
+    if let SettingsError::Registry(inner) = err {
+        return registry_failure(inner);
+    }
+    failure_ref(wire_kind(err.category()), err)
 }
 
 /// 整合包取回 / 布置失败 → 错误帧
 fn modpack_failure(err: &ModpackError) -> Response {
-    let kind = match err {
-        ModpackError::Source(port::SourceError::NotFound(_)) => ErrorKind::NOT_FOUND,
-        ModpackError::UnknownSource(_)
-        | ModpackError::NoSource
-        | ModpackError::MissingMinecraft(_)
-        | ModpackError::UnsupportedLoader(_)
-        | ModpackError::Escapes { .. } => ErrorKind::INVALID,
-        // 核心安装失败沿用生命周期分类（含 Java 选择 / 注册表判定）
-        ModpackError::Lifecycle(inner) => return lifecycle_failure(inner),
-        // #[non_exhaustive]：来源 / 下载 / 解压 / 文件系统失败按通用失败处理
-        _ => ErrorKind::IO,
-    };
-    failure_ref(kind, err)
+    // 核心安装失败沿用生命周期分类（含 Java 选择 / 注册表判定）
+    if let ModpackError::Lifecycle(inner) = err {
+        return lifecycle_failure(inner);
+    }
+    failure_ref(wire_kind(err.category()), err)
 }
 
 fn lifecycle_failure(err: &LifecycleError) -> Response {
-    let kind = match err.kind() {
-        Some(
-            // 停机超时说明服务端仍在运行：状态冲突，客户端重试即可
-            LifecycleErrorKind::AlreadyRunning
-            | LifecycleErrorKind::NotRunning
-            | LifecycleErrorKind::Busy { .. }
-            | LifecycleErrorKind::StopTimedOut { .. },
-        ) => ErrorKind::BUSY,
-        Some(
-            LifecycleErrorKind::NoJar { .. }
-            | LifecycleErrorKind::EulaRequired
-            | LifecycleErrorKind::NoJava
-            | LifecycleErrorKind::UnknownJavaMajor { .. },
-        ) => ErrorKind::INVALID,
-        Some(_) | None => ErrorKind::IO,
-    };
-    failure_ref(kind, err)
+    failure_ref(wire_kind(err.category()), err)
 }
 
 /// 备份失败 → 错误帧：按领域判定分类，不解析文案
 fn backup_failure(err: &service::BackupError) -> Response {
-    let kind = match err.kind() {
-        Some(service::BackupErrorKind::SnapshotNotFound { .. }) => ErrorKind::NOT_FOUND,
-        Some(
-            service::BackupErrorKind::NotRestorable { .. }
-            | service::BackupErrorKind::RestoreWhileRunning { .. }
-            | service::BackupErrorKind::TargetExists { .. }
-            | service::BackupErrorKind::EmptyScope
-            | service::BackupErrorKind::InvalidLabel { .. }
-            | service::BackupErrorKind::ConflictingRetention
-            // 校验失败属于业务结果（对象损坏 / 缺失）：不是 IO，也不该静默成功
-            | service::BackupErrorKind::VerifyFailed { .. },
-        ) => ErrorKind::INVALID,
-        Some(_) | None => ErrorKind::IO,
-    };
-    failure_ref(kind, err)
+    failure_ref(wire_kind(err.category()), err)
 }
 
 /// 可用变体标识：来源 `variant()` 去重，保持注册顺序
@@ -1333,22 +1292,68 @@ fn installer_ctx(agent: &Agent, name: &str, variant: &ServerVariant) -> Option<I
 
 /// 安装失败 → 错误帧（按领域判定分类，不解析文案）
 fn install_failure(err: &InstallJarError) -> Response {
-    let kind = match err {
-        InstallJarError::Registry(inner) => {
-            return registry_failure(inner);
-        }
-        InstallJarError::Inspect(_) | InstallJarError::Downgrade { .. } => ErrorKind::INVALID,
-        // 下载 / 校验失败按 IO：客户端提示「来源不可达或传输失败」
-        InstallJarError::Install(_)
-        // #[non_exhaustive]：未来新增变体按通用失败处理
-        | _ => ErrorKind::IO,
-    };
-    failure_ref(kind, err)
+    if let InstallJarError::Registry(inner) = err {
+        return registry_failure(inner);
+    }
+    failure_ref(wire_kind(err.category()), err)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 投影后可原样还原分类：本地 4 与远端 4 必须是同一个结论
+    ///
+    /// 回归：投影表与 `category()` 各写一份时，同一个错误本地判 2、经 agent
+    /// 判 4，客户端无从判断该不该重试。
+    #[test]
+    fn wire_kind_round_trips_to_the_same_category() {
+        use port::{ErrorCategory, RemoteFailureKind};
+
+        for category in [
+            ErrorCategory::NotFound,
+            ErrorCategory::Conflict,
+            ErrorCategory::Usage,
+            ErrorCategory::Unauthorized,
+            ErrorCategory::Backend,
+        ] {
+            let wire = wire_kind(category);
+            assert_eq!(
+                RemoteFailureKind::from_wire(wire).category(),
+                category,
+                "{wire}"
+            );
+        }
+
+        // 线协议没有「通用失败」与「取消」两档：都退化为后端失败，方向安全
+        // （客户端只会重试或报错，不会误当成「用户取消」而静默成功）
+        for category in [ErrorCategory::Failure, ErrorCategory::Cancelled] {
+            let wire = wire_kind(category);
+            assert_eq!(
+                RemoteFailureKind::from_wire(wire).category(),
+                ErrorCategory::Backend,
+                "{wire}"
+            );
+        }
+    }
+
+    /// 名字冲突单独摘出 `already_exists`，其余照分类投影
+    ///
+    /// 对端据此提示「换个名字」；若笼统落 `busy`，客户端只会说「有冲突」。
+    #[test]
+    fn registry_failure_keeps_already_exists_on_the_wire() {
+        let err = ServerRegistryError::AlreadyExists("web".to_owned());
+        match registry_failure(&err) {
+            Response::Error { kind, .. } => assert_eq!(kind, ErrorKind::ALREADY_EXISTS),
+            other => panic!("应为错误帧：{other:?}"),
+        }
+
+        let missing = ServerRegistryError::NotFound("web".to_owned());
+        match registry_failure(&missing) {
+            Response::Error { kind, .. } => assert_eq!(kind, ErrorKind::NOT_FOUND),
+            other => panic!("应为错误帧：{other:?}"),
+        }
+    }
 
     /// 链尾原因必须带到对端，不能被外层包装吞掉
     ///

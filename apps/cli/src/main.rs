@@ -44,12 +44,10 @@ async fn main() -> ExitCode {
     match commands::run(cli, &cfg, lang).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            let code = output::Printer::exit_code(&err);
-            // 130 只有「用户取消」一条来路（Ctrl-C 协作取消），中间文件已由
-            // 下层静默清理完：不打印错误，直接以取消码退出
-            if code != 130 {
-                printer.render_error(err);
-            }
+            // 渲染与分级在同一个出口里：130（用户取消）由它自己静默，
+            // 入口不再复制「取消不报错」这条判定
+            let code = output::exit_code_of(&err);
+            printer.render_error(err);
             ExitCode::from(code)
         }
     }

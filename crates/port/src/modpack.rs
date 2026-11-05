@@ -266,6 +266,20 @@ pub enum ModpackExtractError {
     Index(#[from] domain::server::modpack::ModpackError),
 }
 
+impl ModpackExtractError {
+    /// 失败等级
+    ///
+    /// 清单非法是用法问题（用户选错了整合包文件），解压失败是后端问题——
+    /// 但两者都是「这个归档用不了」，入口按后端失败呈现更贴近实际。
+    #[must_use]
+    pub fn category(&self) -> crate::ErrorCategory {
+        match self {
+            Self::Index(_) => crate::ErrorCategory::Usage,
+            Self::Extract(_) | Self::MissingIndex(_) => crate::ErrorCategory::Backend,
+        }
+    }
+}
+
 /// 整合包归档读取能力
 ///
 /// 与 `port::ArchiveExtractor` 分开：那个只负责「解到目录」，整合包还要在解压

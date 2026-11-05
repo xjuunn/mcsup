@@ -24,6 +24,9 @@ pub enum BackupIoError {
     },
 }
 
+// 默认等级即可：备份索引的文件系统失败都是后端问题
+impl port::StorageFailure for BackupIoError {}
+
 impl BackupIoError {
     /// 构造 IO 失败
     #[must_use]

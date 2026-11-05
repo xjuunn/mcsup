@@ -35,6 +35,20 @@ pub enum SettingsError {
 }
 
 impl SettingsError {
+    /// 失败等级
+    ///
+    /// 包装变体**委托**；值不满足格式是用法错误，绑定的大版本没有已注册运行时
+    /// 与 `UnknownJavaMajor` 同属「要的资源不在」。
+    #[must_use]
+    pub fn category(&self) -> port::ErrorCategory {
+        match self {
+            Self::Registry(err) => err.category(),
+            Self::Java(err) => err.category(),
+            Self::InvalidValue(_) => port::ErrorCategory::Usage,
+            Self::UnknownJavaMajor { .. } => port::ErrorCategory::NotFound,
+        }
+    }
+
     /// 面向用户展示的分类；结构化错误不带文案，入口按此渲染提示
     #[must_use]
     pub fn kind(&self) -> Option<SettingsErrorKind<'_>> {

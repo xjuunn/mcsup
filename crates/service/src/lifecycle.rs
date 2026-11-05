@@ -147,6 +147,37 @@ pub enum BusyOp {
 }
 
 impl LifecycleError {
+    /// 失败等级
+    ///
+    /// 包装变体**委托**给内层；其余按「改参数能不能解决」判：缺资源 → 未找到，
+    /// 运行中被拒 → 状态冲突，EULA 未同意 → 用法错误。
+    #[must_use]
+    pub fn category(&self) -> port::ErrorCategory {
+        match self {
+            Self::Registry(err) => err.category(),
+            Self::Java(err) => err.category(),
+            Self::Supervisor(err) => err.category(),
+            Self::InstallJar(err) => err.category(),
+            // 未装核心 / 本机没 Java / 绑定的大版本未注册：都是「要的资源不在」
+            Self::NoJar { .. } | Self::NoJava | Self::UnknownJavaMajor { .. } => {
+                port::ErrorCategory::NotFound
+            }
+            // 缺 `--accept-eula` 是调用方可直接补的参数
+            Self::EulaRequired => port::ErrorCategory::Usage,
+            // 已在运行 / 未在运行 / 运行中被拒：状态冲突。停机超时说明服务端
+            // 仍在运行，同样是状态没到可继续的地步
+            Self::AlreadyRunning
+            | Self::NotRunning
+            | Self::Busy { .. }
+            | Self::StopTimedOut { .. } => port::ErrorCategory::Conflict,
+            // 远端镜像拿不到增量日志流是对端能力缺失，不是本机错误；
+            // IO 与实现违约同样是后端不可用
+            Self::RemoteLogStream(_) | Self::Io(_) | Self::StatusCountMismatch { .. } => {
+                port::ErrorCategory::Backend
+            }
+        }
+    }
+
     /// supervisor 注入失败 → 领域错误
     ///
     /// 「对端明确说没在运行」是幂等语义，归 [`Self::NotRunning`]；其余原样

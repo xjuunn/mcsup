@@ -377,6 +377,6 @@ mod tests {
     fn classify_rejects_mixed_bare_keys() {
         let err =
             classify(&args(&["motd", "pvp"]), crate::locale::Lang::Zh).expect_err("ambiguous");
-        assert_eq!(Printer::exit_code(&err), 2);
+        assert_eq!(crate::output::exit_code_of(&err), 2);
     }
 }
