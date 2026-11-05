@@ -22,7 +22,10 @@
 //!
 //! 这是「最新安装器」的**通用地址**：不带版本号，也没有侧车哈希。因此：
 //!
-//! - `InstallKind::Installer`——由 service 执行 `java -jar {installer} install server .`。
+//! - `InstallKind::InstallerSubcommand`——由 service 执行
+//!   `java -jar {installer} install server <mc> <loader> --install-dir=<dir>`。
+//!   Quilt 安装器只认子命令，Forge 系的 `--installServer` 会让它打印 help 后
+//!   以 0 退出。
 //! - [`Checksum::unverified`](domain::server::artifact::Checksum::unverified)，
 //!   `size` 为 `0` 由下载结果覆盖。
 //! - 同一次解析里不同 MC 版本拿到的是**同一个安装器**；差异由安装器参数（MC 版本
@@ -202,11 +205,13 @@ impl ServerJarSource for QuiltSource {
         // 先解析 MC 版本：不存在的版本应在打安装器之前报 `NotFound`，
         // 而不是给出一个「装哪儿都行」的安装器地址让下游失败
         let mc = self.resolve_mc(version).await?;
-        let _loader = self.pick_loader().await?;
+        let loader = self.pick_loader().await?;
         let location = parse_https_url(&self.installer_url)?;
         // Quilt 元数据不声明 Java 要求，按 MC 版本推算（与 Forge 同口径）
         let java_major = domain::server::version::required_java_major(&mc);
-        Ok(Downloads::installer(location)
+        // 安装器是「最新」的通用包：MC 版本与 loader 只能靠位置参数表达，
+        // 用 Forge 的 `--installServer` 开关会让它只打印 help 就退出
+        Ok(Downloads::installer_subcommand(location, vec![mc, loader])
             .java_major(java_major)
             .resolve(version, None))
     }

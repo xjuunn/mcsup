@@ -87,6 +87,13 @@ pub struct ResolvedArtifact {
     /// `Forge` / `NeoForge` 下载得到的是**安装器**，必须运行它才会产出服务端。
     /// 由来源声明，service 据此决定下载后是否继续安装。
     pub install: InstallKind,
+    /// 安装器的额外位置参数（仅安装器类形态有意义）
+    ///
+    /// 命令行形态因平台而异：Forge 系是「一个开关 + 目录」，Quilt 是
+    /// 「子命令 + MC 版本 + loader 版本」。前者由执行器内置拼装，后者只能由
+    /// 来源在解析时给出——只有来源知道自己选中的 loader 版本。空表示没有额外
+    /// 位置参数（Forge 系）。
+    pub installer_args: Vec<String>,
     /// 安装器产出的启动参数文件所在目录名（仅 [`InstallKind::Installer`] 有意义）
     ///
     /// 平台把启动参数文件放在 `libraries/<group>/<artifact>/{目录名}/` 下，而
@@ -106,6 +113,26 @@ pub enum InstallKind {
     /// 下载的是安装器，需运行 `java -jar <installer> --installServer <dir>`
     /// 才能产出服务端目录（`Forge` / `NeoForge`）
     Installer,
+    /// 下载的是安装器，但它的命令行是**子命令式**的：
+    /// `java -jar <installer> install server <mc> [<loader>] --install-dir=<dir>`
+    /// （`Quilt`）
+    ///
+    /// 与 [`Self::Installer`] 分开是因为两者参数形态不同：Forge 系用单个
+    /// `--installServer` 开关，Quilt 用子命令位置参数。共用一种拼法会让
+    /// 安装器只打印 help 就退出——产不出服务端，而错误信息又指向别处。
+    InstallerSubcommand,
+}
+
+impl InstallKind {
+    /// 下载物是否需要**先运行安装器**才能得到服务端
+    ///
+    /// 判定收敛在这里而不是各调用点写 `== InstallKind::Installer`：新增形态时
+    /// 漏掉一处相等比较，安装器就会被当成服务端直接保留下来——服务「创建成功」，
+    /// 启动时却只打印安装器 help。
+    #[must_use]
+    pub fn runs_installer(self) -> bool {
+        !matches!(self, Self::Direct)
+    }
 }
 
 /// 服务端 JAR 来源
@@ -353,6 +380,24 @@ pub enum InstallerError {
     },
 }
 
+/// 一次安装器调用的全部输入
+///
+/// 打包成一个结构体而不是继续加参数：形态（[`InstallKind`]）与位置参数
+/// （`extra_args`）是同一件事的两半，分开传容易在某个实现里漏掉一半。
+#[derive(Debug)]
+pub struct InstallerInvocation<'a> {
+    /// 运行安装器的 `java` 可执行文件
+    pub java_bin: &'a Path,
+    /// 安装器 JAR
+    pub installer: &'a Path,
+    /// 服务端目录（安装器的工作目录，产物落在这里）
+    pub dir: &'a Path,
+    /// 安装器命令行形态
+    pub kind: InstallKind,
+    /// 追加在形态之后的额外位置参数（如 `<mc-version> <loader-version>`）
+    pub extra_args: &'a [String],
+}
+
 /// 执行服务端安装器
 ///
 /// `Forge` / `NeoForge` 的下载物是安装器而非服务端：必须运行
@@ -378,9 +423,7 @@ pub trait InstallerRunner: Send + Sync {
     /// 启动失败、非零退出、产物缺失、被取消或超时返回 [`InstallerError`]
     fn run_installer(
         &self,
-        java_bin: &Path,
-        installer: &Path,
-        dir: &Path,
+        invocation: &InstallerInvocation<'_>,
         output: Option<&dyn InstallerOutputSink>,
         cancel: &CancellationToken,
     ) -> Result<(), InstallerError>;

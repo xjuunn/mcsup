@@ -108,6 +108,8 @@ pub(crate) struct Downloads {
     pub(crate) java_major: Option<domain::java::JavaMajor>,
     /// 下载物用途
     pub(crate) install: InstallKind,
+    /// 安装器的额外位置参数（子命令式安装器需要）
+    pub(crate) installer_args: Vec<String>,
 }
 
 impl Downloads {
@@ -122,6 +124,7 @@ impl Downloads {
             size: 0,
             java_major: None,
             install: InstallKind::Direct,
+            installer_args: Vec::new(),
         }
     }
 
@@ -130,6 +133,21 @@ impl Downloads {
     pub(crate) fn installer(location: Url) -> Self {
         Self {
             install: InstallKind::Installer,
+            ..Self::direct(location)
+        }
+    }
+
+    /// 组装为**子命令式**安装器（`Quilt` 形态）
+    ///
+    /// `args` 是子命令之后的位置参数，如 `["1.21.1", "0.31.0-beta.4"]`。
+    /// 与 [`Self::installer`] 分开是因为两者命令行形态不同，见
+    /// [`InstallKind::InstallerSubcommand`]。
+    #[must_use]
+    #[allow(dead_code, reason = "Quilt 之外暂无子命令式来源")]
+    pub(crate) fn installer_subcommand(location: Url, args: Vec<String>) -> Self {
+        Self {
+            install: InstallKind::InstallerSubcommand,
+            installer_args: args,
             ..Self::direct(location)
         }
     }
@@ -190,6 +208,7 @@ impl Downloads {
             location: self.location,
             java_major: self.java_major,
             install: self.install,
+            installer_args: self.installer_args,
             installer_args_dir,
         }
     }

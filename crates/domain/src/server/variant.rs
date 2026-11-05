@@ -148,16 +148,16 @@ impl ServerVariant {
 
     /// 该变体的下载物是安装器，必须先运行一次才能得到可启动的核心
     ///
-    /// `Forge` / `NeoForge` 发布的是 installer，不是服务端 JAR。入口在拿到
-    /// artifact 之前就要决定「要不要先挑 Java 跑安装器」，因此这条判定必须在
-    /// 领域层可回答，不能由入口按变体名重写一份。
+    /// `Forge` / `NeoForge` / `Quilt` 发布的是 installer，不是服务端 JAR。
+    /// 入口在拿到 artifact 之前就要决定「要不要先挑 Java 跑安装器」，因此这条
+    /// 判定必须在领域层可回答，不能由入口按变体名重写一份。
     ///
     /// 与 `port::InstallKind` 的关系：来源解析出的 artifact 上带的安装类型是
     /// 运行期权威值（artifact 已经拿到时以它为准）；本方法是同一事实在领域侧
     /// 的投影，供「解析之前」的编排使用。新增安装器型变体时两处一起改。
     #[must_use]
     pub fn needs_installer(&self) -> bool {
-        matches!(self, Self::Forge | Self::NeoForge)
+        matches!(self, Self::Forge | Self::NeoForge | Self::Quilt)
     }
 
     /// 由机器名构造，内置名归一为内置项
@@ -310,6 +310,38 @@ impl fmt::Display for ServerVariant {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 安装器型变体必须与来源的 `InstallKind::Installer` 对齐
+    ///
+    /// 回归：`Quilt` 的下载物是 `java-universal` 安装器（需先跑
+    /// `java -jar ... install server`），但 `needs_installer()` 只列了
+    /// `Forge` / `NeoForge`。入口因此不给 `InstallerContext`，service 报笼统的
+    /// `NoJavaForInstaller`——即使本机有 Java，quilt 也永远装不上。
+    #[test]
+    fn needs_installer_covers_every_installer_variant() {
+        for variant in [
+            ServerVariant::Forge,
+            ServerVariant::NeoForge,
+            ServerVariant::Quilt,
+        ] {
+            assert!(
+                variant.needs_installer(),
+                "{variant:?} 的下载物是安装器，必须声明需要 Java"
+            );
+        }
+        // 直接可运行的变体不得误判：否则会白跑一次 Java 选择
+        for variant in [
+            ServerVariant::Vanilla,
+            ServerVariant::Paper,
+            ServerVariant::Fabric,
+            ServerVariant::Purpur,
+        ] {
+            assert!(
+                !variant.needs_installer(),
+                "{variant:?} 下载物可直接运行，不需要安装器"
+            );
+        }
+    }
 
     /// 加载器映射：模组加载器一对一，原版与未知无加载器
     #[test]

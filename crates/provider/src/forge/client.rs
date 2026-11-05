@@ -273,6 +273,7 @@ impl ServerJarSource for ForgeSource {
             location,
             java_major,
             install: port::InstallKind::Installer,
+            installer_args: Vec::new(),
             installer_args_dir: Some(build),
         })
     }
