@@ -2,6 +2,7 @@ pub mod backend;
 pub mod backup;
 pub mod content;
 pub mod error;
+pub mod mod_;
 pub mod modpack;
 pub mod origin;
 pub mod task;

@@ -123,12 +123,13 @@ restart / status / console / send / logs / props / set / remove / version`、
 
 | 层级 | 简写 |
 | --- | --- |
-| 顶层 | `ws` workspace · `srv` server · `jv` java · `rmt` remote · `doc` doctor · `cfg` config · `up` update · `comp` completions · `ver` version |
+| 顶层 | `ws` workspace · `srv` server · `jv` java · `rmt` remote · `doc` doctor · `cfg` config · `md` mod · `up` update · `comp` completions · `ver` version |
 | `workspace` | `in` / `new` init · `ls` list · `sw` use · `rm` remove · `doc` doctor |
 | `server` | `ls` list · `cr` create · `in` install · `up` start · `down` stop · `rs` restart · `st` status · `con` console · `snd` send · `log` logs · `prop` props · `cfg` set · `rm` remove · `ln` link · `ver` version · `bak` backup · `md` mod |
 | `server backup` | `cr` create · `ls` list · `rt` restore · `rm` delete · `vf` verify · `pr` prune |
 | `server mod` | `ls` list · `in` install · `rm` remove · `up` update · `od` outdated |
 | `java` | `ls` list · `sc` scan · `in` install · `un` / `rm` uninstall |
+| `mod` | `in` inspect |
 | `remote` | `ls` list · `sv` serve · `cd` code · `con` connect · `st` status · `pg` ping · `dc` disconnect · `rv` revoke |
 | `config` | `ls` show · `st` set · `us` unset · `ed` edit |
 
@@ -226,6 +227,50 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | `remove` | `mcsup server mod remove <name> <mod>` | 卸载单个 Mod |
 | `update` | `mcsup server mod update <name> [<mod>]` | 更新指定或全部（先 dry-run 列出变更） |
 | `outdated` | `mcsup server mod outdated <name>` | 可更新清单 |
+
+## mcsup mod（Mod 检测，不属于具体服务端）
+
+对任意 jar 做环境检测，不依赖已安装的服务端。与 `server mod`（操作某个
+服务端里的已装 mod）互补：前者回答「这个 jar 能不能进服务端」，后者回答
+「这台服务端装了什么」。
+
+| 子命令 | 用法 | 说明 |
+| --- | --- | --- |
+| `inspect` | `mcsup mod inspect <path>... [--offline]` | 检测 jar 文件或目录（只取直接子项）。报告加载器、MC 区间、Java 版本、客/服归属、风险等级。`--offline` 只做本地检查，不访问上游 API |
+
+### 判定口径
+
+| 风险 | 含义 | 处置建议 |
+| --- | --- | --- |
+| `ok` | 服务端侧明确可用 | 正常安装 |
+| `review` | 判不出服务端归属，或认不出加载器 | **默认仍装**，标记后人工确认 |
+| `blocking` | 服务端侧明确不支持，或缺少必需依赖 | 从 `mods/` 排除 |
+
+客/服归属给**四档**（`required` / `optional` / `unsupported` / `unknown`），
+不是二元。`unknown` 绝不折叠成 `ok`：那会让用户以为已经检查过了。
+
+判不出的条目在人类输出里必定列出「依据」与「建议」两条，不允许只打结论。
+
+### 检查项与可靠度
+
+| 检查项 | 依据 | 可靠度 |
+| --- | --- | --- |
+| 加载器类型 | `fabric.mod.json` / `mods.toml` / `neoforge.mods.toml` / `mcmod.info` / `plugin.yml` | 确定 |
+| 客/服（显式声明） | Fabric `environment`、NeoForge `side` | 确定 |
+| Java 编译版本 | class 文件头第 6-7 字节，换算 `major - 44` | 确定 |
+| 依赖 / 不兼容 | `depends` / `recommends` / `breaks`，含 `provides` 别名与嵌套 jar | 确定 |
+| 目标 MC 区间 | Fabric `depends.minecraft`、Forge `versionRange` | 高 |
+| 客/服（入口点推断） | 只有 `client` 入口、无 `main`/`server` | 中（有双端库反例） |
+| 客/服（字节码） | 常量池引用 `net/minecraft/client/`、`blaze3d` | 中，仅非 Fabric 生态采信 |
+
+**Fabric 的字节码扫不出客户端类**：Fabric mod 运行在 intermediary 名字空间，
+引用的是 `net/minecraft/class_2338` 而非 `net/minecraft/client/Minecraft`。
+这是刻意保留的已知限制，因此该信号对 Fabric 生态**不参与判定**，只作证据。
+
+### 不做什么
+
+只报告，不改开服流程：不删文件、不改清单、不阻断安装。是否排除某个 mod
+由用户决定。
 
 ## mcsup workspace（工作目录）
 

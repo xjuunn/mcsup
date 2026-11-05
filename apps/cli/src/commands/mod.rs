@@ -4,6 +4,7 @@ mod doctor;
 mod install;
 mod java;
 mod lifecycle;
+mod mod_inspect;
 mod modpack;
 mod origin;
 mod props;
@@ -29,6 +30,7 @@ pub(crate) async fn run(cli: Cli, cfg: &ConfigFile, lang: Lang) -> Result<()> {
         Command::Workspace { action } => workspace::run(action, printer),
         Command::Server { action } => server(action, cfg, printer).await,
         Command::Java { action } => java(action, printer).await,
+        Command::Mod { action } => mod_inspect::run(action, printer).await,
         Command::Remote { action } => remote::run(action, printer),
         Command::Doctor { only, strict } => doctor::run(cfg, &only, strict, printer).await,
         Command::Config { action } => config::run(action, printer),

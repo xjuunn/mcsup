@@ -55,7 +55,7 @@ mcsup/
 │   ├── storage/                    # [已落地] 元数据和持久化
 │   ├── file/                       # [已落地] 文件系统和文件传输
 │   ├── backup/                     # [已落地] CAS / Snapshot / Restore / GC
-│   ├── modkit/                     # [目标] Mod / Modpack 管理
+│   ├── modkit/                     # [已落地] Mod / Modpack 管理（jar 检测）
 │   ├── java/                       # [已落地] Java 检测、安装和版本管理
 │   ├── protocol/                   # [已落地] RPC 消息和协议定义
 │   ├── transport/                  # [已落地] RPC 通信实现（TLS + 长度前缀帧）

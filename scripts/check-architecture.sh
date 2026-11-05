@@ -406,6 +406,7 @@ if [ -f "$pkg_manifest" ] && [ -f "$pkg_lib" ]; then
 		auth) printf '%s' 'auth' ;;
 		file) printf '%s' 'domain port file' ;;
 		java) printf '%s' 'domain port java' ;;
+		modkit) printf '%s' 'domain port modkit' ;;
 		provider) printf '%s' 'domain port provider' ;;
 		storage) printf '%s' 'domain port storage' ;;
 		runtime) printf '%s' 'auth domain port protocol runtime' ;;
@@ -413,9 +414,9 @@ if [ -f "$pkg_manifest" ] && [ -f "$pkg_lib" ]; then
 		transport) printf '%s' 'auth domain port protocol transport' ;;
 		backend) printf '%s' 'auth backend backup domain port protocol runtime transport' ;;
 		# 组合 feature：一次拉入全部内层（默认组合根）
-		bootstrap) printf '%s' 'auth backend backup domain file java port protocol provider runtime service storage transport' ;;
+		bootstrap) printf '%s' 'auth backend backup domain file java modkit port protocol provider runtime service storage transport' ;;
 		# 组合 feature：agent 侧要装配整套服务 + 传输 + supervisor 入口
-		remote) printf '%s' 'auth backend backup domain file java port protocol provider runtime service storage transport' ;;
+		remote) printf '%s' 'auth backend backup domain file java modkit port protocol provider runtime service storage transport' ;;
 		*) printf '%s' '' ;;
 		esac
 	}
