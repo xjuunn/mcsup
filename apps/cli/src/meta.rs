@@ -727,6 +727,40 @@ pub(crate) fn server_mod() -> &'static str {
     t("服务端 Mod", "server mods")
 }
 
+// ---- mod（检测） ----
+
+#[must_use]
+pub(crate) fn mod_cmd() -> &'static str {
+    t(
+        "检测 mod 文件的环境要求（加载器 / MC 版本 / Java / 客服归属）",
+        "inspect mod files for environment requirements (loader / MC version / Java / side)",
+    )
+}
+
+#[must_use]
+pub(crate) fn mod_inspect() -> &'static str {
+    t(
+        "检测 jar 或目录，报告服务端可用性与风险",
+        "inspect a jar or directory and report server viability and risk",
+    )
+}
+
+#[must_use]
+pub(crate) fn mod_inspect_path_arg() -> &'static str {
+    t(
+        "jar 文件或包含 jar 的目录（可多个）",
+        "jar file or directory containing jars (repeatable)",
+    )
+}
+
+#[must_use]
+pub(crate) fn mod_offline_arg() -> &'static str {
+    t(
+        "只做本地检查，不访问上游 API",
+        "local checks only, never query the upstream API",
+    )
+}
+
 // ---- java ----
 
 #[must_use]

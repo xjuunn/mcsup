@@ -62,6 +62,10 @@ pub use file;
 #[cfg_attr(docsrs, doc(cfg(feature = "java")))]
 pub use java;
 
+#[cfg(feature = "modkit")]
+#[cfg_attr(docsrs, doc(cfg(feature = "modkit")))]
+pub use modkit;
+
 #[cfg(feature = "provider")]
 #[cfg_attr(docsrs, doc(cfg(feature = "provider")))]
 pub use provider;

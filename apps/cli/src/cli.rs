@@ -101,6 +101,12 @@ pub(crate) enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    #[command(about = crate::meta::mod_cmd())]
+    #[command(visible_alias = "md")]
+    Mod {
+        #[command(subcommand)]
+        action: ModInspectAction,
+    },
     #[command(about = crate::meta::update())]
     #[command(visible_alias = "up")]
     Update,
@@ -452,6 +458,22 @@ pub(crate) enum BackupAction {
         older_than: Option<String>,
         #[arg(long, help = crate::meta::backup_dry_run_arg())]
         dry_run: bool,
+    },
+}
+
+/// 顶层 `mod` 子命令
+///
+/// 与 `server mod` 的区别：本组命令**不依赖具体服务端**，对任意 jar 都可
+/// 运行；`server mod` 操作已安装服务端里的 mod。
+#[derive(Debug, Subcommand)]
+pub(crate) enum ModInspectAction {
+    #[command(about = crate::meta::mod_inspect())]
+    #[command(visible_alias = "in")]
+    Inspect {
+        #[arg(value_name = "PATH", required = true, help = crate::meta::mod_inspect_path_arg())]
+        paths: Vec<PathBuf>,
+        #[arg(long, help = crate::meta::mod_offline_arg())]
+        offline: bool,
     },
 }
 

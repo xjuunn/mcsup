@@ -13,6 +13,7 @@ domain = { version = "0.1.0", path = "../domain" }
 port = { version = "0.1.0", path = "../port" }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+sha1 = "0.11.0"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["time", "macros", "rt", "fs"] }
 toml.workspace = true

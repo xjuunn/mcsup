@@ -5,6 +5,7 @@ mod doctor;
 mod fs_error;
 mod java;
 mod lifecycle;
+mod mod_inspect;
 mod modpack;
 mod origin;
 mod platform_config;
@@ -35,6 +36,9 @@ pub use java::{
 pub use lifecycle::{
     BusyOp, DEFAULT_RAM_MIB, LifecycleError, LifecycleErrorKind, LogWatch, ServerLifecycleService,
     StartOptions, StatusReport,
+};
+pub use mod_inspect::{
+    ModAudit, ModInspectService, ModInspectServiceError, ModReport, collect_jars,
 };
 pub use modpack::{
     ModpackApplied, ModpackError, ModpackInstallOptions, ModpackInstalled, ModpackPrepared,
