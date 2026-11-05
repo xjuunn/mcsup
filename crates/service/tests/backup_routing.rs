@@ -132,9 +132,7 @@ struct NoopInstaller;
 impl port::InstallerRunner for NoopInstaller {
     fn run_installer(
         &self,
-        _java_bin: &std::path::Path,
-        _installer: &std::path::Path,
-        _dir: &std::path::Path,
+        _invocation: &port::InstallerInvocation<'_>,
         _output: Option<&dyn port::InstallerOutputSink>,
         _cancel: &CancellationToken,
     ) -> Result<(), port::InstallerError> {

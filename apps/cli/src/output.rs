@@ -356,6 +356,9 @@ fn structured_message(err: &anyhow::Error, lang: Lang) -> Option<String> {
                 format!("the source has no version {version}"),
             ));
         }
+        if let Some(message) = wrapped_message(cause, lang) {
+            return Some(message);
+        }
         if let Some(reg) = cause.downcast_ref::<mcsup::service::ServerRegistryError>()
             && let Some(kind) = reg.kind()
         {
@@ -407,6 +410,77 @@ fn source_not_found<'a>(cause: &'a (dyn std::error::Error + 'static)) -> Option<
     // `create` / `install` 走 `LifecycleError::InstallJar`，比上面多一层
     if let Some(LifecycleError::InstallJar(jar)) = cause.downcast_ref::<LifecycleError>() {
         return from_jar(jar);
+    }
+    None
+}
+
+/// 处理被 `#[error(transparent)]` 包装的错误
+///
+/// 这组错误在中文界面下都会混出英文，成因同一个：包装类型转发 `source()`，
+/// 但内层既没有 `kind()`，也不会出现在 `anyhow::Error::chain()` 的其它层里。
+/// 逐类型下钻是唯一可靠做法——每加一个 transparent 包装就要在这里补一条。
+fn wrapped_message(cause: &(dyn std::error::Error + 'static), lang: Lang) -> Option<String> {
+    // 属性键 / 值非法：被 `PropsError::InvalidSet` 或 `SettingsError::InvalidValue` 包着
+    let invalid = cause
+        .downcast_ref::<mcsup::service::PropsError>()
+        .and_then(|props| match props {
+            mcsup::service::PropsError::InvalidSet(invalid) => Some(invalid),
+            _ => None,
+        })
+        .or_else(|| cause.downcast_ref::<mcsup::domain::server::error::PropertySetError>());
+    if let Some(invalid) = invalid {
+        return Some(crate::i18n::property_set(invalid, lang));
+    }
+    // `server set` 的值非法走 `SettingsError::InvalidValue`，载荷类型不同
+    if let Some(invalid) = cause
+        .downcast_ref::<mcsup::service::SettingsError>()
+        .and_then(|settings| match settings {
+            mcsup::service::SettingsError::InvalidValue(invalid) => Some(invalid),
+            _ => None,
+        })
+    {
+        return Some(crate::i18n::setting_invalid(invalid, lang));
+    }
+
+    // 文件系统失败：`io error on {path}` 是英文外壳
+    let fs = cause.downcast_ref::<mcsup::service::FsError>().or_else(|| {
+        match cause.downcast_ref::<mcsup::service::ServerRegistryError>() {
+            Some(mcsup::service::ServerRegistryError::Fs(fs)) => Some(fs),
+            _ => None,
+        }
+    });
+    if let Some(mcsup::service::FsError::Io { path, source }) = fs {
+        // 操作系统给的原因（如 `No such file`）保留原样：它比任何中文概括都精确
+        return Some(crate::i18n::pick(
+            lang,
+            format!("文件操作失败: {}: {source}", path.display()),
+            format!("file operation failed: {}: {source}", path.display()),
+        ));
+    }
+
+    // 上游拒绝：`JavaError::Source` 也是 transparent 包装
+    let upstream = cause
+        .downcast_ref::<mcsup::port::SourceError>()
+        .or_else(|| match cause.downcast_ref::<mcsup::service::JavaError>() {
+            Some(mcsup::service::JavaError::Source(source)) => Some(source),
+            _ => None,
+        });
+    if let Some(mcsup::port::SourceError::Upstream { status, message }) = upstream {
+        // 上游原文保留，排障要用
+        return Some(crate::i18n::pick(
+            lang,
+            format!("下载源拒绝请求（{status}）：{message}"),
+            format!("the source rejected the request ({status}): {message}"),
+        ));
+    }
+
+    // 版本不存在：`version not found` 同样是英文
+    if let Some(version) = source_not_found(cause) {
+        return Some(crate::i18n::pick(
+            lang,
+            format!("下载源没有版本 {version}"),
+            format!("the source has no version {version}"),
+        ));
     }
     None
 }
@@ -764,6 +838,59 @@ mod tests {
             structured_message(&wrapped, Lang::En).as_deref(),
             Some("the source has no version 1.2.3")
         );
+    }
+
+    /// transparent 包装的错误在中文界面下不得只剩英文
+    ///
+    /// 回归三例：`server props x 'bad key=v'` 混出 `invalid property key`；
+    /// `java install 99` 混出 `upstream rejected the request`；
+    /// `server link /tmp/nonexist` 混出 `io error on`。成因同一个——内层既无
+    /// `kind()` 也不在 `chain()` 里。
+    #[test]
+    fn transparent_wrappers_are_localized() {
+        use mcsup::domain::server::error::{InvalidPropertyKey, PropertySetError};
+        use mcsup::port::SourceError;
+        use mcsup::service::{FsError, JavaError, PropsError, ServerRegistryError, SettingsError};
+
+        // 属性键非法
+        let props = anyhow::Error::from(PropsError::from(PropertySetError::from(
+            InvalidPropertyKey {
+                raw: "bad key".to_owned(),
+            },
+        )))
+        .context("写入 x 的 server.properties 失败");
+        let zh = structured_message(&props, Lang::Zh).expect("应有中文");
+        assert!(zh.contains("属性键非法"), "{zh}");
+        assert!(!zh.contains("invalid property key"), "{zh}");
+
+        // 上游拒绝：原文保留
+        let upstream = anyhow::Error::from(JavaError::from(SourceError::Upstream {
+            status: 400,
+            message: "not released yet".to_owned(),
+        }))
+        .context("安装 Java 失败");
+        let zh = structured_message(&upstream, Lang::Zh).expect("应有中文");
+        assert!(zh.contains("下载源拒绝请求"), "{zh}");
+        assert!(zh.contains("not released yet"), "上游原文必须保留: {zh}");
+
+        // 文件系统失败：操作系统原因保留
+        let fs = anyhow::Error::from(ServerRegistryError::from(FsError::Io {
+            path: std::path::PathBuf::from("/tmp/nonexist"),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        }))
+        .context("注册服务器目录失败");
+        let zh = structured_message(&fs, Lang::Zh).expect("应有中文");
+        assert!(zh.contains("文件操作失败"), "{zh}");
+        assert!(!zh.contains("io error on"), "{zh}");
+
+        // `server set` 的值非法
+        let invalid = mcsup::domain::server::settings::ServerSettings::default()
+            .apply(mcsup::domain::server::settings::SettingKey::Ram, "abc")
+            .expect_err("abc 不是合法 ram");
+        let settings = anyhow::Error::from(SettingsError::from(invalid));
+        let zh = structured_message(&settings, Lang::Zh).expect("应有中文");
+        assert!(zh.contains("的值非法"), "{zh}");
+        assert!(!zh.contains("invalid value for"), "{zh}");
     }
 
     #[test]

@@ -1,4 +1,7 @@
 use domain::server::launch::LaunchSpec;
+
+/// Quilt 安装器产出的入口 JAR（无参数文件）
+const QUILT_LAUNCH_JAR: &str = "quilt-server-launch.jar";
 use domain::server::meta::{InstalledJar, ServerId, ServerMeta, ServerName};
 use domain::server::settings::ServerSettings;
 use domain::server::version::{ServerVariant, VersionId};
@@ -918,7 +921,7 @@ impl ServerRegistry {
             .await;
         let _ = std::fs::remove_file(&installer_path);
         let out = out?;
-        if out.install != port::InstallKind::Installer {
+        if !out.install.runs_installer() {
             // 不是安装器：临时下载已清，交回调用方走直接路径
             return Ok(None);
         }
@@ -930,6 +933,41 @@ impl ServerRegistry {
         // 不是 `VersionId` 里的 MC 版本（`26.3`）——拿 MC 版本拼路径必然落空，
         // 只能找到 `user_jvm_args.txt`，启动时就少了平台参数文件。
         let build = out.build.as_deref().unwrap_or_else(|| version.as_str());
+
+        // Quilt 的产物形态不同：入口是单个 `quilt-server-launch.jar`，没有
+        // `user_jvm_args.txt`，也没有 `*_args.txt` 参数文件。用 Forge 的判据查
+        // 它必然落空，把「装好了」报成 Layout 不全。
+        if variant == ServerVariant::Quilt {
+            let entry = PathBuf::from(QUILT_LAUNCH_JAR);
+            if !dir.join(&entry).is_file() {
+                return Err(InstallError::Layout(format!(
+                    "安装器完成后在 {} 找不到 {QUILT_LAUNCH_JAR}",
+                    dir.display()
+                ))
+                .into());
+            }
+            let jar = InstalledJar {
+                path: entry.clone(),
+                size: std::fs::metadata(dir.join(&entry)).map_or(0, |m| m.len()),
+                checksum: out.checksum.clone(),
+            };
+            let launch = LaunchSpec::jar(entry.clone());
+            let srv = self.update_core(
+                name,
+                version,
+                &jar,
+                Some(&launch),
+                out.java_major,
+                crate::atomic::unix_now(),
+            )?;
+            return Ok(Some(InstalledServerJar {
+                destination: dir.join(&entry),
+                server: srv,
+                jar,
+                launch,
+            }));
+        }
+
         let files = loader_args_files(&variant, build, dir);
         if files.is_empty() {
             return Err(InstallError::Layout(format!(
@@ -2243,6 +2281,7 @@ mod tests {
                 location: url::Url::parse("https://example.invalid/server.jar").expect("url"),
                 java_major: None,
                 install: port::InstallKind::Direct,
+                installer_args: Vec::new(),
                 installer_args_dir: None,
             })
         }

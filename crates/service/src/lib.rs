@@ -206,7 +206,7 @@ impl ServerInstaller {
             expected: (!unverified).then(|| checksum.clone()),
             expected_size: (!unverified && known_size).then_some(resolved.artifact.size),
         };
-        notify(if install == port::InstallKind::Installer {
+        notify(if install.runs_installer() {
             TaskStage::DownloadingInstaller
         } else {
             TaskStage::Downloading
@@ -215,7 +215,7 @@ impl ServerInstaller {
         status = status.transition(DownloadStatus::Verifying)?;
 
         // 安装器：下载物是安装器本身，就地运行它产出服务端目录
-        if install == port::InstallKind::Installer {
+        if install.runs_installer() {
             if cancel.is_cancelled() {
                 return Err(port::DownloadError::Cancelled.into());
             }
@@ -232,9 +232,13 @@ impl ServerInstaller {
             // 透传给用户，让他们看到正在联机下载 libraries 而不是卡死
             notify(TaskStage::Installing);
             ctx.runner.run_installer(
-                &ctx.java_bin,
-                &destination,
-                dir,
+                &port::InstallerInvocation {
+                    java_bin: &ctx.java_bin,
+                    installer: &destination,
+                    dir,
+                    kind: install,
+                    extra_args: &resolved.installer_args,
+                },
                 observer.map(|observer| observer as &dyn port::InstallerOutputSink),
                 cancel,
             )?;
@@ -259,7 +263,6 @@ mod tests {
     use domain::server::artifact::{Checksum, ChecksumAlgorithm, JarArtifact};
     use port::{DownloadError, DownloadedArtifact, ResolvedArtifact, SourceError};
     use std::error::Error;
-    use std::path::Path;
     use std::sync::Mutex;
 
     struct FakeSource {
@@ -339,6 +342,7 @@ mod tests {
             location: "https://example.invalid/server.jar".parse()?,
             java_major: None,
             install: port::InstallKind::Direct,
+            installer_args: Vec::new(),
             installer_args_dir: None,
         })
     }
@@ -421,6 +425,7 @@ mod tests {
                     location: "https://example.invalid/placeholder.jar".parse()?,
                     java_major: None,
                     install: port::InstallKind::Direct,
+                    installer_args: Vec::new(),
                     installer_args_dir: None,
                 },
             }),
@@ -505,6 +510,7 @@ mod tests {
                     location: "https://example.invalid/server.jar".parse()?,
                     java_major: None,
                     install: port::InstallKind::Direct,
+                    installer_args: Vec::new(),
                     installer_args_dir: None,
                 },
                 not_found: false,
@@ -541,14 +547,12 @@ mod tests {
     impl port::InstallerRunner for FakeRunner {
         fn run_installer(
             &self,
-            _java_bin: &Path,
-            _installer: &Path,
-            dir: &Path,
+            invocation: &port::InstallerInvocation<'_>,
             _output: Option<&dyn port::InstallerOutputSink>,
             _cancel: &CancellationToken,
         ) -> Result<(), port::InstallerError> {
             *self.calls.lock().expect("lock") += 1;
-            std::fs::write(dir.join("user_jvm_args.txt"), b"# args").expect("write");
+            std::fs::write(invocation.dir.join("user_jvm_args.txt"), b"# args").expect("write");
             Ok(())
         }
     }

@@ -263,6 +263,62 @@ pub(crate) fn install_jar(kind: &InstallJarErrorKind<'_>, lang: Lang) -> String 
     }
 }
 
+/// `server.properties` 写入错误提示
+///
+/// 键非法时要说清「为什么」：Java `Properties` 里这些字符是语法，写下去服务端
+/// 读到的键与我们写的不同，只报「非法」用户无从改起。
+#[must_use]
+pub(crate) fn property_set(
+    err: &mcsup::domain::server::error::PropertySetError,
+    lang: Lang,
+) -> String {
+    use mcsup::domain::server::error::PropertySetError as Props;
+    match err {
+        Props::Key(invalid) => match lang {
+            Lang::Zh => format!(
+                "属性键非法: {:?}\n键不能含 = : # ! \\ 或空格、制表符（Java properties 里这些是分隔符 / 注释前缀 / 转义符）",
+                invalid.raw
+            ),
+            Lang::En => format!(
+                "invalid property key: {:?}\nkeys must not contain = : # ! \\ or whitespace (they are separators, comment prefixes or escapes in Java properties)",
+                invalid.raw
+            ),
+        },
+        Props::Value(invalid) => match lang {
+            Lang::Zh => format!("属性 {} 的值不能含换行: {:?}", invalid.key, invalid.value),
+            Lang::En => format!(
+                "the value of {} must not contain a newline: {:?}",
+                invalid.key, invalid.value
+            ),
+        },
+        // non_exhaustive：新增判定在补文案前沿用英文措辞
+        _ => match lang {
+            Lang::Zh => "属性写入失败".to_owned(),
+            Lang::En => "failed to write the property".to_owned(),
+        },
+    }
+}
+
+/// `server set` 的值非法提示
+#[must_use]
+pub(crate) fn setting_invalid(
+    invalid: &mcsup::domain::server::settings::InvalidSettingValue,
+    lang: Lang,
+) -> String {
+    let hint = match lang {
+        Lang::Zh => {
+            "ram 取 MiB 整数（如 2048），java-version 取大版本号（如 21），autostart 取 true / false，backup-scope 取逗号分隔的顶层项"
+        }
+        Lang::En => {
+            "ram takes MiB as an integer (e.g. 2048), java-version a major number (e.g. 21), autostart true / false, backup-scope comma-separated top-level entries"
+        }
+    };
+    match lang {
+        Lang::Zh => format!("{} 的值非法：{}\n{hint}", invalid.key, invalid.raw),
+        Lang::En => format!("invalid value for {}: {}\n{hint}", invalid.key, invalid.raw),
+    }
+}
+
 /// 服务属性错误提示
 #[must_use]
 pub(crate) fn settings(kind: &SettingsErrorKind<'_>, lang: Lang) -> String {

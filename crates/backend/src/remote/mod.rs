@@ -95,14 +95,12 @@ struct UnsupportedInstaller;
 impl port::InstallerRunner for UnsupportedInstaller {
     fn run_installer(
         &self,
-        _java_bin: &std::path::Path,
-        _installer: &std::path::Path,
-        dir: &std::path::Path,
+        invocation: &port::InstallerInvocation<'_>,
         _output: Option<&dyn port::InstallerOutputSink>,
         _cancel: &port::CancellationToken,
     ) -> Result<(), port::InstallerError> {
         Err(port::InstallerError::NoOutput {
-            dir: dir.to_path_buf(),
+            dir: invocation.dir.to_path_buf(),
         })
     }
 }

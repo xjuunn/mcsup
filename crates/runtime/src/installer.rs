@@ -43,6 +43,9 @@ const DEFAULT_INSTALLER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// 参数文件是安装器在依赖齐备后才写的，入口 JAR 与它同级，是最晚一批产物。
 const EXPECTED_MARKERS: &[&str] = &["user_jvm_args.txt", "run.sh", "run.bat"];
 
+/// Quilt 安装器产出的入口 JAR（它没有参数文件，入口就是启动目标）
+const QUILT_LAUNCH_JAR: &str = "quilt-server-launch.jar";
+
 /// 安装器成功后残留的自身日志（约 2MB，不属服务端产物）
 const INSTALLER_LOG: &str = ".forge-installer.jar.log";
 
@@ -72,9 +75,7 @@ impl LocalInstallerRunner {
 impl InstallerRunner for LocalInstallerRunner {
     fn run_installer(
         &self,
-        java_bin: &Path,
-        installer: &Path,
-        dir: &Path,
+        invocation: &port::InstallerInvocation<'_>,
         output: Option<&dyn InstallerOutputSink>,
         cancel: &CancellationToken,
     ) -> Result<(), InstallerError> {
@@ -83,7 +84,7 @@ impl InstallerRunner for LocalInstallerRunner {
             return Err(InstallerError::Cancelled);
         }
 
-        let command = build_installer_command(java_bin, installer, dir);
+        let command = build_installer_command(invocation);
         let (status, stdout, stderr) = run_and_capture(command, self.timeout, cancel, output)?;
 
         if !status.success() {
@@ -94,26 +95,43 @@ impl InstallerRunner for LocalInstallerRunner {
         }
 
         // 退出码为 0 不代表产物齐全：某些镜像会「成功」但漏生成参数文件
-        if !has_expected_marker(dir) {
+        if !has_expected_marker_for(invocation.dir, invocation.kind) {
             return Err(InstallerError::NoOutput {
-                dir: dir.to_path_buf(),
+                dir: invocation.dir.to_path_buf(),
             });
         }
         // 安装器自己的日志不是服务端的一部分，留着会被备份一并打包
-        let _ = std::fs::remove_file(dir.join(INSTALLER_LOG));
+        let _ = std::fs::remove_file(invocation.dir.join(INSTALLER_LOG));
         Ok(())
     }
 }
 
 /// 组装安装器命令：`{java} -jar {installer} --installServer {dir}`，cwd 为 `dir`
-fn build_installer_command(java_bin: &Path, installer: &Path, dir: &Path) -> Command {
-    let mut command = Command::new(java_bin);
+fn build_installer_command(invocation: &port::InstallerInvocation<'_>) -> Command {
+    let mut command = Command::new(invocation.java_bin);
+    command.arg("-jar").arg(invocation.installer);
+    match invocation.kind {
+        // Quilt：`java -jar <installer> install server <mc> [<loader>] --install-dir=<dir>`
+        //
+        // 不能照搬 Forge 的开关：Quilt 安装器只认子命令，拿到未知参数会打印
+        // help 并以退出码 0 结束，随后被当成「装完了但没产物」。
+        port::InstallKind::InstallerSubcommand => {
+            command.arg("install").arg("server");
+            command.args(invocation.extra_args);
+            // Quilt 启动器要求同目录下有 `server.jar`（原版服务端）。不加这个
+            // 开关安装器只装 loader 与 libraries，启动时报
+            // `Missing game jar at <dir>/server.jar`
+            command.arg("--download-server");
+            command.arg(format!("--install-dir={}", invocation.dir.display()));
+        }
+        // Forge 系：`java -jar <installer> --installServer <dir>`
+        // 直接可运行的服务端不该走到这里；新增形态在补拼法前先用 Forge 式开关
+        port::InstallKind::Installer | port::InstallKind::Direct | _ => {
+            command.arg("--installServer").arg(invocation.dir);
+        }
+    }
     command
-        .arg("-jar")
-        .arg(installer)
-        .arg("--installServer")
-        .arg(dir)
-        .current_dir(dir)
+        .current_dir(invocation.dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -351,7 +369,22 @@ fn tail_of(stdout: &[u8], stderr: &[u8]) -> String {
 /// 见 [`EXPECTED_MARKERS`]：存在参数文件只说明安装器跑过前半段。真正的判据是
 /// **入口 JAR 也在**——参数文件里 `-jar` 指向的那个文件存在，才说明这一版
 /// 安装已经下载完依赖。
-fn has_expected_marker(dir: &Path) -> bool {
+/// 按安装器形态判断产物是否齐全
+///
+/// 两种形态的产物布局不同：
+/// - Forge 系：`run.sh` / `run.bat` / `user_jvm_args.txt` + `libraries/**/*_args.txt`
+/// - Quilt：入口 JAR `quilt-server-launch.jar` + `libraries/`，没有参数文件
+///
+/// 用 Forge 的标记去查 Quilt 目录必然判失败，于是「安装器明明跑完了」被报成
+/// `NoOutput`；反过来用 Quilt 的标记查 Forge 也会漏掉「参数文件写了但入口 JAR
+/// 缺失」这半途失败。
+fn has_expected_marker_for(dir: &Path, kind: port::InstallKind) -> bool {
+    if kind == port::InstallKind::InstallerSubcommand {
+        // Quilt 系：入口 JAR 必须落地，且 libraries 里有东西（安装器先建目录
+        // 再下载，空目录说明联网中断）
+        let entry = dir.join(QUILT_LAUNCH_JAR);
+        return entry.is_file() && has_non_empty_subdir(&dir.join("libraries"));
+    }
     if !EXPECTED_MARKERS.iter().any(|name| dir.join(name).is_file()) {
         return false;
     }
@@ -370,6 +403,21 @@ fn has_expected_marker(dir: &Path) -> bool {
         }
     }
     true
+}
+
+/// 目录是否存在（`libraries/` 下有任何一个文件即认为安装器下载过依赖）
+fn has_non_empty_subdir(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        if path.is_dir() {
+            has_non_empty_subdir(&path)
+        } else {
+            true
+        }
+    })
 }
 
 /// 目录下安装器写出的参数文件（`user_jvm_args.txt` 除外：它不含入口）
@@ -445,9 +493,15 @@ mod tests {
     #[test]
     fn marker_detection_requires_any_expected_file() {
         let dir = tempfile::tempdir().expect("tempdir");
-        assert!(!has_expected_marker(dir.path()));
+        assert!(!has_expected_marker_for(
+            dir.path(),
+            port::InstallKind::Installer
+        ));
         std::fs::write(dir.path().join("user_jvm_args.txt"), b"# args").expect("write");
-        assert!(has_expected_marker(dir.path()));
+        assert!(has_expected_marker_for(
+            dir.path(),
+            port::InstallKind::Installer
+        ));
     }
 
     /// 从参数文件里找不到 `-jar` 时视为入口未知（`None`），不据此判失败
@@ -486,11 +540,14 @@ mod tests {
         )
         .expect("write");
         assert!(
-            !has_expected_marker(dir.path()),
+            !has_expected_marker_for(dir.path(), port::InstallKind::Installer),
             "参数文件在、入口 JAR 不在：安装是中途中止的"
         );
         std::fs::write(nested.join("forge-26.3-66.1.0-shim.jar"), b"jar").expect("write");
-        assert!(has_expected_marker(dir.path()));
+        assert!(has_expected_marker_for(
+            dir.path(),
+            port::InstallKind::Installer
+        ));
     }
 
     /// 取消已置位的令牌：不拉起进程直接报 Cancelled
@@ -501,9 +558,13 @@ mod tests {
         cancel.cancel();
         let err = LocalInstallerRunner::new()
             .run_installer(
-                Path::new("definitely-not-a-java"),
-                Path::new("installer.jar"),
-                dir.path(),
+                &port::InstallerInvocation {
+                    java_bin: Path::new("definitely-not-a-java"),
+                    installer: Path::new("installer.jar"),
+                    dir: dir.path(),
+                    kind: port::InstallKind::Installer,
+                    extra_args: &[],
+                },
                 None,
                 &cancel,
             )
@@ -517,7 +578,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let java = Path::new("/opt/jdk21/bin/java");
         let installer = Path::new("/tmp/x/forge-installer.jar");
-        let cmd = build_installer_command(java, installer, dir.path());
+        let cmd = build_installer_command(&port::InstallerInvocation {
+            java_bin: java,
+            installer,
+            dir: dir.path(),
+            kind: port::InstallKind::Installer,
+            extra_args: &[],
+        });
         assert_eq!(cmd.get_program(), java);
         let args: Vec<String> = cmd
             .get_args()
@@ -528,6 +595,44 @@ mod tests {
         assert_eq!(args[2], "--installServer");
         assert_eq!(args[3], dir.path().to_string_lossy());
         assert_eq!(cmd.get_current_dir(), Some(dir.path()));
+    }
+
+    /// 子命令式安装器（Quilt）按 `install server <args> --install-dir=<dir>` 组装
+    ///
+    /// 回归：Quilt 安装器只认子命令，套用 Forge 的 `--installServer` 会让它打印
+    /// help 并以退出码 0 结束，随后被当成「装完了但没产物」。
+    #[test]
+    fn subcommand_installer_command_uses_positional_args() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let java = Path::new("/opt/jdk21/bin/java");
+        let installer = Path::new("/tmp/x/quilt-installer.jar");
+        let extra = vec!["1.21.1".to_owned(), "0.31.0-beta.4".to_owned()];
+        let cmd = build_installer_command(&port::InstallerInvocation {
+            java_bin: java,
+            installer,
+            dir: dir.path(),
+            kind: port::InstallKind::InstallerSubcommand,
+            extra_args: &extra,
+        });
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "-jar".to_owned(),
+                installer.to_string_lossy().into_owned(),
+                "install".to_owned(),
+                "server".to_owned(),
+                "1.21.1".to_owned(),
+                "0.31.0-beta.4".to_owned(),
+                "--download-server".to_owned(),
+                format!("--install-dir={}", dir.path().display()),
+            ]
+        );
+        // 绝不能混进 Forge 的开关
+        assert!(!args.iter().any(|a| a == "--installServer"), "{args:?}");
     }
 
     /// 跑 `sh -c <script>` 的命令
@@ -697,7 +802,7 @@ mod tests {
         .expect("should run");
         assert!(status.success());
         assert!(
-            !has_expected_marker(dir.path()),
+            !has_expected_marker_for(dir.path(), port::InstallKind::Installer),
             "测试前提：没有任何预期产物"
         );
     }

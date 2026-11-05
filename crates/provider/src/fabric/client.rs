@@ -147,6 +147,7 @@ impl ServerJarSource for FabricSource {
             // 会落到「本机最高 JDK」，用 SDK 25 跑要求 21 的 1.21.1 会崩
             java_major: domain::server::version::required_java_major(&game),
             install: port::InstallKind::Direct,
+            installer_args: Vec::new(),
             installer_args_dir: None,
         })
     }
