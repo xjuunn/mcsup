@@ -104,14 +104,20 @@ pub(crate) async fn pick_modpack(
         return pick_by_project(&service, project, version_hint, printer).await;
     }
     if !printer.is_interactive() {
-        anyhow::bail!(
-            "{}",
+        // 缺必选参数：用法错误（2），与 clap 的参数判定同级
+        return Err(AppDiagnostic::usage(
             crate::i18n::pick(
                 printer.lang(),
                 "非交互模式请用 --modpack 指定整合包".to_owned(),
                 "use --modpack to pick a modpack in non-interactive mode".to_owned(),
-            )
-        );
+            ),
+            Some(crate::i18n::pick(
+                printer.lang(),
+                "mcsup server create <name> --variant modrinth-modpack --modpack <ID>".to_owned(),
+                "mcsup server create <name> --variant modrinth-modpack --modpack <ID>".to_owned(),
+            )),
+        )
+        .into());
     }
     run_wizard(&service, version_hint, printer).await
 }
@@ -137,14 +143,14 @@ async fn pick_by_project(
         Some(hint) => versions
             .into_iter()
             .find(|version| version.id == hint || version.version_number == hint)
-            .ok_or_else(|| anyhow::anyhow!("整合包 {project} 没有版本 {hint}"))?,
+            .ok_or_else(|| version_missing(printer.lang(), project, hint))?,
         None if printer.is_interactive() => pick_version(&versions, printer)?,
         None => versions
             .iter()
             .find(|version| version.is_release())
             .or_else(|| versions.first())
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("整合包 {project} 没有可用版本"))?,
+            .ok_or_else(|| no_available_version(printer.lang()))?,
     };
     finish_pick(service, project, &title, version, printer).await
 }
@@ -195,7 +201,7 @@ async fn run_wizard(
                     versions
                         .into_iter()
                         .find(|version| version.id == hint || version.version_number == hint)
-                        .ok_or_else(|| anyhow::anyhow!("整合包 {id} 没有版本 {hint}"))?
+                        .ok_or_else(|| version_missing(printer.lang(), &id, hint))?
                 } else {
                     let Some(version) = pick_version_backable(printer.lang(), &versions)? else {
                         state = Wizard::Results { keyword, page };
@@ -501,10 +507,43 @@ fn version_pool(versions: &[ModpackVersion]) -> Vec<&ModpackVersion> {
     pool
 }
 
+/// 「整合包没有这个版本」：资源不存在（3）
+///
+/// 用户给了错的版本号，重试同一个请求不会成功，因此不能落通用失败 1。
+fn version_missing(lang: crate::locale::Lang, project: &str, hint: &str) -> AppDiagnostic {
+    AppDiagnostic::not_found(
+        crate::i18n::pick(
+            lang,
+            format!("整合包 {project} 没有版本 {hint}"),
+            format!("modpack {project} has no version {hint}"),
+        ),
+        Some(crate::i18n::pick(
+            lang,
+            "去掉 --version 查看全部可用版本".to_owned(),
+            "drop --version to list the available versions".to_owned(),
+        )),
+    )
+}
+
+/// 「该整合包没有可用版本」：资源不存在（3）
+///
+/// 两个选版本入口共用一份，避免像原来那样各自 `bail!` 一次——那种写法没有
+/// `kind()` 也没有 `category()`，会静默退化成通用失败 1。
+fn no_available_version(lang: crate::locale::Lang) -> AppDiagnostic {
+    AppDiagnostic::not_found(
+        crate::i18n::pick(lang, "该整合包没有可用版本", "no versions available"),
+        Some(crate::i18n::pick(
+            lang,
+            "换一个整合包，或稍后再试".to_owned(),
+            "try another modpack or retry later".to_owned(),
+        )),
+    )
+}
+
 /// 选版本：默认只列正式版，选不到再放开测试版
 fn pick_version(versions: &[ModpackVersion], printer: Printer) -> Result<ModpackVersion> {
     if versions.is_empty() {
-        anyhow::bail!("该整合包没有可用版本");
+        return Err(no_available_version(printer.lang()).into());
     }
     let pool = version_pool(versions);
     let labels: Vec<String> = pool
@@ -546,7 +585,7 @@ fn pick_version_backable(
     versions: &[ModpackVersion],
 ) -> Result<Option<ModpackVersion>> {
     if versions.is_empty() {
-        anyhow::bail!("该整合包没有可用版本");
+        return Err(no_available_version(lang).into());
     }
     let pool = version_pool(versions);
     let shown: Vec<&ModpackVersion> = pool.iter().take(VERSION_SHOW_LIMIT).copied().collect();
@@ -762,6 +801,31 @@ struct ModpackInstallJson<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 「没有可用版本」与「没有这个版本」都是资源不存在（3）
+    ///
+    /// 回归：这两处曾用 `anyhow::bail!` / `anyhow::anyhow!` 造错，既没有
+    /// `kind()` 也没有 `category()`，退出码一路退化成通用失败 1。
+    #[test]
+    fn missing_versions_are_not_found() {
+        use mcsup::port::ErrorCategory;
+        assert_eq!(
+            no_available_version(crate::locale::Lang::Zh).category(),
+            ErrorCategory::NotFound
+        );
+        assert_eq!(
+            version_missing(crate::locale::Lang::Zh, "proj", "9.9").category(),
+            ErrorCategory::NotFound
+        );
+    }
+
+    /// 实际走 `pick_version` 的空列表分支，确认它真的用上了上面的分类
+    #[test]
+    fn pick_version_rejects_empty_list_with_not_found() {
+        let printer = Printer::new(crate::output::OutputFormat::Human, crate::locale::Lang::Zh);
+        let err = pick_version(&[], printer).expect_err("空版本列表必须报错");
+        assert_eq!(crate::output::exit_code_of(&err), 3, "{err}");
+    }
 
     #[test]
     fn extract_id_reads_trailing_id() {

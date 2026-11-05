@@ -77,19 +77,37 @@ impl SourceError {
 
     /// 失败等级
     ///
-    /// `400` 归 [`ErrorCategory::NotFound`]：它表示「你给的版本组合不存在」，
-    /// 与 [`Self::NotFound`] 同义；其余上游拒绝（5xx 等）是后端失败。
+    /// 「请求的资源不存在」全归 [`ErrorCategory::NotFound`]，与 [`Self::NotFound`]
+    /// 同义：调用方给的是错的 id / 版本，重试同一个请求不会变成成功。
+    /// 这里按状态码判而不是按构造点判，是因为上游用哪个码表达「不存在」并不统一
+    /// （Modrinth 走 404 且带说明体，Mojang 走 400 且带说明体），漏一个就让
+    /// `--modpack <不存在的 id>` 报成后端挂了。
+    ///
+    /// 其余（5xx、429、传输失败、解码失败）是后端失败：可重试或需运维介入。
+    /// 401 / 403 也留在后端失败——下载源不携带用户凭据，它们只能表示源侧配置
+    /// 问题，不是调用方的身份问题。
     #[must_use]
     pub fn category(&self) -> ErrorCategory {
         match self {
-            Self::NotFound(_) | Self::Upstream { status: 400, .. } => ErrorCategory::NotFound,
-            Self::Status { .. }
-            | Self::Upstream { .. }
-            | Self::Network(_)
-            | Self::Decode(_)
-            | Self::Init(_) => ErrorCategory::Backend,
+            Self::NotFound(_) => ErrorCategory::NotFound,
+            Self::Status { status } | Self::Upstream { status, .. } => {
+                if is_missing_resource(*status) {
+                    ErrorCategory::NotFound
+                } else {
+                    ErrorCategory::Backend
+                }
+            }
+            Self::Network(_) | Self::Decode(_) | Self::Init(_) => ErrorCategory::Backend,
         }
     }
+}
+
+/// 状态码是否表示「请求的资源不存在」
+///
+/// 400 单独列出：Mojang 用它表达「这个版本组合不存在」，与 404 同义。
+/// 后续新增来源若用别的码表达同一件事，只改这里一处。
+const fn is_missing_resource(status: u16) -> bool {
+    matches!(status, 400 | 404 | 410)
 }
 
 /// 待下载的内容和URL

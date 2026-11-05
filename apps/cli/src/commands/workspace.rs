@@ -594,11 +594,20 @@ fn pick_workspace(
         .filter(|sourced| origin.is_none_or(|want| &sourced.origin == want))
         .collect();
     if items.is_empty() {
-        anyhow::bail!(crate::i18n::pick(
-            printer.lang(),
-            "尚无工作目录，先运行 mcsup workspace init".to_owned(),
-            "no workspaces yet; run `mcsup workspace init` first".to_owned(),
-        ));
+        // 「还没有工作目录」是资源不存在，不是通用失败：脚本据此知道要先 init
+        return Err(AppDiagnostic::not_found(
+            crate::i18n::pick(
+                printer.lang(),
+                "尚无工作目录".to_owned(),
+                "no workspaces yet".to_owned(),
+            ),
+            Some(crate::i18n::pick(
+                printer.lang(),
+                "先运行 mcsup workspace init".to_owned(),
+                "run `mcsup workspace init` first".to_owned(),
+            )),
+        )
+        .into());
     }
     let current_marker = crate::i18n::pick(
         printer.lang(),
