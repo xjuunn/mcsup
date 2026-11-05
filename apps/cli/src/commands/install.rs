@@ -1,4 +1,5 @@
 use crate::bootstrap;
+use crate::diagnostic::AppDiagnostic;
 use crate::output::Printer;
 use crate::progress::{InstallSession, TaskSpinner};
 use crate::prompts;
@@ -321,11 +322,20 @@ pub(crate) fn select_version(
     printer: Printer,
 ) -> Result<VersionId> {
     if versions.is_empty() {
-        anyhow::bail!(crate::i18n::pick(
-            printer.lang(),
-            format!("{label} 暂无可用版本"),
-            format!("no versions available for {label}")
-        ));
+        // 来源确实没有给出任何版本：资源不存在（3），不是后端失败
+        return Err(AppDiagnostic::not_found(
+            crate::i18n::pick(
+                printer.lang(),
+                format!("{label} 暂无可用版本"),
+                format!("no versions available for {label}"),
+            ),
+            Some(crate::i18n::pick(
+                printer.lang(),
+                "换一个来源或稍后重试".to_owned(),
+                "try another source or retry later".to_owned(),
+            )),
+        )
+        .into());
     }
     // 顺序由领域层统一：各来源给出的顺序不一致（Forge 的 BTreeMap 是串字典序，
     // `1.10` 会落在 `1.1` 之后），入口不再各自排序

@@ -113,6 +113,8 @@ fn create_help_mentions_modpack() {
 #[test]
 fn modpack_variant_without_project_fails_noninteractive() {
     let home = temp_home();
+    // 先建工作区：否则会先撞「尚无当前工作区」（也是 3），测不到本用例要判的闸
+    init_workspace(&home, "ws1");
     let out = run_full(
         home.path(),
         &[
@@ -130,8 +132,11 @@ fn modpack_variant_without_project_fails_noninteractive() {
             ("ALL_PROXY", DEAD_PROXY),
         ],
     );
-    // 缺名称 / 缺项目都会失败；关键是不能静默创建
-    assert_ne!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    // 缺必选参数是用法错误（2），不是通用失败 1：脚本据此区分「命令写错了」
+    // 与「运行失败」
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("--modpack"), "{err}");
 }
 
 /// 整合包变体不要求 `--version`：闸门不能先把它拦下
@@ -223,6 +228,34 @@ fn modrinth_variant_alias_is_accepted() {
             && !text.contains("暂未支持"),
         "别名不应被拒绝: {text}"
     );
+}
+
+/// 不存在的整合包 id：上游 404 必须是「资源不存在」（3），不是后端失败（5）
+///
+/// 回归：`SourceError::Status` 一律落后端失败，脚本会把「id 写错了」当成
+/// 「对端挂了」去重试。
+#[test]
+fn net_unknown_modpack_project_is_not_found() {
+    if !enabled() {
+        return;
+    }
+    let home = temp_home();
+    init_workspace(&home, "ws");
+    let out = run(
+        home.path(),
+        &[
+            "server",
+            "create",
+            "mp",
+            "--modpack",
+            "mcsup-nonexistent-project-xyz",
+            "--lang",
+            "en",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr(&out));
 }
 
 /// 真实建整合包服务器：落盘 mods / overrides / 核心，注册表记录 MC 版本

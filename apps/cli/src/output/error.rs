@@ -358,6 +358,44 @@ mod tests {
         assert_eq!(exit_code_of(&err), 5);
     }
 
+    /// 上游用 404 / 400 / 410 表达「你要的东西不存在」：都算资源不存在
+    ///
+    /// 回归：只认 400，于是 `--modpack <不存在的 id>` 的 404 落成后端失败 5，
+    /// 脚本会误以为对端挂了而重试，实际是 id 写错了。
+    #[test]
+    fn upstream_missing_resource_statuses_map_to_exit_code_3() {
+        use mcsup::port::SourceError;
+
+        for status in [400, 404, 410] {
+            for err in [
+                SourceError::Status { status },
+                SourceError::Upstream {
+                    status,
+                    message: "not found".to_owned(),
+                },
+            ] {
+                let err = Err::<(), _>(err).context("获取整合包详情失败").unwrap_err();
+                assert_eq!(exit_code_of(&err), 3, "HTTP {status}");
+            }
+        }
+
+        // 5xx / 429 是可重试或需运维介入的后端问题
+        for status in [429, 500, 503] {
+            let err = Err::<(), _>(SourceError::Status { status })
+                .context("获取整合包详情失败")
+                .unwrap_err();
+            assert_eq!(exit_code_of(&err), 5, "HTTP {status}");
+        }
+
+        // 下载源不带用户凭据：401 / 403 是源侧配置问题，不是调用方的身份问题
+        for status in [401, 403] {
+            let err = Err::<(), _>(SourceError::Status { status })
+                .context("获取整合包详情失败")
+                .unwrap_err();
+            assert_eq!(exit_code_of(&err), 5, "HTTP {status}");
+        }
+    }
+
     #[test]
     fn not_found_maps_to_exit_code_3() {
         let err = Err::<(), _>(SourceError::NotFound(VersionId::new("1.21.1")))
