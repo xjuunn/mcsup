@@ -180,7 +180,7 @@ $ mcsup remote connect host:port --code 4821-9375
 | `mcsup remote list` | 已配对远端、连接状态、角色、agent 版本 |
 | `mcsup remote status [<name>]` | 单个远端的详细信息（缺名等价 list） |
 | `mcsup remote ping <name>` | 连通性 / 版本 / 能力，供脚本使用 |
-| `mcsup remote disconnect <name>` | 删除本地配对与凭证，**并通知远端删掉本机那条客户端记录**；对端连不上时本地照常断开、远端记录保留（会提示如何在 serve 端清理）。当前工作区指向该远端时切回本地最后使用的工作区 |
+| `mcsup remote disconnect <name>` | 删除本地配对、凭证与只读缓存目录（`{data_dir}/remotes/<name>/`），**并通知远端删掉本机那条客户端记录**；对端连不上时本地照常断开、远端记录保留（会提示如何在 serve 端清理）。当前工作区指向该远端时切回本地最后使用的工作区 |
 
 `connect` 幂等：重复执行等于重新握手并刷新 token 与指纹。
 
@@ -341,6 +341,10 @@ error: “web” 存在于多个位置
 - `mcsup remote revoke <client>` 在 serve 端离线删除名册记录，立即失效该
   客户端的 token。
 - 未配对或 token 失效：命令报「未授权」（退出码 6），不自动降级到本地。
+  该口径对**所有**远端命令一致：对端拒绝经远端仓库（`RepositoryError::Storage`）
+  或 supervisor（`SupervisorError::Remote{Unauthorized}`）包装后，判级必须下钻
+  到内层 kind，否则会退化成后端失败（5），脚本就分不清「该重新配对」和
+  「对端崩了」。
 
 ## 数据与同步
 

@@ -8,7 +8,7 @@
 // 集成测试的辅助函数不是 #[test]，clippy 的 in-tests 白名单识别不到
 #![allow(clippy::expect_used, clippy::panic)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -303,6 +303,27 @@ fn connect_then_manage_remote_resources_with_identical_commands() {
     let after = run(home_path, &["remote", "list", "--output", "json"]);
     assert_ok(&after, "remote list after disconnect");
     assert_eq!(json(&after)["items"].as_array().expect("items").len(), 0);
+
+    // 缓存目录随配对一起消失：里面留着对端的服务器名、路径、版本与 Java
+    // 清单，断开后既是数据残留，也会让下次 connect 同名前先渲染出过期内容
+    // 数据目录由平台决定（macOS 走 `Library/Application Support`，
+    // Linux 走 `XDG_DATA_HOME`）：问一次 CLI 比在测试里重写平台规则可靠
+    let shown = run(home_path, &["config", "show", "--output", "json"]);
+    assert_ok(&shown, "config show");
+    let shown = json(&shown);
+    let data_dir = shown["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|item| item["key"] == "data-dir")
+        .and_then(|item| item["value"].as_str())
+        .expect("data-dir");
+    let cache_dir = PathBuf::from(data_dir).join("remotes").join("test-box");
+    assert!(
+        !cache_dir.exists(),
+        "断连后缓存应被删除: {}",
+        cache_dir.display()
+    );
 
     // 远端仍在服务：agent 自己的名册里还有这个客户端
     assert!(
