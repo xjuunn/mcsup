@@ -140,13 +140,28 @@ fn sort_by_discovery_order(variants: &mut [ServerVariant]) {
 
 /// 变体在选择器里的展示标签
 ///
-/// 只保留名字本身：列表靠排列顺序表达「需要懂多少」，不靠括号里的解释。
-/// 整合包用短名 `modrinth`，与 `--variant modrinth` 别名一致。
+/// 只保留名字本身：列表靠排列顺序表达「需要懂多少」，解释交给
+/// [`variant_note`] 的灰色说明，不塞进标签（标签同时是提交值，多一个字都
+/// 会让回映失败）。整合包用短名 `modrinth`，与 `--variant modrinth` 别名一致。
 #[must_use]
 pub(crate) fn variant_label(variant: &ServerVariant) -> String {
     match variant {
         ServerVariant::ModrinthModpack => "modrinth".to_owned(),
         other => other.as_str().to_owned(),
+    }
+}
+
+/// 变体在选择器里的灰色说明
+///
+/// 名字本身看不出差别的类型才给说明：`vanilla` 是唯一「官方」来源，
+/// `modrinth` 其实是整合包（不是「一个模组加载器」）。其余变体名字已足够
+/// 自明，返回 `None` 让列表保持清爽。
+#[must_use]
+pub(crate) fn variant_note(variant: &ServerVariant, lang: Lang) -> Option<String> {
+    match variant {
+        ServerVariant::Vanilla => Some(crate::i18n::pick(lang, "官方", "official")),
+        ServerVariant::ModrinthModpack => Some(crate::i18n::pick(lang, "整合包", "modpack")),
+        _ => None,
     }
 }
 
@@ -767,6 +782,37 @@ mod tests {
             );
         }
         assert!(variant_label(&ServerVariant::ModrinthModpack).contains("modrinth"));
+    }
+
+    /// 只有 vanilla 与 modrinth 带说明，其余保持清爽
+    #[test]
+    fn variant_note_only_covers_ambiguous_types() {
+        assert_eq!(
+            variant_note(&ServerVariant::Vanilla, Lang::Zh).as_deref(),
+            Some("官方")
+        );
+        assert_eq!(
+            variant_note(&ServerVariant::ModrinthModpack, Lang::Zh).as_deref(),
+            Some("整合包")
+        );
+        assert_eq!(
+            variant_note(&ServerVariant::Vanilla, Lang::En).as_deref(),
+            Some("official")
+        );
+        assert_eq!(
+            variant_note(&ServerVariant::ModrinthModpack, Lang::En).as_deref(),
+            Some("modpack")
+        );
+        for variant in [
+            ServerVariant::Fabric,
+            ServerVariant::Forge,
+            ServerVariant::NeoForge,
+            ServerVariant::Quilt,
+            ServerVariant::Paper,
+            ServerVariant::Purpur,
+        ] {
+            assert_eq!(variant_note(&variant, Lang::Zh), None, "{variant:?}");
+        }
     }
 
     #[test]

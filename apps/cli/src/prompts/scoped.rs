@@ -41,6 +41,8 @@ pub(crate) struct ScopedChoice {
     pub(crate) display: Option<String>,
     /// 正文前面的灰色前缀（如 ID）；只影响渲染，不参与提交值
     pub(crate) prefix: Option<String>,
+    /// 正文后面的灰色说明（如「官方」）；只影响渲染，不参与过滤与提交
+    pub(crate) suffix: Option<String>,
     /// 是否属于「切换范围后才显示」的扩展候选
     pub(crate) extra: bool,
 }
@@ -52,6 +54,7 @@ impl ScopedChoice {
             label: label.into(),
             display: None,
             prefix: None,
+            suffix: None,
             extra,
         }
     }
@@ -69,6 +72,16 @@ impl ScopedChoice {
         self.display = Some(display.into());
         self
     }
+
+    /// 设置正文后的灰色说明（不参与过滤与提交）
+    ///
+    /// 用来补一句名字本身看不出来的差别（如 `vanilla` 是官方来源、
+    /// `modrinth` 是整合包）；说明只是注解，不该参与用户输入的关键字匹配。
+    #[must_use]
+    pub(crate) fn with_suffix(mut self, suffix: impl Into<String>) -> Self {
+        self.suffix = Some(suffix.into());
+        self
+    }
 }
 
 /// 范围切换的提示文案：措辞由调用方按业务给，组件只负责渲染
@@ -78,6 +91,20 @@ pub(crate) struct ScopeHint {
     pub(crate) show_all: &'static str,
     /// 停在全部范围时展示：切换后会隐藏什么
     pub(crate) show_default: &'static str,
+}
+
+impl ScopeHint {
+    /// 没有扩展候选时的占位：范围提示永不渲染
+    ///
+    /// 候选全是默认范围时 `Ctrl+A` 无从切换，帮助行不会带上范围说明；
+    /// 给这种调用方一个不必编造文案的构造器。
+    #[must_use]
+    pub(crate) const fn none() -> Self {
+        Self {
+            show_all: "",
+            show_default: "",
+        }
+    }
 }
 
 /// 收尾原因：只有这四种会结束交互
@@ -626,7 +653,10 @@ impl<'a> Picker<'a> {
         (line, column)
     }
 
-    /// 建议行：高亮项带 `>` 标记并着色；灰色前缀（如 ID）单独上色
+    /// 建议行：高亮项带 `>` 标记并着色；灰色前缀 / 说明单独上色
+    ///
+    /// 说明（[`ScopedChoice::suffix`]）始终用暗色：它只是注解，即使整行高亮
+    /// 也不该抢走视线；宽度不够时先截说明、再截正文，保证名字可读。
     fn suggestion_line(&self, suggestion: &str, index: usize, max: usize) -> String {
         let highlighted = self.highlight == Some(index);
         let marker = if highlighted { ">" } else { " " };
@@ -635,32 +665,57 @@ impl<'a> Picker<'a> {
             .iter()
             .find(|choice| choice.label == suggestion);
         let prefix = choice.and_then(|choice| choice.prefix.as_deref());
+        let suffix = choice
+            .and_then(|choice| choice.suffix.as_deref())
+            .filter(|suffix| !suffix.is_empty());
         let body = choice
             .and_then(|choice| choice.display.as_deref())
             .unwrap_or(suggestion);
 
-        // 预算：标记 + 空格 + 前缀 + 两个空格 + 正文
+        // 预算：标记 + 空格 + 前缀 + 两个空格 + 正文 + 两个空格 + 说明
         let mut budget = max.saturating_sub(2);
         let prefix = prefix.filter(|prefix| !prefix.is_empty()).map(|prefix| {
             let shown = truncate_str(prefix, budget, "…").to_string();
             budget = budget.saturating_sub(measure_text_width(&shown) + 2);
             shown
         });
+        // 说明先占位，但最多占一半：名字比注解重要
+        let suffix = suffix.map(|suffix| {
+            let shown = truncate_str(suffix, budget / 2, "…").to_string();
+            budget = budget.saturating_sub(measure_text_width(&shown) + 2);
+            shown
+        });
         let body = truncate_str(body, budget, "…").to_string();
 
-        if highlighted {
-            let text = match &prefix {
-                Some(prefix) => format!("{marker} {prefix}  {body}"),
-                None => format!("{marker} {body}"),
-            };
-            return styled(&text, &Style::new().for_stderr().cyan().bold(), max);
-        }
-        match prefix {
-            Some(prefix) => format!(
-                "{marker} {}  {body}",
-                Style::new().for_stderr().dim().apply_to(&prefix)
-            ),
+        let head = match &prefix {
+            Some(prefix) => format!("{marker} {prefix}  {body}"),
             None => format!("{marker} {body}"),
+        };
+        let head = if highlighted {
+            Style::new()
+                .for_stderr()
+                .cyan()
+                .bold()
+                .apply_to(truncate_str(&head, max, "…"))
+                .to_string()
+        } else {
+            match &prefix {
+                Some(prefix) => format!(
+                    "{marker} {}  {body}",
+                    Style::new().for_stderr().dim().apply_to(prefix)
+                ),
+                None => head,
+            }
+        };
+        match suffix {
+            Some(suffix) => format!(
+                "{head}{}",
+                Style::new()
+                    .for_stderr()
+                    .dim()
+                    .apply_to(format!("  {suffix}"))
+            ),
+            None => head,
         }
     }
 }
@@ -1335,6 +1390,59 @@ mod tests {
             start <= highlighted && highlighted < end,
             "上移后高亮在窗口内"
         );
+    }
+
+    /// 说明渲染在名字后面，且不参与过滤与提交
+    #[test]
+    fn suffix_renders_after_body_without_affecting_filtering() {
+        let all = vec![
+            ScopedChoice::new("vanilla", false).with_suffix("官方"),
+            ScopedChoice::new("modrinth", false).with_suffix("整合包"),
+            ScopedChoice::new("fabric", false),
+        ];
+        let picker = new_picker("服务端类型", &all);
+        let lines = picker.screen().lines;
+        let row = |needle: &str| {
+            lines
+                .iter()
+                .find(|line| line.contains(needle))
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert!(row("vanilla").contains("官方"), "{lines:#?}");
+        assert!(row("modrinth").contains("整合包"), "{lines:#?}");
+        // 没有说明的候选不凭空多出灰字
+        assert!(!row("fabric").contains("官"), "{lines:#?}");
+
+        // 关键字仍按名字匹配：说明不该被当成搜索关键词的一部分
+        let mut picker = new_picker("服务端类型", &all);
+        type_chars(&mut picker, "mod");
+        assert_eq!(picker.filtered(), vec!["modrinth"]);
+        type_chars(&mut picker, "rinth");
+        // 提交值是不带说明的候选名
+        let done = picker.handle(Key::Enter).expect("回车不应失败");
+        assert_eq!(done, Some(Done::Submitted("modrinth".to_owned())));
+    }
+
+    /// 高亮行也把说明渲染成独立的暗色段，而不是混进高亮正文
+    #[test]
+    fn suffix_stays_dim_when_highlighted() {
+        let all = vec![ScopedChoice::new("vanilla", false).with_suffix("官方")];
+        let mut picker = new_picker("服务端类型", &all);
+        picker.handle(Key::Down).expect("按键不应失败");
+        let line = picker
+            .screen()
+            .lines
+            .clone()
+            .into_iter()
+            .find(|line| line.contains("vanilla"))
+            .expect("应渲染 vanilla 行");
+        assert!(line.starts_with("> "), "高亮行应带 `>` 标记：{line:?}");
+        assert!(line.contains("官方"), "高亮行仍要带说明：{line:?}");
+        // 说明在正文之后
+        let body = line.find("vanilla").expect("正文");
+        let note = line.find("官方").expect("说明");
+        assert!(body < note, "说明应排在名字之后：{line:?}");
     }
 
     /// 画面只渲染窗口内的一页：候选再多，行数也恒定

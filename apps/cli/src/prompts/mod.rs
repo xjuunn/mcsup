@@ -69,6 +69,22 @@ pub(crate) fn step(printer: Printer, step: usize, total: usize, title: &str) {
     printer.print_section(&format!("[{step}/{total}] {title}"));
 }
 
+/// 统一交互提示符号：去掉 inquire 默认的 `?` 前缀
+///
+/// inquire 默认在问题行前渲染一个绿色 `?`，与本项目自有选择器的
+/// `标签 > 输入` 风格冲突，看起来像渲染错误。这里把待答前缀清空、已答前缀
+/// 统一成 `>`，两类组件由此看起来是同一套提示。
+///
+/// 从 [`RenderConfig::default`] 出发而不是 `empty()`：要保留 `NO_COLOR`
+/// 的判定与错误 / 帮助行的配色，只替换两个前缀符号。
+pub(crate) fn init_render_config() {
+    use inquire::ui::{Color, RenderConfig, Styled};
+    let config = RenderConfig::default()
+        .with_prompt_prefix(Styled::new(""))
+        .with_answered_prompt_prefix(Styled::new(">").with_fg(Color::LightCyan));
+    inquire::set_global_render_config(config);
+}
+
 /// 通用确认（默认值随调用方）
 ///
 /// # Errors
