@@ -390,6 +390,12 @@ pub struct WireVersion {
     pub variant: String,
     /// 该版本要求的 Java 大版本
     pub java_major: Option<i64>,
+    /// 发布时间原文（RFC 3339 UTC）；来源不提供时为 `None`
+    ///
+    /// `serde(default)`：旧客户端不认识该字段，缺省解析为 `None`，退回按
+    /// 版本号排序，不因字段缺失而整帧解析失败。
+    #[serde(default)]
+    pub released: Option<String>,
 }
 
 impl WireVersion {
@@ -422,6 +428,7 @@ impl From<&ServerVersion> for WireVersion {
             kind: WireVersion::kind_text(version.kind).to_owned(),
             variant: version.variant.as_str().to_owned(),
             java_major: version.java_major.map(JavaMajor::as_i64),
+            released: version.released.clone(),
         }
     }
 }
@@ -443,6 +450,7 @@ impl TryFrom<WireVersion> for ServerVersion {
             kind: WireVersion::parse_kind(&wire.kind)?,
             variant,
             java_major,
+            released: wire.released,
         })
     }
 }

@@ -305,6 +305,7 @@ fn latest_mc(metadata: &MavenMetadata) -> Option<String> {
             kind: VersionKind::Release,
             variant: ServerVariant::Forge,
             java_major: None,
+            released: None,
         })
         .collect();
     ServerVersion::sort_display_order(&mut versions);
@@ -341,6 +342,7 @@ fn into_server_version(mc: String, builds: &[String]) -> Option<ServerVersion> {
         kind: VersionKind::Release,
         variant: ServerVariant::Forge,
         java_major: None,
+        released: None,
     })
 }
 

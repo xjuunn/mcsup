@@ -307,6 +307,7 @@ pub(crate) mod mcsup_agent_shim {
                         kind: "release".to_owned(),
                         variant: variant.clone(),
                         java_major: Some(21),
+                        released: Some("2025-06-17T12:00:00+00:00".to_owned()),
                     }],
                 },
                 Request::JavaList | Request::JavaScan => Response::Javas { items: Vec::new() },

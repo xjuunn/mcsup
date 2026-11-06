@@ -240,6 +240,7 @@ fn into_server_version(game: GameVersion) -> ServerVersion {
         kind: game_kind(game.stable),
         variant: ServerVariant::Fabric,
         java_major: None,
+        released: None,
     }
 }
 

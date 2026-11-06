@@ -38,6 +38,18 @@ pub struct ServerVersion {
     /// Minecraft 版本要求的 Java 大版本（如 1.21.1 需要 Java 21）
     /// 来源：版本清单中的 `javaVersion.majorVersion`
     pub java_major: Option<crate::java::JavaMajor>,
+    /// 发布时间，RFC 3339 UTC 原文（如 `2026-11-03T13:08:56+00:00`）
+    ///
+    /// 来源：`Mojang` 清单的 `releaseTime`。排序优先按它倒序，因为版本号
+    /// 拆不出数字的名字（`26w14a` / `26.4-snapshot-7` / `3D Shareware v1.34`）
+    /// 只能靠时间定位先后；只按版本号排会把它们整体垫到列表末尾，而它们
+    /// 往往是最新的。
+    ///
+    /// 存原文而不是解析成时间戳：`chrono` 是 `domain` 之外的依赖，而该字段
+    /// 只用于同一来源内部比较——`Mojang` 给出的格式定长且统一为 `+00:00`，
+    /// 字典序即时间序，无需引入日期库。**不得**把不同来源、不同格式的时间
+    /// 混在一起比较。`None` 表示来源不提供发布时间（`Fabric` / `Paper` 等）。
+    pub released: Option<String>,
 }
 
 impl ServerVersion {
@@ -45,9 +57,10 @@ impl ServerVersion {
     ///
     /// 判定收敛在领域层，入口不再各自排序。口径：
     ///
-    /// 1. 正式版在快照、旧版之前
-    /// 2. 能解析出数字的版本在快照名（`24w14a`）之类之前
-    /// 3. 数字段按数值逐段比较，`1.12.2` > `1.12` > `1.10` > `1.1`
+    /// 1. 有发布时间的按时间倒序（`Mojang` 清单），版本号拆不出数字的
+    ///    `26w14a` / `26.4-snapshot-7` / `3D Shareware v1.34` 靠它定位
+    /// 2. 版本号大的在前（按数字段逐段比较，`1.12.2` > `1.12` > `1.10`）
+    /// 3. **版本号相同时**才比 kind：正式版在快照、旧版之前
     /// 4. 同一版本号的正式形态在后缀之前（`1.21.1` 在 `1.21.1-pre1` 之前）
     ///
     /// 只排序、不去重：来源若给出重复 id，由来源自己负责修正。
@@ -67,6 +80,7 @@ impl ServerVersion {
                     segments,
                     main,
                     prerelease,
+                    released: version.released.as_deref(),
                     raw: version.id.as_str(),
                 }
             })
@@ -93,6 +107,7 @@ impl ServerVersion {
             kind: VersionKind::Release,
             variant: ServerVariant::Vanilla,
             java_major: None,
+            released: None,
         }
     }
 }
@@ -128,6 +143,8 @@ struct VersionOrderKey<'a> {
     main: Option<Vec<VersionSegment<'a>>>,
     /// 预发布 / 变体后缀（首个带前缀段及其后全部段）
     prerelease: Vec<VersionSegment<'a>>,
+    /// 发布时间原文（RFC 3339 UTC）；`None` = 来源不提供
+    released: Option<&'a str>,
     raw: &'a str,
 }
 
@@ -152,7 +169,10 @@ impl Ord for VersionOrderKey<'_> {
         use std::cmp::Ordering;
 
         // 排序口径（新在前），逐级判定，任一级分出胜负即返回：
-        // 1. 能解析的版本排在拆不出的名字（`24w45a`）之前
+        // 0. **发布时间晚的在前**——版本号拆不出数字的名字（`26w14a` /
+        //    `26.4-snapshot-7` / `3D Shareware v1.34`）只能靠时间定位，
+        //    否则会整体垫到列表末尾，而它们往往是最新的
+        // 1. 能解析的版本排在拆不出的名字之前
         // 2. 主路径（去掉预发布后缀的版本号）大的在前：`1.21.4` > `1.21`
         // 3. 主路径相同：正式版（无预发布后缀）在有后缀的之前
         // 4. 都有后缀：按后缀段比较（`pre2` < `pre10`，`rc` 在 `pre` 前）
@@ -163,6 +183,23 @@ impl Ord for VersionOrderKey<'_> {
         // kind 优先，`Mojang` 清单里 758 个快照会整体垫到 103 个正式版之后，
         // 「全部」视图前 100 多项全是正式版，用户翻不到快照（`Ctrl+A` 看起来
         // 没生效）。
+        //
+        // 发布时间只在**同一来源内部**可比：`released` 是来源给的原文，
+        // 格式由来源保证一致（见 [`ServerVersion::released`]）。一方有、
+        // 一方没有时把有时间的排前面——有时间说明来源给出了权威先后，
+        // 比版本号字面更可信。
+        match (self.released, other.released) {
+            (Some(left), Some(right)) => {
+                if left != right {
+                    // 时间倒序：晚的在前
+                    return right.cmp(left);
+                }
+            }
+            (Some(_), None) => return Ordering::Less,
+            (None, Some(_)) => return Ordering::Greater,
+            (None, None) => {}
+        }
+
         match (&self.main, &other.main) {
             (Some(left), Some(right)) => {
                 match compare_segments(left, right) {
@@ -398,6 +435,15 @@ mod tests {
             kind,
             variant: ServerVariant::Vanilla,
             java_major: None,
+            released: None,
+        }
+    }
+
+    /// 带发布时间的版本（`Mojang` 清单形态）
+    fn dated(kind: VersionKind, id: &str, released: &str) -> ServerVersion {
+        ServerVersion {
+            released: Some(released.to_owned()),
+            ..version(kind, id)
         }
     }
 
@@ -473,6 +519,64 @@ mod tests {
             sorted_ids(versions),
             vec!["26.3-21.0.0", "26.3-21.0.0-RC2755", "26.3"]
         );
+    }
+
+    /// 回归：有发布时间的按时间倒序，拆不出数字的名字不能垫底
+    ///
+    /// `26.4-snapshot-7` / `26w14a` / `3D Shareware v1.34` 都解析不出数字
+    /// 版本号，只按版本号排会整体落到列表末尾，而它们恰恰是最新的。
+    #[test]
+    fn release_time_orders_unparsable_names_by_recency() {
+        let versions = vec![
+            dated(
+                VersionKind::Historical,
+                "3D Shareware v1.34",
+                "2019-04-01T00:00:00+00:00",
+            ),
+            dated(VersionKind::Release, "1.21.11", "2025-12-09T12:00:00+00:00"),
+            dated(
+                VersionKind::Snapshot,
+                "26.4-snapshot-7",
+                "2026-11-03T13:08:56+00:00",
+            ),
+            dated(VersionKind::Snapshot, "26w14a", "2026-04-07T12:00:00+00:00"),
+        ];
+        assert_eq!(
+            sorted_ids(versions),
+            vec!["26.4-snapshot-7", "26w14a", "1.21.11", "3D Shareware v1.34"],
+            "按发布时间倒序，与版本号能否解析无关"
+        );
+    }
+
+    /// 有发布时间的排在没时间的之前；两边都没时间才比版本号
+    #[test]
+    fn release_time_wins_over_missing_time() {
+        let versions = vec![
+            version(VersionKind::Release, "1.21.11"),
+            dated(VersionKind::Snapshot, "26w14a", "2026-04-07T12:00:00+00:00"),
+        ];
+        assert_eq!(sorted_ids(versions), vec!["26w14a", "1.21.11"]);
+
+        // 都没时间时退回版本号比较（`1.21.11` > `1.20.1`）
+        let undated = vec![
+            version(VersionKind::Release, "1.20.1"),
+            version(VersionKind::Release, "1.21.11"),
+        ];
+        assert_eq!(sorted_ids(undated), vec!["1.21.11", "1.20.1"]);
+    }
+
+    /// 同一时间戳仍要满足全序，不能因 `Equal` 破坏传递性
+    #[test]
+    fn equal_release_time_falls_back_to_version_order() {
+        let same = "2025-06-17T12:00:00+00:00";
+        let versions = vec![
+            dated(VersionKind::Release, "1.21.1", same),
+            dated(VersionKind::Release, "1.21.2", same),
+            dated(VersionKind::Snapshot, "24w45a", same),
+        ];
+        let sorted = sorted_ids(versions);
+        assert_eq!(sorted[0], "1.21.2", "同时间按版本号大的在前: {sorted:?}");
+        assert_eq!(sorted[1], "1.21.1", "同时间按版本号大的在前: {sorted:?}");
     }
 
     /// 回归：快照 / 预发布必须与正式版按版本号穿插，不能整体垫底

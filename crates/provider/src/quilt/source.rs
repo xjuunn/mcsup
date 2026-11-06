@@ -242,6 +242,7 @@ fn into_server_version(game: GameVersion) -> ServerVersion {
         },
         variant: ServerVariant::Quilt,
         java_major: None,
+        released: None,
     }
 }
 
