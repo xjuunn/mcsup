@@ -379,11 +379,8 @@ fn push_fabric_deps(node: &serde_json::Value, mandatory: bool, cap: &mut ModCapa
                 .join(" || "),
             _ => String::new(),
         };
-        cap.depends.push(ModDependency {
-            id: id.clone(),
-            version_range: range,
-            mandatory,
-        });
+        cap.depends
+            .push(ModDependency::new(id.clone(), range, mandatory).with_loader(ModLoader::Fabric));
     }
 }
 
@@ -410,6 +407,13 @@ fn parse_mc_range(spec: &str) -> VersionRange {
         min: None,
         max: None,
     };
+    // Maven 区间写法优先：Forge 的 `versionRange` 常写成 `[1.21,1.21.2)`。
+    // 不认它就会把整串当裸版本号，产出 `[1.21,1.21.2)` 这种乱码下界。
+    if let Some((min, max)) = parse_maven_range(spec.trim()) {
+        range.min = min;
+        range.max = max;
+        return range;
+    }
     for token in spec.split_whitespace() {
         if let Some(rest) = token.strip_prefix(">=") {
             range.min = Some(normalize_mc(rest));
@@ -522,15 +526,29 @@ fn parse_quilt(raw: &[u8], cap: &mut ModCapability) {
     if cap.version.is_none() {
         cap.version = loader["version"].as_str().map(ToOwned::to_owned);
     }
-    if let Some(deps) = loader["depends"].as_array() {
+    // Quilt 的依赖是对象数组，且支持条件豁免：
+    //   {"id": "quilt_resource_loader", "versions": "*",
+    //    "unless": "fabric-resource-loader-v0"}
+    // 实测 `lukis-*` 系列在 Fabric 服务端就是这个形态：`unless` 命中
+    // fabric-api 提供的模块，本依赖不该算缺失。
+    for key in ["depends", "recommends"] {
+        let Some(deps) = loader[key].as_array() else {
+            continue;
+        };
+        let mandatory = key == "depends";
         for dep in deps {
-            if let Some(id) = dep["id"].as_str() {
-                cap.depends.push(ModDependency {
-                    id: id.to_owned(),
-                    version_range: dep["versions"].as_str().unwrap_or_default().to_owned(),
-                    mandatory: dep["optional"].as_bool().not_optional(),
-                });
-            }
+            let Some(id) = dep["id"].as_str() else {
+                continue;
+            };
+            let mut entry = ModDependency::new(
+                id.to_owned(),
+                dep["versions"].as_str().unwrap_or_default().to_owned(),
+                mandatory && dep["optional"].as_bool().not_optional(),
+            )
+            .with_loader(ModLoader::Quilt);
+            entry = entry.unless_any(quilt_unless(&dep["unless"]));
+            entry = entry.unless_any(quilt_unless(&dep["unless_any"]));
+            cap.depends.push(entry);
         }
     }
 }
@@ -544,6 +562,64 @@ trait OptionalFlag {
 impl OptionalFlag for Option<bool> {
     fn not_optional(self) -> bool {
         !self.unwrap_or(false)
+    }
+}
+
+/// 解析 Maven 风格版本区间（Forge `versionRange` 的写法）
+///
+/// `[1.21,1.21.2)` 下界含、上界不含；`(1.21,1.22]` 两端开闭由括号决定。
+/// 本项目只表达「下界含 + 上界不含」，因此：
+/// - `[`/`(` 都当含下界（`(` 是排他下界，差一个版本，Minecraft 版本粒度下
+///   不值得为此引入开区间模型）
+/// - `]` 是含上界的写法，换算成「下一 patch 之前」
+///
+/// 只认单区间；逗号出现在括号外（多区间并集）或缺少括号时返回 `None`，
+/// 交回逐 token 解析，避免把并集误读成一个区间。
+fn parse_maven_range(spec: &str) -> Option<(Option<String>, Option<String>)> {
+    let mut chars = spec.chars();
+    let open = chars.next()?;
+    if !matches!(open, '[' | '(') {
+        return None;
+    }
+    let close = spec.chars().last()?;
+    if !matches!(close, ']' | ')') {
+        return None;
+    }
+    let inner = &spec[1..spec.len() - 1];
+    let (min_raw, max_raw) = inner.split_once(',')?;
+    // 多区间：`[1.21,1.21.2),[1.21.3,1.22)` —— 逗号不止一个
+    if max_raw.contains(',') {
+        return None;
+    }
+    let min = Some(normalize_mc(min_raw.trim())).filter(|v| !v.is_empty());
+    let max = if max_raw.trim().is_empty() {
+        None
+    } else {
+        let v = normalize_mc(max_raw.trim());
+        if v.is_empty() {
+            None
+        } else if close == ']' {
+            // 含上界：换算成下一 patch 之前
+            Some(bump_patch(&v))
+        } else {
+            Some(v)
+        }
+    };
+    Some((min, max))
+}
+
+/// 读 Quilt 依赖里的条件豁免字段（`unless` / `unless_any`）
+///
+/// 两种写法都合法：单值字符串 `"fabric-resource-loader-v0"` 或字符串数组。
+/// 读不出来就当没有豁免——宁可多报一次缺失，也不要凭空吞掉依赖。
+fn quilt_unless(node: &serde_json::Value) -> Vec<String> {
+    match node {
+        serde_json::Value::String(id) => vec![id.clone()],
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -586,7 +662,7 @@ fn parse_toml_mods(raw: &[u8], cap: &mut ModCapability, neoforge: bool) {
         }
     }
     // 依赖块
-    parse_toml_dependencies(text, cap);
+    parse_toml_dependencies(text, cap, neoforge);
     if neoforge && cap.loaders.contains(&ModLoader::Forge) {
         // 同时有 neoforge.mods.toml 与 mods.toml：两者都记，不合并
         cap.side.evidence.push(Evidence::new(
@@ -638,18 +714,20 @@ fn apply_toml_side(side: Option<&str>, cap: &mut ModCapability) {
 }
 
 /// 解析 `[[dependencies.xxx]]` 块
-fn parse_toml_dependencies(text: &str, cap: &mut ModCapability) {
+fn parse_toml_dependencies(text: &str, cap: &mut ModCapability, neoforge: bool) {
     let mut in_dep = false;
     let mut id = None;
     let mut range = String::new();
     let mut mandatory = true;
     let flush = |cap: &mut ModCapability, id: &Option<String>, range: &str, mandatory: bool| {
         if let Some(id) = id {
-            cap.depends.push(ModDependency {
-                id: id.clone(),
-                version_range: range.to_owned(),
-                mandatory,
-            });
+            cap.depends.push(
+                ModDependency::new(id.clone(), range, mandatory).with_loader(if neoforge {
+                    ModLoader::NeoForge
+                } else {
+                    ModLoader::Forge
+                }),
+            );
             if id == "minecraft" && cap.mc_versions.is_any() {
                 cap.mc_versions = parse_mc_range(range);
             }
@@ -738,6 +816,81 @@ fn manifest_mc_version(raw: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Forge 的 Maven 区间必须按区间解析，不能整串当版本号
+    ///
+    /// 不修这条时表格里会出现 `>=1.21],[1.21.1 <1.21],[1.22.1` 这类乱码。
+    #[test]
+    fn parses_maven_range() {
+        let r = parse_mc_range("[1.21,1.21.2)");
+        assert_eq!(r.min.as_deref(), Some("1.21"));
+        assert_eq!(r.max.as_deref(), Some("1.21.2"));
+        assert!(r.contains("1.21.1"));
+        assert!(!r.contains("1.21.2"));
+
+        // 开上界边界：`]` 是含上界，换算成下一 patch 之前
+        let inclusive = parse_mc_range("[1.21,1.21.1]");
+        assert!(inclusive.contains("1.21.1"));
+
+        // 无上界
+        let open_end = parse_mc_range("[1.21,)");
+        assert_eq!(open_end.min.as_deref(), Some("1.21"));
+        assert!(open_end.max.is_none());
+        assert!(open_end.contains("1.22"));
+    }
+
+    /// 多区间并集不硬套成单区间
+    #[test]
+    fn multi_interval_is_not_flattened() {
+        assert!(parse_maven_range("[1.21,1.21.2),[1.22,1.23)").is_none());
+    }
+
+    /// Fabric 清单的依赖带 fabric 归属
+    #[test]
+    fn fabric_deps_carry_loader() {
+        let raw = br#"{"schemaVersion":1,"id":"x","version":"1",
+            "environment":"*","depends":{"minecraft":"1.21.1","cobblemon":"*"}}"#;
+        let mut cap = ModCapability::empty("x.jar");
+        parse_fabric(raw, &mut cap);
+        let cobblemon = cap
+            .depends
+            .iter()
+            .find(|d| d.id == "cobblemon")
+            .expect("应记录 cobblemon 依赖");
+        assert_eq!(cobblemon.loader, Some(ModLoader::Fabric));
+        assert!(cobblemon.unless.is_empty());
+    }
+
+    /// Quilt 的条件豁免要读进来，别当成普通硬依赖
+    #[test]
+    fn quilt_unless_is_captured() {
+        let raw = br#"{"schemaVersion":1,"quilt_loader":{"id":"x","version":"1",
+            "depends":[{"id":"quilt_resource_loader","versions":"*",
+            "unless":"fabric-resource-loader-v0"}]}}"#;
+        let mut cap = ModCapability::empty("x.jar");
+        parse_quilt(raw, &mut cap);
+        let dep = cap
+            .depends
+            .iter()
+            .find(|d| d.id == "quilt_resource_loader")
+            .expect("应记录 quilt 依赖");
+        assert_eq!(dep.loader, Some(ModLoader::Quilt));
+        assert_eq!(dep.unless, vec!["fabric-resource-loader-v0"]);
+    }
+
+    /// Forge / `NeoForge` 的 TOML 依赖各自带自己的加载器归属
+    #[test]
+    fn toml_deps_carry_loader() {
+        let text = "[[mods]]\nmodId=\"x\"\nversion=\"1\"\n[[dependencies.x]]\nmodId=\"forge\"\nmandatory=true\nversionRange=\"[47,)\"\n[[dependencies.x]]\nmodId=\"curios\"\nmandatory=true\nversionRange=\"*\"";
+        let mut cap = ModCapability::empty("x.jar");
+        parse_toml_mods(text.as_bytes(), &mut cap, true);
+        let curios = cap
+            .depends
+            .iter()
+            .find(|d| d.id == "curios")
+            .expect("应记录 curios 依赖");
+        assert_eq!(curios.loader, Some(ModLoader::NeoForge));
+    }
 
     #[test]
     fn parses_exact_mc_version() {
