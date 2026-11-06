@@ -142,6 +142,18 @@ pub enum ModError {
         /// 越界的路径
         path: PathBuf,
     },
+    /// 更新中途失败：前面的项**已经落盘**，盘上处于「部分更新」状态
+    #[error("update of {server} stopped at {failed} after {applied} installed item(s): {source}")]
+    UpdateAborted {
+        /// 服务端名
+        server: String,
+        /// 失败的文件
+        failed: String,
+        /// 失败之前已经完成的项数
+        applied: usize,
+        /// 失败原因
+        source: Box<ModError>,
+    },
 }
 
 impl ModError {
@@ -156,6 +168,7 @@ impl ModError {
             Self::Registry(err) => err.category(),
             Self::Content(err) => err.category(),
             Self::Source(err) => err.category(),
+            Self::UpdateAborted { source, .. } => source.category(),
             Self::Fs(_) | Self::Inspect(_) => ErrorCategory::Backend,
             Self::Remote { .. } | Self::ClientOnly { .. } | Self::Ambiguous { .. } => {
                 ErrorCategory::Usage
@@ -170,14 +183,40 @@ impl ModError {
 }
 
 /// 列表选项
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct ListOptions<'a> {
+    /// 内容类别：决定扫 `mods/` 还是 `plugins/`（缺省 `mod`）
+    pub kind: ContentKind,
     /// 联网识别已装文件的来源与版本（要算 SHA1 + 访问上游）
     pub identify: bool,
     /// 识别用的来源名；`None` 用默认来源
     pub source: Option<&'a str>,
     /// 顺带判断有没有更新（每个已识别条目一次上游请求）
     pub updates: bool,
+}
+
+impl Default for ListOptions<'_> {
+    fn default() -> Self {
+        Self {
+            kind: ContentKind::Mod,
+            identify: false,
+            source: None,
+            updates: false,
+        }
+    }
+}
+
+impl ListOptions<'_> {
+    /// 只扫某个类别的目录，其余按缺省（不联网）
+    #[must_use]
+    pub const fn of(kind: ContentKind) -> Self {
+        Self {
+            kind,
+            identify: false,
+            source: None,
+            updates: false,
+        }
+    }
 }
 
 /// 一条已装 mod 的记录
@@ -287,6 +326,11 @@ pub struct ModRemoved {
 pub struct UpdateItem {
     /// 当前文件名
     pub file: String,
+    /// 当前文件的绝对路径
+    ///
+    /// 新版本换了文件名时必须删掉它：留着会变成同一 mod 的两份，
+    /// 加载器启动阶段直接报重复 modid。
+    pub current: PathBuf,
     /// 项目 ID
     pub project_id: String,
     /// 当前版本号
@@ -317,6 +361,8 @@ pub struct UpdateChange {
     pub to_version: String,
     /// 安装结果
     pub installed: ModInstalled,
+    /// 被删除的旧文件（新版本换了文件名时才有）
+    pub removed: Option<PathBuf>,
 }
 
 /// 更新执行结果
@@ -387,13 +433,15 @@ impl ModService {
     /// [`ModError`]
     pub async fn list(&self, name: &str, options: ListOptions<'_>) -> Result<ModList, ModError> {
         let server = self.local_server(name)?;
-        let dir = mods_dir(&server, ContentKind::Mod);
+        let dir = mods_dir(&server, options.kind);
         let jars = jars_in(&dir)?;
         let audit = self.inspect(&jars, &server.meta.variant).await?;
 
-        // 哈希只算一次：识别用它，之后按路径回查，避免每个文件算两遍
+        // 哈希只算一次：识别用它，之后按路径回查，避免每个文件算两遍。
+        // `updates` 依赖识别结果，因此隐含打开识别——调用方漏传不该让结论变空。
+        let resolve_upstream = options.identify || options.updates;
         let mut by_path: HashMap<PathBuf, ContentIdentity> = HashMap::new();
-        if options.identify && !jars.is_empty() {
+        if resolve_upstream && !jars.is_empty() {
             let mut hashes = Vec::with_capacity(jars.len());
             for path in &jars {
                 match sha1_of(path) {
@@ -609,10 +657,11 @@ impl ModService {
         &self,
         name: &str,
         selector: &str,
+        kind: ContentKind,
         dry_run: bool,
     ) -> Result<ModRemoved, ModError> {
         let server = self.local_server(name)?;
-        let dir = mods_dir(&server, ContentKind::Mod);
+        let dir = mods_dir(&server, kind);
         let jars = jars_in(&dir)?;
         let hits = match_files(self.inspector.as_ref(), &jars, selector, &dir)?;
         if !dry_run {
@@ -650,6 +699,7 @@ impl ModService {
             .list(
                 name,
                 ListOptions {
+                    kind: options.kind,
                     identify: true,
                     source: options.source,
                     updates: true,
@@ -677,11 +727,19 @@ impl ModService {
         };
 
         let mut items = Vec::new();
-        let mut skipped = Vec::new();
+        // 读不出来的文件同样进 `skipped`：它们既不能被识别也不能被更新，
+        // 静默消失等于宣称「已是最新」。列表记的是路径，这里统一成文件名——
+        // 与 `items` 里的口径一致，入口不必再各自解析。
+        let mut skipped: Vec<(String, String)> = list
+            .unreadable
+            .iter()
+            .map(|(path, reason)| (file_name_of(path), reason.clone()))
+            .collect();
         for entry in list.mods {
             if !selected.is_empty() && !selected.contains(&entry.file) {
                 continue;
             }
+            let current = PathBuf::from(&entry.report.capability.path);
             let Some(identity) = entry.identity else {
                 skipped.push((entry.file, "upstream does not know this file".to_owned()));
                 continue;
@@ -697,10 +755,11 @@ impl ModService {
                         allow_prerelease: true,
                     };
                     let plan = self
-                        .plan_install(name, &identity.project_id, ContentKind::Mod, spec)
+                        .plan_install(name, &identity.project_id, options.kind, spec)
                         .await?;
                     items.push(UpdateItem {
                         file: entry.file,
+                        current,
                         project_id: identity.project_id,
                         from_version: identity.version_number,
                         to_version: version_number,
@@ -717,12 +776,14 @@ impl ModService {
     /// 执行更新计划
     ///
     /// 逐项调用 [`Self::install`]，因此每项都会重新确认服务端已停机并重新做
-    /// 服务端可用性检查。
+    /// 服务端可用性检查。新版本换了文件名时，装成功后删掉旧文件：两份同 modid
+    /// 的 jar 留在 `mods/` 里，加载器启动阶段会直接报重复。
     ///
     /// # Errors
     ///
-    /// 任一项安装失败时立即返回错误：前几项已经落盘，结果里的错误说明失败项，
-    /// 调用方据此提示「部分完成」
+    /// 任一项安装失败时立即停止：**前面几项已经落盘**，盘上处于部分更新状态，
+    /// 因此返回 [`ModError::UpdateAborted`]，把「停在哪一项、已完成几项」连同
+    /// 真实原因一起报出来——只报底层「下载失败」会让用户以为盘上没变。
     pub async fn apply_update(
         &self,
         name: &str,
@@ -731,7 +792,7 @@ impl ModService {
     ) -> Result<UpdateApplied, ModError> {
         let mut changes = Vec::with_capacity(plan.items.len());
         for item in &plan.items {
-            let installed = self
+            let installed = match self
                 .install(
                     name,
                     &item.plan,
@@ -741,12 +802,32 @@ impl ModService {
                         cancel: options.cancel,
                     },
                 )
-                .await?;
+                .await
+            {
+                Ok(installed) => installed,
+                Err(err) => {
+                    warn!(
+                        server = name,
+                        failed = %item.file,
+                        applied = changes.len(),
+                        error = %err,
+                        "mod update aborted"
+                    );
+                    return Err(ModError::UpdateAborted {
+                        server: name.to_owned(),
+                        failed: item.file.clone(),
+                        applied: changes.len(),
+                        source: Box::new(err),
+                    });
+                }
+            };
+            let removed = remove_replaced(&item.current, &installed.path)?;
             changes.push(UpdateChange {
                 file: item.file.clone(),
                 from_version: item.from_version.clone(),
                 to_version: item.to_version.clone(),
                 installed,
+                removed,
             });
         }
         Ok(UpdateApplied { changes })
@@ -815,7 +896,7 @@ impl ModService {
             .candidates(source, &identity.project_id, &request)
             .await
         {
-            Ok(candidates) => Ok(Some(decide_update(&identity.version_id, &candidates))),
+            Ok(candidates) => Ok(Some(decide_update(identity, &candidates))),
             Err(ContentError::NoCandidate { .. }) => Ok(Some(UpdateDecision::UpToDate)),
             Err(err) => Err(err.into()),
         }
@@ -831,7 +912,7 @@ impl Drop for StagingGuard<'_> {
     }
 }
 
-/// mod / 插件落点目录
+/// 一台服务端的某个内容目录（`mods/` / `plugins/` / …）
 fn mods_dir(server: &RegisteredServer, kind: ContentKind) -> PathBuf {
     server.dir.join(kind.install_dir())
 }
@@ -884,6 +965,29 @@ fn verdict_of(audit: ModAudit, file: &str) -> Result<(Risk, Vec<String>, Vec<Str
         file: file.to_owned(),
         reason,
     })
+}
+
+/// 路径的最后一段（展示用文件名）
+fn file_name_of(path: &str) -> String {
+    Path::new(path).file_name().map_or_else(
+        || path.to_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
+/// 换名更新后删掉旧文件
+///
+/// 只在路径不同时动手：同名替换由 [`crate::atomic::replace_file`] 自己处理掉了。
+/// 旧文件已经不存在不算失败——目标状态就是「旧的不在」，重复执行也应当成功。
+fn remove_replaced(current: &Path, installed: &Path) -> Result<Option<PathBuf>, ModError> {
+    if current == installed {
+        return Ok(None);
+    }
+    match crate::fs::remove_file(current) {
+        Ok(()) => Ok(Some(current.to_path_buf())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(FsError::io(current, err).into()),
+    }
 }
 
 /// 按文件名或 modid 在已装文件里挑出目标

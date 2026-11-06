@@ -20,7 +20,9 @@
 
 use async_trait::async_trait;
 use domain::mod_::{ModCapability, ModLoader, SideSupport, SideVerdict};
-use domain::server::content::{ContentCandidate, ContentKind, ContentRequest};
+use domain::server::content::{
+    ContentCandidate, ContentIdentity, ContentKind, ContentRequest, UpdateDecision,
+};
 use domain::server::version::ServerVariant;
 use port::content::{
     ContentFile, ContentProject, ContentQuery, ContentSearch, ContentSource, ContentSourceInfo,
@@ -42,31 +44,48 @@ use testkit::{CommandLog, FakeSupervisor, MemServerRepo, ServiceFixture};
 
 // ---------------------------------------------------------------- 替身
 
-/// 假来源：候选与解析结果由用例给定
-struct FakeSource {
+/// 假来源的可变部分：用例在调用前改，替身本身只读
+struct SourceConfig {
+    /// `candidates` 的返回值；空 = 上游没有兼容版本
     candidates: Vec<ContentCandidate>,
-    resolved: Option<ResolvedContent>,
+    /// `resolve` 能解析出的文件（按项目 + 版本 ID 查）
+    resolved: Vec<ResolvedContent>,
+    /// `by_hash` 的结论，按哈希出现顺序依次取；空 = 上游不认识任何哈希
+    identities: Vec<IdentityPreset>,
     /// 收到的候选请求，供断言过滤条件是否下发
-    seen_requests: Arc<Mutex<Vec<ContentRequest>>>,
+    seen: Vec<ContentRequest>,
+    /// `by_hash` 收到过的哈希
+    hashed: Vec<String>,
+}
+
+/// 「这个哈希属于某项目的某个版本」
+#[derive(Clone)]
+struct IdentityPreset {
+    project: String,
+    version_id: String,
+    version_number: String,
+}
+
+/// 假来源：候选、解析结果与反查结论都由用例给定
+struct FakeSource {
+    config: Mutex<SourceConfig>,
 }
 
 impl FakeSource {
     fn new() -> Self {
         Self {
-            candidates: Vec::new(),
-            resolved: None,
-            seen_requests: Arc::new(Mutex::new(Vec::new())),
+            config: Mutex::new(SourceConfig {
+                candidates: Vec::new(),
+                resolved: Vec::new(),
+                identities: Vec::new(),
+                seen: Vec::new(),
+                hashed: Vec::new(),
+            }),
         }
     }
 
-    fn with_candidates(mut self, candidates: Vec<ContentCandidate>) -> Self {
-        self.candidates = candidates;
-        self
-    }
-
-    fn with_resolved(mut self, resolved: ResolvedContent) -> Self {
-        self.resolved = Some(resolved);
-        self
+    fn configure(&self, edit: impl FnOnce(&mut SourceConfig)) {
+        edit(&mut self.config.lock().expect("source config"));
     }
 }
 
@@ -111,25 +130,53 @@ impl ContentSource for FakeSource {
         _id: &str,
         request: &ContentRequest,
     ) -> Result<Vec<ContentCandidate>, SourceError> {
-        self.seen_requests
-            .lock()
-            .expect("seen")
-            .push(request.clone());
-        Ok(self.candidates.clone())
+        let mut config = self.config.lock().expect("source config");
+        config.seen.push(request.clone());
+        Ok(config.candidates.clone())
     }
 
-    async fn resolve(&self, _id: &str, version: &str) -> Result<ResolvedContent, SourceError> {
-        self.resolved
-            .clone()
-            .filter(|resolved| resolved.version_id == version)
+    async fn resolve(&self, id: &str, version: &str) -> Result<ResolvedContent, SourceError> {
+        self.config
+            .lock()
+            .expect("source config")
+            .resolved
+            .iter()
+            .find(|resolved| resolved.project_id == id && resolved.version_id == version)
+            .cloned()
             .ok_or(SourceError::Status { status: 404 })
+    }
+
+    async fn by_hash(&self, hashes: &[String]) -> Result<Vec<ContentIdentity>, SourceError> {
+        let mut config = self.config.lock().expect("source config");
+        config.hashed.extend(hashes.iter().cloned());
+        // 按哈希出现顺序逐个取预置结论：顺序来自 `collect_jars` 的文件名排序，
+        // 因此用例只要安排「第一个文件属于 A、第二个属于 B」即可
+        Ok(hashes
+            .iter()
+            .zip(config.identities.iter())
+            .map(|(hash, preset)| ContentIdentity {
+                hash: hash.clone(),
+                project_id: preset.project.clone(),
+                slug: Some(preset.project.clone()),
+                title: Some(preset.project.clone()),
+                version_id: preset.version_id.clone(),
+                version_number: preset.version_number.clone(),
+                channel: "release".to_owned(),
+                // 已装版本比任何预置候选都旧：用例里的候选都代表「上游有更新」
+                date_published: "2020-01-01T00:00:00Z".to_owned(),
+                kind: Some(ContentKind::Mod),
+            })
+            .collect())
     }
 }
 
-/// 假下载器：按预置字节真的写到目标路径
+/// 假下载器：按预置字节真的写到目标路径，可切成「被取消」或「某个文件必失败」
 struct FakeDownloader {
     bytes: Vec<u8>,
     calls: Arc<AtomicUsize>,
+    cancelled: std::sync::atomic::AtomicBool,
+    /// 命中这个文件名的下载一律超时（模拟中途失败）
+    fail_on: Mutex<Option<String>>,
 }
 
 impl FakeDownloader {
@@ -137,6 +184,8 @@ impl FakeDownloader {
         Self {
             bytes: bytes.to_vec(),
             calls: Arc::new(AtomicUsize::new(0)),
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+            fail_on: Mutex::new(None),
         }
     }
 }
@@ -150,6 +199,18 @@ impl ArtifactDownloader for FakeDownloader {
         _cancel: &CancellationToken,
     ) -> Result<DownloadedArtifact, DownloadError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.cancelled.load(Ordering::SeqCst) {
+            return Err(DownloadError::Cancelled);
+        }
+        let failing = self
+            .fail_on
+            .lock()
+            .expect("fail_on")
+            .as_deref()
+            .is_some_and(|name| request.destination.ends_with(name));
+        if failing {
+            return Err(DownloadError::Timeout);
+        }
         if let Some(parent) = request.destination.parent() {
             std::fs::create_dir_all(parent).expect("mkdir");
         }
@@ -161,19 +222,40 @@ impl ArtifactDownloader for FakeDownloader {
     }
 }
 
+/// 假检查器的一条结论
+struct Verdict {
+    file: String,
+    side: SideSupport,
+    /// 声明的必需依赖（modid，缺了就算缺失依赖）
+    depends: Vec<String>,
+}
+
 /// 假检查器：按**文件名**给结论（暂存路径每次不同，不能按全路径匹配）
 struct FakeInspector {
-    /// (文件名, 服务端归属, 缺失依赖)
-    verdicts: Vec<(String, SideSupport, Vec<String>)>,
+    verdicts: Mutex<Vec<Verdict>>,
 }
 
 impl FakeInspector {
     fn new(verdicts: &[(&str, SideSupport)]) -> Self {
         Self {
-            verdicts: verdicts
-                .iter()
-                .map(|(name, side)| ((*name).to_owned(), *side, Vec::new()))
-                .collect(),
+            verdicts: Mutex::new(
+                verdicts
+                    .iter()
+                    .map(|(name, side)| Verdict {
+                        file: (*name).to_owned(),
+                        side: *side,
+                        depends: Vec::new(),
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    /// 给某个文件追加一条必需依赖（用于「缺依赖」判定）
+    fn declare_dep(&self, file: &str, dep: &str) {
+        let mut verdicts = self.verdicts.lock().expect("verdicts");
+        if let Some(verdict) = verdicts.iter_mut().find(|verdict| verdict.file == file) {
+            verdict.depends.push(dep.to_owned());
         }
     }
 }
@@ -184,11 +266,8 @@ impl ModInspector for FakeInspector {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let Some((_, side, missing)) = self
-            .verdicts
-            .iter()
-            .find(|(candidate, _, _)| *candidate == name)
-        else {
+        let verdicts = self.verdicts.lock().expect("verdicts");
+        let Some(verdict) = verdicts.iter().find(|verdict| verdict.file == name) else {
             return Err(ModInspectError::NotAnArchive {
                 path: path.to_path_buf(),
             });
@@ -198,8 +277,16 @@ impl ModInspector for FakeInspector {
         capability.id = Some(stem);
         capability.version = Some("1.0.0".to_owned());
         capability.loaders.push(ModLoader::Fabric);
-        capability.side = SideVerdict::declared(SideSupport::Required, *side);
-        let _ = missing;
+        capability.side = SideVerdict::declared(SideSupport::Required, verdict.side);
+        for dep in &verdict.depends {
+            capability.depends.push(domain::mod_::ModDependency {
+                id: dep.clone(),
+                version_range: String::new(),
+                mandatory: true,
+                loader: Some(ModLoader::Fabric),
+                unless: Vec::new(),
+            });
+        }
         Ok(capability)
     }
 }
@@ -239,6 +326,8 @@ struct Harness {
     fixture: ServiceFixture,
     mods: ModService,
     downloader: Arc<FakeDownloader>,
+    source: Arc<FakeSource>,
+    inspector: Arc<FakeInspector>,
 }
 
 impl Harness {
@@ -256,28 +345,81 @@ impl Harness {
             fixture.workspace_repo(),
         ));
         let downloader = Arc::new(FakeDownloader::new(bytes));
+        let source = Arc::new(FakeSource::new());
+        source.configure(|config| {
+            config.candidates = vec![candidate("v2")];
+            config.resolved = vec![resolved("v2", "cool-mod.jar", bytes.len() as u64)];
+        });
         let content = ContentService::new(
-            Arc::new(ContentSourceRegistry::new(vec![Arc::new(
-                FakeSource::new()
-                    .with_candidates(vec![candidate("v2")])
-                    .with_resolved(resolved("v2", "cool-mod.jar", bytes.len() as u64)),
-            )
-                as Arc<dyn ContentSource>])),
+            Arc::new(ContentSourceRegistry::new(vec![
+                Arc::clone(&source) as Arc<dyn ContentSource>
+            ])),
             Arc::clone(&downloader) as Arc<dyn ArtifactDownloader>,
         );
+        let inspector = Arc::new(FakeInspector::new(verdicts));
         let mods = ModService::new(
             registry,
             Arc::new(FakeBackend {
                 supervisor: FakeSupervisor::new(log),
             }),
             content,
-            Arc::new(FakeInspector::new(verdicts)),
+            Arc::clone(&inspector) as Arc<dyn ModInspector>,
         );
         Self {
             fixture,
             mods,
             downloader,
+            source,
+            inspector,
         }
+    }
+
+    /// 让「已装文件」被上游识别为某项目的某个版本
+    fn identify_as(&self, project: &str, version_id: &str, version_number: &str) {
+        self.identify_each(&[(project, version_id, version_number)]);
+    }
+
+    /// 多个已装文件分别属于哪个项目的哪个版本（按文件名排序依次对应）
+    fn identify_each(&self, presets: &[(&str, &str, &str)]) {
+        let presets: Vec<IdentityPreset> = presets
+            .iter()
+            .map(|(project, version_id, version_number)| IdentityPreset {
+                project: (*project).to_owned(),
+                version_id: (*version_id).to_owned(),
+                version_number: (*version_number).to_owned(),
+            })
+            .collect();
+        self.source.configure(|config| config.identities = presets);
+    }
+
+    /// 上游候选版本
+    fn set_candidates(&self, versions: &[&str]) {
+        let versions: Vec<ContentCandidate> = versions.iter().map(|v| candidate(v)).collect();
+        self.source.configure(|config| config.candidates = versions);
+    }
+
+    /// 上游解析结果：版本 ID → 文件名（项目记作 `cool-mod`）
+    fn set_resolved(&self, files: &[(&str, &str)]) {
+        self.set_resolved_for("cool-mod", files);
+    }
+
+    /// 上游解析结果：某个项目的版本 ID → 文件名
+    fn set_resolved_for(&self, project: &str, files: &[(&str, &str)]) {
+        let size = self.downloader.bytes.len() as u64;
+        let files: Vec<ResolvedContent> = files
+            .iter()
+            .map(|(version, name)| resolved_for(project, version, name, size))
+            .collect();
+        self.source.configure(|config| config.resolved = files);
+    }
+
+    fn cancel_downloads(&self) {
+        self.downloader.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    /// 让某个文件名的下载失败（模拟中途超时）
+    fn fail_download_of(&self, file: &str) {
+        *self.downloader.fail_on.lock().expect("fail_on") = Some(file.to_owned());
     }
 
     fn server_dir(&self) -> PathBuf {
@@ -313,8 +455,12 @@ fn candidate(version: &str) -> ContentCandidate {
 }
 
 fn resolved(version: &str, filename: &str, size: u64) -> ResolvedContent {
+    resolved_for("cool-mod", version, filename, size)
+}
+
+fn resolved_for(project: &str, version: &str, filename: &str, size: u64) -> ResolvedContent {
     ResolvedContent {
-        project_id: "cool-mod".to_owned(),
+        project_id: project.to_owned(),
         version_id: version.to_owned(),
         version_number: version.to_owned(),
         file: ContentFile {
@@ -549,7 +695,7 @@ async fn running_server_blocks_plan_and_remove() {
 
     let removed = harness
         .mods
-        .remove("alpha", "cool-mod.jar", false)
+        .remove("alpha", "cool-mod.jar", ContentKind::Mod, false)
         .expect_err("运行中不能删除");
     assert!(matches!(removed, ModError::Running { .. }), "{removed:?}");
     assert!(
@@ -575,7 +721,7 @@ async fn remove_matches_by_file_name_then_modid() {
     // 预览：命中但不是真删
     let preview = harness
         .mods
-        .remove("alpha", "alpha-mod.jar", true)
+        .remove("alpha", "alpha-mod.jar", ContentKind::Mod, true)
         .expect("preview");
     assert_eq!(preview.files.len(), 1);
     assert!(preview.dry_run);
@@ -584,14 +730,14 @@ async fn remove_matches_by_file_name_then_modid() {
     // 文件名删除
     harness
         .mods
-        .remove("alpha", "alpha-mod.jar", false)
+        .remove("alpha", "alpha-mod.jar", ContentKind::Mod, false)
         .expect("remove by name");
     assert!(!harness.mods_dir().join("alpha-mod.jar").exists());
 
     // modid 删除（文件名不带 modid 时命中 capability.id）
     harness
         .mods
-        .remove("alpha", "beta-mod", false)
+        .remove("alpha", "beta-mod", ContentKind::Mod, false)
         .expect("remove by modid");
     assert!(!harness.mods_dir().join("beta-mod.jar").exists());
 }
@@ -608,7 +754,7 @@ async fn remove_unknown_selector_is_not_found() {
 
     let err = harness
         .mods
-        .remove("alpha", "gamma", false)
+        .remove("alpha", "gamma", ContentKind::Mod, false)
         .expect_err("必须报没找到");
     assert!(matches!(err, ModError::NotFound { .. }), "{err:?}");
     assert_eq!(err.category(), port::ErrorCategory::NotFound);
@@ -628,4 +774,499 @@ async fn remote_server_is_rejected() {
         matches!(err, ModError::Registry(_) | ModError::Remote { .. }),
         "{err:?}"
     );
+}
+
+// ---------------------------------------------------------------- 更新
+
+/// `--outdated` 口径：只开 `updates` 也必须拿到结论（隐含识别）
+#[tokio::test]
+async fn list_resolves_updates_without_explicit_identify() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[("cool-mod-1.0.jar", SideSupport::Required)],
+        &[b'x'; 4],
+    );
+    harness.identify_as("cool-mod", "v1", "1.0");
+    harness.set_candidates(&["v2"]);
+    harness.write("mods/cool-mod-1.0.jar", b"old");
+
+    let listed = harness
+        .mods
+        .list(
+            "alpha",
+            ListOptions {
+                kind: ContentKind::Mod,
+                identify: false,
+                source: None,
+                updates: true,
+            },
+        )
+        .await
+        .expect("list");
+
+    let entry = listed.mods.first().expect("one mod");
+    assert_eq!(
+        entry.update,
+        Some(UpdateDecision::Available {
+            version_id: "v2".to_owned(),
+            version_number: "v2".to_owned(),
+        })
+    );
+}
+
+/// 更新：新版本换了文件名时，旧文件必须被删掉
+#[tokio::test]
+async fn update_replaces_renamed_file_and_drops_the_old_one() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[
+            ("cool-mod-1.0.jar", SideSupport::Required),
+            ("cool-mod-2.0.jar", SideSupport::Required),
+        ],
+        b"new-bytes",
+    );
+    harness.identify_as("cool-mod", "v1", "1.0");
+    harness.set_candidates(&["v2"]);
+    harness.set_resolved(&[("v2", "cool-mod-2.0.jar")]);
+    harness.write("mods/cool-mod-1.0.jar", b"old");
+
+    let plan = harness
+        .mods
+        .plan_update("alpha", None, ListOptions::default())
+        .await
+        .expect("plan");
+    assert_eq!(plan.items.len(), 1);
+    assert_eq!(plan.items[0].from_version, "1.0");
+    assert_eq!(plan.items[0].to_version, "v2");
+    assert_eq!(
+        plan.items[0].current,
+        harness.mods_dir().join("cool-mod-1.0.jar")
+    );
+    assert!(
+        plan.skipped.is_empty(),
+        "识别成功的文件不该进 skipped: {:?}",
+        plan.skipped
+    );
+
+    let applied = harness
+        .mods
+        .apply_update(
+            "alpha",
+            &plan,
+            ApplyOptions {
+                allow_blocking: false,
+                progress: None,
+                cancel: &CancellationToken::new(),
+            },
+        )
+        .await
+        .expect("apply");
+
+    assert_eq!(applied.changes.len(), 1);
+    let change = &applied.changes[0];
+    assert_eq!(
+        change.removed.as_deref(),
+        Some(harness.mods_dir().join("cool-mod-1.0.jar").as_path())
+    );
+    assert_eq!(
+        std::fs::read(harness.mods_dir().join("cool-mod-2.0.jar")).expect("read"),
+        b"new-bytes"
+    );
+    assert!(
+        !harness.mods_dir().join("cool-mod-1.0.jar").exists(),
+        "旧文件必须删除，两份同 modid 的 jar 会让服务端起不来"
+    );
+    assert_eq!(harness.staging_entries(), 0);
+}
+
+/// 上游不认识的文件进 `skipped`，不能当作「已是最新」
+#[tokio::test]
+async fn update_marks_unknown_files_as_skipped() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[("manually-dropped.jar", SideSupport::Required)],
+        &[b'x'; 4],
+    );
+    // 不调用 identify_as：`by_hash` 返回空，等价于上游没收录这个文件
+    harness.write("mods/manually-dropped.jar", b"a");
+
+    let plan = harness
+        .mods
+        .plan_update("alpha", None, ListOptions::default())
+        .await
+        .expect("plan");
+
+    assert!(plan.items.is_empty(), "不该凭空造出更新项");
+    assert_eq!(plan.skipped.len(), 1);
+    assert_eq!(plan.skipped[0].0, "manually-dropped.jar");
+}
+
+/// 读不出来的文件同样进 `skipped`：既不能识别也不能更新
+#[tokio::test]
+async fn update_marks_unreadable_files_as_skipped() {
+    // 检查器不认识 broken.jar → 归档读不出来
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[("good.jar", SideSupport::Required)],
+        &[b'x'; 4],
+    );
+    harness.identify_as("cool-mod", "v1", "1.0");
+    harness.set_candidates(&["v1"]);
+    harness.write("mods/broken.jar", b"not-a-zip");
+
+    let plan = harness
+        .mods
+        .plan_update("alpha", None, ListOptions::default())
+        .await
+        .expect("plan");
+
+    assert!(plan.items.is_empty());
+    assert_eq!(
+        plan.skipped.len(),
+        1,
+        "读不出来的文件必须说明，而不是静默消失: {:?}",
+        plan.skipped
+    );
+    assert_eq!(plan.skipped[0].0, "broken.jar");
+}
+
+/// 上游没有兼容候选 = 已是最新，不是失败
+#[tokio::test]
+async fn update_without_candidates_counts_as_up_to_date() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[("cool-mod-1.0.jar", SideSupport::Required)],
+        &[b'x'; 4],
+    );
+    harness.identify_as("cool-mod", "v1", "1.0");
+    harness.set_candidates(&[]);
+    harness.write("mods/cool-mod-1.0.jar", b"old");
+
+    let plan = harness
+        .mods
+        .plan_update("alpha", None, ListOptions::default())
+        .await
+        .expect("plan");
+
+    assert!(plan.items.is_empty());
+    assert!(
+        plan.skipped.is_empty(),
+        "没有候选是「已最新」，不是「判断不了」: {:?}",
+        plan.skipped
+    );
+}
+
+/// 选择器只更新命中的那一个
+#[tokio::test]
+async fn update_honours_the_selector() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[
+            ("cool-mod-1.0.jar", SideSupport::Required),
+            ("other-mod.jar", SideSupport::Required),
+        ],
+        &[b'x'; 4],
+    );
+    harness.identify_as("cool-mod", "v1", "1.0");
+    harness.set_candidates(&["v2"]);
+    harness.set_resolved(&[("v2", "cool-mod.jar")]);
+    harness.write("mods/cool-mod-1.0.jar", b"old");
+    harness.write("mods/other-mod.jar", b"other");
+
+    let plan = harness
+        .mods
+        .plan_update("alpha", Some("cool-mod-1.0.jar"), ListOptions::default())
+        .await
+        .expect("plan");
+
+    assert_eq!(plan.items.len(), 1);
+    assert_eq!(plan.items[0].file, "cool-mod-1.0.jar");
+}
+
+// ---------------------------------------------------------------- 失败收场
+
+/// 检查器读不出暂存文件：不落盘，暂存清空，报「读不出来」
+#[tokio::test]
+async fn install_reports_unreadable_staged_archive() {
+    // 检查器不认识 cool-mod.jar（resolved 出的文件名）
+    let harness = Harness::new(CommandLog::stopped(), &[], b"jar-bytes");
+    let plan = harness
+        .mods
+        .plan_install("alpha", "cool-mod", ContentKind::Mod, install_spec())
+        .await
+        .expect("plan");
+
+    let err = harness
+        .mods
+        .install(
+            "alpha",
+            &plan,
+            ApplyOptions {
+                allow_blocking: false,
+                progress: None,
+                cancel: &CancellationToken::new(),
+            },
+        )
+        .await
+        .expect_err("读不出来必须报错");
+
+    assert!(matches!(err, ModError::Unreadable { .. }), "{err:?}");
+    assert_eq!(err.category(), port::ErrorCategory::Backend);
+    assert!(!harness.mods_dir().join("cool-mod.jar").exists());
+    assert_eq!(harness.staging_entries(), 0);
+}
+
+/// 下载被取消：按取消退出（130），不留半截文件
+#[tokio::test]
+async fn cancelled_download_leaves_nothing_behind() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[("cool-mod.jar", SideSupport::Required)],
+        b"jar-bytes",
+    );
+    harness.cancel_downloads();
+    let plan = harness
+        .mods
+        .plan_install("alpha", "cool-mod", ContentKind::Mod, install_spec())
+        .await
+        .expect("plan");
+
+    let err = harness
+        .mods
+        .install(
+            "alpha",
+            &plan,
+            ApplyOptions {
+                allow_blocking: false,
+                progress: None,
+                cancel: &CancellationToken::new(),
+            },
+        )
+        .await
+        .expect_err("取消必须报错");
+
+    assert_eq!(err.category(), port::ErrorCategory::Cancelled, "{err:?}");
+    assert!(!harness.mods_dir().join("cool-mod.jar").exists());
+    assert_eq!(harness.staging_entries(), 0);
+}
+
+/// 缺必需依赖：判定为 blocking，`--force` 装下去时缺失项必须照实报出
+#[tokio::test]
+async fn missing_required_dependency_is_reported_even_when_forced() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[("cool-mod.jar", SideSupport::Required)],
+        b"jar-bytes",
+    );
+    // `fabric-api` 这类加载器自带的依赖不算缺失，这里用一个真正的外部依赖
+    harness.inspector.declare_dep("cool-mod.jar", "some-lib");
+    let plan = harness
+        .mods
+        .plan_install("alpha", "cool-mod", ContentKind::Mod, install_spec())
+        .await
+        .expect("plan");
+
+    let refused = harness
+        .mods
+        .install(
+            "alpha",
+            &plan,
+            ApplyOptions {
+                allow_blocking: false,
+                progress: None,
+                cancel: &CancellationToken::new(),
+            },
+        )
+        .await
+        .expect_err("缺必需依赖必须拦住");
+    assert!(matches!(refused, ModError::Refused { .. }), "{refused:?}");
+
+    let installed = harness
+        .mods
+        .install(
+            "alpha",
+            &plan,
+            ApplyOptions {
+                allow_blocking: true,
+                progress: None,
+                cancel: &CancellationToken::new(),
+            },
+        )
+        .await
+        .expect("强制安装");
+    assert_eq!(installed.risk, domain::mod_::Risk::Blocking);
+    assert_eq!(installed.missing_deps, vec!["some-lib".to_owned()]);
+}
+
+/// 更新中途失败：已完成项保留，失败项停在原版本，错误说清停在哪
+#[tokio::test]
+async fn update_stops_at_the_failing_item_and_reports_progress() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[
+            ("a-mod-1.0.jar", SideSupport::Required),
+            ("b-mod-1.0.jar", SideSupport::Required),
+            ("a-mod-2.0.jar", SideSupport::Required),
+            ("b-mod-2.0.jar", SideSupport::Required),
+        ],
+        b"new-bytes",
+    );
+    // 文件名排序：a 在前、b 在后，两个文件分别属于两个项目
+    harness.identify_each(&[("a-mod", "v1", "1.0"), ("b-mod", "v1", "1.0")]);
+    harness.set_candidates(&["v2"]);
+    harness.source.configure(|config| {
+        config.resolved = vec![
+            resolved_for("a-mod", "v2", "a-mod-2.0.jar", 9),
+            resolved_for("b-mod", "v2", "b-mod-2.0.jar", 9),
+        ];
+    });
+    harness.write("mods/a-mod-1.0.jar", b"a-old");
+    harness.write("mods/b-mod-1.0.jar", b"b-old");
+    harness.fail_download_of("b-mod-2.0.jar");
+
+    let plan = harness
+        .mods
+        .plan_update("alpha", None, ListOptions::default())
+        .await
+        .expect("plan");
+    assert_eq!(
+        plan.items.len(),
+        2,
+        "两个文件都该有更新: {:?}",
+        plan.skipped
+    );
+
+    let err = harness
+        .mods
+        .apply_update(
+            "alpha",
+            &plan,
+            ApplyOptions {
+                allow_blocking: false,
+                progress: None,
+                cancel: &CancellationToken::new(),
+            },
+        )
+        .await
+        .expect_err("第二项下载失败必须报错");
+
+    match &err {
+        ModError::UpdateAborted {
+            failed, applied, ..
+        } => {
+            assert_eq!(failed, "b-mod-1.0.jar", "要指出失败的那一项");
+            assert_eq!(*applied, 1, "已完成项数必须照实报出");
+        }
+        other => panic!("应报 UpdateAborted，实际 {other:?}"),
+    }
+    // 失败等级沿用底层原因：下载超时是后端失败（5）
+    assert_eq!(err.category(), port::ErrorCategory::Backend);
+
+    // 第一项已经落盘且旧文件已删；第二项保持原样，不留半截文件
+    assert!(harness.mods_dir().join("a-mod-2.0.jar").exists());
+    assert!(!harness.mods_dir().join("a-mod-1.0.jar").exists());
+    assert!(harness.mods_dir().join("b-mod-1.0.jar").exists());
+    assert!(!harness.mods_dir().join("b-mod-2.0.jar").exists());
+    assert_eq!(harness.staging_entries(), 0);
+}
+
+/// 类别决定目录：插件落 `plugins/`，与 `mods/` 互不干扰
+#[tokio::test]
+async fn plugin_kind_uses_the_plugins_directory() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[
+            ("cool-mod.jar", SideSupport::Required),
+            ("alpha-mod.jar", SideSupport::Required),
+        ],
+        b"jar-bytes",
+    );
+    harness.write("mods/alpha-mod.jar", b"a");
+
+    let plan = harness
+        .mods
+        .plan_install("alpha", "cool-mod", ContentKind::Plugin, install_spec())
+        .await
+        .expect("plan");
+    assert_eq!(
+        plan.target,
+        harness.server_dir().join("plugins").join("cool-mod.jar")
+    );
+
+    harness
+        .mods
+        .install(
+            "alpha",
+            &plan,
+            ApplyOptions {
+                allow_blocking: false,
+                progress: None,
+                cancel: &CancellationToken::new(),
+            },
+        )
+        .await
+        .expect("install");
+
+    // 两个目录各看各的：列 mod 只看到 mods/，列插件只看到 plugins/
+    let mods = harness
+        .mods
+        .list("alpha", ListOptions::of(ContentKind::Mod))
+        .await
+        .expect("list mods");
+    assert_eq!(mods.dir, harness.mods_dir());
+    assert_eq!(
+        mods.mods
+            .iter()
+            .map(|entry| entry.file.as_str())
+            .collect::<Vec<_>>(),
+        vec!["alpha-mod.jar"]
+    );
+
+    let plugins = harness
+        .mods
+        .list("alpha", ListOptions::of(ContentKind::Plugin))
+        .await
+        .expect("list plugins");
+    assert_eq!(plugins.dir, harness.server_dir().join("plugins"));
+    assert_eq!(
+        plugins
+            .mods
+            .iter()
+            .map(|entry| entry.file.as_str())
+            .collect::<Vec<_>>(),
+        vec!["cool-mod.jar"]
+    );
+
+    // 卸载同样按类别定位：拿 mod 口径删插件应当「没找到」
+    let err = harness
+        .mods
+        .remove("alpha", "cool-mod.jar", ContentKind::Mod, true)
+        .expect_err("mods/ 里没有这个插件");
+    assert!(matches!(err, ModError::NotFound { .. }), "{err:?}");
+    harness
+        .mods
+        .remove("alpha", "cool-mod.jar", ContentKind::Plugin, false)
+        .expect("按插件类别删除");
+    assert!(!harness.server_dir().join("plugins/cool-mod.jar").exists());
+}
+
+/// 计划里带的是服务端口径的条件：加载器与 MC 版本都来自注册表
+#[tokio::test]
+async fn plan_uses_server_loader_and_game_version() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[("cool-mod.jar", SideSupport::Required)],
+        b"jar-bytes",
+    );
+    harness
+        .mods
+        .plan_install("alpha", "cool-mod", ContentKind::Mod, install_spec())
+        .await
+        .expect("plan");
+
+    let requests = harness.source.config.lock().expect("config").seen.clone();
+    let request = requests.first().expect("候选请求");
+    assert_eq!(request.loader.as_deref(), Some("fabric"));
+    assert_eq!(request.game_version.as_deref(), Some("1.21.1"));
+    assert_eq!(request.kind, ContentKind::Mod);
 }

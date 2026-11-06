@@ -165,6 +165,8 @@ impl ContentSource for ModrinthSource {
                 title: found.project.as_ref().map(|project| project.title.clone()),
                 version_id: found.version.id.clone(),
                 version_number: found.version.version_number.clone(),
+                channel: found.version.version_type.clone(),
+                date_published: found.version.date_published.clone(),
                 // 不套用 `kind_of` 的兜底：识别结果里「认不出上游类型」必须如实
                 // 留空，调用方展示「未知」而不是凭空给一个类别
                 kind: found

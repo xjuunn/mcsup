@@ -258,7 +258,11 @@ pub struct ContentCandidate {
 /// 1. 加载器匹配 `+100`，不匹配但候选声明了加载器 `-50`（硬性不合，仅作兜底）
 /// 2. 游戏版本精确匹配 `+50`
 /// 3. 正式版 `+20`，测试版 `+5`，内测版 `0`
-/// 4. 精选 `+2`
+///
+/// **`featured` 不参与打分**：它只是作者在网页上「置顶推荐」的标记，与版本
+/// 新旧无关。把它当加分项会让一个一年前被作者精选过的旧版本压过最新版，
+/// 于是「检查更新」会建议降级（实测：Cobblemon `1.6.1` 精选、`1.8.4F` 非精选）。
+/// 同分时由 [`rank_candidates`] 按发布时间排序，这才是「谁更新」的依据。
 ///
 /// 只打分不筛选：把「为什么选它」留给调用方展示，也让 `release_only` 这类
 /// 硬条件集中在 [`rank_candidates`] 里一次处理。
@@ -282,9 +286,6 @@ pub fn score_candidate(candidate: &ContentCandidate, request: &ContentRequest) -
         "beta" => 5,
         _ => 0,
     };
-    if candidate.featured {
-        score += 2;
-    }
     score
 }
 
@@ -341,6 +342,15 @@ pub struct ContentIdentity {
     pub version_id: String,
     /// 版本号（展示用）
     pub version_number: String,
+    /// 已装版本的发布通道：`release` / `beta` / `alpha`
+    ///
+    /// 更新判定需要它：装了测试版就要知道「候选里只有更旧的正式版」不算更新。
+    pub channel: String,
+    /// 已装版本的发布时间（ISO-8601）
+    ///
+    /// 候选集不含已装版本时（例如已装的是测试版、而请求只收正式版），
+    /// 靠它判断候选是不是真的更新，避免把降级当成更新。
+    pub date_published: String,
     /// 面向安装的类别；上游类型认不出时为 `None`
     pub kind: Option<ContentKind>,
 }
@@ -362,17 +372,35 @@ pub enum UpdateDecision {
 /// 判断已装的某个版本是否需要更新
 ///
 /// `ranked` 必须是**已按 [`rank_candidates`] 排好序**的候选（第一个即最优）。
-/// 比较口径只有一条：最优候选的版本 ID 与当前版本 ID 是否相同。
+///
+/// 判定分两种情况：
+///
+/// - **已装版本在候选集里**：条件覆盖了它，最优候选不是它就是有更新。
+/// - **已装版本不在候选集里**：条件把它排除在外（典型：装了测试版，而请求只收
+///   正式版），此时必须比较发布时间——最优候选可能比已装的**更旧**。
+///   实测场景：JEI 装了 `19.70.0.460`（beta），正式版最新只到 `19.64.0.455`，
+///   不比时间就会建议降级。
 ///
 /// 这里刻意**不**比较版本号大小：上游版本号不保证可比较（`1.2.3-beta+build7`、
 /// `mc1.21-2.0` 这类命名普遍存在），「谁更新」只有按服务端条件重新挑选才能回答。
 /// 因此语义是「按当前条件应装的版本变了」，而不是「有更高的版本号」。
 #[must_use]
-pub fn decide_update(current_version_id: &str, ranked: &[ContentCandidate]) -> UpdateDecision {
+pub fn decide_update(current: &ContentIdentity, ranked: &[ContentCandidate]) -> UpdateDecision {
     let Some(best) = ranked.first() else {
         return UpdateDecision::UpToDate;
     };
-    if best.version_id == current_version_id {
+    if best.version_id == current.version_id {
+        return UpdateDecision::UpToDate;
+    }
+    let current_is_ranked = ranked
+        .iter()
+        .any(|candidate| candidate.version_id == current.version_id);
+    // 仅当条件把已装版本排除在外时，才需要防止「换成更旧的版本」
+    if !current_is_ranked
+        && !best.date_published.is_empty()
+        && !current.date_published.is_empty()
+        && best.date_published <= current.date_published
+    {
         return UpdateDecision::UpToDate;
     }
     UpdateDecision::Available {
@@ -526,6 +554,40 @@ mod tests {
         assert!(rank_candidates(Vec::new(), &request).is_empty());
     }
 
+    /// 精选（`featured`）不影响排序：作者置顶的旧版本不能盖过更新的版本
+    ///
+    /// 实测场景：Cobblemon 的 `1.6.1` 是作者精选、`1.8.4F` 不是，一旦把精选
+    /// 算作加分项，「检查更新」就会从 `1.8.4F` 建议降级到 `1.6.1`。
+    #[test]
+    fn featured_flag_does_not_outrank_a_newer_release() {
+        let request = ContentRequest::new(ContentKind::Mod)
+            .loader("fabric")
+            .game_version("1.21.1");
+
+        let mut old_featured = candidate("old", "release", &["fabric"], &["1.21.1"]);
+        old_featured.featured = true;
+        old_featured.date_published = "2025-01-26T00:03:08Z".to_owned();
+        let mut new_plain = candidate("new", "release", &["fabric"], &["1.21.1"]);
+        new_plain.featured = false;
+        new_plain.date_published = "2026-10-27T10:10:48Z".to_owned();
+
+        let ranked = rank_candidates([old_featured, new_plain], &request);
+        assert_eq!(
+            ranked[0].version_id, "new",
+            "精选标记不能让旧版本变成「最优候选」"
+        );
+        assert_eq!(
+            decide_update(
+                &installed("old", "release", "2025-01-26T00:03:08Z"),
+                &ranked
+            ),
+            UpdateDecision::Available {
+                version_id: "new".to_owned(),
+                version_number: "new".to_owned(),
+            }
+        );
+    }
+
     #[test]
     fn guess_kind_maps_upstream_project_type() {
         assert_eq!(ProviderHint::guess_kind("mod"), Some(ContentKind::Mod));
@@ -540,18 +602,34 @@ mod tests {
         assert_eq!(ProviderHint::guess_kind("weird"), None);
     }
 
+    /// 构造「已装版本」：ID 与版本号相同，时间由调用方给
+    fn installed(id: &str, channel: &str, date: &str) -> ContentIdentity {
+        ContentIdentity {
+            hash: "h".to_owned(),
+            project_id: "P".to_owned(),
+            slug: None,
+            title: None,
+            version_id: id.to_owned(),
+            version_number: id.to_owned(),
+            channel: channel.to_owned(),
+            date_published: date.to_owned(),
+            kind: Some(ContentKind::Mod),
+        }
+    }
+
     /// 已装的就是最优候选：不报更新
     #[test]
     fn update_decision_up_to_date_when_ids_match() {
         let request = ContentRequest::new(ContentKind::Mod).loader("fabric");
-        let ranked = rank_candidates(
-            [
-                candidate("V2", "release", &["fabric"], &["1.21.1"]),
-                candidate("V1", "release", &["fabric"], &["1.21.1"]),
-            ],
-            &request,
+        let mut v2 = candidate("V2", "release", &["fabric"], &["1.21.1"]);
+        v2.date_published = "2024-01-02T00:00:00Z".to_owned();
+        let mut v1 = candidate("V1", "release", &["fabric"], &["1.21.1"]);
+        v1.date_published = "2024-01-01T00:00:00Z".to_owned();
+        let ranked = rank_candidates([v2, v1], &request);
+        assert_eq!(
+            decide_update(&installed("V2", "release", "2024-01-02T00:00:00Z"), &ranked),
+            UpdateDecision::UpToDate
         );
-        assert_eq!(decide_update("V2", &ranked), UpdateDecision::UpToDate);
     }
 
     /// 最优候选不是已装版本：报可更新，并指向候选的版本 ID
@@ -564,7 +642,10 @@ mod tests {
         newer.date_published = "2024-01-01T00:00:00Z".to_owned();
         let ranked = rank_candidates([older, newer], &request);
         assert_eq!(
-            decide_update("OLD", &ranked),
+            decide_update(
+                &installed("OLD", "release", "2023-01-01T00:00:00Z"),
+                &ranked
+            ),
             UpdateDecision::Available {
                 version_id: "NEW".to_owned(),
                 version_number: "NEW".to_owned(),
@@ -572,9 +653,56 @@ mod tests {
         );
     }
 
+    /// 装了测试版、候选里只剩更旧的正式版：不能报「有更新」（那是降级）
+    ///
+    /// 实测场景：JEI 装了 `19.70.0.460`（beta），正式版最新只到 `19.64.0.455`。
+    #[test]
+    fn update_decision_never_proposes_an_older_release() {
+        let request = ContentRequest::new(ContentKind::Mod)
+            .loader("fabric")
+            .game_version("1.21.1");
+        let mut release = candidate("19.64.0.455", "release", &["fabric"], &["1.21.1"]);
+        release.date_published = "2026-10-16T08:32:37Z".to_owned();
+        let ranked = rank_candidates([release], &request);
+
+        assert_eq!(
+            decide_update(
+                &installed("19.70.0.460", "beta", "2026-10-25T14:13:45Z"),
+                &ranked
+            ),
+            UpdateDecision::UpToDate,
+            "比已装版本旧的正式版不能被当成更新"
+        );
+    }
+
+    /// 装了测试版、候选里有更新的正式版：仍然要报更新
+    #[test]
+    fn update_decision_still_upgrades_beta_to_a_newer_release() {
+        let request = ContentRequest::new(ContentKind::Mod)
+            .loader("fabric")
+            .game_version("1.21.1");
+        let mut release = candidate("20.0.0", "release", &["fabric"], &["1.21.1"]);
+        release.date_published = "2026-11-01T00:00:00Z".to_owned();
+        let ranked = rank_candidates([release], &request);
+
+        assert_eq!(
+            decide_update(
+                &installed("19.70.0.460", "beta", "2026-10-25T14:13:45Z"),
+                &ranked
+            ),
+            UpdateDecision::Available {
+                version_id: "20.0.0".to_owned(),
+                version_number: "20.0.0".to_owned(),
+            }
+        );
+    }
+
     /// 没有候选（如项目已下架）：不能说「有更新」，也不能说「已最新」是空话
     #[test]
     fn update_decision_without_candidates_is_up_to_date() {
-        assert_eq!(decide_update("V1", &[]), UpdateDecision::UpToDate);
+        assert_eq!(
+            decide_update(&installed("V1", "release", "2024-01-01T00:00:00Z"), &[]),
+            UpdateDecision::UpToDate
+        );
     }
 }
