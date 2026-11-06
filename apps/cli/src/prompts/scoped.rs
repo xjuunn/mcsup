@@ -156,12 +156,26 @@ pub(crate) enum EnterMode {
 ///
 /// 空候选**不是**错误：调用方可能刚搜到 0 条，仍应进入选择器让用户看到
 /// 空列表并按 Esc 返回，因此这里返回 `None`，由 [`select_filter_backable`]
-/// 继续提问。单候选时没有「上一步」可选，返回与选中等价于继续。
-fn shortcut(choices: &[ScopedChoice]) -> Option<Backable> {
+/// 继续提问。
+fn shortcut(choices: &[ScopedChoice], single: Single) -> Option<Backable> {
     match choices {
-        [only] => Some(Backable::Picked(only.label.clone())),
+        // 只有明确允许时，单候选才免提问；默认走 `Ask`，让用户亲自看一眼
+        [only] if single == Single::Skip => Some(Backable::Picked(only.label.clone())),
         _ => None,
     }
+}
+
+/// 只有一个候选时是否还要提问
+///
+/// 「直接采纳」适合翻页项、候选天然唯一的场景；但涉及「回车即开始下载几百
+/// MB」的选择（整合包版本）必须让用户亲手确认，不能因为只有一个版本就替他
+/// 决定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Single {
+    /// 单候选直接采纳，不进入选择器
+    Skip,
+    /// 单候选也照常提问
+    Ask,
 }
 
 /// 可过滤 + 可返回的选择：Esc 返回 [`Backable::Back`]，而不是取消整个命令
@@ -169,10 +183,7 @@ fn shortcut(choices: &[ScopedChoice]) -> Option<Backable> {
 /// 与 [`select_filter_scoped`] 的主要区别是 Esc 的语义：向导用它实现「返回
 /// 上一步」，Ctrl+C 仍是取消整个命令（由调用方按 `is_cancelled` 处理）。
 /// 另外 `enter` 可以开启「输入当关键词」模式，供列表只是推荐 / 上一轮结果
-/// 的场景使用。
-/// 单候选免提问直接返回该项——此时没有「上一步」可选，返回与选中等价于
-/// 继续，由调用方的状态机决定是否需要保留返回能力（候选只有一项时通常
-/// 不值得为它多按一次回车）。
+/// 的场景使用。`single` 决定单候选是否仍然提问。
 ///
 /// `esc_help` 是 Esc 去向的说明（由调用方按业务给，如「返回上一步」或
 /// 「输入关键词」）：结果页与版本页的 Esc 去向不同，文案不能由组件硬编码。
@@ -190,8 +201,9 @@ pub(crate) fn select_filter_backable(
     hint: ScopeHint,
     esc_help: &str,
     enter: EnterMode,
+    single: Single,
 ) -> Result<Backable> {
-    if let Some(picked) = shortcut(choices) {
+    if let Some(picked) = shortcut(choices, single) {
         return Ok(picked);
     }
     if !std::io::stdin().is_terminal() {
@@ -788,7 +800,8 @@ impl Frame {
 
 /// 可过滤 + 范围切换的选择：默认只列非 `extra` 候选，`Ctrl+A` 切换范围
 ///
-/// 单候选免提问直接返回；提交值是候选全名（大小写不敏感归一）。
+/// `single` 决定单候选是否仍要提问（版本选择这类「选中就开始下载」的场景
+/// 传 [`Single::Ask`]）；提交值是候选全名（大小写不敏感归一）。
 ///
 /// # Errors
 ///
@@ -799,6 +812,7 @@ pub(crate) fn select_filter_scoped(
     label: &str,
     choices: &[ScopedChoice],
     hint: ScopeHint,
+    single: Single,
 ) -> Result<String> {
     match choices {
         [] => {
@@ -807,7 +821,7 @@ pub(crate) fn select_filter_scoped(
                 Lang::En => "no options available",
             }));
         }
-        [only] => return Ok(only.label.clone()),
+        [only] if single == Single::Skip => return Ok(only.label.clone()),
         _ => {}
     }
     if !std::io::stdin().is_terminal() {
@@ -1262,14 +1276,43 @@ mod tests {
     #[test]
     fn shortcut_only_auto_picks_single_choice() {
         let none: Vec<ScopedChoice> = Vec::new();
-        assert_eq!(shortcut(&none), None, "空候选不能直接报错或返回");
+        assert_eq!(
+            shortcut(&none, Single::Skip),
+            None,
+            "空候选不能直接报错或返回"
+        );
         let single = choices(&[("1.21.1", false)]);
         assert_eq!(
-            shortcut(&single),
+            shortcut(&single, Single::Skip),
             Some(Backable::Picked("1.21.1".to_owned()))
         );
         let two = choices(&[("1.21.1", false), ("1.21.2", false)]);
-        assert_eq!(shortcut(&two), None, "多候选要提问");
+        assert_eq!(shortcut(&two, Single::Skip), None, "多候选要提问");
+    }
+
+    /// `Single::Ask`：只有一个候选也必须进选择器，不能替用户决定
+    ///
+    /// 非 TTY 下选择器直接报 NotTTY，正好证明它没有被单候选捷径短路。
+    #[test]
+    fn ask_mode_does_not_shortcut_single_choice() {
+        let single = choices(&[("1.21.1", false)]);
+        let err = select_filter_backable(
+            Lang::Zh,
+            "选择版本",
+            &single,
+            hint(),
+            "返回",
+            EnterMode::Choice,
+            Single::Ask,
+        )
+        .expect_err("单候选在 Ask 模式也要进选择器");
+        assert!(
+            matches!(
+                err.downcast_ref::<InquireError>(),
+                Some(InquireError::NotTTY)
+            ),
+            "{err:?}"
+        );
     }
 
     /// Esc / Ctrl+C 结束交互，不改状态
@@ -1605,14 +1648,25 @@ mod tests {
         assert_eq!(lines_up(3, 99), 0);
     }
 
-    /// 空候选报错，单候选免提问
+    /// 空候选报错；单候选在 `Skip` 下免提问，在 `Ask` 下照样进选择器
     #[test]
     fn empty_and_single_choice_shortcut() {
-        assert!(select_filter_scoped(Lang::Zh, "选择版本", &[], hint()).is_err());
+        assert!(select_filter_scoped(Lang::Zh, "选择版本", &[], hint(), Single::Skip).is_err());
         let single = choices(&[("1.21.1", false)]);
         assert_eq!(
-            select_filter_scoped(Lang::Zh, "选择版本", &single, hint()).expect("单候选直接返回"),
+            select_filter_scoped(Lang::Zh, "选择版本", &single, hint(), Single::Skip)
+                .expect("单候选直接返回"),
             "1.21.1"
+        );
+        // 非 TTY 下 `Ask` 会进选择器并报 NotTTY，证明没有被短路
+        let err = select_filter_scoped(Lang::Zh, "选择版本", &single, hint(), Single::Ask)
+            .expect_err("单候选在 Ask 模式也要进选择器");
+        assert!(
+            matches!(
+                err.downcast_ref::<InquireError>(),
+                Some(InquireError::NotTTY)
+            ),
+            "{err:?}"
         );
     }
 

@@ -19,7 +19,9 @@ use crate::bootstrap;
 use crate::diagnostic::AppDiagnostic;
 use crate::output::Printer;
 use crate::progress::{BarSink, TaskSpinner};
-use crate::prompts::{Backable, EnterMode, ScopeHint, ScopedChoice, select_filter_backable};
+use crate::prompts::{
+    Backable, EnterMode, ScopeHint, ScopedChoice, Single, select_filter_backable,
+};
 use anyhow::{Context, Result};
 use console::measure_text_width;
 use mcsup::domain::server::variant::ServerVariant;
@@ -144,7 +146,15 @@ async fn pick_by_project(
             .into_iter()
             .find(|version| version.id == hint || version.version_number == hint)
             .ok_or_else(|| version_missing(printer.lang(), project, hint))?,
-        None if printer.is_interactive() => pick_version(&versions, printer)?,
+        None if printer.is_interactive() => {
+            // 选版本 → 确认 → （否认则回到选版本）：确认之前不下载任何东西
+            loop {
+                let picked = pick_version(&versions, printer)?;
+                if confirm_install(printer.lang(), &title, &picked)? {
+                    break picked;
+                }
+            }
+        }
         None => versions
             .iter()
             .find(|version| version.is_release())
@@ -196,20 +206,31 @@ async fn run_wizard(
                 print_detail(&detail, printer)?;
                 let title = detail.summary.title.clone();
 
-                // `--version` 已指定则直接取；否则逐版选择（Esc 回结果页）
+                // `--version` 已指定则直接取；否则逐版选择（Esc 回结果页）。
+                // 选完必须确认：否认就回到同一个整合包的版本选择，Esc 才返回。
                 let picked = if let Some(hint) = version_hint {
                     versions
                         .into_iter()
                         .find(|version| version.id == hint || version.version_number == hint)
                         .ok_or_else(|| version_missing(printer.lang(), &id, hint))?
                 } else {
-                    let Some(version) = pick_version_backable(printer.lang(), &versions)? else {
+                    let mut chosen = None;
+                    loop {
+                        let Some(version) = pick_version_backable(printer.lang(), &versions)?
+                        else {
+                            break;
+                        };
+                        if confirm_install(printer.lang(), &title, &version)? {
+                            chosen = Some(version);
+                            break;
+                        }
+                    }
+                    let Some(version) = chosen else {
                         state = Wizard::Results { keyword, page };
                         continue;
                     };
                     version
                 };
-                // 选中版本即开始创建，不再额外确认
                 return finish_pick(service, &id, &title, picked, printer).await;
             }
         };
@@ -282,6 +303,8 @@ async fn browse_results(
         no_scope(),
         &esc_help,
         EnterMode::Search,
+        // 结果页只是入口列表：唯一命中时直接进详情，不额外消耗一次回车
+        Single::Skip,
     )? {
         Backable::Back => Ok(Browse::Back),
         Backable::Search(keyword) => Ok(Browse::Search(keyword)),
@@ -541,24 +564,58 @@ fn no_available_version(lang: crate::locale::Lang) -> AppDiagnostic {
 }
 
 /// 选版本：默认只列正式版，选不到再放开测试版
+///
+/// 即使只有一个候选也照常提问：这一步之后就要下载几百 MB，不能让用户
+/// 「没看见版本号就开始装」。
 fn pick_version(versions: &[ModpackVersion], printer: Printer) -> Result<ModpackVersion> {
     if versions.is_empty() {
         return Err(no_available_version(printer.lang()).into());
     }
     let pool = version_pool(versions);
-    let labels: Vec<String> = pool
+    let shown: Vec<&ModpackVersion> = pool.iter().take(VERSION_SHOW_LIMIT).copied().collect();
+    let choices: Vec<ScopedChoice> = shown
         .iter()
-        .take(VERSION_SHOW_LIMIT)
-        .map(|version| version_label(version))
+        .map(|version| ScopedChoice::new(version_label(version), false))
         .collect();
-    if labels.len() == 1 {
-        return Ok((*pool[0]).clone());
-    }
-    let picked = crate::prompts::select_filter(printer.lang(), "选择整合包版本", &labels)?;
-    pool.iter()
+    let picked = crate::prompts::select_filter_scoped(
+        printer.lang(),
+        "选择整合包版本",
+        &choices,
+        no_scope(),
+        // 只有一版也要选：选中之后就要下载，不能让用户没看见版本号就开始
+        Single::Ask,
+    )?;
+    shown
+        .into_iter()
         .find(|version| version_label(version) == picked)
-        .map(|version| (*version).clone())
+        .cloned()
         .ok_or_else(|| anyhow::anyhow!("无效选择: {picked}"))
+}
+
+/// 安装前确认：整合包动辄几百 MB，选中版本后必须再确认一次才下载
+///
+/// 默认「是」（用户已经选到这一步，回车即继续）；返回 `false` 表示回到
+/// 版本选择，不下载任何东西。
+fn confirm_install(
+    lang: crate::locale::Lang,
+    title: &str,
+    version: &ModpackVersion,
+) -> Result<bool> {
+    crate::prompts::confirm_yes(
+        lang,
+        &crate::i18n::pick(
+            lang,
+            format!(
+                "用 {} {} 创建服务端并下载整合包？",
+                title, version.version_number
+            ),
+            format!(
+                "create the server from {} {} and download the modpack?",
+                title, version.version_number
+            ),
+        ),
+        true,
+    )
 }
 
 /// 版本列表里的一行展示
@@ -579,7 +636,8 @@ fn version_label(version: &ModpackVersion) -> String {
 /// 交互选版本，Esc 返回 `None` 表示回到详情页
 ///
 /// 与 [`pick_version`] 同一套候选口径（优先正式版、最多展示
-/// [`VERSION_SHOW_LIMIT`] 项），区别只在 Esc 的语义。
+/// [`VERSION_SHOW_LIMIT`] 项），区别只在 Esc 的语义。单候选也照常提问：
+/// 选中之后就要下载，用户必须先看到自己要装的是哪个版本。
 fn pick_version_backable(
     lang: crate::locale::Lang,
     versions: &[ModpackVersion],
@@ -601,6 +659,7 @@ fn pick_version_backable(
         no_scope(),
         &esc_help,
         EnterMode::Choice,
+        Single::Ask,
     )? {
         Backable::Back => Ok(None),
         // 版本候选就是全部可选值，不存在「按关键词去远端搜」这一步
