@@ -266,3 +266,91 @@ fn human_output_mentions_review_reason() {
         "判不出时必须给建议，实际输出:\n{text}"
     );
 }
+
+/// `--loader` 决定采信哪份清单：Quilt 专属依赖在 fabric 口径下不该报缺失
+#[test]
+fn loader_flag_switches_dependency_scope() {
+    let home = temp_home();
+    let path = home.path().join("multi.jar");
+    let file = std::fs::File::create(&path).expect("create jar");
+    let mut zip = zip::ZipWriter::new(file);
+    let opts = zip::write::SimpleFileOptions::default();
+    zip.start_file("fabric.mod.json", opts).expect("start");
+    zip.write_all(
+        br#"{"schemaVersion":1,"id":"multi","version":"1",
+            "environment":"*","depends":{"minecraft":"1.21.1"}}"#,
+    )
+    .expect("write fabric meta");
+    zip.start_file("quilt.mod.json", opts).expect("start");
+    zip.write_all(
+        br#"{"schemaVersion":1,"quilt_loader":{"id":"multi","version":"1",
+            "depends":[{"id":"quilt_loader","versions":"*"}]}}"#,
+    )
+    .expect("write quilt meta");
+    zip.finish().expect("finish zip");
+
+    let jar = path.to_str().expect("path");
+    let out = run(
+        home.path(),
+        &["mod", "inspect", jar, "--offline", "--output", "json"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    // 单个多加载器 jar：交集不唯一 → 目标加载器未知
+    assert!(value[0]["target_loader"].is_null(), "{}", value);
+
+    let out = run(
+        home.path(),
+        &[
+            "mod",
+            "inspect",
+            jar,
+            "--offline",
+            "--loader",
+            "fabric",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(value[0]["target_loader"], "fabric");
+    // fabric-api / quilt_loader 都是内置项，不该报缺失
+    assert_eq!(value[0]["missing_deps"], serde_json::json!([]));
+}
+
+/// 未知加载器名按用法错误退出（2），不猜一个
+#[test]
+fn unknown_loader_is_usage_error() {
+    let home = temp_home();
+    let jar = write_fabric_jar(
+        home.path(),
+        "x.jar",
+        r#"{"schemaVersion":1,"id":"x","version":"1"}"#,
+    );
+    let out = run(
+        home.path(),
+        &[
+            "mod",
+            "inspect",
+            jar.to_str().expect("path"),
+            "--offline",
+            "--loader",
+            "not-a-loader",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

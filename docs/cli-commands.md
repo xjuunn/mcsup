@@ -240,7 +240,7 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 
 | 子命令 | 用法 | 说明 |
 | --- | --- | --- |
-| `inspect` | `mcsup mod inspect <path>... [--offline]` | 检测 jar 文件或目录（只取直接子项）。报告加载器、MC 区间、Java 版本、客/服归属、风险等级。`--offline` 只做本地检查，不访问上游 API |
+| `inspect` | `mcsup mod inspect <path>... [--offline] [--loader <加载器>]` | 检测 jar 文件或目录（只取直接子项）。报告加载器、MC 区间、Java 版本、客/服归属、风险等级。`--offline` 只做本地检查，不访问上游 API；`--loader` 指定目标加载器（缺省按整批文件共同支持的加载器推断，见下） |
 
 ### 判定口径
 
@@ -263,9 +263,22 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | 客/服（显式声明） | Fabric `environment`、NeoForge `side` | 确定 |
 | Java 编译版本 | class 文件头第 6-7 字节，换算 `major - 44` | 确定 |
 | 依赖 / 不兼容 | `depends` / `recommends` / `breaks`，含 `provides` 别名与嵌套 jar | 确定 |
+| 依赖归属 | 依赖按声明它的清单归类（fabric / quilt / forge / neoforge），只采信目标加载器那份 | 确定 |
+| Quilt 条件依赖 | `unless` / `unless_any`：豁免项存在时该依赖不再必需 | 确定 |
 | 目标 MC 区间 | Fabric `depends.minecraft`、Forge `versionRange` | 高 |
 | 客/服（入口点推断） | 只有 `client` 入口、无 `main`/`server` | 中（有双端库反例） |
 | 客/服（字节码） | 常量池引用 `net/minecraft/client/`、`blaze3d` | 中，仅非 Fabric 生态采信 |
+
+**依赖按加载器校验**：一个 jar 可以同时带多份清单（实测 `lukis-*` 同时有
+`fabric.mod.json` 与 `quilt.mod.json`），把不同加载器的依赖合并会造出假缺失
+（Quilt 侧的 `quilt_resource_loader` 在 Fabric 服务端根本不需要）。因此：
+
+- 给了 `--loader` 就只采信那份清单
+- 没给则由这批文件**共同支持的唯一加载器**推断（取交集；含资源包 / 认不出
+  的文件不参与交集）
+- 交集不唯一（分属多个加载器）时目标加载器为「未确定」，带加载器归属的依赖
+  一律不参与校验，只校验与加载器无关的依赖——宁可不判，也不误报
+- 输出会明确写出本次按哪个加载器校验，JSON 的 `target_loader` 同义
 
 **Fabric 的字节码扫不出客户端类**：Fabric mod 运行在 intermediary 名字空间，
 引用的是 `net/minecraft/class_2338` 而非 `net/minecraft/client/Minecraft`。

@@ -754,6 +754,13 @@ pub(crate) fn mod_inspect_path_arg() -> &'static str {
 }
 
 #[must_use]
+pub(crate) fn mod_inspect_loader_arg() -> &'static str {
+    t(
+        "目标加载器：只采信该加载器的清单来校验依赖（缺省按整批文件共同支持的加载器推断）",
+        "target loader: only trust this loader's manifest when checking dependencies (default: infer from what the whole batch supports)",
+    )
+}
+
 pub(crate) fn mod_offline_arg() -> &'static str {
     t(
         "只做本地检查，不访问上游 API",

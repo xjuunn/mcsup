@@ -27,7 +27,7 @@
 //! 因此只在需要联网兜底时才计算。
 
 use crate::fs_error::FsError;
-use domain::mod_::{ModCapability, Risk};
+use domain::mod_::{ModCapability, ModLoader, Risk};
 use port::mod_::{ModInspectError, ModInspector, ModMetadataSource};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -73,6 +73,11 @@ pub struct ModAudit {
     pub queried_upstream: bool,
     /// 读不出来的文件（路径 + 原因文本）
     pub unreadable: Vec<(String, String)>,
+    /// 这批文件的目标加载器
+    ///
+    /// `None` 表示分属多个加载器、无法确定：此时依赖闭包只校验与加载器无关
+    /// 的依赖，不拿单个加载器的清单去吓人（见 `ModDependency::applies`）。
+    pub target_loader: Option<ModLoader>,
 }
 
 impl ModAudit {
@@ -108,6 +113,29 @@ impl ModAudit {
             }
         }
         (ok, review, blocking)
+    }
+}
+
+/// 这批文件共同支持的唯一加载器
+///
+/// 取交集而不是并集：只有「每个 mod 都声明支持」的加载器才可能是这台服务器
+/// 真正运行的加载器。没有任何加载器元数据的文件（资源包 / 认不出的 jar）
+/// 不参与交集，否则一个坏文件就能把结论拖回「未知」。
+///
+/// 交集为空或不止一个都返回 `None`：宁可不做依赖校验，也不拿错清单误报。
+fn common_loader(mods: &[ModReport]) -> Option<ModLoader> {
+    let mut with_loaders = mods.iter().filter(|m| !m.capability.loaders.is_empty());
+    let first = with_loaders.next()?;
+    let mut common: Vec<ModLoader> = first.capability.loaders.clone();
+    for report in with_loaders {
+        common.retain(|loader| report.capability.loaders.contains(loader));
+        if common.is_empty() {
+            return None;
+        }
+    }
+    match common.as_slice() {
+        [only] => Some(*only),
+        _ => None,
     }
 }
 
@@ -172,6 +200,23 @@ impl ModInspectService {
         paths: &[PathBuf],
         allow_upstream: bool,
     ) -> Result<ModAudit, ModInspectServiceError> {
+        self.inspect_paths_for(paths, allow_upstream, None).await
+    }
+
+    /// 检测一批 jar，并显式指定目标加载器
+    ///
+    /// `target` 由调用方给出（`--loader`）时以它为准；为 `None` 则从这批文件
+    /// 共同支持的加载器里推断。看不出唯一结论就保持 `None`，绝不猜。
+    ///
+    /// # Errors
+    ///
+    /// 与 [`Self::inspect_paths`] 相同
+    pub async fn inspect_paths_for(
+        &self,
+        paths: &[PathBuf],
+        allow_upstream: bool,
+        target: Option<ModLoader>,
+    ) -> Result<ModAudit, ModInspectServiceError> {
         let mut audit = ModAudit::default();
 
         for path in paths {
@@ -219,8 +264,10 @@ impl ModInspectService {
             .iter()
             .flat_map(|r| r.capability.provided_ids())
             .collect();
+        // 目标加载器：显式指定优先，否则取这批文件共同支持的唯一加载器
+        let target = target.or_else(|| common_loader(&audit.mods));
         for report in &mut audit.mods {
-            report.missing_deps = report.capability.missing_mandatory_deps(&present);
+            report.missing_deps = report.capability.missing_mandatory_deps(&present, target);
             let mut risk = report.capability.risk();
             if !report.missing_deps.is_empty() {
                 // 缺必需依赖：服务端起不来，与「仅客户端」同等严重
@@ -232,6 +279,7 @@ impl ModInspectService {
         audit
             .mods
             .sort_by(|a, b| a.capability.path.cmp(&b.capability.path));
+        audit.target_loader = target;
         Ok(audit)
     }
 
@@ -412,14 +460,83 @@ mod tests {
         assert_eq!(audit.counts(), (0, 1, 0));
     }
 
+    /// 整批文件共同支持的唯一加载器被识别为目标加载器
+    #[tokio::test]
+    async fn target_loader_is_inferred_from_common_support() {
+        let mut a = cap("/a.jar", "a", SideSupport::Required);
+        a.loaders = vec![ModLoader::Fabric, ModLoader::Quilt];
+        let mut b = cap("/b.jar", "b", SideSupport::Required);
+        b.loaders = vec![ModLoader::Fabric];
+        let svc = ModInspectService::local(Arc::new(FakeInspector(vec![a, b])));
+        let audit = svc
+            .inspect_paths(&[PathBuf::from("/a.jar"), PathBuf::from("/b.jar")], false)
+            .await
+            .expect("audit");
+        assert_eq!(audit.target_loader, Some(ModLoader::Fabric));
+    }
+
+    /// 交集不唯一时目标加载器为未知，不能拿单个加载器的清单误报
+    #[tokio::test]
+    async fn ambiguous_batch_has_no_target_loader() {
+        let mut a = cap("/a.jar", "a", SideSupport::Required);
+        a.loaders = vec![ModLoader::Fabric];
+        a.depends.push(
+            domain::mod_::ModDependency::new("only_in_fabric", "", true)
+                .with_loader(ModLoader::Fabric),
+        );
+        let mut b = cap("/b.jar", "b", SideSupport::Required);
+        b.loaders = vec![ModLoader::Forge];
+        let svc = ModInspectService::local(Arc::new(FakeInspector(vec![a, b])));
+        let audit = svc
+            .inspect_paths(&[PathBuf::from("/a.jar"), PathBuf::from("/b.jar")], false)
+            .await
+            .expect("audit");
+        assert_eq!(audit.target_loader, None);
+        // 目标未知：带加载器归属的依赖不参与，避免假缺失
+        assert!(audit.mods[0].missing_deps.is_empty());
+        assert_eq!(audit.mods[0].risk, Risk::Ok);
+    }
+
+    /// 显式指定加载器时以它为准，即使整批交集不同
+    #[tokio::test]
+    async fn explicit_target_wins_over_inference() {
+        let mut a = cap("/a.jar", "a", SideSupport::Required);
+        a.loaders = vec![ModLoader::Fabric, ModLoader::Quilt];
+        a.depends.push(
+            domain::mod_::ModDependency::new("quilt_only", "", true).with_loader(ModLoader::Quilt),
+        );
+        let svc = ModInspectService::local(Arc::new(FakeInspector(vec![a])));
+        let audit = svc
+            .inspect_paths_for(&[PathBuf::from("/a.jar")], false, Some(ModLoader::Quilt))
+            .await
+            .expect("audit");
+        assert_eq!(audit.target_loader, Some(ModLoader::Quilt));
+        assert_eq!(audit.mods[0].missing_deps, vec!["quilt_only"]);
+    }
+
+    /// 目标加载器下的依赖缺失仍然升级为 blocking
+    #[tokio::test]
+    async fn missing_dep_under_target_escalates() {
+        let mut a = cap("/a.jar", "a", SideSupport::Required);
+        a.loaders = vec![ModLoader::Fabric];
+        a.depends.push(
+            domain::mod_::ModDependency::new("satin", "", true).with_loader(ModLoader::Fabric),
+        );
+        let svc = ModInspectService::local(Arc::new(FakeInspector(vec![a])));
+        let audit = svc
+            .inspect_paths(&[PathBuf::from("/a.jar")], false)
+            .await
+            .expect("audit");
+        assert_eq!(audit.target_loader, Some(ModLoader::Fabric));
+        assert_eq!(audit.mods[0].missing_deps, vec!["satin"]);
+        assert_eq!(audit.mods[0].risk, Risk::Blocking);
+    }
+
     #[tokio::test]
     async fn missing_mandatory_dep_escalates_to_blocking() {
         let mut a = cap("/a.jar", "a", SideSupport::Required);
-        a.depends.push(domain::mod_::ModDependency {
-            id: "absent".to_owned(),
-            version_range: String::new(),
-            mandatory: true,
-        });
+        a.depends
+            .push(domain::mod_::ModDependency::new("absent", "", true));
         let svc = ModInspectService::local(Arc::new(FakeInspector(vec![a])));
         let audit = svc
             .inspect_paths(&[PathBuf::from("/a.jar")], false)
@@ -432,11 +549,8 @@ mod tests {
     #[tokio::test]
     async fn satisfied_dep_does_not_escalate() {
         let mut a = cap("/a.jar", "a", SideSupport::Required);
-        a.depends.push(domain::mod_::ModDependency {
-            id: "b".to_owned(),
-            version_range: String::new(),
-            mandatory: true,
-        });
+        a.depends
+            .push(domain::mod_::ModDependency::new("b", "", true));
         let b = cap("/b.jar", "b", SideSupport::Required);
         let svc = ModInspectService::local(Arc::new(FakeInspector(vec![a, b])));
         let audit = svc

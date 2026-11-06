@@ -9,12 +9,13 @@
 //! 为什么判不出——否则用户会以为工具有 bug。
 
 use crate::cli::ModInspectAction;
+use crate::diagnostic::AppDiagnostic;
 use crate::i18n::text;
 use crate::locale::Lang;
 use crate::output::Printer;
 use anyhow::Result;
 use comfy_table::{ContentArrangement, Table};
-use mcsup::domain::mod_::{Confidence, ModCapability, Risk, SideSupport};
+use mcsup::domain::mod_::{Confidence, ModCapability, ModLoader, Risk, SideSupport};
 use mcsup::modkit::ZipModInspector;
 use mcsup::service::{ModAudit, ModInspectService, ModReport, collect_jars};
 use serde::Serialize;
@@ -36,6 +37,8 @@ struct ModJson {
     confidence: String,
     risk: String,
     missing_deps: Vec<String>,
+    /// 依赖校验使用的目标加载器；`null` 表示未确定
+    target_loader: Option<String>,
     evidence: Vec<EvidenceJson>,
 }
 
@@ -56,11 +59,20 @@ struct EvidenceJson {
 
 pub(crate) async fn run(action: ModInspectAction, printer: Printer) -> Result<()> {
     match action {
-        ModInspectAction::Inspect { paths, offline } => inspect(paths, offline, printer).await,
+        ModInspectAction::Inspect {
+            paths,
+            offline,
+            loader,
+        } => inspect(paths, offline, loader.as_deref(), printer).await,
     }
 }
 
-async fn inspect(paths: Vec<PathBuf>, offline: bool, printer: Printer) -> Result<()> {
+async fn inspect(
+    paths: Vec<PathBuf>,
+    offline: bool,
+    loader: Option<&str>,
+    printer: Printer,
+) -> Result<()> {
     let jars = expand_paths(&paths)?;
     if jars.is_empty() {
         printer.print_warning(text(
@@ -80,8 +92,15 @@ async fn inspect(paths: Vec<PathBuf>, offline: bool, printer: Printer) -> Result
         ),
         printer.is_human(),
     );
+    // 目标加载器决定采信哪个清单的依赖；非法值报用法错误（2），不猜
+    let target = match loader {
+        Some(raw) => {
+            Some(ModLoader::parse(raw).ok_or_else(|| unknown_loader_error(printer.lang(), raw))?)
+        }
+        None => None,
+    };
     let service = ModInspectService::local(Arc::new(ZipModInspector::new()));
-    let audit = service.inspect_paths(&jars, !offline).await;
+    let audit = service.inspect_paths_for(&jars, !offline, target).await;
     spinner.finish();
     let audit = audit?;
 
@@ -105,10 +124,51 @@ fn expand_paths(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
+/// 「依赖按哪个加载器校验」的说明行
+///
+/// 说不清目标加载器时必须讲明白为什么没做校验，否则用户会以为检查过了。
+fn target_loader_line(lang: Lang, target: Option<ModLoader>) -> String {
+    match target {
+        Some(loader) => crate::i18n::pick(
+            lang,
+            format!("依赖校验按 {} 口径", loader.as_str()),
+            format!("dependency check uses the {} manifest", loader.as_str()),
+        ),
+        None => crate::i18n::pick(
+            lang,
+            "未确定目标加载器：这批文件分属多个加载器，只校验与加载器无关的依赖（可用 --loader 指定）",
+            "no single target loader: the batch spans several loaders, so only loader-agnostic dependencies were checked (use --loader to pick one)",
+        ),
+    }
+}
+
+/// `--loader` 给了个不认识的加载器名：用法错误（退出码 2）
+fn unknown_loader_error(lang: Lang, raw: &str) -> anyhow::Error {
+    AppDiagnostic::usage(
+        crate::i18n::pick(
+            lang,
+            format!("未知加载器 {raw}"),
+            format!("unknown loader: {raw}"),
+        ),
+        Some(crate::i18n::pick(
+            lang,
+            "可用：fabric / quilt / forge / neoforge / legacy-forge / liteloader / bukkit"
+                .to_owned(),
+            "available: fabric / quilt / forge / neoforge / legacy-forge / liteloader / bukkit"
+                .to_owned(),
+        )),
+    )
+    .into()
+}
+
 /// 渲染检测结果
 fn render(audit: &ModAudit, printer: Printer) -> Result<()> {
     let lang = printer.lang();
-    let rows: Vec<ModJson> = audit.mods.iter().map(to_json).collect();
+    let rows: Vec<ModJson> = audit
+        .mods
+        .iter()
+        .map(|report| to_json(report, audit.target_loader))
+        .collect();
     printer.print_rows(
         &rows,
         text(lang, "没有可报告的 mod", "nothing to report"),
@@ -123,6 +183,7 @@ fn render(audit: &ModAudit, printer: Printer) -> Result<()> {
         format!("summary: {ok} usable, {review} need review, {blocking} server-incompatible"),
     );
     printer.print_section(&summary);
+    printer.print_section(&target_loader_line(lang, audit.target_loader));
 
     // 有问题的条目逐条给理由：blocking 要说清阻塞在哪，review 要说清为什么判不出
     for report in audit.mods.iter().filter(|r| r.risk != Risk::Ok) {
@@ -288,7 +349,7 @@ fn confidence_name(c: Confidence) -> String {
     c.as_str().to_owned()
 }
 
-fn to_json(report: &ModReport) -> ModJson {
+fn to_json(report: &ModReport, target_loader: Option<ModLoader>) -> ModJson {
     let cap = &report.capability;
     ModJson {
         path: cap.path.clone(),
@@ -307,6 +368,8 @@ fn to_json(report: &ModReport) -> ModJson {
         confidence: confidence_name(cap.side.confidence),
         risk: report.risk.as_str().to_owned(),
         missing_deps: report.missing_deps.clone(),
+        // 目标加载器是整批共享的口径，单条记录也带上，JSON 消费方不必另取
+        target_loader: target_loader.map(|loader| loader.as_str().to_owned()),
         evidence: cap
             .side
             .evidence

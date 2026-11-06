@@ -51,8 +51,8 @@ fn both_environment_records_dependencies() {
     assert_eq!(cap.side.server, SideSupport::Unknown);
     // 判不出服务端归属 → review，不是 ok
     assert_eq!(cap.risk(), Risk::Review);
-    // 依赖要读全，cobblemon 是必需且非内置
-    let missing = cap.missing_mandatory_deps(&[]);
+    // 依赖要读全，cobblemon 是必需且非内置（该 fixture 是 Fabric 形态）
+    let missing = cap.missing_mandatory_deps(&[], Some(ModLoader::Fabric));
     assert_eq!(missing, vec!["cobblemon"]);
     assert!(cap.java_required.is_none());
 }

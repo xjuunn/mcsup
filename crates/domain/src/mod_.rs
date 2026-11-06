@@ -68,6 +68,28 @@ impl ModLoader {
         }
     }
 
+    /// 从用户输入的加载器名解析（`--loader`）
+    ///
+    /// 接受 [`Self::as_str`] 的稳定名，外加几个口语别名：`paper` / `spigot`
+    /// 归到 Bukkit（服务端插件），`neoforge.mods.toml` 的旧写法 `neo` 也认。
+    /// 解析不了返回 `None`，由入口报用法错误而不是猜一个。
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        let key = raw.trim().to_ascii_lowercase().replace('_', "-");
+        Some(match key.as_str() {
+            "fabric" => Self::Fabric,
+            "quilt" => Self::Quilt,
+            "forge" => Self::Forge,
+            "neo" | "neoforge" => Self::NeoForge,
+            "legacy-forge" | "legacyforge" => Self::LegacyForge,
+            "liteloader" => Self::LiteLoader,
+            "bukkit" | "paper" | "spigot" | "purpur" => Self::Bukkit,
+            "resourcepack" | "resource-pack" => Self::ResourcePack,
+            "datapack" | "data-pack" => Self::DataPack,
+            _ => return None,
+        })
+    }
+
     /// 该加载器是否是「模组加载器」（区别于插件 / 资源包）
     #[must_use]
     pub const fn is_mod_loader(self) -> bool {
@@ -406,6 +428,12 @@ pub fn compare_mc_version(a: &str, b: &str) -> std::cmp::Ordering {
 }
 
 /// 一条依赖声明
+///
+/// 依赖**按声明它的加载器归类**：一个 jar 可以同时带 `fabric.mod.json` 与
+/// `quilt.mod.json`，两份清单的依赖各自只在自己的加载器下生效。把不同加载器
+/// 的依赖合并成一张表会造出假缺失——实测 `lukis-*` 系列在 Quilt 清单里写
+/// `quilt_resource_loader`（且带 `unless` 豁免），Fabric 服务端根本没有这个
+/// 概念，合并后就会误判成「不可用于服务端」。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModDependency {
     /// 依赖的 modid（`minecraft` / `java` / `fabric-api` / ...）
@@ -414,6 +442,67 @@ pub struct ModDependency {
     pub version_range: String,
     /// 是否必需（`false` = recommends / suggests）
     pub mandatory: bool,
+    /// 声明这条依赖的加载器；`None` 表示与加载器无关
+    pub loader: Option<ModLoader>,
+    /// 条件豁免：`present` 中任一 modid 存在时，本依赖不再必需
+    ///
+    /// 对应 Quilt 的 `unless` / `unless_any`：`{"id": "quilt_resource_loader",
+    /// "unless": "fabric-resource-loader-v0"}` 在 Fabric 服务端由 fabric-api
+    /// 满足，不应报缺失。
+    pub unless: Vec<String>,
+}
+
+impl ModDependency {
+    /// 构造一条不带加载器归属、无豁免的依赖
+    #[must_use]
+    pub fn new(id: impl Into<String>, version_range: impl Into<String>, mandatory: bool) -> Self {
+        Self {
+            id: id.into(),
+            version_range: version_range.into(),
+            mandatory,
+            loader: None,
+            unless: Vec::new(),
+        }
+    }
+
+    /// 标注声明它的加载器
+    #[must_use]
+    pub fn with_loader(mut self, loader: ModLoader) -> Self {
+        self.loader = Some(loader);
+        self
+    }
+
+    /// 设定条件豁免（任一存在即不需本依赖）
+    #[must_use]
+    pub fn unless_any(mut self, ids: impl IntoIterator<Item = String>) -> Self {
+        self.unless.extend(ids);
+        self
+    }
+
+    /// 在给定「已存在 modid」集合与目标加载器下，本依赖是否成立
+    ///
+    /// `target` 为 `None`（未确定目标加载器）时，带加载器归属的依赖一律**不**
+    /// 参与判定：没有目标就无从说它该被哪个加载器满足，报出来只会是噪声。
+    #[must_use]
+    pub fn applies(&self, present: &[String], target: Option<ModLoader>) -> bool {
+        if !self.mandatory || is_builtin_dep(&self.id) {
+            return false;
+        }
+        match (self.loader, target) {
+            (Some(loader), Some(target)) if loader != target => return false,
+            (Some(_), None) => return false,
+            _ => {}
+        }
+        if self.unless.iter().any(|id| present_has(present, id)) {
+            return false;
+        }
+        !present_has(present, &self.id)
+    }
+}
+
+/// 已存在集合里是否含某个 modid（大小写不敏感）
+fn present_has(present: &[String], id: &str) -> bool {
+    present.iter().any(|have| have.eq_ignore_ascii_case(id))
 }
 
 /// 风险等级
@@ -554,14 +643,22 @@ impl ModCapability {
 
     /// 在给定已有 modid 集合下，列出缺失的必需依赖
     ///
-    /// 内置项（`minecraft` / `java` / 各加载器自身）不参与比对：它们由服务端
-    /// 与加载器提供，不在 `mods/` 里。
+    /// 只比对本 mod 声明的依赖与「整批文件能提供的 modid」：
+    ///
+    /// - 内置项（`minecraft` / `java` / 各加载器自身）不参与比对，它们由服务端
+    ///   与加载器提供，不在 `mods/` 里
+    /// - 依赖按声明它的加载器归类，`target` 决定采信哪一份清单（见
+    ///   [`ModDependency::applies`]）；未确定目标加载器时不拿带归属的依赖吓人
+    /// - 命中 `unless` 豁免的依赖不算缺失
     #[must_use]
-    pub fn missing_mandatory_deps(&self, present: &[String]) -> Vec<String> {
+    pub fn missing_mandatory_deps(
+        &self,
+        present: &[String],
+        target: Option<ModLoader>,
+    ) -> Vec<String> {
         self.depends
             .iter()
-            .filter(|dep| dep.mandatory && !is_builtin_dep(&dep.id))
-            .filter(|dep| !present.iter().any(|id| id.eq_ignore_ascii_case(&dep.id)))
+            .filter(|dep| dep.applies(present, target))
             .map(|dep| dep.id.clone())
             .collect()
     }
@@ -658,32 +755,76 @@ mod tests {
         assert!(!SideSupport::Unsupported.installable());
     }
 
+    /// 依赖按加载器归类：只采信目标加载器那份清单
+    ///
+    /// 实测形态：`lukis-*` 同时带 fabric 与 quilt 清单，Quilt 侧声明
+    /// `quilt_resource_loader`。Fabric 服务端不该因为这份清单报缺失。
+    #[test]
+    fn dependency_only_counts_for_target_loader() {
+        let mut cap = ModCapability::empty("a.jar");
+        cap.loaders = vec![ModLoader::Fabric, ModLoader::Quilt];
+        cap.depends = vec![
+            ModDependency::new("fabric-api", "", true).with_loader(ModLoader::Fabric),
+            ModDependency::new("quilt_resource_loader", "", true).with_loader(ModLoader::Quilt),
+        ];
+        // fabric-api 是内置项，真正参与比对的是 quilt 那条
+        assert_eq!(
+            cap.missing_mandatory_deps(&[], Some(ModLoader::Quilt)),
+            vec!["quilt_resource_loader"]
+        );
+        // Fabric 口径下不该拿 Quilt 的依赖算账
+        assert!(
+            cap.missing_mandatory_deps(&[], Some(ModLoader::Fabric))
+                .is_empty()
+        );
+        // 目标未确定：带加载器归属的依赖一律不参与，避免制造假缺失
+        assert!(cap.missing_mandatory_deps(&[], None).is_empty());
+    }
+
+    /// `unless` 命中时依赖不再必需（Quilt 的条件豁免）
+    #[test]
+    fn unless_suppresses_dependency() {
+        let mut cap = ModCapability::empty("a.jar");
+        cap.depends = vec![
+            ModDependency::new("quilt_resource_loader", "*", true)
+                .with_loader(ModLoader::Quilt)
+                .unless_any(vec!["fabric-resource-loader-v0".to_owned()]),
+        ];
+        // 豁免项存在 → 不缺
+        let present = vec!["fabric-resource-loader-v0".to_owned()];
+        assert!(
+            cap.missing_mandatory_deps(&present, Some(ModLoader::Quilt))
+                .is_empty()
+        );
+        // 豁免项不存在 → 如实报缺失
+        assert_eq!(
+            cap.missing_mandatory_deps(&[], Some(ModLoader::Quilt)),
+            vec!["quilt_resource_loader"]
+        );
+    }
+
+    /// 与加载器无关的依赖（`loader = None`）在任何口径下都参与校验
+    #[test]
+    fn loader_agnostic_dependency_always_checked() {
+        let mut cap = ModCapability::empty("a.jar");
+        cap.depends = vec![ModDependency::new("cobblemon", "", true)];
+        assert_eq!(cap.missing_mandatory_deps(&[], None), vec!["cobblemon"]);
+        assert_eq!(
+            cap.missing_mandatory_deps(&[], Some(ModLoader::Fabric)),
+            vec!["cobblemon"]
+        );
+    }
+
     #[test]
     fn missing_deps_ignore_builtins() {
         let mut cap = ModCapability::empty("a.jar");
         cap.depends = vec![
-            ModDependency {
-                id: "minecraft".to_owned(),
-                version_range: "1.21.1".to_owned(),
-                mandatory: true,
-            },
-            ModDependency {
-                id: "fabric-api".to_owned(),
-                version_range: String::new(),
-                mandatory: true,
-            },
-            ModDependency {
-                id: "cobblemon".to_owned(),
-                version_range: String::new(),
-                mandatory: true,
-            },
-            ModDependency {
-                id: "sodium".to_owned(),
-                version_range: String::new(),
-                mandatory: false,
-            },
+            ModDependency::new("minecraft", "1.21.1", true),
+            ModDependency::new("fabric-api", "", true),
+            ModDependency::new("cobblemon", "", true),
+            ModDependency::new("sodium", "", false),
         ];
-        let missing = cap.missing_mandatory_deps(&[]);
+        let missing = cap.missing_mandatory_deps(&[], None);
         // minecraft / fabric-api 是内置的，sodium 是可选的
         assert_eq!(missing, vec!["cobblemon"]);
     }
@@ -698,13 +839,9 @@ mod tests {
 
         let mut waystones = ModCapability::empty("waystones.jar");
         waystones.id = Some("waystones".to_owned());
-        waystones.depends = vec![ModDependency {
-            id: "balm-fabric".to_owned(),
-            version_range: "*".to_owned(),
-            mandatory: true,
-        }];
+        waystones.depends = vec![ModDependency::new("balm-fabric", "*", true)];
         let present = balm.provided_ids();
-        assert!(waystones.missing_mandatory_deps(&present).is_empty());
+        assert!(waystones.missing_mandatory_deps(&present, None).is_empty());
     }
 
     #[test]
@@ -718,13 +855,9 @@ mod tests {
     #[test]
     fn missing_deps_match_case_insensitively() {
         let mut cap = ModCapability::empty("a.jar");
-        cap.depends = vec![ModDependency {
-            id: "Cobblemon".to_owned(),
-            version_range: String::new(),
-            mandatory: true,
-        }];
+        cap.depends = vec![ModDependency::new("Cobblemon", "", true)];
         assert!(
-            cap.missing_mandatory_deps(&["cobblemon".to_owned()])
+            cap.missing_mandatory_deps(&["cobblemon".to_owned()], None)
                 .is_empty()
         );
     }
