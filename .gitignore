@@ -1,6 +1,8 @@
 /target
 # fuzz 是独立 workspace（cargo-fuzz 要求），自带一份 target
 /fuzz/target
+# release 打包产物（.github/workflows/release.yml 生成）
+/dist
 **/*.rs.bk
 *.pdb
 

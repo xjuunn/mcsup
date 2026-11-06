@@ -350,7 +350,27 @@ pub(crate) async fn create(args: CreateArgs<'_>, printer: Printer) -> Result<()>
         );
     }
     let interactive = printer.is_interactive();
-    // `--modpack` 隐含整合包变体，避免用户同时写两个参数还写错
+    // `--modpack` 隐含整合包变体；但与显式给出的、非整合包的 `--variant`
+    // 同时出现是矛盾输入（文档承诺退出码 2），必须报错而不是静默覆盖。
+    if let (Some(raw), Some(pack)) = (variant, modpack)
+        && !is_modpack_flag(raw)
+    {
+        return Err(AppDiagnostic::usage(
+            crate::i18n::pick(
+                printer.lang(),
+                "server create: --modpack 与 --variant 不能同时指定".to_owned(),
+                "server create: --modpack and --variant are mutually exclusive".to_owned(),
+            ),
+            Some(crate::i18n::pick(
+                printer.lang(),
+                format!("--modpack {pack} 已隐含整合包变体，去掉 --variant {raw}"),
+                format!(
+                    "--modpack {pack} already implies the modpack variant; drop --variant {raw}"
+                ),
+            )),
+        )
+        .into());
+    }
     let variant = modpack.is_some().then_some("modrinth-modpack").or(variant);
 
     // 1. 用法闸（先于落库与联网，快速失败）
@@ -863,9 +883,12 @@ fn resolve_create_workspace(
     let svc = WorkspaceService::new(store.clone(), store);
     let all = svc.list()?;
 
-    let by_name = match workspace {
+    // `--workspace-name` 单独给出时也要查名称：名称已注册到别的路径就是矛盾
+    // 输入（文档承诺退出码 2），不能等到落库时才以「已存在」的 4 报出来。
+    let by_name = match workspace.or(workspace_name) {
         Some(sel) => match resolve_selector(&all, sel) {
             Ok(ws) => Some(ws),
+            // `--workspace-name` 的常规意图就是新建，未命中不报错
             Err(WorkspaceError::NotFound(_)) => None,
             Err(err) => return Err(err.into()),
         },

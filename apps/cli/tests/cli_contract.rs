@@ -391,6 +391,73 @@ fn workspace_purge_from_inside_dir_exits_4() {
     assert!(ws.join("workspace.toml").is_file(), "目录必须原样保留");
 }
 
+/// `server remove --purge` 在待删服务器目录内：退出 4，且中文下必须是中文提示
+///
+/// 回归：`ServerRegistryError::Workspace` → `WorkspaceError::CwdInsideTarget`
+/// 是两层 transparent 包装，`kind()` 在外层返回 `None`。入口没有逐层拆开时，
+/// 提示会掉回 `Display` 的硬编码英文，`--lang zh` 下混出英文。
+#[test]
+fn server_purge_from_inside_dir_is_localized() {
+    let home = temp_home();
+    let ws = home.path().join("wsdir");
+    let init = run(
+        home.path(),
+        &[
+            "workspace",
+            "init",
+            "--dir",
+            ws.to_str().expect("utf8"),
+            "--name",
+            "ws1",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(init.status.code(), Some(0), "stderr: {}", stderr(&init));
+
+    // 建一台「已登记但没装成核心」的服务器：`--version 99.99` 在上游不存在，
+    // 登记仍然落库（文档：下载失败保留已注册结果），退出码 3。这样不必真去
+    // 下载 JAR——cwd 闸在装核心之前就会命中。
+    let create = run_full(
+        home.path(),
+        home.path(),
+        &[
+            "server",
+            "create",
+            "s1",
+            "--variant",
+            "vanilla",
+            "--version",
+            "99.99",
+            "--output",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(
+        create.status.code(),
+        Some(3),
+        "预置服务器应「已登记但安装失败」: {}",
+        stderr(&create)
+    );
+    let srv = ws.join("servers").join("s1");
+    assert!(srv.is_dir(), "服务器目录必须已建好: {}", srv.display());
+
+    let out = run_full(
+        &srv,
+        home.path(),
+        &["server", "remove", "s1", "--purge", "--yes", "--lang", "zh"],
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(4), "stderr: {}", stderr(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains("当前工作目录在待删目录内"),
+        "中文下不得混出英文: {err}"
+    );
+    assert!(!err.contains("move out of it first"), "{err}");
+}
+
 /// `--purge` 时目录本就不存在：退出 0 注销登记，JSON 必须如实区分
 /// 「请求了删盘」与「磁盘真的删了」
 #[test]

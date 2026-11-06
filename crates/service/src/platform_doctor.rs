@@ -317,9 +317,9 @@ fn check_data_dir(data_dir: &Path, out: &mut Vec<PlatformFinding>) {
     }
     // 实际探一次写权限：只查元数据不足以发现只读挂载 / ACL 拒写
     let probe = path.join(".mcsup-doctor-write-probe");
-    match std::fs::write(&probe, b"") {
+    match crate::fs::write(&probe, b"") {
         Ok(()) => {
-            let _ = std::fs::remove_file(&probe);
+            let _ = crate::fs::remove_file(&probe);
         }
         Err(err) => out.push(PlatformFinding {
             check: PlatformCheck::DataDirNotWritable {

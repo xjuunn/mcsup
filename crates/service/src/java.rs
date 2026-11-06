@@ -323,7 +323,7 @@ impl JavaService {
         let dir_preexisting = install_dir.exists();
         // 建目录是阻塞 IO：放到阻塞线程池，不占 async 执行器
         let mk = install_dir.clone();
-        tokio::task::spawn_blocking(move || std::fs::create_dir_all(&mk))
+        tokio::task::spawn_blocking(move || crate::fs::create_dir_all(&mk))
             .await
             .map_err(|e| join_error(&e))?
             .map_err(|source| JavaError::io(&install_dir, source))?;
@@ -384,7 +384,7 @@ impl JavaService {
         // 照常注册（入口层见取消后静默退出，不打印成功）
         if cancel.is_cancelled() && !dir_preexisting {
             let dir = install_dir.clone();
-            let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&dir)).await;
+            let _ = tokio::task::spawn_blocking(move || crate::fs::remove_dir_all(&dir)).await;
             return Err(JavaError::Download(port::DownloadError::Cancelled));
         }
 
@@ -424,7 +424,7 @@ impl JavaService {
             if let Some(install_dir) = managed_install_dir(&self.java_root, &runtime.path)
                 && install_dir.exists()
             {
-                std::fs::remove_dir_all(&install_dir)
+                crate::fs::remove_dir_all(&install_dir)
                     .map_err(|source| JavaError::io(&install_dir, source))?;
                 prune_empty_parents(&install_dir, &self.java_root);
             }
@@ -477,7 +477,7 @@ fn prune_empty_parents(start: &Path, root: &Path) {
         if dir == root || !dir.starts_with(root) {
             break;
         }
-        if std::fs::remove_dir(&dir).is_err() {
+        if crate::fs::remove_dir(&dir).is_err() {
             break;
         }
         cursor = dir.parent().map(Path::to_path_buf);
@@ -500,9 +500,9 @@ fn managed_install_dir(java_root: &Path, home: &Path) -> Option<PathBuf> {
 /// 归档文件（可能数百 MB）总是删掉；`install_dir` 是本次新建的空壳时整个删除，
 /// 重装场景（目录本就存在）只删归档，旧运行时原样保留。
 fn cleanup_partial_install(install_dir: &Path, archive: &Path, dir_preexisting: bool) {
-    let _ = std::fs::remove_file(archive);
+    let _ = crate::fs::remove_file(archive);
     if !dir_preexisting {
-        let _ = std::fs::remove_dir_all(install_dir);
+        let _ = crate::fs::remove_dir_all(install_dir);
     }
 }
 
@@ -545,7 +545,7 @@ const CANCEL_POLL: Duration = Duration::from_millis(25);
 /// 目录、`*.tmp` 下载半成品会永久留在 `java_root`。下次安装开始时按年龄
 /// 清理：够老（[`STALE_TEMP_AGE`]）才删，不碰并发安装的进行中产物。
 fn sweep_stale_temp(java_root: &Path) {
-    let Ok(entries) = std::fs::read_dir(java_root) else {
+    let Ok(entries) = crate::fs::read_dir(java_root) else {
         return;
     };
     let now = SystemTime::now();
@@ -569,9 +569,9 @@ fn sweep_stale_temp(java_root: &Path) {
         }
         let path = entry.path();
         let removed = if path.is_dir() {
-            std::fs::remove_dir_all(&path)
+            crate::fs::remove_dir_all(&path)
         } else {
-            std::fs::remove_file(&path)
+            crate::fs::remove_file(&path)
         };
         match removed {
             Ok(()) => info!(path = %path.display(), "removed stale temp from previous run"),
@@ -602,7 +602,7 @@ fn locate_java_home(root: &Path) -> Option<PathBuf> {
     if let Some(home) = domain::java::find_jvm_home(root, Path::is_file) {
         return Some(home);
     }
-    let entries = std::fs::read_dir(root).ok()?;
+    let entries = crate::fs::read_dir(root).ok()?;
     entries
         .flatten()
         .find_map(|entry| domain::java::find_jvm_home(&entry.path(), Path::is_file))
@@ -660,13 +660,13 @@ fn extract_and_swap(
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
     let tmp = parent.join(format!(".tmp-{name}-{stamp}"));
-    std::fs::create_dir_all(&tmp).map_err(|source| JavaError::io(&tmp, source))?;
+    crate::fs::create_dir_all(&tmp).map_err(|source| JavaError::io(&tmp, source))?;
 
     let extract_result = extractor
         .extract(archive, &tmp)
         .map_err(|err| java_io_err(archive, err.to_string()));
     if let Err(err) = extract_result {
-        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = crate::fs::remove_dir_all(&tmp);
         return Err(err);
     }
 
@@ -675,7 +675,7 @@ fn extract_and_swap(
     let home = match require_jvm_home(archive, &tmp) {
         Ok(home) => home,
         Err(err) => {
-            let _ = std::fs::remove_dir_all(&tmp);
+            let _ = crate::fs::remove_dir_all(&tmp);
             return Err(err);
         }
     };
@@ -683,19 +683,19 @@ fn extract_and_swap(
     // 归档已在 tmp 中解压完毕：旧目录先改名备份，改名失败可原样回滚
     let bak = parent.join(format!(".bak-{name}-{stamp}"));
     let had_old = into.exists();
-    if had_old && let Err(source) = std::fs::rename(into, &bak) {
-        let _ = std::fs::remove_dir_all(&tmp);
+    if had_old && let Err(source) = crate::fs::rename(into, &bak) {
+        let _ = crate::fs::remove_dir_all(&tmp);
         return Err(JavaError::io(into, source));
     }
 
     // home 提升到目标目录根；home 就是 tmp 根时整树直接入位
     let promote = if home == tmp {
-        std::fs::rename(&tmp, into)
+        crate::fs::rename(&tmp, into)
     } else {
-        match std::fs::rename(&home, into) {
+        match crate::fs::rename(&home, into) {
             Ok(()) => {
                 // 包装目录残渣（归档顶层目录的其余内容）一并清掉
-                let _ = std::fs::remove_dir_all(&tmp);
+                let _ = crate::fs::remove_dir_all(&tmp);
                 Ok(())
             }
             Err(source) => Err(source),
@@ -704,13 +704,13 @@ fn extract_and_swap(
     if let Err(source) = promote {
         // 回滚：新目录没入位，把旧目录放回去
         if had_old {
-            let _ = std::fs::rename(&bak, into);
+            let _ = crate::fs::rename(&bak, into);
         }
-        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = crate::fs::remove_dir_all(&tmp);
         return Err(JavaError::io(into, source));
     }
     if had_old {
-        let _ = std::fs::remove_dir_all(&bak);
+        let _ = crate::fs::remove_dir_all(&bak);
     }
     Ok(into.to_path_buf())
 }
@@ -860,10 +860,10 @@ mod tests {
                 .parent()
                 .ok_or_else(|| port::DownloadError::Io(std::io::Error::other("no parent")))?;
             let bin = dir.join("bin");
-            std::fs::create_dir_all(&bin).map_err(port::DownloadError::Io)?;
-            std::fs::write(bin.join(domain::java::java_exe_name()), b"stub")
+            crate::fs::create_dir_all(&bin).map_err(port::DownloadError::Io)?;
+            crate::fs::write(bin.join(domain::java::java_exe_name()), b"stub")
                 .map_err(port::DownloadError::Io)?;
-            std::fs::write(&request.destination, b"stub").map_err(port::DownloadError::Io)?;
+            crate::fs::write(&request.destination, b"stub").map_err(port::DownloadError::Io)?;
             Ok(DownloadedArtifact {
                 path: request.destination.clone(),
                 size: 4,
@@ -897,7 +897,7 @@ mod tests {
             _progress: Option<&dyn ProgressSink>,
             _cancel: &CancellationToken,
         ) -> Result<DownloadedArtifact, port::DownloadError> {
-            std::fs::write(&request.destination, b"stub").map_err(port::DownloadError::Io)?;
+            crate::fs::write(&request.destination, b"stub").map_err(port::DownloadError::Io)?;
             Ok(DownloadedArtifact {
                 path: request.destination.clone(),
                 size: 4,
@@ -920,7 +920,7 @@ mod tests {
         }
 
         fn extract(&self, _archive: &Path, dest: &Path) -> Result<(), port::ExtractError> {
-            std::fs::create_dir_all(dest).map_err(|err| port::ExtractError(err.to_string()))?;
+            crate::fs::create_dir_all(dest).map_err(|err| port::ExtractError(err.to_string()))?;
             Ok(())
         }
     }
@@ -935,8 +935,8 @@ mod tests {
 
         fn extract(&self, _archive: &Path, dest: &Path) -> Result<(), port::ExtractError> {
             let home = dest.join("zulu27.28.101").join("bin");
-            std::fs::create_dir_all(&home).map_err(|err| port::ExtractError(err.to_string()))?;
-            std::fs::write(home.join(domain::java::java_exe_name()), b"stub")
+            crate::fs::create_dir_all(&home).map_err(|err| port::ExtractError(err.to_string()))?;
+            crate::fs::write(home.join(domain::java::java_exe_name()), b"stub")
                 .map_err(|err| port::ExtractError(err.to_string()))?;
             Ok(())
         }
@@ -948,9 +948,9 @@ mod tests {
     fn extract_and_swap_promotes_nested_home() {
         let tmp = tempfile::tempdir().expect("tmp");
         let into = tmp.path().join("zulu-27");
-        std::fs::create_dir_all(&into).expect("mkdir into");
+        crate::fs::create_dir_all(&into).expect("mkdir into");
         let archive = into.join("zulu.zip");
-        std::fs::write(&archive, b"stub").expect("archive");
+        crate::fs::write(&archive, b"stub").expect("archive");
 
         let home = extract_and_swap(&archive, &into, &NestedExtractor).expect("swap");
 
@@ -962,7 +962,7 @@ mod tests {
             "home must sit at install root"
         );
         // 包装目录与临时目录都不残留
-        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+        let leftovers: Vec<_> = crate::fs::read_dir(tmp.path())
             .expect("read_dir")
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
@@ -995,7 +995,7 @@ mod tests {
         });
         let extractor = Arc::new(FakeExtractor);
         let java_root = tmp.join("java");
-        std::fs::create_dir_all(&java_root).expect("mkdir");
+        crate::fs::create_dir_all(&java_root).expect("mkdir");
         (
             JavaService::new(
                 repo.clone(),
@@ -1070,7 +1070,7 @@ mod tests {
         let (service, _repo) = svc(tmp.path());
         service.scan(false, &mut |_| {}).expect("scan");
         let path = tmp.path().join("jdk21");
-        std::fs::create_dir_all(&path).expect("mkdir home");
+        crate::fs::create_dir_all(&path).expect("mkdir home");
         let outcome = service.uninstall(&path).expect("uninstall");
         assert_eq!(
             outcome,
@@ -1097,8 +1097,8 @@ mod tests {
         let java_root = tmp.path().join("java");
         let install_dir = java_root.join("zulu27");
         let home = install_dir.join("zulu27").join("Contents").join("Home");
-        std::fs::create_dir_all(home.join("bin")).expect("mkdir");
-        std::fs::write(
+        crate::fs::create_dir_all(home.join("bin")).expect("mkdir");
+        crate::fs::write(
             home.join("bin").join(domain::java::java_exe_name()),
             b"stub",
         )
@@ -1128,10 +1128,10 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let (service, repo) = svc(tmp.path());
         let java_root = tmp.path().join("java");
-        std::fs::create_dir_all(&java_root).expect("mkdir");
+        crate::fs::create_dir_all(&java_root).expect("mkdir");
         // 安装目录换成同名文件：remove_dir_all 必失败
         let install_dir = java_root.join("zulu27");
-        std::fs::write(&install_dir, "occupied").expect("file");
+        crate::fs::write(&install_dir, "occupied").expect("file");
         let home = install_dir.join("zulu27").join("Contents").join("Home");
         repo.upsert(&JavaRuntime {
             id: "zulu27".into(),
@@ -1181,7 +1181,7 @@ mod tests {
 
     /// `java_root` 下的全部残留名（失败清理类断言用）
     fn java_root_entries(tmp: &Path) -> Vec<String> {
-        std::fs::read_dir(tmp.join("java"))
+        crate::fs::read_dir(tmp.join("java"))
             .expect("read java_root")
             .flatten()
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
@@ -1244,8 +1244,8 @@ mod tests {
         let java_root = tmp.path().join("java");
         let install_dir = java_root.join("temurin-21");
         let sentinel = install_dir.join("keep.txt");
-        std::fs::create_dir_all(&install_dir).expect("mkdir");
-        std::fs::write(&sentinel, b"old install").expect("sentinel");
+        crate::fs::create_dir_all(&install_dir).expect("mkdir");
+        crate::fs::write(&sentinel, b"old install").expect("sentinel");
 
         let (service, _repo) = svc_with(tmp.path(), Arc::new(ArchiveOnlyDownloader));
         let cancel = CancellationToken::new();
@@ -1423,7 +1423,7 @@ mod tests {
                 _progress: Option<&dyn ProgressSink>,
                 _cancel: &CancellationToken,
             ) -> Result<DownloadedArtifact, port::DownloadError> {
-                std::fs::write(&request.destination, b"stub").map_err(port::DownloadError::Io)?;
+                crate::fs::write(&request.destination, b"stub").map_err(port::DownloadError::Io)?;
                 self.cancel.cancel();
                 Ok(DownloadedArtifact {
                     path: request.destination.clone(),
@@ -1465,10 +1465,10 @@ mod tests {
     fn sweep_stale_temp_removes_only_stale() {
         let tmp = tempfile::tempdir().expect("tmp");
         let java_root = tmp.path().join("java");
-        std::fs::create_dir_all(&java_root).expect("mkdir");
+        crate::fs::create_dir_all(&java_root).expect("mkdir");
 
         let stale = java_root.join(".partial.zip.123.1.tmp");
-        std::fs::write(&stale, b"half").expect("stale file");
+        crate::fs::write(&stale, b"half").expect("stale file");
         let handle = std::fs::File::options()
             .write(true)
             .open(&stale)
@@ -1478,11 +1478,11 @@ mod tests {
             .expect("backdate");
 
         let fresh = java_root.join(".fresh.zip.124.2.tmp");
-        std::fs::write(&fresh, b"half").expect("fresh file");
+        crate::fs::write(&fresh, b"half").expect("fresh file");
         let live_tmp = java_root.join(".tmp-zulu-27-20260101");
-        std::fs::create_dir_all(&live_tmp).expect("tmp dir");
+        crate::fs::create_dir_all(&live_tmp).expect("tmp dir");
         let install = java_root.join("zulu-27");
-        std::fs::create_dir_all(&install).expect("install dir");
+        crate::fs::create_dir_all(&install).expect("install dir");
 
         sweep_stale_temp(&java_root);
 
@@ -1514,8 +1514,8 @@ mod tests {
     fn locate_java_home_finds_nested_home() {
         let tmp = tempfile::tempdir().expect("tmp");
         let home = tmp.path().join("jdk-21");
-        std::fs::create_dir_all(home.join("bin")).expect("bin");
-        std::fs::write(
+        crate::fs::create_dir_all(home.join("bin")).expect("bin");
+        crate::fs::write(
             home.join("bin").join(domain::java::java_exe_name()),
             b"stub",
         )
@@ -1526,8 +1526,8 @@ mod tests {
     #[test]
     fn locate_java_home_finds_root_home() {
         let tmp = tempfile::tempdir().expect("tmp");
-        std::fs::create_dir_all(tmp.path().join("bin")).expect("bin");
-        std::fs::write(
+        crate::fs::create_dir_all(tmp.path().join("bin")).expect("bin");
+        crate::fs::write(
             tmp.path().join("bin").join(domain::java::java_exe_name()),
             b"stub",
         )
@@ -1540,13 +1540,13 @@ mod tests {
     fn require_jvm_home_rejects_foreign_platform_tree() {
         let dir = tempfile::tempdir().expect("tmp");
         let bin = dir.path().join("jdk-27").join("bin");
-        std::fs::create_dir_all(&bin).expect("bin");
+        crate::fs::create_dir_all(&bin).expect("bin");
         let foreign = if cfg!(target_os = "windows") {
             "java"
         } else {
             "java.exe"
         };
-        std::fs::write(bin.join(foreign), b"stub").expect("stub");
+        crate::fs::write(bin.join(foreign), b"stub").expect("stub");
 
         let archive = dir.path().join("foreign.zip");
         let err = require_jvm_home(&archive, dir.path()).expect_err("must fail");
@@ -1557,8 +1557,8 @@ mod tests {
     fn require_jvm_home_accepts_current_platform_tree() {
         let dir = tempfile::tempdir().expect("tmp");
         let bin = dir.path().join("jdk-27").join("bin");
-        std::fs::create_dir_all(&bin).expect("bin");
-        std::fs::write(bin.join(domain::java::java_exe_name()), b"stub").expect("stub");
+        crate::fs::create_dir_all(&bin).expect("bin");
+        crate::fs::write(bin.join(domain::java::java_exe_name()), b"stub").expect("stub");
 
         let archive = dir.path().join("ok.zip");
         let home = require_jvm_home(&archive, dir.path()).expect("home");

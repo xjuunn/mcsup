@@ -86,7 +86,7 @@ impl ServerPropsService {
     pub fn read(&self, name: &str) -> Result<PropsReport, PropsError> {
         let server = self.registry.get(name)?;
         let path = server.dir.join(PROPERTIES_FILE);
-        let text = match std::fs::read_to_string(&path) {
+        let text = match crate::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(err) if err.kind() == ErrorKind::NotFound => String::new(),
             Err(err) => return Err(FsError::io(&path, err).into()),
@@ -248,7 +248,7 @@ mod tests {
     fn fixture() -> (ServerPropsService, PathBuf, tempfile::TempDir) {
         let tmp = tempfile::tempdir().expect("tmp");
         let ws_path = tmp.path().join("ws");
-        std::fs::create_dir_all(ws_path.join("servers")).expect("mkdir");
+        crate::fs::create_dir_all(ws_path.join("servers")).expect("mkdir");
         let ws = Workspace {
             id: WorkspaceId::parse("550e8400-e29b-41d4-a716-446655440001").expect("uuid"),
             name: WorkspaceName::parse("ws01").expect("valid"),
@@ -298,13 +298,13 @@ mod tests {
             .expect("set");
         assert_eq!(report.properties.get("motd"), Some("hello"));
 
-        let text = std::fs::read_to_string(dir.join(PROPERTIES_FILE)).expect("file");
+        let text = crate::fs::read_to_string(dir.join(PROPERTIES_FILE)).expect("file");
         assert_eq!(text, "motd=hello\nmax-players=8\n");
 
         let reread = svc.read("alpha").expect("read");
         assert_eq!(reread.properties.get("max-players"), Some("8"));
         // 临时文件不残留
-        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        let leftovers: Vec<_> = crate::fs::read_dir(&dir)
             .expect("read dir")
             .filter_map(Result::ok)
             .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
@@ -321,7 +321,7 @@ mod tests {
             .expect_err("invalid key");
         assert!(matches!(err, PropsError::InvalidSet(_)));
 
-        let text = std::fs::read_to_string(dir.join(PROPERTIES_FILE)).expect("file");
+        let text = crate::fs::read_to_string(dir.join(PROPERTIES_FILE)).expect("file");
         assert_eq!(text, "motd=kept\n");
     }
 

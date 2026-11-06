@@ -32,12 +32,12 @@ pub(crate) fn write_atomic(path: &Path, text: &str) -> Result<(), FsError> {
         .file_name()
         .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
     let tmp = path.with_file_name(format!(".{name}.{}.{seq}.tmp", std::process::id()));
-    if let Err(err) = std::fs::write(&tmp, text) {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(err) = crate::fs::write(&tmp, text) {
+        let _ = crate::fs::remove_file(&tmp);
         return Err(FsError::io(&tmp, err));
     }
-    if let Err(err) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(err) = crate::fs::rename(&tmp, path) {
+        let _ = crate::fs::remove_file(&tmp);
         return Err(FsError::io(path, err));
     }
     Ok(())
@@ -51,16 +51,16 @@ mod tests {
     fn atomic_write_replaces_content_without_leaving_temp() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("mcsup.json");
-        std::fs::write(&path, "old").expect("seed");
+        crate::fs::write(&path, "old").expect("seed");
 
         write_atomic(&path, "{\"schema\":1}").expect("write");
         assert_eq!(
-            std::fs::read_to_string(&path).expect("read"),
+            crate::fs::read_to_string(&path).expect("read"),
             "{\"schema\":1}"
         );
 
         // 临时文件不能留在目录里：备份与 doctor 会把它们当业务文件
-        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        let leftovers: Vec<_> = crate::fs::read_dir(dir.path())
             .expect("read dir")
             .filter_map(Result::ok)
             .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
@@ -74,7 +74,7 @@ mod tests {
         let path = dir.path().join("workspace.toml");
         write_atomic(&path, "schema = 1\n").expect("write");
         assert_eq!(
-            std::fs::read_to_string(&path).expect("read"),
+            crate::fs::read_to_string(&path).expect("read"),
             "schema = 1\n"
         );
     }

@@ -195,6 +195,17 @@ Domain 不涉及 CLI、HTTP、REST、TUI、MCP、数据库、RPC / gRPC，必须
 
 Service 不负责 CLI 输出、HTTP Router、HTML、TUI 渲染、MCP 协议细节。
 
+**文件系统访问**：`service` 内部一切 `std::fs` 调用必须经 `crate::fs`（`crates/service/src/fs.rs`）
+这一个入口，不要在业务模块里直接写 `std::fs::xxx`。理由不是洁癖，是删除提示：
+`remove_dir_all` / `remove_dir` 在 Windows 上遇到目录被占用（`os error 32`）必须补一句
+「终端工作目录在其中 / 其他程序打开着」的可操作提示，散落写会漏。
+
+> 这是**收敛**不是**依赖倒置**：签名仍是 `std::io::Result`、仍操作真实磁盘。
+> 真正的方向是把它变成 `port` 里的 trait、由 `file` crate 实现、构造时注入，
+> 但那要改 50 个构造点（`ServerRegistry::new` 19 处、`WorkspaceService::new` 17 处…），
+> 属于独立事项。`crate::fs` 的函数与 `std::fs` 同名同参，因此可以逐文件推进、
+> 每批单独过门禁。
+
 **同步 / 异步契约**：`service` 同时存在两种编排接口，边界按「有没有网络
 IO」划分，不按模块划分：
 

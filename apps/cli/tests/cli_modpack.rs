@@ -172,6 +172,38 @@ fn modpack_variant_allows_missing_version() {
     );
 }
 
+/// `--modpack` 与显式非整合包 `--variant` 互斥：用法错误（2）
+///
+/// 文档承诺「`--modpack` 与 `--variant` 互斥（同用 → 退出码 2）」。曾经的实现
+/// 是静默让 `--modpack` 覆盖 `--variant`，用户写错变体不会被告知。
+#[test]
+fn modpack_and_variant_are_mutually_exclusive() {
+    let home = temp_home();
+    init_workspace(&home, "ws1");
+    let out = run(
+        home.path(),
+        &[
+            "server",
+            "create",
+            "mp",
+            "--variant",
+            "fabric",
+            "--modpack",
+            "fabulously-optimized",
+            "--version",
+            "1.21.1",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    let text = stderr(&out);
+    assert!(
+        text.contains("--modpack") && text.contains("--variant"),
+        "应指出两个参数互斥: {text}"
+    );
+}
+
 /// `--modpack` 与显式 `--variant` 不冲突（前者隐含后者）
 #[test]
 fn modpack_flag_implies_variant() {

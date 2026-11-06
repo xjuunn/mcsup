@@ -13,6 +13,29 @@ use std::path::{Path, PathBuf};
 /// 安装器产出的首个启动参数文件（[`LaunchSpec::Args`] 的第一项）
 pub const USER_ARGS: &str = "user_jvm_args.txt";
 
+/// `DirProbe::list` 返回的一项
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirEntry {
+    /// 子项完整路径
+    pub path: PathBuf,
+    /// 是否为目录
+    pub is_dir: bool,
+}
+
+/// 目录探测能力：布局判定属于领域，读盘属于宿主
+///
+/// [`installer_args_files`] 需要「这个文件在不在」「这个目录里有什么」两个
+/// 事实才能下判定。领域层不直接调 `std::fs`——那样它就无法脱离真实磁盘测试，
+/// 也无法在非本地场景复用。把这两个能力声明成 trait，由调用方（`service`）
+/// 注入实现，判定逻辑本身仍完整留在领域层。
+pub trait DirProbe {
+    /// `path` 是否为已存在的普通文件
+    fn is_file(&self, path: &Path) -> bool;
+
+    /// 列出 `dir` 的直接子项；读不到时返回 `None`
+    fn list(&self, dir: &Path) -> Option<Vec<DirEntry>>;
+}
+
 /// 安装器类变体的启动参数文件（相对服务器目录，按展开顺序）
 ///
 /// `Forge` 与 `NeoForge` 的安装器都会写出 `user_jvm_args.txt` 与平台专属的
@@ -30,10 +53,17 @@ pub const USER_ARGS: &str = "user_jvm_args.txt";
 ///
 /// 属于领域判定：这是「该变体该如何启动」，`service` 编排与 `runtime` 组装命令行
 /// 都要用同一份，放在任一实现层都会让另一层要么复制、要么反向依赖。
+///
+/// 需要看磁盘的部分经 `probe` 注入，领域层自己不做 IO。
 #[must_use]
-pub fn installer_args_files(variant: &ServerVariant, build: &str, dir: &Path) -> Vec<PathBuf> {
+pub fn installer_args_files<P: DirProbe + ?Sized>(
+    probe: &P,
+    variant: &ServerVariant,
+    build: &str,
+    dir: &Path,
+) -> Vec<PathBuf> {
     let mut files = Vec::new();
-    if !dir.join(USER_ARGS).is_file() {
+    if !probe.is_file(&dir.join(USER_ARGS)) {
         return files;
     }
     files.push(PathBuf::from(USER_ARGS));
@@ -41,13 +71,13 @@ pub fn installer_args_files(variant: &ServerVariant, build: &str, dir: &Path) ->
     let platform = platform_args_name();
     if let Some(base) = installer_maven_base(variant) {
         let relative = format!("{base}/{build}/{platform}");
-        if dir.join(&relative).is_file() {
+        if probe.is_file(&dir.join(&relative)) {
             files.push(PathBuf::from(relative));
             return files;
         }
     }
     // 兜底：上游若改了坐标或版本目录命名，仍要求所在目录就是本 build
-    if let Some(rel) = find_args_file(&dir.join("libraries"), platform, build) {
+    if let Some(rel) = find_args_file(probe, &dir.join("libraries"), platform, build) {
         files.push(rel);
     }
     files
@@ -80,16 +110,27 @@ pub fn installer_maven_base(variant: &ServerVariant) -> Option<&'static str> {
 ///
 /// 命中条件是「文件名匹配 **且** 所在目录名等于 `build`」——宁可找不到（由上层
 /// 报错）也不要拉起到另一个版本。深度受限，避免扫遍整个 libraries。
-fn find_args_file(root: &Path, name: &str, build: &str) -> Option<PathBuf> {
-    fn walk(dir: &Path, name: &str, build: &str, depth: usize) -> Option<PathBuf> {
+fn find_args_file<P: DirProbe + ?Sized>(
+    probe: &P,
+    root: &Path,
+    name: &str,
+    build: &str,
+) -> Option<PathBuf> {
+    fn walk<P: DirProbe + ?Sized>(
+        probe: &P,
+        dir: &Path,
+        name: &str,
+        build: &str,
+        depth: usize,
+    ) -> Option<PathBuf> {
         if depth == 0 {
             return None;
         }
-        let entries = std::fs::read_dir(dir).ok()?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if let Some(found) = walk(&path, name, build, depth - 1) {
+        let entries = probe.list(dir)?;
+        for entry in entries {
+            let path = entry.path;
+            if entry.is_dir {
+                if let Some(found) = walk(probe, &path, name, build, depth - 1) {
                     return Some(found);
                 }
             } else if path.file_name().and_then(|n| n.to_str()) == Some(name)
@@ -104,7 +145,7 @@ fn find_args_file(root: &Path, name: &str, build: &str) -> Option<PathBuf> {
         }
         None
     }
-    let found = walk(root, name, build, 8)?;
+    let found = walk(probe, root, name, build, 8)?;
     // 转成相对服务器目录：root 是 `{dir}/libraries`，取其父
     let server_dir = root.parent()?;
     found.strip_prefix(server_dir).ok().map(PathBuf::from)
@@ -262,60 +303,144 @@ mod tests {
     }
 
     // ---- 安装器产物的磁盘布局 ----
+    //
+    // 这些用例全部走内存 `FakeProbe`：领域层的判定不该依赖真实磁盘，否则
+    // 既跑不快，也没法表达「读不到目录」这类事实。
 
-    fn temp_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "mcsup-launch-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        ));
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        dir
+    /// 内存目录树：`is_file` 判定集合里的路径，`list` 按父目录分组
+    #[derive(Default)]
+    struct FakeProbe {
+        files: Vec<PathBuf>,
+        dirs: Vec<PathBuf>,
+    }
+
+    impl FakeProbe {
+        fn file(mut self, path: impl Into<PathBuf>) -> Self {
+            self.files.push(path.into());
+            self
+        }
+
+        fn dir(mut self, path: impl Into<PathBuf>) -> Self {
+            self.dirs.push(path.into());
+            self
+        }
+    }
+
+    impl DirProbe for FakeProbe {
+        fn is_file(&self, path: &Path) -> bool {
+            self.files.iter().any(|f| f == path)
+        }
+
+        fn list(&self, dir: &Path) -> Option<Vec<DirEntry>> {
+            if !self.dirs.iter().any(|d| d == dir) {
+                return None;
+            }
+            let mut out = Vec::new();
+            for d in &self.dirs {
+                if d != dir && d.parent() == Some(dir) {
+                    out.push(DirEntry {
+                        path: d.clone(),
+                        is_dir: true,
+                    });
+                }
+            }
+            for f in &self.files {
+                if f.parent() == Some(dir) {
+                    out.push(DirEntry {
+                        path: f.clone(),
+                        is_dir: false,
+                    });
+                }
+            }
+            Some(out)
+        }
     }
 
     /// 坐标命中：用户参数 + `libraries/net/minecraftforge/forge/<build>/{platform}_args.txt`
     #[test]
     fn finds_installer_args_by_maven_coordinate() {
-        let dir = temp_dir();
-        std::fs::write(dir.join(USER_ARGS), b"#").expect("user args");
+        let dir = Path::new("/srv/mc");
         let rel = format!(
             "libraries/net/minecraftforge/forge/26.3-66.1.0/{}",
             platform_args_name()
         );
-        let target = dir.join(&rel);
-        std::fs::create_dir_all(target.parent().expect("parent")).expect("mkdir");
-        std::fs::write(&target, b"#").expect("args");
+        let probe = FakeProbe::default()
+            .file(dir.join(USER_ARGS))
+            .dir(dir.join("libraries"))
+            .file(dir.join(&rel));
 
-        let files = installer_args_files(&ServerVariant::Forge, "26.3-66.1.0", &dir);
+        let files = installer_args_files(&probe, &ServerVariant::Forge, "26.3-66.1.0", dir);
         assert_eq!(files, vec![PathBuf::from(USER_ARGS), PathBuf::from(rel)]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 缺用户参数文件 = 安装失败（返回空，由上层报错）
     #[test]
     fn missing_user_args_yields_nothing() {
-        let dir = temp_dir();
-        assert!(installer_args_files(&ServerVariant::Forge, "26.3", &dir).is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = Path::new("/srv/mc");
+        let probe = FakeProbe::default();
+        assert!(
+            installer_args_files(&probe, &ServerVariant::Forge, "26.3", dir).is_empty(),
+            "缺 user_jvm_args.txt 时必须返回空，交由上层报安装失败"
+        );
     }
 
     /// 兜底扫描只认本 build 的目录，不会拉起到旧版本
     #[test]
     fn fallback_only_accepts_matching_build() {
-        let dir = temp_dir();
-        std::fs::write(dir.join(USER_ARGS), b"#").expect("user args");
-        let stale = dir
-            .join("libraries/net/minecraftforge/forge/26.3-OLD")
-            .join(platform_args_name());
-        std::fs::create_dir_all(stale.parent().expect("parent")).expect("mkdir");
-        std::fs::write(&stale, b"#").expect("stale");
+        let dir = Path::new("/srv/mc");
+        let stale_dir = dir.join("libraries/net/minecraftforge/forge/26.3-OLD");
+        let probe = FakeProbe::default()
+            .file(dir.join(USER_ARGS))
+            .dir(dir.join("libraries"))
+            .dir(dir.join("libraries/net/minecraftforge"))
+            .dir(dir.join("libraries/net/minecraftforge/forge"))
+            .dir(stale_dir.clone())
+            .file(stale_dir.join(platform_args_name()));
 
         // build 不匹配 → 只剩用户参数文件
-        let files = installer_args_files(&ServerVariant::Forge, "26.3", &dir);
+        let files = installer_args_files(&probe, &ServerVariant::Forge, "26.3", dir);
+        assert_eq!(
+            files,
+            vec![PathBuf::from(USER_ARGS)],
+            "兜底扫描不得命中其他 build 的目录"
+        );
+    }
+
+    /// 兜底能得到正确结果时，返回相对服务器目录的路径
+    #[test]
+    fn fallback_returns_path_relative_to_server_dir() {
+        let dir = Path::new("/srv/mc");
+        // 坐标前缀不匹配（forge 之外的路径），只能走兜底
+        let build_dir = dir.join("libraries/renamed/forge/26.3");
+        let probe = FakeProbe::default()
+            .file(dir.join(USER_ARGS))
+            .dir(dir.join("libraries"))
+            .dir(dir.join("libraries/renamed"))
+            .dir(dir.join("libraries/renamed/forge"))
+            .dir(build_dir.clone())
+            .file(build_dir.join(platform_args_name()));
+
+        let files = installer_args_files(&probe, &ServerVariant::Forge, "26.3", dir);
+        assert_eq!(
+            files,
+            vec![
+                PathBuf::from(USER_ARGS),
+                PathBuf::from(format!(
+                    "libraries/renamed/forge/26.3/{}",
+                    platform_args_name()
+                ))
+            ]
+        );
+    }
+
+    /// 读不到目录时退化为「找不到」，不 panic
+    #[test]
+    fn unreadable_libraries_dir_falls_back_to_user_args_only() {
+        let dir = Path::new("/srv/mc");
+        let probe = FakeProbe::default().file(dir.join(USER_ARGS));
+
+        let files = installer_args_files(&probe, &ServerVariant::Forge, "26.3", dir);
         assert_eq!(files, vec![PathBuf::from(USER_ARGS)]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 非安装器类变体没有坐标前缀

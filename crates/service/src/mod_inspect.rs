@@ -303,7 +303,7 @@ impl ModInspectService {
 /// 依赖，但 modkit 不该依赖它。
 fn sha1_of(path: &Path) -> Result<String, std::io::Error> {
     use sha1::{Digest, Sha1};
-    let bytes = std::fs::read(path)?;
+    let bytes = crate::fs::read(path)?;
     let digest = Sha1::digest(&bytes);
     // sha1 0.11 的 GenericArray 不实现 LowerHex，手动转十六进制
     Ok(digest.iter().fold(String::with_capacity(40), |mut acc, b| {
@@ -323,7 +323,7 @@ fn sha1_of(path: &Path) -> Result<String, std::io::Error> {
 /// 目录不可读时返回 [`FsError`]。
 pub fn collect_jars(dir: &Path) -> Result<Vec<PathBuf>, FsError> {
     let mut out = Vec::new();
-    let entries = std::fs::read_dir(dir).map_err(|err| FsError::io(dir, err))?;
+    let entries = crate::fs::read_dir(dir).map_err(|err| FsError::io(dir, err))?;
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_file()

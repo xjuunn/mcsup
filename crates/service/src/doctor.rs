@@ -370,7 +370,7 @@ impl DoctorService {
         }
 
         let servers_dir = ws.path.join("servers");
-        let entries = match std::fs::read_dir(&servers_dir) {
+        let entries = match crate::fs::read_dir(&servers_dir) {
             Ok(entries) => entries,
             Err(err) => {
                 push(
@@ -415,7 +415,7 @@ impl DoctorService {
                 // file_type 读不出来时仍按名字比对，不用吞掉整项
                 continue;
             };
-            if file_type.is_symlink() && std::fs::metadata(&path).is_err() {
+            if file_type.is_symlink() && crate::fs::metadata(&path).is_err() {
                 push(out, CheckKind::DanglingLink { path });
                 continue;
             }

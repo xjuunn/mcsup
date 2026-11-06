@@ -182,6 +182,16 @@ pub(crate) fn structured_message(err: &anyhow::Error, lang: Lang) -> Option<Stri
         if let Some(message) = wrapped_message(cause, lang) {
             return Some(message);
         }
+        // `ServerRegistryError::Workspace` 是 transparent 包装：`kind()` 对它的
+        // 返回是 `None`，内层 `WorkspaceError` 又不在 `chain()` 里。必须当场
+        // 拆开，否则 `server remove --purge` 在 cwd 位于目标目录内时的提示会
+        // 掉回硬编码英文（`--lang zh` 下成为英文）。包装层级可能不止一层：
+        // `LifecycleError::Registry` / `PropsError::Registry` 等都会再套一次。
+        if let Some(ws) = nested_workspace_error(cause)
+            && let Some(kind) = ws.kind()
+        {
+            return Some(crate::i18n::workspace(&kind, lang));
+        }
         if let Some(reg) = cause.downcast_ref::<mcsup::service::ServerRegistryError>()
             && let Some(kind) = reg.kind()
         {
@@ -197,6 +207,59 @@ pub(crate) fn structured_message(err: &anyhow::Error, lang: Lang) -> Option<Stri
         {
             return Some(message);
         }
+    }
+    None
+}
+
+/// 从透明包装链里掏出内层 `WorkspaceError`
+///
+/// 各 service 错误都用 `#[error(transparent)] Registry(ServerRegistryError)`
+/// 包一层，`ServerRegistryError::Workspace(WorkspaceError)` 再包一层。两层都
+/// 不进 `chain()`，`kind()` 也在外层返回 `None`，只能逐层手动拆。
+fn nested_workspace_error<'a>(
+    cause: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a mcsup::service::WorkspaceError> {
+    use mcsup::service::{
+        BackupError, PropsError, ServerRegistryError, SettingsError, WorkspaceError,
+    };
+
+    let registry = |reg: &'a ServerRegistryError| match reg {
+        ServerRegistryError::Workspace(ws) => Some(ws),
+        _ => None,
+    };
+
+    if let Some(ws) = cause.downcast_ref::<WorkspaceError>() {
+        return Some(ws);
+    }
+    for reg in [
+        cause.downcast_ref::<ServerRegistryError>(),
+        cause.downcast_ref::<PropsError>().and_then(|e| match e {
+            PropsError::Registry(reg) => Some(reg),
+            _ => None,
+        }),
+        cause.downcast_ref::<BackupError>().and_then(|e| match e {
+            BackupError::Registry(reg) => Some(reg),
+            _ => None,
+        }),
+        cause.downcast_ref::<SettingsError>().and_then(|e| match e {
+            SettingsError::Registry(reg) => Some(reg),
+            _ => None,
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(ws) = registry(reg) {
+            return Some(ws);
+        }
+    }
+
+    // `LifecycleError` / `InstallJarError` / `JavaError` 不在此列：它们的
+    // `Registry` 变体由各自的 `category()` 判级，文案另走 `lifecycle_message`。
+    if let Some(mcsup::service::LifecycleError::Registry(reg)) =
+        cause.downcast_ref::<mcsup::service::LifecycleError>()
+    {
+        return registry(reg);
     }
     None
 }

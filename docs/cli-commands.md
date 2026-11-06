@@ -413,7 +413,7 @@ SSH 起远端 agent + 本地 `ssh -L` 隧道，每条命令临时建立），
 | --- | --- | --- |
 | `doctor` | `mcsup doctor [--only <kind,...>] [--strict]` | 平台环境自检：数据目录可写、配置可解析、Java 可用、来源已装配。完全离线，不发任何网络请求。error 级非零退出；`--only` 按检查项标识过滤（只影响展示与退出码，检查本身全跑），`--strict` 让 warning 也算失败 |
 | `config` | `mcsup config show \| set <key> <value> \| unset <key> \| edit` | 查看/修改/重置/编辑平台配置；`edit` 打开 `$VISUAL` / `$EDITOR`，非交互下退 2 |
-| `update` | `mcsup update [--version <v>]` | 升级 mcsup 自身 |
+| `update` | `mcsup update` | 升级 mcsup 自身。**尚未实现**：入口直接返回「尚未实现」（退出码 1）。自升级需要 release 产物地址与校验策略，先排期再实现；`--version <v>` 的取值语义（跟随该版本）在实现时一并定义 |
 | `completions` | `mcsup completions <zsh\|bash\|fish>` | 生成 shell 补全脚本 |
 | `version` | `mcsup version` | 版本、构建与协议信息（`mcsup --version` 只打一行 `mcsup <ver>`，两者互不影响） |
 | `help` | `mcsup help [<group>]` | 分组帮助 |

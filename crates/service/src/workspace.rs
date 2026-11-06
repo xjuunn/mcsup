@@ -565,7 +565,7 @@ impl WorkspaceService {
             if !is_deletable(&ws) {
                 return Err(WorkspaceError::NotAWorkspace(ws.path.clone()));
             }
-            std::fs::remove_dir_all(&ws.path)
+            crate::fs::remove_dir_all(&ws.path)
                 .map_err(|err| WorkspaceError::io(&ws.path, deletion_hint(err)))?;
             disk_purged = true;
         }
@@ -789,7 +789,7 @@ fn is_deletable(ws: &Workspace) -> bool {
 fn create_layout(dir: &Path) -> Result<(), WorkspaceError> {
     for sub in ["servers", "backups/cas", "backups/snapshots", "cache"] {
         let path = dir.join(sub);
-        std::fs::create_dir_all(&path).map_err(|err| WorkspaceError::io(&path, err))?;
+        crate::fs::create_dir_all(&path).map_err(|err| WorkspaceError::io(&path, err))?;
     }
     Ok(())
 }
@@ -799,7 +799,7 @@ fn read_marker(dir: &Path) -> Result<Option<MarkerToml>, WorkspaceError> {
     if !path.exists() {
         return Ok(None);
     }
-    let text = std::fs::read_to_string(&path).map_err(|err| WorkspaceError::io(&path, err))?;
+    let text = crate::fs::read_to_string(&path).map_err(|err| WorkspaceError::io(&path, err))?;
     let marker: MarkerToml = toml::from_str(&text)
         .map_err(|err| WorkspaceError::marker(path.clone(), err.to_string()))?;
     if marker.schema != MARKER_SCHEMA {
@@ -821,7 +821,7 @@ fn write_marker(dir: &Path, marker: &MarkerToml) -> Result<(), WorkspaceError> {
 }
 
 fn is_empty_dir(dir: &Path) -> Result<bool, WorkspaceError> {
-    let entries = std::fs::read_dir(dir).map_err(|err| WorkspaceError::io(dir, err))?;
+    let entries = crate::fs::read_dir(dir).map_err(|err| WorkspaceError::io(dir, err))?;
     for entry in entries {
         let entry = entry.map_err(|err| WorkspaceError::io(dir, err))?;
         let name = entry.file_name();
@@ -875,7 +875,7 @@ pub(crate) fn ensure_outside(cwd: &Path, target: &Path) -> Result<(), WorkspaceE
 
 /// 解析符号链接后的物理路径；不存在或不可解析时原样返回
 pub(crate) fn physical_path(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    crate::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// `target` 是否落在 `root` 之内（先解析符号链接再比较）
@@ -1220,8 +1220,8 @@ mod tests {
     fn init_rejects_non_empty_dir() {
         let (svc, tmp) = svc();
         let dir = tmp.path().join("full");
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        std::fs::write(dir.join("keep.txt"), "x").expect("file");
+        crate::fs::create_dir_all(&dir).expect("mkdir");
+        crate::fs::write(dir.join("keep.txt"), "x").expect("file");
         let err = svc.init(&dir, Some("ws")).expect_err("reject");
         assert!(matches!(err, WorkspaceError::NotEmpty(_)));
     }
@@ -1230,9 +1230,9 @@ mod tests {
     fn init_ignores_noise_files() {
         let (svc, tmp) = svc();
         let dir = tmp.path().join("noisy");
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        std::fs::write(dir.join(".DS_Store"), "x").expect("noise");
-        std::fs::write(dir.join("Thumbs.db"), "x").expect("noise");
+        crate::fs::create_dir_all(&dir).expect("mkdir");
+        crate::fs::write(dir.join(".DS_Store"), "x").expect("noise");
+        crate::fs::write(dir.join("Thumbs.db"), "x").expect("noise");
         assert!(svc.init(&dir, Some("ws01")).is_ok());
     }
 
@@ -1268,11 +1268,11 @@ mod tests {
     fn init_recovers_interrupted_marker() {
         let (svc, tmp) = svc();
         let dir = tmp.path().join("half");
-        std::fs::create_dir_all(dir.join("servers")).expect("mkdir");
+        crate::fs::create_dir_all(dir.join("servers")).expect("mkdir");
         let id = "550e8400-e29b-41d4-a716-4466554400aa";
         let marker =
             format!("schema = 1\nid = \"{id}\"\nname = \"half\"\ncreated_at = 1700000000\n");
-        std::fs::write(dir.join("workspace.toml"), marker).expect("marker");
+        crate::fs::write(dir.join("workspace.toml"), marker).expect("marker");
         let outcome = svc.init(&dir, None).expect("recover");
         let InitOutcome::Recovered(ws) = outcome else {
             unreachable!("expected Recovered, got {outcome:?}")
@@ -1291,7 +1291,7 @@ mod tests {
         let dir = tmp.path().join("ws");
         svc.init(&dir, Some("ws01")).expect("init");
         let before = svc.resolve("ws01").expect("resolve");
-        std::fs::remove_file(dir.join("workspace.toml")).expect("rm marker");
+        crate::fs::remove_file(dir.join("workspace.toml")).expect("rm marker");
 
         let outcome = svc.init(&dir, None).expect("restore");
         let InitOutcome::MarkerRestored(ws) = outcome else {
@@ -1312,8 +1312,8 @@ mod tests {
     fn init_still_rejects_unregistered_non_empty_dir() {
         let (svc, tmp) = svc();
         let dir = tmp.path().join("foreign");
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        std::fs::write(dir.join("keep.txt"), "x").expect("file");
+        crate::fs::create_dir_all(&dir).expect("mkdir");
+        crate::fs::write(dir.join("keep.txt"), "x").expect("file");
 
         let err = svc.init(&dir, None).expect_err("必须拒绝");
         assert!(matches!(err, WorkspaceError::NotEmpty(_)), "got {err:?}");
@@ -1528,7 +1528,7 @@ mod tests {
         let (svc, tmp) = svc();
         let dir = tmp.path().join("ws");
         svc.init(&dir, Some("ws01")).expect("init");
-        std::fs::remove_dir_all(&dir).expect("rmdir");
+        crate::fs::remove_dir_all(&dir).expect("rmdir");
 
         let out = svc
             .remove("ws01", true, &tmp.path().join("elsewhere"))
@@ -1581,7 +1581,7 @@ mod tests {
         let dir = tmp.path().join("ws");
         svc.init(&dir, Some("ws01")).expect("init");
         let sibling = tmp.path().join("ws2");
-        std::fs::create_dir_all(&sibling).expect("mkdir");
+        crate::fs::create_dir_all(&sibling).expect("mkdir");
 
         svc.remove("ws01", true, &sibling).expect("remove");
         assert!(!dir.exists());
@@ -1601,8 +1601,8 @@ mod tests {
         svc.init(&real, Some("ws01")).expect("init");
         std::os::unix::fs::symlink(&real, &link).expect("symlink");
 
-        std::fs::create_dir_all(real.join("servers")).expect("mkdir");
-        let physical = std::fs::canonicalize(real.join("servers")).expect("physical");
+        crate::fs::create_dir_all(real.join("servers")).expect("mkdir");
+        let physical = crate::fs::canonicalize(real.join("servers")).expect("physical");
         let err = svc.remove("ws01", true, &physical).expect_err("必须拒绝");
         assert!(
             matches!(err, WorkspaceError::CwdInsideTarget { .. }),
@@ -1638,7 +1638,7 @@ mod tests {
         let (svc, tmp) = svc();
         let dir = tmp.path().join("ws");
         svc.init(&dir, Some("ws01")).expect("init");
-        std::fs::remove_file(dir.join("workspace.toml")).expect("rm marker");
+        crate::fs::remove_file(dir.join("workspace.toml")).expect("rm marker");
 
         let err = svc
             .ensure_purgeable("ws01", tmp.path())
@@ -1669,8 +1669,8 @@ mod tests {
         svc.init(&dir, Some("ws01")).expect("init");
         // 换成同名普通文件：不是目录也不像工作区，删除闸先拒绝；记录必须保留，
         // 用户删除该文件后重试即可
-        std::fs::remove_dir_all(&dir).expect("rmdir");
-        std::fs::write(&dir, "occupied").expect("file");
+        crate::fs::remove_dir_all(&dir).expect("rmdir");
+        crate::fs::write(&dir, "occupied").expect("file");
 
         let err = svc
             .remove("ws01", true, &tmp.path().join("elsewhere"))
@@ -1698,7 +1698,7 @@ mod tests {
             .expect("init");
         // 目录名对不上记录（模拟 path 被手改成某个别的目录）
         let foreign = tmp.path().join("other");
-        std::fs::create_dir_all(&foreign).expect("mkdir");
+        crate::fs::create_dir_all(&foreign).expect("mkdir");
         repo.items.lock().expect("lock")[0].path = foreign.clone();
 
         let err = svc
