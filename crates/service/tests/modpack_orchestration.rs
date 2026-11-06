@@ -40,6 +40,10 @@ struct FakeModpackSource {
     metadata_fails: bool,
     /// 收到过的哈希批次（按调用顺序）
     queried: Arc<Mutex<Vec<Vec<String>>>>,
+    /// 「文件名 → 当前权威 sha1」，供 `authoritative_hashes` 返回
+    authoritative: Vec<(String, String)>,
+    /// `authoritative_hashes` 被调用过的次数
+    authoritative_calls: Arc<Mutex<usize>>,
 }
 
 impl FakeModpackSource {
@@ -49,7 +53,21 @@ impl FakeModpackSource {
             client_only: Vec::new(),
             metadata_fails: false,
             queried: Arc::new(Mutex::new(Vec::new())),
+            authoritative: Vec::new(),
+            authoritative_calls: Arc::new(Mutex::new(0)),
         }
+    }
+
+    /// 让 `authoritative_hashes` 对 `filename` 返回 `sha1`
+    fn authoritative(mut self, filename: &str, sha1_hex: &str) -> Self {
+        self.authoritative
+            .push((filename.to_owned(), sha1_hex.to_owned()));
+        self
+    }
+
+    /// 共享的 authoritative 调用计数
+    fn authoritative_calls(&self) -> Arc<Mutex<usize>> {
+        self.authoritative_calls.clone()
     }
 
     /// 指定上游判成仅客户端的哈希
@@ -114,6 +132,20 @@ impl ModpackSource for FakeModpackSource {
             .cloned()
             .collect())
     }
+
+    async fn authoritative_hashes(
+        &self,
+        hints: &[(String, String)],
+    ) -> Result<std::collections::HashMap<String, String>, SourceError> {
+        *self.authoritative_calls.lock().expect("calls") += 1;
+        let wanted: HashSet<&str> = hints.iter().map(|(_, name)| name.as_str()).collect();
+        Ok(self
+            .authoritative
+            .iter()
+            .filter(|(name, _)| wanted.contains(name.as_str()))
+            .map(|(name, sha1)| (name.clone(), sha1.clone()))
+            .collect())
+    }
 }
 
 /// 不提供元数据能力的来源：走 trait 默认实现，必须保持「按清单 env 装」的旧行为
@@ -175,10 +207,13 @@ impl ModpackExtractor for FakeExtractor {
     }
 }
 
-/// 假下载器：记录请求、按预期大小写盘、可注入失败
+/// 假下载器：记录请求、按预期大小写盘、可注入失败或清单哈希过期
 struct FakeDownloader {
     requests: Arc<Mutex<Vec<DownloadRequest>>>,
     fail: bool,
+    /// 「文件名 → 实际字节的 sha1」：配置后，若请求的 expected 与之不符则返回
+    /// `ChecksumMismatch { expected: 清单值, actual: 实际值 }`，模拟上游重新上传
+    actual_hashes: Vec<(String, String)>,
 }
 
 impl FakeDownloader {
@@ -186,6 +221,7 @@ impl FakeDownloader {
         Self {
             requests: Arc::new(Mutex::new(Vec::new())),
             fail: false,
+            actual_hashes: Vec::new(),
         }
     }
 
@@ -193,7 +229,23 @@ impl FakeDownloader {
         Self {
             requests: Arc::new(Mutex::new(Vec::new())),
             fail: true,
+            actual_hashes: Vec::new(),
         }
+    }
+
+    /// 指定某文件的实际字节 sha1（与清单不符时首轮报 mismatch）
+    fn with_actual(mut self, filename: &str, sha1_hex: &str) -> Self {
+        self.actual_hashes
+            .push((filename.to_owned(), sha1_hex.to_owned()));
+        self
+    }
+
+    fn actual_for(&self, request: &DownloadRequest) -> Option<&str> {
+        let name = request.destination.file_name()?.to_str()?;
+        self.actual_hashes
+            .iter()
+            .find(|(file, _)| file == name)
+            .map(|(_, sha1)| sha1.as_str())
     }
 }
 
@@ -208,6 +260,16 @@ impl ArtifactDownloader for FakeDownloader {
         self.requests.lock().expect("seen").push(request.clone());
         if self.fail {
             return Err(DownloadError::Io(std::io::Error::other("injected")));
+        }
+        // 模拟上游重新上传：实际 sha1 与请求的 expected 不符时报 mismatch
+        if let Some(actual) = self.actual_for(request).map(str::to_owned)
+            && let Some(expected) = request.expected.as_ref()
+            && expected.hex() != actual
+        {
+            return Err(DownloadError::ChecksumMismatch {
+                expected: expected.hex().to_owned(),
+                actual,
+            });
         }
         let parent = request.destination.parent().expect("parent");
         std::fs::create_dir_all(parent).expect("mkdir");
@@ -891,6 +953,167 @@ async fn unknown_source_in_prepared_is_reported() {
         .expect_err("来源不在注册表里应报错");
     assert!(
         matches!(&err, ModpackError::UnknownSource(name) if name == "ghost"),
+        "{err:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// 清单哈希过期（上游文件被重新上传）的回退
+// ---------------------------------------------------------------------------
+
+/// 清单 sha1 与下载字节不符，但上游权威 sha1 与字节一致：接受并记入 `stale_hashes`
+#[tokio::test]
+async fn stale_manifest_hash_accepted_when_upstream_agrees() {
+    let stale = sha1(0xaa); // 清单里打包时的旧哈希
+    let current = sha1(0xbb); // 上游当前文件的真实哈希
+    let index = ModpackIndex::new(
+        1,
+        "minecraft",
+        "1.0.0",
+        "Pack",
+        deps(&[("minecraft", "1.20.1"), ("forge", "47.3.12")]),
+        vec![file_with_sha1(
+            "mods/caelus.jar",
+            4,
+            EnvTag::Required,
+            &stale,
+        )],
+    )
+    .expect("index");
+    let source = FakeModpackSource::new().authoritative("caelus.jar", &current);
+    let calls = source.authoritative_calls();
+    let downloader = FakeDownloader::ok().with_actual("caelus.jar", &current);
+    let requests = downloader.requests.clone();
+    let service = service_with_source(index, Vec::new(), downloader, Arc::new(source));
+    let dir = scratch("stale-ok");
+
+    let prepared = service
+        .prepare(
+            "P",
+            ModpackInstallOptions::new(&dir),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("prepare");
+    let applied = service
+        .apply(&prepared, &dir, None, &CancellationToken::new())
+        .await
+        .expect("应接受上游权威哈希并完成安装");
+
+    assert_eq!(applied.stale_hashes, vec!["mods/caelus.jar".to_owned()]);
+    assert_eq!(applied.downloaded_bytes, 4);
+    assert!(dir.join("mods/caelus.jar").is_file());
+    // 首个请求是 .mrpack，其后两次是该文件：首轮用清单哈希、次轮用权威哈希
+    let reqs = requests.lock().expect("reqs");
+    let file_reqs: Vec<_> = reqs
+        .iter()
+        .filter(|r| r.destination.ends_with("mods/caelus.jar"))
+        .collect();
+    assert_eq!(file_reqs.len(), 2, "应在回源后按权威哈希重下一次");
+    assert_eq!(
+        file_reqs[0]
+            .expected
+            .as_ref()
+            .map(domain::server::artifact::Checksum::hex),
+        Some(stale.as_str())
+    );
+    assert_eq!(
+        file_reqs[1]
+            .expected
+            .as_ref()
+            .map(domain::server::artifact::Checksum::hex),
+        Some(current.as_str())
+    );
+    assert_eq!(*calls.lock().expect("calls"), 1);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 清单 sha1 不符，且上游权威 sha1 也不符：如实报 ChecksumMismatch，不放宽
+#[tokio::test]
+async fn stale_manifest_hash_still_fails_when_upstream_also_disagrees() {
+    let stale = sha1(0xaa);
+    let current = sha1(0xbb);
+    let some_other = sha1(0xcc); // 下载字节的真实哈希，权威表里也没有
+    let index = ModpackIndex::new(
+        1,
+        "minecraft",
+        "1.0.0",
+        "Pack",
+        deps(&[("minecraft", "1.20.1"), ("forge", "47.3.12")]),
+        vec![file_with_sha1(
+            "mods/broken.jar",
+            4,
+            EnvTag::Required,
+            &stale,
+        )],
+    )
+    .expect("index");
+    // 上游权威表给的是 current，但实际下载到的字节是 some_other
+    let source = FakeModpackSource::new().authoritative("broken.jar", &current);
+    let downloader = FakeDownloader::ok().with_actual("broken.jar", &some_other);
+    let service = service_with_source(index, Vec::new(), downloader, Arc::new(source));
+    let dir = scratch("stale-fail");
+
+    let prepared = service
+        .prepare(
+            "P",
+            ModpackInstallOptions::new(&dir),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("prepare");
+    let err = service
+        .apply(&prepared, &dir, None, &CancellationToken::new())
+        .await
+        .expect_err("权威哈希也不符时必须报错");
+    assert!(
+        matches!(
+            err,
+            ModpackError::Download(DownloadError::ChecksumMismatch { .. })
+        ),
+        "{err:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 来源不支持回源（默认实现返回空 map）：清单哈希过期时保持原样报错
+#[tokio::test]
+async fn stale_manifest_hash_fails_without_authoritative_support() {
+    let stale = sha1(0xaa);
+    let current = sha1(0xbb);
+    let index = ModpackIndex::new(
+        1,
+        "minecraft",
+        "1.0.0",
+        "Pack",
+        deps(&[("minecraft", "1.20.1"), ("forge", "47.3.12")]),
+        vec![file_with_sha1("mods/m.jar", 4, EnvTag::Required, &stale)],
+    )
+    .expect("index");
+    // LegacyModpackSource 不实现 authoritative_hashes
+    let source = LegacyModpackSource(FakeModpackSource::new());
+    let downloader = FakeDownloader::ok().with_actual("m.jar", &current);
+    let service = service_with_source(index, Vec::new(), downloader, Arc::new(source));
+    let dir = scratch("stale-legacy");
+
+    let prepared = service
+        .prepare(
+            "P",
+            ModpackInstallOptions::new(&dir),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("prepare");
+    let err = service
+        .apply(&prepared, &dir, None, &CancellationToken::new())
+        .await
+        .expect_err("没有权威哈希能力时应报原始 mismatch");
+    assert!(
+        matches!(
+            err,
+            ModpackError::Download(DownloadError::ChecksumMismatch { .. })
+        ),
         "{err:?}"
     );
     std::fs::remove_dir_all(&dir).ok();

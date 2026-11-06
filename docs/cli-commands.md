@@ -346,8 +346,17 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 `.mrpack` 由内置 zip 解析直接解开，不调用系统 `unzip`，归档内的 UTF-8
 文件名按原样落盘。
 
+清单里的 sha1 是**打包时的快照**。整合包作者或上游事后重新上传同一版本的文件
+（修 bug、换文件）后，清单哈希就会过期，使下载本应成功却卡在
+`checksum mismatch`。遇到这种情况，安装会用清单里的下载地址回源（Modrinth
+`GET /version/{id}`）取**当前**权威 sha1：若与下载到的字节一致，就接受该文件并
+继续安装（人类可读输出与 JSON 的 `stale_hashes` 都会提示数量），只有权威哈希也
+不符时才如实报错。来源不支持回源或地址不是 Modrinth CDN 时，保持原有的严格校验
+行为。
+
 建好的整合包服务与 `server create` 建的服务是同一种对象，后续运维都走
-`mcsup server ...`。
+`mcsup server ...`；若建站时因上游波动导致核心或文件下载失败，可用
+`mcsup server install <name>` 重试。
 
 ## mcsup java（机器级 JVM 运行时）
 

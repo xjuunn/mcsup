@@ -702,6 +702,9 @@ pub enum Response {
         reused: usize,
         /// 按上游元数据判定为仅客户端、已跳过的文件数
         skipped_client_only: usize,
+        /// 清单哈希过期、按上游权威哈希接受的文件数
+        #[serde(default)]
+        stale_hashes: usize,
     },
     /// Java 卸载结果
     JavaUninstalled {
@@ -1255,6 +1258,7 @@ mod tests {
                 downloaded_bytes: 4_096,
                 reused: 30,
                 skipped_client_only: 2,
+                stale_hashes: 0,
             },
             Response::JavaUninstalled {
                 path: "/opt/java/temurin-21".to_owned(),

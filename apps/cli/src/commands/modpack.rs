@@ -698,9 +698,11 @@ pub(crate) async fn install_modpack(
         downloaded_bytes: applied.downloaded_bytes,
         reused: applied.reused,
         skipped_client_only: applied.skipped_client_only,
+        stale_hashes: applied.stale_hashes.len(),
         path: server_dir.display().to_string(),
     };
-    let note = skipped_note(printer.lang(), applied.skipped_client_only);
+    let mut note = skipped_note(printer.lang(), applied.skipped_client_only);
+    note.push_str(&stale_note(printer.lang(), applied.stale_hashes.len()));
     let human = crate::i18n::pick(
         printer.lang(),
         format!(
@@ -743,9 +745,11 @@ pub(crate) fn report_remote_applied(
         downloaded_bytes: result.downloaded_bytes,
         reused: result.reused,
         skipped_client_only: result.skipped_client_only,
+        stale_hashes: result.stale_hashes,
         path,
     };
-    let note = skipped_note(lang, result.skipped_client_only);
+    let mut note = skipped_note(lang, result.skipped_client_only);
+    note.push_str(&stale_note(lang, result.stale_hashes));
     let human = crate::i18n::pick(
         lang,
         format!(
@@ -781,6 +785,23 @@ fn skipped_note(lang: crate::locale::Lang, skipped: usize) -> String {
     )
 }
 
+/// 「清单哈希已过期但按上游权威哈希接受」的提示后缀；没有时为空串
+///
+/// 整合包里的哈希是打包时的快照，上游文件被重新上传后就会对不上。这类文件
+/// 已按上游当前哈希校验通过并安装，但仍应提示，便于用户知道清单与上游漂移。
+fn stale_note(lang: crate::locale::Lang, stale: usize) -> String {
+    if stale == 0 {
+        return String::new();
+    }
+    crate::i18n::pick(
+        lang,
+        format!("，{stale} 个文件的清单哈希已过期，已按上游当前哈希校验后安装"),
+        format!(
+            ", {stale} file(s) had stale manifest hashes; accepted after verifying against the upstream hash"
+        ),
+    )
+}
+
 /// 整合包布置结果的 JSON 形状
 #[derive(serde::Serialize)]
 struct ModpackInstallJson<'a> {
@@ -795,6 +816,8 @@ struct ModpackInstallJson<'a> {
     reused: usize,
     /// 按上游元数据判定为仅客户端、已跳过的模组数
     skipped_client_only: usize,
+    /// 清单哈希过期、但按上游权威哈希接受的文件数
+    stale_hashes: usize,
     path: String,
 }
 

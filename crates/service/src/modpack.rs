@@ -319,6 +319,8 @@ impl ModpackService {
         let mut reused = 0;
         let mut downloaded_bytes = 0;
         let mut skipped_client_only = 0;
+        // 清单哈希过期、但上游权威哈希与下载字节一致的文件路径
+        let mut stale_hashes: Vec<String> = Vec::new();
         for file in prepared.index.downloadable_server_files() {
             let target = safe_target(server_dir, &file.path)?;
             if file
@@ -347,14 +349,13 @@ impl ModpackService {
                 continue;
             }
             let url = first_https(&file.downloads)?;
-            let request = DownloadRequest {
-                location: url,
-                destination: target,
-                expected: file.hashes.sha1_checksum(),
-                expected_size: (file.size > 0).then_some(file.size),
-            };
-            let downloaded = self.downloader.download(&request, progress, cancel).await?;
-            downloaded_bytes += downloaded.size;
+            let fetched = self
+                .fetch_one_file(source.as_ref(), file, url, &target, progress, cancel)
+                .await?;
+            downloaded_bytes += fetched.bytes;
+            if fetched.stale {
+                stale_hashes.push(file.path.clone());
+            }
         }
 
         info!(
@@ -364,6 +365,7 @@ impl ModpackService {
             downloaded_bytes,
             reused,
             skipped_client_only,
+            stale_hashes = stale_hashes.len(),
             "modpack applied"
         );
         Ok(ModpackApplied {
@@ -371,6 +373,7 @@ impl ModpackService {
             downloaded_bytes,
             reused,
             skipped_client_only,
+            stale_hashes,
         })
     }
 
@@ -391,6 +394,74 @@ impl ModpackService {
         self.downloader.download(&request, progress, cancel).await?;
         Ok(())
     }
+
+    /// 下载单个清单文件，必要时按上游权威哈希修正过期清单哈希
+    ///
+    /// 先用清单里的 sha1 强校验下载；一旦报 `ChecksumMismatch`，说明上游文件
+    /// 被重新上传、清单哈希过期。此时回源取**当前**权威哈希：若与刚下载的字节
+    /// 一致则接受并按权威哈希重下一次（仍强校验），否则如实抛出原错误。
+    async fn fetch_one_file(
+        &self,
+        source: &dyn ModpackSource,
+        file: &ModpackFile,
+        url: url::Url,
+        target: &Path,
+        progress: Option<&dyn ProgressSink>,
+        cancel: &CancellationToken,
+    ) -> Result<FetchedFile, ModpackError> {
+        let expected_size = (file.size > 0).then_some(file.size);
+        let request = DownloadRequest {
+            location: url.clone(),
+            destination: target.to_path_buf(),
+            expected: file.hashes.sha1_checksum(),
+            expected_size,
+        };
+        match self.downloader.download(&request, progress, cancel).await {
+            Ok(downloaded) => Ok(FetchedFile {
+                bytes: downloaded.size,
+                stale: false,
+            }),
+            Err(port::DownloadError::ChecksumMismatch { expected, actual }) => {
+                let Some(authoritative) =
+                    authoritative_sha1(source, &file.downloads, &file.path, cancel).await?
+                else {
+                    return Err(port::DownloadError::ChecksumMismatch { expected, actual }.into());
+                };
+                if authoritative != actual {
+                    return Err(port::DownloadError::ChecksumMismatch { expected, actual }.into());
+                }
+                info!(
+                    path = %file.path,
+                    manifest_sha1 = %expected,
+                    upstream_sha1 = %actual,
+                    "modpack file hash is stale in manifest; accepted upstream hash"
+                );
+                let retry = DownloadRequest {
+                    location: url,
+                    destination: target.to_path_buf(),
+                    expected: Some(domain::server::artifact::Checksum::new(
+                        domain::server::artifact::ChecksumAlgorithm::Sha1,
+                        authoritative,
+                    )),
+                    expected_size,
+                };
+                let downloaded = self.downloader.download(&retry, progress, cancel).await?;
+                Ok(FetchedFile {
+                    bytes: downloaded.size,
+                    stale: true,
+                })
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+}
+
+/// 单文件下载结果
+struct FetchedFile {
+    /// 本次写入的字节数
+    bytes: u64,
+    /// 是否因清单哈希过期、按上游权威哈希接受
+    stale: bool,
 }
 
 /// 已取回并解析的整合包
@@ -452,7 +523,7 @@ impl ModpackPrepared {
 }
 
 /// 布置结果
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModpackApplied {
     /// 实际安装的服务端文件数
     pub file_count: usize,
@@ -462,6 +533,8 @@ pub struct ModpackApplied {
     pub reused: usize,
     /// 按上游元数据判定为仅客户端、已跳过的文件数
     pub skipped_client_only: usize,
+    /// 清单哈希已过期、但按上游权威哈希接受的文件路径
+    pub stale_hashes: Vec<String>,
 }
 
 /// 加载器名 → 服务端变体
@@ -520,6 +593,35 @@ async fn existing_matches(path: &Path, file: &ModpackFile) -> bool {
     match tokio::fs::metadata(path).await {
         Ok(meta) if file.size > 0 => meta.len() == file.size,
         _ => false,
+    }
+}
+
+/// 回源取某文件的当前权威 sha1
+///
+/// 清单哈希过期时调用：用下载地址 + 文件名作为线索向来源查询上游**当前**
+/// 哈希。返回 `None` 表示来源不支持、或查不到该文件，此时调用方应退回原来的
+/// `ChecksumMismatch`，不做任何放宽。
+///
+/// 查询本身失败（网络 / 上游异常）不视为硬错误：这只是一次尽力而为的核对，
+/// 失败时同样返回 `None`，让原错误如实抛出。
+async fn authoritative_sha1(
+    source: &dyn ModpackSource,
+    downloads: &[String],
+    path: &str,
+    _cancel: &CancellationToken,
+) -> Result<Option<String>, ModpackError> {
+    let Some(url) = downloads.first() else {
+        return Ok(None);
+    };
+    let filename = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path)
+        .to_owned();
+    let hints = [(url.clone(), filename.clone())];
+    match source.authoritative_hashes(&hints).await {
+        Ok(mut map) => Ok(map.remove(&filename)),
+        Err(_) => Ok(None),
     }
 }
 

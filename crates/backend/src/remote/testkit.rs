@@ -345,6 +345,7 @@ pub(crate) mod mcsup_agent_shim {
                         downloaded_bytes: 1024,
                         reused: 1,
                         skipped_client_only: 0,
+                        stale_hashes: 0,
                     }
                 }
                 Request::PropsGet { .. } => Response::Props {

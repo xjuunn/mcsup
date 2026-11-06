@@ -229,6 +229,67 @@ impl ModpackSource for ModrinthModpackSource {
         }
         Ok(client_only)
     }
+
+    async fn authoritative_hashes(
+        &self,
+        hints: &[(String, String)],
+    ) -> Result<HashMap<String, String>, SourceError> {
+        // 清单里的下载地址形如
+        //   https://cdn.modrinth.com/data/{proj}/versions/{version_id}/{filename}
+        // 版本 ID 是权威哈希的入口：拿到它即可查 `GET /version/{id}`，逐文件
+        // 取当前 sha1。按版本 ID 归并，避免同一版本被查多次。
+        let mut by_version: HashMap<String, Vec<String>> = HashMap::new();
+        for (url, filename) in hints {
+            if let Some(version_id) = modrinth_version_id_from_url(url) {
+                by_version
+                    .entry(version_id)
+                    .or_default()
+                    .push(filename.clone());
+            }
+        }
+        let mut out = HashMap::new();
+        for (version_id, filenames) in by_version {
+            let Ok(version) = self.inner.version(&version_id).await else {
+                // 单个版本查失败不应让整次安装失败：调用方据此退回原
+                // ChecksumMismatch，行为与未实现本能力一致
+                continue;
+            };
+            let current: HashMap<&str, &super::manifest::VersionFile> = version
+                .files
+                .iter()
+                .map(|file| (file.filename.as_str(), file))
+                .collect();
+            for filename in filenames {
+                if let Some(sha1) = current
+                    .get(filename.as_str())
+                    .and_then(|file| file.hashes.sha1.as_deref())
+                    && sha1.len() == 40
+                    && sha1.chars().all(|c| c.is_ascii_hexdigit())
+                {
+                    out.insert(filename, sha1.to_ascii_lowercase());
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// 从 Modrinth CDN 下载地址里取出 version ID
+///
+/// 只认 `cdn.modrinth.com/data/{proj}/versions/{id}/{file}` 形状；其它来源
+/// （第三方站、自建镜像）返回 `None`，由调用方退回原错误。
+#[must_use]
+fn modrinth_version_id_from_url(url: &str) -> Option<String> {
+    let url = url.parse::<url::Url>().ok()?;
+    if url.host_str() != Some("cdn.modrinth.com") {
+        return None;
+    }
+    let segments: Vec<&str> = url.path_segments()?.filter(|s| !s.is_empty()).collect();
+    // data / {proj} / versions / {id} / {file}
+    match segments.as_slice() {
+        ["data", _proj, "versions", id, ..] => Some((*id).to_owned()),
+        _ => None,
+    }
 }
 
 /// 从「哈希 → 版本」与「项目详情」里挑出仅客户端条目
@@ -758,5 +819,37 @@ mod tests {
             .await
             .expect("空输入不应发请求");
         assert!(marked.is_empty());
+    }
+
+    /// CDN 下载地址 → version ID：只认 cdn.modrinth.com 的规范形状
+    #[test]
+    fn version_id_from_url_parses_canonical_cdn() {
+        assert_eq!(
+            modrinth_version_id_from_url(
+                "https://cdn.modrinth.com/data/40FYwb4z/versions/mRry0DgY/caelus-forge-3.2.0%2B1.20.1.jar"
+            ),
+            Some("mRry0DgY".to_owned())
+        );
+        // 查询串 / 额外路径段不影响
+        assert_eq!(
+            modrinth_version_id_from_url(
+                "https://cdn.modrinth.com/data/A/versions/vID/file.jar?download=1"
+            ),
+            Some("vID".to_owned())
+        );
+    }
+
+    /// 非 cdn.modrinth.com 或非规范路径一律返回 None（第三方站 / 镜像）
+    #[test]
+    fn version_id_from_url_rejects_foreign_urls() {
+        assert_eq!(
+            modrinth_version_id_from_url("https://example.com/data/A/versions/vID/x.jar"),
+            None
+        );
+        assert_eq!(
+            modrinth_version_id_from_url("https://cdn.modrinth.com/data/A/x.jar"),
+            None
+        );
+        assert_eq!(modrinth_version_id_from_url("not a url"), None);
     }
 }

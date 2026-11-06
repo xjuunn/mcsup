@@ -238,6 +238,27 @@ pub trait ModpackSource: ContentSourceInfo + Send + Sync {
     async fn client_only_hashes(&self, _hashes: &[String]) -> Result<HashSet<String>, SourceError> {
         Ok(HashSet::new())
     }
+
+    /// 按清单里的下载地址重新取上游的**权威**文件哈希
+    ///
+    /// `.mrpack` 里的 sha1 是打包时写死的快照，上游文件被重新上传（作者修
+    /// 版本、替换文件）后就会过期，使本应成功的下载卡在 `ChecksumMismatch`。
+    /// 当某文件用清单哈希校验失败时，Service 用本方法按下载地址回到上游取
+    /// **当前**哈希：若新哈希与下载到的字节一致，则接受该文件并告警；都不
+    /// 一致才判失败。
+    ///
+    /// `hints` 是 `(下载地址, 文件名)` 列表；返回 `文件名 → 当前 sha1`（十六进
+    /// 制小写）。上游不支持该能力时返回空 map，让调用方按原样报错。
+    ///
+    /// # Errors
+    ///
+    /// 上游不可达或响应异常时返回 [`SourceError`]（调用方据此退回原错误）
+    async fn authoritative_hashes(
+        &self,
+        _hints: &[(String, String)],
+    ) -> Result<std::collections::HashMap<String, String>, SourceError> {
+        Ok(std::collections::HashMap::new())
+    }
 }
 
 /// 整合包搜索页
