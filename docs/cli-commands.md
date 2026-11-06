@@ -61,14 +61,12 @@
 已实现命令全部遵守上面的补参规则：`server create / install / start / stop /
 restart / status / console / send / logs / props / set / remove / version`、
 `server backup create / list / restore / delete / verify / prune`、
+`server mod list / install / remove / update / outdated`、
 `workspace init / use / remove`、`java install / uninstall`、
 `config set / unset`。
 
-尚未实现的命令（`server mod`）参数声明已按规则改为可选，但入口在 service
-能力落地前直接返回「尚未实现」，因此缺失必填参数时给的是未实现错误而非
-补参交互。service 层实现后，入口只需接上已有的 `require_server_name` /
-补参组件即可。`remote` 已全部接入（无参数局域网发现除外，显式报「尚未
-实现」）。
+`remote` 已全部接入（无参数局域网发现除外，显式报「尚未实现」）。`update`
+（自升级）仍未实现，入口直接返回「尚未实现」。
 
 ### 界面语言
 
@@ -224,13 +222,30 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 
 ## mcsup server mod（Mod，属于服务端）
 
+操作**某台服务端**的 `mods/`（或 `--kind plugin` 的 `plugins/`）目录。与
+`mcsup mod inspect` 互补：这里回答「这台服务端装了什么、该装什么」，那里回答
+「这个 jar 能不能进服务端」。
+
 | 子命令 | 用法 | 说明 |
 | --- | --- | --- |
-| `list` | `mcsup server mod list <name>` | Mod 列表与版本、分组状态 |
-| `install` | `mcsup server mod install <name> <spec>` | `spec` 支持 ID/URL/`@search 关键词`；先显示依赖与冲突再确认 |
-| `remove` | `mcsup server mod remove <name> <mod>` | 卸载单个 Mod |
-| `update` | `mcsup server mod update <name> [<mod>]` | 更新指定或全部（先 dry-run 列出变更） |
-| `outdated` | `mcsup server mod outdated <name>` | 可更新清单 |
+| `list` | `mcsup server mod list [<name>] [--project-info] [--source <s>] [--outdated]` | 扫描 `mods/` 的直接子项并做本地检查（加载器、客/服归属、依赖闭包、风险）。默认**不联网**也不建表：目录本身是唯一权威，手工丢进去的文件同样会被列出。`--project-info` 才算 SHA1 反查上游项目与版本；`--outdated` 在此基础上逐项查候选版本，只列有更新的条目 |
+| `install` | `mcsup server mod install [<name>] [<spec>] [--version <id>] [--kind <k>] [--source <s>] [--prerelease] [--force] [--dry-run]` | `spec` 支持项目 ID / slug、`https://modrinth.com/<type>/<slug>` 链接、`@search <关键词>`（交互搜索）。两阶段：先算计划并展示（来源、版本、落点、是否替换），确认后才下载。`--version` 精确指定版本，缺省按服务端加载器与 MC 版本自动挑最优候选 |
+| `remove` | `mcsup server mod remove [<name>] [<mod>] [--dry-run]` | 按文件名（可省略 `.jar`）或 modid 定位；modid 命中多个文件时不猜，列出候选并退 2 |
+| `update` | `mcsup server mod update [<name>] [<mod>] [--source <s>] [--force] [--dry-run]` | 识别 → 逐项查候选 → `decide_update` → 展示清单 → 确认后逐个安装。不给 `<mod>` 时处理全部可更新项 |
+| `outdated` | `mcsup server mod outdated [<name>] [--source <s>]` | 只读版 `update`：只列可更新项，不下载 |
+
+约定：
+
+- **服务端运行中一律拒绝改动**（计划与落盘都拒，退出码 4）。判定问 supervisor
+  的实时状态，不猜「应该没在跑」；状态取不到时按失败处理，不当作已停机。
+- **落盘顺序**：下载到 `<server>/.mcsup-staging/<n>/mods/` → 用 `ZipModInspector`
+  检查 → 检查通过才原子替换进 `mods/`。暂存目录在用完（含失败）后删除。
+- **检查拒绝时不落盘**（退出码 4）：明确不可用于服务端、或缺少必需依赖。
+  `--force` 放行，但风险与依据照样打印，不让强制变成静默。
+- 上游不认识某个文件时 `update` / `outdated` 把它列进「无法判断」，不当作
+  「已是最新」。
+- `remote` 条目（`--origin` 指向远端服务器）在本地直接拒绝（退出码 2）：
+  远端 mod 管理需要协议帧，排在后续阶段。
 
 ## mcsup mod（Mod 检测，不属于具体服务端）
 

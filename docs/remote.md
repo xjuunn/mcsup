@@ -308,7 +308,8 @@ error: “web” 存在于多个位置
 | `server link --origin` | `ServerLink`：符号链接、marker 与入库全在对端 |
 | `server create --origin`（交互） | `ServerVariants` / `ServerVersions` 取对端变体与版本，再走普通创建 |
 
-仍只有本地实现的：`server mod`、`modpack` 的独立子命令（尚未提供）。
+仍只有本地实现的：`server mod`（远端条目在本地直接拒绝，退出码 2——mod 相关
+帧尚未定义，见实施阶段）、`modpack` 的独立子命令（尚未提供）。
 `server create --origin` 的整合包变体仍要求显式 `--modpack`（清单要在对端读，
 远端侧不提供交互式整合包搜索）。
 

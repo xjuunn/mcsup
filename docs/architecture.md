@@ -296,6 +296,54 @@ Provider 对外提供两个互不重叠的端口：
                         └──→ port::ArtifactDownloader   provider::modrinth
 ```
 
+## 服务端 Mod 管理
+
+`server mod` 是「某台服务端装了什么、该装什么」，与 `mod inspect`（「这个 jar
+能不能进服务端」）互补。前者要有服务端记录（目录、加载器、MC 版本）与运行态，
+后者只面对文件。
+
+| 层 | 职责 |
+| --- | --- |
+| `domain::mod_` | 客/服归属、依赖闭包、风险等级、`InstallVerdict`（`Blocking` 到底拦不拦） |
+| `domain::server::content` | 类别 / 落点 / 候选排序；`ContentIdentity`（哈希反查结果）、`decide_update`（版本 ID 比较） |
+| `port::mod_::ModInspector` | 读一个 jar 的能力面；`port::content::ContentSource::by_hash` |
+| `port::Backend` | 运行态从 supervisor 取，判定「现在能不能改 disk」 |
+| `service::ModService` | list / plan_install / install / remove / plan_update / apply_update |
+| `apps/cli` | 只解析参数、调服务、渲染 |
+
+不变量：
+
+- **状态从磁盘读，不建表。** `mods/` 目录是唯一权威：建「已装 mod」表必然
+  出现「表说装了、盘上没有」，用户手工丢进去的文件也会漏掉。代价是每次列表都
+  要读 zip，联网识别要现算 SHA1——所以识别与查更新是显式可选项（`--project-info`
+  / `--outdated`）。
+- **两阶段。** `plan_install` / `plan_update` 零写入，入口展示后确认才
+  `install` / `apply_update`；`--dry-run` 停在第一步。计划里带版本、落点与
+  是否替换，用户确认的是**具体动作**而非「大概装点什么」。
+- **先暂存再换入。** 下载落到 `<server>/.mcsup-staging/<n>/mods/`，用
+  `ZipModInspector` 检查，通过才 `service::atomic::replace_file` 换进正式位置
+  （同卷 rename，旧文件先挪开、失败回滚）。半截文件与「装进去必然起不来」的
+  文件不会留在 `mods/` 里。
+- **运行中一律拒绝。** 服务端正在读这些文件时改动等于随机崩溃。判定问
+  `Backend::supervisor()` 的实时状态（与 `server start` 同源），不猜「目录里
+  有没有锁文件」；状态取不到按失败处理。
+- **判定不可用于服务端时不落盘**，`--force` 才放行，且风险与依据照样输出——
+  强制不等于静默。
+- **更新靠哈希反查。** `by_hash` → 识别项目与版本 → `candidates` → `decide_update`。
+  上游不认识的文件进「无法判断」，绝不当作「已是最新」。
+
+```
+入口 apps/cli ──→ service::ModService ──→ service::ContentService ──→ port::content
+                        │                        └─→ port::ArtifactDownloader
+                        ├─→ port::mod_::ModInspector（本地检查）
+                        ├─→ port::Backend::supervisor（运行态）
+                        └─→ service::ServerRegistry（目录 / 变体 / MC 版本）
+```
+
+暂不作为本次范围：依赖求解（`ContentSource::dependencies` + 领域侧闭包规划）、
+远端 mod 管理（协议 `Mod*` 帧 + agent 侧落地）。二者都不改变上面的分层，
+只是在上表里各加一格。
+
 ## Modrinth 整合包（开服变体）
 
 整合包不是一种「服务端软件」，而是**一份服务端布置方案**。它作为内置变体
