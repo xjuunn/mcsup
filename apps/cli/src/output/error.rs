@@ -81,6 +81,7 @@ fn category_of(cause: &(dyn std::error::Error + 'static)) -> Option<ErrorCategor
         service::BackupError,
         service::DoctorError,
         service::ModpackError,
+        service::ModError,
         service::ContentError,
         service::ResolveError,
         service::ConfigValueError,

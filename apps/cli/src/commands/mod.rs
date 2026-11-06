@@ -9,6 +9,7 @@ mod modpack;
 mod origin;
 mod props;
 mod remote;
+mod server_mod;
 mod server_ops;
 mod server_remote;
 mod settings;
@@ -340,7 +341,7 @@ async fn server(action: ServerAction, cfg: &ConfigFile, printer: Printer) -> Res
             settings::version(&name, printer)
         }
         ServerAction::Backup { action } => backup(action, printer).await,
-        ServerAction::Mod { .. } => err("mod"),
+        ServerAction::Mod { action } => server_mod::run(action, printer).await,
     }
 }
 

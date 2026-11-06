@@ -727,6 +727,133 @@ pub(crate) fn server_mod() -> &'static str {
     t("服务端 Mod", "server mods")
 }
 
+// ---- server mod（管理服务端 mods/） ----
+
+#[must_use]
+pub(crate) fn server_mod_list() -> &'static str {
+    t(
+        "列出服务端 mods/ 里的 mod（默认只做本地检查）",
+        "list the mods in a server's mods/ directory (local checks only by default)",
+    )
+}
+
+#[must_use]
+pub(crate) fn server_mod_install() -> &'static str {
+    t(
+        "从 Modrinth 安装 mod 到服务端（下载到暂存区、检查通过后才落盘）",
+        "install a mod into a server from Modrinth (staged download, written only after checks pass)",
+    )
+}
+
+#[must_use]
+pub(crate) fn server_mod_remove() -> &'static str {
+    t(
+        "从服务端删除一个 mod（按文件名或 modid）",
+        "remove a mod from a server (by file name or modid)",
+    )
+}
+
+#[must_use]
+pub(crate) fn server_mod_update() -> &'static str {
+    t(
+        "按上游最新兼容版本更新服务端的 mod",
+        "update a server's mods to the latest compatible versions",
+    )
+}
+
+#[must_use]
+pub(crate) fn server_mod_outdated() -> &'static str {
+    t(
+        "列出有可用更新的 mod（只读，不下载）",
+        "list mods with available updates (read-only, no download)",
+    )
+}
+
+#[must_use]
+pub(crate) fn server_mod_name_arg() -> &'static str {
+    t(
+        "服务端名称，缺省时交互选择",
+        "server name; picked interactively when omitted",
+    )
+}
+
+#[must_use]
+pub(crate) fn server_mod_spec_arg() -> &'static str {
+    t(
+        "项目 ID / slug / modrinth.com 链接；也可写 '@search 关键词' 交互搜索",
+        "project id, slug or modrinth.com link; use '@search <keyword>' to search interactively",
+    )
+}
+
+#[must_use]
+pub(crate) fn server_mod_selector_arg() -> &'static str {
+    t(
+        "文件名或 modid，缺省时全部处理",
+        "file name or modid; all entries when omitted",
+    )
+}
+
+#[must_use]
+pub(crate) fn server_mod_version_arg() -> &'static str {
+    t(
+        "指定版本 ID，缺省按服务端加载器与 MC 版本自动挑选",
+        "explicit version id; otherwise picked for the server's loader and MC version",
+    )
+}
+
+#[must_use]
+pub(crate) fn server_mod_kind_arg() -> &'static str {
+    t(
+        "内容类别：mod / plugin / datapack（默认 mod）",
+        "content kind: mod / plugin / datapack (default: mod)",
+    )
+}
+
+#[must_use]
+pub(crate) fn content_source_arg() -> &'static str {
+    t(
+        "内容来源名，缺省用默认来源（Modrinth）",
+        "content source name; defaults to the default source (Modrinth)",
+    )
+}
+
+#[must_use]
+pub(crate) fn server_mod_project_info_arg() -> &'static str {
+    t(
+        "联网识别每个文件的上游项目与版本（要算 SHA1 并访问上游）",
+        "identify each file's upstream project and version (hashes files and calls the source)",
+    )
+}
+
+#[must_use]
+pub(crate) fn server_mod_outdated_arg() -> &'static str {
+    t(
+        "只列出有可用更新的条目（隐含 --project-info）",
+        "only show entries with available updates (implies --project-info)",
+    )
+}
+
+#[must_use]
+pub(crate) fn server_mod_prerelease_arg() -> &'static str {
+    t("允许测试版 / 内测版", "allow beta and alpha versions")
+}
+
+#[must_use]
+pub(crate) fn server_mod_force_arg() -> &'static str {
+    t(
+        "即使检查判定不可用于服务端也安装（会同时打印判定依据）",
+        "install even when the server-side check refuses it (the evidence is still printed)",
+    )
+}
+
+#[must_use]
+pub(crate) fn server_mod_dry_run_arg() -> &'static str {
+    t(
+        "只展示计划，不下载也不落盘",
+        "show the plan without downloading or writing anything",
+    )
+}
+
 // ---- mod（检测） ----
 
 #[must_use]

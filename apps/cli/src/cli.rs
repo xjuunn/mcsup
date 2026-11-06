@@ -481,36 +481,69 @@ pub(crate) enum ModInspectAction {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum ModAction {
+    #[command(about = crate::meta::server_mod_list())]
     #[command(visible_alias = "ls")]
     List {
-        #[arg(value_name = "NAME")]
+        #[arg(value_name = "NAME", help = crate::meta::server_mod_name_arg())]
         name: Option<String>,
+        #[arg(long, help = crate::meta::server_mod_project_info_arg())]
+        project_info: bool,
+        #[arg(long, value_name = "SOURCE", help = crate::meta::content_source_arg())]
+        source: Option<String>,
+        #[arg(long, help = crate::meta::server_mod_outdated_arg())]
+        outdated: bool,
     },
+    #[command(about = crate::meta::server_mod_install())]
     #[command(visible_alias = "in")]
     Install {
-        #[arg(value_name = "NAME")]
+        #[arg(value_name = "NAME", help = crate::meta::server_mod_name_arg())]
         name: Option<String>,
-        #[arg(value_name = "SPEC")]
+        #[arg(value_name = "SPEC", help = crate::meta::server_mod_spec_arg())]
         spec: Option<String>,
+        #[arg(long, value_name = "VERSION", help = crate::meta::server_mod_version_arg())]
+        version: Option<String>,
+        #[arg(long, value_name = "KIND", help = crate::meta::server_mod_kind_arg())]
+        kind: Option<String>,
+        #[arg(long, value_name = "SOURCE", help = crate::meta::content_source_arg())]
+        source: Option<String>,
+        #[arg(long, help = crate::meta::server_mod_prerelease_arg())]
+        prerelease: bool,
+        #[arg(long, help = crate::meta::server_mod_force_arg())]
+        force: bool,
+        #[arg(long, help = crate::meta::server_mod_dry_run_arg())]
+        dry_run: bool,
     },
+    #[command(about = crate::meta::server_mod_remove())]
     #[command(visible_alias = "rm")]
     Remove {
-        #[arg(value_name = "NAME")]
+        #[arg(value_name = "NAME", help = crate::meta::server_mod_name_arg())]
         name: Option<String>,
-        #[arg(value_name = "MOD")]
+        #[arg(value_name = "MOD", help = crate::meta::server_mod_selector_arg())]
         m: Option<String>,
+        #[arg(long, help = crate::meta::server_mod_dry_run_arg())]
+        dry_run: bool,
     },
+    #[command(about = crate::meta::server_mod_update())]
     #[command(visible_alias = "up")]
     Update {
-        #[arg(value_name = "NAME")]
+        #[arg(value_name = "NAME", help = crate::meta::server_mod_name_arg())]
         name: Option<String>,
-        #[arg(value_name = "MOD")]
+        #[arg(value_name = "MOD", help = crate::meta::server_mod_selector_arg())]
         m: Option<String>,
+        #[arg(long, value_name = "SOURCE", help = crate::meta::content_source_arg())]
+        source: Option<String>,
+        #[arg(long, help = crate::meta::server_mod_force_arg())]
+        force: bool,
+        #[arg(long, help = crate::meta::server_mod_dry_run_arg())]
+        dry_run: bool,
     },
+    #[command(about = crate::meta::server_mod_outdated())]
     #[command(visible_alias = "od")]
     Outdated {
-        #[arg(value_name = "NAME")]
+        #[arg(value_name = "NAME", help = crate::meta::server_mod_name_arg())]
         name: Option<String>,
+        #[arg(long, value_name = "SOURCE", help = crate::meta::content_source_arg())]
+        source: Option<String>,
     },
 }
 
