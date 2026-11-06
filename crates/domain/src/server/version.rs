@@ -55,14 +55,20 @@ impl ServerVersion {
         // 先解析再排序：解析是 O(段数)，不能放进比较函数里反复做
         let keys: Vec<VersionOrderKey<'_>> = versions
             .iter()
-            .map(|version| VersionOrderKey {
-                kind_rank: match version.kind {
-                    VersionKind::Release => 0,
-                    VersionKind::Snapshot => 1,
-                    VersionKind::Historical => 2,
-                },
-                segments: parse_segments(version.id.as_str()),
-                raw: version.id.as_str(),
+            .map(|version| {
+                let segments = parse_segments(version.id.as_str());
+                let (main, prerelease) = split_prerelease(segments.as_deref());
+                VersionOrderKey {
+                    kind_rank: match version.kind {
+                        VersionKind::Release => 0,
+                        VersionKind::Snapshot => 1,
+                        VersionKind::Historical => 2,
+                    },
+                    segments,
+                    main,
+                    prerelease,
+                    raw: version.id.as_str(),
+                }
             })
             .collect();
 
@@ -112,11 +118,21 @@ struct VersionOrderKey<'a> {
     kind_rank: u8,
     /// `None` 表示版本串拆不出数字段，只能按 `raw` 字面比较
     segments: Option<Vec<VersionSegment<'a>>>,
+    /// 主路径：`segments` 里第一个带前缀段（`pre` / `rc` / `snapshot` …）之前
+    /// 的部分。`1.21-pre1` → `[1, 21]`，`1.21.4-rc1` → `[1, 21, 4]`。
+    ///
+    /// 排序先看主路径，再看待有预发布后缀：这样 `1.21-pre1`（主路径 `1.21`）
+    /// 落在 `1.21.4-rc1`（主路径 `1.21.4`）之前，而 `1.21` 正式版又排在
+    /// `1.21-pre1` 之前。若直接用整段比较，「多出数字段更新」与「预发布在
+    /// 后」两条规则会互相矛盾，比较函数退化为非全序，`sort_by` 会 panic。
+    main: Option<Vec<VersionSegment<'a>>>,
+    /// 预发布 / 变体后缀（首个带前缀段及其后全部段）
+    prerelease: Vec<VersionSegment<'a>>,
     raw: &'a str,
 }
 
 /// 版本串的一个分段
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VersionSegment<'a> {
     /// 纯数字段（`1` / `21` / `2755`），按数值比较
     Number(u64),
@@ -135,42 +151,85 @@ impl Ord for VersionOrderKey<'_> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         use std::cmp::Ordering;
 
-        // 直接给出「谁在前」：正式版优先，然后版本号大的在前
-        match self.kind_rank.cmp(&other.kind_rank) {
-            Ordering::Equal => {}
-            other => return other,
-        }
-        match (&self.segments, &other.segments) {
-            // 能解析的版本排在快照名之类之前
-            (Some(_), None) => return Ordering::Less,
-            (None, Some(_)) => return Ordering::Greater,
-            (None, None) => return other.raw.cmp(self.raw),
+        // 排序口径（新在前），逐级判定，任一级分出胜负即返回：
+        // 1. 能解析的版本排在拆不出的名字（`24w45a`）之前
+        // 2. 主路径（去掉预发布后缀的版本号）大的在前：`1.21.4` > `1.21`
+        // 3. 主路径相同：正式版（无预发布后缀）在有后缀的之前
+        // 4. 都有后缀：按后缀段比较（`pre2` < `pre10`，`rc` 在 `pre` 前）
+        // 5. 仍相同：按 kind（正式版在快照 / 旧版之前），最后按字面倒序
+        //
+        // 这一顺序是全序：每一级都是对固定元组的逐位比较，不存在两条路径
+        // 给出相反结论的情况。kind 只在版本号完全相同时才起作用——若让
+        // kind 优先，`Mojang` 清单里 758 个快照会整体垫到 103 个正式版之后，
+        // 「全部」视图前 100 多项全是正式版，用户翻不到快照（`Ctrl+A` 看起来
+        // 没生效）。
+        match (&self.main, &other.main) {
             (Some(left), Some(right)) => {
-                if let Some(ordering) = compare_segments(left, right) {
-                    // `compare_segments` 返回「谁更旧」，这里取反成新的在前
-                    return ordering.reverse();
+                match compare_segments(left, right) {
+                    // `compare_segments` 返回「谁更旧」，取反成新的在前
+                    Some(ordering) if ordering.is_ne() => return ordering.reverse(),
+                    _ => {}
                 }
             }
+            (Some(_), None) => return Ordering::Less,
+            (None, Some(_)) => return Ordering::Greater,
+            (None, None) => {}
         }
-        // 前缀完全相同、只是一方多出段：
-        // - 多出的是数字段（`1.12.2` 对 `1.12`）→ 多出者更新，在前
-        // - 多出的是带前缀段（`1.21.1-pre1` 对 `1.21.1`）→ 预发布，在后
-        let suffix_kind = |key: &Self, shared: usize| {
-            key.segments
-                .as_ref()
-                .and_then(|segments| segments.get(shared))
-                .map(|segment| matches!(segment, VersionSegment::Text { .. }))
-        };
-        let left_len = self.segments.as_ref().map_or(0, Vec::len);
-        let right_len = other.segments.as_ref().map_or(0, Vec::len);
-        let shared = left_len.min(right_len);
-        match (suffix_kind(self, shared), suffix_kind(other, shared)) {
-            // 自己多出数字段（`1.12.2` 对 `1.12`）更新，在前；对方多出预发布后缀同理
-            (Some(false), None) | (None, Some(true)) => Ordering::Less,
-            // 自己多出预发布后缀（`1.21.1-pre1` 对 `1.21.1`）在后；对方多出数字段同理
-            (Some(true), None) | (None, Some(false)) => Ordering::Greater,
-            _ => other.raw.cmp(self.raw),
+
+        // 主路径相同：正式版先于预发布
+        let self_pre = !self.prerelease.is_empty();
+        let other_pre = !other.prerelease.is_empty();
+        if self_pre != other_pre {
+            return if self_pre {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            };
         }
+        // 都有预发布后缀：比较后缀段。`compare_segments` 在这里返回的就是
+        // 「谁在前」（`prefix_rank` 已把 rc / pre / snapshot 按「越接近正式版
+        // 越新」排好，数字段也是数值大在前），**不能** reverse。
+        if self_pre
+            && let Some(ordering) = compare_segments(&self.prerelease, &other.prerelease)
+            && ordering.is_ne()
+        {
+            return ordering;
+        }
+
+        // 版本号完全并列：kind 决胜，再按字面倒序
+        match self.kind_rank.cmp(&other.kind_rank) {
+            Ordering::Equal => other.raw.cmp(self.raw),
+            other => other,
+        }
+    }
+}
+
+/// 把解析后的段切成「主路径」与「预发布后缀」
+///
+/// 主路径取第一个带前缀段之前的部分；找不到带前缀段时后缀为空、主路径即全部。
+/// `parse_segments` 返回 `None` 时两者都是 `None` / 空。
+fn split_prerelease<'a>(
+    segments: Option<&[VersionSegment<'a>]>,
+) -> (Option<Vec<VersionSegment<'a>>>, Vec<VersionSegment<'a>>) {
+    let Some(segments) = segments else {
+        return (None, Vec::new());
+    };
+    let first_text = segments
+        .iter()
+        .position(|segment| matches!(segment, VersionSegment::Text { .. }));
+    match first_text {
+        Some(index) => {
+            let main = segments[..index].to_vec();
+            // 首段就是带前缀段（`b1.8` / `a1.2` 这类 beta / alpha 历史版，或
+            // 纯 `pre1`）：没有数字主路径可比，视为「排在任何数字版本之后」。
+            // 返回 `None` 让排序把它归到不可解析一档，内部再按 kind + 字面排。
+            if main.is_empty() {
+                (None, segments.to_vec())
+            } else {
+                (Some(main), segments[index..].to_vec())
+            }
+        }
+        None => (Some(segments.to_vec()), Vec::new()),
     }
 }
 
@@ -208,7 +267,17 @@ fn compare_segments(
             return Some(ordering);
         }
     }
-    None
+    // 共享段全部相等：按长度决胜（短者更旧）。
+    //
+    // 主路径里不会有带前缀段（都被切进 prerelease 了），所以「更长」等于
+    // 「多出数字段」→ 更长的版本更新；预发布后缀同理（`pre` ⊂ `pre.1`，
+    // 后者是更细的变体，更新）。长度相同返回 `None` 交给调用方的 kind 决胜。
+    match left.len().cmp(&right.len()) {
+        Ordering::Equal => None,
+        // 谁更短谁更旧
+        Ordering::Less => Some(Ordering::Less),
+        Ordering::Greater => Some(Ordering::Greater),
+    }
 }
 
 /// 后缀前缀的稳定性排序：常见的预发布前缀按「越接近正式版越新」排列
@@ -367,10 +436,11 @@ mod tests {
             version(VersionKind::Release, "1.21.1"),
             version(VersionKind::Release, "1.21.1-pre1"),
         ];
-        // `1.21.1` 与 `1.21.1-pre1` 是同一版本号，正式形态在前
+        // 主路径大的在前：`1.21.1` 系列最新；同主路径时正式形态在预发布前。
+        // 可解析出数字序列的 `1.0` 排在拆不出的快照名 `24w45a` 之前。
         assert_eq!(
             sorted_ids(versions),
-            vec!["1.21.1", "1.21.1-pre1", "24w45a", "1.0"]
+            vec!["1.21.1", "1.21.1-pre1", "1.0", "24w45a"]
         );
     }
 
@@ -397,9 +467,59 @@ mod tests {
             version(VersionKind::Release, "26.3-21.0.0"),
             version(VersionKind::Release, "26.3"),
         ];
+        // 主路径 `26.3-21.0.0` 最长最新；RC 是其预发布，次之；只到
+        // `26.3` 的串最短最旧
         assert_eq!(
             sorted_ids(versions),
-            vec!["26.3-21.0.0", "26.3", "26.3-21.0.0-RC2755"]
+            vec!["26.3-21.0.0", "26.3-21.0.0-RC2755", "26.3"]
+        );
+    }
+
+    /// 回归：快照 / 预发布必须与正式版按版本号穿插，不能整体垫底
+    ///
+    /// 真实清单里快照 758 个、正式版 103 个。旧口径「kind 优先」会让「全部」
+    /// 视图前 100 多项全是正式版，`Ctrl+A` 后翻不到任何预发布版。修复后
+    /// `1.21.11` 之后紧跟它的 pre / rc 快照，再往下才是 `1.21.10`。
+    #[test]
+    fn snapshots_interleave_with_releases_by_version_number() {
+        let versions = vec![
+            version(VersionKind::Release, "1.21.10"),
+            version(VersionKind::Release, "1.21.11"),
+            version(VersionKind::Snapshot, "1.21.11-pre1"),
+            version(VersionKind::Snapshot, "1.21.11-rc1"),
+        ];
+        assert_eq!(
+            sorted_ids(versions),
+            vec!["1.21.11", "1.21.11-rc1", "1.21.11-pre1", "1.21.10"],
+            "预发布紧跟在同版本号正式版之后，再排下一个正式版"
+        );
+    }
+
+    /// 回归：混合 kind / 预发布 / 历史版时比较函数必须满足全序
+    ///
+    /// 非全序会让 `sort_by` panic（user-provided comparison function does not
+    /// correctly implement a total order）。这里只验证不 panic 且新版本在最前。
+    #[test]
+    fn comparison_is_a_total_order_across_mixed_kinds() {
+        let versions = vec![
+            version(VersionKind::Release, "1.21.1"),
+            version(VersionKind::Snapshot, "1.21.1"),
+            version(VersionKind::Historical, "1.21.1"),
+            version(VersionKind::Snapshot, "1.21.1-pre1"),
+            version(VersionKind::Release, "1.21"),
+            version(VersionKind::Snapshot, "24w45a"),
+            version(VersionKind::Historical, "b1.8"),
+            version(VersionKind::Historical, "1.0"),
+        ];
+        let sorted = sorted_ids(versions);
+        assert_eq!(sorted[0], "1.21.1", "最新正式版在最前，实际: {sorted:?}");
+        // 同号正式 / 快照的 id 相同，无法只按字符串区分；这里验证预发布
+        // 落在所有 `1.21.1` 之后、`1.21` 之前
+        let pre = sorted.iter().position(|s| s == "1.21.1-pre1").unwrap();
+        let short = sorted.iter().position(|s| s == "1.21").unwrap();
+        assert!(
+            pre < short,
+            "同号预发布要排在 `1.21` 之前，实际: {sorted:?}"
         );
     }
 
