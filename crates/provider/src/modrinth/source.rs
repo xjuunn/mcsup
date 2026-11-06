@@ -29,7 +29,7 @@ use super::manifest::{Project, SearchHit, Version, VersionFile};
 use super::{file_checksum, primary_file};
 use async_trait::async_trait;
 use domain::server::content::{
-    ContentCandidate, ContentKind, ContentRequest, ProviderHint, rank_candidates,
+    ContentCandidate, ContentIdentity, ContentKind, ContentRequest, ProviderHint, rank_candidates,
 };
 use port::SourceError;
 use port::content::{
@@ -150,6 +150,30 @@ impl ContentSource for ModrinthSource {
             version_number: version.version_number.clone(),
             file: content_file(file)?,
         })
+    }
+
+    async fn by_hash(&self, hashes: &[String]) -> Result<Vec<ContentIdentity>, SourceError> {
+        let mut out: Vec<ContentIdentity> = Vec::new();
+        for found in self.identify(hashes).await? {
+            out.push(ContentIdentity {
+                hash: found.hash,
+                project_id: found.version.project_id.clone(),
+                slug: found
+                    .project
+                    .as_ref()
+                    .and_then(|project| project.slug.clone()),
+                title: found.project.as_ref().map(|project| project.title.clone()),
+                version_id: found.version.id.clone(),
+                version_number: found.version.version_number.clone(),
+                // 不套用 `kind_of` 的兜底：识别结果里「认不出上游类型」必须如实
+                // 留空，调用方展示「未知」而不是凭空给一个类别
+                kind: found
+                    .project
+                    .as_ref()
+                    .and_then(|project| ProviderHint::guess_kind(&project.project_type)),
+            });
+        }
+        Ok(out)
     }
 }
 

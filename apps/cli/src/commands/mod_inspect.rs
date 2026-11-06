@@ -17,6 +17,7 @@ use anyhow::Result;
 use comfy_table::{ContentArrangement, Table};
 use mcsup::domain::mod_::{Confidence, ModCapability, ModLoader, Risk, SideSupport};
 use mcsup::modkit::ZipModInspector;
+use mcsup::port::mod_::ModInspector;
 use mcsup::service::{ModAudit, ModInspectService, ModReport, collect_jars};
 use serde::Serialize;
 use std::path::PathBuf;
@@ -99,12 +100,43 @@ async fn inspect(
         }
         None => None,
     };
-    let service = ModInspectService::local(Arc::new(ZipModInspector::new()));
+    let service = inspect_service(offline, printer.lang())?;
     let audit = service.inspect_paths_for(&jars, !offline, target).await;
     spinner.finish();
     let audit = audit?;
 
     render(&audit, printer)
+}
+
+/// 按 `--offline` 组装检测服务
+///
+/// 联网兜底是「本地判不出时才向上游查」，因此 `--offline` 必须真的少调一次
+/// 上游：差别的唯一来源就是这里注入的服务。上游客户端构造失败（TLS 初始化
+/// 之类）不降级——那会让「联网检测」静默变成「离线检测」，用户看不到任何
+/// 提示却以为查过了。
+fn inspect_service(offline: bool, lang: Lang) -> Result<ModInspectService> {
+    let inspector: Arc<dyn ModInspector> = Arc::new(ZipModInspector::new());
+    if offline {
+        return Ok(ModInspectService::local(inspector));
+    }
+    let upstream = mcsup::provider::modrinth::ModrinthSource::new().map_err(|err| {
+        AppDiagnostic::failure(
+            crate::i18n::pick(
+                lang,
+                format!("初始化上游来源失败：{err}"),
+                format!("cannot initialize upstream source: {err}"),
+            ),
+            Some(crate::i18n::pick(
+                lang,
+                "使用 --offline 只做本地检测".to_owned(),
+                "use --offline to inspect locally only".to_owned(),
+            )),
+        )
+    })?;
+    Ok(ModInspectService::with_upstream(
+        inspector,
+        Arc::new(upstream),
+    ))
 }
 
 /// 把用户给的路径展开成 jar 列表

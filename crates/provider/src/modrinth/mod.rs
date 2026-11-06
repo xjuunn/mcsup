@@ -29,6 +29,7 @@
 
 mod client;
 pub mod facets;
+mod identify;
 pub mod manifest;
 pub mod modpack;
 mod source;

@@ -16,7 +16,7 @@
 
 use async_trait::async_trait;
 use domain::server::artifact::Checksum;
-use domain::server::content::{ContentCandidate, ContentKind};
+use domain::server::content::{ContentCandidate, ContentIdentity, ContentKind};
 use url::Url;
 
 use crate::SourceError;
@@ -230,6 +230,26 @@ pub trait ContentSource: ContentSourceInfo + Send + Sync {
         id_or_slug: &str,
         version_id: &str,
     ) -> Result<ResolvedContent, SourceError>;
+
+    /// 按文件哈希反查「这个文件属于哪个项目的哪个版本」
+    ///
+    /// 已落盘的 jar 只有内容，没有项目信息；文件名是打包者随手起的，不可信。
+    /// 哈希是内容指纹，是所有来源都能对上的唯一标识。
+    ///
+    /// 契约：
+    ///
+    /// - 未命中的哈希**不出现**在结果里（上游批量接口就是这种形状）；调用方
+    ///   据此判定「该文件不在这个来源里」，而不是「来源说它没用」
+    /// - 默认实现返回空集合，表示来源不支持该能力。调用方必须把整批结果当作
+    ///   「未知」处理，不得据此推断任何结论——与
+    ///   [`crate::modpack::ModpackSource::client_only_hashes`] 的口径一致
+    ///
+    /// # Errors
+    ///
+    /// 上游不可达、状态码异常或响应无法解析时返回 [`SourceError`]
+    async fn by_hash(&self, _hashes: &[String]) -> Result<Vec<ContentIdentity>, SourceError> {
+        Ok(Vec::new())
+    }
 }
 
 /// 内容来源注册表：多来源按名字选取

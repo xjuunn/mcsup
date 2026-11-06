@@ -317,6 +317,70 @@ pub fn rank_candidates(
     scored
 }
 
+/// 一次「这个文件属于哪个项目的哪个版本」的回答
+///
+/// 由来源**按文件哈希反查**得到，用于两件必须分开的事：
+///
+/// - 已装内容识别：`mods/` 里的 jar 叫什么、属于哪个项目
+/// - 更新判定：当前版本 ID 与按服务端条件挑出的最新候选比较（[`decide_update`]）
+///
+/// 与 `port::content::ContentProject` 的分工：那个描述「可检索的项目」，这个
+/// 描述「已落盘的一个文件」。因此 `title` / `slug` / `kind` 都可以缺失——上游
+/// 批量接口不保证返回全部字段，缺失时调用方按「未知」呈现，不得据空值推断结论。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentIdentity {
+    /// 反查时使用的文件哈希（原样回填，便于调用方按哈希回查结果）
+    pub hash: String,
+    /// 项目 ID
+    pub project_id: String,
+    /// 可读标识（可能缺失）
+    pub slug: Option<String>,
+    /// 项目标题（可能缺失）
+    pub title: Option<String>,
+    /// 版本 ID
+    pub version_id: String,
+    /// 版本号（展示用）
+    pub version_number: String,
+    /// 面向安装的类别；上游类型认不出时为 `None`
+    pub kind: Option<ContentKind>,
+}
+
+/// 「已装版本 vs 候选版本」的判定结果
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateDecision {
+    /// 按当前条件已是最优版本
+    UpToDate,
+    /// 按当前条件应换到该候选
+    Available {
+        /// 候选版本 ID
+        version_id: String,
+        /// 候选版本号（展示用）
+        version_number: String,
+    },
+}
+
+/// 判断已装的某个版本是否需要更新
+///
+/// `ranked` 必须是**已按 [`rank_candidates`] 排好序**的候选（第一个即最优）。
+/// 比较口径只有一条：最优候选的版本 ID 与当前版本 ID 是否相同。
+///
+/// 这里刻意**不**比较版本号大小：上游版本号不保证可比较（`1.2.3-beta+build7`、
+/// `mc1.21-2.0` 这类命名普遍存在），「谁更新」只有按服务端条件重新挑选才能回答。
+/// 因此语义是「按当前条件应装的版本变了」，而不是「有更高的版本号」。
+#[must_use]
+pub fn decide_update(current_version_id: &str, ranked: &[ContentCandidate]) -> UpdateDecision {
+    let Some(best) = ranked.first() else {
+        return UpdateDecision::UpToDate;
+    };
+    if best.version_id == current_version_id {
+        return UpdateDecision::UpToDate;
+    }
+    UpdateDecision::Available {
+        version_id: best.version_id.clone(),
+        version_number: best.version_number.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,5 +538,43 @@ mod tests {
             Some(ContentKind::Shader)
         );
         assert_eq!(ProviderHint::guess_kind("weird"), None);
+    }
+
+    /// 已装的就是最优候选：不报更新
+    #[test]
+    fn update_decision_up_to_date_when_ids_match() {
+        let request = ContentRequest::new(ContentKind::Mod).loader("fabric");
+        let ranked = rank_candidates(
+            [
+                candidate("V2", "release", &["fabric"], &["1.21.1"]),
+                candidate("V1", "release", &["fabric"], &["1.21.1"]),
+            ],
+            &request,
+        );
+        assert_eq!(decide_update("V2", &ranked), UpdateDecision::UpToDate);
+    }
+
+    /// 最优候选不是已装版本：报可更新，并指向候选的版本 ID
+    #[test]
+    fn update_decision_reports_best_candidate() {
+        let request = ContentRequest::new(ContentKind::Mod).loader("fabric");
+        let mut older = candidate("OLD", "release", &["fabric"], &["1.21.1"]);
+        older.date_published = "2023-01-01T00:00:00Z".to_owned();
+        let mut newer = candidate("NEW", "release", &["fabric"], &["1.21.1"]);
+        newer.date_published = "2024-01-01T00:00:00Z".to_owned();
+        let ranked = rank_candidates([older, newer], &request);
+        assert_eq!(
+            decide_update("OLD", &ranked),
+            UpdateDecision::Available {
+                version_id: "NEW".to_owned(),
+                version_number: "NEW".to_owned(),
+            }
+        );
+    }
+
+    /// 没有候选（如项目已下架）：不能说「有更新」，也不能说「已最新」是空话
+    #[test]
+    fn update_decision_without_candidates_is_up_to_date() {
+        assert_eq!(decide_update("V1", &[]), UpdateDecision::UpToDate);
     }
 }

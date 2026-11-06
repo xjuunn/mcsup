@@ -14,6 +14,8 @@
 
 #![allow(clippy::expect_used, reason = "测试夹具，失败直接 panic 才有用")]
 
+use port::content::ContentSource;
+use port::mod_::ModMetadataSource;
 use port::modpack::{ModpackQuery, ModpackSource};
 use provider::modrinth::{
     Facet, FacetTree, HashAlgorithm, ModrinthModpackSource, ModrinthSource, ProjectType,
@@ -831,4 +833,241 @@ async fn mock_records_nothing_when_unused() {
     }
     let mock = Mock::start(vec![]).await;
     assert!(mock.requests().is_empty());
+}
+
+// ---- 哈希反查：内容识别与服务端归属 ----
+//
+// 以下用例都只打回环地址，默认执行：`server mod` 的列表 / 更新判定与
+// `mod inspect` 的联网兜底共用这条链路，不能停在「手动才跑」。
+
+/// 带展示字段的项目对象
+fn project_full(
+    id: &str,
+    title: &str,
+    slug: &str,
+    project_type: &str,
+    server_side: Option<&str>,
+    client_side: Option<&str>,
+) -> serde_json::Value {
+    let mut project = serde_json::json!({
+        "id": id,
+        "team": "T",
+        "title": title,
+        "description": "d",
+        "body": "b",
+        "status": "approved",
+        "project_type": project_type,
+        "slug": slug,
+        "license": {"id": "MIT"},
+        "published": "2024-01-01T00:00:00Z",
+        "updated": "2024-01-01T00:00:00Z",
+        "downloads": 0,
+        "followers": 0,
+    });
+    if let Some(side) = server_side {
+        project["server_side"] = serde_json::json!(side);
+    }
+    if let Some(side) = client_side {
+        project["client_side"] = serde_json::json!(side);
+    }
+    project
+}
+
+/// 带指定版本号的版本对象
+fn version_full(id: &str, project_id: &str, version_number: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "project_id": project_id,
+        "version_number": version_number,
+        "author_id": "A",
+        "date_published": "2024-01-01T00:00:00Z",
+        "downloads": 0,
+        "files": [],
+    })
+}
+
+/// 哈希反查：命中项翻译成「项目 + 版本」身份，项目详情只查一次
+#[tokio::test]
+async fn by_hash_identifies_projects_and_versions() {
+    let versions = serde_json::json!({
+        "hash-a": version_full("V1", "P1", "1.0.0"),
+        "hash-b": version_full("V2", "P1", "1.1.0"),
+    });
+    let projects = serde_json::json!([project_full(
+        "P1",
+        "Sodium",
+        "sodium",
+        "mod",
+        Some("required"),
+        Some("required")
+    )]);
+    let mock = Mock::start(vec![
+        ("POST", "/v2/version_files", 200, versions.to_string()),
+        ("GET", "/v2/projects", 200, projects.to_string()),
+    ])
+    .await;
+    let source = source_for(&mock);
+
+    let found = source
+        .by_hash(&["hash-a".to_owned(), "hash-b".to_owned()])
+        .await
+        .expect("by_hash");
+
+    assert_eq!(found.len(), 2, "两个哈希都应命中：{found:?}");
+    // 结果按哈希排序，便于调用方按哈希回查
+    assert_eq!(found[0].hash, "hash-a");
+    assert_eq!(found[0].project_id, "P1");
+    assert_eq!(found[0].version_id, "V1");
+    assert_eq!(found[0].version_number, "1.0.0");
+    assert_eq!(found[0].title.as_deref(), Some("Sodium"));
+    assert_eq!(found[0].slug.as_deref(), Some("sodium"));
+    assert_eq!(
+        found[0].kind,
+        Some(domain::server::content::ContentKind::Mod),
+        "project_type=mod 应映射成 Mod 类别"
+    );
+    assert_eq!(found[1].hash, "hash-b");
+    assert_eq!(found[1].version_number, "1.1.0");
+
+    let ids = ids_from_target(&mock.requests()[1].target);
+    assert_eq!(
+        ids,
+        HashSet::from(["P1".to_owned()]),
+        "同一项目的多个文件只查一次项目详情"
+    );
+}
+
+/// 未命中的哈希不出现在结果里：不能凭空造出「未知项目」条目
+#[tokio::test]
+async fn by_hash_omits_unhit_hashes() {
+    let versions = serde_json::json!({"known": version_full("V1", "P1", "1.0.0")});
+    let projects = serde_json::json!([project_full(
+        "P1",
+        "Sodium",
+        "sodium",
+        "mod",
+        Some("required"),
+        Some("required")
+    )]);
+    let mock = Mock::start(vec![
+        ("POST", "/v2/version_files", 200, versions.to_string()),
+        ("GET", "/v2/projects", 200, projects.to_string()),
+    ])
+    .await;
+    let source = source_for(&mock);
+
+    let found = source
+        .by_hash(&["known".to_owned(), "unknown".to_owned()])
+        .await
+        .expect("by_hash");
+
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].hash, "known");
+}
+
+/// 空入参不发请求：扫 `mods/` 为空时不该白打一次上游
+#[tokio::test]
+async fn by_hash_without_hashes_sends_no_request() {
+    let mock = Mock::start(vec![]).await;
+    let source = source_for(&mock);
+
+    let found = source.by_hash(&[]).await.expect("by_hash");
+
+    assert!(found.is_empty());
+    assert!(mock.requests().is_empty(), "空入参不应发出任何请求");
+}
+
+/// 项目详情失败原样上报：半份结果不能当成完整结果
+#[tokio::test]
+async fn by_hash_propagates_project_error() {
+    let versions = serde_json::json!({"known": version_full("V1", "P1", "1.0.0")});
+    let mock = Mock::start(vec![
+        ("POST", "/v2/version_files", 200, versions.to_string()),
+        ("GET", "/v2/projects", 503, String::new()),
+    ])
+    .await;
+    let source = source_for(&mock);
+
+    let err = source
+        .by_hash(&["known".to_owned()])
+        .await
+        .expect_err("项目详情 503 应报错");
+    assert!(err.retryable(), "503 应归类为可重试: {err:?}");
+}
+
+/// 服务端归属：上游标注原样上报，客户端侧缺失时为 Unknown
+#[tokio::test]
+async fn server_support_reports_upstream_sides() {
+    let versions = serde_json::json!({
+        "clienthash": version_full("V1", "P-CLIENT", "1.0.0"),
+        "serverhash": version_full("V2", "P-SERVER", "1.0.0"),
+    });
+    let projects = serde_json::json!([
+        project_full(
+            "P-CLIENT",
+            "Client Only",
+            "client-only",
+            "mod",
+            Some("unsupported"),
+            Some("required")
+        ),
+        project_full(
+            "P-SERVER",
+            "Server Side",
+            "server-side",
+            "mod",
+            Some("required"),
+            Some("optional")
+        ),
+    ]);
+    let mock = Mock::start(vec![
+        ("POST", "/v2/version_files", 200, versions.to_string()),
+        ("GET", "/v2/projects", 200, projects.to_string()),
+    ])
+    .await;
+    let source = source_for(&mock);
+
+    let sides = source
+        .server_support(&["clienthash".to_owned(), "serverhash".to_owned()])
+        .await
+        .expect("server_support");
+
+    assert_eq!(sides.len(), 2, "{sides:?}");
+    assert_eq!(sides[0].hash, "clienthash");
+    assert_eq!(sides[0].server, domain::mod_::SideSupport::Unsupported);
+    assert_eq!(sides[0].client, domain::mod_::SideSupport::Required);
+    assert_eq!(sides[0].slug.as_deref(), Some("client-only"));
+    assert_eq!(sides[1].hash, "serverhash");
+    assert_eq!(sides[1].server, domain::mod_::SideSupport::Required);
+    assert_eq!(sides[1].client, domain::mod_::SideSupport::Optional);
+}
+
+/// 上游没给 `server_side` 时不返回该哈希：调用方保持「未知」，不折叠成可用
+#[tokio::test]
+async fn server_support_skips_projects_without_server_side() {
+    let versions = serde_json::json!({"nohint": version_full("V1", "P1", "1.0.0")});
+    let projects = serde_json::json!([project_full(
+        "P1",
+        "No Hint",
+        "no-hint",
+        "mod",
+        None,
+        Some("required")
+    )]);
+    let mock = Mock::start(vec![
+        ("POST", "/v2/version_files", 200, versions.to_string()),
+        ("GET", "/v2/projects", 200, projects.to_string()),
+    ])
+    .await;
+    let source = source_for(&mock);
+
+    let sides = source
+        .server_support(&["nohint".to_owned()])
+        .await
+        .expect("server_support");
+
+    assert!(
+        sides.is_empty(),
+        "没有服务端结论就不该出现在结果里：{sides:?}"
+    );
 }

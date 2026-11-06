@@ -12,7 +12,7 @@
 //! - 下载走 [`port::ArtifactDownloader`]，校验和与大小由它负责，本层不自己算哈希
 
 use crate::fs_error::FsError;
-use domain::server::content::{ContentKind, ContentRequest, rank_candidates};
+use domain::server::content::{ContentIdentity, ContentKind, ContentRequest, rank_candidates};
 use port::content::{
     ContentFile, ContentQuery, ContentSearch, ContentSource, ContentSourceRegistry,
     ResolvedContent, safe_filename,
@@ -185,6 +185,10 @@ impl std::fmt::Debug for InstallOptions<'_> {
 /// 内容编排
 ///
 /// 持有来源注册表与下载器；来源可按名字选择（换源），也可注入聚合实现。
+///
+/// 可 `Clone`：内部只有 `Arc`，装配方（如 `Mcsup`）要在多个服务之间共享同一份
+/// 来源注册表，复制句柄比再拼一次注册表安全。
+#[derive(Clone)]
 pub struct ContentService {
     sources: Arc<ContentSourceRegistry>,
     downloader: Arc<dyn ArtifactDownloader>,
@@ -274,6 +278,25 @@ impl ContentService {
             });
         }
         Ok(candidates)
+    }
+
+    /// 按文件哈希反查上游项目与版本
+    ///
+    /// 「磁盘上这个 jar 到底是哪个项目的哪个版本」只能由哈希回答，文件名和包内
+    /// 元数据都可能被改。上游不认识哈希时不返回条目（不是错误）；来源完全
+    /// 不支持反查时返回空列表——调用方必须把「没查到」当成「未知」，不能当成
+    /// 「已是最新」。
+    ///
+    /// # Errors
+    ///
+    /// 来源选择失败或上游异常时返回 [`ContentError`]
+    pub async fn identify(
+        &self,
+        source: Option<&str>,
+        hashes: &[String],
+    ) -> Result<Vec<ContentIdentity>, ContentError> {
+        let source = self.select_source(source)?;
+        Ok(source.by_hash(hashes).await?)
     }
 
     /// 安装一个内容项目到服务端目录
