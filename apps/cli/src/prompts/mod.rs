@@ -19,7 +19,8 @@ use std::path::{Path, PathBuf};
 mod scoped;
 
 pub(crate) use scoped::{
-    Backable, EnterMode, ScopeHint, ScopedChoice, select_filter_backable, select_filter_scoped,
+    Backable, EnterMode, ScopeHint, ScopedChoice, Single, select_filter_backable,
+    select_filter_scoped,
 };
 
 /// 交互文案的二元取用：`zh` / `en` 都是已渲染好的字符串

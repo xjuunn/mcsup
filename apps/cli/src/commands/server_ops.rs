@@ -752,7 +752,14 @@ pub(super) fn pick_variant(available: &[ServerVariant], printer: Printer) -> Res
         })
         .collect();
     // 变体没有「扩展候选」这一层，范围提示永不渲染
-    let picked = prompts::select_filter_scoped(lang, &title, &choices, prompts::ScopeHint::none())?;
+    let picked = prompts::select_filter_scoped(
+        lang,
+        &title,
+        &choices,
+        prompts::ScopeHint::none(),
+        // 只剩一个来源没必要再选一次：调用方在上面已按单可用项直接返回
+        prompts::Single::Skip,
+    )?;
     bootstrap::variant_from_label(&picked, available)
         .ok_or_else(|| anyhow::anyhow!("无效变体: {picked}"))
 }

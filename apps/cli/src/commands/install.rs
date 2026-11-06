@@ -349,6 +349,8 @@ pub(crate) fn select_version(
             show_all: crate::i18n::pick(printer.lang(), "显示所有版本", "show all versions").leak(),
             show_default: crate::i18n::pick(printer.lang(), "只显示正式版", "releases only").leak(),
         },
+        // 只有一个版本时直接用它：这一步之后还有安装确认，不必多按一次回车
+        prompts::Single::Skip,
     )?;
     versions
         .into_iter()
