@@ -804,8 +804,8 @@ pub(crate) fn server_mod_version_arg() -> &'static str {
 #[must_use]
 pub(crate) fn server_mod_kind_arg() -> &'static str {
     t(
-        "内容类别：mod / plugin / datapack（默认 mod）",
-        "content kind: mod / plugin / datapack (default: mod)",
+        "内容类别：mod / plugin（默认 mod，决定扫 mods/ 还是 plugins/）",
+        "content kind: mod / plugin (default: mod; selects mods/ or plugins/)",
     )
 }
 

@@ -486,6 +486,8 @@ pub(crate) enum ModAction {
     List {
         #[arg(value_name = "NAME", help = crate::meta::server_mod_name_arg())]
         name: Option<String>,
+        #[arg(long, value_name = "KIND", help = crate::meta::server_mod_kind_arg())]
+        kind: Option<String>,
         #[arg(long, help = crate::meta::server_mod_project_info_arg())]
         project_info: bool,
         #[arg(long, value_name = "SOURCE", help = crate::meta::content_source_arg())]
@@ -520,6 +522,8 @@ pub(crate) enum ModAction {
         name: Option<String>,
         #[arg(value_name = "MOD", help = crate::meta::server_mod_selector_arg())]
         m: Option<String>,
+        #[arg(long, value_name = "KIND", help = crate::meta::server_mod_kind_arg())]
+        kind: Option<String>,
         #[arg(long, help = crate::meta::server_mod_dry_run_arg())]
         dry_run: bool,
     },
@@ -530,6 +534,8 @@ pub(crate) enum ModAction {
         name: Option<String>,
         #[arg(value_name = "MOD", help = crate::meta::server_mod_selector_arg())]
         m: Option<String>,
+        #[arg(long, value_name = "KIND", help = crate::meta::server_mod_kind_arg())]
+        kind: Option<String>,
         #[arg(long, value_name = "SOURCE", help = crate::meta::content_source_arg())]
         source: Option<String>,
         #[arg(long, help = crate::meta::server_mod_force_arg())]
@@ -542,6 +548,8 @@ pub(crate) enum ModAction {
     Outdated {
         #[arg(value_name = "NAME", help = crate::meta::server_mod_name_arg())]
         name: Option<String>,
+        #[arg(long, value_name = "KIND", help = crate::meta::server_mod_kind_arg())]
+        kind: Option<String>,
         #[arg(long, value_name = "SOURCE", help = crate::meta::content_source_arg())]
         source: Option<String>,
     },

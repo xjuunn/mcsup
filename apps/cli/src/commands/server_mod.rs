@@ -37,12 +37,14 @@ pub(crate) async fn run(action: ModAction, printer: Printer) -> Result<()> {
     match action {
         ModAction::List {
             name,
+            kind,
             project_info,
             source,
             outdated,
         } => {
             list(
                 name.as_deref(),
+                kind.as_deref(),
                 project_info,
                 source.as_deref(),
                 outdated,
@@ -73,10 +75,16 @@ pub(crate) async fn run(action: ModAction, printer: Printer) -> Result<()> {
             )
             .await
         }
-        ModAction::Remove { name, m, dry_run } => remove(name.as_deref(), m, dry_run, printer),
+        ModAction::Remove {
+            name,
+            m,
+            kind,
+            dry_run,
+        } => remove(name.as_deref(), m, kind.as_deref(), dry_run, printer),
         ModAction::Update {
             name,
             m,
+            kind,
             source,
             force,
             dry_run,
@@ -84,6 +92,7 @@ pub(crate) async fn run(action: ModAction, printer: Printer) -> Result<()> {
             update(
                 name.as_deref(),
                 m.as_deref(),
+                kind.as_deref(),
                 source.as_deref(),
                 force,
                 dry_run,
@@ -91,8 +100,8 @@ pub(crate) async fn run(action: ModAction, printer: Printer) -> Result<()> {
             )
             .await
         }
-        ModAction::Outdated { name, source } => {
-            outdated(name.as_deref(), source.as_deref(), printer).await
+        ModAction::Outdated { name, kind, source } => {
+            outdated(name.as_deref(), kind.as_deref(), source.as_deref(), printer).await
         }
     }
 }
@@ -102,6 +111,7 @@ pub(crate) async fn run(action: ModAction, printer: Printer) -> Result<()> {
 /// `server mod list`
 async fn list(
     name: Option<&str>,
+    kind: Option<&str>,
     project_info: bool,
     source: Option<&str>,
     only_outdated: bool,
@@ -109,11 +119,13 @@ async fn list(
 ) -> Result<()> {
     let lang = printer.lang();
     let name = crate::commands::server_ops::require_server_name(name, "server mod list", printer)?;
+    let kind = parse_kind(kind, lang)?;
     let mc = bootstrap::open_mcsup_with_remotes()?;
 
     // 识别要联网，只读命令默认不联网；`--outdated` 依赖识别结果，因此自动打开
     let identify = project_info || only_outdated;
     let options = ListOptions {
+        kind,
         identify,
         source,
         updates: only_outdated,
@@ -121,8 +133,8 @@ async fn list(
     let spinner = TaskSpinner::new(
         pick(
             lang,
-            "正在读取 mods/ 目录…".to_owned(),
-            "reading the mods/ directory…".to_owned(),
+            format!("正在读取 {} 目录…", kind.install_dir().display()),
+            format!("reading the {} directory…", kind.install_dir().display()),
         ),
         printer.is_human(),
     );
@@ -141,13 +153,42 @@ async fn list(
     };
 
     let rows: Vec<ModEntryJson> = entries.iter().map(|entry| entry_json(entry)).collect();
-    printer.print_rows(
-        &rows,
-        text(lang, "该服务端还没有安装任何 mod", "no mods installed yet"),
-        || mods_table(&entries, lang),
-    )?;
+    printer.print_rows(&rows, &empty_hint(kind, lang), || {
+        mods_table(&entries, lang)
+    })?;
+    // 只列「有更新」时，没被识别的条目不会出现在表里：明说个数，
+    // 否则用户会把「没列出来」读成「已是最新」
+    if only_outdated {
+        let unknown = listed
+            .mods
+            .iter()
+            .filter(|entry| entry.update.is_none())
+            .count();
+        if unknown > 0 {
+            let warn = pick(
+                lang,
+                format!("{unknown} 个文件无法判断是否有更新（未识别）"),
+                format!("{unknown} file(s) could not be checked (not identified)"),
+            );
+            if printer.is_human() {
+                printer.print_warning(&warn);
+            } else {
+                crate::output::print_error_line(&format!("mcsup: {warn}"));
+            }
+        }
+    }
     report_unreadable(&listed, printer);
     Ok(())
+}
+
+/// 「一个都没有」的文案：按类别说准目录名
+fn empty_hint(kind: ContentKind, lang: Lang) -> String {
+    let dir = kind.install_dir().display().to_string();
+    pick(
+        lang,
+        format!("{dir}/ 里还没有任何内容"),
+        format!("nothing installed in {dir}/ yet"),
+    )
 }
 
 // ---------------------------------------------------------------- install
@@ -271,12 +312,14 @@ async fn download_and_apply(
 fn remove(
     name: Option<&str>,
     selector: Option<String>,
+    kind: Option<&str>,
     dry_run: bool,
     printer: Printer,
 ) -> Result<()> {
     let lang = printer.lang();
     let name =
         crate::commands::server_ops::require_server_name(name, "server mod remove", printer)?;
+    let kind = parse_kind(kind, lang)?;
     let selector = crate::commands::server_ops::require_text(
         selector,
         &pick(lang, "缺少要删除的 mod", "missing mod to remove"),
@@ -284,7 +327,7 @@ fn remove(
         printer,
     )?;
     let mc = bootstrap::open_mcsup_with_remotes()?;
-    let removed = mc.mods.remove(&name, &selector, dry_run)?;
+    let removed = mc.mods.remove(&name, &selector, kind, dry_run)?;
     let files: Vec<String> = removed
         .files
         .iter()
@@ -314,12 +357,18 @@ fn remove(
 // ---------------------------------------------------------------- outdated
 
 /// `server mod outdated`
-async fn outdated(name: Option<&str>, source: Option<&str>, printer: Printer) -> Result<()> {
+async fn outdated(
+    name: Option<&str>,
+    kind: Option<&str>,
+    source: Option<&str>,
+    printer: Printer,
+) -> Result<()> {
     let lang = printer.lang();
     let name =
         crate::commands::server_ops::require_server_name(name, "server mod outdated", printer)?;
+    let kind = parse_kind(kind, lang)?;
     let mc = bootstrap::open_mcsup_with_remotes()?;
-    let plan = plan_update(&mc.mods, &name, None, source, printer).await?;
+    let plan = plan_update(&mc.mods, &name, kind, None, source, printer).await?;
     let payload = update_plan_json(&name, &plan);
     if plan.items.is_empty() {
         let human = pick(
@@ -332,10 +381,13 @@ async fn outdated(name: Option<&str>, source: Option<&str>, printer: Printer) ->
         report_skipped(&plan, printer);
         return Ok(());
     }
-    printer.print_rows(
+    // JSON 一律输出带 `server` / `skipped` 的完整对象：有没有更新项都同一个形状，
+    // 脚本才不会因为「这次恰好没有更新」而解析失败
+    printer.print_table_or_payload(
         &payload.items,
         text(lang, "没有可更新的 mod", "no mods to update"),
         || update_table(&plan, lang),
+        &payload,
     )?;
     report_skipped(&plan, printer);
     Ok(())
@@ -344,9 +396,11 @@ async fn outdated(name: Option<&str>, source: Option<&str>, printer: Printer) ->
 // ---------------------------------------------------------------- update
 
 /// `server mod update`
+#[allow(clippy::too_many_arguments)] // 每个参数对应一个 clap 选项，收结构体只会多一层包装
 async fn update(
     name: Option<&str>,
     selector: Option<&str>,
+    kind: Option<&str>,
     source: Option<&str>,
     force: bool,
     dry_run: bool,
@@ -355,8 +409,9 @@ async fn update(
     let lang = printer.lang();
     let name =
         crate::commands::server_ops::require_server_name(name, "server mod update", printer)?;
+    let kind = parse_kind(kind, lang)?;
     let mc = bootstrap::open_mcsup_with_remotes()?;
-    let plan = plan_update(&mc.mods, &name, selector, source, printer).await?;
+    let plan = plan_update(&mc.mods, &name, kind, selector, source, printer).await?;
     let payload = update_plan_json(&name, &plan);
     if plan.items.is_empty() {
         let human = pick(
@@ -368,10 +423,12 @@ async fn update(
         report_skipped(&plan, printer);
         return Ok(());
     }
-    printer.print_rows(
+    // 同 `outdated`：形状不随内容变化
+    printer.print_table_or_payload(
         &payload.items,
         text(lang, "没有可更新的 mod", "no mods to update"),
         || update_table(&plan, lang),
+        &payload,
     )?;
     report_skipped(&plan, printer);
 
@@ -414,6 +471,10 @@ async fn update(
             from_version: change.from_version.clone(),
             to_version: change.to_version.clone(),
             risk: change.installed.risk.as_str().to_owned(),
+            removed: change
+                .removed
+                .as_ref()
+                .map(|path| path.display().to_string()),
         })
         .collect();
     let out = UpdateAppliedJson {
@@ -425,13 +486,26 @@ async fn update(
         format!("已更新 {} 个 mod", applied.changes.len()),
         format!("updated {} mod(s)", applied.changes.len()),
     );
-    printer.print_outcome(&human, &out)
+    printer.print_outcome(&human, &out)?;
+    // 换了文件名就等于删了旧文件：不说明的话用户会在目录里找不见旧文件
+    for change in &applied.changes {
+        if let Some(removed) = &change.removed {
+            let note = pick(
+                lang,
+                format!("  ↳ 已删除旧文件 {}", removed.display()),
+                format!("  ↳ removed the old file {}", removed.display()),
+            );
+            printer.print_section(&note);
+        }
+    }
+    Ok(())
 }
 
 /// 算更新计划（带 spinner）：识别 + 逐项查候选
 async fn plan_update(
     mods: &ModService,
     name: &str,
+    kind: ContentKind,
     selector: Option<&str>,
     source: Option<&str>,
     printer: Printer,
@@ -450,6 +524,7 @@ async fn plan_update(
             name,
             selector,
             ListOptions {
+                kind,
                 identify: true,
                 source,
                 updates: true,
@@ -462,7 +537,12 @@ async fn plan_update(
 
 // ---------------------------------------------------------------- 参数解析
 
-/// `--kind`：只接受服务端能装载的类别
+/// `--kind`：只接受服务端从**顶层目录**直接装载的类别
+///
+/// 其余类别不是「不好用」，而是落点根本不在这里：数据包要进
+/// `world/datapacks/`，服务端资源包由 `server.properties` 下发。把它们写进
+/// `<server>/datapacks/` 或 `resourcepacks/` 只是放一个永远不会被读到的文件，
+/// 所以入口直接拒绝并说清原因，而不是默默装进去。
 fn parse_kind(raw: Option<&str>, lang: Lang) -> Result<ContentKind> {
     let Some(raw) = raw else {
         return Ok(ContentKind::Mod);
@@ -476,23 +556,46 @@ fn parse_kind(raw: Option<&str>, lang: Lang) -> Result<ContentKind> {
             ),
             Some(pick(
                 lang,
-                "可用：mod / plugin / resourcepack / datapack".to_owned(),
-                "available: mod / plugin / resourcepack / datapack".to_owned(),
+                "可用：mod / plugin".to_owned(),
+                "available: mod / plugin".to_owned(),
             )),
         )
     })?;
-    if !kind.is_server_usable() {
-        return Err(AppDiagnostic::usage(
+    match kind {
+        ContentKind::Mod | ContentKind::Plugin => Ok(kind),
+        ContentKind::DataPack => Err(AppDiagnostic::usage(
             pick(
                 lang,
-                format!("{raw} 是纯客户端内容，不能装到服务端"),
-                format!("{raw} is client-only and cannot be installed on a server"),
+                "数据包装在 world/datapacks/ 里，本版本还不支持".to_owned(),
+                "datapacks live in world/datapacks/, which this version does not manage".to_owned(),
+            ),
+            Some(pick(
+                lang,
+                "需要数据包时请手动放到 <服务端>/world/datapacks/".to_owned(),
+                "place datapacks in <server>/world/datapacks/ manually".to_owned(),
+            )),
+        )
+        .into()),
+        ContentKind::ResourcePack => Err(AppDiagnostic::usage(
+            pick(
+                lang,
+                "服务端资源包由 server.properties 下发，不是本地目录".to_owned(),
+                "server resource packs are delivered via server.properties, not a local directory"
+                    .to_owned(),
             ),
             None,
         )
-        .into());
+        .into()),
+        _ => Err(AppDiagnostic::usage(
+            pick(
+                lang,
+                format!("{raw} 不能装到服务端"),
+                format!("{raw} cannot be installed on a server"),
+            ),
+            None,
+        )
+        .into()),
     }
-    Ok(kind)
 }
 
 /// 把用户给的 `SPEC` 解析成项目标识
@@ -877,8 +980,14 @@ fn report_skipped(plan: &UpdatePlan, printer: Printer) {
         format!("{} file(s) could not be checked", plan.skipped.len()),
     );
     printer.print_warning(&warn);
+    // JSON 模式下 stdout 只能是数据，结论性的提示落到 stderr：
+    // 静默丢掉等于让脚本以为「全都最新」
     for (file, reason) in &plan.skipped {
-        printer.print_section(&format!("  {file}: {reason}"));
+        if printer.is_human() {
+            printer.print_section(&format!("  {file}: {reason}"));
+        } else {
+            crate::output::print_error_line(&format!("mcsup: {file}: {reason}"));
+        }
     }
 }
 
@@ -895,7 +1004,11 @@ fn report_unreadable(list: &ModList, printer: Printer) {
     );
     printer.print_warning(&warn);
     for (path, reason) in &list.unreadable {
-        printer.print_section(&format!("  {path}: {reason}"));
+        if printer.is_human() {
+            printer.print_section(&format!("  {path}: {reason}"));
+        } else {
+            crate::output::print_error_line(&format!("mcsup: {path}: {reason}"));
+        }
     }
 }
 
@@ -995,6 +1108,7 @@ struct UpdatePlanJson<'a> {
 #[derive(Debug, Serialize)]
 struct UpdateItemJson {
     file: String,
+    current: String,
     project_id: String,
     from_version: String,
     to_version: String,
@@ -1016,6 +1130,7 @@ fn update_plan_json<'a>(name: &'a str, plan: &'a UpdatePlan) -> UpdatePlanJson<'
             .iter()
             .map(|item| UpdateItemJson {
                 file: item.file.clone(),
+                current: item.current.display().to_string(),
                 project_id: item.project_id.clone(),
                 from_version: item.from_version.clone(),
                 to_version: item.to_version.clone(),
@@ -1040,6 +1155,8 @@ struct ChangedJson {
     from_version: String,
     to_version: String,
     risk: String,
+    /// 换名更新时被删掉的旧文件
+    removed: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1103,5 +1220,14 @@ mod tests {
         assert_eq!(crate::output::exit_code_of(&err), 2);
         let err = parse_kind(Some("nope"), Lang::Zh).expect_err("必须拒绝");
         assert_eq!(crate::output::exit_code_of(&err), 2);
+    }
+
+    /// 数据包与资源包的落点不在本命令管理的目录里，一律拒绝而不是装错地方
+    #[test]
+    fn parse_kind_rejects_kinds_with_other_locations() {
+        for raw in ["datapack", "resourcepack", "modpack"] {
+            let err = parse_kind(Some(raw), Lang::Zh).expect_err("必须拒绝");
+            assert_eq!(crate::output::exit_code_of(&err), 2, "{raw} 应是用法错误");
+        }
     }
 }

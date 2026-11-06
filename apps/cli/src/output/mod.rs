@@ -143,6 +143,40 @@ impl Printer {
         }
     }
 
+    /// 带上下文的列表：人类打表格，JSON 打**一个对象**
+    ///
+    /// 与 [`Self::print_rows`] 的分工：那个只输出条目数组，适合「结果就是这一
+    /// 批行」的命令；这里输出的是带 `server` / `skipped` 等上下文的完整载荷，
+    /// 即使条目为空也是同一个对象——否则同一命令的 JSON 形状会随内容变化，
+    /// 脚本就没法稳定解析。
+    ///
+    /// # Errors
+    ///
+    /// 序列化结果失败时返回底层错误
+    pub(crate) fn print_table_or_payload<T: Serialize>(
+        self,
+        rows: &[T],
+        empty_human: &str,
+        build_table: impl FnOnce() -> Table,
+        payload: &impl Serialize,
+    ) -> anyhow::Result<()> {
+        match self.format {
+            OutputFormat::Human => {
+                if rows.is_empty() {
+                    print_styled(empty_human);
+                } else {
+                    print_table(&build_table());
+                }
+                Ok(())
+            }
+            OutputFormat::Json => {
+                let line = serde_json::to_string(payload)?;
+                print_json_line(&line);
+                Ok(())
+            }
+        }
+    }
+
     /// 单条结果：人类打标题行，JSON 打一个对象
     ///
     /// # Errors

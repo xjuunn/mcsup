@@ -228,11 +228,16 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 
 | 子命令 | 用法 | 说明 |
 | --- | --- | --- |
-| `list` | `mcsup server mod list [<name>] [--project-info] [--source <s>] [--outdated]` | 扫描 `mods/` 的直接子项并做本地检查（加载器、客/服归属、依赖闭包、风险）。默认**不联网**也不建表：目录本身是唯一权威，手工丢进去的文件同样会被列出。`--project-info` 才算 SHA1 反查上游项目与版本；`--outdated` 在此基础上逐项查候选版本，只列有更新的条目 |
+| `list` | `mcsup server mod list [<name>] [--kind <k>] [--project-info] [--source <s>] [--outdated]` | 扫描 `mods/` 的直接子项并做本地检查（加载器、客/服归属、依赖闭包、风险）。默认**不联网**也不建表：目录本身是唯一权威，手工丢进去的文件同样会被列出。`--project-info` 才算 SHA1 反查上游项目与版本；`--outdated` 在此基础上逐项查候选版本，只列有更新的条目 |
 | `install` | `mcsup server mod install [<name>] [<spec>] [--version <id>] [--kind <k>] [--source <s>] [--prerelease] [--force] [--dry-run]` | `spec` 支持项目 ID / slug、`https://modrinth.com/<type>/<slug>` 链接、`@search <关键词>`（交互搜索）。两阶段：先算计划并展示（来源、版本、落点、是否替换），确认后才下载。`--version` 精确指定版本，缺省按服务端加载器与 MC 版本自动挑最优候选 |
-| `remove` | `mcsup server mod remove [<name>] [<mod>] [--dry-run]` | 按文件名（可省略 `.jar`）或 modid 定位；modid 命中多个文件时不猜，列出候选并退 2 |
-| `update` | `mcsup server mod update [<name>] [<mod>] [--source <s>] [--force] [--dry-run]` | 识别 → 逐项查候选 → `decide_update` → 展示清单 → 确认后逐个安装。不给 `<mod>` 时处理全部可更新项 |
-| `outdated` | `mcsup server mod outdated [<name>] [--source <s>]` | 只读版 `update`：只列可更新项，不下载 |
+| `remove` | `mcsup server mod remove [<name>] [<mod>] [--kind <k>] [--dry-run]` | 按文件名（可省略 `.jar`）或 modid 定位；modid 命中多个文件时不猜，列出候选并退 2 |
+| `update` | `mcsup server mod update [<name>] [<mod>] [--kind <k>] [--source <s>] [--force] [--dry-run]` | 识别 → 逐项查候选 → `decide_update` → 展示清单 → 确认后逐个安装。不给 `<mod>` 时处理全部可更新项。换名更新会把旧文件删掉，避免两份同 modid 的 jar |
+| `outdated` | `mcsup server mod outdated [<name>] [--kind <k>] [--source <s>]` | 只读版 `update`：只列可更新项，不下载 |
+
+`--kind` 只接受 `mod` 与 `plugin`（默认 `mod`）：这两个类别由服务端从顶层目录
+直接装载，改动的就是 `mods/` 与 `plugins/`。其余类别落点不在这里——数据包在
+`world/datapacks/`，服务端资源包由 `server.properties` 下发——因此直接报用法
+错误（退出码 2），而不是把文件放进一个永远不会被读到的目录。
 
 约定：
 
