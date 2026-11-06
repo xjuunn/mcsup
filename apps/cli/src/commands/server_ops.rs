@@ -736,19 +736,23 @@ pub(super) fn pick_variant(available: &[ServerVariant], printer: Printer) -> Res
     if let [only] = available {
         return Ok(only.clone());
     }
-    prompts::step(
-        printer,
-        2,
-        3,
-        &crate::i18n::pick(printer.lang(), "服务端类型", "server type"),
-    );
-    // 标签由 `bootstrap::variant_label` 统一给出，候选与变体一一对应
-    let labels: Vec<String> = available.iter().map(bootstrap::variant_label).collect();
-    let picked = prompts::select_filter(
-        printer.lang(),
-        &crate::i18n::pick(printer.lang(), "服务端类型", "server type"),
-        &labels,
-    )?;
+    let lang = printer.lang();
+    let title = crate::i18n::pick(lang, "服务端类型", "server type");
+    prompts::step(printer, 2, 3, &title);
+    // 标签由 `bootstrap::variant_label` 统一给出，候选与变体一一对应；说明
+    // 只影响渲染，不参与过滤与提交值
+    let choices: Vec<prompts::ScopedChoice> = available
+        .iter()
+        .map(|variant| {
+            let choice = prompts::ScopedChoice::new(bootstrap::variant_label(variant), false);
+            match bootstrap::variant_note(variant, lang) {
+                Some(note) => choice.with_suffix(note),
+                None => choice,
+            }
+        })
+        .collect();
+    // 变体没有「扩展候选」这一层，范围提示永不渲染
+    let picked = prompts::select_filter_scoped(lang, &title, &choices, prompts::ScopeHint::none())?;
     bootstrap::variant_from_label(&picked, available)
         .ok_or_else(|| anyhow::anyhow!("无效变体: {picked}"))
 }

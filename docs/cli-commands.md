@@ -47,6 +47,10 @@
   可过滤选择、输入名称确认；`workspace init` / `server create` /
   `server remove` / `server set` 共用。组件只做 UI，业务判定仍在
   service / domain。
+- 提示行首符号统一：待答 `标签 > 输入`、已答 `> 标签 答案`，不用 inquire
+  默认的 `?`；选择器只给名字看不出差别的候选补一句灰色说明（服务端类型里
+  `vanilla` 是「官方」、`modrinth` 是「整合包」），说明只影响渲染，不参与
+  过滤与提交值。
 - `workspace init` 无 `--dir` 且可交互时：目录三选项（数据目录 =
   `{data_dir}/mcsup/workspaces/<名称>`；当前目录；自定义目录，输入时校验、
   非法重输）→ 名称（默认=目录名，不合法退回序号 `workspaceNN`）→ 确认。

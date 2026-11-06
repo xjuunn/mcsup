@@ -36,6 +36,8 @@ async fn main() -> ExitCode {
     let lang = locale::detect(locale::LangChoice::parse(&cli.lang));
     let printer = output::Printer::new(cli.output, lang).with_yes(cli.yes);
     init_color(cli.output);
+    // 提示框的 `?` 前缀与自有选择器风格冲突，统一在这里改掉
+    prompts::init_render_config();
     verbosity::init(cli.verbose);
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "启动");
 
