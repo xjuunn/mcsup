@@ -334,6 +334,7 @@ fn into_server_version(id: &str, variant: ServerVariant) -> ServerVersion {
         kind: VersionKind::Release,
         variant,
         java_major: None,
+        released: None,
     }
 }
 

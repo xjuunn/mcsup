@@ -1237,6 +1237,7 @@ mod tests {
                     kind: "release".to_owned(),
                     variant: "paper".to_owned(),
                     java_major: Some(21),
+                    released: None,
                 }],
             },
             Response::Props {
@@ -1336,6 +1337,7 @@ mod tests {
             kind: VersionKind::Release,
             variant: domain::server::version::ServerVariant::Paper,
             java_major: Some(JavaMajor::parse(21).expect("major")),
+            released: Some("2025-06-17T12:00:00+00:00".to_owned()),
         };
         let wire = WireVersion::from(&original);
         let back = ServerVersion::try_from(wire).expect("decode");
@@ -1347,6 +1349,7 @@ mod tests {
             kind: "weird".to_owned(),
             variant: "vanilla".to_owned(),
             java_major: None,
+            released: None,
         };
         assert!(ServerVersion::try_from(bad).is_err());
     }

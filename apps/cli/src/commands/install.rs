@@ -408,6 +408,7 @@ mod tests {
             kind,
             variant: ServerVariant::Vanilla,
             java_major: None,
+            released: None,
         }
     }
 

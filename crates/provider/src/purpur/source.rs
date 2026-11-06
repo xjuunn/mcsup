@@ -236,6 +236,7 @@ fn into_server_version(id: String) -> ServerVersion {
         kind: VersionKind::Release,
         variant: ServerVariant::Purpur,
         java_major: None,
+        released: None,
     }
 }
 

@@ -18,6 +18,12 @@ pub(crate) struct VersionManifestItem {
     pub(crate) id: String,
     #[serde(rename = "type")]
     pub(crate) kind: VersionKind,
+    /// 发布时间，RFC 3339 UTC 原文（如 `2026-11-03T13:08:56+00:00`）
+    ///
+    /// 清单里每条都有，但按可选解析：字段缺失时退回版本号排序，不让整个
+    /// 版本列表因为一条缺字段而获取失败。
+    #[serde(rename = "releaseTime")]
+    pub(crate) released: Option<String>,
     pub(crate) url: String,
 }
 

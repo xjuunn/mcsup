@@ -240,6 +240,7 @@ fn into_server_version(id: String) -> ServerVersion {
         kind: VersionKind::Release,
         variant: ServerVariant::Leaf,
         java_major: None,
+        released: None,
     }
 }
 

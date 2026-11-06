@@ -192,6 +192,7 @@ fn into_server_version(version: String) -> ServerVersion {
         kind,
         variant: ServerVariant::SpongeVanilla,
         java_major: None,
+        released: None,
     }
 }
 

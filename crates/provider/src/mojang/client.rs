@@ -92,6 +92,8 @@ fn into_version(item: VersionManifestItem) -> ServerVersion {
         kind: into_domain_kind(item.kind),
         variant: ServerVariant::Vanilla,
         java_major: None, // 版本列表不包含 Java 版本，详情接口才有
+        // 清单自带发布时间，排序靠它定位 `26w14a` 这类拆不出数字的名字
+        released: item.released,
     }
 }
 

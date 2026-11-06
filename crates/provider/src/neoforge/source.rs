@@ -369,6 +369,7 @@ fn into_server_version(mc: String) -> ServerVersion {
         kind: VersionKind::Release,
         variant: ServerVariant::NeoForge,
         java_major: None,
+        released: None,
     }
 }
 
