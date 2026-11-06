@@ -347,9 +347,9 @@ impl ModInspectService {
 
 /// 算文件的 SHA1（十六进制小写）
 ///
-/// 手写实现以免为一次哈希引入 `sha1` 之外的依赖；`file` crate 已有同款
-/// 依赖，但 modkit 不该依赖它。
-fn sha1_of(path: &Path) -> Result<String, std::io::Error> {
+/// `pub(crate)`：`mod` 编排（`server mod` 的更新检测）要用同一份实现按哈希反查
+/// 上游，两处各写一遍必然出现「一边忽略大小写一边不忽略」这类分叉。
+pub(crate) fn sha1_of(path: &Path) -> Result<String, std::io::Error> {
     use sha1::{Digest, Sha1};
     let bytes = crate::fs::read(path)?;
     let digest = Sha1::digest(&bytes);

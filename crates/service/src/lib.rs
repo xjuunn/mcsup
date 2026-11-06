@@ -7,6 +7,7 @@ mod fs_error;
 mod fs_probe;
 mod java;
 mod lifecycle;
+mod mod_;
 mod mod_inspect;
 mod modpack;
 mod origin;
@@ -38,6 +39,10 @@ pub use java::{
 pub use lifecycle::{
     BusyOp, DEFAULT_RAM_MIB, LifecycleError, LifecycleErrorKind, LogWatch, ServerLifecycleService,
     StartOptions, StatusReport,
+};
+pub use mod_::{
+    ApplyOptions, InstallPlan, InstallSpec, ListOptions, ModEntry, ModError, ModInstalled, ModList,
+    ModRemoved, ModService, STAGING_DIR, UpdateApplied, UpdateChange, UpdateItem, UpdatePlan,
 };
 pub use mod_inspect::{
     ModAudit, ModInspectService, ModInspectServiceError, ModReport, collect_jars,

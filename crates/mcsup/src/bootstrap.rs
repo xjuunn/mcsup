@@ -91,6 +91,8 @@ pub struct Mcsup {
     pub content: ContentService,
     /// 整合包开服编排（取回清单 → 装加载器 → 铺 overrides → 装文件）
     pub modpack: ModpackService,
+    /// 服务端 mod 编排（列表 / 安装 / 卸载 / 检查更新 / 更新）
+    pub mods: service::ModService,
     /// 下载器（HTTP 传输 + 断点续传）：远端安装核心时由 agent 侧复用
     ///
     /// 与各 service 内部持有的是同一个实例；单独暴露是因为远端安装（
@@ -173,6 +175,7 @@ pub struct McsupBuilder {
     content_sources: Option<Vec<Arc<dyn ContentSource>>>,
     modpack_sources: Option<Vec<Arc<dyn ModpackSource>>>,
     modpack_extractor: Option<Arc<dyn ModpackExtractor>>,
+    mod_inspector: Option<Arc<dyn port::mod_::ModInspector>>,
 }
 
 impl std::fmt::Debug for McsupBuilder {
@@ -204,6 +207,7 @@ impl std::fmt::Debug for McsupBuilder {
                 &self.modpack_sources.as_ref().map_or(0, Vec::len),
             )
             .field("modpack_extractor", &self.modpack_extractor.is_some())
+            .field("mod_inspector", &self.mod_inspector.is_some())
             .finish()
     }
 }
@@ -354,6 +358,16 @@ impl McsupBuilder {
         self
     }
 
+    /// 注入 mod 包读取实现（默认 zip 解析版 [`modkit::ZipModInspector`]）
+    ///
+    /// 宿主若已有自己的元数据读取器（例如带缓存的实现），从这里替换；
+    /// 判定口径（客/服归属、依赖闭包）仍在 `domain`，换实现不改结论。
+    #[must_use]
+    pub fn mod_inspector(mut self, inspector: Arc<dyn port::mod_::ModInspector>) -> Self {
+        self.mod_inspector = Some(inspector);
+        self
+    }
+
     /// 装配；`data_dir` 为平台数据目录
     ///
     /// # Errors
@@ -462,6 +476,16 @@ impl McsupBuilder {
             Arc::clone(&downloader),
         );
 
+        // mod 编排与服务端生命周期共用同一个 backend：运行中拒绝改动 mod 的
+        // 判定必须问同一个 supervisor，另起一个实例会各自看到不同的运行态
+        let mods = service::ModService::new(
+            Arc::clone(&registry),
+            Arc::clone(&backend),
+            content.clone(),
+            self.mod_inspector
+                .unwrap_or_else(|| Arc::new(modkit::ZipModInspector::new())),
+        );
+
         Ok(Mcsup {
             workspaces,
             registry,
@@ -471,6 +495,7 @@ impl McsupBuilder {
             jar_sources,
             content,
             modpack,
+            mods,
             downloader,
             store,
         })

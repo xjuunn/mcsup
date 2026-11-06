@@ -682,9 +682,66 @@ fn is_builtin_dep(id: &str) -> bool {
     )
 }
 
+/// 安装一个 jar 之前应当如何处置
+///
+/// 判定只在 `domain` 一处收敛：若入口各自决定「`Blocking` 到底拦不拦」，CLI
+/// 与 API 迟早给出两种结论。`--force` 的含义也由这里的 `allow_blocking` 定义，
+/// 不是各命令自己解释。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallVerdict {
+    /// 可以直接落盘
+    Allow,
+    /// 可以落盘，但必须把风险提示给用户
+    Review,
+    /// 拒绝落盘（除非用户显式允许）
+    Refuse,
+}
+
+impl InstallVerdict {
+    /// 由风险等级与「用户是否已显式允许装 `Blocking`」推出处置
+    ///
+    /// `Blocking` + 允许 → 仍然只降级成 [`Self::Review`]：装了也要留提示，
+    /// 不能让 `--force` 把「明确不可用于服务端」这件事从输出里抹掉。
+    #[must_use]
+    pub fn of(risk: Risk, allow_blocking: bool) -> Self {
+        match risk {
+            Risk::Ok => Self::Allow,
+            Risk::Review => Self::Review,
+            Risk::Blocking if allow_blocking => Self::Review,
+            Risk::Blocking => Self::Refuse,
+        }
+    }
+
+    /// 是否允许落盘
+    #[must_use]
+    pub fn is_allowed(self) -> bool {
+        !matches!(self, Self::Refuse)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn install_verdict_refuses_blocking_unless_allowed() {
+        assert_eq!(InstallVerdict::of(Risk::Ok, false), InstallVerdict::Allow);
+        assert_eq!(
+            InstallVerdict::of(Risk::Review, false),
+            InstallVerdict::Review
+        );
+        assert_eq!(
+            InstallVerdict::of(Risk::Blocking, false),
+            InstallVerdict::Refuse
+        );
+        // 强制放行不等于「无风险」：仍然要给用户看到提示
+        assert_eq!(
+            InstallVerdict::of(Risk::Blocking, true),
+            InstallVerdict::Review
+        );
+        assert!(!InstallVerdict::of(Risk::Blocking, false).is_allowed());
+        assert!(InstallVerdict::of(Risk::Blocking, true).is_allowed());
+    }
 
     #[test]
     fn mc_version_ordering_treats_missing_segment_as_zero() {
