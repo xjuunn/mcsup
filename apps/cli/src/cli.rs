@@ -256,6 +256,8 @@ pub(crate) enum ServerAction {
         name: Option<String>,
         #[arg(long, help = crate::meta::server_accept_eula_arg())]
         accept_eula: bool,
+        #[arg(long, help = crate::meta::server_skip_mod_check_arg())]
+        skip_mod_check: bool,
     },
     #[command(about = crate::meta::server_stop())]
     #[command(visible_alias = "down")]
@@ -279,6 +281,8 @@ pub(crate) enum ServerAction {
         name: Option<String>,
         #[arg(long, help = crate::meta::server_accept_eula_arg())]
         accept_eula: bool,
+        #[arg(long, help = crate::meta::server_skip_mod_check_arg())]
+        skip_mod_check: bool,
         #[arg(
             long,
             value_name = "SEC",

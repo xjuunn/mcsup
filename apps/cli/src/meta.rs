@@ -448,6 +448,14 @@ pub(crate) fn server_accept_eula_arg() -> &'static str {
 }
 
 #[must_use]
+pub(crate) fn server_skip_mod_check_arg() -> &'static str {
+    t(
+        "跳过启动前的 mod 检查（缺依赖 / 仅客户端照常启动）",
+        "skip the pre-start mod check (start even with missing deps / client-only mods)",
+    )
+}
+
+#[must_use]
 pub(crate) fn server_stop() -> &'static str {
     t("停止服务", "stop a server")
 }

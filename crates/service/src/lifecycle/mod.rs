@@ -5,11 +5,16 @@
 //! `port` / `domain`，本层只做组装与前置检查。
 
 use crate::java::JavaService;
-use crate::{InstallJarError, ServerRegistry, ServerRegistryError};
+use crate::{
+    InstallJarError, ServerRegistry, ServerRegistryError,
+    mod_inspect::{ModInspectService, ModReport},
+};
 use domain::java::java_bin_under;
+use domain::mod_::{FitVerdict, Risk, ServerTarget};
 use domain::server::eula::{EULA_FILE, eula_accepted, render_eula};
 use domain::server::layout::console_log_path;
 use domain::server::version::VersionId;
+use port::mod_::ModInspector;
 use port::{
     Backend, CancellationToken, CoreInspector, EventSink, NoopEventSink, ScannedJava, StopOutcome,
     StopSpec, SupervisorError, SupervisorStartOutcome, SupervisorStartRequest, SupervisorStatus,
@@ -46,6 +51,11 @@ pub struct StatusReport {
 pub struct StartOptions {
     /// 同意 EULA（缺失 / `eula=false` 时写 `eula=true`）
     pub accept_eula: bool,
+    /// 跳过 mod 预检
+    ///
+    /// 预检拦的是「加载器一定会在解析阶段拒绝」的问题（缺必需依赖 / 仅客户端
+    /// / 版本不匹配）。确认要硬闯时跳过，与服务端自己决定是否启动的口径一致。
+    pub skip_mod_check: bool,
     /// 堆上限；`None` 用 [`DEFAULT_RAM_MIB`]
     pub ram_mib: Option<u32>,
     /// 拉起 supervisor 的可执行文件（`mcsup` 本体）
@@ -98,6 +108,18 @@ pub enum LifecycleError {
     /// 服务器未在运行
     #[error("server is not running")]
     NotRunning,
+    /// 有会让服务端起不来的 mod（缺必需依赖 / 仅客户端 / 与服务端不匹配）
+    ///
+    /// 预检在拉起 supervisor **之前**执行：这类问题加载器一定会在解析阶段
+    /// 终止启动，与其让用户去服务端日志里翻英文报错，不如启动前就给出中文
+    /// 结论与逐条原因。`--skip-mod-check` 可跳过。
+    #[error("server {name} has mods that will stop it from starting")]
+    ModsBlocked {
+        /// 服务器名
+        name: String,
+        /// 逐条问题（文件名 + 原因）
+        issues: Vec<String>,
+    },
     /// 目标操作与运行状态冲突：删除 / 换核心不允许在运行中进行
     #[error("server {name} is running, refusing to {op:?}")]
     Busy {
@@ -165,11 +187,13 @@ impl LifecycleError {
             // 缺 `--accept-eula` 是调用方可直接补的参数
             Self::EulaRequired => port::ErrorCategory::Usage,
             // 已在运行 / 未在运行 / 运行中被拒：状态冲突。停机超时说明服务端
-            // 仍在运行，同样是状态没到可继续的地步
+            // 仍在运行，同样是状态没到可继续的地步。mod 预检拦截同理：去掉
+            // 或修好 mods/ 里的文件后状态就变了
             Self::AlreadyRunning
             | Self::NotRunning
             | Self::Busy { .. }
-            | Self::StopTimedOut { .. } => port::ErrorCategory::Conflict,
+            | Self::StopTimedOut { .. }
+            | Self::ModsBlocked { .. } => port::ErrorCategory::Conflict,
             // 远端镜像拿不到增量日志流是对端能力缺失，不是本机错误；
             // IO 与实现违约同样是后端不可用
             Self::RemoteLogStream(_) | Self::Io(_) | Self::StatusCountMismatch { .. } => {
@@ -213,6 +237,10 @@ impl LifecycleError {
             },
             Self::AlreadyRunning => LifecycleErrorKind::AlreadyRunning,
             Self::NotRunning => LifecycleErrorKind::NotRunning,
+            Self::ModsBlocked { name, issues } => LifecycleErrorKind::ModsBlocked {
+                name,
+                issues: issues.as_slice(),
+            },
             Self::Busy { name, op } => LifecycleErrorKind::Busy { name, op: *op },
             Self::StopTimedOut { waited } => LifecycleErrorKind::StopTimedOut { waited: *waited },
             Self::RemoteLogStream(name) => LifecycleErrorKind::RemoteLogStream { name },
@@ -240,6 +268,13 @@ pub enum LifecycleErrorKind<'a> {
     AlreadyRunning,
     /// 未在运行
     NotRunning,
+    /// 有会让服务端起不来的 mod
+    ModsBlocked {
+        /// 服务器名
+        name: &'a str,
+        /// 逐条问题（文件名 + 原因）
+        issues: &'a [String],
+    },
     /// 运行中被拒
     Busy { name: &'a str, op: BusyOp },
     /// 停机超时
@@ -258,6 +293,11 @@ pub struct ServerLifecycleService {
     java: JavaService,
     backend: Arc<dyn Backend>,
     events: Arc<dyn EventSink>,
+    /// mod 预检用的读取器；`None` = 不做预检（保持旧行为）
+    ///
+    /// 组合根默认给 zip 解析版。预检是可选能力的理由：宿主启动器可能完全
+    /// 接管 mod 管理，让它被迫装配读取器没有意义。
+    mod_inspector: Option<Arc<dyn ModInspector>>,
 }
 
 impl std::fmt::Debug for ServerLifecycleService {
@@ -294,7 +334,15 @@ impl ServerLifecycleService {
             java,
             backend,
             events,
+            mod_inspector: None,
         }
+    }
+
+    /// 注入 mod 预检的读取器（启动前检查 `mods/` 里会让服务端起不来的文件）
+    #[must_use]
+    pub fn with_mod_inspector(mut self, inspector: Arc<dyn ModInspector>) -> Self {
+        self.mod_inspector = Some(inspector);
+        self
     }
 
     /// 启动服务器：注册表 → 提前拒绝已在运行 → jar → EULA → Java 选择 → 拉起
@@ -371,6 +419,7 @@ impl ServerLifecycleService {
                 });
             }
             ensure_eula(&server.dir, opts.accept_eula)?;
+            self.check_mods(&server, opts.skip_mod_check)?;
             let runtimes = self.java.list_or_scan(on_first_scan, on_found)?;
             let runtime = pick_runtime(
                 &runtimes,
@@ -404,6 +453,51 @@ impl ServerLifecycleService {
                 name: name.to_owned(),
             });
         Ok(outcome)
+    }
+
+    /// 启动前的 mod 预检：找出会让加载器拒绝启动的文件
+    ///
+    /// 只拦「必然失败」：缺必需依赖（加载器解析阶段直接终止）、仅客户端
+    /// （加载器拒绝装载）、与服务端明显不匹配（声明区间不含这台的版本）。
+    /// 「待确认」（判不出客/服）不拦——那种启动也许能成，拦了就没人能启动
+    /// 任何整合包了。远端服务器不做：`mods/` 在对端，本地读不到。
+    ///
+    /// 没装配读取器时静默跳过：预检是可选能力，不是必须项。
+    fn check_mods(
+        &self,
+        server: &crate::registry::RegisteredServer,
+        skip: bool,
+    ) -> Result<(), LifecycleError> {
+        if skip {
+            return Ok(());
+        }
+        let Some(inspector) = &self.mod_inspector else {
+            return Ok(());
+        };
+        let mut issues: Vec<String> = Vec::new();
+        for dir in ["mods", "plugins"] {
+            let dir = server.dir.join(dir);
+            if !dir.is_dir() {
+                continue;
+            }
+            let jars = crate::mod_inspect::collect_jars(&dir)
+                .map_err(|err| LifecycleError::Io(std::io::Error::other(err.to_string())))?;
+            if jars.is_empty() {
+                continue;
+            }
+            let service = ModInspectService::local(Arc::clone(inspector));
+            let target = crate::mod_::server_target(server);
+            // 预检不联网：启动是本地决策，上游挂了不该拦着人开服
+            let audit = block_on_inspect(&service, &jars, &target)?;
+            issues.extend(audit.mods.iter().filter_map(blocking_issue));
+        }
+        if issues.is_empty() {
+            return Ok(());
+        }
+        Err(LifecycleError::ModsBlocked {
+            name: server.meta.name.as_str().to_owned(),
+            issues,
+        })
     }
 
     /// 停机：不在运行视为幂等成功；宽限到期映射为 [`LifecycleError::StopTimedOut`]
@@ -800,6 +894,52 @@ fn meta_java_major(
     mc: &str,
 ) -> Option<domain::java::JavaMajor> {
     recorded.or_else(|| domain::server::version::required_java_major(mc))
+}
+
+/// 在同步的 `start` 里跑一次（不联网的）异步检查
+///
+/// `start` 是同步 API，三个入口都不在异步上下文里调它；检查本身不联网、
+/// 不依赖外部执行器，起一个一次性的当前线程运行时即可——不能借用调用方的
+/// 运行时配 `block_in_place`，它要求 `rt` feature，而 feature 矩阵里会关掉。
+fn block_on_inspect(
+    service: &ModInspectService,
+    jars: &[PathBuf],
+    target: &ServerTarget,
+) -> Result<crate::mod_inspect::ModAudit, LifecycleError> {
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .map_err(|err| LifecycleError::Io(std::io::Error::other(err.to_string())))?
+        .block_on(service.inspect_paths_for(jars, false, Some(target)))
+        .map_err(|err| LifecycleError::Io(std::io::Error::other(err.to_string())))
+}
+
+/// 一个 mod 会让启动失败的理由；没有则 `None`
+fn blocking_issue(report: &ModReport) -> Option<String> {
+    let file = Path::new(&report.capability.path).file_name().map_or_else(
+        || report.capability.path.clone(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    if !report.missing_deps.is_empty() {
+        return Some(format!(
+            "{file}: 缺少必需依赖 {}",
+            report.missing_deps.join("、")
+        ));
+    }
+    if report.risk == Risk::Blocking {
+        return Some(format!(
+            "{file}: 明确不可用于服务端（仅客户端或被上游标注）"
+        ));
+    }
+    if let Some(fit) = &report.fit
+        && fit.verdict == FitVerdict::Rejected
+    {
+        let detail = fit
+            .issues
+            .first()
+            .map_or_else(|| "与服务端不匹配".to_owned(), |issue| issue.detail.clone());
+        return Some(format!("{file}: 装不进这台服务端（{detail}）"));
+    }
+    None
 }
 
 /// Java 选择：`server set java-version` 绑定大版本时取该版本的运行时，

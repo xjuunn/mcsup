@@ -26,9 +26,11 @@ workspace = true
 
 [dev-dependencies]
 backup = { version = "0.1.0", path = "../backup" }
+modkit = { version = "0.1.0", path = "../modkit" }
 service = { version = "0.1.0", path = "." }
 storage = { version = "0.1.0", path = "../storage" }
 tempfile.workspace = true
 testkit = { version = "0.1.0", path = "../testkit" }
 tokio = { workspace = true, features = ["macros", "rt"] }
 uuid.workspace = true
+zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2"] }

@@ -176,6 +176,16 @@ pub(crate) fn lifecycle(kind: &LifecycleErrorKind<'_>, lang: Lang) -> String {
             "停机超时（已等待 {}），可加 --force 强杀",
             fmt_duration(*waited)
         ),
+        LifecycleErrorKind::ModsBlocked { name, issues } => {
+            let mut text = format!(
+                "启动中止：服务器 {name} 有会让服务端起不来的 mod，修复后重试，或加 --skip-mod-check 硬闯"
+            );
+            for issue in *issues {
+                text.push_str("\n  ↳ ");
+                text.push_str(issue);
+            }
+            text
+        }
         // non_exhaustive：新增判定在补文案前沿用英文措辞，不漏掉提示
         _ => lifecycle_en(kind),
     }
@@ -210,6 +220,16 @@ fn lifecycle_en(kind: &LifecycleErrorKind<'_>) -> String {
             "stop timed out after {}; add --force to kill it",
             fmt_duration(*waited)
         ),
+        LifecycleErrorKind::ModsBlocked { name, issues } => {
+            let mut text = format!(
+                "start aborted: server {name} has mods that will stop it; fix them or retry with --skip-mod-check"
+            );
+            for issue in *issues {
+                text.push_str("\n  ↳ ");
+                text.push_str(issue);
+            }
+            text
+        }
         _ => "operation failed".to_owned(),
     }
 }

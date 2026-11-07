@@ -43,11 +43,13 @@ async fn run_start(
     service: &ServerLifecycleService,
     name: &str,
     mut accept_eula: bool,
+    skip_mod_check: bool,
     supervisor_exe: &std::path::Path,
     printer: Printer,
 ) -> Result<SupervisorStartOutcome> {
     let opts = |accept: bool| StartOptions {
         accept_eula: accept,
+        skip_mod_check,
         ram_mib: None,
         supervisor_exe: supervisor_exe.to_path_buf(),
         supervisor_args: vec![std::ffi::OsString::from("__supervise")],
@@ -157,10 +159,23 @@ async fn run_start(
 }
 
 /// `server start`：启动并报告 supervisor PID
-pub(crate) async fn start(name: &str, accept_eula: bool, printer: Printer) -> Result<()> {
+pub(crate) async fn start(
+    name: &str,
+    accept_eula: bool,
+    skip_mod_check: bool,
+    printer: Printer,
+) -> Result<()> {
     let service = lifecycle_service()?;
     let supervisor_exe = std::env::current_exe().context("定位 mcsup 可执行文件")?;
-    let outcome = run_start(&service, name, accept_eula, &supervisor_exe, printer).await?;
+    let outcome = run_start(
+        &service,
+        name,
+        accept_eula,
+        skip_mod_check,
+        &supervisor_exe,
+        printer,
+    )
+    .await?;
     let payload = StartJson {
         name,
         supervisor_pid: outcome.supervisor_pid,
@@ -257,6 +272,7 @@ pub(crate) fn stop(name: &str, grace: u64, force: bool, printer: Printer) -> Res
 pub(crate) async fn restart(
     name: &str,
     accept_eula: bool,
+    skip_mod_check: bool,
     grace: u64,
     force: bool,
     printer: Printer,
@@ -291,7 +307,15 @@ pub(crate) async fn restart(
         }
     }
 
-    let outcome = run_start(&service, name, accept_eula, &supervisor_exe, printer).await?;
+    let outcome = run_start(
+        &service,
+        name,
+        accept_eula,
+        skip_mod_check,
+        &supervisor_exe,
+        printer,
+    )
+    .await?;
     let payload = StartJson {
         name,
         supervisor_pid: outcome.supervisor_pid,
