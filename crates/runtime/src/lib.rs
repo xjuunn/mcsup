@@ -20,6 +20,8 @@ mod launch;
 mod local;
 mod process;
 mod supervisor;
+#[cfg(test)]
+mod windows_ipc_tests;
 
 pub use installer::LocalInstallerRunner;
 pub use launch::MinecraftLaunch;

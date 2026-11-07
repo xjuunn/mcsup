@@ -899,8 +899,9 @@ impl ModCapability {
     ///   保留 Fabric 兼容层，因此 `Quilt` 目标接受 Fabric mod；反向不成立。
     ///   其余跨加载器兼容（`NeoForge` 1.20.1 的 Forge 血统等）版本相关，
     ///   不能一概而论，宁可不判。
-    /// - **MC 版本**：文件声明的区间是否含目标版本。未声明区间就是判不出，
-    ///   不按「大概能跑」放行。
+    /// - **MC 版本**：文件声明的区间是否含目标版本。**没声明区间算满足**：
+    ///   加载器对「没有 `minecraft` 依赖」的处理就是不施加版本限制，数据包类
+    ///   mod 普遍如此。只有声明了区间且目标不在区间内才判不匹配。
     /// - **Java**：按 class 文件头实测的最大版本比。**只可能给出不匹配**：
     ///   没扫到 class（数据包、扫描预算用尽）说明不了任何问题，不该因此
     ///   把结论降成「待确认」，否则每个数据包都会变成待确认。
@@ -930,16 +931,15 @@ impl ModCapability {
             }
         };
 
-        let mc_version = match (&target.mc_version, self.mc_versions.is_any()) {
-            (None, _) => Fit::Unknown,
-            (Some(_), true) => {
-                issues.push(FitIssue::new(
-                    FitDimension::McVersion,
-                    "文件未声明 MC 版本区间，判不出是否兼容".to_owned(),
-                ));
-                Fit::Unknown
-            }
-            (Some(mc), false) => {
+        let mc_version = match &target.mc_version {
+            None => Fit::Unknown,
+            // 没声明区间不等于判不出：加载器对「没有 minecraft 依赖」的处理是
+            // 不施加版本限制，Fabric / Forge 都会照常装载。数据包类 mod 普遍
+            // 如此（它们只带资源，本来就不绑定版本）。把这种情况降成待确认，
+            // 一台正常服务端里会有几十个条目永远停在「待确认」，这一列就没人
+            // 看了——与「只扫到部分 class 就把整列作废」是同一个错误。
+            Some(_) if self.mc_versions.is_any() => Fit::Match,
+            Some(mc) => {
                 if self.mc_versions.contains(mc) {
                     Fit::Match
                 } else {
@@ -967,9 +967,10 @@ impl ModCapability {
             _ => Fit::Unknown,
         };
 
-        // 只有「问了」的维度才可能让结论变成待确认：没问不等于有问题
-        let unresolved = (target.loader.is_some() && loader == Fit::Unknown)
-            || (target.mc_version.is_some() && mc_version == Fit::Unknown);
+        // 只有「问了且判不出」的维度才可能让结论变成待确认：没问不等于有
+        // 问题。MC 维度问了就不会是 `Unknown`（未声明区间按「不施加限制」
+        // 处理），所以这里只剩加载器一种可能。
+        let unresolved = target.loader.is_some() && loader == Fit::Unknown;
         let verdict =
             if loader == Fit::Mismatch || mc_version == Fit::Mismatch || java == Fit::Mismatch {
                 FitVerdict::Rejected
@@ -1347,19 +1348,29 @@ mod tests {
         assert_eq!(fit.verdict, FitVerdict::Rejected);
     }
 
-    /// 未声明 MC 区间是「判不出」，不是「不匹配」：结论降为待确认
+    /// 未声明 MC 区间不是「判不出」，而是「不施加版本限制」
+    ///
+    /// 数据包类 mod（`depends` 里根本没有 `minecraft`）占一台正常服务端的
+    /// 很大一块。把它们全判成待确认，等于让这一列永远给不出结论。
     #[test]
-    fn undeclared_mc_range_is_unclear_not_rejected() {
+    fn undeclared_mc_range_means_no_constraint() {
         let fit =
             cap(&[ModLoader::Fabric], "", None).fit_for(&target(ModLoader::Fabric, "1.21.1", None));
-        assert_eq!(fit.mc_version, Fit::Unknown);
-        assert_eq!(fit.verdict, FitVerdict::Unclear);
-        assert!(
-            fit.issues
-                .iter()
-                .any(|i| i.dimension == FitDimension::McVersion),
-            "判不出必须给出理由"
-        );
+        assert_eq!(fit.mc_version, Fit::Match);
+        assert_eq!(fit.verdict, FitVerdict::Installable);
+        assert!(fit.issues.is_empty(), "{:?}", fit.issues);
+    }
+
+    /// 声明了区间但不含目标版本，仍然是不匹配
+    #[test]
+    fn declared_range_without_target_is_mismatch() {
+        let fit = cap(&[ModLoader::Fabric], "1.20.1", None).fit_for(&target(
+            ModLoader::Fabric,
+            "1.21.1",
+            None,
+        ));
+        assert_eq!(fit.mc_version, Fit::Mismatch);
+        assert_eq!(fit.verdict, FitVerdict::Rejected);
     }
 
     /// 没问的维度不参与结论：只问加载器时，MC / Java 未知不该拖成待确认

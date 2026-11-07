@@ -144,8 +144,12 @@ fn write_broken_jar(dir: &Path) {
     std::fs::write(mods.join("broken.jar"), b"not-a-zip").expect("write");
 }
 
-/// 造一个最小 Fabric mod jar 放进 `mods/`
+/// 造一个最小 Fabric mod jar 放进 `mods/`，可附加一条必需依赖
 fn write_fabric_jar(dir: &Path, name: &str, mc: &str) {
+    write_fabric_jar_with_dep(dir, name, mc, None);
+}
+
+fn write_fabric_jar_with_dep(dir: &Path, name: &str, mc: &str, dep: Option<&str>) {
     use std::io::Write as _;
 
     let mods = dir.join("mods");
@@ -153,11 +157,14 @@ fn write_fabric_jar(dir: &Path, name: &str, mc: &str) {
     let file = std::fs::File::create(mods.join(name)).expect("create jar");
     let mut zip = zip::ZipWriter::new(file);
     let opts = zip::write::SimpleFileOptions::default();
+    let extra = dep
+        .map(|d| format!(r#","{d}":">=2.0.0""#))
+        .unwrap_or_default();
     zip.start_file("fabric.mod.json", opts).expect("start");
     zip.write_all(
         format!(
             r#"{{"schemaVersion":1,"id":"probe","version":"1",
-                "environment":"*","depends":{{"minecraft":"{mc}"}}}}"#
+                "environment":"*","depends":{{"minecraft":"{mc}"{extra}}}}}"#
         )
         .as_bytes(),
     )
@@ -507,4 +514,51 @@ fn list_human_output_shows_fit_and_reason() {
     let text = stdout(&out);
     assert!(text.contains("适配"), "表格缺少适配列: {text}");
     assert!(text.contains("装不进这台服务端"), "缺少拒绝理由: {text}");
+}
+
+/// 缺必需依赖：风险是 blocking，但光有个标记不够，要说清缺的是什么
+///
+/// 真实场景：`mods/` 里少了 `satin`，Fabric 在解析阶段直接终止启动，服务端
+/// 日志里只有一行加载器报错。列表若只打个 `blocking`，用户无从下手。
+#[test]
+fn list_explains_missing_required_dependency() {
+    let home = temp_home();
+    let (_, dir) = workspace_with_server(&home);
+    write_fabric_jar_with_dep(&dir, "needs-satin.jar", "1.21.1", Some("satin"));
+
+    let out = run(
+        home.path(),
+        &["server", "mod", "list", "srv1", "--output", "json"],
+    );
+    ok(&out, "server mod list");
+    let payload = json(&out);
+    assert_eq!(payload[0]["risk"], "blocking", "{payload}");
+    assert_eq!(payload[0]["missing_deps"], serde_json::json!(["satin"]));
+
+    let out = run(
+        home.path(),
+        &["server", "mod", "list", "srv1", "--lang", "zh"],
+    );
+    ok(&out, "server mod list");
+    let text = stdout(&out);
+    assert!(text.contains("会让服务端起不来"), "{text}");
+    assert!(text.contains("缺少必需依赖 satin"), "{text}");
+}
+
+/// 表格不画框线：`+---+` 与 `|` 既占宽度又会随中文双宽字符错位
+#[test]
+fn list_table_has_no_borders() {
+    let home = temp_home();
+    let (_, dir) = workspace_with_server(&home);
+    write_fabric_jar(&dir, "plain.jar", "1.21.1");
+
+    let out = run(
+        home.path(),
+        &["server", "mod", "list", "srv1", "--lang", "zh"],
+    );
+    ok(&out, "server mod list");
+    let text = stdout(&out);
+    assert!(!text.contains("+---"), "表格不该有外框: {text}");
+    assert!(!text.contains("│"), "表格不该有列分隔: {text}");
+    assert!(text.contains("plain.jar"), "{text}");
 }
