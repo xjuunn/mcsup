@@ -27,7 +27,7 @@
 //! 因此只在需要联网兜底时才计算。
 
 use crate::fs_error::FsError;
-use domain::mod_::{ModCapability, ModLoader, Risk};
+use domain::mod_::{ModCapability, ModLoader, Risk, ServerFit, ServerTarget};
 use port::mod_::{ModInspectError, ModInspector, ModMetadataSource};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -62,6 +62,10 @@ pub struct ModReport {
     pub risk: Risk,
     /// 缺失的必需依赖（已在包内其他 mod 中找不到的）
     pub missing_deps: Vec<String>,
+    /// 与目标服务端的匹配结论；未指定目标（`mod inspect` 无 `--mc` /
+    /// `--server`）时为 `None`——没问就不给结论，别让「没问」看起来像
+    /// 「查过了」
+    pub fit: Option<ServerFit>,
 }
 
 /// 整批检测结果
@@ -203,10 +207,12 @@ impl ModInspectService {
         self.inspect_paths_for(paths, allow_upstream, None).await
     }
 
-    /// 检测一批 jar，并显式指定目标加载器
+    /// 检测一批 jar，并显式指定目标服务端的安装条件
     ///
-    /// `target` 由调用方给出（`--loader`）时以它为准；为 `None` 则从这批文件
-    /// 共同支持的加载器里推断。看不出唯一结论就保持 `None`，绝不猜。
+    /// `target` 由调用方给出（`--mc` / `--server`，或 `server mod list` 从
+    /// 服务端元数据组装）：加载器同时用作依赖校验的口径，三个维度一起用来
+    /// 判定「能不能装到这台服务端」。为 `None` 时不做匹配判定，依赖校验的
+    /// 目标加载器从这批文件共同支持的加载器里推断。
     ///
     /// # Errors
     ///
@@ -215,7 +221,7 @@ impl ModInspectService {
         &self,
         paths: &[PathBuf],
         allow_upstream: bool,
-        target: Option<ModLoader>,
+        target: Option<&ServerTarget>,
     ) -> Result<ModAudit, ModInspectServiceError> {
         let mut audit = ModAudit::default();
 
@@ -225,6 +231,7 @@ impl ModInspectService {
                     capability: cap,
                     risk: Risk::Ok,
                     missing_deps: Vec::new(),
+                    fit: None,
                 }),
                 Err(err) => {
                     warn!(path = %path.display(), error = %err, "mod inspection failed");
@@ -265,21 +272,28 @@ impl ModInspectService {
             .flat_map(|r| r.capability.provided_ids())
             .collect();
         // 目标加载器：显式指定优先，否则取这批文件共同支持的唯一加载器
-        let target = target.or_else(|| common_loader(&audit.mods));
+        let loader = target
+            .and_then(|t| t.loader)
+            .or_else(|| common_loader(&audit.mods));
         for report in &mut audit.mods {
-            report.missing_deps = report.capability.missing_mandatory_deps(&present, target);
+            report.missing_deps = report.capability.missing_mandatory_deps(&present, loader);
             let mut risk = report.capability.risk();
             if !report.missing_deps.is_empty() {
                 // 缺必需依赖：服务端起不来，与「仅客户端」同等严重
                 risk = risk.max(Risk::Blocking);
             }
             report.risk = risk;
+            // 匹配判定与风险互不覆盖：一个答「是不是服务端的东西」，
+            // 一个答「和这台服务端对不对得上」
+            report.fit = target
+                .filter(|t| !t.is_empty())
+                .map(|t| report.capability.fit_for(t));
         }
 
         audit
             .mods
             .sort_by(|a, b| a.capability.path.cmp(&b.capability.path));
-        audit.target_loader = target;
+        audit.target_loader = loader;
         Ok(audit)
     }
 
@@ -460,6 +474,44 @@ mod tests {
         assert_eq!(audit.counts(), (0, 1, 0));
     }
 
+    /// 没给目标服务端时不做匹配判定：`fit` 必须是 `None`，不能伪装成查过
+    #[tokio::test]
+    async fn no_target_means_no_fit() {
+        let svc = ModInspectService::local(Arc::new(FakeInspector(vec![cap(
+            "/a.jar",
+            "a",
+            SideSupport::Required,
+        )])));
+        let audit = svc
+            .inspect_paths(&[PathBuf::from("/a.jar")], false)
+            .await
+            .expect("audit");
+        assert!(audit.mods[0].fit.is_none());
+    }
+
+    /// 目标服务端的加载器与文件不符时给出 rejected，理由随之带出
+    #[tokio::test]
+    async fn mismatched_loader_is_rejected() {
+        let mut a = cap("/a.jar", "a", SideSupport::Required);
+        a.loaders = vec![ModLoader::Forge];
+        let svc = ModInspectService::local(Arc::new(FakeInspector(vec![a])));
+        let target = ServerTarget {
+            loader: Some(ModLoader::Fabric),
+            mc_version: Some("1.21.1".to_owned()),
+            java_major: Some(21),
+        };
+        let audit = svc
+            .inspect_paths_for(&[PathBuf::from("/a.jar")], false, Some(&target))
+            .await
+            .expect("audit");
+        let fit = audit.mods[0].fit.as_ref().expect("fit");
+        assert_eq!(fit.verdict, domain::mod_::FitVerdict::Rejected);
+        assert_eq!(fit.loader, domain::mod_::Fit::Mismatch);
+        assert!(!fit.issues.is_empty());
+        // 匹配结论不覆盖风险：客/服归属照旧
+        assert_eq!(audit.mods[0].risk, Risk::Ok);
+    }
+
     /// 整批文件共同支持的唯一加载器被识别为目标加载器
     #[tokio::test]
     async fn target_loader_is_inferred_from_common_support() {
@@ -506,8 +558,12 @@ mod tests {
             domain::mod_::ModDependency::new("quilt_only", "", true).with_loader(ModLoader::Quilt),
         );
         let svc = ModInspectService::local(Arc::new(FakeInspector(vec![a])));
+        let target = ServerTarget {
+            loader: Some(ModLoader::Quilt),
+            ..ServerTarget::none()
+        };
         let audit = svc
-            .inspect_paths_for(&[PathBuf::from("/a.jar")], false, Some(ModLoader::Quilt))
+            .inspect_paths_for(&[PathBuf::from("/a.jar")], false, Some(&target))
             .await
             .expect("audit");
         assert_eq!(audit.target_loader, Some(ModLoader::Quilt));

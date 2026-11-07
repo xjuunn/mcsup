@@ -83,6 +83,19 @@ fn bukkit_plugin_is_server_only() {
     assert_eq!(cap.risk(), Risk::Ok);
 }
 
+/// `api-version` 是插件唯一的版本线索，必须当成 MC 下界
+///
+/// 不当成区间的话，插件在「能否装到这台服务端」里永远只能给出「判不出」，
+/// 而 `api-version: 1.21` 明明已经说明了它跑在 1.21 及以上。
+#[test]
+fn bukkit_api_version_becomes_mc_lower_bound() {
+    let cap = inspect("bukkit_plugin.jar");
+    assert_eq!(cap.mc_versions.min.as_deref(), Some("1.21"));
+    assert_eq!(cap.mc_versions.max, None);
+    assert!(cap.mc_versions.contains("1.21.1"));
+    assert!(!cap.mc_versions.contains("1.20.6"));
+}
+
 #[test]
 fn resource_pack_is_recognized_as_such() {
     let cap = inspect("resource_pack.jar");

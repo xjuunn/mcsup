@@ -888,6 +888,22 @@ pub(crate) fn mod_inspect_loader_arg() -> &'static str {
     )
 }
 
+#[must_use]
+pub(crate) fn mod_inspect_mc_arg() -> &'static str {
+    t(
+        "目标 MC 版本：给出后判定文件声明的版本区间是否覆盖它",
+        "target Minecraft version: check whether the declared version range covers it",
+    )
+}
+
+#[must_use]
+pub(crate) fn mod_inspect_server_arg() -> &'static str {
+    t(
+        "目标服务端名：加载器、MC 版本与 Java 直接取该服务端，判定能否装进去",
+        "target server name: take loader, MC version and Java from that server and judge installability",
+    )
+}
+
 pub(crate) fn mod_offline_arg() -> &'static str {
     t(
         "只做本地检查，不访问上游 API",

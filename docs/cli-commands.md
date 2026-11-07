@@ -228,7 +228,7 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 
 | 子命令 | 用法 | 说明 |
 | --- | --- | --- |
-| `list` | `mcsup server mod list [<name>] [--kind <k>] [--project-info] [--source <s>] [--outdated]` | 扫描 `mods/` 的直接子项并做本地检查（加载器、客/服归属、依赖闭包、风险）。默认**不联网**也不建表：目录本身是唯一权威，手工丢进去的文件同样会被列出。`--project-info` 才算 SHA1 反查上游项目与版本；`--outdated` 在此基础上逐项查候选版本，只列有更新的条目 |
+| `list` | `mcsup server mod list [<name>] [--kind <k>] [--project-info] [--source <s>] [--outdated]` | 扫描 `mods/` 的直接子项并做本地检查（加载器、客/服归属、依赖闭包、风险、**与这台服务端的匹配**）。默认**不联网**也不建表：目录本身是唯一权威，手工丢进去的文件同样会被列出。「适配」列答「装到这台服务端对不对得上」（加载器 / MC 版本 / Java），与「风险」列正交；`rejected` 的条目在表下逐条给出理由。`--project-info` 才算 SHA1 反查上游项目与版本；`--outdated` 在此基础上逐项查候选版本，只列有更新的条目 |
 | `add` | `mcsup server mod add [<name>] [<spec>] [--version <id>] [--kind <k>] [--source <s>] [--prerelease] [--force] [--dry-run]` | `spec` 支持项目 ID / slug、`https://modrinth.com/<type>/<slug>` 链接、`@search <关键词>`。**不给 `spec` 时交互搜索**：打开即列这台服务端能跑的 mod（按下载量排序），输入框与列表同屏，回车按关键词远端搜索；命中项超过一页时列表末尾出现「下一页」「上一页」，Esc 逐级返回（搜索结果 → 推荐列表 → 取消）。列表只含**能在服务端运行**的项目（上游 `server_side` facet 过滤，仅客户端的光影加载器、小地图一类不会出现）。选中项目后同屏展示详情并选版本（默认只列正式版，`--prerelease` 放开），版本列表也由服务端的加载器与 MC 版本过滤。选完走两阶段：先算计划并展示（来源、版本、落点、是否替换），确认后才下载。`--version` 精确指定版本（版本 ID 与版本号都认），缺省按服务端加载器与 MC 版本自动挑最优候选。旧名 `install` / `in` 保留为别名 |
 | `remove` | `mcsup server mod remove [<name>] [<mod>] [--kind <k>] [--dry-run]` | 按文件名（可省略 `.jar`）或 modid 定位；modid 命中多个文件时不猜，列出候选并退 2 |
 | `update` | `mcsup server mod update [<name>] [<mod>] [--kind <k>] [--source <s>] [--force] [--dry-run]` | 识别 → 逐项查候选 → `decide_update` → 展示清单 → 确认后逐个安装。不给 `<mod>` 时处理全部可更新项。换名更新会把旧文件删掉，避免两份同 modid 的 jar |
@@ -260,7 +260,7 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 
 | 子命令 | 用法 | 说明 |
 | --- | --- | --- |
-| `inspect` | `mcsup mod inspect <path>... [--offline] [--loader <加载器>]` | 检测 jar 文件或目录（只取直接子项）。报告加载器、MC 区间、Java 版本、客/服归属、风险等级。`--offline` 只做本地检查，不访问上游 API；`--loader` 指定目标加载器（缺省按整批文件共同支持的加载器推断，见下） |
+| `inspect` | `mcsup mod inspect <path>... [--offline] [--loader <加载器>] [--mc <版本>] [--server <名称>]` | 检测 jar 文件或目录（只取直接子项）。报告加载器、MC 区间、Java 版本、客/服归属、风险等级。`--offline` 只做本地检查，不访问上游 API；`--loader` 指定目标加载器（缺省按整批文件共同支持的加载器推断，见下）。给了 `--mc` / `--server` 时额外判定「能不能装到这台服务端」，见「目标服务端匹配」 |
 
 ### 判定口径
 
@@ -303,6 +303,31 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 **Fabric 的字节码扫不出客户端类**：Fabric mod 运行在 intermediary 名字空间，
 引用的是 `net/minecraft/class_2338` 而非 `net/minecraft/client/Minecraft`。
 这是刻意保留的已知限制，因此该信号对 Fabric 生态**不参与判定**，只作证据。
+
+### 目标服务端匹配
+
+风险等级回答「这个 jar 本身是不是服务端的东西」，与装到哪台服务端无关。
+「能不能装到这台服务端」是另一个正交问题，由**适配**（`fit`）回答：
+
+| 维度 | 判定 | 说明 |
+| --- | --- | --- |
+| 加载器 | 文件声明的加载器里有目标加载器 | `Quilt` 目标接受 Fabric mod（Quilt Loader 保留兼容层），反向不成立；其余跨加载器兼容随版本变化，不猜 |
+| MC 版本 | 文件声明的区间是否覆盖目标版本 | 未声明区间 → 判不出，不按「大概能跑」放行 |
+| Java | class 文件头实测的最大版本 ≤ 服务端实际用的版本 | 只可能给出不匹配：没扫到 class（数据包、扫描预算用尽）说明不了任何问题 |
+
+结论三档：`installable`（三维度都满足）、`unclear`（没有不匹配，但有维度
+判不出）、`rejected`（至少一个维度明确不满足）。
+
+- 目标条件来自 `--server`（读该服务端的加载器 / MC 版本 / Java）或
+  `--loader` + `--mc`（描述一台尚未登记的服务端）；两者互斥
+- `--server` 与 `server mod list` 走同一个构造函数，Java 大版本优先取服务端
+  元数据记录的，旧记录按 MC 版本推算——与启动判定同源
+- 没问的维度不参与结论：只给 `--loader` 时，MC / Java 未知不会把结论拖成
+  `unclear`
+- `server mod list` 的「适配」列与 `mod inspect` 的 `fit` 字段是同一份形状，
+  脚本不必按命令名分两套解析
+- 已知限制：原版服务端没有 mod 加载器，加载器维度因此不参与判定（它本来也
+  不读 `mods/`）。这类服务端上只看 MC 版本与 Java 两个维度
 
 ### 不做什么
 
