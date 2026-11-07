@@ -10,7 +10,7 @@ use crate::{
     mod_inspect::{ModInspectService, ModReport},
 };
 use domain::java::java_bin_under;
-use domain::mod_::{FitVerdict, Risk, ServerTarget};
+use domain::mod_::{FitVerdict, Risk};
 use domain::server::eula::{EULA_FILE, eula_accepted, render_eula};
 use domain::server::layout::console_log_path;
 use domain::server::version::VersionId;
@@ -487,8 +487,9 @@ impl ServerLifecycleService {
             }
             let service = ModInspectService::local(Arc::clone(inspector));
             let target = crate::mod_::server_target(server);
-            // 预检不联网：启动是本地决策，上游挂了不该拦着人开服
-            let audit = block_on_inspect(&service, &jars, &target)?;
+            // 预检不联网：启动是本地决策，上游挂了不该拦着人开服；检查本身
+            // 是同步的（`start` 会被异步调用方调，不能起运行时也不能 `block_on`）
+            let audit = service.inspect_paths_for_sync(&jars, Some(&target));
             issues.extend(audit.mods.iter().filter_map(blocking_issue));
         }
         if issues.is_empty() {
@@ -894,23 +895,6 @@ fn meta_java_major(
     mc: &str,
 ) -> Option<domain::java::JavaMajor> {
     recorded.or_else(|| domain::server::version::required_java_major(mc))
-}
-
-/// 在同步的 `start` 里跑一次（不联网的）异步检查
-///
-/// `start` 是同步 API，三个入口都不在异步上下文里调它；检查本身不联网、
-/// 不依赖外部执行器，起一个一次性的当前线程运行时即可——不能借用调用方的
-/// 运行时配 `block_in_place`，它要求 `rt` feature，而 feature 矩阵里会关掉。
-fn block_on_inspect(
-    service: &ModInspectService,
-    jars: &[PathBuf],
-    target: &ServerTarget,
-) -> Result<crate::mod_inspect::ModAudit, LifecycleError> {
-    tokio::runtime::Builder::new_current_thread()
-        .build()
-        .map_err(|err| LifecycleError::Io(std::io::Error::other(err.to_string())))?
-        .block_on(service.inspect_paths_for(jars, false, Some(target)))
-        .map_err(|err| LifecycleError::Io(std::io::Error::other(err.to_string())))
 }
 
 /// 一个 mod 会让启动失败的理由；没有则 `None`
