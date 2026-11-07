@@ -242,9 +242,13 @@ async fn server(action: ServerAction, cfg: &ConfigFile, printer: Printer) -> Res
             )?;
             install::run(&name, version.as_deref(), cfg, printer).await
         }
-        ServerAction::Start { name, accept_eula } => {
+        ServerAction::Start {
+            name,
+            accept_eula,
+            skip_mod_check,
+        } => {
             let name = server_ops::require_server_name(name.as_deref(), "server start", printer)?;
-            lifecycle::start(&name, accept_eula, printer).await
+            lifecycle::start(&name, accept_eula, skip_mod_check, printer).await
         }
         ServerAction::Stop { name, grace, force } => {
             let name = server_ops::require_server_name(name.as_deref(), "server stop", printer)?;
@@ -253,11 +257,12 @@ async fn server(action: ServerAction, cfg: &ConfigFile, printer: Printer) -> Res
         ServerAction::Restart {
             name,
             accept_eula,
+            skip_mod_check,
             grace,
             force,
         } => {
             let name = server_ops::require_server_name(name.as_deref(), "server restart", printer)?;
-            lifecycle::restart(&name, accept_eula, grace, force, printer).await
+            lifecycle::restart(&name, accept_eula, skip_mod_check, grace, force, printer).await
         }
         ServerAction::Status { name } => {
             let name = server_ops::require_server_name(name.as_deref(), "server status", printer)?;

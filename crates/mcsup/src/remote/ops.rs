@@ -429,6 +429,8 @@ impl Agent {
         };
         let opts = StartOptions {
             accept_eula,
+            // 远端帧没有这个开关；对端的 mods/ 由对端预检（同样有读取器）
+            skip_mod_check: false,
             ram_mib,
             supervisor_exe: self.supervisor_exe().to_path_buf(),
             supervisor_args: vec![std::ffi::OsString::from("__supervise")],

@@ -442,7 +442,9 @@ impl McsupBuilder {
             java.clone(),
             Arc::clone(&backend),
             Arc::clone(&events),
-        );
+        )
+        // 启动前的 mod 预检与 `server mod list` 用同一套读取与判定
+        .with_mod_inspector(Arc::new(modkit::ZipModInspector::new()));
         let backup =
             service::BackupService::new(Arc::clone(&registry), Arc::clone(&backend), backup_store)
                 .with_events(events);

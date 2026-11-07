@@ -404,6 +404,10 @@ impl FakeSupervisor {
         }
     }
 
+    fn stopped() -> Self {
+        Self::with_status(None)
+    }
+
     fn running() -> Self {
         Self::with_status(Some(SupervisorStatus {
             status: domain::server::status::ServerStatus::Running,
@@ -594,6 +598,7 @@ fn service(
 fn opts(accept_eula: bool) -> StartOptions {
     StartOptions {
         accept_eula,
+        skip_mod_check: false,
         ram_mib: None,
         supervisor_exe: PathBuf::from("/usr/local/bin/mcsup"),
         supervisor_args: vec![std::ffi::OsString::from("__supervise")],
@@ -949,6 +954,7 @@ fn start_honors_ram_setting_and_opts_override_it() {
     // 换一套监督器验证覆盖关系）
     let explicit = StartOptions {
         accept_eula: true,
+        skip_mod_check: false,
         ram_mib: Some(512),
         supervisor_exe: PathBuf::from("/usr/local/bin/mcsup"),
         supervisor_args: vec![std::ffi::OsString::from("__supervise")],
@@ -1603,5 +1609,198 @@ fn stop_publishes_server_stopped_event() {
             domain::server::event::DomainEvent::ServerStopped { name } if name == &fixture.name
         )),
         "{events:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 启动前的 mod 预检
+// ---------------------------------------------------------------------------
+
+/// 写一个最小的 Fabric mod jar：`fabric.mod.json` 带 `depends`
+///
+/// 用真实的 zip 结构（预检走 [`modkit::ZipModInspector`]，不是假读取器）。
+fn write_fabric_jar(path: &Path, id: &str, depends: &[(&str, &str)]) {
+    use std::io::Write as _;
+    let file = std::fs::File::create(path).expect("create jar");
+    let mut zip = zip::ZipWriter::new(file);
+    zip.start_file("fabric.mod.json", zip::write::SimpleFileOptions::default())
+        .expect("start file");
+    let deps: Vec<String> = depends
+        .iter()
+        .map(|(id, spec)| format!("\"{id}\": \"{spec}\""))
+        .collect();
+    let manifest = format!(
+        "{{\"schemaVersion\":1,\"id\":\"{id}\",\"version\":\"1.0.0\",\"environment\":\"*\",\"depends\":{{{}}}}}",
+        deps.join(",")
+    );
+    zip.write_all(manifest.as_bytes()).expect("write manifest");
+    zip.finish().expect("finish zip");
+}
+
+/// Fabric 服务端 + 已装核心 + EULA 同意 + 可用 Java：预检之前的门槛全过
+fn fabric_fixture(with_jar: bool) -> Fixture {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let ws = ws_fixture(tmp.path());
+    let servers = Arc::new(MemServers::new());
+    let registry = Arc::new(ServerRegistry::new(
+        Arc::clone(&servers) as Arc<dyn ServerRepository>,
+        Arc::new(MemWorkspaces::new(ws)),
+    ));
+    let server = registry
+        .create(
+            None,
+            "fab",
+            &VersionId::new("1.21.1"),
+            ServerVariant::Fabric,
+            None,
+        )
+        .expect("create");
+    if with_jar {
+        crate::fs::write(server.dir.join("server.jar"), b"jar").expect("jar");
+        registry
+            .update_core(
+                "fab",
+                &VersionId::new("1.21.1"),
+                &InstalledJar {
+                    path: PathBuf::from("server.jar"),
+                    size: 3,
+                    checksum: Checksum::new(ChecksumAlgorithm::Sha1, "0".repeat(40)),
+                },
+                None,
+                None,
+                1_700_000_000,
+            )
+            .expect("jar");
+    }
+    crate::fs::write(server.dir.join("eula.txt"), b"eula=true\n").expect("eula");
+    Fixture {
+        registry,
+        servers,
+        server_dir: server.dir,
+        name: server.meta.name.as_str().to_owned(),
+        id: server.meta.id.clone(),
+        _tmp: tmp,
+    }
+}
+
+fn fabric_java() -> JavaService {
+    JavaService::new(
+        Arc::new(MemJavaRepo::new(
+            vec![runtime(Path::new("/opt/java21"), 21)],
+            true,
+        )),
+        Arc::new(FixedScanner { homes: vec![] }),
+        Arc::new(NoopJavaRegistry),
+        Arc::new(NoopDownloader),
+        Arc::new(NoopExtractor),
+        PathBuf::from("/nonexistent-java-root"),
+    )
+}
+
+fn with_preflight(fixture: &Fixture, supervisor: Arc<FakeSupervisor>) -> ServerLifecycleService {
+    ServerLifecycleService::new(
+        Arc::clone(&fixture.registry),
+        fabric_java(),
+        Arc::new(SupBackend {
+            supervisor: supervisor as Arc<dyn SupervisorPort>,
+        }),
+    )
+    .with_mod_inspector(Arc::new(modkit::ZipModInspector::new()))
+}
+
+/// 缺必需依赖的 mod 必须在启动前拦下——这正是 environmentz 的现场：列表里
+/// 已经说了缺 satin，用户启动照样炸，只能去服务端日志里翻英文报错
+#[test]
+fn start_refuses_when_mod_misses_required_dependency() {
+    let fixture = fabric_fixture(true);
+    let mods_dir = fixture.server_dir.join("mods");
+    std::fs::create_dir_all(&mods_dir).expect("mkdir");
+    write_fabric_jar(
+        &mods_dir.join("environmentz.jar"),
+        "environmentz",
+        &[("satin", ">=2.0.0")],
+    );
+    let supervisor = Arc::new(FakeSupervisor::stopped());
+    let svc = with_preflight(&fixture, Arc::clone(&supervisor));
+
+    let err = start(&svc, &fixture.name, true).expect_err("缺依赖必须拦");
+    let LifecycleError::ModsBlocked { name, issues } = &err else {
+        panic!("{err:?}")
+    };
+    assert_eq!(name, &fixture.name);
+    assert!(
+        issues
+            .iter()
+            .any(|issue| issue.contains("satin") && issue.contains("environmentz.jar")),
+        "{issues:?}"
+    );
+    // supervisor 一次都没被叫：拦截发生在拉起之前
+    assert!(supervisor.starts().is_empty());
+}
+
+/// 依赖已装：不拦，正常走完 start
+#[test]
+fn start_allows_when_dependency_is_present_in_mods_dir() {
+    let fixture = fabric_fixture(true);
+    let mods_dir = fixture.server_dir.join("mods");
+    std::fs::create_dir_all(&mods_dir).expect("mkdir");
+    write_fabric_jar(
+        &mods_dir.join("environmentz.jar"),
+        "environmentz",
+        &[("satin", ">=2.0.0")],
+    );
+    write_fabric_jar(&mods_dir.join("satin.jar"), "satin", &[]);
+    let supervisor = Arc::new(FakeSupervisor::stopped());
+    let svc = with_preflight(&fixture, Arc::clone(&supervisor));
+
+    start(&svc, &fixture.name, true).expect("依赖已装不该拦");
+    assert_eq!(supervisor.starts().len(), 1);
+}
+
+/// `--skip-mod-check`：确认要硬闯时跳过预检
+#[test]
+fn start_with_skip_mod_check_bypasses_preflight() {
+    let fixture = fabric_fixture(true);
+    let mods_dir = fixture.server_dir.join("mods");
+    std::fs::create_dir_all(&mods_dir).expect("mkdir");
+    write_fabric_jar(
+        &mods_dir.join("environmentz.jar"),
+        "environmentz",
+        &[("satin", ">=2.0.0")],
+    );
+    let supervisor = Arc::new(FakeSupervisor::stopped());
+    let svc = with_preflight(&fixture, Arc::clone(&supervisor));
+
+    let mut options = opts(true);
+    options.skip_mod_check = true;
+    svc.start(&fixture.name, &options, &mut || {}, &mut |_| {})
+        .expect("跳过预检就放行");
+    assert_eq!(supervisor.starts().len(), 1);
+}
+
+/// 仅客户端 mod 同样在启动前拦下（`environment` 声明 client）
+#[test]
+fn start_refuses_client_only_mod() {
+    let fixture = fabric_fixture(true);
+    let mods_dir = fixture.server_dir.join("mods");
+    std::fs::create_dir_all(&mods_dir).expect("mkdir");
+    let file = std::fs::File::create(mods_dir.join("client-only.jar")).expect("create jar");
+    let mut zip = zip::ZipWriter::new(file);
+    zip.start_file("fabric.mod.json", zip::write::SimpleFileOptions::default())
+        .expect("start file");
+    zip.write_all(
+        br#"{"schemaVersion":1,"id":"client-only","version":"1.0.0","environment":"client"}"#,
+    )
+    .expect("write");
+    zip.finish().expect("finish");
+
+    let svc = with_preflight(&fixture, Arc::new(FakeSupervisor::stopped()));
+    let err = start(&svc, &fixture.name, true).expect_err("仅客户端必须拦");
+    let LifecycleError::ModsBlocked { issues, .. } = &err else {
+        panic!("{err:?}")
+    };
+    assert!(
+        issues.iter().any(|issue| issue.contains("client-only.jar")),
+        "{issues:?}"
     );
 }
