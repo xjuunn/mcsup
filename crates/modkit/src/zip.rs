@@ -12,7 +12,7 @@
 //! | `environment: "client"` | 仅客户端 | Certain |
 //! | NeoForge `side = "CLIENT"` | 仅客户端 | Certain |
 //! | 只有 `client` 入口，无 `main`/`server` | 仅客户端 | High |
-//! | 字节码引用客户端类（非 Fabric） | 仅客户端迹象 | Medium |
+//! | 字节码引用客户端类（仅无加载器元数据的裸 jar） | 仅客户端迹象 | Medium |
 //! | mixin 有 `client` 段 | 仅记证据，不下结论 | — |
 
 use domain::mod_::{
@@ -77,30 +77,13 @@ impl ModInspector for ZipModInspector {
 
         parse_metadata(&mut zip, &mut cap);
 
-        // 字节码：Java 版本取所有 class 的最大值；客户端类引用只在非 Fabric
-        // 生态才采信（Fabric 用 intermediary 名，扫不出结论）
-        let fabric_like = cap
-            .loaders
-            .iter()
-            .any(|l| matches!(l, ModLoader::Fabric | ModLoader::Quilt));
+        // 字节码：Java 版本取所有 class 的最大值；客户端类引用只在元数据
+        // 完全没给 side 结论时才采信
         let (max_java, any_client_ref) = scan_classes(&mut zip, &names);
         // class major → Java 大版本（65 对用户没意义，用户要的是「Java 21」）
         cap.java_compiled = max_java.and_then(domain::mod_::java_version_from_class_major);
         if any_client_ref {
-            cap.side.evidence.push(Evidence::new(
-                EvidenceSource::Bytecode,
-                "字节码引用客户端专属类（net/minecraft/client/ 或 blaze3d）",
-            ));
-            // Fabric 生态下这个信号不可信：它的 mod 用 intermediary 名，
-            // 扫不到反而是常态。只有非 Fabric 才把它当作弱证据
-            if !fabric_like
-                && cap.side.server == SideSupport::Unknown
-                && cap.side.client == SideSupport::Unknown
-            {
-                cap.side.client = SideSupport::Required;
-                cap.side.server = SideSupport::Unsupported;
-                cap.side.confidence = Confidence::Medium;
-            }
+            apply_client_bytecode(&mut cap);
         }
 
         // 嵌套 jar：整合包里的「壳 jar」常把真正的实现放在 META-INF/jars/，
@@ -277,6 +260,32 @@ fn scan_classes(zip: &mut ZipArchive<std::fs::File>, names: &[String]) -> (Optio
         }
     }
     (max_java, any_client)
+}
+
+/// 字节码发现客户端类引用后的 side 处置
+///
+/// 证据永远记；结论只对「连加载器都认不出」的裸 jar 下：
+/// - Fabric/Quilt 用 intermediary 名，扫出 `net/minecraft/client/` 不稀奇，
+///   定罪会大量误伤
+/// - Forge/NeoForge 的服务端 mod 引用客户端类是常态（DistExecutor、懒加载
+///   渲染分支），加载器运行期按 dist 正确跳过——实测反例：1.19.2 的
+///   MOKEYneedsGeckoLib、betterfpsdist，mods.toml 不写 side、字节码引用了
+///   客户端类，装到服务端正常加载
+///
+/// 裸 jar 没有更好的解释，引用客户端类才是最强信号
+fn apply_client_bytecode(cap: &mut ModCapability) {
+    cap.side.evidence.push(Evidence::new(
+        EvidenceSource::Bytecode,
+        "字节码引用客户端专属类（net/minecraft/client/ 或 blaze3d）",
+    ));
+    if cap.loaders.is_empty()
+        && cap.side.server == SideSupport::Unknown
+        && cap.side.client == SideSupport::Unknown
+    {
+        cap.side.client = SideSupport::Required;
+        cap.side.server = SideSupport::Unsupported;
+        cap.side.confidence = Confidence::Medium;
+    }
 }
 
 /// 最多扫描多少个 class（避免对超大 jar 做全量 IO）
@@ -1022,5 +1031,50 @@ mod tests {
     #[test]
     fn manifest_without_field_returns_none() {
         assert_eq!(manifest_mc_version(b"Manifest-Version: 1.0\r\n"), None);
+    }
+
+    /// Forge mod 的 mods.toml 不写 side 是常态，字节码引用客户端类不能
+    /// 单独定罪（MOKEYneedsGeckoLib / betterfpsdist 现场）：服务端可用 mod
+    /// 引用客户端类（DistExecutor、懒加载渲染分支）加载器会正确跳过
+    #[test]
+    fn forge_mod_with_client_class_refs_is_not_condemned() {
+        let text = "[[mods]]\nmodId=\"mokey\"\nversion=\"1.7.0\"\n\
+            [[dependencies.mokey]]\nmodId=\"forge\"\nmandatory=true\nversionRange=\"[43,)\"\n\
+            [[dependencies.mokey]]\nmodId=\"minecraft\"\nmandatory=true\nversionRange=\"[1.19.2,1.20)\"\n\
+            [[dependencies.mokey]]\nmodId=\"geckolib3\"\nmandatory=true\nversionRange=\"[3.1.40,)\"\nside=\"BOTH\"";
+        let mut cap = ModCapability::empty("mokey.jar");
+        cap.loaders.push(ModLoader::Forge);
+        parse_toml_mods(text.as_bytes(), &mut cap, false);
+        // 依赖块里的 side=BOTH 是依赖的装载侧，不是 mod 自身的 side：
+        // 不应该把 mod 推成双端 Required（那是 apply_toml_side 的事）
+        assert_eq!(cap.side.server, SideSupport::Unknown);
+        // 字节码引用客户端类：只记证据，不下结论（loaders 非空）
+        apply_client_bytecode(&mut cap);
+        assert_eq!(cap.side.server, SideSupport::Unknown);
+        assert!(
+            cap.side
+                .evidence
+                .iter()
+                .any(|e| e.source == EvidenceSource::Bytecode)
+        );
+    }
+
+    /// 认不出加载器的裸 jar：字节码引用客户端类才允许定罪
+    #[test]
+    fn unknown_loader_jar_with_client_refs_is_condemned() {
+        let mut cap = ModCapability::empty("mystery.jar");
+        apply_client_bytecode(&mut cap);
+        assert_eq!(cap.side.server, SideSupport::Unsupported);
+        assert_eq!(cap.side.client, SideSupport::Required);
+    }
+
+    /// mods.toml 显式写 side=CLIENT 的 Forge mod：声明优先，字节码不再覆盖
+    #[test]
+    fn declared_client_side_survives_bytecode_evidence() {
+        let text = "[[mods]]\nmodId=\"x\"\nside=\"CLIENT\"";
+        let mut cap = ModCapability::empty("x.jar");
+        parse_toml_mods(text.as_bytes(), &mut cap, false);
+        apply_client_bytecode(&mut cap);
+        assert_eq!(cap.side.server, SideSupport::Unsupported);
     }
 }
