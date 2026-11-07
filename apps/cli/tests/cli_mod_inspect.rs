@@ -354,3 +354,162 @@ fn unknown_loader_is_usage_error() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// 不给目标时 `fit` 必须是 `null`：没问就不能装作查过
+#[test]
+fn fit_is_null_without_target() {
+    let home = temp_home();
+    let jar = write_fabric_jar(
+        home.path(),
+        "a.jar",
+        r#"{"schemaVersion":1,"id":"a","version":"1",
+            "environment":"*","depends":{"minecraft":"1.21.1"}}"#,
+    );
+    let out = run(
+        home.path(),
+        &[
+            "mod",
+            "inspect",
+            jar.to_str().expect("path"),
+            "--offline",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(out.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert!(value[0]["fit"].is_null(), "{}", value);
+    assert!(value[0]["target"].is_null(), "{}", value);
+}
+
+/// `--mc` 命中声明的区间：可装，且回显判定用的目标条件
+#[test]
+fn mc_within_range_is_installable() {
+    let home = temp_home();
+    let jar = write_fabric_jar(
+        home.path(),
+        "ok.jar",
+        r#"{"schemaVersion":1,"id":"okmod","version":"1",
+            "environment":"*","depends":{"minecraft":"1.21.1"}}"#,
+    );
+    let out = run(
+        home.path(),
+        &[
+            "mod",
+            "inspect",
+            jar.to_str().expect("path"),
+            "--offline",
+            "--mc",
+            "1.21.1",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(value[0]["fit"]["verdict"], "installable", "{value}");
+    assert_eq!(value[0]["fit"]["mc_version"], "match");
+    // 目标条件要回显，用户才能核对「你是按什么判的」
+    assert_eq!(value[0]["target"]["mc_version"], "1.21.1");
+}
+
+/// `--mc` 落在区间外：拒绝，且理由要指出声明的是哪个版本
+#[test]
+fn mc_out_of_range_is_rejected() {
+    let home = temp_home();
+    let jar = write_fabric_jar(
+        home.path(),
+        "old.jar",
+        r#"{"schemaVersion":1,"id":"oldmod","version":"1",
+            "environment":"*","depends":{"minecraft":"1.20.1"}}"#,
+    );
+    let out = run(
+        home.path(),
+        &[
+            "mod",
+            "inspect",
+            jar.to_str().expect("path"),
+            "--offline",
+            "--mc",
+            "1.21.1",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(out.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(value[0]["fit"]["verdict"], "rejected", "{value}");
+    assert_eq!(value[0]["fit"]["mc_version"], "mismatch");
+    let issues = value[0]["fit"]["issues"].as_array().expect("issues");
+    assert!(
+        issues.iter().any(|i| i["dimension"] == "mc_version"
+            && i["detail"].as_str().is_some_and(|d| d.contains("1.20.1"))),
+        "{issues:?}"
+    );
+}
+
+/// 加载器对不上：`--mc` 与 `--loader` 一起给出时按两个维度分别判定
+#[test]
+fn foreign_loader_is_rejected() {
+    let home = temp_home();
+    let jar = write_fabric_jar(
+        home.path(),
+        "f.jar",
+        r#"{"schemaVersion":1,"id":"fab","version":"1",
+            "environment":"*","depends":{"minecraft":"1.21.1"}}"#,
+    );
+    let out = run(
+        home.path(),
+        &[
+            "mod",
+            "inspect",
+            jar.to_str().expect("path"),
+            "--offline",
+            "--loader",
+            "forge",
+            "--mc",
+            "1.21.1",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(out.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(value[0]["fit"]["verdict"], "rejected", "{value}");
+    assert_eq!(value[0]["fit"]["loader"], "mismatch");
+    assert_eq!(value[0]["fit"]["mc_version"], "match");
+}
+
+/// `--server` 与 `--mc` / `--loader` 互斥：两条来源混用会让结论无从解释
+#[test]
+fn server_conflicts_with_explicit_conditions() {
+    let home = temp_home();
+    let jar = write_fabric_jar(
+        home.path(),
+        "x.jar",
+        r#"{"schemaVersion":1,"id":"x","version":"1"}"#,
+    );
+    let out = run(
+        home.path(),
+        &[
+            "mod",
+            "inspect",
+            jar.to_str().expect("path"),
+            "--offline",
+            "--server",
+            "srv",
+            "--mc",
+            "1.21.1",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

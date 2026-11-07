@@ -781,10 +781,24 @@ fn parse_plugin_yml(raw: &[u8], cap: &mut ModCapability) {
         } else if let Some(rest) = line.strip_prefix("version:") {
             cap.version = Some(rest.trim().to_owned());
         } else if let Some(rest) = line.strip_prefix("api-version:") {
+            let api = rest.trim();
             cap.side.evidence.push(Evidence::new(
                 EvidenceSource::Manifest,
-                format!("Bukkit 插件 api-version {}", rest.trim()),
+                format!("Bukkit 插件 api-version {api}"),
             ));
+            // `api-version` 的语义是「最低支持的 MC 版本」，与 mod 的
+            // `depends.minecraft` 不同：没有上界。不填这一格，插件在
+            // 「能否装到这台服务端」里永远只能给出「判不出」。
+            if cap.mc_versions.is_any()
+                && !api.is_empty()
+                && api.chars().next().is_some_and(|c| c.is_ascii_digit())
+            {
+                cap.mc_versions = VersionRange {
+                    raw: format!(">={api}"),
+                    min: Some(api.to_owned()),
+                    max: None,
+                };
+            }
         }
     }
     // 插件只跑在服务端

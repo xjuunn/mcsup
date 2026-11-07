@@ -474,8 +474,22 @@ pub(crate) enum ModInspectAction {
         paths: Vec<PathBuf>,
         #[arg(long, help = crate::meta::mod_offline_arg())]
         offline: bool,
-        #[arg(long, value_name = "LOADER", help = crate::meta::mod_inspect_loader_arg())]
+        #[arg(
+            long,
+            value_name = "LOADER",
+            help = crate::meta::mod_inspect_loader_arg(),
+            conflicts_with = "server"
+        )]
         loader: Option<String>,
+        #[arg(
+            long,
+            value_name = "VERSION",
+            help = crate::meta::mod_inspect_mc_arg(),
+            conflicts_with = "server"
+        )]
+        mc: Option<String>,
+        #[arg(long, value_name = "NAME", help = crate::meta::mod_inspect_server_arg())]
+        server: Option<String>,
     },
 }
 

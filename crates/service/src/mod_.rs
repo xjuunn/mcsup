@@ -30,7 +30,7 @@ use crate::mod_inspect::{
     ModAudit, ModInspectService, ModInspectServiceError, ModReport, collect_jars, sha1_of,
 };
 use crate::registry::{RegisteredServer, ServerRegistry, ServerRegistryError};
-use domain::mod_::{InstallVerdict, ModLoader, Risk};
+use domain::mod_::{InstallVerdict, ModLoader, Risk, ServerTarget};
 use domain::server::content::{
     ContentCandidate, ContentIdentity, ContentKind, ContentRequest, UpdateDecision, decide_update,
 };
@@ -435,7 +435,7 @@ impl ModService {
         let server = self.local_server(name)?;
         let dir = mods_dir(&server, options.kind);
         let jars = jars_in(&dir)?;
-        let audit = self.inspect(&jars, &server.meta.variant).await?;
+        let audit = self.inspect(&jars, &server).await?;
 
         // 哈希只算一次：识别用它，之后按路径回查，避免每个文件算两遍。
         // `updates` 依赖识别结果，因此隐含打开识别——调用方漏传不该让结论变空。
@@ -681,7 +681,7 @@ impl ModService {
             .await?;
 
         let staged = [install.path.clone()];
-        let audit = self.inspect(&staged, &server.meta.variant).await?;
+        let audit = self.inspect(&staged, &server).await?;
         let (risk, missing_deps, evidence) = verdict_of(audit, &plan.file)?;
         let verdict = InstallVerdict::of(risk, options.allow_blocking);
         if !verdict.is_allowed() {
@@ -936,14 +936,18 @@ impl ModService {
     }
 
     /// 本地检查一批 jar（不联网）
+    ///
+    /// 目标服务端条件取自服务端元数据：加载器、MC 版本、Java 大版本。
+    /// 三者一起构成「能不能装到这台服务端」的判定依据。
     async fn inspect(
         &self,
         paths: &[PathBuf],
-        variant: &ServerVariant,
+        server: &RegisteredServer,
     ) -> Result<ModAudit, ModError> {
         let service = ModInspectService::local(Arc::clone(&self.inspector));
+        let target = server_target(server);
         Ok(service
-            .inspect_paths_for(paths, false, loader_of(variant))
+            .inspect_paths_for(paths, false, Some(&target))
             .await?)
     }
 
@@ -1043,6 +1047,33 @@ fn jars_in(dir: &Path) -> Result<Vec<PathBuf>, ModError> {
 /// 服务端变体对应的 mod 加载器
 fn loader_of(variant: &ServerVariant) -> Option<ModLoader> {
     variant.content_loader().and_then(ModLoader::parse)
+}
+
+/// 这台服务端的安装条件
+///
+/// Java 大版本优先取元数据里记录的（启动时实际会用的那个）；旧记录没有这个
+/// 字段，按 MC 版本推算补上——与启动时的判定口径一致，两处不一致会让
+/// 「检查说没问题、启动说缺 Java」。
+///
+/// 入口（`mod inspect --server`）也用它，避免 CLI 与 service 各拼一份条件。
+#[must_use]
+pub fn server_target(server: &RegisteredServer) -> ServerTarget {
+    let meta = &server.meta;
+    ServerTarget {
+        loader: loader_of(&meta.variant),
+        mc_version: Some(meta.version.as_str().to_owned()),
+        java_major: target_java(meta.java_major, meta.version.as_str()),
+    }
+}
+
+/// 这台服务端实际会用的 Java 大版本
+///
+/// 元数据记录的优先（启动时按它挑运行时），旧记录没有这个字段就按 MC 版本
+/// 推算——与启动判定同源，避免「检查说没问题、启动说缺 Java」。
+fn target_java(recorded: Option<domain::java::JavaMajor>, mc: &str) -> Option<u32> {
+    recorded
+        .or_else(|| domain::server::version::required_java_major(mc))
+        .and_then(|major| u32::try_from(major.as_i16()).ok())
 }
 
 /// 新建一个本次安装专用的暂存目录（同卷，便于 rename 换入）
@@ -1258,6 +1289,16 @@ mod tests {
     fn loader_maps_known_variants_only() {
         assert_eq!(loader_of(&ServerVariant::Fabric), Some(ModLoader::Fabric));
         assert_eq!(loader_of(&ServerVariant::Vanilla), None);
+    }
+
+    /// 记录的 Java 优先；没有记录时按 MC 版本推算，与启动判定同源
+    #[test]
+    fn target_java_prefers_recorded_then_falls_back_to_mc() {
+        let recorded = domain::java::JavaMajor::parse(17).expect("17");
+        assert_eq!(target_java(Some(recorded), "1.21.1"), Some(17));
+        assert_eq!(target_java(None, "1.21.1"), Some(21));
+        // 推不出的版本不给结论，绝不猜一个
+        assert_eq!(target_java(None, "24w14a"), None);
     }
 
     /// 搜索条件要带上这台服务端的加载器与游戏版本，且类别固定为用户要装的类别

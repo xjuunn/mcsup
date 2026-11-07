@@ -15,7 +15,9 @@ use crate::locale::Lang;
 use crate::output::Printer;
 use anyhow::Result;
 use comfy_table::{ContentArrangement, Table};
-use mcsup::domain::mod_::{Confidence, ModCapability, ModLoader, Risk, SideSupport};
+use mcsup::domain::mod_::{
+    Confidence, FitVerdict, ModCapability, ModLoader, Risk, ServerFit, ServerTarget, SideSupport,
+};
 use mcsup::modkit::ZipModInspector;
 use mcsup::port::mod_::ModInspector;
 use mcsup::service::{ModAudit, ModInspectService, ModReport, collect_jars};
@@ -40,7 +42,73 @@ struct ModJson {
     missing_deps: Vec<String>,
     /// 依赖校验使用的目标加载器；`null` 表示未确定
     target_loader: Option<String>,
+    /// 与目标服务端的匹配结论；未指定目标（无 `--mc` / `--server`）时为 `null`
+    fit: Option<FitJson>,
+    /// 判定所用的目标条件；未指定目标时为 `null`
+    target: Option<TargetJson>,
     evidence: Vec<EvidenceJson>,
+}
+
+/// JSON 契约里的匹配结论
+///
+/// `server mod list` 复用同一形状：两条命令对「能不能装」必须给出同一种
+/// 表达，否则脚本要按命令名分两套解析。
+#[derive(Debug, Serialize)]
+pub(crate) struct FitJson {
+    /// `installable` / `unclear` / `rejected`
+    pub(crate) verdict: String,
+    /// `match` / `mismatch` / `unknown`
+    pub(crate) loader: String,
+    pub(crate) mc_version: String,
+    pub(crate) java: String,
+    /// 不匹配或判不出的逐条说明
+    pub(crate) issues: Vec<FitIssueJson>,
+}
+
+/// JSON 契约里的一条匹配说明
+#[derive(Debug, Serialize)]
+pub(crate) struct FitIssueJson {
+    /// `loader` / `mc_version` / `java`
+    pub(crate) dimension: String,
+    pub(crate) detail: String,
+}
+
+/// JSON 契约里的目标条件
+#[derive(Debug, Serialize)]
+struct TargetJson {
+    loader: Option<String>,
+    mc_version: Option<String>,
+    java_major: Option<u32>,
+}
+
+/// 匹配结论转 JSON（`server mod list` 共用）
+pub(crate) fn fit_json(fit: &ServerFit) -> FitJson {
+    FitJson {
+        verdict: fit.verdict.as_str().to_owned(),
+        loader: fit.loader.as_str().to_owned(),
+        mc_version: fit.mc_version.as_str().to_owned(),
+        java: fit.java.as_str().to_owned(),
+        issues: fit
+            .issues
+            .iter()
+            .map(|issue| FitIssueJson {
+                dimension: issue.dimension.as_str().to_owned(),
+                detail: issue.detail.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// 目标条件转 JSON
+fn target_json(target: &ServerTarget) -> Option<TargetJson> {
+    if target.is_empty() {
+        return None;
+    }
+    Some(TargetJson {
+        loader: target.loader.map(|l| l.as_str().to_owned()),
+        mc_version: target.mc_version.clone(),
+        java_major: target.java_major,
+    })
 }
 
 /// JSON 契约里的版本区间
@@ -64,7 +132,19 @@ pub(crate) async fn run(action: ModInspectAction, printer: Printer) -> Result<()
             paths,
             offline,
             loader,
-        } => inspect(paths, offline, loader.as_deref(), printer).await,
+            mc,
+            server,
+        } => {
+            inspect(
+                paths,
+                offline,
+                loader.as_deref(),
+                mc.as_deref(),
+                server.as_deref(),
+                printer,
+            )
+            .await
+        }
     }
 }
 
@@ -72,6 +152,8 @@ async fn inspect(
     paths: Vec<PathBuf>,
     offline: bool,
     loader: Option<&str>,
+    mc: Option<&str>,
+    server: Option<&str>,
     printer: Printer,
 ) -> Result<()> {
     let jars = expand_paths(&paths)?;
@@ -94,18 +176,54 @@ async fn inspect(
         printer.is_human(),
     );
     // 目标加载器决定采信哪个清单的依赖；非法值报用法错误（2），不猜
-    let target = match loader {
+    let loader = match loader {
         Some(raw) => {
             Some(ModLoader::parse(raw).ok_or_else(|| unknown_loader_error(printer.lang(), raw))?)
         }
         None => None,
     };
+    let target = build_target(server, loader, mc, printer.lang())?;
     let service = inspect_service(offline, printer.lang())?;
-    let audit = service.inspect_paths_for(&jars, !offline, target).await;
+    let audit = service
+        .inspect_paths_for(&jars, !offline, Some(&target))
+        .await;
     spinner.finish();
     let audit = audit?;
 
-    render(&audit, printer)
+    render(&audit, &target, printer)
+}
+
+/// 组装目标服务端条件
+///
+/// `--server` 直接取那台服务端（加载器、MC 版本、Java 全部来自元数据），与
+/// `server mod list` 用同一个构造函数；`--loader` / `--mc` 用来描述一台还没
+/// 登记的服务端。两条路都走 [`mcsup::service::server_target`]，入口不自己
+/// 推算 Java 版本。
+fn build_target(
+    server: Option<&str>,
+    loader: Option<ModLoader>,
+    mc: Option<&str>,
+    lang: Lang,
+) -> Result<ServerTarget> {
+    if let Some(name) = server {
+        let registry = crate::commands::server_ops::open_registry()?;
+        let found = registry.get(name).map_err(|err| {
+            AppDiagnostic::failure(
+                crate::i18n::pick(
+                    lang,
+                    format!("找不到服务端 {name}：{err}"),
+                    format!("server {name} not found: {err}"),
+                ),
+                None,
+            )
+        })?;
+        return Ok(mcsup::service::server_target(&found));
+    }
+    Ok(ServerTarget {
+        loader,
+        mc_version: mc.map(ToOwned::to_owned),
+        java_major: None,
+    })
 }
 
 /// 按 `--offline` 组装检测服务
@@ -194,17 +312,17 @@ fn unknown_loader_error(lang: Lang, raw: &str) -> anyhow::Error {
 }
 
 /// 渲染检测结果
-fn render(audit: &ModAudit, printer: Printer) -> Result<()> {
+fn render(audit: &ModAudit, target: &ServerTarget, printer: Printer) -> Result<()> {
     let lang = printer.lang();
     let rows: Vec<ModJson> = audit
         .mods
         .iter()
-        .map(|report| to_json(report, audit.target_loader))
+        .map(|report| to_json(report, audit.target_loader, target))
         .collect();
     printer.print_rows(
         &rows,
         text(lang, "没有可报告的 mod", "nothing to report"),
-        || build_table(audit, lang),
+        || build_table(audit, target, lang),
     )?;
 
     // 结论概览
@@ -216,10 +334,29 @@ fn render(audit: &ModAudit, printer: Printer) -> Result<()> {
     );
     printer.print_section(&summary);
     printer.print_section(&target_loader_line(lang, audit.target_loader));
+    // 匹配结论依赖目标条件，必须回显让用户核对「你是按什么判的」
+    if !target.is_empty() {
+        printer.print_section(&target_line(target, lang));
+        let (fit_ok, unclear, rejected) = fit_counts(audit);
+        let line = crate::i18n::pick(
+            lang,
+            format!("适配：{fit_ok} 个可装，{unclear} 个待确认，{rejected} 个不匹配"),
+            format!("fit: {fit_ok} installable, {unclear} unclear, {rejected} rejected"),
+        );
+        printer.print_section(&line);
+    }
 
     // 有问题的条目逐条给理由：blocking 要说清阻塞在哪，review 要说清为什么判不出
     for report in audit.mods.iter().filter(|r| r.risk != Risk::Ok) {
         print_reason_detail(report, printer);
+    }
+    // 匹配结论独立成段：装不进这台服务端的原因与「是不是服务端的东西」无关
+    for report in audit.mods.iter().filter(|r| {
+        r.fit
+            .as_ref()
+            .is_some_and(|f| f.verdict != FitVerdict::Installable)
+    }) {
+        print_fit_detail(report, printer);
     }
 
     // 读不出来的文件
@@ -238,18 +375,85 @@ fn render(audit: &ModAudit, printer: Printer) -> Result<()> {
     Ok(())
 }
 
+/// 各匹配结论的计数
+fn fit_counts(audit: &ModAudit) -> (usize, usize, usize) {
+    let mut ok = 0;
+    let mut unclear = 0;
+    let mut rejected = 0;
+    for fit in audit.mods.iter().filter_map(|r| r.fit.as_ref()) {
+        match fit.verdict {
+            FitVerdict::Installable => ok += 1,
+            FitVerdict::Unclear => unclear += 1,
+            FitVerdict::Rejected => rejected += 1,
+        }
+    }
+    (ok, unclear, rejected)
+}
+
+/// 目标条件回显
+fn target_line(target: &ServerTarget, lang: Lang) -> String {
+    let mut parts = Vec::new();
+    if let Some(loader) = target.loader {
+        parts.push(loader.as_str().to_owned());
+    }
+    if let Some(mc) = &target.mc_version {
+        parts.push(format!("MC {mc}"));
+    }
+    if let Some(java) = target.java_major {
+        parts.push(format!("Java {java}"));
+    }
+    crate::i18n::pick(
+        lang,
+        format!("目标服务端：{}", parts.join(" / ")),
+        format!("target server: {}", parts.join(" / ")),
+    )
+}
+
+/// 一条匹配结论不理想的条目
+fn print_fit_detail(report: &ModReport, printer: Printer) {
+    let Some(fit) = &report.fit else {
+        return;
+    };
+    let lang = printer.lang();
+    let cap = &report.capability;
+    let name = cap.id.as_deref().unwrap_or_else(|| file_name(&cap.path));
+    let title = match fit.verdict {
+        FitVerdict::Rejected => crate::i18n::pick(
+            lang,
+            format!("{name} 装不进这台服务端："),
+            format!("{name} cannot be installed on this server:"),
+        ),
+        FitVerdict::Unclear => crate::i18n::pick(
+            lang,
+            format!("{name} 无法判定能否装入："),
+            format!("{name} cannot be judged for this server:"),
+        ),
+        FitVerdict::Installable => return,
+    };
+    printer.print_section(&title);
+    for issue in &fit.issues {
+        printer.print_section(&format!("  ↳ [{}] {}", issue.dimension, issue.detail));
+    }
+}
+
 /// 表格：只放结论，不放长理由
-fn build_table(audit: &ModAudit, lang: Lang) -> Table {
+fn build_table(audit: &ModAudit, target: &ServerTarget, lang: Lang) -> Table {
     let mut table = Table::new();
     table.set_content_arrangement(ContentArrangement::Dynamic);
-    table.set_header([
+    let mut header = vec![
         text(lang, "mod", "mod"),
         text(lang, "加载器", "loader"),
         text(lang, "MC 区间", "MC range"),
         text(lang, "Java", "Java"),
         text(lang, "服务端", "server"),
         text(lang, "风险", "risk"),
-    ]);
+    ];
+    // 没有目标服务端时不给「适配」列：整列 unknown 只会误导
+    let show_fit = !target.is_empty();
+    if show_fit {
+        header.push(text(lang, "适配", "fit"));
+    }
+    table.set_header(header);
     for report in &audit.mods {
         let cap = &report.capability;
         let name = cap.id.as_deref().unwrap_or_else(|| file_name(&cap.path));
@@ -269,14 +473,18 @@ fn build_table(audit: &ModAudit, lang: Lang) -> Table {
             (None, Some(comp)) => comp.to_string(),
             (None, None) => "-".to_owned(),
         };
-        table.add_row([
+        let mut row = vec![
             name.to_owned(),
             loaders,
             range_text(cap, lang),
             java,
             side_text(cap.side.server, lang).to_owned(),
             risk_text(report.risk, lang).to_owned(),
-        ]);
+        ];
+        if show_fit {
+            row.push(fit_text(report.fit.as_ref(), lang).to_owned());
+        }
+        table.add_row(row);
     }
     table
 }
@@ -376,12 +584,22 @@ fn risk_text(risk: Risk, lang: Lang) -> &'static str {
     }
 }
 
+/// 匹配结论展示
+fn fit_text(fit: Option<&ServerFit>, lang: Lang) -> &'static str {
+    match fit.map(|f| f.verdict) {
+        Some(FitVerdict::Installable) => text(lang, "✓ 可装", "✓ ok"),
+        Some(FitVerdict::Unclear) => text(lang, "? 待确认", "? unclear"),
+        Some(FitVerdict::Rejected) => text(lang, "✗ 不匹配", "✗ mismatch"),
+        None => "-",
+    }
+}
+
 /// 置信度转机器名（JSON 契约用稳定英文，不做翻译）
 fn confidence_name(c: Confidence) -> String {
     c.as_str().to_owned()
 }
 
-fn to_json(report: &ModReport, target_loader: Option<ModLoader>) -> ModJson {
+fn to_json(report: &ModReport, target_loader: Option<ModLoader>, target: &ServerTarget) -> ModJson {
     let cap = &report.capability;
     ModJson {
         path: cap.path.clone(),
@@ -402,6 +620,8 @@ fn to_json(report: &ModReport, target_loader: Option<ModLoader>) -> ModJson {
         missing_deps: report.missing_deps.clone(),
         // 目标加载器是整批共享的口径，单条记录也带上，JSON 消费方不必另取
         target_loader: target_loader.map(|loader| loader.as_str().to_owned()),
+        fit: report.fit.as_ref().map(fit_json),
+        target: target_json(target),
         evidence: cap
             .side
             .evidence
