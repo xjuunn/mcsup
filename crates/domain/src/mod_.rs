@@ -589,6 +589,15 @@ pub struct ModCapability {
     /// `balm` 声明 `provides: ["balm-fabric"]`，而依赖方写的是
     /// `balm-fabric`——不读这个字段就会把已满足的依赖误报成缺失。
     pub provides: Vec<String>,
+    /// 上游声明的「库」身份（Fabric `custom.badges` 含 `library`）
+    ///
+    /// API 库的 `environment: "client"` 是误标的高发区：库本身带 `client`
+    /// 入口（给客户端提供 API），但服务端也要装载它来满足依赖方的声明
+    /// （实测 `satin`——shader 库，`environment: "client"`，`server_side`
+    /// 上游标 `unsupported`，却是一众服务端 mod 的必需依赖）。装上服务端
+    /// 后加载器正常装载，`client` 入口不会被调用。库身份把这类误标从
+    /// 「明确不可用」降级为「待确认」，最终裁决留给实测启动。
+    pub is_library: bool,
 }
 
 impl ModCapability {
@@ -609,6 +618,7 @@ impl ModCapability {
             breaks: Vec::new(),
             nested_jars: 0,
             provides: Vec::new(),
+            is_library: false,
         }
     }
 
@@ -616,12 +626,21 @@ impl ModCapability {
     ///
     /// 客/服结论是主判据；此外「必需依赖缺失」由调用方用
     /// [`Self::missing_mandatory_deps`] 另行判定并叠加。
+    ///
+    /// 库身份是唯一的例外通道：`environment: "client"` 的库几乎都是清单
+    /// 误标（见 [`Self::is_library`]），按「明确不可用」处置会把用户锁死
+    /// ——依赖方要它，搜索列表不收它，装上又拦它。降级为「待确认」：
+    /// 该验证的验证流程一个不少，只是不替用户下死刑。
     #[must_use]
     pub fn risk(&self) -> Risk {
         let base = Risk::of(&self.side);
         // 没有任何模组加载器元数据：可能是资源包 / 数据包 / 损坏文件，
         // 也可能只是我们认不出。判不出就降级为待确认，而不是放行。
         if self.loaders.is_empty() && base == Risk::Ok {
+            return Risk::Review;
+        }
+        // 上游声明自己只是库 + 清单判「仅客户端」：按误标对待，不拦死
+        if self.is_library && base == Risk::Blocking {
             return Risk::Review;
         }
         base
@@ -1071,6 +1090,46 @@ mod tests {
     fn client_only_maps_to_blocking() {
         let side = SideVerdict::declared(SideSupport::Required, SideSupport::Unsupported);
         assert_eq!(Risk::of(&side), Risk::Blocking);
+    }
+
+    /// 库身份让「仅客户端」降级为「待确认」：satin 现场的基础
+    ///
+    /// 实测：satin `environment: "client"`，却是一众服务端 mod 的必需依赖，
+    /// 服务端装载正常。不降级的话，依赖方要它、搜索不收它、装上又拦它，
+    /// 用户被三面锁死。
+    #[test]
+    fn library_client_only_is_review_not_blocking() {
+        let mut cap = ModCapability::empty("satin.jar");
+        cap.side = SideVerdict::declared(SideSupport::Required, SideSupport::Unsupported);
+        cap.is_library = true;
+        assert_eq!(cap.risk(), Risk::Review);
+    }
+
+    /// 库身份只降级「仅客户端」，其它 Blocking 源头不受影响
+    ///
+    /// 库身份不是免死金牌：字节码判出的强客户端（非 Fabric 生态）与「无任何
+    /// 元数据」不该因为 badges 有 library 就放行。
+    #[test]
+    fn library_without_metadata_stays_review_but_nonlibrary_blocking_unchanged() {
+        // 非 library 的仅客户端仍是 Blocking
+        let mut cap = ModCapability::empty("iris.jar");
+        cap.side = SideVerdict::declared(SideSupport::Required, SideSupport::Unsupported);
+        assert_eq!(cap.risk(), Risk::Blocking);
+
+        // library + 无加载器元数据：本来就因「无元数据」是 Review
+        let mut bare = ModCapability::empty("bare.jar");
+        bare.is_library = true;
+        assert_eq!(bare.risk(), Risk::Review);
+    }
+
+    /// library 的双端正常结论不变化
+    #[test]
+    fn library_dual_side_stays_ok() {
+        let mut cap = ModCapability::empty("lib.jar");
+        cap.loaders = vec![ModLoader::Fabric];
+        cap.side = SideVerdict::declared(SideSupport::Required, SideSupport::Required);
+        cap.is_library = true;
+        assert_eq!(cap.risk(), Risk::Ok);
     }
 
     #[test]

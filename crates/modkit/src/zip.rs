@@ -354,6 +354,23 @@ fn parse_fabric(raw: &[u8], cap: &mut ModCapability) {
         }
     }
 
+    // 库身份：`custom.badges` 含 `library`。API 库的 `environment: "client"`
+    // 是误标高发区（实测 satin——依赖方要求它，服务端也装载正常），库身份
+    // 让领域判定把这类「仅客户端」降级为「待确认」而不是拦死。
+    if let Some(badges) = v["custom"]["badges"].as_array() {
+        let is_library = badges
+            .iter()
+            .filter_map(|b| b.as_str())
+            .any(|b| b.eq_ignore_ascii_case("library"));
+        if is_library {
+            cap.is_library = true;
+            cap.side.evidence.push(Evidence::new(
+                EvidenceSource::Manifest,
+                "上游声明 badges: [library]——API 库，client 入口仅供客户端调用",
+            ));
+        }
+    }
+
     // depends / recommends / breaks
     push_fabric_deps(&v["depends"], true, cap);
     push_fabric_deps(&v["recommends"], false, cap);
@@ -873,6 +890,25 @@ mod tests {
             .expect("应记录 cobblemon 依赖");
         assert_eq!(cobblemon.loader, Some(ModLoader::Fabric));
         assert!(cobblemon.unless.is_empty());
+    }
+
+    /// `badges: [library]` 记录库身份（satin 现场的基础）
+    #[test]
+    fn library_badge_is_detected() {
+        let raw = br#"{"schemaVersion":1,"id":"satin","version":"2.0.0",
+            "environment":"client","custom":{"badges":["library"]}}"#;
+        let mut cap = ModCapability::empty("satin.jar");
+        parse_fabric(raw, &mut cap);
+        assert!(cap.is_library);
+    }
+
+    /// 普通 mod 没有 library 徽章，不误标
+    #[test]
+    fn normal_mod_is_not_library() {
+        let raw = br#"{"schemaVersion":1,"id":"iris","version":"1","environment":"client"}"#;
+        let mut cap = ModCapability::empty("iris.jar");
+        parse_fabric(raw, &mut cap);
+        assert!(!cap.is_library);
     }
 
     /// Quilt 的条件豁免要读进来，别当成普通硬依赖

@@ -209,9 +209,18 @@ async fn browse_results(
     // 命中项与「title · id」的对应关系要先记住：选择器只回报标签文本，
     // 回来时按它找回完整项目（详情与类别都在里面，不必再查一次上游）。
     let hits = search.hits;
+    // 上游标注「仅客户端」的条目（过滤为空时 service 会带回来）要有显式
+    // 标记：satin 一类 API 库确实能装，但纯客户端 mod 装上就是起不来，
+    // 不能让两种情况在列表里看起来一样。
     let labels: Vec<String> = hits
         .iter()
-        .map(|hit| format!("{} · {}", hit.title, hit.id))
+        .map(|hit| {
+            if hit.client_only {
+                format!("{} · {}（上游标注仅客户端）", hit.title, hit.id)
+            } else {
+                format!("{} · {}", hit.title, hit.id)
+            }
+        })
         .collect();
     let choices = with_pagers(
         hits.iter()
@@ -574,6 +583,7 @@ mod tests {
             author: None,
             downloads: 1,
             icon_url: None,
+            client_only: false,
         };
         let labels: Vec<&str> = detail_rows(&project)
             .iter()

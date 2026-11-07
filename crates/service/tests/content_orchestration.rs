@@ -94,6 +94,7 @@ impl ContentSource for FakeSource {
             author: None,
             downloads: 0,
             icon_url: None,
+            client_only: false,
         })
     }
 

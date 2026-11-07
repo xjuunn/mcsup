@@ -56,6 +56,8 @@ struct SourceConfig {
     seen: Vec<ContentRequest>,
     /// `by_hash` 收到过的哈希
     hashed: Vec<String>,
+    /// 全部可搜索的项目（替身按 `server_usable_only` 模拟上游过滤）
+    search_pool: Vec<ContentProject>,
 }
 
 /// 「这个哈希属于某项目的某个版本」
@@ -80,6 +82,7 @@ impl FakeSource {
                 identities: Vec::new(),
                 seen: Vec::new(),
                 hashed: Vec::new(),
+                search_pool: Vec::new(),
             }),
         }
     }
@@ -101,11 +104,19 @@ impl ContentSource for FakeSource {
         ContentKind::ALL.to_vec()
     }
 
-    async fn search(&self, _query: &ContentQuery) -> Result<ContentSearch, SourceError> {
+    async fn search(&self, query: &ContentQuery) -> Result<ContentSearch, SourceError> {
+        let config = self.config.lock().expect("source config");
+        // 模拟上游 facet 行为：`server_usable_only` 时只返回非仅客户端项目
+        let hits: Vec<ContentProject> = config
+            .search_pool
+            .iter()
+            .filter(|hit| !query.server_usable_only || !hit.client_only)
+            .cloned()
+            .collect();
         Ok(ContentSearch {
-            hits: Vec::new(),
+            total: hits.len() as u64,
             offset: 0,
-            total: 0,
+            hits,
         })
     }
 
@@ -122,6 +133,7 @@ impl ContentSource for FakeSource {
             author: None,
             downloads: 0,
             icon_url: None,
+            client_only: false,
         })
     }
 
@@ -478,6 +490,76 @@ fn install_spec() -> InstallSpec<'static> {
         source: None,
         allow_prerelease: false,
     }
+}
+
+fn search_hit(id: &str, client_only: bool) -> ContentProject {
+    ContentProject {
+        id: id.to_owned(),
+        slug: Some(id.to_owned()),
+        title: id.to_owned(),
+        description: String::new(),
+        kind: ContentKind::Mod,
+        also_kinds: Vec::new(),
+        loaders: vec!["fabric".to_owned()],
+        game_versions: vec!["1.21.1".to_owned()],
+        author: None,
+        downloads: 0,
+        icon_url: None,
+        client_only,
+    }
+}
+
+/// 服务端检索为空时带回落选的仅客户端项目（satin 现场的基础）
+///
+/// 上游标注本身有误标：`environment: "client"` 的 API 库可能服务端照样装载
+/// （satin 是一众服务端 mod 的必需依赖）。过滤后为空不等于「没有这个东西」，
+/// 把仅客户端的条目带回来并标记，选择权交还用户。
+#[tokio::test]
+async fn empty_filtered_search_falls_back_to_client_only_hits() {
+    let harness = Harness::new(CommandLog::stopped(), &[], &[b'x'; 4]);
+    harness.source.configure(|config| {
+        config.search_pool = vec![
+            search_hit("satin", true),
+            search_hit("some-client-mod", true),
+        ];
+    });
+
+    let found = harness
+        .mods
+        .search(
+            "alpha",
+            ContentKind::Mod,
+            &ContentQuery::new().keyword("satin"),
+            None,
+        )
+        .await
+        .expect("search");
+    assert_eq!(found.hits.len(), 2, "{:?}", found.hits);
+    assert!(found.hits.iter().all(|hit| hit.client_only));
+    assert!(found.hits.iter().any(|hit| hit.id == "satin"));
+}
+
+/// 服务器可用的结果存在时不放宽：正常列表不带仅客户端噪音
+#[tokio::test]
+async fn nonempty_filtered_search_keeps_client_only_excluded() {
+    let harness = Harness::new(CommandLog::stopped(), &[], &[b'x'; 4]);
+    harness.source.configure(|config| {
+        config.search_pool = vec![search_hit("satin", true), search_hit("fabric-api", false)];
+    });
+
+    let found = harness
+        .mods
+        .search(
+            "alpha",
+            ContentKind::Mod,
+            &ContentQuery::new().keyword("api"),
+            None,
+        )
+        .await
+        .expect("search");
+    assert_eq!(found.hits.len(), 1);
+    assert_eq!(found.hits[0].id, "fabric-api");
+    assert!(!found.hits[0].client_only);
 }
 
 // ---------------------------------------------------------------- 用例
