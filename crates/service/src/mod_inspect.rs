@@ -243,6 +243,42 @@ impl ModInspectService {
         allow_upstream: bool,
         target: Option<&ServerTarget>,
     ) -> Result<ModAudit, ModInspectServiceError> {
+        let mut audit = self.inspect_locally(paths, context, target);
+
+        // 上游兜底：只对本地判不出服务端归属的条目查，联网不是免费的
+        if allow_upstream && let Some(upstream) = &self.upstream {
+            let pending: Vec<usize> = audit
+                .mods
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.capability.side.server == domain::mod_::SideSupport::Unknown)
+                .map(|(i, _)| i)
+                .collect();
+            if !pending.is_empty() {
+                match self
+                    .fill_from_upstream(upstream.as_ref(), paths, &pending, &mut audit)
+                    .await
+                {
+                    Ok(()) => audit.queried_upstream = true,
+                    // 上游挂了不影响本地结论：降级为「未知」继续
+                    Err(err) => warn!(error = %err, "upstream mod metadata lookup failed"),
+                }
+            }
+        }
+
+        Ok(audit)
+    }
+
+    /// 不联网的检测：读取 + 依赖闭包 + 匹配判定，一次成型
+    ///
+    /// 与异步路径共用同一套判定；同步入口（启动预检，`start` 是同步 API，
+    /// 不能起运行时也不该 `block_on`）与列表 / 安装共用它保证口径一致。
+    fn inspect_locally(
+        &self,
+        paths: &[PathBuf],
+        context: &[PathBuf],
+        target: Option<&ServerTarget>,
+    ) -> ModAudit {
         let mut audit = ModAudit::default();
 
         for path in paths {
@@ -270,27 +306,6 @@ impl ModInspectService {
                 Ok(cap) => provided.extend(cap.provided_ids()),
                 Err(err) => {
                     debug!(path = %path.display(), error = %err, "context mod unreadable");
-                }
-            }
-        }
-
-        // 上游兜底：只对本地判不出服务端归属的条目查，联网不是免费的
-        if allow_upstream && let Some(upstream) = &self.upstream {
-            let pending: Vec<usize> = audit
-                .mods
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| r.capability.side.server == domain::mod_::SideSupport::Unknown)
-                .map(|(i, _)| i)
-                .collect();
-            if !pending.is_empty() {
-                match self
-                    .fill_from_upstream(upstream.as_ref(), paths, &pending, &mut audit)
-                    .await
-                {
-                    Ok(()) => audit.queried_upstream = true,
-                    // 上游挂了不影响本地结论：降级为「未知」继续
-                    Err(err) => warn!(error = %err, "upstream mod metadata lookup failed"),
                 }
             }
         }
@@ -325,7 +340,23 @@ impl ModInspectService {
             .mods
             .sort_by(|a, b| a.capability.path.cmp(&b.capability.path));
         audit.target_loader = loader;
-        Ok(audit)
+        audit
+    }
+
+    /// 本地检测（不查上游）的同步入口：启动预检用
+    ///
+    /// `start` 是同步 API，被异步与同步两种调用方共用：CLI 在 tokio 运行时
+    /// 里调它，嵌入方可能在裸线程里调。任何「起运行时 / `block_on` / 嵌套」
+    /// 的方案都会在其中一个场景炸掉，所以预检走的检查必须本身是同步的。
+    ///
+    /// 单个文件读不出来不中断整批（记进 `unreadable` 继续读其余文件）。
+    #[must_use]
+    pub fn inspect_paths_for_sync(
+        &self,
+        paths: &[PathBuf],
+        target: Option<&ServerTarget>,
+    ) -> ModAudit {
+        self.inspect_locally(paths, &[], target)
     }
 
     /// 向上游补齐服务端归属
