@@ -208,6 +208,7 @@ fn project_from_hit(hit: &SearchHit) -> ContentProject {
         author: Some(hit.author.clone()),
         downloads: u64::try_from(hit.downloads).unwrap_or_default(),
         icon_url: hit.icon_url.clone(),
+        client_only: hit.server_side.as_deref() == Some("unsupported"),
     }
 }
 
@@ -229,6 +230,7 @@ fn project_from_detail(project: &Project) -> ContentProject {
         author: None,
         downloads: u64::try_from(project.downloads).unwrap_or_default(),
         icon_url: project.icon_url.clone(),
+        client_only: project.server_side.as_deref() == Some("unsupported"),
     }
 }
 

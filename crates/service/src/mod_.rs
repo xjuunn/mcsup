@@ -522,7 +522,8 @@ impl ModService {
         if !kind.is_server_usable() {
             return Err(ModError::ClientOnly { kind });
         }
-        self.content
+        let search = self
+            .content
             .search(
                 source,
                 &server_query(
@@ -533,7 +534,40 @@ impl ModService {
                 ),
             )
             .await
-            .map_err(ModError::from)
+            .map_err(ModError::from)?;
+        // 过滤后为空不等于「没有这个东西」：上游标注本身有误标（API 库的
+        // `environment: "client"` 常见，实测 satin 是服务端 mod 的必需依赖，
+        // 服务端装载正常）。放宽过滤再查一次，把仅客户端的条目带回来并
+        // 标记——选择权交还用户，而不是把「搜不到」留给用户猜。
+        if search.total == 0 {
+            let mut relaxed = server_query(
+                &server.meta.variant,
+                server.meta.version.as_str(),
+                kind,
+                query,
+            );
+            relaxed.server_usable_only = false;
+            let relaxed = self
+                .content
+                .search(source, &relaxed)
+                .await
+                .map_err(ModError::from)?;
+            // 只带回落选结果里被过滤掉的：上游同时命中两者的场景不存在
+            // （原查询为空），这里是防御性写法，口径保持「过滤为空才放宽」
+            let client_only: Vec<_> = relaxed
+                .hits
+                .into_iter()
+                .filter(|hit| hit.client_only)
+                .collect();
+            if !client_only.is_empty() {
+                return Ok(ContentSearch {
+                    total: client_only.len() as u64,
+                    offset: 0,
+                    hits: client_only,
+                });
+            }
+        }
+        Ok(search)
     }
 
     /// 列出某个项目在这台服务端上可安装的候选版本（已按适配度排序）

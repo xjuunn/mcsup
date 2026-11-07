@@ -134,6 +134,13 @@ pub struct ContentProject {
     pub downloads: u64,
     /// 图标地址
     pub icon_url: Option<String>,
+    /// 上游标注的「仅客户端」（`server_side: unsupported`）
+    ///
+    /// 搜索列表默认滤掉这类项目，但标注有误标（API 库的 `environment:
+    /// "client"` 常见误标，实测 `satin` 是一众服务端 mod 的必需依赖）。
+    /// 过滤后的搜索为空时，service 会把这类项目带回来并标记，
+    /// 由入口提示用户「装上可能起不来」，选择权留给用户。
+    pub client_only: bool,
 }
 
 impl ContentProject {
@@ -403,6 +410,7 @@ mod tests {
             author: None,
             downloads: 0,
             icon_url: None,
+            client_only: false,
         };
         assert_eq!(
             project.kinds(),
