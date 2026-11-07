@@ -738,10 +738,10 @@ pub(crate) fn server_mod_list() -> &'static str {
 }
 
 #[must_use]
-pub(crate) fn server_mod_install() -> &'static str {
+pub(crate) fn server_mod_add() -> &'static str {
     t(
-        "从 Modrinth 安装 mod 到服务端（下载到暂存区、检查通过后才落盘）",
-        "install a mod into a server from Modrinth (staged download, written only after checks pass)",
+        "从 Modrinth 给服务端添加 mod（不写项目时交互搜索；下载到暂存区、检查通过后才落盘）",
+        "add a mod to a server from Modrinth (searches interactively when no project is given; staged download, written only after checks pass)",
     )
 }
 
@@ -780,8 +780,8 @@ pub(crate) fn server_mod_name_arg() -> &'static str {
 #[must_use]
 pub(crate) fn server_mod_spec_arg() -> &'static str {
     t(
-        "项目 ID / slug / modrinth.com 链接；也可写 '@search 关键词' 交互搜索",
-        "project id, slug or modrinth.com link; use '@search <keyword>' to search interactively",
+        "项目 ID / slug / modrinth.com 链接；缺省时交互搜索，也可写 '@search 关键词'",
+        "project id, slug or modrinth.com link; omitted means interactive search, or use '@search <keyword>'",
     )
 }
 

@@ -268,6 +268,14 @@ fn workspace_and_server_ops_run_on_the_agent() {
 #[test]
 fn server_link_variants_and_versions_run_on_the_agent() {
     let harness = Harness::start();
+
+    // `server link` 要在对端建符号链接：Windows 无开发者模式 / 管理员时这条
+    // 系统调用直接失败，用例在本机跑不了，跳过（CI 以管理员身份照常执行）
+    if !symlink_allowed(harness.dir.path()) {
+        eprintln!("本机无符号链接权限，跳过 server link 用例");
+        return;
+    }
+
     let client = harness.paired("admin-ish", false);
 
     // link 需要一个工作区作为 servers/ 的落点
@@ -422,4 +430,25 @@ fn handshake_frames_are_rejected_after_authentication() {
         Response::Error { kind, .. } => assert_eq!(kind, ErrorKind::PROTOCOL),
         other => panic!("重放握手帧应报协议错误：{other:?}"),
     }
+}
+
+/// 本机能否创建目录符号链接
+///
+/// `server link` 在对端建符号链接；Windows 上这条系统调用要求开发者模式或
+/// 管理员。没有权限时用例在本机跑不了，跳过而不是报红——CI（管理员身份）
+/// 照常执行。判定直接试同一条系统调用，探测目录用完即删。
+fn symlink_allowed(scratch: &std::path::Path) -> bool {
+    let target = scratch.join("symlink-probe-target");
+    let link = scratch.join("symlink-probe-link");
+    let _ = std::fs::remove_file(&link);
+    if std::fs::create_dir_all(&target).is_err() {
+        return false;
+    }
+    #[cfg(windows)]
+    let created = std::os::windows::fs::symlink_dir(&target, &link).is_ok();
+    #[cfg(unix)]
+    let created = std::os::unix::fs::symlink(&target, &link).is_ok();
+    let _ = std::fs::remove_file(&link);
+    let _ = std::fs::remove_dir_all(&target);
+    created
 }

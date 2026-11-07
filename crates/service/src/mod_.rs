@@ -32,10 +32,10 @@ use crate::mod_inspect::{
 use crate::registry::{RegisteredServer, ServerRegistry, ServerRegistryError};
 use domain::mod_::{InstallVerdict, ModLoader, Risk};
 use domain::server::content::{
-    ContentIdentity, ContentKind, ContentRequest, UpdateDecision, decide_update,
+    ContentCandidate, ContentIdentity, ContentKind, ContentRequest, UpdateDecision, decide_update,
 };
 use domain::server::version::ServerVariant;
-use port::content::safe_filename;
+use port::content::{ContentQuery, ContentSearch, safe_filename};
 use port::mod_::ModInspector;
 use port::{Backend, CancellationToken, ErrorCategory, ProgressSink};
 use std::collections::HashMap;
@@ -501,6 +501,74 @@ impl ModService {
         })
     }
 
+    /// 按服务端条件搜索可安装的内容
+    ///
+    /// 交互选择（`server mod add` 不带项目时）用它列出「装了能跑」的项目：
+    /// 类别限定为用户要装的类别，加载器与游戏版本取这台服务端的实际条件。
+    /// 过滤条件在这里拼而不是在入口拼——入口只该知道「哪台服务端、要什么
+    /// 关键词、第几页」，不该知道服务端变体对应哪个加载器。
+    ///
+    /// # Errors
+    ///
+    /// 服务器不存在、位于远端、类别不可用于服务端或上游异常时返回 [`ModError`]
+    pub async fn search(
+        &self,
+        name: &str,
+        kind: ContentKind,
+        query: &ContentQuery,
+        source: Option<&str>,
+    ) -> Result<ContentSearch, ModError> {
+        let server = self.local_server(name)?;
+        if !kind.is_server_usable() {
+            return Err(ModError::ClientOnly { kind });
+        }
+        self.content
+            .search(
+                source,
+                &server_query(
+                    &server.meta.variant,
+                    server.meta.version.as_str(),
+                    kind,
+                    query,
+                ),
+            )
+            .await
+            .map_err(ModError::from)
+    }
+
+    /// 列出某个项目在这台服务端上可安装的候选版本（已按适配度排序）
+    ///
+    /// 供交互选择版本：入口把列表展示给用户，选中的版本 ID 再交给
+    /// [`Self::plan_install`] 的 `spec.version`，因此挑版本的口径与自动挑
+    /// 完全一致，不会出现「交互里能选、非交互装不上」的分叉。
+    ///
+    /// # Errors
+    ///
+    /// 服务器不存在、位于远端、类别不可用于服务端、来源异常或没有可安装
+    /// 版本时返回 [`ModError`]
+    pub async fn candidates(
+        &self,
+        name: &str,
+        project: &str,
+        kind: ContentKind,
+        spec: InstallSpec<'_>,
+    ) -> Result<Vec<ContentCandidate>, ModError> {
+        let server = self.local_server(name)?;
+        if !kind.is_server_usable() {
+            return Err(ModError::ClientOnly { kind });
+        }
+        let request = server_request(
+            &server.meta.variant,
+            server.meta.version.as_str(),
+            kind,
+            spec.allow_prerelease,
+        );
+        self.content
+            .candidates(spec.source, project, &request)
+            .await
+            .map_err(ModError::from)
+    }
+
     /// 规划一次安装：解析版本与落点，**不写盘**
     ///
     /// 入口把结果展示给用户确认，确认后才调用 [`Self::install`]。中间可能过了
@@ -523,10 +591,12 @@ impl ModService {
             return Err(ModError::ClientOnly { kind });
         }
         let source = self.content.select_source(spec.source)?;
-        let mut request = request_for(kind, &server.meta.variant, server.meta.version.as_str());
-        if spec.allow_prerelease {
-            request = request.allow_prerelease();
-        }
+        let request = server_request(
+            &server.meta.variant,
+            server.meta.version.as_str(),
+            kind,
+            spec.allow_prerelease,
+        );
         let version_id = match spec.version {
             Some(explicit) => explicit.to_owned(),
             None => self
@@ -917,6 +987,51 @@ fn mods_dir(server: &RegisteredServer, kind: ContentKind) -> PathBuf {
     server.dir.join(kind.install_dir())
 }
 
+/// 这台服务端装某类内容时的版本挑选条件
+///
+/// 加载器与游戏版本都取自服务端元数据，因此「交互里列出的版本」与「自动挑
+/// 的版本」用的是同一份条件。
+fn server_request(
+    variant: &ServerVariant,
+    game_version: &str,
+    kind: ContentKind,
+    allow_prerelease: bool,
+) -> ContentRequest {
+    let mut request = request_for(kind, variant, game_version);
+    if allow_prerelease {
+        request = request.allow_prerelease();
+    }
+    request
+}
+
+/// 把用户的检索条件加上这台服务端的硬性条件
+///
+/// 类别限定为用户要装的类别；加载器只在类别按变体过滤时生效
+/// （数据包不看加载器）；游戏版本总是限定，否则会列出这台服务端跑不起来的
+/// 项目，用户选完才发现没有可安装版本。
+fn server_query(
+    variant: &ServerVariant,
+    game_version: &str,
+    kind: ContentKind,
+    query: &ContentQuery,
+) -> ContentQuery {
+    let request = server_request(variant, game_version, kind, false);
+    let mut query = query.clone();
+    query.kinds = vec![kind];
+    query.loaders = request
+        .loader_filter()
+        .map(<str>::to_owned)
+        .into_iter()
+        .collect();
+    query.game_versions = request
+        .game_version
+        .as_deref()
+        .map(<str>::to_owned)
+        .into_iter()
+        .collect();
+    query
+}
+
 /// 目录里的 jar；目录不存在就是空（先装第一个 mod 之前目录本来就不在）
 fn jars_in(dir: &Path) -> Result<Vec<PathBuf>, ModError> {
     if !dir.is_dir() {
@@ -1143,5 +1258,44 @@ mod tests {
     fn loader_maps_known_variants_only() {
         assert_eq!(loader_of(&ServerVariant::Fabric), Some(ModLoader::Fabric));
         assert_eq!(loader_of(&ServerVariant::Vanilla), None);
+    }
+
+    /// 搜索条件要带上这台服务端的加载器与游戏版本，且类别固定为用户要装的类别
+    #[test]
+    fn server_query_pins_server_conditions() {
+        let query = server_query(
+            &ServerVariant::Fabric,
+            "1.21.1",
+            ContentKind::Mod,
+            &ContentQuery::new().keyword("sodium").page(20, 20),
+        );
+        assert_eq!(query.kinds, vec![ContentKind::Mod], "类别固定为要装的类别");
+        assert_eq!(
+            query.loaders,
+            vec!["fabric".to_owned()],
+            "加载器取自服务端变体"
+        );
+        assert_eq!(
+            query.game_versions,
+            vec!["1.21.1".to_owned()],
+            "游戏版本取自服务端"
+        );
+        assert_eq!(query.keyword.as_deref(), Some("sodium"), "关键词原样保留");
+        assert_eq!(query.offset, 20, "分页原样保留");
+        assert_eq!(query.limit, 20);
+    }
+
+    /// 数据包不看加载器：搜索不按加载器过滤，但游戏版本仍限定
+    #[test]
+    fn server_query_skips_loader_for_datapack() {
+        let query = server_query(
+            &ServerVariant::Fabric,
+            "1.21.1",
+            ContentKind::DataPack,
+            &ContentQuery::new(),
+        );
+        assert_eq!(query.kinds, vec![ContentKind::DataPack]);
+        assert!(query.loaders.is_empty(), "数据包不过滤加载器");
+        assert_eq!(query.game_versions, vec!["1.21.1".to_owned()]);
     }
 }
