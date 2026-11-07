@@ -842,6 +842,19 @@ pub(crate) fn server_mod_outdated_arg() -> &'static str {
 }
 
 #[must_use]
+pub(crate) fn server_mod_fix() -> &'static str {
+    t(
+        "自动修复会让服务端起不来的 mod：补装缺失依赖、移除不兼容文件",
+        "auto-fix mods that would stop the server: install missing deps, remove incompatible files",
+    )
+}
+
+#[must_use]
+pub(crate) fn server_mod_yes_arg() -> &'static str {
+    t("跳过确认直接执行修复", "apply the fix without confirmation")
+}
+
+#[must_use]
 pub(crate) fn server_mod_prerelease_arg() -> &'static str {
     t("允许测试版 / 内测版", "allow beta and alpha versions")
 }

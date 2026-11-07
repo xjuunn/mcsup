@@ -30,7 +30,7 @@ use crate::mod_inspect::{
     ModAudit, ModInspectService, ModInspectServiceError, ModReport, collect_jars, sha1_of,
 };
 use crate::registry::{RegisteredServer, ServerRegistry, ServerRegistryError};
-use domain::mod_::{InstallVerdict, ModLoader, Risk, ServerTarget};
+use domain::mod_::{FitVerdict, InstallVerdict, ModLoader, Risk, ServerTarget};
 use domain::server::content::{
     ContentCandidate, ContentIdentity, ContentKind, ContentRequest, UpdateDecision, decide_update,
 };
@@ -319,6 +319,59 @@ pub struct ModRemoved {
     pub files: Vec<PathBuf>,
     /// 只预览没动盘
     pub dry_run: bool,
+}
+
+/// 修复计划的一项：补装缺失依赖
+#[derive(Debug, Clone)]
+pub struct FixInstall {
+    /// 依赖它的文件（展示用）
+    pub needed_by: String,
+    /// 缺失的依赖 modid
+    pub missing: String,
+    /// 上游项目 ID（按 modid 检索命中）
+    pub project_id: String,
+    /// 项目标题
+    pub title: String,
+    /// 上游项目自身是否标注仅客户端
+    pub client_only: bool,
+}
+
+/// 修复计划的一项：移除带问题的 mod 文件
+#[derive(Debug, Clone)]
+pub struct FixRemove {
+    /// 要移除的文件
+    pub file: PathBuf,
+    /// 移除原因（展示用）
+    pub reason: String,
+}
+
+/// 一次修复计划（预览，不写盘）
+///
+/// 由 [`ModService::plan_fix`] 产出：缺失依赖补装、带问题的文件移除、
+/// 上游找不到提供方的依赖如实列出。
+#[derive(Debug, Clone)]
+pub struct ModFixPlan {
+    /// 服务器名
+    pub server: String,
+    /// 补装项
+    pub installs: Vec<FixInstall>,
+    /// 移除项
+    pub removals: Vec<FixRemove>,
+    /// 上游找不到提供方的依赖（不猜，交给用户）
+    pub unresolved: Vec<String>,
+}
+
+/// 修复执行结果
+#[derive(Debug, Clone)]
+pub struct ModFixApplied {
+    /// 实际移除的文件
+    pub removed: Vec<PathBuf>,
+    /// 实际补装的 mod
+    pub installed: Vec<ModInstalled>,
+    /// 被安装门禁拒绝的项目（缺依赖等，需人工处置）
+    pub refused: Vec<String>,
+    /// 上游找不到提供方的依赖
+    pub unresolved: Vec<String>,
 }
 
 /// 更新计划的一项
@@ -785,6 +838,194 @@ impl ModService {
         Ok(ModRemoved {
             files: hits,
             dry_run,
+        })
+    }
+
+    /// 规划一次修复：找出会让服务端起不来的问题并给出处置，**不写盘**
+    ///
+    /// 与启动预检同一套判定（同一个审计、同一个 `ServerTarget`）：
+    ///
+    /// - 缺必需依赖 → 在上游按 modid 检索提供方，命中就规划补装；找不到
+    ///   提供方的进 `unresolved`，不猜
+    /// - 明确不可用（仅客户端且非库 / 与服务端明显不匹配）→ 规划移除该文件，
+    ///   原因照实记录
+    ///
+    /// 上游检索取第一个非仅客户端的命中：modid 与项目 slug 通常是同一命名，
+    /// 但这只是约定不是保证，因此应用前必须经用户确认（CLI 的确认提示）。
+    ///
+    /// # Errors
+    ///
+    /// 服务器不存在、位于远端、正在运行、目录无法遍历或上游异常时返回
+    /// [`ModError`]
+    pub async fn plan_fix(&self, name: &str, kind: ContentKind) -> Result<ModFixPlan, ModError> {
+        let server = self.local_server(name)?;
+        self.ensure_stopped(&server)?;
+        if !kind.is_server_usable() {
+            return Err(ModError::ClientOnly { kind });
+        }
+        let dir = mods_dir(&server, kind);
+        let jars = jars_in(&dir)?;
+        let audit = self.inspect(&jars, &[], &server).await?;
+
+        let mut installs: Vec<FixInstall> = Vec::new();
+        let mut unresolved: Vec<String> = Vec::new();
+        for report in &audit.mods {
+            if report.missing_deps.is_empty() {
+                continue;
+            }
+            let needed_by = file_name_of(&report.capability.path);
+            for missing in &report.missing_deps {
+                match self.find_provider(missing, &server).await? {
+                    Some(project) => installs.push(FixInstall {
+                        needed_by: needed_by.clone(),
+                        missing: missing.clone(),
+                        project_id: project.clone(),
+                        title: project.clone(),
+                        client_only: false,
+                    }),
+                    None => unresolved.push(missing.clone()),
+                }
+            }
+        }
+
+        let mut removals: Vec<FixRemove> = Vec::new();
+        for report in &audit.mods {
+            // 缺依赖的文件由补装项处置，这里只管文件本身的问题
+            if !report.missing_deps.is_empty() {
+                continue;
+            }
+            if report.risk == Risk::Blocking {
+                removals.push(FixRemove {
+                    file: PathBuf::from(&report.capability.path),
+                    reason: "上游标注或清单判定为仅客户端，服务端无法装载".to_owned(),
+                });
+                continue;
+            }
+            if let Some(fit) = &report.fit
+                && fit.verdict == FitVerdict::Rejected
+            {
+                let detail = fit
+                    .issues
+                    .first()
+                    .map_or_else(|| "与服务端不匹配".to_owned(), |issue| issue.detail.clone());
+                removals.push(FixRemove {
+                    file: PathBuf::from(&report.capability.path),
+                    reason: format!("与这台服务端不匹配（{detail}）"),
+                });
+            }
+        }
+
+        Ok(ModFixPlan {
+            server: server.meta.name.as_str().to_owned(),
+            installs,
+            removals,
+            unresolved,
+        })
+    }
+
+    /// 在上游检索某个 modid 的提供方
+    ///
+    /// 按 modid 检索、取第一个非仅客户端的命中。检索是「尽力而为」：上游
+    /// 检索不到就返回 `None`，不猜也不报错——修复计划里如实进 `unresolved`。
+    async fn find_provider(
+        &self,
+        modid: &str,
+        server: &RegisteredServer,
+    ) -> Result<Option<String>, ModError> {
+        let query = ContentQuery::new().keyword(modid).page(0, 5);
+        let found = self
+            .content
+            .search(
+                None,
+                &server_query(
+                    &server.meta.variant,
+                    server.meta.version.as_str(),
+                    ContentKind::Mod,
+                    &query,
+                ),
+            )
+            .await?;
+        Ok(found
+            .hits
+            .into_iter()
+            .find(|hit| !hit.client_only)
+            .map(|hit| hit.id))
+    }
+
+    /// 执行修复计划：移除带问题的文件，补装缺失依赖
+    ///
+    /// 先移除后补装：移除会改变目录的依赖闭包，先移除能避免给已被判
+    /// 「不匹配」的 mod 旧版本补装依赖。补装沿用单文件安装的完整门禁
+    /// （下载 → 检查 → 原子换入），拒绝时不中断其余项，逐项汇总。
+    ///
+    /// # Errors
+    ///
+    /// 服务器不存在、位于远端、状态在计划之后发生变化或移除失败时返回
+    /// [`ModError`]
+    pub async fn apply_fix(
+        &self,
+        name: &str,
+        plan: &ModFixPlan,
+        options: ApplyOptions<'_>,
+    ) -> Result<ModFixApplied, ModError> {
+        let server = self.local_server(name)?;
+        self.ensure_stopped(&server)?;
+        let kind = ContentKind::Mod;
+
+        let mut removed: Vec<PathBuf> = Vec::new();
+        for item in &plan.removals {
+            // 路径出自本服务的审计（mods/ 目录的直接子文件），仍然校验
+            // 落点在服务端目录内，防计划在手工流转中被篡改
+            if !item.file.starts_with(server.dir.join(kind.install_dir())) {
+                return Err(ModError::Escapes {
+                    path: item.file.clone(),
+                });
+            }
+            if item.file.is_file() {
+                crate::fs::remove_file(&item.file).map_err(|err| FsError::io(&item.file, err))?;
+                removed.push(item.file.clone());
+            }
+        }
+
+        let mut installed: Vec<ModInstalled> = Vec::new();
+        let mut refused: Vec<String> = Vec::new();
+        for item in &plan.installs {
+            let install_plan = self
+                .plan_install(
+                    name,
+                    &item.project_id,
+                    kind,
+                    InstallSpec {
+                        version: None,
+                        source: None,
+                        allow_prerelease: false,
+                    },
+                )
+                .await?;
+            match self
+                .install(
+                    name,
+                    &install_plan,
+                    ApplyOptions {
+                        allow_blocking: options.allow_blocking,
+                        progress: options.progress,
+                        cancel: options.cancel,
+                    },
+                )
+                .await
+            {
+                Ok(installed_mod) => installed.push(installed_mod),
+                // 单项被拒不拖垮整批：缺依赖项继续补，问题汇总给用户
+                Err(ModError::Refused { .. }) => refused.push(item.project_id.clone()),
+                Err(err) => return Err(err),
+            }
+        }
+
+        Ok(ModFixApplied {
+            removed,
+            installed,
+            refused,
+            unresolved: plan.unresolved.clone(),
         })
     }
 

@@ -32,7 +32,8 @@ use mcsup::domain::mod_::{FitVerdict, Risk, ServerFit, SideSupport};
 use mcsup::domain::server::content::{ContentKind, UpdateDecision};
 use mcsup::port::CancellationToken;
 use mcsup::service::{
-    ApplyOptions, InstallPlan, InstallSpec, ListOptions, ModEntry, ModList, ModService, UpdatePlan,
+    ApplyOptions, InstallPlan, InstallSpec, ListOptions, ModEntry, ModFixPlan, ModList, ModService,
+    UpdatePlan,
 };
 use serde::Serialize;
 
@@ -106,6 +107,9 @@ pub(crate) async fn run(action: ModAction, printer: Printer) -> Result<()> {
         }
         ModAction::Outdated { name, kind, source } => {
             outdated(name.as_deref(), kind.as_deref(), source.as_deref(), printer).await
+        }
+        ModAction::Fix { name, kind, yes } => {
+            fix(name.as_deref(), kind.as_deref(), yes, printer).await
         }
     }
 }
@@ -468,6 +472,235 @@ async fn outdated(
     )?;
     report_skipped(&plan, printer);
     Ok(())
+}
+
+// ---------------------------------------------------------------- fix
+
+/// `server mod fix`：预检问题的自动处置
+///
+/// 与 `add` / `update` 同一条两阶段流程：先算计划（零写入）→ 展示 →
+/// 确认 → 执行。`--yes` 跳过确认提问，不跳过计划展示。
+async fn fix(name: Option<&str>, kind: Option<&str>, yes: bool, printer: Printer) -> Result<()> {
+    let lang = printer.lang();
+    let name = crate::commands::server_ops::require_server_name(name, "server mod fix", printer)?;
+    let kind = parse_kind(kind, lang)?;
+    let mc = bootstrap::open_mcsup_with_remotes()?;
+
+    let spinner = TaskSpinner::new(
+        pick(
+            lang,
+            format!("正在分析 {name} 的 mods 目录…"),
+            format!("analyzing the mods directory of {name}…"),
+        ),
+        printer.is_human(),
+    );
+    let planned = mc.mods.plan_fix(&name, kind).await;
+    spinner.finish();
+    let plan = planned?;
+
+    if plan.installs.is_empty() && plan.removals.is_empty() {
+        let human = if plan.unresolved.is_empty() {
+            pick(lang, "没有需要修复的 mod", "nothing to fix")
+        } else {
+            pick(
+                lang,
+                "没有可自动修复的问题，但有依赖找不到提供方",
+                "nothing to auto-fix, but some dependencies have no upstream provider",
+            )
+        };
+        report_fix_plan(&plan, printer, false)?;
+        printer.print_outcome(&human, &fix_plan_json(&plan))?;
+        return Ok(());
+    }
+
+    report_fix_plan(&plan, printer, true)?;
+    if !yes
+        && !crate::prompts::confirm_or_yes(
+            printer,
+            &pick(lang, "按以上计划执行修复？", "apply this fix plan?"),
+            true,
+        )?
+    {
+        return Err(AppDiagnostic::cancelled().into());
+    }
+
+    let apply_spinner = TaskSpinner::new(
+        pick(lang, "正在执行修复…", "applying the fix…"),
+        printer.is_human(),
+    );
+    let applied = mc
+        .mods
+        .apply_fix(
+            &name,
+            &plan,
+            ApplyOptions {
+                allow_blocking: false,
+                progress: None,
+                cancel: &CancellationToken::new(),
+            },
+        )
+        .await;
+    apply_spinner.finish();
+    report_fix_applied(&applied?, printer)
+}
+
+/// 逐条交代执行结果：装了什么、删了什么、哪些被门禁拒了、哪些找不到提供方
+fn report_fix_applied(applied: &mcsup::service::ModFixApplied, printer: Printer) -> Result<()> {
+    let lang = printer.lang();
+    for item in &applied.installed {
+        printer.print_outcome(
+            &pick(
+                lang,
+                format!(
+                    "已补装 {}（{}）",
+                    item.file,
+                    item.replaced.as_ref().map_or("新文件", |_| "替换旧文件")
+                ),
+                format!("installed {}", item.file),
+            ),
+            &(),
+        )?;
+    }
+    for file in &applied.removed {
+        printer.print_outcome(
+            &pick(
+                lang,
+                format!("已移除 {}", file.display()),
+                format!("removed {}", file.display()),
+            ),
+            &(),
+        )?;
+    }
+    for project in &applied.refused {
+        printer.print_outcome(
+            &pick(
+                lang,
+                format!("补装 {project} 被安装检查拒绝，需人工处置"),
+                format!("installing {project} was refused by the install check"),
+            ),
+            &(),
+        )?;
+    }
+    for missing in &applied.unresolved {
+        printer.print_outcome(
+            &pick(
+                lang,
+                format!("依赖 {missing} 没有找到可自动补装的提供方，需人工处置"),
+                format!("dependency {missing} has no auto-installable provider"),
+            ),
+            &(),
+        )?;
+    }
+    printer.print_outcome(
+        &pick(
+            lang,
+            format!(
+                "修复完成：补装 {} 项，移除 {} 项",
+                applied.installed.len(),
+                applied.removed.len()
+            ),
+            format!(
+                "fix applied: {} installed, {} removed",
+                applied.installed.len(),
+                applied.removed.len()
+            ),
+        ),
+        &(),
+    )
+}
+
+/// 展示修复计划：每一条都带原因，不写盘前用户能看到全部动作
+fn report_fix_plan(plan: &ModFixPlan, printer: Printer, actionable: bool) -> Result<()> {
+    let lang = printer.lang();
+    if !actionable && plan.unresolved.is_empty() {
+        return Ok(());
+    }
+    for item in &plan.installs {
+        let title = &item.title;
+        let needed_by = &item.needed_by;
+        let missing = &item.missing;
+        let note = if item.client_only {
+            text(lang, "（上游标注仅客户端）", "(upstream marks client-only)")
+        } else {
+            ""
+        };
+        printer.print_outcome(
+            &pick(
+                lang,
+                format!("补装 {title}{note}：{needed_by} 缺少必需依赖 {missing}"),
+                format!("install {title}{note}: {needed_by} misses dependency {missing}"),
+            ),
+            &(),
+        )?;
+    }
+    for item in &plan.removals {
+        printer.print_outcome(
+            &pick(
+                lang,
+                format!("移除 {}：{}", item.file.display(), item.reason),
+                format!("remove {}: {}", item.file.display(), item.reason),
+            ),
+            &(),
+        )?;
+    }
+    for missing in &plan.unresolved {
+        printer.print_outcome(
+            &pick(
+                lang,
+                format!("无法自动补装：依赖 {missing} 在上游找不到提供方"),
+                format!("cannot auto-install: dependency {missing} has no upstream provider"),
+            ),
+            &(),
+        )?;
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct FixPlanJson<'a> {
+    server: &'a str,
+    installs: Vec<FixInstallJson<'a>>,
+    removals: Vec<FixRemoveJson<'a>>,
+    unresolved: &'a [String],
+}
+
+#[derive(Serialize)]
+struct FixInstallJson<'a> {
+    needed_by: &'a str,
+    missing: &'a str,
+    project_id: &'a str,
+    title: &'a str,
+}
+
+#[derive(Serialize)]
+struct FixRemoveJson<'a> {
+    file: String,
+    reason: &'a str,
+}
+
+fn fix_plan_json(plan: &ModFixPlan) -> FixPlanJson<'_> {
+    FixPlanJson {
+        server: &plan.server,
+        installs: plan
+            .installs
+            .iter()
+            .map(|item| FixInstallJson {
+                needed_by: &item.needed_by,
+                missing: &item.missing,
+                project_id: &item.project_id,
+                title: &item.title,
+            })
+            .collect(),
+        removals: plan
+            .removals
+            .iter()
+            .map(|item| FixRemoveJson {
+                file: item.file.display().to_string(),
+                reason: &item.reason,
+            })
+            .collect(),
+        unresolved: &plan.unresolved,
+    }
 }
 
 // ---------------------------------------------------------------- update

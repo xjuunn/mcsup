@@ -178,7 +178,7 @@ pub(crate) fn lifecycle(kind: &LifecycleErrorKind<'_>, lang: Lang) -> String {
         ),
         LifecycleErrorKind::ModsBlocked { name, issues } => {
             let mut text = format!(
-                "启动中止：服务器 {name} 有会让服务端起不来的 mod，修复后重试，或加 --skip-mod-check 硬闯"
+                "启动中止：服务器 {name} 的 mods 目录存在会导致加载器解析失败的问题，可执行 mcsup server mod fix {name} 自动修复，或逐条处置后重试（--skip-mod-check 可跳过检查）"
             );
             for issue in *issues {
                 text.push_str("\n  ↳ ");
@@ -222,7 +222,7 @@ fn lifecycle_en(kind: &LifecycleErrorKind<'_>) -> String {
         ),
         LifecycleErrorKind::ModsBlocked { name, issues } => {
             let mut text = format!(
-                "start aborted: server {name} has mods that will stop it; fix them or retry with --skip-mod-check"
+                "start aborted: the mods directory of server {name} has entries that will fail loader resolution; run `mcsup server mod fix {name}` to auto-fix, or resolve each item below (--skip-mod-check bypasses the check)"
             );
             for issue in *issues {
                 text.push_str("\n  ↳ ");
