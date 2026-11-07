@@ -10,6 +10,7 @@ mod origin;
 mod props;
 mod remote;
 mod server_mod;
+mod server_mod_pick;
 mod server_ops;
 mod server_remote;
 mod settings;

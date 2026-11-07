@@ -495,9 +495,9 @@ pub(crate) enum ModAction {
         #[arg(long, help = crate::meta::server_mod_outdated_arg())]
         outdated: bool,
     },
-    #[command(about = crate::meta::server_mod_install())]
-    #[command(visible_alias = "in")]
-    Install {
+    #[command(about = crate::meta::server_mod_add())]
+    #[command(visible_alias = "ad", visible_alias = "install", visible_alias = "in")]
+    Add {
         #[arg(value_name = "NAME", help = crate::meta::server_mod_name_arg())]
         name: Option<String>,
         #[arg(value_name = "SPEC", help = crate::meta::server_mod_spec_arg())]

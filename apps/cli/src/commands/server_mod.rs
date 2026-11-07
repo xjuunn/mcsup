@@ -6,8 +6,12 @@
 //!
 //! # 两阶段：先给计划，再落盘
 //!
-//! `install` / `update` 都是「先算计划（零写入）→ 展示 → 用户确认 → 执行」。
+//! `add` / `update` 都是「先算计划（零写入）→ 展示 → 用户确认 → 执行」。
 //! `--dry-run` 停在第一步；`-y` 只跳过确认提问，不跳过计划展示。
+//!
+//! 不带项目时 `add` 进 [`server_mod_pick`] 的搜索向导（浏览 / 搜索 / 翻页 /
+//! 选版本），选完仍回到这条两阶段流程，`--dry-run` 与 `-y` 的语义因此与
+//! 非交互路径完全一致。
 //!
 //! # 回显
 //!
@@ -16,6 +20,7 @@
 
 use crate::bootstrap;
 use crate::cli::ModAction;
+use crate::commands::server_mod_pick;
 use crate::diagnostic::AppDiagnostic;
 use crate::i18n::{pick, text};
 use crate::locale::Lang;
@@ -26,7 +31,6 @@ use comfy_table::{ContentArrangement, Table};
 use mcsup::domain::mod_::Risk;
 use mcsup::domain::server::content::{ContentKind, UpdateDecision};
 use mcsup::port::CancellationToken;
-use mcsup::port::content::ContentQuery;
 use mcsup::service::{
     ApplyOptions, InstallPlan, InstallSpec, ListOptions, ModEntry, ModList, ModService, UpdatePlan,
 };
@@ -52,7 +56,7 @@ pub(crate) async fn run(action: ModAction, printer: Printer) -> Result<()> {
             )
             .await
         }
-        ModAction::Install {
+        ModAction::Add {
             name,
             spec,
             version,
@@ -62,7 +66,7 @@ pub(crate) async fn run(action: ModAction, printer: Printer) -> Result<()> {
             force,
             dry_run,
         } => {
-            install(
+            add(
                 name.as_deref(),
                 spec,
                 version.as_deref(),
@@ -191,11 +195,17 @@ fn empty_hint(kind: ContentKind, lang: Lang) -> String {
     )
 }
 
-// ---------------------------------------------------------------- install
+// ---------------------------------------------------------------- add
 
-/// `server mod install`
+/// `server mod add`
+///
+/// 项目来源三选一，三者都在同一层决定：
+///
+/// - 直接给项目 ID / slug / 链接：不再提问
+/// - `@search <关键词>`：进向导并从该关键词的第一页开始
+/// - 什么都不给：交互下进向导（推荐列表起步，可搜索可翻页）；非交互报用法错误
 #[allow(clippy::too_many_arguments)] // 每个参数对应一个 clap 选项，收结构体只会多一层包装
-async fn install(
+async fn add(
     name: Option<&str>,
     spec: Option<String>,
     version: Option<&str>,
@@ -207,36 +217,17 @@ async fn install(
     printer: Printer,
 ) -> Result<()> {
     let lang = printer.lang();
-    let name =
-        crate::commands::server_ops::require_server_name(name, "server mod install", printer)?;
-    // 缺必填参数：交互下补参，非交互报用法错误（2）
-    let spec = match spec {
-        Some(spec) => spec,
-        None if printer.is_interactive() => crate::commands::server_ops::require_text(
-            None,
-            &pick(lang, "缺少要安装的项目", "missing project to install"),
-            "mcsup server mod install <name> <project>",
-            printer,
-        )?,
-        None => {
-            return Err(AppDiagnostic::usage(
-                pick(
-                    lang,
-                    "server mod install 缺少项目".to_owned(),
-                    "server mod install requires a project".to_owned(),
-                ),
-                Some(pick(
-                    lang,
-                    "mcsup server mod install <名称> <项目ID|slug|URL>".to_owned(),
-                    "mcsup server mod install <name> <project-id|slug|url>".to_owned(),
-                )),
-            )
-            .into());
-        }
-    };
+    let name = crate::commands::server_ops::require_server_name(name, "server mod add", printer)?;
     let kind = parse_kind(kind, lang)?;
     let mc = bootstrap::open_mcsup_with_remotes()?;
-    let project = resolve_spec(&mc.content, &spec, kind, source, printer).await?;
+    let options = server_mod_pick::PickOptions {
+        kind,
+        source,
+        allow_prerelease: prerelease,
+    };
+
+    let (project, version) =
+        resolve_target(&mc.mods, &name, spec, version, options, printer).await?;
 
     let spinner = TaskSpinner::new(
         pick(
@@ -253,7 +244,7 @@ async fn install(
             &project,
             kind,
             InstallSpec {
-                version,
+                version: version.as_deref(),
                 source,
                 allow_prerelease: prerelease,
             },
@@ -272,6 +263,86 @@ async fn install(
 
     let installed = download_and_apply(&mc.mods, &name, &plan, force, printer).await?;
     report_installed(&name, &installed, printer)
+}
+
+/// 从 `SPEC` 得到项目标识与版本
+///
+/// 三种写法各自对应一条路径，闭合在 `server_mod_pick::pick_mod` 与
+/// `resolve_spec` 两个出口上：向导负责「搜索 → 选项目 → 选版本」，其余写法
+/// 只做字符串解析。`version` 在向导路径里是版本提示（`--version` 与候选对
+/// 不上就报错），在直给路径里原样交给服务端做精确版本。
+async fn resolve_target(
+    mods: &ModService,
+    name: &str,
+    spec: Option<String>,
+    version: Option<&str>,
+    options: server_mod_pick::PickOptions<'_>,
+    printer: Printer,
+) -> Result<(String, Option<String>)> {
+    let lang = printer.lang();
+    match spec.as_deref().map(str::trim) {
+        // 没给项目：交互下走搜索向导，非交互没有可自动选择的信息
+        None if printer.is_interactive() => {
+            let picked =
+                server_mod_pick::pick_mod(mods, name, options, None, version, printer).await?;
+            Ok((picked.project_id, picked.version_id))
+        }
+        None => Err(AppDiagnostic::usage(
+            pick(
+                lang,
+                "server mod add 缺少项目".to_owned(),
+                "server mod add requires a project".to_owned(),
+            ),
+            Some(pick(
+                lang,
+                "交互模式直接运行 mcsup server mod add <名称> 搜索选择；脚本请给项目 ID".to_owned(),
+                "run `mcsup server mod add <name>` to search and pick; scripts pass a project id"
+                    .to_owned(),
+            )),
+        )
+        .into()),
+        Some("") => Err(AppDiagnostic::usage(
+            pick(lang, "项目标识为空".to_owned(), "empty project".to_owned()),
+            None,
+        )
+        .into()),
+        // `@search <关键词>`：进同一个向导，只是从关键词的第一页开始
+        Some(spec) if spec.starts_with("@search") => {
+            let keyword = spec.trim_start_matches("@search").trim();
+            if !printer.is_interactive() {
+                return Err(AppDiagnostic::usage(
+                    pick(
+                        lang,
+                        "@search 需要交互选择，非交互模式请直接给项目 ID".to_owned(),
+                        "@search needs an interactive terminal; pass a project id instead"
+                            .to_owned(),
+                    ),
+                    None,
+                )
+                .into());
+            }
+            if keyword.is_empty() {
+                return Err(AppDiagnostic::usage(
+                    pick(
+                        lang,
+                        "请给出搜索关键词".to_owned(),
+                        "missing search keyword".to_owned(),
+                    ),
+                    Some(pick(
+                        lang,
+                        "mcsup server mod add <名称> '@search <关键词>'".to_owned(),
+                        "mcsup server mod add <name> '@search <keyword>'".to_owned(),
+                    )),
+                )
+                .into());
+            }
+            let picked =
+                server_mod_pick::pick_mod(mods, name, options, Some(keyword), version, printer)
+                    .await?;
+            Ok((picked.project_id, picked.version_id))
+        }
+        Some(spec) => Ok((resolve_spec(spec, lang)?, version.map(<str>::to_owned))),
+    }
 }
 
 /// 下载 + 检查 + 落盘，全程一条进度回显
@@ -598,31 +669,13 @@ fn parse_kind(raw: Option<&str>, lang: Lang) -> Result<ContentKind> {
     }
 }
 
-/// 把用户给的 `SPEC` 解析成项目标识
+/// 把用户给的项目标识解析成上游项目标识
 ///
-/// 支持三种写法：项目 ID / slug、`https://modrinth.com/<type>/<slug>` 链接、
-/// `@search <关键词>` 交互搜索。别的站点链接一律报用法错误——把
-/// `curseforge.com/...` 当 slug 传给上游只会得到「没找到」，用户看不出是
-/// 「不支持这个站点」。
-async fn resolve_spec(
-    content: &mcsup::service::ContentService,
-    spec: &str,
-    kind: ContentKind,
-    source: Option<&str>,
-    printer: Printer,
-) -> Result<String> {
-    let lang = printer.lang();
-    let spec = spec.trim();
-    if spec.is_empty() {
-        return Err(AppDiagnostic::usage(
-            pick(lang, "项目标识为空".to_owned(), "empty project".to_owned()),
-            None,
-        )
-        .into());
-    }
-    if let Some(keyword) = spec.strip_prefix("@search") {
-        return search_project(content, keyword.trim(), kind, source, printer).await;
-    }
+/// 只处理两种写法：项目 ID / slug、`https://modrinth.com/<type>/<slug>` 链接。
+/// `@search` 与「什么都不给」都由 [`resolve_target`] 先分流到搜索向导，不经过
+/// 这里。别的站点链接一律报用法错误——把 `curseforge.com/...` 当 slug 传给
+/// 上游只会得到「没找到」，用户看不出是「不支持这个站点」。
+fn resolve_spec(spec: &str, lang: Lang) -> Result<String> {
     if spec.starts_with("http://") || spec.starts_with("https://") {
         return slug_from_url(spec, lang);
     }
@@ -670,90 +723,6 @@ fn slug_from_url(raw: &str, lang: Lang) -> Result<String> {
         .into());
     }
     Ok(slug.to_owned())
-}
-
-/// `@search <关键词>`：搜索后让用户选一个项目
-async fn search_project(
-    content: &mcsup::service::ContentService,
-    keyword: &str,
-    kind: ContentKind,
-    source: Option<&str>,
-    printer: Printer,
-) -> Result<String> {
-    let lang = printer.lang();
-    if !printer.is_interactive() {
-        return Err(AppDiagnostic::usage(
-            pick(
-                lang,
-                "@search 需要交互选择，非交互模式请直接给项目 ID".to_owned(),
-                "@search needs an interactive terminal; pass a project id instead".to_owned(),
-            ),
-            None,
-        )
-        .into());
-    }
-    if keyword.is_empty() {
-        return Err(AppDiagnostic::usage(
-            pick(
-                lang,
-                "请给出搜索关键词".to_owned(),
-                "missing search keyword".to_owned(),
-            ),
-            Some(pick(
-                lang,
-                "mcsup server mod install <名称> '@search <关键词>'".to_owned(),
-                "mcsup server mod install <name> '@search <keyword>'".to_owned(),
-            )),
-        )
-        .into());
-    }
-    let mut query = ContentQuery::new().keyword(keyword);
-    query.kinds = vec![kind];
-    let spinner = TaskSpinner::new(
-        pick(
-            lang,
-            format!("搜索 {keyword}"),
-            format!("searching {keyword}"),
-        ),
-        printer.is_human(),
-    );
-    let found = content.search(source, &query).await;
-    spinner.finish();
-    let found = found?;
-    let choices: Vec<String> = found
-        .hits
-        .iter()
-        .map(|hit| format!("{} · {}", hit.title, hit.id))
-        .collect();
-    if choices.is_empty() {
-        return Err(AppDiagnostic::not_found(
-            pick(
-                lang,
-                format!("没有匹配「{keyword}」的项目"),
-                format!("no project matches {keyword}"),
-            ),
-            Some(pick(
-                lang,
-                "换个关键词再试".to_owned(),
-                "try another keyword".to_owned(),
-            )),
-        )
-        .into());
-    }
-    let picked =
-        crate::prompts::select_filter(lang, &pick(lang, "选择项目", "pick a project"), &choices)?;
-    match picked.rsplit_once(" · ") {
-        Some((_, id)) if !id.is_empty() => Ok(id.to_owned()),
-        _ => Err(AppDiagnostic::failure(
-            pick(
-                lang,
-                format!("无效选择：{picked}"),
-                format!("invalid choice: {picked}"),
-            ),
-            None,
-        )
-        .into()),
-    }
 }
 
 // ---------------------------------------------------------------- 渲染

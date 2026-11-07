@@ -16,8 +16,10 @@ use mcsup::port::RemoteName;
 use mcsup::service::{MARKER_FILE, NOISE_ENTRIES, absolute_path};
 use std::path::{Path, PathBuf};
 
+mod pager;
 mod scoped;
 
+pub(crate) use pager::{NEXT as NEXT_PAGE, PREV as PREV_PAGE, with_pagers};
 pub(crate) use scoped::{
     Backable, EnterMode, ScopeHint, ScopedChoice, Single, select_filter_backable,
     select_filter_scoped,

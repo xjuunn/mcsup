@@ -164,17 +164,21 @@ fn list_unknown_server_exits_3() {
 }
 
 /// 缺项目参数：非交互下是用法错误（2）
+///
+/// `install` / `in` / `ad` 都是 `add` 的别名，必须走到同一条路径。
 #[test]
 fn install_without_project_exits_2() {
     let home = temp_home();
     let (_, _) = workspace_with_server(&home);
-    let out = run(home.path(), &["server", "mod", "install", "srv1"]);
-    assert_eq!(code(&out), Some(2), "stderr: {}", stderr(&out));
-    assert!(
-        stderr(&out).contains("server mod install"),
-        "错误里应给出用法提示: {}",
-        stderr(&out)
-    );
+    for sub in ["add", "install", "in", "ad"] {
+        let out = run(home.path(), &["server", "mod", sub, "srv1"]);
+        assert_eq!(code(&out), Some(2), "{sub} stderr: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("server mod add"),
+            "{sub} 错误里应给出用法提示: {}",
+            stderr(&out)
+        );
+    }
 }
 
 /// 纯客户端类别在联网之前就被拒绝：不能把 shader 装进服务端

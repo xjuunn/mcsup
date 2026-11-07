@@ -131,6 +131,29 @@ fn assert_ok(out: &Output, what: &str) {
     );
 }
 
+/// 本机能否创建目录符号链接
+///
+/// `server link` 的核心动作是对端建符号链接；Windows 上这条系统调用要求
+/// 开发者模式或管理员。没有权限时用例在本机跑不了，跳过而不是报红——同一
+/// 条用例在 CI（管理员身份）上照常执行。
+///
+/// 判定直接试同一条系统调用，不猜环境变量：探测目录在 `scratch` 下，用完即删。
+fn symlink_allowed(scratch: &Path) -> bool {
+    let target = scratch.join("symlink-probe-target");
+    let link = scratch.join("symlink-probe-link");
+    let _ = std::fs::remove_file(&link);
+    if std::fs::create_dir_all(&target).is_err() {
+        return false;
+    }
+    #[cfg(windows)]
+    let created = std::os::windows::fs::symlink_dir(&target, &link).is_ok();
+    #[cfg(unix)]
+    let created = std::os::unix::fs::symlink(&target, &link).is_ok();
+    let _ = std::fs::remove_file(&link);
+    let _ = std::fs::remove_dir_all(&target);
+    created
+}
+
 /// 一个已绑定并在后台运行的 agent
 struct AgentHandle {
     addr: String,
@@ -870,6 +893,13 @@ fn remote_server_link_registers_a_directory_on_the_peer() {
     let home = temp_home();
     let agent = AgentHandle::start();
     let home_path = home.path();
+
+    // `server link` 要在对端建符号链接：Windows 无开发者模式 / 管理员时
+    // 这条系统调用直接失败，用例在本机跑不了，跳过（CI 以管理员身份照常执行）
+    if !symlink_allowed(agent.dir.path()) {
+        eprintln!("本机无符号链接权限，跳过 server link 用例");
+        return;
+    }
 
     assert_ok(
         &run(

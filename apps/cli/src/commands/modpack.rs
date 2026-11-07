@@ -20,10 +20,10 @@ use crate::diagnostic::AppDiagnostic;
 use crate::output::Printer;
 use crate::progress::{BarSink, TaskSpinner};
 use crate::prompts::{
-    Backable, EnterMode, ScopeHint, ScopedChoice, Single, select_filter_backable,
+    Backable, EnterMode, NEXT_PAGE, PREV_PAGE, ScopeHint, ScopedChoice, Single,
+    select_filter_backable, with_pagers,
 };
 use anyhow::{Context, Result};
-use console::measure_text_width;
 use mcsup::domain::server::variant::ServerVariant;
 use mcsup::port::CancellationToken;
 use mcsup::port::modpack::{ModpackDetail, ModpackQuery, ModpackVersion};
@@ -52,10 +52,6 @@ pub(crate) struct PickedModpack {
 
 /// 每页整合包数量
 const PAGE_SIZE: u32 = 20;
-
-/// 结果列表里的翻页项：用不可能出现在标题里的前缀，避免与真实整合包重名
-const NEXT_PAGE: &str = "→ 下一页";
-const PREV_PAGE: &str = "← 上一页";
 
 /// 向导状态
 ///
@@ -281,7 +277,7 @@ async fn browse_results(
                 .with_display(hit.title.clone())
         })
         .collect();
-    let choices = result_choices(hits, search.offset, search.total, page);
+    let choices = with_pagers(hits, search.offset, search.total, page);
 
     // 0 条也要进入选择器：空列表 + Esc 返回上一级，而不是让整个命令退出。
     let label = results_label(keyword, search.total, page);
@@ -314,27 +310,6 @@ async fn browse_results(
             .map(Browse::Pick)
             .ok_or_else(|| anyhow::anyhow!("无效选择: {picked}")),
     }
-}
-
-/// 结果页的可选项：命中项在前，翻页项在后
-///
-/// 翻页项按「上一页在上、下一页在下」排列：返回上一页更贴近列表，继续向下
-/// 翻页放在最末。是否出现只由 `offset + len` 与 `total` 决定，与网络无关，
-/// 因此抽成纯函数单独测试。
-fn result_choices(
-    mut choices: Vec<ScopedChoice>,
-    offset: u32,
-    total: u64,
-    page: u32,
-) -> Vec<ScopedChoice> {
-    let more = u64::from(offset) + choices.len() as u64;
-    if page > 0 {
-        choices.push(ScopedChoice::new(PREV_PAGE, false));
-    }
-    if more < total {
-        choices.push(ScopedChoice::new(NEXT_PAGE, false));
-    }
-    choices
 }
 
 /// 结果页标题：0 条时说明没有匹配，其余显示页码与总数
@@ -462,37 +437,13 @@ fn detail_rows(detail: &ModpackDetail) -> Vec<(&'static str, String)> {
     rows
 }
 
-/// 标签列与值列之间的固定间隔
-const LABEL_GAP: usize = 2;
-
-/// 标签列按最宽标签右补空格，值列起点对齐；不画表格边框，也不加冒号
-///
-/// 中文标签是双宽字符，补空格按显示宽度而不是字符数算，否则「ID」和
-/// 「游戏版本」后面的值会错开。
-fn render_detail(rows: &[(&str, String)]) -> String {
-    let width = rows
-        .iter()
-        .map(|(label, _)| measure_text_width(label))
-        .max()
-        .unwrap_or(0);
-    rows.iter()
-        .map(|(label, value)| {
-            let pad = width
-                .saturating_sub(measure_text_width(label))
-                .saturating_add(LABEL_GAP);
-            format!("{label}{}{value}", " ".repeat(pad))
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 /// 展示整合包详情
 ///
 /// 人类可读模式按「标签列 + 值列」对齐输出，不画表格边框：版本选择紧接在
 /// 同一屏出现，边框只会挤占宽度。
 fn print_detail(detail: &ModpackDetail, printer: Printer) -> Result<()> {
     if printer.is_human() {
-        printer.print_section(&render_detail(&detail_rows(detail)));
+        printer.print_section(&crate::output::render_fields(&detail_rows(detail)));
         return Ok(());
     }
     let summary = &detail.summary;
@@ -925,42 +876,8 @@ mod tests {
             .with_display(title)
     }
 
-    #[test]
-    fn result_choices_adds_next_only_when_more_remain() {
-        let hits = vec![hit("1", "A"), hit("2", "B")];
-        let first = result_choices(hits.clone(), 0, 3, 0);
-        assert_eq!(first.len(), 3);
-        assert_eq!(first[2].label, NEXT_PAGE);
-        assert!(!first.iter().any(|c| c.label == PREV_PAGE));
-
-        let last = result_choices(hits, 2, 3, 1);
-        assert!(!last.iter().any(|c| c.label == NEXT_PAGE));
-        assert_eq!(last.last().map(|c| c.label.as_str()), Some(PREV_PAGE));
-    }
-
-    /// 中间页：上一页在上、下一页在下，选中一行不会把翻页项的顺序看反
-    #[test]
-    fn result_choices_orders_prev_above_next() {
-        let hits = vec![hit("1", "A"), hit("2", "B")];
-        let middle = result_choices(hits, 20, 138, 1);
-        let labels: Vec<&str> = middle.iter().map(|choice| choice.label.as_str()).collect();
-        assert_eq!(labels[labels.len() - 2], PREV_PAGE, "上一页在上");
-        assert_eq!(labels[labels.len() - 1], NEXT_PAGE, "下一页在下");
-    }
-
-    #[test]
-    fn result_choices_has_no_pager_when_everything_fits() {
-        let choices = result_choices(vec![hit("1", "A")], 0, 1, 0);
-        assert_eq!(choices.len(), 1);
-    }
-
-    /// 0 条时不生成翻页项，空列表原样交给可返回选择器
-    #[test]
-    fn result_choices_stays_empty_without_hits() {
-        assert!(result_choices(Vec::new(), 0, 0, 0).is_empty());
-    }
-
-    /// 向导起点是默认列表：不发关键词、从第一页开始，用户不必先按回车
+    /// 翻页项的文案、出现条件与排列顺序由 [`crate::prompts::with_pagers`] 自己
+    /// 测试（它在两个向导之间共用）；这里不再重复一份。
     #[test]
     fn wizard_starts_on_default_list() {
         assert_eq!(
@@ -1063,31 +980,10 @@ mod tests {
         }
     }
 
-    /// 标签按显示宽度补空格，值列起点一致；不画边框，也不加冒号
-    #[test]
-    fn render_detail_aligns_values_by_display_width() {
-        let rows = detail_rows(&modpack_detail(true));
-        let rendered = render_detail(&rows);
-        let width = rows
-            .iter()
-            .map(|(label, _)| measure_text_width(label))
-            .max()
-            .expect("详情至少有一行");
-        assert_eq!(width, measure_text_width("游戏版本"), "最宽标签决定列宽");
-        for ((label, value), line) in rows.iter().zip(rendered.lines()) {
-            let prefix = format!(
-                "{label}{}",
-                " ".repeat(width + LABEL_GAP - measure_text_width(label))
-            );
-            let rest = line
-                .strip_prefix(&prefix)
-                .unwrap_or_else(|| panic!("值列起点不一致: {line}"));
-            assert_eq!(rest, value.as_str(), "标签后直接是值，不加冒号");
-            assert!(!line.contains('│') && !line.contains('|'), "不画表格边框");
-        }
-    }
-
-    /// 可选字段缺省时不占行，剩余行仍对齐
+    /// 可选字段缺省时不占行，剩余行顺序不变
+    ///
+    /// 对齐口径由 [`crate::output::render_fields`] 自己的测试保证，这里只
+    /// 关心「哪些行会出现」。
     #[test]
     fn detail_rows_skip_missing_optional_fields() {
         let rows = detail_rows(&modpack_detail(false));
@@ -1098,20 +994,6 @@ mod tests {
         assert_eq!(labels.last().copied(), Some("简介"), "简介是最后一行");
         assert_eq!(labels.first().copied(), Some("标题"));
         assert_eq!(labels.len(), 8);
-
-        let rendered = render_detail(&rows);
-        assert_eq!(rendered.lines().count(), rows.len());
-        for ((label, value), line) in rows.iter().zip(rendered.lines()) {
-            let prefix = format!(
-                "{label}{}",
-                " ".repeat(8 + LABEL_GAP - measure_text_width(label))
-            );
-            assert_eq!(
-                line.strip_prefix(&prefix),
-                Some(value.as_str()),
-                "列宽仍然是 8: {line}"
-            );
-        }
     }
 
     /// 没跳过时不留尾巴；有跳过时中英文都要说明原因

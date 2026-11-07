@@ -61,7 +61,7 @@
 已实现命令全部遵守上面的补参规则：`server create / install / start / stop /
 restart / status / console / send / logs / props / set / remove / version`、
 `server backup create / list / restore / delete / verify / prune`、
-`server mod list / install / remove / update / outdated`、
+`server mod list / add / remove / update / outdated`、
 `workspace init / use / remove`、`java install / uninstall`、
 `config set / unset`。
 
@@ -129,7 +129,7 @@ restart / status / console / send / logs / props / set / remove / version`、
 | `workspace` | `in` / `new` init · `ls` list · `sw` use · `rm` remove · `doc` doctor |
 | `server` | `ls` list · `cr` create · `in` install · `up` start · `down` stop · `rs` restart · `st` status · `con` console · `snd` send · `log` logs · `prop` props · `cfg` set · `rm` remove · `ln` link · `ver` version · `bak` backup · `md` mod |
 | `server backup` | `cr` create · `ls` list · `rt` restore · `rm` delete · `vf` verify · `pr` prune |
-| `server mod` | `ls` list · `in` install · `rm` remove · `up` update · `od` outdated |
+| `server mod` | `ls` list · `ad` add · `rm` remove · `up` update · `od` outdated |
 | `java` | `ls` list · `sc` scan · `in` install · `un` / `rm` uninstall |
 | `mod` | `in` inspect |
 | `remote` | `ls` list · `sv` serve · `cd` code · `con` connect · `st` status · `pg` ping · `dc` disconnect · `rv` revoke |
@@ -148,7 +148,7 @@ mcsup
 │   ├── status (st) / console (con) / send (snd) / logs (log)
 │   ├── props (prop) / set (cfg) / remove (rm) / version (ver)
 │   ├── backup (bak)  create (cr) · list (ls) · restore (rt) · delete (rm) · verify (vf) · prune (pr)
-│   └── mod (md)      list (ls) · install (in) · remove (rm) · update (up) · outdated (od)
+│   └── mod (md)      list (ls) · add (ad) · remove (rm) · update (up) · outdated (od)
 ├── java (jv)                 # 机器级 JVM 运行时
 │   └── list (ls) [--origin <o>] / scan (sc) [--origin <名字>] / install (in) [--origin <名字>] / uninstall (un|rm) [--origin <名字>]
 ├── remote (rmt)              # 远端执行位置（Backend）
@@ -229,7 +229,7 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | 子命令 | 用法 | 说明 |
 | --- | --- | --- |
 | `list` | `mcsup server mod list [<name>] [--kind <k>] [--project-info] [--source <s>] [--outdated]` | 扫描 `mods/` 的直接子项并做本地检查（加载器、客/服归属、依赖闭包、风险）。默认**不联网**也不建表：目录本身是唯一权威，手工丢进去的文件同样会被列出。`--project-info` 才算 SHA1 反查上游项目与版本；`--outdated` 在此基础上逐项查候选版本，只列有更新的条目 |
-| `install` | `mcsup server mod install [<name>] [<spec>] [--version <id>] [--kind <k>] [--source <s>] [--prerelease] [--force] [--dry-run]` | `spec` 支持项目 ID / slug、`https://modrinth.com/<type>/<slug>` 链接、`@search <关键词>`（交互搜索）。两阶段：先算计划并展示（来源、版本、落点、是否替换），确认后才下载。`--version` 精确指定版本，缺省按服务端加载器与 MC 版本自动挑最优候选 |
+| `add` | `mcsup server mod add [<name>] [<spec>] [--version <id>] [--kind <k>] [--source <s>] [--prerelease] [--force] [--dry-run]` | `spec` 支持项目 ID / slug、`https://modrinth.com/<type>/<slug>` 链接、`@search <关键词>`。**不给 `spec` 时交互搜索**：打开即列这台服务端能跑的 mod（按下载量排序），输入框与列表同屏，回车按关键词远端搜索；命中项超过一页时列表末尾出现「下一页」「上一页」，Esc 逐级返回（搜索结果 → 推荐列表 → 取消）。选中项目后同屏展示详情并选版本（默认只列正式版，`--prerelease` 放开），版本列表也由服务端的加载器与 MC 版本过滤。选完走两阶段：先算计划并展示（来源、版本、落点、是否替换），确认后才下载。`--version` 精确指定版本（版本 ID 与版本号都认），缺省按服务端加载器与 MC 版本自动挑最优候选。旧名 `install` / `in` 保留为别名 |
 | `remove` | `mcsup server mod remove [<name>] [<mod>] [--kind <k>] [--dry-run]` | 按文件名（可省略 `.jar`）或 modid 定位；modid 命中多个文件时不猜，列出候选并退 2 |
 | `update` | `mcsup server mod update [<name>] [<mod>] [--kind <k>] [--source <s>] [--force] [--dry-run]` | 识别 → 逐项查候选 → `decide_update` → 展示清单 → 确认后逐个安装。不给 `<mod>` 时处理全部可更新项。换名更新会把旧文件删掉，避免两份同 modid 的 jar |
 | `outdated` | `mcsup server mod outdated [<name>] [--kind <k>] [--source <s>]` | 只读版 `update`：只列可更新项，不下载 |
