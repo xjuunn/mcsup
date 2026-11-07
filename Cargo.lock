@@ -1144,6 +1144,7 @@ dependencies = [
  "async-trait",
  "domain",
  "flate2",
+ "futures",
  "port",
  "serde_json",
  "sha1",

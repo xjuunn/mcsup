@@ -315,12 +315,30 @@ impl ModpackService {
             source.client_only_hashes(&mod_hashes).await?
         };
 
-        // 3. 清单文件：只装服务端需要的（server: unsupported 已由领域层过滤）
-        let mut reused = 0;
-        let mut downloaded_bytes = 0;
-        let mut skipped_client_only = 0;
-        // 清单哈希过期、但上游权威哈希与下载字节一致的文件路径
-        let mut stale_hashes: Vec<String> = Vec::new();
+        // 3. 清单文件：只装服务端需要的（server: unsupported 已由领域层过滤），
+        //    并行下载，进度收敛为整包口径（见 [`Self::download_files`]）
+        let (jobs, skipped_client_only) = self
+            .classify_files(prepared, server_dir, &client_only)
+            .await?;
+        let mut applied = self
+            .download_files(prepared, source.as_ref(), &jobs, progress, cancel)
+            .await?;
+        applied.file_count = prepared.index.server_files().len() - skipped_client_only;
+        applied.skipped_client_only = skipped_client_only;
+        Ok(applied)
+    }
+
+    /// 把清单文件分类：要下载的、仅客户端剔除的
+    ///
+    /// 仅客户端文件顺手清掉旧落盘——重装时留着只会让服务端起不来。
+    async fn classify_files<'a>(
+        &self,
+        prepared: &'a ModpackPrepared,
+        server_dir: &Path,
+        client_only: &HashSet<String>,
+    ) -> Result<(Vec<(&'a ModpackFile, PathBuf)>, usize), ModpackError> {
+        let mut skipped_client_only = 0_usize;
+        let mut jobs: Vec<(&'a ModpackFile, PathBuf)> = Vec::new();
         for file in prepared.index.downloadable_server_files() {
             let target = safe_target(server_dir, &file.path)?;
             if file
@@ -330,8 +348,8 @@ impl ModpackService {
                 .is_some_and(|hash| client_only.contains(hash))
             {
                 // 上一次安装可能已经把它落盘；重装时顺手清掉，避免旧文件
-                // 继续让服务端起不来。
-                if tokio::fs::metadata(&target).await.is_ok() {
+                // 继续让服务端起不来
+                if tokio::fs::try_exists(&target).await.unwrap_or(false) {
                     tokio::fs::remove_file(&target)
                         .await
                         .map_err(|err| ModpackError::io(&target, err))?;
@@ -339,20 +357,102 @@ impl ModpackService {
                 skipped_client_only += 1;
                 continue;
             }
+            jobs.push((file, target));
+        }
+        Ok((jobs, skipped_client_only))
+    }
+
+    /// 并行下载清单文件，进度收敛为整包口径
+    ///
+    /// 下载本身交给 [`ArtifactDownloader::download_many`]：并发度、整包进度聚合、
+    /// 瞬态重试都是下载器的职责（见 file crate 的实现），service 只做业务编排——
+    /// 判定复用、决定每个文件的目标路径，以及哈希过期后的回源修正。
+    ///
+    /// 两段式：先按清单哈希整批并发下载（绝大多数文件这一轮就完成），只有报
+    /// `ChecksumMismatch` 的少数文件再走 [`Self::fetch_one_file`] 的权威哈希
+    /// 回源路径。这样快车道不被慢逻辑拖累，业务语义（清单哈希过期可修正）不变。
+    ///
+    /// 进度口径收敛为整包：清单里每个文件都带 size，总字节可知；已复用
+    /// （reused）的文件按声明 size 直接计入已完成，余下的由下载器累加。
+    async fn download_files(
+        &self,
+        prepared: &ModpackPrepared,
+        source: &dyn ModpackSource,
+        jobs: &[(&ModpackFile, PathBuf)],
+        progress: Option<&dyn ProgressSink>,
+        cancel: &CancellationToken,
+    ) -> Result<ModpackApplied, ModpackError> {
+        // 总字节与已复用字节：进度条的总长一次算清
+        let total_bytes: u64 = jobs.iter().map(|(file, _)| file.size).sum();
+        // 先把「已存在且校验一致」的文件找出来：它们的字节直接计入已完成
+        let mut reused_bytes = 0_u64;
+        let mut to_download: Vec<(&ModpackFile, PathBuf)> = Vec::new();
+        for (file, target) in jobs {
             if let Some(parent) = target.parent() {
                 tokio::fs::create_dir_all(parent)
                     .await
                     .map_err(|err| ModpackError::io(parent, err))?;
             }
-            if existing_matches(&target, file).await {
-                reused += 1;
-                continue;
+            if existing_matches(target, file).await {
+                reused_bytes += file.size;
+            } else {
+                to_download.push((file, target.clone()));
             }
+        }
+        let reused = jobs.len() - to_download.len();
+
+        // 复用部分的字节先计入：进度条的起点就是「跳过的那一大半」
+        let settled = ReusedProgress::new(reused_bytes, total_bytes, progress);
+
+        // 第一段：按清单哈希整批并发下载
+        let mut requests = Vec::with_capacity(to_download.len());
+        let mut index: Vec<usize> = Vec::with_capacity(to_download.len());
+        for (position, (file, target)) in to_download.iter().enumerate() {
+            let url = first_https(&file.downloads)?;
+            requests.push(DownloadRequest {
+                location: url,
+                destination: target.clone(),
+                expected: file.hashes.sha1_checksum(),
+                expected_size: (file.size > 0).then_some(file.size),
+            });
+            index.push(position);
+        }
+        let outcomes = self
+            .downloader
+            .download_many(&requests, FILE_CONCURRENCY, Some(&settled.sink()), cancel)
+            .await;
+
+        let mut downloaded_bytes = 0_u64;
+        // 清单哈希过期、但上游权威哈希与下载字节一致的文件路径
+        let mut stale_hashes: Vec<String> = Vec::new();
+        // (位置, 清单声明的哈希, 实际下载字节的哈希)
+        let mut needs_authority: Vec<(usize, String, String)> = Vec::new();
+        for (position, outcome) in index.iter().copied().zip(outcomes) {
+            match outcome {
+                Ok(downloaded) => {
+                    downloaded_bytes = downloaded_bytes.saturating_add(downloaded.size);
+                }
+                Err(port::DownloadError::ChecksumMismatch { expected, actual }) => {
+                    needs_authority.push((position, expected, actual));
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        // 第二段：只有清单哈希过期的文件才回源确认 + 按权威哈希重下。
+        // 带着批量下载已取得的 expected/actual 进入，不重复注定失败的尝试。
+        for (position, expected, actual) in needs_authority {
+            if cancel.is_cancelled() {
+                return Err(ModpackError::Download(port::DownloadError::Cancelled));
+            }
+            let (file, target) = &to_download[position];
             let url = first_https(&file.downloads)?;
             let fetched = self
-                .fetch_one_file(source.as_ref(), file, url, &target, progress, cancel)
+                .accept_authoritative_hash(
+                    source, file, url, target, expected, actual, progress, cancel,
+                )
                 .await?;
-            downloaded_bytes += fetched.bytes;
+            downloaded_bytes = downloaded_bytes.saturating_add(fetched.bytes);
             if fetched.stale {
                 stale_hashes.push(file.path.clone());
             }
@@ -364,15 +464,14 @@ impl ModpackService {
             files = prepared.index.server_files().len(),
             downloaded_bytes,
             reused,
-            skipped_client_only,
             stale_hashes = stale_hashes.len(),
-            "modpack applied"
+            "modpack files downloaded"
         );
         Ok(ModpackApplied {
-            file_count: prepared.index.server_files().len() - skipped_client_only,
+            file_count: 0,
             downloaded_bytes,
             reused,
-            skipped_client_only,
+            skipped_client_only: 0,
             stale_hashes,
         })
     }
@@ -395,64 +494,54 @@ impl ModpackService {
         Ok(())
     }
 
-    /// 下载单个清单文件，必要时按上游权威哈希修正过期清单哈希
+    /// 清单哈希已过期：回源确认并改用权威哈希重下
     ///
-    /// 先用清单里的 sha1 强校验下载；一旦报 `ChecksumMismatch`，说明上游文件
-    /// 被重新上传、清单哈希过期。此时回源取**当前**权威哈希：若与刚下载的字节
-    /// 一致则接受并按权威哈希重下一次（仍强校验），否则如实抛出原错误。
-    async fn fetch_one_file(
+    /// 单独成函数是为了让批量下载的第二阶段复用它：批量下载已经用清单哈希试过
+    /// 一次并拿到 `ChecksumMismatch`，此时**不该**再重复一遍注定失败的尝试——
+    /// 直接带着已知的 `expected`/`actual` 进入回源确认。
+    ///
+    /// 判定标准：上游权威哈希必须与刚下载的字节一致，才认为「文件本身没坏、
+    /// 只是清单过期了」；不一致说明下载到的字节确实不对，原样抛出 mismatch。
+    #[allow(clippy::too_many_arguments)]
+    async fn accept_authoritative_hash(
         &self,
         source: &dyn ModpackSource,
         file: &ModpackFile,
         url: url::Url,
         target: &Path,
+        expected: String,
+        actual: String,
         progress: Option<&dyn ProgressSink>,
         cancel: &CancellationToken,
     ) -> Result<FetchedFile, ModpackError> {
-        let expected_size = (file.size > 0).then_some(file.size);
-        let request = DownloadRequest {
-            location: url.clone(),
-            destination: target.to_path_buf(),
-            expected: file.hashes.sha1_checksum(),
-            expected_size,
+        let Some(authoritative) =
+            authoritative_sha1(source, &file.downloads, &file.path, cancel).await?
+        else {
+            return Err(port::DownloadError::ChecksumMismatch { expected, actual }.into());
         };
-        match self.downloader.download(&request, progress, cancel).await {
-            Ok(downloaded) => Ok(FetchedFile {
-                bytes: downloaded.size,
-                stale: false,
-            }),
-            Err(port::DownloadError::ChecksumMismatch { expected, actual }) => {
-                let Some(authoritative) =
-                    authoritative_sha1(source, &file.downloads, &file.path, cancel).await?
-                else {
-                    return Err(port::DownloadError::ChecksumMismatch { expected, actual }.into());
-                };
-                if authoritative != actual {
-                    return Err(port::DownloadError::ChecksumMismatch { expected, actual }.into());
-                }
-                info!(
-                    path = %file.path,
-                    manifest_sha1 = %expected,
-                    upstream_sha1 = %actual,
-                    "modpack file hash is stale in manifest; accepted upstream hash"
-                );
-                let retry = DownloadRequest {
-                    location: url,
-                    destination: target.to_path_buf(),
-                    expected: Some(domain::server::artifact::Checksum::new(
-                        domain::server::artifact::ChecksumAlgorithm::Sha1,
-                        authoritative,
-                    )),
-                    expected_size,
-                };
-                let downloaded = self.downloader.download(&retry, progress, cancel).await?;
-                Ok(FetchedFile {
-                    bytes: downloaded.size,
-                    stale: true,
-                })
-            }
-            Err(err) => Err(err.into()),
+        if authoritative != actual {
+            return Err(port::DownloadError::ChecksumMismatch { expected, actual }.into());
         }
+        info!(
+            path = %file.path,
+            manifest_sha1 = %expected,
+            upstream_sha1 = %actual,
+            "modpack file hash is stale in manifest; accepted upstream hash"
+        );
+        let retry = DownloadRequest {
+            location: url,
+            destination: target.to_path_buf(),
+            expected: Some(domain::server::artifact::Checksum::new(
+                domain::server::artifact::ChecksumAlgorithm::Sha1,
+                authoritative,
+            )),
+            expected_size: (file.size > 0).then_some(file.size),
+        };
+        let downloaded = self.downloader.download(&retry, progress, cancel).await?;
+        Ok(FetchedFile {
+            bytes: downloaded.size,
+            stale: true,
+        })
     }
 }
 
@@ -462,6 +551,65 @@ struct FetchedFile {
     bytes: u64,
     /// 是否因清单哈希过期、按上游权威哈希接受
     stale: bool,
+}
+
+/// 清单文件并发下载上限
+///
+/// 清单文件通常是几十到几百个小 jar：并发太高（几十路）只会放大对 CDN
+/// 的压力，收益递减；8 路在常见家庭带宽上已能把吞吐跑满，同时单文件
+/// 内部的分片下载仍在 file crate 里按需并发，两层不叠加失控。
+const FILE_CONCURRENCY: usize = 8;
+
+/// 复用文件的进度起点
+///
+/// 重装整合包时大部分文件已存在且校验一致，它们不会经过下载器，下载器也就
+/// 不知道这部分字节。把复用字节作为**偏移量**叠加到下载器的整批进度上，
+/// 进度条才从「实际已完成」的位置开始走，而不是从 0 重新爬。
+///
+/// 偏移只在 service 侧持有：下载器仍然只报告它自己传了多少，语义不被污染；
+/// 上层拿到的仍是整包绝对值。
+struct ReusedProgress<'a> {
+    /// 复用文件贡献的字节
+    offset: u64,
+    /// 整包总字节
+    total: u64,
+    /// 上层 sink
+    upstream: Option<&'a dyn ProgressSink>,
+}
+
+impl<'a> ReusedProgress<'a> {
+    fn new(offset: u64, total: u64, upstream: Option<&'a dyn ProgressSink>) -> Self {
+        Self {
+            offset,
+            total,
+            upstream,
+        }
+    }
+
+    /// 叠加了复用偏移的 sink
+    fn sink(&self) -> OffsetSink<'_> {
+        OffsetSink {
+            offset: self.offset,
+            total: self.total,
+            upstream: self.upstream,
+        }
+    }
+}
+
+/// 把下载器的整批进度叠加复用偏移后上报
+struct OffsetSink<'a> {
+    offset: u64,
+    total: u64,
+    upstream: Option<&'a dyn ProgressSink>,
+}
+
+impl ProgressSink for OffsetSink<'_> {
+    fn on_progress(&self, transferred: u64, _total: Option<u64>) {
+        if let Some(sink) = self.upstream {
+            // 偏移量与传来的增量相加即为整包已完成字节；总长用清单字节总和
+            sink.on_progress(self.offset.saturating_add(transferred), Some(self.total));
+        }
+    }
 }
 
 /// 已取回并解析的整合包

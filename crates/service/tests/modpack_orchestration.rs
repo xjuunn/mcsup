@@ -1118,3 +1118,118 @@ async fn stale_manifest_hash_fails_without_authoritative_support() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// 进度是整包口径：总长 = 清单字节总和，且单调不回退
+///
+/// 旧实现把单文件下载器的回调直接透传，进度条跟着单个文件走，
+/// 文件下完就归零——并行下载后更是多个文件互相踩。聚合层的契约：
+/// 每个 `on_progress` 都是整包绝对值，total 恒为清单字节总和。
+struct RecordingSink {
+    samples: Mutex<Vec<(u64, u64)>>,
+}
+
+impl ProgressSink for RecordingSink {
+    fn on_progress(&self, transferred: u64, total: Option<u64>) {
+        self.samples
+            .lock()
+            .expect("samples")
+            .push((transferred, total.unwrap_or(0)));
+    }
+}
+
+#[tokio::test]
+async fn apply_reports_pack_level_monotonic_progress() {
+    let index = ModpackIndex::new(
+        1,
+        "minecraft",
+        "1.0.0",
+        "Pack",
+        deps(&[("minecraft", "1.21.1"), ("fabric-loader", "0.16.0")]),
+        vec![
+            file("mods/a.jar", 4, EnvTag::Required),
+            file("mods/b.jar", 8, EnvTag::Required),
+            file("mods/c.jar", 16, EnvTag::Required),
+            file("config/x.toml", 2, EnvTag::None),
+        ],
+    )
+    .expect("index");
+    let service = service(index, Vec::new(), FakeDownloader::ok());
+    let dir = scratch("progress-aggregate");
+
+    let prepared = service
+        .prepare(
+            "P",
+            ModpackInstallOptions::new(&dir),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("prepare");
+    let sink = RecordingSink {
+        samples: Mutex::new(Vec::new()),
+    };
+    let applied = service
+        .apply(&prepared, &dir, Some(&sink), &CancellationToken::new())
+        .await
+        .expect("apply");
+    assert_eq!(applied.downloaded_bytes, 30);
+
+    let samples = sink.samples.lock().expect("samples").clone();
+    // 每个样本的 total 都是清单字节总和（30），不是单个文件的大小
+    assert!(
+        samples.iter().all(|(_, total)| *total == 30),
+        "total 必须是整包字节：{samples:?}"
+    );
+    // 进度单调不回退，且最终到达总量
+    let mut last = 0;
+    for (done, _) in &samples {
+        assert!(*done >= last, "进度回退：{samples:?}");
+        last = *done;
+    }
+    assert_eq!(
+        samples.last().map(|(done, _)| *done),
+        Some(30),
+        "最终样本必须到达总量：{samples:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 并行下载：全部文件落盘，结果与串行一致
+///
+/// `FakeDownloader` 无真并发压力，此测试验证并发路径的正确性
+/// （缓冲乱序收集后逐个汇总），大整合包的性能收益由真实网络承担。
+#[tokio::test]
+async fn apply_downloads_all_files_via_concurrency() {
+    let files: Vec<ModpackFile> = (0..20)
+        .map(|i| file(&format!("mods/m{i}.jar"), 4, EnvTag::Required))
+        .collect();
+    let index = ModpackIndex::new(
+        1,
+        "minecraft",
+        "1.0.0",
+        "Pack",
+        deps(&[("minecraft", "1.21.1"), ("fabric-loader", "0.16.0")]),
+        files,
+    )
+    .expect("index");
+    let service = service(index, Vec::new(), FakeDownloader::ok());
+    let dir = scratch("parallel");
+
+    let prepared = service
+        .prepare(
+            "P",
+            ModpackInstallOptions::new(&dir),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("prepare");
+    let applied = service
+        .apply(&prepared, &dir, None, &CancellationToken::new())
+        .await
+        .expect("apply");
+    assert_eq!(applied.file_count, 20);
+    assert_eq!(applied.downloaded_bytes, 80);
+    for i in 0..20 {
+        assert!(dir.join(format!("mods/m{i}.jar")).is_file(), "m{i} 缺失");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}

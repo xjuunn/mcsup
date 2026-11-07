@@ -395,6 +395,46 @@ pub trait ArtifactDownloader: Send + Sync {
         progress: Option<&dyn ProgressSink>,
         cancel: &CancellationToken,
     ) -> Result<DownloadedArtifact, DownloadError>;
+
+    /// 批量下载：并发执行多个独立文件，进度收敛为整批口径
+    ///
+    /// 默认实现串行逐个调用 [`Self::download`]（正确但慢）；实现层可以
+    /// 覆盖为并发——清单类批量下载（整合包上百个文件）是主要受益方。
+    ///
+    /// 进度契约（对**所有**实现成立）：
+    ///
+    /// - `total` 恒为整批声明字节总和（`expected_size` 未知按 0 计；
+    ///   全部未知时为 `None`，进度退化为「已传字节」口径）
+    /// - `transferred` 严格单调不回退：实现按增量累加，而非透传单文件
+    ///   的从零进度
+    /// - 结果顺序与入参一致，失败项原地报错、不拖垮整批
+    async fn download_many(
+        &self,
+        requests: &[DownloadRequest],
+        _concurrency: usize,
+        progress: Option<&dyn ProgressSink>,
+        cancel: &CancellationToken,
+    ) -> Vec<Result<DownloadedArtifact, DownloadError>> {
+        let total: u64 = requests.iter().filter_map(|r| r.expected_size).sum();
+        let all_known = requests.iter().all(|r| r.expected_size.is_some());
+        let total = all_known.then_some(total);
+        let mut done = 0_u64;
+        let mut results = Vec::with_capacity(requests.len());
+        for request in requests {
+            let outcome = self.download(request, None, cancel).await;
+            if let Ok(artifact) = &outcome {
+                done += artifact.size;
+                if let Some(sink) = progress {
+                    sink.on_progress(done, total);
+                }
+            }
+            results.push(outcome);
+            if cancel.is_cancelled() {
+                break;
+            }
+        }
+        results
+    }
 }
 
 /// 归档解压失败（工具缺失 / 执行失败），消息自带工具与路径上下文
