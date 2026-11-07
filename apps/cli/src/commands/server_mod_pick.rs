@@ -259,6 +259,10 @@ async fn browse_results(
 }
 
 /// 结果页标题：0 条时说明没有匹配，其余显示页码与总数
+///
+/// 列表已经滤掉仅客户端的项目（见 `ContentQuery::server_usable_only`），
+/// 所以 0 条时要把这层口径讲清楚：用户搜「iris」搜不到，很可能只是因为它
+/// 是客户端专属，而不是搜错了词。
 fn results_label(
     lang: Lang,
     kind: ContentKind,
@@ -271,13 +275,17 @@ fn results_label(
         return match keyword {
             Some(keyword) => pick(
                 lang,
-                format!("搜索{noun}「{keyword}」 · 没有匹配结果"),
-                format!("searching {noun}s for {keyword} · no matches"),
+                format!("搜索{noun}「{keyword}」 · 没有可装到服务端的{noun}（仅客户端的已排除）"),
+                format!(
+                    "searching {noun}s for {keyword} · no server-installable {noun}s (client-only ones are excluded)"
+                ),
             ),
             None => pick(
                 lang,
-                format!("搜索{noun} · 没有可添加到服务端的{noun}"),
-                format!("searching {noun}s · nothing installable on a server"),
+                format!("搜索{noun} · 没有可添加到服务端的{noun}（仅客户端的已排除）"),
+                format!(
+                    "searching {noun}s · nothing installable on a server (client-only ones are excluded)"
+                ),
             ),
         };
     }
@@ -498,7 +506,11 @@ mod tests {
         assert!(zh.contains("42"), "{zh}");
 
         let empty = results_label(Lang::Zh, ContentKind::Mod, Some("zzz"), 0, 0);
-        assert!(empty.contains("没有匹配结果"), "{empty}");
+        assert!(empty.contains("没有可装到服务端"), "{empty}");
+        assert!(
+            empty.contains("仅客户端的已排除"),
+            "要说明过滤口径：{empty}"
+        );
 
         let plugin = results_label(Lang::Zh, ContentKind::Plugin, None, 7, 0);
         assert!(plugin.contains("插件"), "插件要用自己的名词：{plugin}");

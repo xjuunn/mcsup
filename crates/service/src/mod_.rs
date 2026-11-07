@@ -1008,7 +1008,8 @@ fn server_request(
 ///
 /// 类别限定为用户要装的类别；加载器只在类别按变体过滤时生效
 /// （数据包不看加载器）；游戏版本总是限定，否则会列出这台服务端跑不起来的
-/// 项目，用户选完才发现没有可安装版本。
+/// 项目，用户选完才发现没有可安装版本。同样地，仅客户端的项目（光影加载器、
+/// 小地图…）也挡在列表外——它们能装进 `mods/`，但装上去服务端起不来。
 fn server_query(
     variant: &ServerVariant,
     game_version: &str,
@@ -1029,6 +1030,7 @@ fn server_query(
         .map(<str>::to_owned)
         .into_iter()
         .collect();
+    query.server_usable_only = true;
     query
 }
 
@@ -1283,6 +1285,10 @@ mod tests {
         assert_eq!(query.keyword.as_deref(), Some("sodium"), "关键词原样保留");
         assert_eq!(query.offset, 20, "分页原样保留");
         assert_eq!(query.limit, 20);
+        assert!(
+            query.server_usable_only,
+            "仅客户端的项目不能出现在服务端安装列表里"
+        );
     }
 
     /// 数据包不看加载器：搜索不按加载器过滤，但游戏版本仍限定

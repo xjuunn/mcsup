@@ -106,10 +106,7 @@ impl ModpackSource for ModrinthModpackSource {
     async fn search(&self, query: &ModpackQuery) -> Result<ModpackSearch, SourceError> {
         let mut facets = FacetTree::new().and([Facet::eq("project_type", "modpack")]);
         // 服务端可跑：required 或 optional 都算（optional 表示服务端可用但非必需）
-        facets = facets.and([
-            Facet::eq("server_side", "required"),
-            Facet::eq("server_side", "optional"),
-        ]);
+        facets = facets.and(super::facets::server_usable());
         if !query.loaders.is_empty() {
             facets = facets.and(
                 query

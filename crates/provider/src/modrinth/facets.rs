@@ -108,6 +108,20 @@ pub struct FacetTree {
     groups: Vec<Vec<Facet>>,
 }
 
+/// 「能在服务端运行」这一组 OR 条件
+///
+/// 上游的 `server_side` 是三态：`required` / `optional` / `unsupported`。
+/// 前两者都表示能在服务端运行（`optional` 是「可用但非必需」），
+/// `unsupported` 是仅客户端。字段缺失表示上游没标注——那不等于支持服务端，
+/// 因此不并入这一组：宁可在搜索阶段就少列，也不要把只在客户端跑的项目
+/// 摆到服务端安装的列表里，等用户选完、确认、下载完才被拒绝。
+pub(crate) fn server_usable() -> [Facet; 2] {
+    [
+        Facet::eq("server_side", "required"),
+        Facet::eq("server_side", "optional"),
+    ]
+}
+
 impl FacetTree {
     /// 空条件树（编码为 `[]`，表示不过滤）
     #[must_use]

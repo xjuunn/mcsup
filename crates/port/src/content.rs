@@ -36,6 +36,13 @@ pub struct ContentQuery {
     pub loaders: Vec<String>,
     /// 游戏版本过滤（空表示不限）
     pub game_versions: Vec<String>,
+    /// 只保留能在服务端运行的项目
+    ///
+    /// 上游对每个项目标注了客户端 / 服务端两侧的支持情况，其中「仅客户端」
+    /// 的条目（光影加载器、小地图一类）也能装进 `mods/`，但装上去服务端起
+    /// 不来。检索「要装到服务端的内容」时置为 `true`，把这类项目挡在列表
+    /// 之外；纯粹浏览目录时保持 `false`。
+    pub server_usable_only: bool,
     /// 跳过的结果数
     pub offset: u32,
     /// 返回条数
@@ -77,6 +84,15 @@ impl ContentQuery {
     #[must_use]
     pub fn game_versions(mut self, versions: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.game_versions = versions.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// 只保留能在服务端运行的项目
+    ///
+    /// 用于「要装到服务端」的检索；纯浏览不调用它。
+    #[must_use]
+    pub fn server_usable_only(mut self) -> Self {
+        self.server_usable_only = true;
         self
     }
 

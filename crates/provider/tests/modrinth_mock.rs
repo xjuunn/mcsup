@@ -14,7 +14,7 @@
 
 #![allow(clippy::expect_used, reason = "测试夹具，失败直接 panic 才有用")]
 
-use port::content::ContentSource;
+use port::content::{ContentQuery, ContentSource};
 use port::mod_::ModMetadataSource;
 use port::modpack::{ModpackQuery, ModpackSource};
 use provider::modrinth::{
@@ -271,6 +271,48 @@ async fn modpack_default_search_sends_no_keyword() {
     );
     assert!(target.contains("offset=0"), "首屏从第一页开始: {target}");
     assert!(target.contains("limit=20"), "{target}");
+}
+
+/// 服务端安装用的检索：仅客户端的项目必须挡在上游
+///
+/// 光影加载器一类项目同样能塞进 `mods/`，装上去服务端却起不来。等用户选完、
+/// 确认、下载完才被服务端检查拒绝，等于让用户白跑一趟。
+#[tokio::test]
+async fn server_usable_search_filters_client_only_projects() {
+    let mock = Mock::start(vec![("GET", "/v2/search", 200, SEARCH.to_owned())]).await;
+    let source = source_for(&mock);
+
+    // 走 `ContentSource` 的检索口径：`ModrinthSource` 另有一个收
+    // `SearchQuery` 的固有方法，点号调用会命中它
+    ContentSource::search(
+        &source,
+        &ContentQuery::new().keyword("iris").server_usable_only(),
+    )
+    .await
+    .expect("search");
+
+    let target = &mock.requests()[0].target;
+    assert!(
+        target.contains("server_side%3Drequired") && target.contains("server_side%3Doptional"),
+        "要按服务端可用过滤: {target}"
+    );
+}
+
+/// 纯浏览不加服务端限制：目录检索要能看到仅客户端的项目
+#[tokio::test]
+async fn plain_search_keeps_client_only_projects() {
+    let mock = Mock::start(vec![("GET", "/v2/search", 200, SEARCH.to_owned())]).await;
+    let source = source_for(&mock);
+
+    ContentSource::search(&source, &ContentQuery::new().keyword("iris"))
+        .await
+        .expect("search");
+
+    let target = &mock.requests()[0].target;
+    assert!(
+        !target.contains("server_side"),
+        "不应凭空收紧检索: {target}"
+    );
 }
 
 /// 项目详情：slug 进路径段

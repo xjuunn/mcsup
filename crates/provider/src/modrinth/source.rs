@@ -79,6 +79,12 @@ impl ContentSource for ModrinthSource {
                     .map(|version| Facet::eq("versions", version.as_str())),
             );
         }
+        if query.server_usable_only {
+            // 仅客户端的项目（光影加载器、小地图…）同样能塞进 `mods/`，
+            // 装上去服务端却起不来。在检索阶段就挡掉，别等用户选完、
+            // 确认、下载完才被服务端检查拒绝。
+            facets = facets.and(super::facets::server_usable());
+        }
 
         let mut request = SearchQuery::new()
             .facets(facets)
