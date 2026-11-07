@@ -435,7 +435,7 @@ impl ModService {
         let server = self.local_server(name)?;
         let dir = mods_dir(&server, options.kind);
         let jars = jars_in(&dir)?;
-        let audit = self.inspect(&jars, &server).await?;
+        let audit = self.inspect(&jars, &[], &server).await?;
 
         // 哈希只算一次：识别用它，之后按路径回查，避免每个文件算两遍。
         // `updates` 依赖识别结果，因此隐含打开识别——调用方漏传不该让结论变空。
@@ -680,8 +680,15 @@ impl ModService {
             )
             .await?;
 
+        // 依赖闭包看整个 `mods/` 目录（排除本次要替换的那个文件——它马上就
+        // 不在了）：待装文件声明的依赖已装在目录里时不算缺失。只看暂存区
+        // 会把「satin 已装好」误报成「缺少 satin」，用户只能 --force。
+        let existing = jars_in(&mods_dir(&server, plan.kind))?
+            .into_iter()
+            .filter(|path| Some(path.as_path()) != plan.replaces.as_deref())
+            .collect::<Vec<_>>();
         let staged = [install.path.clone()];
-        let audit = self.inspect(&staged, &server).await?;
+        let audit = self.inspect(&staged, &existing, &server).await?;
         let (risk, missing_deps, evidence) = verdict_of(audit, &plan.file)?;
         let verdict = InstallVerdict::of(risk, options.allow_blocking);
         if !verdict.is_allowed() {
@@ -939,15 +946,20 @@ impl ModService {
     ///
     /// 目标服务端条件取自服务端元数据：加载器、MC 版本、Java 大版本。
     /// 三者一起构成「能不能装到这台服务端」的判定依据。
+    ///
+    /// `context` 是参与依赖闭包但不进结果的文件：安装检查传入已装的 `mods/`
+    /// 目录，待装文件声明的依赖已装在目录里时不算缺失——加载器解析看的是
+    /// 整个目录，不是这一个 jar。列表检查不需要（那批文件本身就是目录）。
     async fn inspect(
         &self,
         paths: &[PathBuf],
+        context: &[PathBuf],
         server: &RegisteredServer,
     ) -> Result<ModAudit, ModError> {
         let service = ModInspectService::local(Arc::clone(&self.inspector));
         let target = server_target(server);
         Ok(service
-            .inspect_paths_for(paths, false, Some(&target))
+            .inspect_with_context(paths, context, false, Some(&target))
             .await?)
     }
 
