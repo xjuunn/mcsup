@@ -875,6 +875,12 @@ impl ModService {
             }
             let needed_by = file_name_of(&report.capability.path);
             for missing in &report.missing_deps {
+                // 同一个依赖被多个文件缺：只检索一次，计划里不重复刷屏
+                if unresolved.iter().any(|seen| seen == missing)
+                    || installs.iter().any(|seen| &seen.missing == missing)
+                {
+                    continue;
+                }
                 match self.find_provider(missing, &server).await? {
                     Some(project) => installs.push(FixInstall {
                         needed_by: needed_by.clone(),
@@ -932,24 +938,28 @@ impl ModService {
         modid: &str,
         server: &RegisteredServer,
     ) -> Result<Option<String>, ModError> {
-        let query = ContentQuery::new().keyword(modid).page(0, 5);
-        let found = self
-            .content
-            .search(
-                None,
-                &server_query(
-                    &server.meta.variant,
-                    server.meta.version.as_str(),
-                    ContentKind::Mod,
-                    &query,
-                ),
-            )
-            .await?;
-        Ok(found
-            .hits
-            .into_iter()
-            .find(|hit| !hit.client_only)
-            .map(|hit| hit.id))
+        // 上游检索把 modid 当整词条：`geckolib3` 搜不到 `geckolib`（实测
+        // 全文索引里带数字尾巴的旧命名排不进结果）。原词落空后去掉尾部
+        // 版本数字再试一次；命中同样要过「非仅客户端」过滤。
+        for term in provider_search_terms(modid) {
+            let query = ContentQuery::new().keyword(&term).page(0, 5);
+            let found = self
+                .content
+                .search(
+                    None,
+                    &server_query(
+                        &server.meta.variant,
+                        server.meta.version.as_str(),
+                        ContentKind::Mod,
+                        &query,
+                    ),
+                )
+                .await?;
+            if let Some(hit) = found.hits.into_iter().find(|hit| !hit.client_only) {
+                return Ok(Some(hit.id));
+            }
+        }
+        Ok(None)
     }
 
     /// 执行修复计划：移除带问题的文件，补装缺失依赖
@@ -1410,6 +1420,21 @@ fn file_name_of(path: &str) -> String {
     )
 }
 
+/// 修复补装时检索提供方的检索词，按优先级排列
+///
+/// 依赖 modid 常带版本尾巴（`geckolib3`、`clothconfig2`），而上游项目
+/// 名通常不带（`geckolib`、`cloth-config`）；上游全文检索把检索词当
+/// 整词条，带尾巴的原词往往搜不到本体。因此原词之外补一个去掉尾部
+/// 版本数字的词——只剥末尾数字，不动 `fabric-api` 这类正常命名。
+fn provider_search_terms(modid: &str) -> Vec<String> {
+    let mut terms = vec![modid.to_owned()];
+    let trimmed = modid.trim_end_matches(|c: char| c.is_ascii_digit());
+    if trimmed.len() != modid.len() && !trimmed.is_empty() {
+        terms.push(trimmed.to_owned());
+    }
+    terms
+}
+
 /// 换名更新后删掉旧文件
 ///
 /// 只在路径不同时动手：同名替换由 [`crate::atomic::replace_file`] 自己处理掉了。
@@ -1568,7 +1593,6 @@ mod tests {
         let dir = Path::new("/srv/mods");
         let jars = vec![PathBuf::from("/srv/mods/abc-1.0.jar")];
         let inspector = FakeInspector(vec![cap("/srv/mods/abc-1.0.jar", "abc")]);
-
         let err = match_files(&inspector, &jars, "zzz", dir).expect_err("missing");
         assert!(matches!(err, ModError::NotFound { .. }), "{err:?}");
         assert_eq!(err.category(), ErrorCategory::NotFound);
@@ -1578,6 +1602,22 @@ mod tests {
     fn loader_maps_known_variants_only() {
         assert_eq!(loader_of(&ServerVariant::Fabric), Some(ModLoader::Fabric));
         assert_eq!(loader_of(&ServerVariant::Vanilla), None);
+    }
+
+    /// 带版本尾巴的 modid 要补一个去尾词：上游搜 `geckolib3` 搜不到 `geckolib`
+    #[test]
+    fn provider_terms_strip_trailing_version_digits() {
+        assert_eq!(
+            provider_search_terms("geckolib3"),
+            vec!["geckolib3".to_owned(), "geckolib".to_owned()]
+        );
+        // 正常命名不受影响
+        assert_eq!(
+            provider_search_terms("fabric-api"),
+            vec!["fabric-api".to_owned()]
+        );
+        // 全是数字的 modid 不剥（剥完就空了）
+        assert_eq!(provider_search_terms("42"), vec!["42".to_owned()]);
     }
 
     /// 记录的 Java 优先；没有记录时按 MC 版本推算，与启动判定同源
