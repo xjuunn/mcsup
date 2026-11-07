@@ -27,15 +27,11 @@ pub(crate) fn rpc(
             let mut stream =
                 interprocess::local_socket::Stream::connect(endpoint::endpoint_name(&dir)?)
                     .map_err(|err| SupervisorError::Unreachable(err.to_string()))?;
-            // 套接字读写也必须自带超时：外层 `recv_timeout` 到期只是让调用方
+            // 套接字读写也自带超时：外层 `recv_timeout` 到期只是让调用方
             // 返回，这个线程仍在阻塞读上，会连同 socket 一起泄漏。supervisor
             // 卡住时（长 GC、`save-all flush`）每次调用都漏一个线程。
-            stream
-                .set_recv_timeout(Some(timeout))
-                .map_err(|err| transport(&err))?;
-            stream
-                .set_send_timeout(Some(timeout))
-                .map_err(|err| transport(&err))?;
+            apply_timeout(stream.set_recv_timeout(Some(timeout)))?;
+            apply_timeout(stream.set_send_timeout(Some(timeout)))?;
             protocol::write_frame(&mut stream, &request).map_err(|err| transport(&err))?;
             let response: Response = protocol::read_frame(&mut BufReader::new(stream))
                 .map_err(|err| frame_error(&err))?;
@@ -50,6 +46,24 @@ pub(crate) fn rpc(
 /// 传输层 IO 错误
 fn transport(err: &std::io::Error) -> SupervisorError {
     SupervisorError::Unreachable(err.to_string())
+}
+
+/// 设置套接字超时；平台不支持时放行
+///
+/// Windows 的命名管道没有 I/O 超时这一说，`interprocess` 对
+/// `set_recv_timeout` / `set_send_timeout` 一律返回 `Unsupported`。那是
+/// **平台能力缺失**，不是连接故障：把它当成连接失败，Windows 上每一次
+/// supervisor 调用都会立刻报「supervisor unreachable」，服务端永远起不来。
+///
+/// 放行之后仍由外层 `recv_timeout` 保证调用方按时返回；读线程要等到对端
+/// 应答或断开才结束，代价是 supervisor 卡死时会多挂一个阻塞线程，而不是
+/// 整个平台不可用。
+fn apply_timeout(result: std::io::Result<()>) -> Result<(), SupervisorError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::Unsupported => Ok(()),
+        Err(err) => Err(transport(&err)),
+    }
 }
 
 /// 帧非法 = 协议问题，其余 = 连接问题
@@ -143,5 +157,36 @@ pub(crate) fn unwrap_ok(response: Response) -> Result<Response, SupervisorError>
             message,
         }),
         other => Ok(other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 平台不支持超时不是连接故障
+    ///
+    /// 回归：Windows 命名管道对 `set_*_timeout` 一律返回 `Unsupported`，
+    /// 曾经被当成连接失败，于是 Windows 上所有 supervisor 调用都报
+    /// 「unreachable」，`server start` 永远起不来。
+    #[test]
+    fn unsupported_timeout_is_not_a_connection_failure() {
+        let unsupported =
+            std::io::Error::new(std::io::ErrorKind::Unsupported, "no I/O timeouts here");
+        assert!(apply_timeout(Err(unsupported)).is_ok());
+    }
+
+    /// 其余 IO 错误仍然是连接故障：不能把真实故障一起吞掉
+    #[test]
+    fn other_timeout_errors_still_fail() {
+        let broken = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pipe closed");
+        let err = apply_timeout(Err(broken)).expect_err("must fail");
+        assert!(matches!(err, SupervisorError::Unreachable(_)), "{err:?}");
+    }
+
+    /// 成功设置超时不改变任何东西
+    #[test]
+    fn setting_timeout_success_is_ok() {
+        assert!(apply_timeout(Ok(())).is_ok());
     }
 }
