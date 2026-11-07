@@ -1098,6 +1098,87 @@ async fn missing_required_dependency_is_reported_even_when_forced() {
     assert_eq!(installed.missing_deps, vec!["some-lib".to_owned()]);
 }
 
+/// 依赖已经装在 `mods/` 里：不判缺失，正常安装
+///
+/// 回归：安装检查只看暂存区那一批文件，`mods/` 里已有的 `satin` 满足不了
+/// 待装文件声明的依赖，被误报成「缺少必需依赖」，只能 `--force`。加载器
+/// 解析时看的是整个目录。
+#[tokio::test]
+async fn dependency_present_in_mods_dir_is_not_missing() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[
+            ("cool-mod.jar", SideSupport::Required),
+            ("satin.jar", SideSupport::Required),
+        ],
+        b"jar-bytes",
+    );
+    harness.inspector.declare_dep("cool-mod.jar", "satin");
+    // 预置依赖提供方：FakeInspector 按文件名给结论，磁盘上放同名文件
+    harness.write("mods/satin.jar", b"installed-lib");
+    let plan = harness
+        .mods
+        .plan_install("alpha", "cool-mod", ContentKind::Mod, install_spec())
+        .await
+        .expect("plan");
+
+    let installed = harness
+        .mods
+        .install(
+            "alpha",
+            &plan,
+            ApplyOptions {
+                allow_blocking: false,
+                progress: None,
+                cancel: &CancellationToken::new(),
+            },
+        )
+        .await
+        .expect("依赖已装就不该拦");
+    assert_eq!(installed.risk, domain::mod_::Risk::Ok, "{installed:?}");
+    assert!(installed.missing_deps.is_empty());
+}
+
+/// 被替换的旧文件不参与依赖闭包：升级后旧文件不存在了，不能拿它满足依赖
+///
+/// 场景：旧 `cool-mod.jar` 提供 `old-api`，新版本不再提供但仍声明依赖它
+/// （上游改了依赖名）——闭包若把即将被替换的文件也算进去，就会漏判。
+/// 实际更常见的形态是「同名文件被覆盖」：闭包里必须排除 `plan.replaces`。
+#[tokio::test]
+async fn replaced_file_is_excluded_from_dependency_closure() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[("cool-mod.jar", SideSupport::Required)],
+        b"jar-bytes-new",
+    );
+    // 新文件依赖 `satin`；磁盘上的旧 cool-mod.jar 不提供它（旧文件会被替换）
+    harness.inspector.declare_dep("cool-mod.jar", "satin");
+    harness.write("mods/cool-mod.jar", b"jar-bytes-old");
+    // 让计划解析出同名文件 → replaces 命中旧文件
+    harness.set_resolved(&[("v2", "cool-mod.jar")]);
+    let plan = harness
+        .mods
+        .plan_install("alpha", "cool-mod", ContentKind::Mod, install_spec())
+        .await
+        .expect("plan");
+    assert!(plan.replaces.is_some(), "应当命中同名旧文件");
+
+    let refused = harness
+        .mods
+        .install(
+            "alpha",
+            &plan,
+            ApplyOptions {
+                allow_blocking: false,
+                progress: None,
+                cancel: &CancellationToken::new(),
+            },
+        )
+        .await
+        .expect_err("替换后旧文件不能继续满足依赖");
+    assert!(matches!(refused, ModError::Refused { .. }), "{refused:?}");
+}
+
 /// 更新中途失败：已完成项保留，失败项停在原版本，错误说清停在哪
 #[tokio::test]
 async fn update_stops_at_the_failing_item_and_reports_progress() {

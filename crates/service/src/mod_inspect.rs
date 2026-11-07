@@ -214,12 +214,32 @@ impl ModInspectService {
     /// 判定「能不能装到这台服务端」。为 `None` 时不做匹配判定，依赖校验的
     /// 目标加载器从这批文件共同支持的加载器里推断。
     ///
+    /// `context` 是参与**依赖闭包**但不进检测结果的文件（已装目录里的 jar）：
+    /// 检查一个待装文件时，它声明的依赖如果已经装在 `mods/` 里，就不该报
+    /// 「缺失」——加载器解析时看的是整个目录，不是这一个 jar。
+    ///
     /// # Errors
     ///
     /// 与 [`Self::inspect_paths`] 相同
     pub async fn inspect_paths_for(
         &self,
         paths: &[PathBuf],
+        allow_upstream: bool,
+        target: Option<&ServerTarget>,
+    ) -> Result<ModAudit, ModInspectServiceError> {
+        self.inspect_with_context(paths, &[], allow_upstream, target)
+            .await
+    }
+
+    /// [`Self::inspect_paths_for`] 的完整形态：额外指定依赖闭包的上下文
+    ///
+    /// # Errors
+    ///
+    /// 与 [`Self::inspect_paths`] 相同
+    pub async fn inspect_with_context(
+        &self,
+        paths: &[PathBuf],
+        context: &[PathBuf],
         allow_upstream: bool,
         target: Option<&ServerTarget>,
     ) -> Result<ModAudit, ModInspectServiceError> {
@@ -238,6 +258,18 @@ impl ModInspectService {
                     audit
                         .unreadable
                         .push((path.display().to_string(), err.to_string()));
+                }
+            }
+        }
+
+        // 上下文文件只贡献 modid，不进结果：读不出来就少一个可满足的依赖，
+        // 与「文件不在」等价，不必单独报告
+        let mut provided: Vec<String> = Vec::new();
+        for path in context {
+            match self.inspector.inspect(path) {
+                Ok(cap) => provided.extend(cap.provided_ids()),
+                Err(err) => {
+                    debug!(path = %path.display(), error = %err, "context mod unreadable");
                 }
             }
         }
@@ -266,11 +298,10 @@ impl ModInspectService {
         // 依赖闭包：先收集包内已有的 modid，再逐个比对
         // 依赖比对应基于「所有 mod 能提供的 modid」，含 provides 别名。
         // 只看 id 会把 balm → balm-fabric 这类别名误报成缺失依赖。
-        let present: Vec<String> = audit
-            .mods
-            .iter()
-            .flat_map(|r| r.capability.provided_ids())
-            .collect();
+        // `context`（已装目录）同样参与闭包：检查待装文件时，它声明的依赖
+        // 已经装在 `mods/` 里就不算缺失。
+        let mut present = provided;
+        present.extend(audit.mods.iter().flat_map(|r| r.capability.provided_ids()));
         // 目标加载器：显式指定优先，否则取这批文件共同支持的唯一加载器
         let loader = target
             .and_then(|t| t.loader)
@@ -620,6 +651,55 @@ mod tests {
             .expect("a");
         assert!(a_report.missing_deps.is_empty());
         assert_eq!(a_report.risk, Risk::Ok);
+    }
+
+    /// 上下文里的文件满足依赖：已装的东西不该被判成缺失
+    ///
+    /// 场景：`mods/` 里已有 `satin`，装一个依赖 `satin` 的 mod。闭包只看
+    /// 检测对象本身的话会误报缺失，用户只能 `--force`。
+    #[tokio::test]
+    async fn context_satisfies_dependencies() {
+        let mut a = cap("/staging/a.jar", "a", SideSupport::Required);
+        a.depends
+            .push(domain::mod_::ModDependency::new("satin", "", true));
+        let satin = cap("/mods/satin.jar", "satin", SideSupport::Required);
+        let svc = ModInspectService::local(Arc::new(FakeInspector(vec![a, satin.clone()])));
+        let audit = svc
+            .inspect_with_context(
+                &[PathBuf::from("/staging/a.jar")],
+                &[PathBuf::from("/mods/satin.jar")],
+                false,
+                None,
+            )
+            .await
+            .expect("audit");
+        // 上下文只贡献 modid，不进结果
+        assert_eq!(audit.mods.len(), 1);
+        assert!(audit.mods[0].missing_deps.is_empty(), "{:?}", audit.mods[0]);
+        assert_eq!(audit.mods[0].risk, Risk::Ok);
+    }
+
+    /// 上下文读不出来等价于「文件不在」：不报错，也不满足依赖
+    #[tokio::test]
+    async fn unreadable_context_does_not_satisfy_dependencies() {
+        let mut a = cap("/staging/a.jar", "a", SideSupport::Required);
+        a.depends
+            .push(domain::mod_::ModDependency::new("satin", "", true));
+        // FakeInspector 里没有 /mods/gone.jar，inspect 会失败
+        let svc = ModInspectService::local(Arc::new(FakeInspector(vec![a])));
+        let audit = svc
+            .inspect_with_context(
+                &[PathBuf::from("/staging/a.jar")],
+                &[PathBuf::from("/mods/gone.jar")],
+                false,
+                None,
+            )
+            .await
+            .expect("audit");
+        assert_eq!(audit.mods.len(), 1);
+        assert_eq!(audit.mods[0].missing_deps, vec!["satin"]);
+        assert_eq!(audit.mods[0].risk, Risk::Blocking);
+        assert!(audit.unreadable.is_empty(), "上下文的坏文件不进结果");
     }
 
     #[tokio::test]
