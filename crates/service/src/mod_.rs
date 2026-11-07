@@ -35,7 +35,7 @@ use domain::server::content::{
     ContentCandidate, ContentIdentity, ContentKind, ContentRequest, UpdateDecision, decide_update,
 };
 use domain::server::version::ServerVariant;
-use port::content::{ContentQuery, ContentSearch, safe_filename};
+use port::content::{ContentProject, ContentQuery, ContentSearch, safe_filename};
 use port::mod_::ModInspector;
 use port::{Backend, CancellationToken, ErrorCategory, ProgressSink};
 use std::collections::HashMap;
@@ -955,7 +955,11 @@ impl ModService {
                     ),
                 )
                 .await?;
-            if let Some(hit) = found.hits.into_iter().find(|hit| !hit.client_only) {
+            if let Some(hit) = found
+                .hits
+                .into_iter()
+                .find(|hit| !hit.client_only && provider_hit_matches(hit, &term))
+            {
                 return Ok(Some(hit.id));
             }
         }
@@ -1435,6 +1439,18 @@ fn provider_search_terms(modid: &str) -> Vec<String> {
     terms
 }
 
+/// 命中项目与检索词的相关性校验
+///
+/// 上游检索按相关度排序，但缺依赖 modid 往往命中同名无关项目——实测
+/// 反例：缺 `cupboard` 时第一个可用命中是 `aesthetic-storage`（Modrinth
+/// 上搜不到那个库本体），照单全收就会给用户装进毫不相干的 mod。
+/// 要求 slug / id / 标题至少之一包含检索词，包含不上的一律不猜。
+fn provider_hit_matches(hit: &ContentProject, term: &str) -> bool {
+    let term = term.to_ascii_lowercase();
+    let contains = |text: &str| text.to_ascii_lowercase().contains(&term);
+    hit.slug.as_deref().is_some_and(contains) || contains(&hit.id) || contains(&hit.title)
+}
+
 /// 换名更新后删掉旧文件
 ///
 /// 只在路径不同时动手：同名替换由 [`crate::atomic::replace_file`] 自己处理掉了。
@@ -1618,6 +1634,40 @@ mod tests {
         );
         // 全是数字的 modid 不剥（剥完就空了）
         assert_eq!(provider_search_terms("42"), vec!["42".to_owned()]);
+    }
+
+    /// 命中项目必须与检索词相关：slug/id/标题都不含词的照单不收
+    #[test]
+    fn provider_hit_requires_name_relevance() {
+        let hit = |id: &str, title: &str| ContentProject {
+            id: id.to_owned(),
+            slug: Some(id.to_owned()),
+            title: title.to_owned(),
+            description: String::new(),
+            kind: ContentKind::Mod,
+            also_kinds: Vec::new(),
+            loaders: Vec::new(),
+            game_versions: Vec::new(),
+            author: None,
+            downloads: 0,
+            icon_url: None,
+            client_only: false,
+        };
+        // cupboard 搜出的无关项目不收（实测反例）
+        assert!(!provider_hit_matches(
+            &hit("aesthetic-storage", "Aesthetic Storage"),
+            "cupboard"
+        ));
+        // slug 含词的收（geckolib 现场）
+        assert!(provider_hit_matches(
+            &hit("geckolib", "GeckoLib"),
+            "geckolib"
+        ));
+        // 去尾词命中：geckolib 含 geckolib（搜 geckolib3 去尾后的词）
+        assert!(provider_hit_matches(
+            &hit("geckolib", "GeckoLib"),
+            "geckolib"
+        ));
     }
 
     /// 记录的 Java 优先；没有记录时按 MC 版本推算，与启动判定同源
