@@ -24,6 +24,7 @@
 //!
 //! `downloads.primary.sha256` 内嵌在响应里，可强校验（比 Purpur 强）。
 
+use crate::calendar::{ReleaseCalendar, fetch_or_empty};
 use crate::http::{build_client, get_json};
 use crate::shared::{
     Downloads, VersionIntent, normalize_base, parse_https_url, parse_sha256_hex,
@@ -191,12 +192,13 @@ impl ServerJarSource for LeafSource {
     }
 
     async fn versions(&self) -> Result<Vec<ServerVersion>, SourceError> {
-        Ok(self
-            .project()
-            .await?
-            .versions
+        let versions = self.project().await?.versions;
+        // Leaf 的版本数组「旧在前」，且不含发布时间；时间统一取 Mojang 清单，
+        // 顺序交给领域层判定
+        let calendar = fetch_or_empty(&self.http).await;
+        Ok(versions
             .into_iter()
-            .map(into_server_version)
+            .map(|id| into_server_version(id, &calendar))
             .collect())
     }
 
@@ -234,13 +236,15 @@ fn select_build(builds: &[Build], version: &str) -> Result<Build, SourceError> {
 /// 版本号 → 领域版本
 ///
 /// Leaf 只覆盖正式 MC 版本，统一标 `Release`；Java 大版本由原版元数据给出。
-fn into_server_version(id: String) -> ServerVersion {
+/// 发布时间取自 `Mojang` 清单（[`ReleaseCalendar`]）。
+fn into_server_version(id: String, calendar: &ReleaseCalendar) -> ServerVersion {
+    let released = calendar.released(&id).map(str::to_owned);
     ServerVersion {
         id: VersionId::new(id),
         kind: VersionKind::Release,
         variant: ServerVariant::Leaf,
         java_major: None,
-        released: None,
+        released,
     }
 }
 
@@ -383,14 +387,41 @@ mod tests {
 
     #[test]
     fn version_list_marks_leaf_release() {
+        let calendar = ReleaseCalendar::default();
         let mapped: Vec<_> = project()
             .versions
             .into_iter()
-            .map(into_server_version)
+            .map(|id| into_server_version(id, &calendar))
             .collect();
         assert!(mapped.iter().all(|v| v.variant == ServerVariant::Leaf));
         assert!(mapped.iter().all(|v| v.kind == VersionKind::Release));
         assert!(mapped.iter().any(|v| v.id.as_str() == "1.21.11"));
+    }
+
+    /// 发布时间从 Mojang 清单补齐：Leaf 的版本数组本身不含时间
+    #[test]
+    fn version_list_carries_release_time_from_calendar() {
+        let manifest: crate::mojang::manifest::VersionManifest =
+            serde_json::from_str(include_str!("../../tests/fixtures/version_manifest.json"))
+                .expect("version_manifest fixture");
+        let calendar = ReleaseCalendar::from_manifest(manifest);
+
+        let mapped: Vec<_> = project()
+            .versions
+            .into_iter()
+            .map(|id| into_server_version(id, &calendar))
+            .collect();
+        let by_id = |id: &str| {
+            mapped
+                .iter()
+                .find(|v| v.id.as_str() == id)
+                .expect("fixture 里有该版本")
+        };
+        assert_eq!(
+            by_id("26.3").released.as_deref(),
+            Some("2026-09-01T00:00:00+00:00")
+        );
+        assert_eq!(by_id("1.21.11").released, None, "清单没有的版本保持 None");
     }
 
     /// `latest` 取版本列表末项

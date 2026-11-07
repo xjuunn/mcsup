@@ -35,6 +35,7 @@
 //! `spongeforge` / `spongeneo` 是模组形态（要配合 `Forge` / `NeoForge`），
 //! 启动方式不同，本来源只负责 `spongevanilla`。
 
+use crate::calendar::{ReleaseCalendar, fetch_or_empty};
 use crate::http::{build_client, get_text};
 use crate::shared::{Downloads, normalize_base, parse_https_url, parse_sha1_sidecar};
 use async_trait::async_trait;
@@ -157,12 +158,13 @@ impl ServerJarSource for SpongeSource {
     }
 
     async fn versions(&self) -> Result<Vec<ServerVersion>, SourceError> {
-        Ok(self
-            .metadata()
-            .await?
-            .versions
+        let versions = self.metadata().await?.versions;
+        // Maven 元数据不保证顺序，也不含发布时间；时间按版本串里的 MC 段取
+        // Mojang 清单（同一个 MC 的多个 Sponge 实现共享同一发布时间）
+        let calendar = fetch_or_empty(&self.http).await;
+        Ok(versions
             .into_iter()
-            .map(into_server_version)
+            .map(|version| into_server_version(version, &calendar))
             .collect())
     }
 
@@ -181,18 +183,23 @@ impl ServerJarSource for SpongeSource {
 /// `26.3-21.0.0-RC2755` 这类带 `RC` / `beta` 的串标 [`VersionKind::Snapshot`]，
 /// 其余（`1.21.1-14.0.0`、`26.3-21.0.0`）标 [`VersionKind::Release`]。
 /// 判定只看 Sponge 实现版本段的后缀——MC 版本段本身不会是预发布名。
-fn into_server_version(version: String) -> ServerVersion {
+///
+/// 发布时间取自 `Mojang` 清单（[`ReleaseCalendar`]），键取版本串的 MC 段：
+/// 同一个 MC 版本的多个 Sponge 实现共享同一发布时间，这正是「按发布时间排序」
+/// 想要的口径。
+fn into_server_version(version: String, calendar: &ReleaseCalendar) -> ServerVersion {
     let kind = if is_prerelease(&version) {
         VersionKind::Snapshot
     } else {
         VersionKind::Release
     };
+    let released = calendar.released(mc_of(&version)).map(str::to_owned);
     ServerVersion {
         id: VersionId::new(version),
         kind,
         variant: ServerVariant::SpongeVanilla,
         java_major: None,
-        released: None,
+        released,
     }
 }
 
@@ -317,10 +324,11 @@ mod tests {
     /// 版本列表：预发布 → Snapshot，其余 → Release
     #[test]
     fn version_list_maps_prerelease_to_snapshot() {
+        let calendar = ReleaseCalendar::default();
         let mapped: Vec<_> = Metadata::parse(FIXTURE)
             .versions
             .into_iter()
-            .map(into_server_version)
+            .map(|version| into_server_version(version, &calendar))
             .collect();
         assert!(
             mapped
@@ -330,6 +338,25 @@ mod tests {
         // fixture 全是 RC：都应标 Snapshot
         assert!(mapped.iter().all(|v| v.kind == VersionKind::Snapshot));
         assert!(mapped.iter().any(|v| v.id.as_str() == "26.3-21.0.0-RC2755"));
+    }
+
+    /// 发布时间按版本串的 MC 段取：同一 MC 的多个 Sponge 实现共享时间
+    #[test]
+    fn version_list_carries_release_time_from_mc_segment() {
+        let manifest: crate::mojang::manifest::VersionManifest =
+            serde_json::from_str(include_str!("../../tests/fixtures/version_manifest.json"))
+                .expect("version_manifest fixture");
+        let calendar = ReleaseCalendar::from_manifest(manifest);
+        let mapped = into_server_version("26.3-21.0.0-RC2755".to_owned(), &calendar);
+        assert_eq!(
+            mapped.released.as_deref(),
+            Some("2026-09-01T00:00:00+00:00"),
+            "时间取自 MC 段 `26.3`，不是整串版本号"
+        );
+
+        // MC 段不在清单里时不猜时间
+        let unknown = into_server_version("1.5.2-1.0.0".to_owned(), &calendar);
+        assert_eq!(unknown.released, None);
     }
 
     /// MC 版本轴：第一个 `-` 之前

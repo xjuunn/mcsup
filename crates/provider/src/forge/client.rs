@@ -27,6 +27,7 @@
 //! - `.sha1` 侧车是纯 40 位十六进制，无换行依赖，直接可用。
 //! - `maven-metadata.json` 的 build 数组「旧在前」，**末项最新**。
 
+use crate::calendar::{ReleaseCalendar, fetch_or_empty};
 use crate::http::{build_client, get_json, get_text};
 use async_trait::async_trait;
 use domain::server::{
@@ -243,9 +244,12 @@ impl ServerJarSource for ForgeSource {
 
     async fn versions(&self) -> Result<Vec<ServerVersion>, SourceError> {
         let metadata = self.metadata().await?;
+        // Maven 元数据是 MC 版本 → build 串的映射，不含发布时间；时间统一取
+        // Mojang 清单，让 Forge 的版本列表与其他变体同一口径
+        let calendar = fetch_or_empty(&self.http).await;
         Ok(metadata
             .into_iter()
-            .filter_map(|(mc, builds)| into_server_version(mc, &builds))
+            .filter_map(|(mc, builds)| into_server_version(mc, &builds, &calendar))
             .collect())
     }
 
@@ -332,17 +336,22 @@ fn select_build(mc: &str, metadata: &MavenMetadata, promoted: Option<&str>) -> O
 ///
 /// `Forge` 只覆盖正式 MC 版本，统一标为 `Release`；没有任何 build 的 MC 版本
 /// 返回 `None`（下载必然失败，不该出现在版本列表里）。Java 大版本由原版元数据
-/// 给出，这里不做猜测。
-fn into_server_version(mc: String, builds: &[String]) -> Option<ServerVersion> {
+/// 给出，这里不做猜测。发布时间取自 `Mojang` 清单（[`ReleaseCalendar`]）。
+fn into_server_version(
+    mc: String,
+    builds: &[String],
+    calendar: &ReleaseCalendar,
+) -> Option<ServerVersion> {
     if builds.is_empty() {
         return None;
     }
+    let released = calendar.released(&mc).map(str::to_owned);
     Some(ServerVersion {
         id: VersionId::new(mc),
         kind: VersionKind::Release,
         variant: ServerVariant::Forge,
         java_major: None,
-        released: None,
+        released,
     })
 }
 
@@ -480,9 +489,10 @@ mod tests {
     /// 版本列表全部标为 forge 变体与正式版，不带 Java 要求
     #[test]
     fn version_list_marks_variant_release_and_no_java() {
+        let calendar = ReleaseCalendar::default();
         let mapped: Vec<_> = metadata()
             .into_iter()
-            .filter_map(|(mc, builds)| into_server_version(mc, &builds))
+            .filter_map(|(mc, builds)| into_server_version(mc, &builds, &calendar))
             .collect();
         assert!(mapped.iter().all(|v| v.variant == ServerVariant::Forge));
         assert!(mapped.iter().all(|v| v.kind == VersionKind::Release));
@@ -490,11 +500,45 @@ mod tests {
         assert!(mapped.iter().any(|v| v.id.as_str() == "1.21.1"));
     }
 
+    /// 发布时间从 Mojang 清单补齐：Forge 的 Maven 元数据本身不含时间
+    #[test]
+    fn version_list_carries_release_time_from_calendar() {
+        let manifest: crate::mojang::manifest::VersionManifest =
+            serde_json::from_str(include_str!("../../tests/fixtures/version_manifest.json"))
+                .expect("version_manifest fixture");
+        let calendar = ReleaseCalendar::from_manifest(manifest);
+
+        let mapped: Vec<_> = metadata()
+            .into_iter()
+            .filter_map(|(mc, builds)| into_server_version(mc, &builds, &calendar))
+            .collect();
+        let by_id = |id: &str| {
+            mapped
+                .iter()
+                .find(|v| v.id.as_str() == id)
+                .expect("fixture 里有该版本")
+        };
+        assert_eq!(
+            by_id("1.21.1").released.as_deref(),
+            Some("2024-08-08T00:00:00+00:00")
+        );
+        // fixture 里清单没有的版本保持 None
+        assert_eq!(by_id("1.20.1").released, None);
+    }
+
     /// 无 build 的 MC 版本不进入版本列表
     #[test]
     fn empty_build_list_is_skipped() {
-        assert!(into_server_version("1.21.1".to_owned(), &[]).is_none());
-        assert!(into_server_version("1.21.1".to_owned(), &["1.21.1-52.0.1".to_owned()]).is_some());
+        let calendar = ReleaseCalendar::default();
+        assert!(into_server_version("1.21.1".to_owned(), &[], &calendar).is_none());
+        assert!(
+            into_server_version(
+                "1.21.1".to_owned(),
+                &["1.21.1-52.0.1".to_owned()],
+                &calendar
+            )
+            .is_some()
+        );
     }
 
     /// `latest` 取数值最新的 MC 版本（Forge 无快照档）

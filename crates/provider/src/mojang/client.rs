@@ -12,8 +12,8 @@ use url::Url;
 
 use super::manifest::{VersionDetails, VersionKind, VersionManifest, VersionManifestItem};
 
-/// 版本清单地址
-const MANIFEST_URL: &str = "https://piston-meta.mojang.com/mc/game/version_manifest.json";
+/// 版本清单地址（与 [`crate::calendar::MANIFEST_URL`] 同源）
+const MANIFEST_URL: &str = crate::calendar::MANIFEST_URL;
 
 /// Mojang 官方服务端来源
 #[derive(Debug)]
