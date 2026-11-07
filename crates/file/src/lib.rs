@@ -7,6 +7,7 @@ pub use inspect::FileCoreInspector;
 
 use async_trait::async_trait;
 use domain::server::artifact::ChecksumAlgorithm;
+use futures::{StreamExt, stream};
 use port::{
     ArtifactDownloader, ByteSource, CancellationToken, DownloadError, DownloadRequest,
     DownloadedArtifact, ProgressSink, RangeSource, RemoteStat, SourceError,
@@ -35,7 +36,52 @@ const SEGMENT_MAX_ATTEMPTS: u32 = 3;
 const SEGMENT_RETRY_DELAY: Duration = Duration::from_millis(250);
 /// 取消标志的轮询粒度
 const CANCEL_POLL: Duration = Duration::from_millis(25);
+/// 批量下载未指定并发时的默认值
+///
+/// 与单文件内分段并发（[`SEGMENT_CONCURRENCY`]）是两层：批量并行让多个小文件
+/// 同时在途，分段并行让单个大文件跑满一条链路。两者按场景各自生效，不叠加。
+const BATCH_CONCURRENCY: usize = 8;
+/// 文件级重试的最多尝试次数（含首次）
+///
+/// 清单类批量下载动辄数百个请求，瞬态 5xx / 连接重置必然出现；整批因此报废
+/// 重来代价极高，值得给每个文件几次机会
+const FILE_MAX_ATTEMPTS: u32 = 3;
+/// 文件级重试退避基数（随尝试次数线性放大）
+const FILE_RETRY_DELAY: Duration = Duration::from_millis(200);
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// 批量下载里的单文件进度换算
+///
+/// 每个文件独立的 `download` 回调报的是「本文件从 0 开始已传字节」，直接透传
+/// 到批量进度条就是反复归零。本结构把它换算成**整批累计值**：
+///
+/// - `accounted` 记录本文件本轮尝试已计入的增量，用来算 delta，避免同一批字节
+///   被重复累加（透传绝对值会重复计数：并发时 A 文件完成一跳，B 文件仍按旧基数
+///   上报，总量立刻虚高）
+/// - 重试作废上一轮时，调用方按 `accounted` 精确退还，不让作废的字节留在总数里
+struct BatchSink<'a> {
+    /// 整批已完成字节（所有文件共享）
+    done: Arc<AtomicU64>,
+    /// 本文件本轮尝试已计入的字节
+    accounted: Arc<AtomicU64>,
+    /// 整批声明总字节
+    total: Option<u64>,
+    /// 上层 sink
+    upstream: &'a dyn ProgressSink,
+}
+
+impl ProgressSink for BatchSink<'_> {
+    fn on_progress(&self, transferred: u64, _total: Option<u64>) {
+        // 分段任务并发写同一个计数器，可能出现回退观测；饱和减法保证不为负
+        let previous = self.accounted.swap(transferred, Ordering::Relaxed);
+        let delta = transferred.saturating_sub(previous);
+        if delta == 0 {
+            return;
+        }
+        let done = self.done.fetch_add(delta, Ordering::Relaxed) + delta;
+        self.upstream.on_progress(done, self.total);
+    }
+}
 
 /// 取消可打断的网络等待
 ///
@@ -378,6 +424,112 @@ impl ArtifactDownloader for FileDownloader {
             path: destination,
             size,
         })
+    }
+
+    /// 批量下载：有界并发 + 整批进度 + 单文件瞬态重试
+    ///
+    /// 三件事叠加起来才谈得上「快」：
+    ///
+    /// 1. **并发**：批量里的文件彼此独立，串行时链路大部分时间在等首字节；
+    ///    有界并发让多个文件的重叠等待段并起来，聚合吞吐成倍提升
+    /// 2. **整批进度**：[`BatchSink`] 把每个文件的从零进度换算成整批累计值，
+    ///    进度条一条线走到底，不再被单个文件的完成反复归零
+    /// 3. **瞬态重试**：批量动辄数百请求，偶发 5xx / 连接重置不该毁掉整批；
+    ///    只对 [`DownloadError::retryable`] 的失败重试，校验失败与取消不重试
+    ///
+    /// 结果顺序与入参一致，某个文件彻底失败不影响其余文件继续下载。
+    async fn download_many(
+        &self,
+        requests: &[DownloadRequest],
+        concurrency: usize,
+        progress: Option<&dyn ProgressSink>,
+        cancel: &CancellationToken,
+    ) -> Vec<Result<DownloadedArtifact, DownloadError>> {
+        let total: u64 = requests.iter().filter_map(|r| r.expected_size).sum();
+        let all_known = requests.iter().all(|r| r.expected_size.is_some());
+        let total = all_known.then_some(total);
+        let done = Arc::new(AtomicU64::new(0));
+        if let Some(sink) = progress {
+            sink.on_progress(0, total);
+        }
+        // 并发为 0 时取默认值：调用方只想「并行」而不关心具体路数
+        let concurrency = if concurrency == 0 {
+            BATCH_CONCURRENCY
+        } else {
+            concurrency
+        }
+        .min(requests.len().max(1));
+
+        // 先把每个文件的 future 实体化到 Vec，再交给 stream：
+        // 直接在 `stream::iter(iter.map(..))` 里构造会让闭包绑定到某一个具体
+        // 生命周期，`buffer_unordered` 要求它对任意生命周期成立，编译器会报
+        // 「FnOnce is not general enough」。收集到 Vec 后生命周期在构建时即固定。
+        let pending: Vec<_> = requests
+            .iter()
+            .enumerate()
+            .map(|(index, request)| {
+                let done = Arc::clone(&done);
+                async move {
+                    let outcome = self
+                        .download_with_retry(request, &done, total, progress, cancel)
+                        .await;
+                    (index, outcome)
+                }
+            })
+            .collect();
+
+        let mut outcomes: Vec<(usize, Result<DownloadedArtifact, DownloadError>)> =
+            stream::iter(pending)
+                .buffer_unordered(concurrency)
+                .collect()
+                .await;
+
+        // 并发完成顺序是乱的，按入参下标归位，保证结果与调用方预期一一对应
+        outcomes.sort_by_key(|(index, _)| *index);
+        outcomes.into_iter().map(|(_, outcome)| outcome).collect()
+    }
+}
+
+impl FileDownloader {
+    /// 带瞬态重试的单文件下载
+    ///
+    /// 重试时把上一轮尝试已计入 `done` 的字节精确退还：作废的传输不该留在进度
+    /// 总数里，否则进度条会虚高甚至在重传后越过 100%。
+    async fn download_with_retry(
+        &self,
+        request: &DownloadRequest,
+        done: &Arc<AtomicU64>,
+        total: Option<u64>,
+        progress: Option<&dyn ProgressSink>,
+        cancel: &CancellationToken,
+    ) -> Result<DownloadedArtifact, DownloadError> {
+        let mut attempt = 1_u32;
+        loop {
+            // 每轮尝试重新计数：上一轮的增量已在失败分支退还
+            let accounted = Arc::new(AtomicU64::new(0));
+            let batch = progress.map(|upstream| BatchSink {
+                done: Arc::clone(done),
+                accounted: Arc::clone(&accounted),
+                total,
+                upstream,
+            });
+            let sink = batch.as_ref().map(|sink| sink as &dyn ProgressSink);
+            match self.download(request, sink, cancel).await {
+                Ok(artifact) => return Ok(artifact),
+                Err(err)
+                    if err.retryable() && attempt < FILE_MAX_ATTEMPTS && !cancel.is_cancelled() =>
+                {
+                    // 退还本轮已计入的增量：这些字节随失败作废，重传时会重新计入
+                    let refund = accounted.load(Ordering::Relaxed);
+                    if refund > 0 {
+                        done.fetch_sub(refund, Ordering::Relaxed);
+                    }
+                    tokio::time::sleep(FILE_RETRY_DELAY * attempt).await;
+                    attempt += 1;
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
 }
 
@@ -1127,6 +1279,137 @@ mod tests {
 
         assert!(matches!(result, Err(DownloadError::Cancelled)));
         assert!(!destination.exists());
+        Ok(())
+    }
+
+    /// 记录收到的每个进度样本
+    struct RecordingSink {
+        samples: std::sync::Mutex<Vec<(u64, Option<u64>)>>,
+    }
+
+    impl RecordingSink {
+        fn new() -> Self {
+            Self {
+                samples: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn samples(&self) -> Vec<(u64, Option<u64>)> {
+            self.samples.lock().expect("samples").clone()
+        }
+    }
+
+    impl ProgressSink for RecordingSink {
+        fn on_progress(&self, transferred: u64, total: Option<u64>) {
+            self.samples
+                .lock()
+                .expect("samples")
+                .push((transferred, total));
+        }
+    }
+
+    fn batch_request(dir: &Path, name: &str, payload: &[u8]) -> DownloadRequest {
+        DownloadRequest {
+            location: format!("https://example.com/{name}").parse().expect("url"),
+            destination: dir.join(name),
+            expected: Some(Checksum::new(ChecksumAlgorithm::Sha1, sha1_hex(payload))),
+            expected_size: Some(payload.len() as u64),
+        }
+    }
+
+    /// 批量下载：全部落盘、结果顺序与入参一致、进度是整批口径且单调
+    #[tokio::test]
+    async fn download_many_reports_batch_level_monotonic_progress() -> Result<(), Box<dyn Error>> {
+        let dir = tempdir()?;
+        let payload = b"chunk-of-mod";
+        let requests: Vec<DownloadRequest> = (0..6)
+            .map(|index| batch_request(dir.path(), &format!("m{index}.jar"), payload))
+            .collect();
+        let sink = RecordingSink::new();
+
+        let downloader = FileDownloader::new(fake_source(&[payload]));
+        let outcomes = downloader
+            .download_many(&requests, 4, Some(&sink), &CancellationToken::new())
+            .await;
+
+        assert_eq!(outcomes.len(), requests.len());
+        for (index, outcome) in outcomes.iter().enumerate() {
+            let artifact = outcome.as_ref().map_err(|err| format!("{err:?}"))?;
+            // 顺序必须与入参一一对应：第 index 项落在第 index 个路径
+            assert_eq!(artifact.path, requests[index].destination);
+            assert!(requests[index].destination.is_file(), "m{index} 未落盘");
+        }
+
+        let expected_total = payload.len() as u64 * requests.len() as u64;
+        let samples = sink.samples();
+        // 每个样本的 total 都是整批字节总和
+        assert!(
+            samples
+                .iter()
+                .all(|(_, total)| *total == Some(expected_total)),
+            "total 必须是整批字节：{samples:?}"
+        );
+        // 单调不回退，且最终到达整批总量
+        let mut last = 0;
+        for (done, _) in &samples {
+            assert!(*done >= last, "进度回退：{samples:?}");
+            last = *done;
+        }
+        assert_eq!(
+            samples.last().map(|(done, _)| *done),
+            Some(expected_total),
+            "最终样本必须到达整批总量：{samples:?}"
+        );
+        Ok(())
+    }
+
+    /// 批量下载：单个文件失败不拖垮整批，失败项留在原位置
+    #[tokio::test]
+    async fn download_many_keeps_going_after_one_failure() -> Result<(), Box<dyn Error>> {
+        let dir = tempdir()?;
+        let payload = b"ok";
+        let mut requests: Vec<DownloadRequest> = (0..3)
+            .map(|index| batch_request(dir.path(), &format!("m{index}.jar"), payload))
+            .collect();
+        // 中间那个声明了错误的哈希，必然校验失败
+        requests[1].expected = Some(Checksum::new(ChecksumAlgorithm::Sha1, "00".repeat(20)));
+
+        let downloader = FileDownloader::new(fake_source(&[payload]));
+        let outcomes = downloader
+            .download_many(&requests, 2, None, &CancellationToken::new())
+            .await;
+
+        assert_eq!(outcomes.len(), 3);
+        assert!(outcomes[0].is_ok(), "{:?}", outcomes[0]);
+        assert!(
+            matches!(outcomes[1], Err(DownloadError::ChecksumMismatch { .. })),
+            "{:?}",
+            outcomes[1]
+        );
+        assert!(outcomes[2].is_ok(), "{:?}", outcomes[2]);
+        assert!(requests[0].destination.is_file());
+        assert!(requests[2].destination.is_file());
+        // 校验失败不应留下半成品
+        assert!(!requests[1].destination.exists());
+        Ok(())
+    }
+
+    /// 批量下载：并发度 0 取默认值，空批次不 panic
+    #[tokio::test]
+    async fn download_many_handles_empty_and_zero_concurrency() -> Result<(), Box<dyn Error>> {
+        let downloader = FileDownloader::new(fake_source(&[b"x"]));
+        let empty = downloader
+            .download_many(&[], 0, None, &CancellationToken::new())
+            .await;
+        assert!(empty.is_empty());
+
+        let dir = tempdir()?;
+        let requests = vec![batch_request(dir.path(), "one.jar", b"x")];
+        let outcomes = downloader
+            .download_many(&requests, 0, None, &CancellationToken::new())
+            .await;
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].is_ok());
         Ok(())
     }
 }

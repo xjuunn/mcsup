@@ -10,7 +10,6 @@ publish = false
 async-trait.workspace = true
 dirs.workspace = true
 domain = { version = "0.1.0", path = "../domain" }
-futures = { version = "0.3.31", default-features = false, features = ["std"] }
 port = { version = "0.1.0", path = "../port" }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

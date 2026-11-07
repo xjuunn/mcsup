@@ -14,6 +14,16 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// 流式响应两次可读之间的最大间隔
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// 每个 host 保留的空闲连接数
+///
+/// 要覆盖两层并发：批量下载的文件级并发（8）与单文件内的分片并发（24）。
+/// 取 32 让两层都能命中已建立的连接，又不会无节制占用文件句柄。
+const IDLE_CONNECTIONS_PER_HOST: usize = 32;
+/// 空闲连接保留时长
+///
+/// 批量下载的文件是一个接一个取走的，间隔通常是毫秒级；留 90 秒足够跨过
+/// 短暂的排队与重试退避，又不至于长期占着不放。
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const USER_AGENT: &str = concat!("mcsup/", env!("CARGO_PKG_VERSION"));
 
 /// 安装 rustls 的 ring crypto provider（进程内一次）
@@ -41,6 +51,12 @@ pub(crate) fn build_client() -> Result<Client, SourceError> {
 }
 
 /// 大文件客户端
+///
+/// 空闲连接池按**并发下载路数**留足：reqwest 默认每个 host 只留 1 条空闲连接，
+/// 批量下载（整合包清单动辄上百个文件、并发 8 路，单文件内还有分段并发）会
+/// 反复丢弃并重建连接，每次都交一次 TCP + TLS 握手的钱。池子留够之后，同一
+/// CDN host 的连接被复用，握手成本摊薄到接近零——大整合包的下载时间差别相当
+/// 明显。
 pub(crate) fn build_stream_client() -> Result<Client, SourceError> {
     install_crypto_provider();
     Client::builder()
@@ -48,6 +64,8 @@ pub(crate) fn build_stream_client() -> Result<Client, SourceError> {
         .read_timeout(READ_TIMEOUT)
         .user_agent(USER_AGENT)
         .http1_only()
+        .pool_max_idle_per_host(IDLE_CONNECTIONS_PER_HOST)
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
         .build()
         .map_err(|e| SourceError::Init(Box::new(e)))
 }
