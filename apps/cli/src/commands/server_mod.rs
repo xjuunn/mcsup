@@ -571,12 +571,14 @@ fn report_fix_applied(applied: &mcsup::service::ModFixApplied, printer: Printer)
             &(),
         )?;
     }
-    for project in &applied.refused {
+    for item in &applied.refused {
+        let project = &item.project_id;
+        let reason = &item.reason;
         printer.print_outcome(
             &pick(
                 lang,
-                format!("补装 {project} 被安装检查拒绝，需人工处置"),
-                format!("installing {project} was refused by the install check"),
+                format!("补装 {project} 未完成：{reason}"),
+                format!("installing {project} did not complete: {reason}"),
             ),
             &(),
         )?;
