@@ -37,6 +37,7 @@
 //! - `GET {meta}/v3/versions/game` → `[{"version":"26.3","stable":true}]`，新在前。
 //! - 两处都**无**分页参数；不存在的路径返回 `404`。
 
+use crate::calendar::{ReleaseCalendar, fetch_or_empty};
 use crate::http::{build_client, get_json};
 use crate::shared::{
     Downloads, VersionIntent, normalize_base, parse_https_url, pick_by_version_aliases,
@@ -193,11 +194,13 @@ impl ServerJarSource for QuiltSource {
     }
 
     async fn versions(&self) -> Result<Vec<ServerVersion>, SourceError> {
-        Ok(self
-            .games()
-            .await?
+        let games = self.games().await?;
+        // Quilt Meta 与 Fabric 同形：只有 `stable` 标记，没有发布时间。
+        // 时间统一取 Mojang 清单，否则拆不出数字的快照名会被排到列表末尾
+        let calendar = fetch_or_empty(&self.http).await;
+        Ok(games
             .into_iter()
-            .map(into_server_version)
+            .map(|game| into_server_version(game, &calendar))
             .collect())
     }
 
@@ -232,7 +235,9 @@ fn select_loader(loaders: &[LoaderVersion]) -> Option<String> {
 /// MC 版本 → 领域版本
 ///
 /// `stable` 映射为 [`VersionKind::Release`]，否则 [`VersionKind::Snapshot`]。
-fn into_server_version(game: GameVersion) -> ServerVersion {
+/// 发布时间取自 `Mojang` 清单（[`ReleaseCalendar`]），清单里没有的保持 `None`。
+fn into_server_version(game: GameVersion, calendar: &ReleaseCalendar) -> ServerVersion {
+    let released = calendar.released(&game.version).map(str::to_owned);
     ServerVersion {
         id: VersionId::new(game.version),
         kind: if game.stable {
@@ -242,7 +247,7 @@ fn into_server_version(game: GameVersion) -> ServerVersion {
         },
         variant: ServerVariant::Quilt,
         java_major: None,
-        released: None,
+        released,
     }
 }
 
@@ -401,7 +406,10 @@ mod tests {
     /// 版本列表：stable → Release，其余 → Snapshot
     #[test]
     fn version_list_maps_stable_flag_to_kind() {
-        let mapped: Vec<_> = games().into_iter().map(into_server_version).collect();
+        let mapped: Vec<_> = games()
+            .into_iter()
+            .map(|game| into_server_version(game, &ReleaseCalendar::default()))
+            .collect();
         assert!(mapped.iter().all(|v| v.variant == ServerVariant::Quilt));
         let stable = mapped
             .iter()

@@ -27,6 +27,7 @@
 //! 决定。本来源只给端点地址，不拼 `purpur-{v}-{b}.jar`——上游改命名时拼出来的
 //! 地址就 404 了。
 
+use crate::calendar::{ReleaseCalendar, fetch_or_empty};
 use crate::http::{build_client, get_json};
 use crate::shared::{
     Downloads, VersionIntent, normalize_base, parse_https_url, pick_by_version_aliases,
@@ -196,12 +197,13 @@ impl ServerJarSource for PurpurSource {
     }
 
     async fn versions(&self) -> Result<Vec<ServerVersion>, SourceError> {
-        Ok(self
-            .index()
-            .await?
-            .versions
+        let versions = self.index().await?.versions;
+        // Purpur 的版本数组「旧在前」，且不含发布时间；时间统一取 Mojang 清单，
+        // 顺序交给领域层判定
+        let calendar = fetch_or_empty(&self.http).await;
+        Ok(versions
             .into_iter()
-            .map(into_server_version)
+            .map(|id| into_server_version(id, &calendar))
             .collect())
     }
 
@@ -230,13 +232,15 @@ fn is_valid_build(build: &str) -> bool {
 /// 版本号 → 领域版本
 ///
 /// Purpur 只覆盖正式 MC 版本，统一标 `Release`；Java 大版本由原版元数据给出。
-fn into_server_version(id: String) -> ServerVersion {
+/// 发布时间取自 `Mojang` 清单（[`ReleaseCalendar`]）。
+fn into_server_version(id: String, calendar: &ReleaseCalendar) -> ServerVersion {
+    let released = calendar.released(&id).map(str::to_owned);
     ServerVersion {
         id: VersionId::new(id),
         kind: VersionKind::Release,
         variant: ServerVariant::Purpur,
         java_major: None,
-        released: None,
+        released,
     }
 }
 
@@ -349,15 +353,42 @@ mod tests {
 
     #[test]
     fn version_list_marks_purpur_release() {
+        let calendar = ReleaseCalendar::default();
         let mapped: Vec<_> = index()
             .versions
             .into_iter()
-            .map(into_server_version)
+            .map(|id| into_server_version(id, &calendar))
             .collect();
         assert!(mapped.iter().all(|v| v.variant == ServerVariant::Purpur));
         assert!(mapped.iter().all(|v| v.kind == VersionKind::Release));
         assert!(mapped.iter().all(|v| v.java_major.is_none()));
         assert!(mapped.iter().any(|v| v.id.as_str() == "1.21.1"));
+    }
+
+    /// 发布时间从 Mojang 清单补齐：Purpur 的版本数组本身不含时间
+    #[test]
+    fn version_list_carries_release_time_from_calendar() {
+        let manifest: crate::mojang::manifest::VersionManifest =
+            serde_json::from_str(include_str!("../../tests/fixtures/version_manifest.json"))
+                .expect("version_manifest fixture");
+        let calendar = ReleaseCalendar::from_manifest(manifest);
+
+        let mapped: Vec<_> = index()
+            .versions
+            .into_iter()
+            .map(|id| into_server_version(id, &calendar))
+            .collect();
+        let by_id = |id: &str| {
+            mapped
+                .iter()
+                .find(|v| v.id.as_str() == id)
+                .expect("fixture 里有该版本")
+        };
+        assert_eq!(
+            by_id("1.21.1").released.as_deref(),
+            Some("2024-08-08T00:00:00+00:00")
+        );
+        assert_eq!(by_id("1.20.1").released, None, "清单没有的版本保持 None");
     }
 
     /// build 号必须是纯数字（会进 URL 路径）

@@ -20,6 +20,7 @@
 //! - 服务端 JAR 走 chunked 传输，既无 `Content-Length` 也不提供哈希文件，
 //!   因此解析结果为 [`Checksum::unverified`]，大小取 `0` 并由下载结果覆盖。
 
+use crate::calendar::{ReleaseCalendar, fetch_or_empty};
 use crate::http::{build_client, get_json};
 use async_trait::async_trait;
 use domain::server::{
@@ -128,7 +129,13 @@ impl ServerJarSource for FabricSource {
     async fn versions(&self) -> Result<Vec<ServerVersion>, SourceError> {
         let url = format!("{}/v2/versions/game", self.base_url);
         let games: Vec<GameVersion> = self.get(&url, None).await?;
-        Ok(games.into_iter().map(into_server_version).collect())
+        // Fabric Meta 只给 `stable` 标记，没有发布时间；时间统一取 Mojang 清单，
+        // 否则 `26w14a` / `3D Shareware v1.34` 这类拆不出数字的名字会被排到末尾
+        let calendar = fetch_or_empty(&self.http).await;
+        Ok(games
+            .into_iter()
+            .map(|game| into_server_version(game, &calendar))
+            .collect())
     }
 
     async fn artifact(&self, version: &VersionId) -> Result<ResolvedArtifact, SourceError> {
@@ -234,13 +241,18 @@ fn resolve_game_id(raw: &str, games: Vec<GameVersion>) -> Option<String> {
 ///
 /// Fabric 只关心 loader 自身的最低 Java 要求，MC 版本要求的 Java 大版本由
 /// 原版元数据给出，这里不做猜测，一律 `None`。
-fn into_server_version(game: GameVersion) -> ServerVersion {
+///
+/// 发布时间取自 `Mojang` 清单：[`ReleaseCalendar`] 认得 `_unobfuscated` /
+/// `_original` 这类 Fabric 独有的变体后缀，取基础版本的发布时间；清单里没有
+/// 的实验版（`1.16_combat-3` 等）保持 `None`，由排序退回版本号口径。
+fn into_server_version(game: GameVersion, calendar: &ReleaseCalendar) -> ServerVersion {
+    let released = calendar.released(&game.version).map(str::to_owned);
     ServerVersion {
         id: VersionId::new(game.version),
         kind: game_kind(game.stable),
         variant: ServerVariant::Fabric,
         java_major: None,
-        released: None,
+        released,
     }
 }
 
@@ -531,7 +543,10 @@ mod tests {
     /// `stable` 标注类别，且全部声明 fabric 变体、不带 Java 要求
     #[test]
     fn version_list_marks_kind_and_variant() {
-        let mapped: Vec<_> = games().into_iter().map(into_server_version).collect();
+        let mapped: Vec<_> = games()
+            .into_iter()
+            .map(|game| into_server_version(game, &ReleaseCalendar::default()))
+            .collect();
         assert_eq!(mapped[0].id, VersionId::new("26.4-snapshot-5"));
         assert_eq!(mapped[0].kind, VersionKind::Snapshot);
         assert_eq!(mapped[1].kind, VersionKind::Release);
@@ -539,6 +554,60 @@ mod tests {
         assert!(
             mapped.iter().all(|v| v.java_major.is_none()),
             "版本列表不携带 Java 要求；安装时由 artifact 按 MC 版本推算"
+        );
+    }
+
+    /// 回归：Fabric Meta 不给发布时间，时间必须从 Mojang 清单补齐
+    ///
+    /// 缺时间时 `26w14a` / `3D Shareware v1.34` 这类拆不出数字的名字会被排到
+    /// 列表末尾，而它们往往是最新的（用户报告的排序错乱根因）。
+    #[test]
+    fn version_list_carries_release_time_from_calendar() {
+        let manifest: crate::mojang::manifest::VersionManifest =
+            serde_json::from_str(include_str!("../../tests/fixtures/version_manifest.json"))
+                .expect("version_manifest fixture");
+        let calendar = ReleaseCalendar::from_manifest(manifest);
+
+        let mapped: Vec<_> = games()
+            .into_iter()
+            .map(|game| into_server_version(game, &calendar))
+            .collect();
+
+        let by_id = |id: &str| {
+            mapped
+                .iter()
+                .find(|v| v.id.as_str() == id)
+                .expect("fixture 里有该版本")
+        };
+        assert_eq!(
+            by_id("1.21.1").released.as_deref(),
+            Some("2024-08-08T00:00:00+00:00"),
+            "清单里有的版本要带上发布时间"
+        );
+        assert_eq!(
+            by_id("26.4-snapshot-5").released,
+            None,
+            "清单里没有的版本保持 None，退回版本号口径"
+        );
+    }
+
+    /// `_unobfuscated` 变体取基础版本的发布时间（两者同时发布）
+    #[test]
+    fn unobfuscated_variant_borrows_base_release_time() {
+        let manifest: crate::mojang::manifest::VersionManifest =
+            serde_json::from_str(include_str!("../../tests/fixtures/version_manifest.json"))
+                .expect("version_manifest fixture");
+        let calendar = ReleaseCalendar::from_manifest(manifest);
+        let mapped = into_server_version(
+            GameVersion {
+                version: "1.21.1_unobfuscated".to_owned(),
+                stable: false,
+            },
+            &calendar,
+        );
+        assert_eq!(
+            mapped.released.as_deref(),
+            Some("2024-08-08T00:00:00+00:00")
         );
     }
 }

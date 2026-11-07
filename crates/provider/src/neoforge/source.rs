@@ -36,6 +36,7 @@
 //! - installer 位于 `{maven}/releases/net/neoforged/neoforge/{ver}/neoforge-{ver}-installer.jar`，
 //!   同名 `.sha1` 侧车是纯 40 位十六进制（实测与文件一致，可强校验）。
 
+use crate::calendar::{ReleaseCalendar, fetch_or_empty};
 use crate::http::{build_client, get_json, get_text};
 use crate::shared::{
     Downloads, VersionIntent, normalize_base, parse_https_url, parse_sha1_sidecar,
@@ -202,9 +203,13 @@ impl ServerJarSource for NeoForgeSource {
     }
 
     async fn versions(&self) -> Result<Vec<ServerVersion>, SourceError> {
-        Ok(builds_by_mc(&self.index().await?)
+        let grouped = builds_by_mc(&self.index().await?);
+        // 索引只有 build 串，没有发布时间；时间统一取 Mojang 清单，让所有变体
+        // 的版本列表同一口径
+        let calendar = fetch_or_empty(&self.http).await;
+        Ok(grouped
             .into_keys()
-            .map(into_server_version)
+            .map(|mc| into_server_version(mc, &calendar))
             .collect())
     }
 
@@ -362,14 +367,15 @@ fn select_build(mc: &str, grouped: &BuildsByMc) -> Option<String> {
 /// MC 版本 → 领域版本
 ///
 /// `NeoForge` 只覆盖正式 MC 版本，统一标 `Release`；Java 大版本由原版元数据
-/// 给出，这里不做猜测。
-fn into_server_version(mc: String) -> ServerVersion {
+/// 给出，这里不做猜测。发布时间取自 `Mojang` 清单（[`ReleaseCalendar`]）。
+fn into_server_version(mc: String, calendar: &ReleaseCalendar) -> ServerVersion {
+    let released = calendar.released(&mc).map(str::to_owned);
     ServerVersion {
         id: VersionId::new(mc),
         kind: VersionKind::Release,
         variant: ServerVariant::NeoForge,
         java_major: None,
-        released: None,
+        released,
     }
 }
 
@@ -547,13 +553,39 @@ mod tests {
     /// 版本列表全部标 neoforge、正式版、无 Java 要求
     #[test]
     fn version_list_marks_variant_and_kind() {
+        let calendar = ReleaseCalendar::default();
         let mapped: Vec<_> = builds_by_mc(&index())
             .into_keys()
-            .map(into_server_version)
+            .map(|mc| into_server_version(mc, &calendar))
             .collect();
         assert!(mapped.iter().all(|v| v.variant == ServerVariant::NeoForge));
         assert!(mapped.iter().all(|v| v.kind == VersionKind::Release));
         assert!(mapped.iter().all(|v| v.java_major.is_none()));
+    }
+
+    /// 发布时间从 Mojang 清单补齐：`neoforge` 索引本身不含时间
+    #[test]
+    fn version_list_carries_release_time_from_calendar() {
+        let manifest: crate::mojang::manifest::VersionManifest =
+            serde_json::from_str(include_str!("../../tests/fixtures/version_manifest.json"))
+                .expect("version_manifest fixture");
+        let calendar = ReleaseCalendar::from_manifest(manifest);
+
+        let mapped: Vec<_> = builds_by_mc(&index())
+            .into_keys()
+            .map(|mc| into_server_version(mc, &calendar))
+            .collect();
+        let by_id = |id: &str| {
+            mapped
+                .iter()
+                .find(|v| v.id.as_str() == id)
+                .expect("fixture 里有该 MC 版本")
+        };
+        assert_eq!(
+            by_id("1.21.1").released.as_deref(),
+            Some("2024-08-08T00:00:00+00:00")
+        );
+        assert_eq!(by_id("26.2").released, None, "清单没有的版本保持 None");
     }
 
     /// installer 与 `.sha1` 地址拼装
