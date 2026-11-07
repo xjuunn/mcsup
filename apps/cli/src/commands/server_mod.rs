@@ -28,7 +28,7 @@ use crate::output::{Printer, human_bytes};
 use crate::progress::{BarSink, TaskSpinner};
 use anyhow::Result;
 use comfy_table::{ContentArrangement, Table};
-use mcsup::domain::mod_::Risk;
+use mcsup::domain::mod_::{FitVerdict, Risk, ServerFit};
 use mcsup::domain::server::content::{ContentKind, UpdateDecision};
 use mcsup::port::CancellationToken;
 use mcsup::service::{
@@ -182,6 +182,8 @@ async fn list(
         }
     }
     report_unreadable(&listed, printer);
+    // 装不进这台服务端的文件必须逐条说明：留在 mods/ 里会让服务端起不来
+    report_fit_problems(&listed, printer);
     Ok(())
 }
 
@@ -885,6 +887,7 @@ fn mods_table(entries: &[&ModEntry], lang: Lang) -> Table {
         text(lang, "版本", "version"),
         text(lang, "服务端", "server"),
         text(lang, "风险", "risk"),
+        text(lang, "适配", "fit"),
         text(lang, "上游", "upstream"),
     ]);
     for entry in entries {
@@ -895,10 +898,64 @@ fn mods_table(entries: &[&ModEntry], lang: Lang) -> Table {
             capability.version.clone().unwrap_or_else(|| "-".to_owned()),
             capability.side.server.as_str().to_owned(),
             entry.report.risk.as_str().to_owned(),
+            fit_text(entry.report.fit.as_ref(), lang).to_owned(),
             upstream_text(entry),
         ]);
     }
     table
+}
+
+/// 匹配结论展示
+///
+/// 「适配」与「风险」是两件事：前者答「和这台服务端对不对得上」，后者答
+/// 「这个 jar 本身是不是服务端的东西」。合成一列就说不清到底是哪种问题。
+fn fit_text(fit: Option<&ServerFit>, lang: Lang) -> &'static str {
+    match fit.map(|f| f.verdict) {
+        Some(FitVerdict::Installable) => text(lang, "✓ 可装", "✓ ok"),
+        Some(FitVerdict::Unclear) => text(lang, "? 待确认", "? unclear"),
+        Some(FitVerdict::Rejected) => text(lang, "✗ 不匹配", "✗ mismatch"),
+        None => "-",
+    }
+}
+
+/// 装不进这台服务端的条目：逐条给理由
+///
+/// 这类文件留在 `mods/` 里会让服务端直接起不来，光在表格里打个标记不够。
+fn report_fit_problems(list: &ModList, printer: Printer) {
+    let lang = printer.lang();
+    let problems: Vec<&ModEntry> = list
+        .mods
+        .iter()
+        .filter(|entry| {
+            entry
+                .report
+                .fit
+                .as_ref()
+                .is_some_and(|fit| fit.verdict == FitVerdict::Rejected)
+        })
+        .collect();
+    if problems.is_empty() {
+        return;
+    }
+    let warn = pick(
+        lang,
+        format!("{} 个文件装不进这台服务端", problems.len()),
+        format!("{} file(s) cannot run on this server", problems.len()),
+    );
+    printer.print_warning(&warn);
+    for entry in problems {
+        let Some(fit) = &entry.report.fit else {
+            continue;
+        };
+        for issue in &fit.issues {
+            let line = format!("  {}: [{}] {}", entry.file, issue.dimension, issue.detail);
+            if printer.is_human() {
+                printer.print_section(&line);
+            } else {
+                crate::output::print_error_line(&format!("mcsup: {line}"));
+            }
+        }
+    }
 }
 
 /// 上游列：已识别时给项目 + 版本，未识别时明说「未识别」
@@ -992,6 +1049,8 @@ struct ModEntryJson {
     loaders: Vec<String>,
     server: String,
     risk: String,
+    /// 与这台服务端的匹配结论（`mod inspect` 用同一形状）
+    fit: Option<crate::commands::mod_inspect::FitJson>,
     missing_deps: Vec<String>,
     /// 上游项目 ID（未识别时为 `null`）
     project_id: Option<String>,
@@ -1019,6 +1078,11 @@ fn entry_json(entry: &ModEntry) -> ModEntryJson {
             .collect(),
         server: capability.side.server.as_str().to_owned(),
         risk: entry.report.risk.as_str().to_owned(),
+        fit: entry
+            .report
+            .fit
+            .as_ref()
+            .map(crate::commands::mod_inspect::fit_json),
         missing_deps: entry.report.missing_deps.clone(),
         project_id: entry.identity.as_ref().map(|id| id.project_id.clone()),
         project_slug: entry.identity.as_ref().and_then(|id| id.slug.clone()),

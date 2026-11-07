@@ -144,6 +144,27 @@ fn write_broken_jar(dir: &Path) {
     std::fs::write(mods.join("broken.jar"), b"not-a-zip").expect("write");
 }
 
+/// 造一个最小 Fabric mod jar 放进 `mods/`
+fn write_fabric_jar(dir: &Path, name: &str, mc: &str) {
+    use std::io::Write as _;
+
+    let mods = dir.join("mods");
+    std::fs::create_dir_all(&mods).expect("mkdir mods");
+    let file = std::fs::File::create(mods.join(name)).expect("create jar");
+    let mut zip = zip::ZipWriter::new(file);
+    let opts = zip::write::SimpleFileOptions::default();
+    zip.start_file("fabric.mod.json", opts).expect("start");
+    zip.write_all(
+        format!(
+            r#"{{"schemaVersion":1,"id":"probe","version":"1",
+                "environment":"*","depends":{{"minecraft":"{mc}"}}}}"#
+        )
+        .as_bytes(),
+    )
+    .expect("write meta");
+    zip.finish().expect("finish zip");
+}
+
 // ---------------------------------------------------------------- 参数与退出码
 
 /// 缺服务端名：非交互下是用法错误（2），不是「未实现」也不再是补参提问
@@ -419,4 +440,71 @@ fn install_dry_run_fails_before_writing_anything() {
         !dir.join(".mcsup-staging").exists(),
         "计划阶段不能建暂存目录"
     );
+}
+
+// ---------------------------------------------------------------- 服务端匹配
+
+/// 声明的 MC 区间不覆盖这台服务端：`list` 要报 `rejected` 并给出理由
+///
+/// 这是「这个 mod 能不能装到服务器」的核心答案：只报风险等级不够，风险
+/// 说的是「是不是服务端的东西」，与「和这台服务端对不对得上」是两回事。
+#[test]
+fn list_rejects_mod_for_other_mc_version() {
+    let home = temp_home();
+    let (_, dir) = workspace_with_server(&home);
+    // 服务端是 1.21.1，jar 声明 1.20.1
+    write_fabric_jar(&dir, "old.jar", "1.20.1");
+
+    let out = run(
+        home.path(),
+        &["server", "mod", "list", "srv1", "--output", "json"],
+    );
+    ok(&out, "server mod list");
+    let payload = json(&out);
+    let entry = &payload[0];
+    assert_eq!(entry["fit"]["verdict"], "rejected", "{payload}");
+    assert_eq!(entry["fit"]["mc_version"], "mismatch");
+    let issues = entry["fit"]["issues"].as_array().expect("issues");
+    assert!(
+        issues
+            .iter()
+            .any(|issue| issue["dimension"] == "mc_version"),
+        "{issues:?}"
+    );
+    // 风险列独立于适配列：这个 jar 本身没有客/服问题
+    assert_eq!(entry["risk"], "review");
+}
+
+/// 声明覆盖这台服务端：`installable`
+#[test]
+fn list_accepts_mod_for_matching_mc_version() {
+    let home = temp_home();
+    let (_, dir) = workspace_with_server(&home);
+    write_fabric_jar(&dir, "new.jar", "1.21.1");
+
+    let out = run(
+        home.path(),
+        &["server", "mod", "list", "srv1", "--output", "json"],
+    );
+    ok(&out, "server mod list");
+    let payload = json(&out);
+    assert_eq!(payload[0]["fit"]["verdict"], "installable", "{payload}");
+    assert_eq!(payload[0]["fit"]["mc_version"], "match");
+}
+
+/// 人类模式：适配列与理由都要出现，否则用户看不到「装不进去」
+#[test]
+fn list_human_output_shows_fit_and_reason() {
+    let home = temp_home();
+    let (_, dir) = workspace_with_server(&home);
+    write_fabric_jar(&dir, "old.jar", "1.20.1");
+
+    let out = run(
+        home.path(),
+        &["server", "mod", "list", "srv1", "--lang", "zh"],
+    );
+    ok(&out, "server mod list");
+    let text = stdout(&out);
+    assert!(text.contains("适配"), "表格缺少适配列: {text}");
+    assert!(text.contains("装不进这台服务端"), "缺少拒绝理由: {text}");
 }

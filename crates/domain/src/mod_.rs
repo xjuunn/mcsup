@@ -719,6 +719,287 @@ impl InstallVerdict {
     }
 }
 
+/// 目标服务端的安装条件
+///
+/// 三个字段都是 `Option`，`None` 表示这一维**不参与判定**——`mod inspect`
+/// 检查任意 jar 时并不知道要装到哪台服务端。两件事必须分开：
+///
+/// - 字段为 `None`：这一维没问
+/// - [`Fit::Unknown`]：问了，但文件没给出可判定的证据
+///
+/// 混为一谈会把「没问」渲染成「有问题」，用户看到一片「待确认」就再也不看
+/// 这一列了。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ServerTarget {
+    /// 目标加载器（由服务端变体换算）
+    pub loader: Option<ModLoader>,
+    /// 目标 MC 版本（服务端实际跑的版本）
+    pub mc_version: Option<String>,
+    /// 目标 Java 大版本（服务端实际会用的那个）
+    pub java_major: Option<u32>,
+}
+
+impl ServerTarget {
+    /// 什么都不问
+    #[must_use]
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// 是否一维都没问
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.loader.is_none() && self.mc_version.is_none() && self.java_major.is_none()
+    }
+}
+
+/// 单个维度的匹配结论
+///
+/// 与 [`SideSupport`] 同样不压缩成二元：`Unknown` 是「判不出」，不是
+/// 「不匹配」。把判不出当成不匹配会让工具开始骗人。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Fit {
+    /// 满足
+    Match,
+    /// 明确不满足
+    Mismatch,
+    /// 判不出
+    #[default]
+    Unknown,
+}
+
+impl Fit {
+    /// 稳定机器名
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Match => "match",
+            Self::Mismatch => "mismatch",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl fmt::Display for Fit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// 参与匹配判定的维度
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FitDimension {
+    /// 加载器
+    Loader,
+    /// MC 版本
+    McVersion,
+    /// Java 大版本
+    Java,
+}
+
+impl FitDimension {
+    /// 稳定机器名
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Loader => "loader",
+            Self::McVersion => "mc_version",
+            Self::Java => "java",
+        }
+    }
+}
+
+impl fmt::Display for FitDimension {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// 一条匹配说明
+///
+/// `Mismatch` 与「有信息量的 `Unknown`」各一条：用户要的是「为什么不行」和
+/// 「差什么才能判」，不是三个字母的枚举。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FitIssue {
+    /// 哪个维度
+    pub dimension: FitDimension,
+    /// 人话说明
+    pub detail: String,
+}
+
+impl FitIssue {
+    /// 构造一条
+    #[must_use]
+    pub fn new(dimension: FitDimension, detail: impl Into<String>) -> Self {
+        Self {
+            dimension,
+            detail: detail.into(),
+        }
+    }
+}
+
+/// 「这个文件能不能装到这台服务端」的总结论
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FitVerdict {
+    /// 三个维度都满足
+    Installable,
+    /// 没有不匹配，但有维度判不出
+    Unclear,
+    /// 至少一个维度明确不满足
+    Rejected,
+}
+
+impl FitVerdict {
+    /// 稳定机器名
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Installable => "installable",
+            Self::Unclear => "unclear",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+impl fmt::Display for FitVerdict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// 文件与目标服务端的匹配结论
+///
+/// # 与 [`Risk`] 的分工
+///
+/// `Risk` 回答「这个 jar 本身是不是服务端的东西」（客/服归属、依赖闭包），
+/// 与装到哪台服务端无关；`ServerFit` 回答「它和这台服务端对不对得上」
+/// （加载器、MC 版本、Java）。同一份文件在不同服务端上的 `Fit` 不同，
+/// 但 `Risk` 不变——两者合并成一个数就没法分别展示，也无法解释。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerFit {
+    /// 加载器维度
+    pub loader: Fit,
+    /// MC 版本维度
+    pub mc_version: Fit,
+    /// Java 维度
+    pub java: Fit,
+    /// 总结论
+    pub verdict: FitVerdict,
+    /// 逐条说明（不匹配的必有一条；判不出的看情况给）
+    pub issues: Vec<FitIssue>,
+}
+
+impl ModCapability {
+    /// 判定本文件能否装到 `target` 描述的服务端
+    ///
+    /// 判定口径：
+    ///
+    /// - **加载器**：文件声明的加载器里有目标加载器即满足。`Quilt` 运行时
+    ///   保留 Fabric 兼容层，因此 `Quilt` 目标接受 Fabric mod；反向不成立。
+    ///   其余跨加载器兼容（`NeoForge` 1.20.1 的 Forge 血统等）版本相关，
+    ///   不能一概而论，宁可不判。
+    /// - **MC 版本**：文件声明的区间是否含目标版本。未声明区间就是判不出，
+    ///   不按「大概能跑」放行。
+    /// - **Java**：按 class 文件头实测的最大版本比。**只可能给出不匹配**：
+    ///   没扫到 class（数据包、扫描预算用尽）说明不了任何问题，不该因此
+    ///   把结论降成「待确认」，否则每个数据包都会变成待确认。
+    #[must_use]
+    pub fn fit_for(&self, target: &ServerTarget) -> ServerFit {
+        let mut issues = Vec::new();
+
+        let loader = match target.loader {
+            None => Fit::Unknown,
+            Some(want) => {
+                if self.loaders.is_empty() {
+                    issues.push(FitIssue::new(
+                        FitDimension::Loader,
+                        format!("jar 内没有可识别的加载器元数据，判不出是否支持 {want}"),
+                    ));
+                    Fit::Unknown
+                } else if self.loaders.iter().any(|have| loads(want, *have)) {
+                    Fit::Match
+                } else {
+                    let have: Vec<&str> = self.loaders.iter().map(|l| l.as_str()).collect();
+                    issues.push(FitIssue::new(
+                        FitDimension::Loader,
+                        format!("只支持 {}，服务端是 {want}", have.join(" / ")),
+                    ));
+                    Fit::Mismatch
+                }
+            }
+        };
+
+        let mc_version = match (&target.mc_version, self.mc_versions.is_any()) {
+            (None, _) => Fit::Unknown,
+            (Some(_), true) => {
+                issues.push(FitIssue::new(
+                    FitDimension::McVersion,
+                    "文件未声明 MC 版本区间，判不出是否兼容".to_owned(),
+                ));
+                Fit::Unknown
+            }
+            (Some(mc), false) => {
+                if self.mc_versions.contains(mc) {
+                    Fit::Match
+                } else {
+                    issues.push(FitIssue::new(
+                        FitDimension::McVersion,
+                        format!("声明区间 {}，服务端是 {mc}", self.mc_versions.raw),
+                    ));
+                    Fit::Mismatch
+                }
+            }
+        };
+
+        let java = match (target.java_major, self.java_compiled) {
+            (Some(want), Some(compiled)) => {
+                if compiled <= want {
+                    Fit::Match
+                } else {
+                    issues.push(FitIssue::new(
+                        FitDimension::Java,
+                        format!("需要 Java {compiled}，服务端用 Java {want}"),
+                    ));
+                    Fit::Mismatch
+                }
+            }
+            _ => Fit::Unknown,
+        };
+
+        // 只有「问了」的维度才可能让结论变成待确认：没问不等于有问题
+        let unresolved = (target.loader.is_some() && loader == Fit::Unknown)
+            || (target.mc_version.is_some() && mc_version == Fit::Unknown);
+        let verdict =
+            if loader == Fit::Mismatch || mc_version == Fit::Mismatch || java == Fit::Mismatch {
+                FitVerdict::Rejected
+            } else if unresolved {
+                FitVerdict::Unclear
+            } else {
+                FitVerdict::Installable
+            };
+
+        ServerFit {
+            loader,
+            mc_version,
+            java,
+            verdict,
+            issues,
+        }
+    }
+}
+
+/// `target` 加载器能否载入 `have` 声明的 mod
+fn loads(target: ModLoader, have: ModLoader) -> bool {
+    if target == have {
+        return true;
+    }
+    // Quilt Loader 保留 Fabric 兼容层；反向不成立。
+    // NeoForge 与 Forge 的兼容性随版本变化（1.20.1 是同一血统，1.20.2 起
+    // 分道扬镳），无法用「加载器」这一维表达，因此不猜。
+    matches!((target, have), (ModLoader::Quilt, ModLoader::Fabric))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -943,5 +1224,175 @@ mod tests {
         assert_eq!(Risk::Ok.max(Risk::Blocking), Risk::Blocking);
         assert_eq!(Risk::Review.max(Risk::Ok), Risk::Review);
         assert_eq!(Risk::Ok.max(Risk::Ok), Risk::Ok);
+    }
+
+    /// 构造一个只填了匹配判定相关字段的文件
+    fn cap(loaders: &[ModLoader], mc: &str, java: Option<u32>) -> ModCapability {
+        let mut cap = ModCapability::empty("/x.jar");
+        cap.loaders = loaders.to_vec();
+        cap.mc_versions = if mc.is_empty() {
+            VersionRange::any()
+        } else {
+            exact_range(mc)
+        };
+        cap.java_compiled = java;
+        cap
+    }
+
+    /// 单个版本的区间：`[v, 下一 patch)`
+    ///
+    /// 与 `modkit::parse_mc_range` 对裸版本号的口径一致。不能用
+    /// [`VersionRange::exact`]：它只设下界，等于「v 及以上」，判不出上界。
+    fn exact_range(v: &str) -> VersionRange {
+        let mut parts: Vec<String> = v.split('.').map(ToOwned::to_owned).collect();
+        if let Some(last) = parts.last_mut() {
+            let bumped = last.parse::<u64>().unwrap_or(0) + 1;
+            *last = bumped.to_string();
+        }
+        VersionRange {
+            raw: v.to_owned(),
+            min: Some(v.to_owned()),
+            max: Some(parts.join(".")),
+        }
+    }
+
+    fn target(loader: ModLoader, mc: &str, java: Option<u32>) -> ServerTarget {
+        ServerTarget {
+            loader: Some(loader),
+            mc_version: Some(mc.to_owned()),
+            java_major: java,
+        }
+    }
+
+    #[test]
+    fn fit_accepts_matching_loader_and_version() {
+        let fit = cap(&[ModLoader::Fabric], "1.21.1", Some(21)).fit_for(&target(
+            ModLoader::Fabric,
+            "1.21.1",
+            Some(21),
+        ));
+        assert_eq!(fit.loader, Fit::Match);
+        assert_eq!(fit.mc_version, Fit::Match);
+        assert_eq!(fit.java, Fit::Match);
+        assert_eq!(fit.verdict, FitVerdict::Installable);
+        assert!(fit.issues.is_empty());
+    }
+
+    #[test]
+    fn fit_rejects_foreign_loader_with_reason() {
+        let fit = cap(&[ModLoader::Forge], "1.21.1", None).fit_for(&target(
+            ModLoader::Fabric,
+            "1.21.1",
+            None,
+        ));
+        assert_eq!(fit.loader, Fit::Mismatch);
+        assert_eq!(fit.verdict, FitVerdict::Rejected);
+        // 理由要能直接回答「为什么不行」
+        assert!(
+            fit.issues
+                .iter()
+                .any(|i| i.dimension == FitDimension::Loader
+                    && i.detail.contains("forge")
+                    && i.detail.contains("fabric")),
+            "{:?}",
+            fit.issues
+        );
+    }
+
+    /// Quilt 运行时能载入 Fabric mod，反过来不行
+    #[test]
+    fn quilt_target_loads_fabric_mod_but_not_the_reverse() {
+        let fabric_mod = cap(&[ModLoader::Fabric], "1.21.1", None);
+        assert_eq!(
+            fabric_mod
+                .fit_for(&target(ModLoader::Quilt, "1.21.1", None))
+                .loader,
+            Fit::Match
+        );
+        let quilt_mod = cap(&[ModLoader::Quilt], "1.21.1", None);
+        assert_eq!(
+            quilt_mod
+                .fit_for(&target(ModLoader::Fabric, "1.21.1", None))
+                .loader,
+            Fit::Mismatch
+        );
+    }
+
+    #[test]
+    fn fit_rejects_out_of_range_mc_version() {
+        let fit = cap(&[ModLoader::Fabric], "1.20.1", None).fit_for(&target(
+            ModLoader::Fabric,
+            "1.21.1",
+            None,
+        ));
+        assert_eq!(fit.mc_version, Fit::Mismatch);
+        assert_eq!(fit.verdict, FitVerdict::Rejected);
+        assert!(
+            fit.issues
+                .iter()
+                .any(|i| i.dimension == FitDimension::McVersion && i.detail.contains("1.20.1")),
+            "{:?}",
+            fit.issues
+        );
+    }
+
+    #[test]
+    fn fit_rejects_mod_needing_newer_java() {
+        let fit = cap(&[ModLoader::Fabric], "1.21.1", Some(21)).fit_for(&target(
+            ModLoader::Fabric,
+            "1.21.1",
+            Some(17),
+        ));
+        assert_eq!(fit.java, Fit::Mismatch);
+        assert_eq!(fit.verdict, FitVerdict::Rejected);
+    }
+
+    /// 未声明 MC 区间是「判不出」，不是「不匹配」：结论降为待确认
+    #[test]
+    fn undeclared_mc_range_is_unclear_not_rejected() {
+        let fit =
+            cap(&[ModLoader::Fabric], "", None).fit_for(&target(ModLoader::Fabric, "1.21.1", None));
+        assert_eq!(fit.mc_version, Fit::Unknown);
+        assert_eq!(fit.verdict, FitVerdict::Unclear);
+        assert!(
+            fit.issues
+                .iter()
+                .any(|i| i.dimension == FitDimension::McVersion),
+            "判不出必须给出理由"
+        );
+    }
+
+    /// 没问的维度不参与结论：只问加载器时，MC / Java 未知不该拖成待确认
+    #[test]
+    fn unasked_dimensions_do_not_downgrade_verdict() {
+        let fit = cap(&[ModLoader::Fabric], "", None).fit_for(&ServerTarget {
+            loader: Some(ModLoader::Fabric),
+            mc_version: None,
+            java_major: None,
+        });
+        assert_eq!(fit.mc_version, Fit::Unknown);
+        assert_eq!(fit.java, Fit::Unknown);
+        assert_eq!(fit.verdict, FitVerdict::Installable);
+    }
+
+    /// 没扫到 class（数据包、预算用尽）说明不了 Java 要求，不能算不匹配
+    #[test]
+    fn missing_bytecode_never_rejects() {
+        let fit = cap(&[ModLoader::DataPack], "1.21.1", None).fit_for(&target(
+            ModLoader::DataPack,
+            "1.21.1",
+            Some(21),
+        ));
+        assert_eq!(fit.java, Fit::Unknown);
+        assert_eq!(fit.verdict, FitVerdict::Installable);
+    }
+
+    /// 空目标：一维都没问
+    #[test]
+    fn empty_target_asks_nothing() {
+        let fit = cap(&[ModLoader::Fabric], "1.21.1", Some(21)).fit_for(&ServerTarget::none());
+        assert!(ServerTarget::none().is_empty());
+        assert_eq!(fit.verdict, FitVerdict::Installable);
+        assert!(fit.issues.is_empty());
     }
 }
