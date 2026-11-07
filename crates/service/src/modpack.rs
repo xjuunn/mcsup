@@ -24,13 +24,16 @@ use crate::fs_error::FsError;
 use crate::lifecycle::LifecycleError;
 use domain::server::modpack::{ModpackFile, ModpackIndex};
 use domain::server::version::ServerVariant;
+use futures::StreamExt;
+use futures::stream;
 use port::modpack::{
     ModpackExtractError, ModpackExtractor, ModpackSource, ModpackSourceRegistry, ResolvedModpack,
 };
 use port::{ArtifactDownloader, CancellationToken, DownloadRequest, ProgressSink, SourceError};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tracing::info;
 
@@ -315,12 +318,30 @@ impl ModpackService {
             source.client_only_hashes(&mod_hashes).await?
         };
 
-        // 3. 清单文件：只装服务端需要的（server: unsupported 已由领域层过滤）
-        let mut reused = 0;
-        let mut downloaded_bytes = 0;
-        let mut skipped_client_only = 0;
-        // 清单哈希过期、但上游权威哈希与下载字节一致的文件路径
-        let mut stale_hashes: Vec<String> = Vec::new();
+        // 3. 清单文件：只装服务端需要的（server: unsupported 已由领域层过滤），
+        //    并行下载，进度收敛为整包口径（见 [`Self::download_files`]）
+        let (jobs, skipped_client_only) = self
+            .classify_files(prepared, server_dir, &client_only)
+            .await?;
+        let mut applied = self
+            .download_files(prepared, source.as_ref(), &jobs, progress, cancel)
+            .await?;
+        applied.file_count = prepared.index.server_files().len() - skipped_client_only;
+        applied.skipped_client_only = skipped_client_only;
+        Ok(applied)
+    }
+
+    /// 把清单文件分类：要下载的、仅客户端剔除的
+    ///
+    /// 仅客户端文件顺手清掉旧落盘——重装时留着只会让服务端起不来。
+    async fn classify_files<'a>(
+        &self,
+        prepared: &'a ModpackPrepared,
+        server_dir: &Path,
+        client_only: &HashSet<String>,
+    ) -> Result<(Vec<(&'a ModpackFile, PathBuf)>, usize), ModpackError> {
+        let mut skipped_client_only = 0_usize;
+        let mut jobs: Vec<(&'a ModpackFile, PathBuf)> = Vec::new();
         for file in prepared.index.downloadable_server_files() {
             let target = safe_target(server_dir, &file.path)?;
             if file
@@ -330,8 +351,8 @@ impl ModpackService {
                 .is_some_and(|hash| client_only.contains(hash))
             {
                 // 上一次安装可能已经把它落盘；重装时顺手清掉，避免旧文件
-                // 继续让服务端起不来。
-                if tokio::fs::metadata(&target).await.is_ok() {
+                // 继续让服务端起不来
+                if tokio::fs::try_exists(&target).await.unwrap_or(false) {
                     tokio::fs::remove_file(&target)
                         .await
                         .map_err(|err| ModpackError::io(&target, err))?;
@@ -339,24 +360,93 @@ impl ModpackService {
                 skipped_client_only += 1;
                 continue;
             }
+            jobs.push((file, target));
+        }
+        Ok((jobs, skipped_client_only))
+    }
+
+    /// 并行下载清单文件，进度收敛为整包口径
+    ///
+    /// 并行下载：清单文件动辄上百个、彼此独立，串行是纯 IO 等待的浪费。
+    /// 并发度有界（[`FILE_CONCURRENCY`]），不放大上游压力；单文件内部
+    /// 的分片下载保持不动（file crate 自己决定怎么跑满一条文件）。
+    ///
+    /// 进度口径收敛为整包：清单里每个文件都带 size，总字节可知；
+    /// 已复用（reused）的文件按声明 size 直接计入已完成，其余按下载
+    /// 增量累加。上层收到的 `on_progress(done, Some(total))` 从此是
+    /// 整包视角，不再被单个文件的进度反复归零。
+    async fn download_files(
+        &self,
+        prepared: &ModpackPrepared,
+        source: &dyn ModpackSource,
+        jobs: &[(&ModpackFile, PathBuf)],
+        progress: Option<&dyn ProgressSink>,
+        cancel: &CancellationToken,
+    ) -> Result<ModpackApplied, ModpackError> {
+        // 总字节与已复用字节：进度条的总长一次算清
+        let total_bytes: u64 = jobs.iter().map(|(file, _)| file.size).sum();
+        // 先把「已存在且校验一致」的文件找出来：它们的字节直接计入已完成
+        let mut reused_bytes = 0_u64;
+        let mut to_download: Vec<(&ModpackFile, PathBuf)> = Vec::new();
+        for (file, target) in jobs {
             if let Some(parent) = target.parent() {
                 tokio::fs::create_dir_all(parent)
                     .await
                     .map_err(|err| ModpackError::io(parent, err))?;
             }
-            if existing_matches(&target, file).await {
-                reused += 1;
-                continue;
-            }
-            let url = first_https(&file.downloads)?;
-            let fetched = self
-                .fetch_one_file(source.as_ref(), file, url, &target, progress, cancel)
-                .await?;
-            downloaded_bytes += fetched.bytes;
-            if fetched.stale {
-                stale_hashes.push(file.path.clone());
+            if existing_matches(target, file).await {
+                reused_bytes += file.size;
+            } else {
+                to_download.push((file, target.clone()));
             }
         }
+        let reused = jobs.len() - to_download.len();
+
+        // 共享计数器：已完成字节（复用 + 下载增量）
+        let done = Arc::new(AtomicU64::new(reused_bytes));
+        if let Some(sink) = progress {
+            sink.on_progress(done.load(Ordering::Relaxed), Some(total_bytes));
+        }
+        // 清单哈希过期、但上游权威哈希与下载字节一致的文件路径
+        let stale_hashes = Mutex::new(Vec::new());
+        let source_ref = source;
+        let fetched: Vec<Result<FetchedFile, ModpackError>> = {
+            let stale_hashes = &stale_hashes;
+            stream::iter(to_download.into_iter().map(|(file, target)| {
+                let url = first_https(&file.downloads);
+                let done = Arc::clone(&done);
+                async move {
+                    let url = url?;
+                    // 每个并发文件一个聚合 sink：把「文件内已传字节」换算成
+                    // 整包口径的绝对值上报
+                    let aggregate =
+                        progress.map(|sink| AggregateSink::new(Arc::clone(&done), sink));
+                    let sink_ref = aggregate.as_ref().map(|s| s as &dyn ProgressSink);
+                    let fetched = self
+                        .fetch_one_file(source_ref, file, url, &target, sink_ref, cancel)
+                        .await?;
+                    done.fetch_add(fetched.bytes, Ordering::Relaxed);
+                    if let Some(sink) = progress {
+                        sink.on_progress(done.load(Ordering::Relaxed), Some(total_bytes));
+                    }
+                    if fetched.stale
+                        && let Ok(mut list) = stale_hashes.lock()
+                    {
+                        list.push(file.path.clone());
+                    }
+                    Ok(fetched)
+                }
+            }))
+            .buffer_unordered(FILE_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await
+        };
+
+        let mut downloaded_bytes = 0_u64;
+        for result in fetched {
+            downloaded_bytes += result?.bytes;
+        }
+        let stale_hashes = stale_hashes.into_inner().unwrap_or_default();
 
         info!(
             project = %prepared.resolved.project_id,
@@ -364,15 +454,14 @@ impl ModpackService {
             files = prepared.index.server_files().len(),
             downloaded_bytes,
             reused,
-            skipped_client_only,
             stale_hashes = stale_hashes.len(),
-            "modpack applied"
+            "modpack files downloaded"
         );
         Ok(ModpackApplied {
-            file_count: prepared.index.server_files().len() - skipped_client_only,
+            file_count: 0,
             downloaded_bytes,
             reused,
-            skipped_client_only,
+            skipped_client_only: 0,
             stale_hashes,
         })
     }
@@ -462,6 +551,42 @@ struct FetchedFile {
     bytes: u64,
     /// 是否因清单哈希过期、按上游权威哈希接受
     stale: bool,
+}
+
+/// 清单文件并发下载上限
+///
+/// 清单文件通常是几十到几百个小 jar：并发太高（几十路）只会放大对 CDN
+/// 的压力，收益递减；8 路在常见家庭带宽上已能把吞吐跑满，同时单文件
+/// 内部的分片下载仍在 file crate 里按需并发，两层不叠加失控。
+const FILE_CONCURRENCY: usize = 8;
+
+/// 并发下载的整包进度聚合
+///
+/// 每个并发文件各自收到的是「本文件已传字节」（下载器回调口径），
+/// 直接画到进度条上就是用户看到的反复归零。聚合层把每个文件的上报
+/// 换算成整包口径：`base + 文件内 transferred`，其中 base 是共享计数器
+/// 的当前值——同一时刻多个文件各自上报，绝对值取「共享计数 + 自身增量」，
+/// 进度单调不回退。
+struct AggregateSink<'a> {
+    /// 整包已完成字节（含复用与其他并发文件的已落盘部分）
+    done: Arc<AtomicU64>,
+    /// 上层 sink（CLI 进度条）
+    upstream: &'a dyn ProgressSink,
+}
+
+impl<'a> AggregateSink<'a> {
+    fn new(done: Arc<AtomicU64>, upstream: &'a dyn ProgressSink) -> Self {
+        Self { done, upstream }
+    }
+}
+
+impl ProgressSink for AggregateSink<'_> {
+    fn on_progress(&self, transferred: u64, total: Option<u64>) {
+        // 文件内 transferred 是本文件从 0 开始的进度；整包口径 =
+        // 共享计数（其他文件已计入的部分 + 复用）+ 本文件当前增量
+        self.upstream
+            .on_progress(self.done.load(Ordering::Relaxed) + transferred, total);
+    }
 }
 
 /// 已取回并解析的整合包

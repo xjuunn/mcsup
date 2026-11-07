@@ -2908,6 +2908,7 @@ dependencies = [
  "backup",
  "dirs",
  "domain",
+ "futures",
  "modkit",
  "port",
  "serde",

@@ -679,7 +679,12 @@ pub(crate) async fn install_modpack(
     super::install::download_jar(name, &version_id, core_source, variant, printer).await?;
 
     // 3. 铺 overrides + 下载清单文件
-    let label = format!("布置整合包 {name}");
+    //
+    // 进度条画的是整包口径：总长 = 清单文件字节总和（service 层聚合，
+    // 见 `ModpackService::apply`），每个文件的下载增量汇入同一个计数器，
+    // 不会出现「一个文件下载完进度条就归零」的观感。
+    let file_count = prepared.index.server_files().len();
+    let label = format!("布置整合包 {name}（{file_count} 个文件）");
     let spinner = TaskSpinner::new(label.clone(), printer.is_human());
     let sink = BarSink::new(spinner.handle(), label);
     let cancel = CancellationToken::new();
