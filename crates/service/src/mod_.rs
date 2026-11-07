@@ -30,7 +30,7 @@ use crate::mod_inspect::{
     ModAudit, ModInspectService, ModInspectServiceError, ModReport, collect_jars, sha1_of,
 };
 use crate::registry::{RegisteredServer, ServerRegistry, ServerRegistryError};
-use domain::mod_::{FitVerdict, InstallVerdict, ModLoader, Risk, ServerTarget};
+use domain::mod_::{FitVerdict, InstallVerdict, ModLoader, Risk, ServerTarget, SideSupport};
 use domain::server::content::{
     ContentCandidate, ContentIdentity, ContentKind, ContentRequest, UpdateDecision, decide_update,
 };
@@ -38,7 +38,7 @@ use domain::server::version::ServerVariant;
 use port::content::{ContentProject, ContentQuery, ContentSearch, safe_filename};
 use port::mod_::ModInspector;
 use port::{Backend, CancellationToken, ErrorCategory, ProgressSink};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
@@ -50,6 +50,12 @@ use tracing::{info, warn};
 /// 也会被 [`collect_jars`] 扫进来。以 `.` 开头的名字同时避开备份作用域里的
 /// 常见过滤口径。
 pub const STAGING_DIR: &str = ".mcsup-staging";
+
+/// 一次修复最多向下展开多少层依赖
+///
+/// 依赖链正常只有一两层；设上限是为了让「互相依赖」的坏数据停在一个可
+/// 报告的位置，而不是无限递归。
+const MAX_DEPENDENCY_DEPTH: usize = 16;
 
 /// mod 管理失败
 #[derive(Debug, Error)]
@@ -119,12 +125,16 @@ pub enum ModError {
         candidates: Vec<String>,
     },
     /// 检查判定为不可安装
-    #[error("{file} was refused by the server-side check (risk={risk}): {evidence:?}")]
+    #[error(
+        "{file} was refused by the server-side check (risk={risk}, missing={missing_deps:?}): {evidence:?}"
+    )]
     Refused {
         /// 文件名
         file: String,
         /// 风险等级
         risk: Risk,
+        /// 缺失的必需依赖（`risk` 为 `Blocking` 时的主要成因）
+        missing_deps: Vec<String>,
         /// 判定依据
         evidence: Vec<String>,
     },
@@ -135,6 +145,16 @@ pub enum ModError {
         file: String,
         /// 底层原因
         reason: String,
+    },
+    /// 上游命中的项目不提供需要的 modid（同名/同义词检索的误命中）
+    #[error("{file} does not provide the modid {need}")]
+    WrongProvider {
+        /// 要补的 modid
+        need: String,
+        /// 命中的文件名
+        file: String,
+        /// 该 jar 实际提供的 modid
+        provides: Vec<String>,
     },
     /// 落点越出服务端目录（防御性检查，正常路径不会触发）
     #[error("refusing to write outside the server directory: {path}")]
@@ -177,7 +197,9 @@ impl ModError {
             Self::UnknownState { .. } | Self::Unreadable { .. } | Self::Escapes { .. } => {
                 ErrorCategory::Backend
             }
-            Self::NoCandidate { .. } | Self::NotFound { .. } => ErrorCategory::NotFound,
+            Self::NoCandidate { .. } | Self::NotFound { .. } | Self::WrongProvider { .. } => {
+                ErrorCategory::NotFound
+            }
         }
     }
 }
@@ -283,6 +305,12 @@ pub struct InstallPlan {
     pub replaces: Option<PathBuf>,
     /// 下载条件；仅供 [`ModService::install`] 复用
     request: ContentRequest,
+    /// 这次安装必须由该 jar 提供的 modid（补装依赖时用）
+    ///
+    /// 上游检索按名字匹配，名字相关的项目未必提供这个 modid：实测
+    /// `melody` 与 `music-and-melody` 是两个项目，后者不提供 `melody`。
+    /// 没有这道校验就会把不相干的 jar 装进 `mods/`。
+    pub expect_modid: Option<String>,
 }
 
 impl InstallPlan {
@@ -368,10 +396,33 @@ pub struct ModFixApplied {
     pub removed: Vec<PathBuf>,
     /// 实际补装的 mod
     pub installed: Vec<ModInstalled>,
-    /// 被安装门禁拒绝的项目（缺依赖等，需人工处置）
-    pub refused: Vec<String>,
+    /// 没能装上的项目，带原因
+    pub refused: Vec<FixRefused>,
     /// 上游找不到提供方的依赖
     pub unresolved: Vec<String>,
+}
+
+/// 一项没能装上的修复动作
+///
+/// 「被安装检查拒绝」本身不是给用户看的结论：缺依赖、上游仅客户端、
+/// 没有匹配版本的处置各不相同。把原因一路带出来，入口只负责展示。
+#[derive(Debug, Clone)]
+pub struct FixRefused {
+    /// 项目 ID
+    pub project_id: String,
+    /// 拒绝原因（展示用，已按成因措辞）
+    pub reason: String,
+}
+
+/// 待补装的一项（内部工作队列元素）
+#[derive(Debug, Clone)]
+struct PendingFix {
+    /// 项目 ID
+    project_id: String,
+    /// 这次安装要补的 modid（安装时校验 jar 是否真的提供它）
+    missing: Option<String>,
+    /// 是否已经为它展开过一轮依赖（只重试一次）
+    retried: bool,
 }
 
 /// 更新计划的一项
@@ -722,6 +773,37 @@ impl ModService {
             target,
             replaces,
             request,
+            expect_modid: None,
+        })
+    }
+
+    /// 为修复补装选版本的入口：正式版优先，没有正式版才接受预发布
+    ///
+    /// 依赖能不能补上不受版本渠道摆布：实测 `unified-api` 在 26.3 上只发
+    /// beta，若坚持 `allow_prerelease = false`，必需依赖永远补不上，修复
+    /// 命令等于永远失败。排名本身让正式版胜出（见 `content` 的渠道测试），
+    /// 因此这里只在「一个正式版都没有」时退一步。
+    async fn plan_dependency_install(
+        &self,
+        name: &str,
+        project: &str,
+        kind: ContentKind,
+        expect_modid: Option<&str>,
+    ) -> Result<InstallPlan, ModError> {
+        let spec = |allow_prerelease| InstallSpec {
+            version: None,
+            source: None,
+            allow_prerelease,
+        };
+        let planned = match self.plan_install(name, project, kind, spec(false)).await {
+            Err(ModError::Content(ContentError::NoCandidate { .. })) => {
+                self.plan_install(name, project, kind, spec(true)).await
+            }
+            other => other,
+        }?;
+        Ok(InstallPlan {
+            expect_modid: expect_modid.map(ToOwned::to_owned),
+            ..planned
         })
     }
 
@@ -776,12 +858,30 @@ impl ModService {
             .collect::<Vec<_>>();
         let staged = [install.path.clone()];
         let audit = self.inspect(&staged, &existing, &server).await?;
-        let (risk, missing_deps, evidence) = verdict_of(audit, &plan.file)?;
+        let staged_verdict = verdict_of(audit, &plan.file)?;
+        let StagedVerdict {
+            risk,
+            missing_deps,
+            evidence,
+            provides,
+        } = staged_verdict;
+        // 补装依赖时必须确认这个 jar 真的提供要补的 modid：上游按名字检索，
+        // 名字相近的项目可能是别的东西（`melody` ≠ `music-and-melody`）
+        if let Some(need) = &plan.expect_modid
+            && !provides.iter().any(|id| id == need)
+        {
+            return Err(ModError::WrongProvider {
+                need: need.clone(),
+                file: plan.file.clone(),
+                provides,
+            });
+        }
         let verdict = InstallVerdict::of(risk, options.allow_blocking);
         if !verdict.is_allowed() {
             return Err(ModError::Refused {
                 file: plan.file.clone(),
                 risk,
+                missing_deps,
                 evidence,
             });
         }
@@ -882,12 +982,12 @@ impl ModService {
                     continue;
                 }
                 match self.find_provider(missing, &server).await? {
-                    Some(project) => installs.push(FixInstall {
+                    Some(hit) => installs.push(FixInstall {
                         needed_by: needed_by.clone(),
                         missing: missing.clone(),
-                        project_id: project.clone(),
-                        title: project.clone(),
-                        client_only: false,
+                        project_id: hit.id,
+                        title: hit.title,
+                        client_only: hit.client_only,
                     }),
                     None => unresolved.push(missing.clone()),
                 }
@@ -896,8 +996,25 @@ impl ModService {
 
         let mut removals: Vec<FixRemove> = Vec::new();
         for report in &audit.mods {
-            // 缺依赖的文件由补装项处置，这里只管文件本身的问题
+            // 缺依赖的文件默认由补装项处置；补不上的、且文件本身只是客户端
+            // 功能时，移除才是能让服务端起得来的处置——这种情况多见于整合
+            // 包把客户端界面 mod（要客户端音乐库）一起摊到服务端上
             if !report.missing_deps.is_empty() {
+                let unsatisfiable = report
+                    .missing_deps
+                    .iter()
+                    .all(|missing| unresolved.iter().any(|seen| seen == missing));
+                let client_feature = report.capability.side.client == SideSupport::Required
+                    && report.capability.side.server != SideSupport::Required;
+                if unsatisfiable && client_feature {
+                    removals.push(FixRemove {
+                        file: PathBuf::from(&report.capability.path),
+                        reason: format!(
+                            "仅客户端功能，且必需依赖 {} 在服务端找不到可补装的提供方",
+                            report.missing_deps.join("、")
+                        ),
+                    });
+                }
                 continue;
             }
             if report.risk == Risk::Blocking {
@@ -937,7 +1054,7 @@ impl ModService {
         &self,
         modid: &str,
         server: &RegisteredServer,
-    ) -> Result<Option<String>, ModError> {
+    ) -> Result<Option<ContentProject>, ModError> {
         // 上游检索把 modid 当整词条：`geckolib3` 搜不到 `geckolib`（实测
         // 全文索引里带数字尾巴的旧命名排不进结果）。原词落空后去掉尾部
         // 版本数字再试一次；命中同样要过「非仅客户端」过滤。
@@ -960,7 +1077,7 @@ impl ModService {
                 .into_iter()
                 .find(|hit| !hit.client_only && provider_hit_matches(hit, &term))
             {
-                return Ok(Some(hit.id));
+                return Ok(Some(hit));
             }
         }
         Ok(None)
@@ -1001,21 +1118,74 @@ impl ModService {
             }
         }
 
+        let mut unresolved: Vec<String> = plan.unresolved.clone();
+        let (installed, refused) = self
+            .install_fix_batch(name, &server, kind, plan, options, &mut unresolved)
+            .await?;
+
+        Ok(ModFixApplied {
+            removed,
+            installed,
+            refused,
+            unresolved,
+        })
+    }
+
+    /// 按依赖链逐项补装，汇总装上的与被拒的
+    ///
+    /// 依赖是链不是一层：补装的 mod 自己可能还缺依赖（实测现场：fancymenu
+    /// 缺 melody，melody 又缺 unified-api）。装被拒不等于修不了——把被拒时
+    /// 暴露的缺失依赖排到队尾继续解析，本项的重试排在依赖之后。单项失败只
+    /// 记一笔，不中断其余项。
+    async fn install_fix_batch(
+        &self,
+        name: &str,
+        server: &RegisteredServer,
+        kind: ContentKind,
+        plan: &ModFixPlan,
+        options: ApplyOptions<'_>,
+        unresolved: &mut Vec<String>,
+    ) -> Result<(Vec<ModInstalled>, Vec<FixRefused>), ModError> {
         let mut installed: Vec<ModInstalled> = Vec::new();
-        let mut refused: Vec<String> = Vec::new();
-        for item in &plan.installs {
-            let install_plan = self
-                .plan_install(
+        let mut refused: Vec<FixRefused> = Vec::new();
+        let mut queue: VecDeque<PendingFix> = plan
+            .installs
+            .iter()
+            .map(|item| PendingFix {
+                project_id: item.project_id.clone(),
+                missing: Some(item.missing.clone()),
+                retried: false,
+            })
+            .collect();
+        // 已尝试过的项目 + 已成链展开过的依赖，避免互相依赖时死循环
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut expansions = 0usize;
+
+        while let Some(pending) = queue.pop_front() {
+            if visited.contains(&pending.project_id) {
+                continue;
+            }
+            let install_plan = match self
+                .plan_dependency_install(
                     name,
-                    &item.project_id,
+                    &pending.project_id,
                     kind,
-                    InstallSpec {
-                        version: None,
-                        source: None,
-                        allow_prerelease: false,
-                    },
+                    pending.missing.as_deref(),
                 )
-                .await?;
+                .await
+            {
+                Ok(plan) => plan,
+                // 逐项汇总：某一项在上游没有匹配版本（或上游本身出错）不该
+                // 让整批停下——其余待修项仍然可以装好
+                Err(err) => {
+                    visited.insert(pending.project_id.clone());
+                    refused.push(FixRefused {
+                        project_id: pending.project_id.clone(),
+                        reason: err.to_string(),
+                    });
+                    continue;
+                }
+            };
             match self
                 .install(
                     name,
@@ -1028,19 +1198,124 @@ impl ModService {
                 )
                 .await
             {
-                Ok(installed_mod) => installed.push(installed_mod),
-                // 单项被拒不拖垮整批：缺依赖项继续补，问题汇总给用户
-                Err(ModError::Refused { .. }) => refused.push(item.project_id.clone()),
-                Err(err) => return Err(err),
+                Ok(installed_mod) => {
+                    visited.insert(pending.project_id.clone());
+                    installed.push(installed_mod);
+                }
+                // 缺依赖被拒：先补它自己的依赖，再回头重试本项
+                Err(ModError::Refused { missing_deps, .. })
+                    if may_expand_dependencies(&pending, &missing_deps, expansions) =>
+                {
+                    expansions += 1;
+                    self.expand_dependency_chain(
+                        &pending,
+                        &missing_deps,
+                        server,
+                        &visited,
+                        &mut queue,
+                        unresolved,
+                        &mut refused,
+                    )
+                    .await?;
+                }
+                Err(ModError::Refused { risk, evidence, .. }) => {
+                    visited.insert(pending.project_id.clone());
+                    refused.push(FixRefused {
+                        project_id: pending.project_id.clone(),
+                        reason: refusal_reason(risk, &evidence),
+                    });
+                }
+                Err(err) => {
+                    // 命中的项目不提供这个 modid：记进 unresolved，让用户
+                    // 知道缺的依赖仍然缺着，而不是以为已经补上了
+                    if let ModError::WrongProvider { need, .. } = &err
+                        && !unresolved.contains(need)
+                    {
+                        unresolved.push(need.clone());
+                    }
+                    visited.insert(pending.project_id.clone());
+                    refused.push(FixRefused {
+                        project_id: pending.project_id.clone(),
+                        reason: err.to_string(),
+                    });
+                }
             }
         }
 
-        Ok(ModFixApplied {
-            removed,
-            installed,
-            refused,
-            unresolved: plan.unresolved.clone(),
-        })
+        Ok((installed, refused))
+    }
+
+    /// 缺依赖被拒后展开一层：依赖排进队列，本项排在其后重试
+    ///
+    /// 依赖一项都排不进去时，本项记为 refused 并说明缺哪个 modid。
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "队列、visited、unresolved 都要原地改"
+    )]
+    async fn expand_dependency_chain(
+        &self,
+        pending: &PendingFix,
+        missing_deps: &[String],
+        server: &RegisteredServer,
+        visited: &HashSet<String>,
+        queue: &mut VecDeque<PendingFix>,
+        unresolved: &mut Vec<String>,
+        refused: &mut Vec<FixRefused>,
+    ) -> Result<(), ModError> {
+        let planned = self
+            .queue_missing_deps(missing_deps, server, visited, queue, unresolved)
+            .await?;
+        if planned {
+            queue.push_back(PendingFix {
+                project_id: pending.project_id.clone(),
+                missing: pending.missing.clone(),
+                retried: true,
+            });
+            return Ok(());
+        }
+        refused.push(FixRefused {
+            project_id: pending.project_id.clone(),
+            reason: format!(
+                "缺少必需依赖 {}，上游找不到可自动补装的提供方",
+                missing_deps.join("、")
+            ),
+        });
+        Ok(())
+    }
+
+    /// 把一组缺失依赖的提供方排进补装队列
+    ///
+    /// 返回「是否至少排进去一项」：一项都排不进去说明上游确实没有可补的
+    /// 东西，调用方据此把该项记为 refused 而不是反复重试。找不到提供方的
+    /// 依赖同时进 `unresolved`，让用户看到缺的到底是哪个 modid。
+    async fn queue_missing_deps(
+        &self,
+        missing_deps: &[String],
+        server: &RegisteredServer,
+        visited: &HashSet<String>,
+        queue: &mut VecDeque<PendingFix>,
+        unresolved: &mut Vec<String>,
+    ) -> Result<bool, ModError> {
+        let mut planned = false;
+        for missing in missing_deps {
+            match self.find_provider(missing, server).await? {
+                Some(hit) if !visited.contains(&hit.id) => {
+                    queue.push_back(PendingFix {
+                        project_id: hit.id,
+                        missing: Some(missing.clone()),
+                        retried: false,
+                    });
+                    planned = true;
+                }
+                Some(_) => {}
+                None => {
+                    if !unresolved.contains(missing) {
+                        unresolved.push(missing.clone());
+                    }
+                }
+            }
+        }
+        Ok(planned)
     }
 
     /// 规划一次更新：识别已装文件并算出可更新的项，**不写盘**
@@ -1392,10 +1667,22 @@ fn new_staging(server: &RegisteredServer) -> PathBuf {
     ))
 }
 
-/// 从「只装了一个文件」的审计结果里取风险与依据
+/// 暂存文件的一次检查结论
+struct StagedVerdict {
+    /// 风险等级
+    risk: Risk,
+    /// 缺失的必需依赖
+    missing_deps: Vec<String>,
+    /// 判定依据
+    evidence: Vec<String>,
+    /// 这个 jar 能提供的 modid（含 `provides` 别名）
+    provides: Vec<String>,
+}
+
+/// 从「只装了一个文件」的审计结果里取结论
 ///
 /// 读不出来时**不**当成 `Ok`：那样用户会以为检查过了。
-fn verdict_of(audit: ModAudit, file: &str) -> Result<(Risk, Vec<String>, Vec<String>), ModError> {
+fn verdict_of(audit: ModAudit, file: &str) -> Result<StagedVerdict, ModError> {
     if let Some(report) = audit.mods.into_iter().next() {
         let evidence: Vec<String> = report
             .capability
@@ -1404,7 +1691,13 @@ fn verdict_of(audit: ModAudit, file: &str) -> Result<(Risk, Vec<String>, Vec<Str
             .iter()
             .map(|item| item.detail.clone())
             .collect();
-        return Ok((report.risk, report.missing_deps, evidence));
+        let provides = report.capability.provided_ids();
+        return Ok(StagedVerdict {
+            risk: report.risk,
+            missing_deps: report.missing_deps,
+            evidence,
+            provides,
+        });
     }
     let reason = audit.unreadable.into_iter().next().map_or_else(
         || "inspection produced no result".to_owned(),
@@ -1414,6 +1707,27 @@ fn verdict_of(audit: ModAudit, file: &str) -> Result<(Risk, Vec<String>, Vec<Str
         file: file.to_owned(),
         reason,
     })
+}
+
+/// 该不该为这一项继续往下展开依赖
+///
+/// 只在「确实缺依赖、还没为它展开过、且没到深度上限」时展开：成环的数据
+/// 必须停在一个可报告的位置。
+fn may_expand_dependencies(
+    pending: &PendingFix,
+    missing_deps: &[String],
+    expansions: usize,
+) -> bool {
+    !missing_deps.is_empty() && !pending.retried && expansions < MAX_DEPENDENCY_DEPTH
+}
+
+/// 安装被拒时的展示措辞（非依赖成因，如上游标注仅客户端）
+fn refusal_reason(risk: Risk, evidence: &[String]) -> String {
+    if evidence.is_empty() {
+        format!("安装检查判定为 {}，服务端无法装载", risk.as_str())
+    } else {
+        format!("安装检查判定为 {}：{}", risk.as_str(), evidence.join("；"))
+    }
 }
 
 /// 路径的最后一段（展示用文件名）

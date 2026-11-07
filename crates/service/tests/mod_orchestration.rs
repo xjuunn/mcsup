@@ -425,6 +425,18 @@ impl Harness {
         self.source.configure(|config| config.resolved = files);
     }
 
+    /// 追加解析结果（多个项目各自可解析时用）
+    fn add_resolved_for(&self, project: &str, files: &[(&str, &str)]) {
+        let size = self.downloader.bytes.len() as u64;
+        self.source.configure(|config| {
+            for (version, name) in files {
+                config
+                    .resolved
+                    .push(resolved_for(project, version, name, size));
+            }
+        });
+    }
+
     fn cancel_downloads(&self) {
         self.downloader.cancelled.store(true, Ordering::SeqCst);
     }
@@ -707,6 +719,325 @@ async fn apply_fix_installs_the_missing_dependency() {
     assert!(applied.refused.is_empty());
     // 补装后的文件在 mods/ 目录里
     assert!(harness.mods_dir().join("some-lib.jar").is_file());
+}
+
+/// 依赖是链不是一层：补装的 mod 自己还缺依赖时继续往下解析
+///
+/// 现场：fancymenu 缺 melody，melody 又缺 unified-api。装 melody 被安装
+/// 检查拒绝（缺 unified-api）时不能就此停手，否则每跑一次只能前进一层。
+#[tokio::test]
+async fn apply_fix_resolves_a_dependency_chain() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[
+            ("fancymenu.jar", SideSupport::Required),
+            ("melody.jar", SideSupport::Required),
+            ("unified-api.jar", SideSupport::Required),
+        ],
+        b"jar-bytes",
+    );
+    // fancymenu → melody → unified-api
+    harness.inspector.declare_dep("fancymenu.jar", "melody");
+    harness.inspector.declare_dep("melody.jar", "unified-api");
+    harness.write("mods/fancymenu.jar", b"fm");
+    harness.source.configure(|config| {
+        config.search_pool = vec![
+            search_hit("melody", false),
+            search_hit("unified-api", false),
+        ];
+        config.candidates = vec![candidate("v1")];
+    });
+    harness.set_resolved_for("melody", &[("v1", "melody.jar")]);
+    harness.add_resolved_for("unified-api", &[("v1", "unified-api.jar")]);
+
+    let plan = harness
+        .mods
+        .plan_fix("alpha", ContentKind::Mod)
+        .await
+        .expect("plan_fix");
+    assert_eq!(plan.installs.len(), 1, "{plan:?}");
+    assert_eq!(plan.installs[0].missing, "melody");
+
+    let applied = harness
+        .mods
+        .apply_fix(
+            "alpha",
+            &plan,
+            ApplyOptions {
+                allow_blocking: false,
+                progress: None,
+                cancel: &CancellationToken::new(),
+            },
+        )
+        .await
+        .expect("apply_fix");
+    let installed: Vec<&str> = applied
+        .installed
+        .iter()
+        .map(|item| item.file.as_str())
+        .collect();
+    assert_eq!(
+        installed,
+        vec!["unified-api.jar", "melody.jar"],
+        "{applied:?}"
+    );
+    assert!(applied.refused.is_empty(), "{applied:?}");
+    assert!(applied.unresolved.is_empty(), "{applied:?}");
+}
+
+/// 依赖补不上、文件又只是客户端功能：计划给出移除，而不是反复补装
+#[tokio::test]
+async fn plan_fix_proposes_removing_client_mod_with_unsatisfiable_dependency() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[
+            ("fancymenu.jar", SideSupport::Optional),
+            ("good.jar", SideSupport::Required),
+        ],
+        b"jar-bytes",
+    );
+    harness.inspector.declare_dep("fancymenu.jar", "melody");
+    harness.write("mods/fancymenu.jar", b"fm");
+    harness.write("mods/good.jar", b"good");
+    // 上游只有仅客户端的 melody：服务端没有可补的提供方
+    harness.source.configure(|config| {
+        config.search_pool = vec![search_hit("melody", true)];
+    });
+
+    let plan = harness
+        .mods
+        .plan_fix("alpha", ContentKind::Mod)
+        .await
+        .expect("plan_fix");
+    assert!(plan.installs.is_empty(), "{plan:?}");
+    assert_eq!(plan.unresolved, vec!["melody".to_owned()]);
+    assert_eq!(plan.removals.len(), 1, "{plan:?}");
+    assert!(plan.removals[0].file.ends_with("fancymenu.jar"));
+    assert!(
+        plan.removals[0].reason.contains("melody"),
+        "reason should name the dependency: {}",
+        plan.removals[0].reason
+    );
+}
+
+/// 服务端真正需要的 mod 缺依赖时不提议移除：删掉它能起，但业务就没了
+#[tokio::test]
+async fn plan_fix_keeps_server_mod_with_unsatisfiable_dependency() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[("gameplay.jar", SideSupport::Required)],
+        b"jar-bytes",
+    );
+    harness.inspector.declare_dep("gameplay.jar", "some-lib");
+    harness.write("mods/gameplay.jar", b"g");
+    harness
+        .source
+        .configure(|config| config.search_pool = Vec::new());
+
+    let plan = harness
+        .mods
+        .plan_fix("alpha", ContentKind::Mod)
+        .await
+        .expect("plan_fix");
+    assert!(plan.removals.is_empty(), "{plan:?}");
+    assert_eq!(plan.unresolved, vec!["some-lib".to_owned()]);
+}
+
+/// 上游命中的项目不提供要补的 modid：不许落盘
+///
+/// 现场：`melody` 与 `music-and-melody` 是两个项目，后者的 modid 是
+/// `music_and_melody`。按名字检索会把不相干的 jar 装进 `mods/`，之后依赖
+/// 依旧缺失，用户只会看到「补装了但没修好」。
+#[tokio::test]
+async fn apply_fix_refuses_a_provider_that_does_not_provide_the_modid() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[
+            ("fancymenu.jar", SideSupport::Required),
+            ("music-and-melody.jar", SideSupport::Required),
+        ],
+        b"jar-bytes",
+    );
+    harness.inspector.declare_dep("fancymenu.jar", "melody");
+    harness.write("mods/fancymenu.jar", b"fm");
+    harness.source.configure(|config| {
+        config.search_pool = vec![search_hit("melody", false)];
+        config.candidates = vec![candidate("v1")];
+    });
+    // 命中的项目给出来的是名字相近的另一个 mod
+    harness.set_resolved_for("melody", &[("v1", "music-and-melody.jar")]);
+
+    let plan = harness
+        .mods
+        .plan_fix("alpha", ContentKind::Mod)
+        .await
+        .expect("plan_fix");
+    let applied = harness
+        .mods
+        .apply_fix(
+            "alpha",
+            &plan,
+            ApplyOptions {
+                allow_blocking: false,
+                progress: None,
+                cancel: &CancellationToken::new(),
+            },
+        )
+        .await
+        .expect("apply_fix");
+    assert!(applied.installed.is_empty(), "{applied:?}");
+    assert!(!harness.mods_dir().join("music-and-melody.jar").exists());
+    let refused = applied.refused.first().expect("refused entry");
+    assert!(
+        refused.reason.contains("melody"),
+        "reason should name the modid: {}",
+        refused.reason
+    );
+    assert!(
+        applied.unresolved.contains(&"melody".to_owned()),
+        "melody is still missing: {applied:?}"
+    );
+}
+
+/// 上游只发预发布时依赖照样补得上
+///
+/// 现场：`unified-api` 在 26.3 上只发 beta。坚持「不要预发布」会让必需
+/// 依赖永远补不上，修复命令永远停在同一步。
+#[tokio::test]
+async fn apply_fix_falls_back_to_prerelease_for_dependencies() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[
+            ("fancymenu.jar", SideSupport::Required),
+            ("unified-api.jar", SideSupport::Required),
+        ],
+        b"jar-bytes",
+    );
+    harness
+        .inspector
+        .declare_dep("fancymenu.jar", "unified-api");
+    harness.write("mods/fancymenu.jar", b"fm");
+    harness.source.configure(|config| {
+        config.search_pool = vec![search_hit("unified-api", false)];
+        // 只有 beta，没有正式版
+        config.candidates = vec![ContentCandidate {
+            channel: "beta".to_owned(),
+            ..candidate("26.3-1.0-beta-23")
+        }];
+    });
+    harness.set_resolved_for("unified-api", &[("26.3-1.0-beta-23", "unified-api.jar")]);
+
+    let plan = harness
+        .mods
+        .plan_fix("alpha", ContentKind::Mod)
+        .await
+        .expect("plan_fix");
+    let applied = harness
+        .mods
+        .apply_fix(
+            "alpha",
+            &plan,
+            ApplyOptions {
+                allow_blocking: false,
+                progress: None,
+                cancel: &CancellationToken::new(),
+            },
+        )
+        .await
+        .expect("apply_fix");
+    assert_eq!(applied.installed.len(), 1, "{applied:?}");
+    assert!(applied.refused.is_empty(), "{applied:?}");
+    assert!(harness.mods_dir().join("unified-api.jar").is_file());
+}
+
+/// 提供方项目存在但没有匹配这台服务端的版本：记成 refused 而不是整批报错
+#[tokio::test]
+async fn apply_fix_records_provider_without_candidate() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[("fancymenu.jar", SideSupport::Required)],
+        b"jar-bytes",
+    );
+    harness.inspector.declare_dep("fancymenu.jar", "melody");
+    harness.write("mods/fancymenu.jar", b"fm");
+    harness.source.configure(|config| {
+        config.search_pool = vec![search_hit("melody", false)];
+        // 候选为空：这台服务端没有可装版本
+    });
+
+    let plan = harness
+        .mods
+        .plan_fix("alpha", ContentKind::Mod)
+        .await
+        .expect("plan_fix");
+    let applied = harness
+        .mods
+        .apply_fix(
+            "alpha",
+            &plan,
+            ApplyOptions {
+                allow_blocking: false,
+                progress: None,
+                cancel: &CancellationToken::new(),
+            },
+        )
+        .await
+        .expect("apply_fix must not fail the batch");
+    assert!(applied.installed.is_empty(), "{applied:?}");
+    let refused = applied.refused.first().expect("refused entry");
+    assert_eq!(refused.project_id, "melody");
+    assert!(!refused.reason.is_empty());
+}
+
+/// 链上某一环在上游找不到：如实报出缺的是哪个依赖，不整批失败
+#[tokio::test]
+async fn apply_fix_reports_chain_dependency_without_provider() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[
+            ("fancymenu.jar", SideSupport::Required),
+            ("melody.jar", SideSupport::Required),
+        ],
+        b"jar-bytes",
+    );
+    harness.inspector.declare_dep("fancymenu.jar", "melody");
+    harness.inspector.declare_dep("melody.jar", "unified-api");
+    harness.write("mods/fancymenu.jar", b"fm");
+    harness.source.configure(|config| {
+        // melody 找得到，unified-api 找不到
+        config.search_pool = vec![search_hit("melody", false)];
+        config.candidates = vec![candidate("v1")];
+    });
+    harness.set_resolved_for("melody", &[("v1", "melody.jar")]);
+
+    let plan = harness
+        .mods
+        .plan_fix("alpha", ContentKind::Mod)
+        .await
+        .expect("plan_fix");
+    let applied = harness
+        .mods
+        .apply_fix(
+            "alpha",
+            &plan,
+            ApplyOptions {
+                allow_blocking: false,
+                progress: None,
+                cancel: &CancellationToken::new(),
+            },
+        )
+        .await
+        .expect("apply_fix");
+
+    assert!(applied.installed.is_empty(), "{applied:?}");
+    // 结论必须说清是哪个依赖缺，而不是一句「被拒绝」
+    assert_eq!(applied.unresolved, vec!["unified-api".to_owned()]);
+    let refused = applied.refused.first().expect("refused entry");
+    assert!(
+        refused.reason.contains("unified-api"),
+        "reason should name the missing dependency: {}",
+        refused.reason
+    );
 }
 
 // ---------------------------------------------------------------- 用例

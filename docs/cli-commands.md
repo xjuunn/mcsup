@@ -233,6 +233,7 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | `remove` | `mcsup server mod remove [<name>] [<mod>] [--kind <k>] [--dry-run]` | 按文件名（可省略 `.jar`）或 modid 定位；modid 命中多个文件时不猜，列出候选并退 2 |
 | `update` | `mcsup server mod update [<name>] [<mod>] [--kind <k>] [--source <s>] [--force] [--dry-run]` | 识别 → 逐项查候选 → `decide_update` → 展示清单 → 确认后逐个安装。不给 `<mod>` 时处理全部可更新项。换名更新会把旧文件删掉，避免两份同 modid 的 jar |
 | `outdated` | `mcsup server mod outdated [<name>] [--kind <k>] [--source <s>]` | 只读版 `update`：只列可更新项，不下载 |
+| `fix` | `mcsup server mod fix [<name>] [--kind <k>] [--yes]` | 按本地审计算出修复计划（补装缺失依赖 / 移除无法装载的文件）→ 展示 → 确认 → 执行 |
 
 `--kind` 只接受 `mod` 与 `plugin`（默认 `mod`）：这两个类别由服务端从顶层目录
 直接装载，改动的就是 `mods/` 与 `plugins/`。其余类别落点不在这里——数据包在
@@ -247,6 +248,11 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
   检查 → 检查通过才原子替换进 `mods/`。暂存目录在用完（含失败）后删除。
 - **检查拒绝时不落盘**（退出码 4）：明确不可用于服务端、或缺少必需依赖。
   `--force` 放行，但风险与依据照样打印，不让强制变成静默。
+- `fix` 逐项汇总，不整批失败：**依赖按链解析**（补装的 mod 自己还缺依赖时
+  继续往下补，成环或超深时停下并报告），一项装不上只记一笔并说明原因——
+  缺依赖、上游标注仅客户端、上游没有可装版本各不相同，都写到条目上而不是
+  一句「被拒绝」。正式版优先，上游只有预发布时才接受预发布（部分依赖确实
+  只发 beta），否则必需依赖永远补不上。
 - 上游不认识某个文件时 `update` / `outdated` 把它列进「无法判断」，不当作
   「已是最新」。
 - `remote` 条目（`--origin` 指向远端服务器）在本地直接拒绝（退出码 2）：
