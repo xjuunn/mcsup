@@ -610,6 +610,62 @@ async fn plan_fix_reports_unresolved_when_no_provider() {
     assert_eq!(plan.unresolved, vec!["obscure-lib".to_owned()]);
 }
 
+/// 依赖带版本尾巴（geckolib3）而上游项目名不带（geckolib）：
+/// 原词落空后去尾重搜，仍能找到提供方
+#[tokio::test]
+async fn plan_fix_strips_trailing_digits_when_searching_provider() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[("cool-mod.jar", SideSupport::Required)],
+        b"jar-bytes",
+    );
+    harness.inspector.declare_dep("cool-mod.jar", "geckolib3");
+    harness.write("mods/cool-mod.jar", b"cool");
+    harness.source.configure(|config| {
+        // 模拟上游：搜「geckolib3」没有本体，搜「geckolib」才有
+        config.search_pool = vec![search_hit("geckolib", false)];
+        config.candidates = vec![candidate("v1")];
+    });
+    harness.set_resolved_for("geckolib", &[("v1", "geckolib.jar")]);
+
+    let plan = harness
+        .mods
+        .plan_fix("alpha", ContentKind::Mod)
+        .await
+        .expect("plan_fix");
+    assert_eq!(plan.installs.len(), 1, "{plan:?}");
+    assert_eq!(plan.installs[0].missing, "geckolib3");
+    assert_eq!(plan.installs[0].project_id, "geckolib");
+}
+
+/// 同一个依赖被多个文件缺：计划里只出现一次，不重复刷屏
+#[tokio::test]
+async fn plan_fix_dedupes_the_same_missing_dependency() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[
+            ("one.jar", SideSupport::Required),
+            ("two.jar", SideSupport::Required),
+            ("three.jar", SideSupport::Required),
+        ],
+        b"jar-bytes",
+    );
+    harness.inspector.declare_dep("one.jar", "geckolib3");
+    harness.inspector.declare_dep("two.jar", "geckolib3");
+    harness.inspector.declare_dep("three.jar", "geckolib3");
+    harness.write("mods/one.jar", b"1");
+    harness.write("mods/two.jar", b"2");
+    harness.write("mods/three.jar", b"3");
+
+    let plan = harness
+        .mods
+        .plan_fix("alpha", ContentKind::Mod)
+        .await
+        .expect("plan_fix");
+    assert!(plan.installs.is_empty());
+    assert_eq!(plan.unresolved, vec!["geckolib3".to_owned()]);
+}
+
 /// 执行修复：补装落盘
 #[tokio::test]
 async fn apply_fix_installs_the_missing_dependency() {
