@@ -118,15 +118,19 @@ impl ModInspector for ZipModInspector {
             }
         }
 
-        // MANIFEST 里的编译期 MC 版本：与 depends 交叉校验用
+        // MANIFEST 里的编译期 MC 版本：只记证据，**不**当运行区间
+        //
+        // 实测反例：Fabric Language Kotlin 只声明 `fabricloader` 依赖、
+        // 没有声明 `minecraft`（它是版本无关的语言适配器，上游版本表覆盖
+        // 1.14–26.x），但构建于 MC 26.2。把编译期版本当成运行区间会把
+        // 它判成「装不进 1.21.1」。没声明 `minecraft` 就是没有运行约束——
+        // 编译期版本只说明「作者用什么版本开发」，不是兼容性声明。
         if let Some(raw) = read_entry(&mut zip, "META-INF/MANIFEST.MF")
             && let Some(mc) = manifest_mc_version(&raw)
-            && cap.mc_versions.is_any()
         {
-            cap.mc_versions = VersionRange::exact(mc.clone());
             cap.side.evidence.push(Evidence::new(
                 EvidenceSource::Archive,
-                format!("MANIFEST 记录编译期 MC 版本 {mc}"),
+                format!("MANIFEST 记录编译期 MC 版本 {mc}（非兼容性声明）"),
             ));
         }
 

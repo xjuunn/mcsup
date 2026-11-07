@@ -571,6 +571,15 @@ pub(crate) enum ModAction {
         #[arg(long, value_name = "SOURCE", help = crate::meta::content_source_arg())]
         source: Option<String>,
     },
+    #[command(about = crate::meta::server_mod_fix())]
+    Fix {
+        #[arg(value_name = "NAME", help = crate::meta::server_mod_name_arg())]
+        name: Option<String>,
+        #[arg(long, value_name = "KIND", help = crate::meta::server_mod_kind_arg())]
+        kind: Option<String>,
+        #[arg(long, help = crate::meta::server_mod_yes_arg())]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

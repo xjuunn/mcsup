@@ -562,6 +562,97 @@ async fn nonempty_filtered_search_keeps_client_only_excluded() {
     assert!(!found.hits[0].client_only);
 }
 
+/// 修复计划：缺失依赖找到提供方 → 规划补装
+#[tokio::test]
+async fn plan_fix_installs_found_dependency() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[("cool-mod.jar", SideSupport::Required)],
+        b"jar-bytes",
+    );
+    harness.inspector.declare_dep("cool-mod.jar", "some-lib");
+    harness.write("mods/cool-mod.jar", b"cool");
+    harness.source.configure(|config| {
+        config.search_pool = vec![search_hit("some-lib", false)];
+    });
+    // 提供方要能解析出文件供补装
+    harness.set_resolved_for("some-lib", &[("v1", "some-lib.jar")]);
+
+    let plan = harness
+        .mods
+        .plan_fix("alpha", ContentKind::Mod)
+        .await
+        .expect("plan_fix");
+    assert_eq!(plan.installs.len(), 1, "{plan:?}");
+    assert_eq!(plan.installs[0].missing, "some-lib");
+    assert_eq!(plan.installs[0].project_id, "some-lib");
+    assert!(plan.unresolved.is_empty());
+    assert!(plan.removals.is_empty());
+}
+
+/// 提供方搜不到：不猜，依赖进 unresolved
+#[tokio::test]
+async fn plan_fix_reports_unresolved_when_no_provider() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[("cool-mod.jar", SideSupport::Required)],
+        b"jar-bytes",
+    );
+    harness.inspector.declare_dep("cool-mod.jar", "obscure-lib");
+    harness.write("mods/cool-mod.jar", b"cool");
+
+    let plan = harness
+        .mods
+        .plan_fix("alpha", ContentKind::Mod)
+        .await
+        .expect("plan_fix");
+    assert!(plan.installs.is_empty());
+    assert_eq!(plan.unresolved, vec!["obscure-lib".to_owned()]);
+}
+
+/// 执行修复：补装落盘
+#[tokio::test]
+async fn apply_fix_installs_the_missing_dependency() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[
+            ("cool-mod.jar", SideSupport::Required),
+            ("some-lib.jar", SideSupport::Required),
+        ],
+        b"jar-bytes",
+    );
+    harness.inspector.declare_dep("cool-mod.jar", "some-lib");
+    harness.write("mods/cool-mod.jar", b"cool");
+    harness.source.configure(|config| {
+        config.search_pool = vec![search_hit("some-lib", false)];
+        config.candidates = vec![candidate("v1")];
+    });
+    harness.set_resolved_for("some-lib", &[("v1", "some-lib.jar")]);
+
+    let plan = harness
+        .mods
+        .plan_fix("alpha", ContentKind::Mod)
+        .await
+        .expect("plan_fix");
+    let applied = harness
+        .mods
+        .apply_fix(
+            "alpha",
+            &plan,
+            ApplyOptions {
+                allow_blocking: false,
+                progress: None,
+                cancel: &CancellationToken::new(),
+            },
+        )
+        .await
+        .expect("apply_fix");
+    assert_eq!(applied.installed.len(), 1, "{applied:?}");
+    assert!(applied.refused.is_empty());
+    // 补装后的文件在 mods/ 目录里
+    assert!(harness.mods_dir().join("some-lib.jar").is_file());
+}
+
 // ---------------------------------------------------------------- 用例
 
 /// 空服务端：没有 `mods/` 目录也照常回答「没有 mod」，不报错

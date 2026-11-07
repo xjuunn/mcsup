@@ -905,13 +905,13 @@ fn blocking_issue(report: &ModReport) -> Option<String> {
     );
     if !report.missing_deps.is_empty() {
         return Some(format!(
-            "{file}: 缺少必需依赖 {}",
+            "{file}: 缺少必需依赖 {}（可执行 mcsup server mod fix 自动补装）",
             report.missing_deps.join("、")
         ));
     }
     if report.risk == Risk::Blocking {
         return Some(format!(
-            "{file}: 明确不可用于服务端（仅客户端或被上游标注）"
+            "{file}: 清单或上游判定仅客户端，服务端无法装载（可 mcsup server mod remove 移除）"
         ));
     }
     if let Some(fit) = &report.fit
@@ -921,7 +921,9 @@ fn blocking_issue(report: &ModReport) -> Option<String> {
             .issues
             .first()
             .map_or_else(|| "与服务端不匹配".to_owned(), |issue| issue.detail.clone());
-        return Some(format!("{file}: 装不进这台服务端（{detail}）"));
+        return Some(format!(
+            "{file}: {detail}（与目标服务端的版本区间不符，可移除该文件或更换适配版本）"
+        ));
     }
     None
 }
