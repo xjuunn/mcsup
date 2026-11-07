@@ -3,12 +3,30 @@
 //! 只放「怎么写」，不放「写什么」：文案与分级在 [`super::error`] 与
 //! [`crate::i18n`]，本模块不认识任何业务类型。
 
-use comfy_table::Table;
+use comfy_table::{ContentArrangement, Table, TableStyle};
 use console::measure_text_width;
 use owo_colors::{OwoColorize, Stream};
 
 /// 标签列与值列之间的固定间隔
 pub(crate) const LABEL_GAP: usize = 2;
+
+/// 紧凑表格样式：不画外框、列分隔与横线
+///
+/// 表格的职责是对齐列，不是画格子。`+----+` 与 `|` 既占宽度，又会随中文
+/// 双宽字符对不齐——框线按字符数排、内容按显示宽度排，两者一旦不一致，线就
+/// 会跑到表格外面去。列多的时候这种错位比没有框更难看。
+///
+/// 表头下也不留横线：动态排版下它按终端宽度铺满，比内容长出好几截，反而
+/// 是最显眼的错位。表头靠首行位置区分就够了。
+const COMPACT: TableStyle = TableStyle::new();
+
+/// 建一张紧凑的无边框表格
+pub(crate) fn compact_table() -> Table {
+    let mut table = Table::new();
+    table.load_style(COMPACT);
+    table.set_content_arrangement(ContentArrangement::Dynamic);
+    table
+}
 
 /// 「标签列 + 值列」对齐的一段文本
 ///

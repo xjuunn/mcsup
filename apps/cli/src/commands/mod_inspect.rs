@@ -14,7 +14,7 @@ use crate::i18n::text;
 use crate::locale::Lang;
 use crate::output::Printer;
 use anyhow::Result;
-use comfy_table::{ContentArrangement, Table};
+use comfy_table::Table;
 use mcsup::domain::mod_::{
     Confidence, FitVerdict, ModCapability, ModLoader, Risk, ServerFit, ServerTarget, SideSupport,
 };
@@ -438,8 +438,7 @@ fn print_fit_detail(report: &ModReport, printer: Printer) {
 
 /// 表格：只放结论，不放长理由
 fn build_table(audit: &ModAudit, target: &ServerTarget, lang: Lang) -> Table {
-    let mut table = Table::new();
-    table.set_content_arrangement(ContentArrangement::Dynamic);
+    let mut table = crate::output::compact_table();
     let mut header = vec![
         text(lang, "mod", "mod"),
         text(lang, "加载器", "loader"),

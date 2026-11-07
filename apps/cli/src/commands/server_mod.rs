@@ -27,8 +27,8 @@ use crate::locale::Lang;
 use crate::output::{Printer, human_bytes};
 use crate::progress::{BarSink, TaskSpinner};
 use anyhow::Result;
-use comfy_table::{ContentArrangement, Table};
-use mcsup::domain::mod_::{FitVerdict, Risk, ServerFit};
+use comfy_table::Table;
+use mcsup::domain::mod_::{FitVerdict, Risk, ServerFit, SideSupport};
 use mcsup::domain::server::content::{ContentKind, UpdateDecision};
 use mcsup::port::CancellationToken;
 use mcsup::service::{
@@ -184,6 +184,10 @@ async fn list(
     report_unreadable(&listed, printer);
     // 装不进这台服务端的文件必须逐条说明：留在 mods/ 里会让服务端起不来
     report_fit_problems(&listed, printer);
+    // 「适配」只答和这台服务端对不对得上；「风险」答的是 jar 自己能不能在
+    // 服务端跑（仅客户端、缺必需依赖）。后者不合格同样起不来，也要说清楚，
+    // 否则用户只能从服务端日志里的一行 Fabric 报错反推。
+    report_blockers(&listed, printer);
     Ok(())
 }
 
@@ -771,8 +775,7 @@ fn print_plan(plan: &InstallPlan, printer: Printer) -> Result<()> {
             .map(|path| path.display().to_string()),
     };
     let title = plan.project_title.as_deref().unwrap_or(&plan.project_id);
-    let mut table = Table::new();
-    table.set_content_arrangement(ContentArrangement::Dynamic);
+    let mut table = crate::output::compact_table();
     table.set_header([
         text(lang, "项", "field").to_owned(),
         text(lang, "值", "value").to_owned(),
@@ -879,8 +882,7 @@ fn report_installed(
 
 /// 列表表格
 fn mods_table(entries: &[&ModEntry], lang: Lang) -> Table {
-    let mut table = Table::new();
-    table.set_content_arrangement(ContentArrangement::Dynamic);
+    let mut table = crate::output::compact_table();
     table.set_header([
         text(lang, "文件", "file"),
         text(lang, "modid", "modid"),
@@ -958,6 +960,65 @@ fn report_fit_problems(list: &ModList, printer: Printer) {
     }
 }
 
+/// 会让服务端起不来的条目：逐条给理由
+///
+/// 风险为 `blocking` 有两种来源：jar 本身只能在客户端跑，或者它依赖的必需
+/// 模组不在 `mods/` 里。两种情况加载器都会在解析阶段直接终止启动，而服务端
+/// 日志里只有加载器的英文报错——用户得自己把 modid 对上文件名。
+fn report_blockers(list: &ModList, printer: Printer) {
+    let lang = printer.lang();
+    let blocked: Vec<&ModEntry> = list
+        .mods
+        .iter()
+        .filter(|entry| entry.report.risk == Risk::Blocking)
+        .collect();
+    if blocked.is_empty() {
+        return;
+    }
+    let warn = pick(
+        lang,
+        format!("{} 个文件会让服务端起不来", blocked.len()),
+        format!(
+            "{} file(s) will stop the server from starting",
+            blocked.len()
+        ),
+    );
+    printer.print_warning(&warn);
+    for entry in blocked {
+        let line = format!("  {}: {}", entry.file, blocker_reason(entry, lang));
+        if printer.is_human() {
+            printer.print_section(&line);
+        } else {
+            crate::output::print_error_line(&format!("mcsup: {line}"));
+        }
+    }
+}
+
+/// 起不来的原因：缺依赖优先，其次仅客户端
+fn blocker_reason(entry: &ModEntry, lang: Lang) -> String {
+    let report = &entry.report;
+    if !report.missing_deps.is_empty() {
+        let names = report.missing_deps.join("、");
+        return pick(
+            lang,
+            format!("缺少必需依赖 {names}，加载器会拒绝启动"),
+            format!("missing required dependency {names}; the loader will refuse to start"),
+        );
+    }
+    if report.capability.side.server == SideSupport::Unsupported {
+        return pick(
+            lang,
+            "仅客户端，服务端不会加载它".to_owned(),
+            "client-only; a server never loads it".to_owned(),
+        );
+    }
+    pick(
+        lang,
+        "被判定为不可用于服务端".to_owned(),
+        "judged unusable on a server".to_owned(),
+    )
+}
+
 /// 上游列：已识别时给项目 + 版本，未识别时明说「未识别」
 fn upstream_text(entry: &ModEntry) -> String {
     match &entry.identity {
@@ -975,8 +1036,7 @@ fn upstream_text(entry: &ModEntry) -> String {
 
 /// 更新计划表格
 fn update_table(plan: &UpdatePlan, lang: Lang) -> Table {
-    let mut table = Table::new();
-    table.set_content_arrangement(ContentArrangement::Dynamic);
+    let mut table = crate::output::compact_table();
     table.set_header([
         text(lang, "文件", "file"),
         text(lang, "项目", "project"),
