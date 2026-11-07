@@ -111,7 +111,8 @@ git status --short --branch
 stash` / `git checkout` 掩盖——如实说明哪几个文件被动了，由用户处置。
 
 完成后运行 `scripts/check.sh`，测试必须完全通过，然后提交。提交信息规范见
-`docs/development-workflow.md` 的「提交信息规范」。
+`docs/development-workflow.md` 的「提交信息规范」：标题写系统做了什么，
+用项目已有的技术词，禁止拟人化与情绪化用词（如「定罪」「甩锅」「终于」）。
 
 合入 master 必须单独取得用户同意。提交不等于同意合入，用户同意过上一个任务
 也不等于同意这个任务：
