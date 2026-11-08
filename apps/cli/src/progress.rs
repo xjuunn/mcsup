@@ -202,6 +202,11 @@ impl ProgressSink for BarSink {
                 apply_bar_style(&self.bar);
                 self.bar.disable_steady_tick();
                 self.bar.set_position(transferred);
+                // 到此为止的字节可能全是续传时磁盘上已有的部分。把它算进吞吐，
+                // 画面会瞬间飙到几十 MiB/s 再慢慢回落到真实值 —— 用户看到的是
+                // 「速度飞快但其实没在下」。重置估计器正好以当前位置为新基线
+                // （只清估计历史，不清位置）。
+                self.bar.reset_eta();
                 state.determinate = true;
             }
             // 已是定长进度条，或总长未知（保持 spinner + 已传字节）
@@ -599,6 +604,59 @@ mod tests {
         drop(session);
         assert!(cancel.is_cancelled());
         assert!(handle.is_finished());
+    }
+
+    /// 续传时不得把磁盘上已有的字节算成本轮吞吐
+    ///
+    /// Ctrl-C 后重下会从残片继续：首个 `on_progress` 就到 `transferred = 已有字节`。
+    /// indicatif 的估计器把这一跳当成「刚刚瞬间传完」，于是画面上出现几十 MiB/s
+    /// 的速度与 `ETA 0s`，再随平滑窗口收敛掉回真实值 —— 用户看到的是
+    /// 「显示很快但实际没在下」。切定长时重置估计器即以此为基线。
+    #[test]
+    fn resume_bytes_are_not_counted_as_throughput() {
+        const RESUMED: u64 = 250 * 1024 * 1024;
+        const TOTAL: u64 = 320 * 1024 * 1024;
+
+        let spinner = TaskSpinner::new("取回整合包", false);
+        let handle = spinner.handle();
+        let sink = BarSink::new(handle.clone(), "取回整合包");
+
+        sink.start();
+        sink.on_progress(RESUMED, Some(TOTAL));
+
+        // 位置照常前进（进度条要显示已完成的部分）
+        assert_eq!(handle.position(), RESUMED);
+        assert_eq!(handle.length(), Some(TOTAL));
+        // 但吞吐从零起算：一个字节都还没传，速度必须是 0 而不是 RESUMED/秒
+        assert!(
+            handle.per_sec() < 1.0,
+            "续传的已存在字节被算进了吞吐: {} B/s",
+            handle.per_sec()
+        );
+    }
+
+    /// 续传之后的真实增量仍然要统计
+    #[test]
+    fn resumed_transfer_still_reports_new_bytes() {
+        const RESUMED: u64 = 250 * 1024 * 1024;
+        const TOTAL: u64 = 320 * 1024 * 1024;
+        const STEP: u64 = 64 * 1024;
+
+        let spinner = TaskSpinner::new("取回整合包", false);
+        let handle = spinner.handle();
+        let sink = BarSink::new(handle.clone(), "取回整合包");
+
+        sink.start();
+        sink.on_progress(RESUMED, Some(TOTAL));
+        std::thread::sleep(Duration::from_millis(300));
+        sink.on_progress(RESUMED + STEP, Some(TOTAL));
+
+        assert_eq!(handle.position(), RESUMED + STEP);
+        assert!(
+            handle.per_sec() > 0.0,
+            "新传的字节没有被计入吞吐: {} B/s",
+            handle.per_sec()
+        );
     }
 
     /// 下载进度与阶段 spinner共用同一条线，且 finish 之后仍能接手
