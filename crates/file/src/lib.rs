@@ -28,6 +28,12 @@ use url::Url;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 /// 分段并发上限
 const SEGMENT_CONCURRENCY: usize = 24;
+/// 切片数相对并发度的富余倍数
+///
+/// 切片数与并发度相等时，先跑完的切片不会被补位：在途连接数一路
+/// 24 → 23 → … → 1 衰减，聚合吞吐随之衰减，观感就是「越下越慢」。
+/// 留几轮富余，队列里始终有活可派，吞吐才能持平到收尾。
+const SEGMENT_WAVES: usize = 8;
 /// 单段最小字节数，低于它不值得分段建立新建连接
 const SEGMENT_MIN_BYTES: u64 = 2 * 1024 * 1024;
 /// 整体小于该大小直接单流
@@ -130,6 +136,8 @@ struct SegmentTask {
     location: Url,
     temp_path: PathBuf,
     bounds: RangeInclusive<u64>,
+    /// 分段并发闸门：切片数多于并发度，多余的排在这里等前一片跑完补位
+    gate: Arc<Semaphore>,
     /// 全局在途许可；`None` 表示不限（见 [`FileDownloader::with_inflight_limit`]）
     inflight: Option<Arc<Semaphore>>,
     /// 本段在 [`plan_segments`] 结果里的下标，写完时报给编排侧记账
@@ -349,6 +357,7 @@ impl FileDownloader {
             }
         }
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Option<usize>>();
+        let gate = Arc::new(Semaphore::new(SEGMENT_CONCURRENCY));
         let mut handles = Vec::with_capacity(bounds_list.len() - done.len());
         for (index, bounds) in bounds_list.iter().enumerate() {
             if done.contains(&index) {
@@ -359,6 +368,7 @@ impl FileDownloader {
                 location: request.location.clone(),
                 temp_path: temp_path.to_path_buf(),
                 bounds: bounds.clone(),
+                gate: gate.clone(),
                 inflight: self.inflight.clone(),
                 index,
             };
@@ -377,6 +387,7 @@ impl FileDownloader {
             rx,
             &marks_path,
             done.is_empty(),
+            bounds_list.len(),
             &transferred,
             progress_total,
             progress,
@@ -647,8 +658,14 @@ impl FileDownloader {
 }
 
 /// 把总量切成闭区间列表
+///
+/// 切片按 [`SEGMENT_MIN_BYTES`] 取，数量上限是并发度的 [`SEGMENT_WAVES`] 倍：
+/// 上限内的每片都够大，不值得再细分；超出上限才合并，避免超大文件切出成千上万段。
+/// 关键是**切片数多于并发度**——多出来的分片排队等着，某条连接跑完立刻补位，
+/// 在途连接数才不会一路衰减到 1。
 fn plan_segments(total: u64) -> Vec<RangeInclusive<u64>> {
-    let count = (total / SEGMENT_MIN_BYTES).clamp(1, SEGMENT_CONCURRENCY as u64);
+    let cap = (SEGMENT_CONCURRENCY * SEGMENT_WAVES) as u64;
+    let count = (total / SEGMENT_MIN_BYTES).clamp(1, cap);
     let chunk = total / count;
     (0..count)
         .map(|index| {
@@ -713,6 +730,12 @@ async fn fetch_segment(
     if cancel.is_cancelled() || stop.is_cancelled() {
         return Err(DownloadError::Cancelled);
     }
+    // 先排队等分段闸门，再要全局在途许可：顺序固定才不会互相堵住
+    // （切片数多于并发度，绝大多数任务都停在这一步等前一片收尾）
+    let _gate = until_cancelled(Arc::clone(&task.gate).acquire_owned(), &[cancel, stop])
+        .await
+        .map_err(|_| DownloadError::Cancelled)?
+        .map_err(|_| DownloadError::Cancelled)?;
     // 拿在途许可也要可打断：排队等到一半用户按了 Ctrl-C 不能继续等
     let _permit = match task.inflight.as_ref() {
         Some(semaphore) => Some(
@@ -884,6 +907,7 @@ async fn record_segments(
     mut rx: UnboundedReceiver<Option<usize>>,
     marks_path: &Path,
     fresh: bool,
+    segments: usize,
     transferred: &Arc<AtomicU64>,
     progress_total: Option<u64>,
     progress: Option<&dyn ProgressSink>,
@@ -903,6 +927,13 @@ async fn record_segments(
             .await
     }
     .map_err(DownloadError::Io)?;
+    if fresh {
+        // 首行写分段数：续传时据此判断「第 i 段」还是不是同一块字节
+        marks_file
+            .write_all(format!("#{segments}\n").as_bytes())
+            .await
+            .map_err(DownloadError::Io)?;
+    }
     while let Some(event) = rx.recv().await {
         if let Some(index) = event {
             marks_file
@@ -936,11 +967,7 @@ async fn prepare_partial(
         .await
         .is_ok_and(|meta| meta.len() == total);
     let done: HashSet<usize> = if complete {
-        read_marks(marks_path)
-            .await
-            .into_iter()
-            .filter(|index| *index < segments)
-            .collect()
+        read_marks(marks_path, segments).await
     } else {
         HashSet::new()
     };
@@ -979,14 +1006,27 @@ fn marks_path_for(temp_path: &Path) -> PathBuf {
 
 /// 读已完成的段序号
 ///
-/// 记录缺失或内容不可解析都当作「没有可续的进度」：这份记录只是加速手段，
-/// 读不懂就从零重来，不该让下载失败。
-async fn read_marks(path: &Path) -> HashSet<usize> {
+/// 首行是分段数（`#<n>`）：分段方案变了，旧记录说的「第 i 段」就不是同一块字节，
+/// 必须整体作废——否则会把残缺数据当成已完成直接跳过。
+///
+/// 记录缺失、格式不认识或分段数不符都当作「没有可续的进度」：这份记录只是加速
+/// 手段，读不懂就从零重来，不该让下载失败。
+async fn read_marks(path: &Path, segments: usize) -> HashSet<usize> {
     let Ok(text) = tokio::fs::read_to_string(path).await else {
         return HashSet::new();
     };
-    text.lines()
+    let mut lines = text.lines();
+    let header = lines
+        .next()
+        .map(str::trim)
+        .and_then(|line| line.strip_prefix('#'))
+        .and_then(|count| count.parse::<usize>().ok());
+    if header != Some(segments) {
+        return HashSet::new();
+    }
+    lines
         .filter_map(|line| line.trim().parse::<usize>().ok())
+        .filter(|index| *index < segments)
         .collect()
 }
 
@@ -1342,7 +1382,7 @@ mod tests {
         let mut partial = vec![0_u8; payload.len()];
         partial[..missing_start].copy_from_slice(&payload[..missing_start]);
         std::fs::write(&temp, &partial)?;
-        let mut recorded = String::new();
+        let mut recorded = format!("#{}\n", bounds.len());
         for index in 0..missing {
             writeln!(recorded, "{index}")?;
         }
@@ -1370,6 +1410,76 @@ mod tests {
         // 段记录随成功作废；留着会让下一次同目标的下载以为已经写完
         assert!(!marks.exists(), "续传记录应被清掉");
         Ok(())
+    }
+
+    /// 分段方案变了，旧记录说的「第 i 段」就不是同一块字节：必须整体作废
+    ///
+    /// 残片长度和上游一致仍然成立，所以只靠长度查不出来。记录首行带分段数，
+    /// 对不上就从零重来——否则会把残缺的字节当成已完成直接跳过，最后只剩校验
+    /// 失败一次（白传一整份）。
+    #[tokio::test]
+    async fn stale_segment_plan_is_not_resumed() -> Result<(), Box<dyn Error>> {
+        let dir = tempdir()?;
+        let destination = dir.path().join("server.jar");
+        let payload = big_payload();
+        let total = payload.len() as u64;
+        let bounds = plan_segments(total);
+
+        let temp = temp_path_for(&destination, Some(total));
+        let marks = marks_path_for(&temp);
+        std::fs::write(&temp, vec![0_u8; payload.len()])?;
+        // 首行声明的分段数与本次计划不同（例如升级前是 2 段）
+        std::fs::write(&marks, "#2\n0\n")?;
+
+        let range = fake_range(&payload, true);
+        let downloader =
+            FileDownloader::new(fake_source(&[&payload])).with_range_source(range.clone());
+        let request = request_for(
+            &destination,
+            &payload,
+            Some(Checksum::new(ChecksumAlgorithm::Sha1, sha1_hex(&payload))),
+        );
+        downloader
+            .download(&request, None, &CancellationToken::new())
+            .await?;
+
+        assert_eq!(std::fs::read(&destination)?, payload);
+        assert_eq!(
+            range.open_calls.load(Ordering::Relaxed),
+            u32::try_from(bounds.len())?,
+            "方案不符必须整份重下"
+        );
+        Ok(())
+    }
+
+    /// 切片数必须多于并发度，否则跑完的连接不会被补位，吞吐一路衰减
+    #[test]
+    fn plan_has_spare_slices_beyond_concurrency() {
+        // 320MiB 的整合包：按最小分片切，片数远超并发度
+        let bounds = plan_segments(320 * 1024 * 1024);
+        let expected = usize::try_from(320 * 1024 * 1024 / SEGMENT_MIN_BYTES).expect("fits");
+        assert_eq!(bounds.len(), expected, "大文件按最小分片切");
+        assert!(
+            bounds.len() > SEGMENT_CONCURRENCY,
+            "切片数不多于并发度就没有补位余地"
+        );
+        // 首尾相接、无缝无洞
+        assert_eq!(*bounds.first().expect("非空").start(), 0);
+        assert_eq!(*bounds.last().expect("非空").end(), 320 * 1024 * 1024 - 1);
+        for pair in bounds.windows(2) {
+            assert_eq!(*pair[1].start(), *pair[0].end() + 1, "切片必须首尾相接");
+        }
+
+        // 小文件保持原有粒度：没必要为几十 MiB 切出上百片
+        assert_eq!(plan_segments(8 * 1024 * 1024).len(), 4);
+        // 超大文件按上限切，不无限细分（记录文件与请求数都要有界）
+        assert_eq!(
+            plan_segments(8 * 1024 * 1024 * 1024).len(),
+            SEGMENT_CONCURRENCY * SEGMENT_WAVES
+        );
+        // 小于最小分片直接一片
+        assert_eq!(plan_segments(1024 * 1024).len(), 1);
+        assert_eq!(plan_segments(1).len(), 1);
     }
 
     /// 残片长度与上游不符时不得续传：那是别的版本或上次写坏的
