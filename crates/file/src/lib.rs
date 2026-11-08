@@ -426,6 +426,22 @@ impl FileDownloader {
 
 #[async_trait]
 impl ArtifactDownloader for FileDownloader {
+    /// 按候选地址依次尝试，全部失败才报错
+    ///
+    /// 候选语义见 [`DownloadRequest::mirrors`]：同一内容的多个入口，校验和与
+    /// 大小对全部候选成立，因此换源不放宽正确性判定。
+    ///
+    /// 换源时的取舍：
+    ///
+    /// - **丢弃残片与段记录**。残片是上一个主机给的前缀，换主机后无法保证
+    ///   逐字节一致（镜像回源滞后、分块边界不同都会让同一段字节不同）；
+    ///   留着续传等于把两个来源的字节拼成一个文件，最后只能靠整体校验兜底，
+    ///   而那时已经白传了一整遍。
+    /// - **本地错误不换源**。`Io` 与 `UnsupportedAlgorithm` 是本机的问题，
+    ///   换个远端不会变好，直接返回。
+    /// - **校验失败优先上报**。若某个候选下完了但校验对不上，说明清单哈希
+    ///   可能过期，这个信号比「连接失败」有价值得多，不能被后面的传输错误
+    ///   覆盖——上层（整合包）正是凭它去回源确认权威哈希。
     async fn download(
         &self,
         request: &DownloadRequest,
@@ -445,33 +461,82 @@ impl ArtifactDownloader for FileDownloader {
             .map_err(DownloadError::Io)?;
         let temp_path = temp_path_for(&destination, request.expected_size);
         let marks_path = marks_path_for(&temp_path);
-        let outcome = tokio::time::timeout(
-            self.timeout,
-            self.transfer(&temp_path, request, progress, cancel),
-        )
-        .await;
-        let size = match outcome {
-            Ok(Ok(size)) => size,
-            Ok(Err(err)) => {
-                discard_if_unusable(&temp_path, &marks_path, &err).await;
-                return Err(err);
+
+        // 校验失败单独记：它比传输失败更能说明发生了什么
+        let mut mismatch: Option<DownloadError> = None;
+        // 主地址的错误：候选全灭时以它为准，因为那是「选中的源」给出的答复
+        let mut primary: Option<DownloadError> = None;
+        let mut last: Option<DownloadError> = None;
+
+        for (index, location) in request.candidates().enumerate() {
+            if index > 0 {
+                if cancel.is_cancelled() {
+                    return Err(DownloadError::Cancelled);
+                }
+                // 换源：上一个主机的残片不能与这一轮的字节拼接
+                remove_quietly(&temp_path).await;
+                remove_quietly(&marks_path).await;
             }
-            Err(_elapsed) => {
-                // 超时是可重试的瞬态失败，残片留着供下一轮续传
-                return Err(DownloadError::Timeout);
+            let attempt = DownloadRequest {
+                location: location.clone(),
+                ..request.clone()
+            };
+            let outcome = tokio::time::timeout(
+                self.timeout,
+                self.transfer(&temp_path, &attempt, progress, cancel),
+            )
+            .await;
+            let size = match outcome {
+                Ok(Ok(size)) => size,
+                Ok(Err(err)) => {
+                    // 取消与本地错误终止整次下载，换源没有意义
+                    if matches!(err, DownloadError::Cancelled)
+                        || matches!(err, DownloadError::Io(_))
+                        || matches!(err, DownloadError::UnsupportedAlgorithm)
+                    {
+                        return Err(err);
+                    }
+                    discard_if_unusable(&temp_path, &marks_path, &err).await;
+                    if discards_partial(&err) {
+                        if mismatch.is_none() {
+                            mismatch = Some(err);
+                        }
+                    } else if index == 0 {
+                        primary = Some(err);
+                    } else {
+                        last = Some(err);
+                    }
+                    continue;
+                }
+                Err(_elapsed) => {
+                    // 超时是可重试的瞬态失败，残片留着供下一轮续传
+                    if index == 0 {
+                        primary = Some(DownloadError::Timeout);
+                    } else {
+                        last = Some(DownloadError::Timeout);
+                    }
+                    continue;
+                }
+            };
+            if let Err(err) = tokio::fs::rename(&temp_path, &destination).await {
+                remove_quietly(&temp_path).await;
+                remove_quietly(&marks_path).await;
+                return Err(DownloadError::Io(err));
             }
-        };
-        if let Err(err) = tokio::fs::rename(&temp_path, &destination).await {
-            remove_quietly(&temp_path).await;
+            // 落盘成功，段记录随之作废；留着会让下一次同目标的下载误以为已经写完
             remove_quietly(&marks_path).await;
-            return Err(DownloadError::Io(err));
+            return Ok(DownloadedArtifact {
+                path: destination,
+                size,
+            });
         }
-        // 落盘成功，段记录随之作废；留着会让下一次同目标的下载误以为已经写完
+
+        // 全灭：清理这一轮留下的残片，避免下一次下载误续到别人的前缀
         remove_quietly(&marks_path).await;
-        Ok(DownloadedArtifact {
-            path: destination,
-            size,
-        })
+        Err(mismatch
+            .or(primary)
+            .or(last)
+            .unwrap_or(DownloadError::Cancelled))
     }
 
     /// 批量下载：有界并发 + 整批进度 + 单文件瞬态重试
@@ -1755,6 +1820,182 @@ mod tests {
         assert!(peak <= 2, "在途上限 2 却观测到峰值 {peak}");
         // 全部结束后坑位必须回零，否则上限会随下载次数累积泄漏
         assert_eq!(state.live.load(Ordering::SeqCst), 0, "在途计数未归零");
+        Ok(())
+    }
+
+    // ------------------------------------------------------- 候选地址回退
+
+    /// 按地址分派的字节源：指定地址按指定状态码失败，其余按给定内容成功
+    struct DispatchSource {
+        payload: Vec<u8>,
+        /// 失败地址 → 状态码
+        failing: Vec<(String, u16)>,
+        /// 每个地址被请求的次数
+        opened: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl ByteSource for DispatchSource {
+        async fn open(&self, location: &Url) -> Result<Box<dyn ByteReader>, SourceError> {
+            let raw = location.to_string();
+            self.opened.lock().expect("opened").push(raw.clone());
+            if let Some((_, status)) = self.failing.iter().find(|(address, _)| *address == raw) {
+                return Err(SourceError::Status { status: *status });
+            }
+            Ok(Box::new(FakeReader {
+                chunks: vec![self.payload.clone()].into_iter(),
+            }))
+        }
+    }
+
+    fn dispatch_source(payload: &[u8], failing: &[(&str, u16)]) -> Arc<DispatchSource> {
+        Arc::new(DispatchSource {
+            payload: payload.to_vec(),
+            failing: failing
+                .iter()
+                .map(|(address, status)| ((*address).to_owned(), *status))
+                .collect(),
+            opened: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn candidate_request(destination: &Path, size: u64, mirrors: &[&str]) -> DownloadRequest {
+        DownloadRequest {
+            location: "https://official.example/data/pack.mrpack"
+                .parse()
+                .expect("url"),
+            destination: destination.to_path_buf(),
+            expected: None,
+            expected_size: Some(size),
+            mirrors: mirrors
+                .iter()
+                .map(|address| address.parse().expect("url"))
+                .collect(),
+        }
+    }
+
+    /// 主地址失败后按序尝试镜像，成功的那个落盘
+    #[tokio::test]
+    async fn falls_back_to_mirror_when_primary_fails() -> Result<(), Box<dyn Error>> {
+        let dir = tempdir()?;
+        let destination = dir.path().join("pack.mrpack");
+        let payload = b"mirrored bytes";
+        let source = dispatch_source(
+            payload,
+            &[("https://official.example/data/pack.mrpack", 503)],
+        );
+        let downloader = FileDownloader::new(Arc::clone(&source) as Arc<dyn ByteSource>);
+
+        let request = candidate_request(
+            &destination,
+            payload.len() as u64,
+            &["https://mirror.example/data/pack.mrpack"],
+        );
+        let done = downloader
+            .download(&request, None, &CancellationToken::new())
+            .await?;
+
+        assert_eq!(done.size, payload.len() as u64);
+        assert_eq!(std::fs::read(&destination)?, payload);
+        assert_eq!(
+            source.opened.lock().expect("opened").as_slice(),
+            [
+                "https://official.example/data/pack.mrpack",
+                "https://mirror.example/data/pack.mrpack",
+            ],
+            "官方在前，镜像在其失败后才请求"
+        );
+        Ok(())
+    }
+
+    /// 主地址可用时不该碰镜像：多打一次请求就是白花的首字节等待
+    #[tokio::test]
+    async fn primary_success_does_not_touch_mirrors() -> Result<(), Box<dyn Error>> {
+        let dir = tempdir()?;
+        let destination = dir.path().join("pack.mrpack");
+        let payload = b"official bytes";
+        let source = dispatch_source(payload, &[]);
+        let downloader = FileDownloader::new(Arc::clone(&source) as Arc<dyn ByteSource>);
+
+        let request = candidate_request(
+            &destination,
+            payload.len() as u64,
+            &["https://mirror.example/data/pack.mrpack"],
+        );
+        downloader
+            .download(&request, None, &CancellationToken::new())
+            .await?;
+
+        assert_eq!(
+            source.opened.lock().expect("opened").len(),
+            1,
+            "主地址成功就不得再请求镜像"
+        );
+        Ok(())
+    }
+
+    /// 全部候选失败时要报出主地址的错误：那是「选中的源」给的答复
+    #[tokio::test]
+    async fn all_candidates_failing_reports_primary_error() -> Result<(), Box<dyn Error>> {
+        let dir = tempdir()?;
+        let source = dispatch_source(
+            b"",
+            &[
+                ("https://official.example/data/pack.mrpack", 503),
+                ("https://mirror.example/data/pack.mrpack", 502),
+            ],
+        );
+        let downloader = FileDownloader::new(Arc::clone(&source) as Arc<dyn ByteSource>);
+        let request = candidate_request(
+            &dir.path().join("pack.mrpack"),
+            10,
+            &["https://mirror.example/data/pack.mrpack"],
+        );
+        let err = downloader
+            .download(&request, None, &CancellationToken::new())
+            .await
+            .expect_err("全部候选失败");
+
+        match err {
+            DownloadError::Source(SourceError::Status { status }) => {
+                assert_eq!(status, 503, "应报主地址的状态码，而非最后一个候选");
+            }
+            other => panic!("期望主地址的 503，实际 {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// 某个候选下完但校验不符时，这个信号必须盖过后续的传输失败
+    ///
+    /// 上层凭 `ChecksumMismatch` 判断「清单哈希过期」，进而回源确认权威哈希；
+    /// 被一个 502 覆盖掉，整条修复路径就断了。
+    #[tokio::test]
+    async fn checksum_mismatch_outranks_transport_failure() -> Result<(), Box<dyn Error>> {
+        let dir = tempdir()?;
+        // 主地址给错内容（长度对、哈希不对），镜像直接 502
+        let source = dispatch_source(
+            b"wrong-but-sized",
+            &[("https://mirror.example/data/pack.mrpack", 502)],
+        );
+        let downloader = FileDownloader::new(Arc::clone(&source) as Arc<dyn ByteSource>);
+        let payload = b"expected-bytes";
+        let expected = Checksum::new(ChecksumAlgorithm::Sha1, sha1_hex(payload));
+        let mut request = candidate_request(
+            &dir.path().join("pack.mrpack"),
+            b"wrong-but-sized".len() as u64,
+            &["https://mirror.example/data/pack.mrpack"],
+        );
+        request.expected = Some(expected);
+
+        let err = downloader
+            .download(&request, None, &CancellationToken::new())
+            .await
+            .expect_err("校验不符");
+
+        assert!(
+            matches!(err, DownloadError::ChecksumMismatch { .. }),
+            "期望 ChecksumMismatch，实际 {err:?}"
+        );
         Ok(())
     }
 }

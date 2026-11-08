@@ -19,6 +19,7 @@ use provider::forge::ForgeSource;
 use provider::http::HttpByteSource;
 use provider::java::JavaSourceRegistry;
 use provider::leaf::LeafSource;
+use provider::mirror::{self as download_mirror, HttpSourceProbe};
 use provider::modrinth::{ModrinthModpackSource, ModrinthSource, MrpackExtractor};
 use provider::mojang::MojangSource;
 use provider::neoforge::NeoForgeSource;
@@ -27,8 +28,8 @@ use provider::purpur::PurpurSource;
 use provider::quilt::QuiltSource;
 use provider::sponge::SpongeSource;
 use service::{
-    ContentService, JavaService, ModpackService, ServerLifecycleService, ServerRegistry,
-    WorkspaceService,
+    ContentService, JavaService, ModpackService, RoutingDownloader, ServerLifecycleService,
+    ServerRegistry, SourceRouter, WorkspaceService,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -176,6 +177,13 @@ pub struct McsupBuilder {
     modpack_sources: Option<Vec<Arc<dyn ModpackSource>>>,
     modpack_extractor: Option<Arc<dyn ModpackExtractor>>,
     mod_inspector: Option<Arc<dyn port::mod_::ModInspector>>,
+    /// 下载源目录表；`None` 用 [`provider::mirror::builtin_catalog`] 加
+    /// `download-sources` 里配置的镜像前缀
+    mirror_catalog: Option<Arc<domain::mirror::Catalog>>,
+    /// 选源探测器；`None` 用真实 HTTP 探测
+    source_probe: Option<Arc<dyn port::SourceProbe>>,
+    /// 选源记录仓库；`None` 用元数据仓库
+    route_store: Option<Arc<dyn port::SourceRouteStore>>,
     /// 平台配置：决定下载并发与镜像前缀；`None` 全用缺省
     config: Option<service::Config>,
 }
@@ -210,6 +218,9 @@ impl std::fmt::Debug for McsupBuilder {
             )
             .field("modpack_extractor", &self.modpack_extractor.is_some())
             .field("mod_inspector", &self.mod_inspector.is_some())
+            .field("mirror_catalog", &self.mirror_catalog.is_some())
+            .field("source_probe", &self.source_probe.is_some())
+            .field("route_store", &self.route_store.is_some())
             .field("config", &self.config.is_some())
             .finish()
     }
@@ -272,6 +283,34 @@ impl McsupBuilder {
     #[must_use]
     pub fn config(mut self, config: service::Config) -> Self {
         self.config = Some(config);
+        self
+    }
+
+    /// 注入下载源目录表（覆盖内置目录表与 `download-sources` 配置）
+    ///
+    /// 目录表是纯数据：加一条源只需要往表里 `insert` 一个
+    /// [`domain::mirror::Source`]，不必改任何代码路径。给定它之后
+    /// `config` 里的 `download-sources` 不再参与装配，避免两处定义打架。
+    #[must_use]
+    pub fn mirror_catalog(mut self, catalog: Arc<domain::mirror::Catalog>) -> Self {
+        self.mirror_catalog = Some(catalog);
+        self
+    }
+
+    /// 注入选源探测器（接管「哪个源最快」的判定方式）
+    #[must_use]
+    pub fn source_probe(mut self, probe: Arc<dyn port::SourceProbe>) -> Self {
+        self.source_probe = Some(probe);
+        self
+    }
+
+    /// 注入选源记录仓库（接管「选择落在哪里」）
+    ///
+    /// 默认与元数据仓库共用同一个 `JsonStore`，落在
+    /// `<data>/db/download/state.json`。
+    #[must_use]
+    pub fn route_store(mut self, store: Arc<dyn port::SourceRouteStore>) -> Self {
+        self.route_store = Some(store);
         self
     }
 
@@ -390,8 +429,9 @@ impl McsupBuilder {
     #[allow(clippy::too_many_lines)] // 装配序列本身长；拆出小函数只会增加跳转
     pub fn build(self, data_dir: &Path) -> Result<Mcsup, BootstrapError> {
         let db_root = data_dir.join("db");
-        let store = match self.store {
-            Some(store) => store,
+        // 借 `self.store` 而不是 move：后面算路由组件还要用 `&self`
+        let store = match &self.store {
+            Some(store) => Arc::clone(store),
             None => {
                 Arc::new(
                     JsonStore::open(&db_root).map_err(|source| BootstrapError::Store {
@@ -405,7 +445,9 @@ impl McsupBuilder {
         let bytes = Arc::new(
             HttpByteSource::new().map_err(|err| BootstrapError::Transport(Box::new(err)))?,
         );
-        let downloader = self.downloader.unwrap_or_else(|| {
+        // 路由组件先算好：`self.downloader` 被 move 之后就不能再借 `self`
+        let router = self.router(&store)?;
+        let transport = self.downloader.unwrap_or_else(|| {
             let mut downloader =
                 FileDownloader::new(bytes.clone()).with_range_source(bytes.clone());
             if let Some(config) = &self.config {
@@ -413,6 +455,10 @@ impl McsupBuilder {
             }
             Arc::new(downloader)
         });
+        let downloader: Arc<dyn port::ArtifactDownloader> = match router {
+            Some(router) => Arc::new(RoutingDownloader::new(transport, Arc::new(router))),
+            None => transport,
+        };
 
         let java_root = Mcsup::java_root(data_dir)?;
         let java_repo: Arc<dyn port::JavaRuntimeRepository> =
@@ -476,7 +522,6 @@ impl McsupBuilder {
             Some(sources) => sources,
             None => default_jar_sources()?,
         };
-
         let content_sources = match self.content_sources {
             Some(sources) => sources,
             None => default_content_sources()?,
@@ -497,9 +542,7 @@ impl McsupBuilder {
             Arc::clone(&downloader),
         );
         if let Some(config) = &self.config {
-            modpack = modpack
-                .with_file_concurrency(config.resolved_download_concurrency())
-                .with_mirrors(config.resolved_download_sources());
+            modpack = modpack.with_file_concurrency(config.resolved_download_concurrency());
         }
 
         // mod 编排与服务端生命周期共用同一个 backend：运行中拒绝改动 mod 的
@@ -525,6 +568,63 @@ impl McsupBuilder {
             downloader,
             store,
         })
+    }
+
+    /// 组装选源组件；没有可用镜像时返回 `None`
+    ///
+    /// 「没有可用镜像」是指目录表里只剩官方源：此时装饰下载器只会给每次下载
+    /// 多加一层无用转发和一行日志，直接返回传输实现更诚实。
+    ///
+    /// 三个注入点各自独立：目录表决定「有哪些源」，探测器决定「选哪个」，
+    /// 记录仓库决定「记在哪」。默认值只用本 crate 已有的构件，宿主可逐个替换。
+    fn router(&self, store: &Arc<JsonStore>) -> Result<Option<SourceRouter>, BootstrapError> {
+        let catalog = self.catalog()?;
+        let mirrors = catalog
+            .sources()
+            .iter()
+            .filter(|source| !source.id().is_official())
+            .count();
+        if mirrors == 0 {
+            tracing::debug!("目录表里没有镜像源，跳过下载源路由");
+            return Ok(None);
+        }
+        let probe: Arc<dyn port::SourceProbe> = match &self.source_probe {
+            Some(probe) => Arc::clone(probe),
+            None => Arc::new(
+                HttpSourceProbe::new().map_err(|err| BootstrapError::Transport(Box::new(err)))?,
+            ),
+        };
+        let routes: Arc<dyn port::SourceRouteStore> = match &self.route_store {
+            Some(routes) => Arc::clone(routes),
+            None => Arc::clone(store) as Arc<dyn port::SourceRouteStore>,
+        };
+        Ok(Some(SourceRouter::new(Arc::new(catalog), probe, routes)))
+    }
+
+    /// 本次装配使用的目录表
+    ///
+    /// 显式注入优先；否则内置表 + `download-sources` 里配置的镜像前缀。
+    /// 配置里的非法前缀只报警告而不失败：一个手滑的地址不该让整个平台起不来，
+    /// 而它被忽略这件事必须留痕，否则用户会以为镜像生效了。
+    fn catalog(&self) -> Result<domain::mirror::Catalog, BootstrapError> {
+        if let Some(catalog) = &self.mirror_catalog {
+            return Ok((**catalog).clone());
+        }
+        let mut catalog = download_mirror::builtin_catalog()
+            .map_err(|err| BootstrapError::Source(Box::new(err)))?;
+        if let Some(config) = &self.config {
+            // 直接取原始条目：领域层按字符串做前缀匹配，不经 `Url` 往返
+            // （`Url` 会把路径规范化，和用户手写的形态未必一致）
+            let rejected =
+                download_mirror::with_configured_mirrors(&mut catalog, &config.download_sources);
+            for prefix in rejected {
+                tracing::warn!(
+                    prefix = %prefix,
+                    "download-sources 里的地址无法作为镜像，已忽略"
+                );
+            }
+        }
+        Ok(catalog)
     }
 }
 

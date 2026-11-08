@@ -2,6 +2,7 @@ pub mod backend;
 pub mod backup;
 pub mod content;
 pub mod error;
+pub mod mirror;
 pub mod mod_;
 pub mod modpack;
 pub mod origin;
@@ -24,6 +25,7 @@ use domain::server::version::{ServerVariant, ServerVersion, VersionId};
 use domain::server::world::{DataVersion, WorldInfo};
 use domain::workspace::{Workspace, WorkspaceId, WorkspaceName};
 pub use error::{ErrorCategory, StorageFailure};
+pub use mirror::{MemoryRouteStore, SourceProbe, SourceRouteStore};
 pub use origin::{
     LOCAL_NAME, MAX_NAME_LEN, Origin, OriginError, RESERVED_NAMES, RemoteName, Sourced,
     WorkspaceSelection,

@@ -1101,3 +1101,92 @@ fn java_scan_state_roundtrip() {
         Some(1_700_000_000)
     );
 }
+
+// ---------------------------------------------------------------- 下载源选择
+
+/// 没探过的上游面必须返回「没有记录」，不能返回官方
+///
+/// 两者语义不同：`None` 表示下次要探测，`Some(official)` 表示探过并且选中了
+/// 官方、不该再探。把前者错报成后者，镜像永远不会被启用。
+#[test]
+fn route_missing_upstream_is_none() {
+    let store = JsonStore::open_in_memory().expect("open");
+    assert_eq!(store.route("forge-maven").expect("read"), None);
+}
+
+#[test]
+fn route_remember_then_read_roundtrip() {
+    let store = JsonStore::open_in_memory().expect("open");
+    let bmclapi = SourceId::new("bmclapi").expect("id");
+    store.remember("forge-maven", &bmclapi).expect("write");
+    assert_eq!(store.route("forge-maven").expect("read"), Some(bmclapi));
+    // 另一个上游面不受影响：键是各自的，不是全局单值
+    assert_eq!(store.route("modrinth-cdn").expect("read"), None);
+}
+
+#[test]
+fn route_remember_overwrites_previous_choice() {
+    let store = JsonStore::open_in_memory().expect("open");
+    store
+        .remember("forge-maven", &SourceId::new("bmclapi").expect("id"))
+        .expect("first");
+    let mcim = SourceId::new("mcim").expect("id");
+    store.remember("forge-maven", &mcim).expect("second");
+    assert_eq!(store.route("forge-maven").expect("read"), Some(mcim));
+}
+
+/// 失败后重新选源要求能作废旧选择；重复作废不得报错
+#[test]
+fn route_forget_removes_and_is_idempotent() {
+    let store = JsonStore::open_in_memory().expect("open");
+    store
+        .remember("forge-maven", &SourceId::new("bmclapi").expect("id"))
+        .expect("write");
+    store.forget("forge-maven").expect("forget");
+    assert_eq!(store.route("forge-maven").expect("read"), None);
+    // 再忘一次：没有记录也算成功，调用方不必先查
+    store.forget("forge-maven").expect("forget twice");
+}
+
+/// 手改坏的状态文件只丢一次探测机会，不该让下载失败
+#[test]
+fn route_unparsable_choice_reads_as_none() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = JsonStore::open(dir.path()).expect("open");
+    let path = dir.path().join("download").join("state.json");
+    std::fs::write(&path, r#"{"version":1,"routes":{"forge-maven":"BMCLAPI"}}"#).expect("seed");
+    assert_eq!(
+        store.route("forge-maven").expect("read"),
+        None,
+        "非法源标识按未记录处理"
+    );
+    // 覆盖写入仍然可用，坏值不会卡住后续选择
+    let bmclapi = SourceId::new("bmclapi").expect("id");
+    store.remember("forge-maven", &bmclapi).expect("write");
+    assert_eq!(store.route("forge-maven").expect("read"), Some(bmclapi));
+}
+
+/// 选源状态只有一个文件：拆成记录文件会为含连字符的键绕开文件名规则
+#[test]
+fn route_state_uses_no_record_files() {
+    let store = JsonStore::open_in_memory().expect("open");
+    store
+        .remember("forge-maven", &SourceId::new("bmclapi").expect("id"))
+        .expect("write");
+    store
+        .remember("modrinth-cdn", &SourceId::new("mcim").expect("id"))
+        .expect("write");
+    // 目录里除了 state.json 不该再有别的文件：记录文件名要经过
+    // `RECORD_EXT` 与文件名规则，`forge-maven` 这类键走不通
+    let names: Vec<String> = std::fs::read_dir(store.collection_dir(Collection::Download))
+        .expect("read dir")
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec![STATE_FILE.to_owned()]);
+    let raw = std::fs::read_to_string(store.state_path(Collection::Download)).expect("state file");
+    let parsed: serde_json::Value = serde_json::from_str(&raw).expect("json");
+    assert_eq!(parsed["version"], DOWNLOAD_STATE_VERSION);
+    assert_eq!(parsed["routes"]["forge-maven"], "bmclapi");
+    assert_eq!(parsed["routes"]["modrinth-cdn"], "mcim");
+}

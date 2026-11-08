@@ -2,6 +2,7 @@ mod atomic;
 mod backup;
 mod content;
 mod doctor;
+mod download_source;
 mod fs;
 mod fs_error;
 mod fs_probe;
@@ -33,6 +34,8 @@ pub use doctor::{CheckKind, DoctorError, DoctorService, Finding, Report, Severit
 use domain::server::download::DownloadStatus;
 use domain::server::error::InvalidTransition;
 use domain::server::version::VersionId;
+/// 下载源路由：选源、复用、失败重选
+pub use download_source::{Route, RoutingDownloader, SourceRouter};
 pub use fs_error::FsError;
 pub use java::{
     InstallOutcome, JavaError, JavaService, RemoteJavaPackage, ScanOutcome, UninstallOutcome,

@@ -129,11 +129,22 @@ impl McsupBuilder {
     pub fn server_repository(self, r: Arc<dyn ServerRepository>) -> Self;
     pub fn workspace_repository(self, r: Arc<dyn WorkspaceRepository>) -> Self;
     pub fn jar_sources(self, s: Vec<Arc<dyn ServerJarSource>>) -> Self;
+    // 下载源三件套：目录表（纯数据）、探测器、选择记录
+    pub fn mirror_catalog(self, c: Arc<domain::mirror::Catalog>) -> Self;
+    pub fn source_probe(self, p: Arc<dyn SourceProbe>) -> Self;
+    pub fn route_store(self, s: Arc<dyn SourceRouteStore>) -> Self;
     pub fn build(self, data_dir: &Path) -> Result<Mcsup, BootstrapError>;
 }
 ```
 
 每个字段都是 `Option`：不注入就用内置实现，注入是为了让宿主接管。
+
+`downloader` 与「下载源三件套」是两个层次，不要混用：前者接管**字节怎么传**
+（传输实现、续传、校验策略），后者决定**从哪个入口传**。不注入 `downloader`
+时，组合根把内置 `FileDownloader` 交给 `RoutingDownloader` 装饰——所以宿主
+注入自己的下载器时，选源能力仍然生效；要整体接管（含选源），注入
+`mirror_catalog` 换成只剩官方源的表，路由层就自动不装（没有镜像可选时不做
+无谓装饰）。
 
 公开 API 还必须提供同步入口。大量启动器使用同步模型（Qt 主线程、Swing），
 只给 async API 会把采用门槛抬高一个数量级：
