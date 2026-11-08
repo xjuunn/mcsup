@@ -427,6 +427,63 @@ pub fn compare_mc_version(a: &str, b: &str) -> std::cmp::Ordering {
     }
 }
 
+/// 一条依赖在哪一侧生效
+///
+/// 对应 Forge / `NeoForge` 的 `[[dependencies.x]] side=` 字段。加载器在
+/// 校验依赖前先按当前 dist 过滤：`IFMLLoadingPlugin` 的
+/// `IModInfo.DependencySide.isCorrectSide()` 在 dedicated server 上对
+/// `CLIENT` 返回 false，那条依赖整个不参与校验。
+///
+/// 实测：`embeddiumplus` 把 `embeddium` / `textrues_embeddium_options` 都
+/// 声明成 `side="CLIENT"`，装到服务端照常启动；不读这个字段就会把它们
+/// 报成「缺少必需依赖」，进而误判成服务端起不来。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DepSide {
+    /// 两侧都生效（缺省值：没写 `side` 的依赖就是这个）
+    #[default]
+    Both,
+    /// 只在客户端校验
+    Client,
+    /// 只在服务端校验
+    Server,
+}
+
+impl DepSide {
+    /// 稳定机器名
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Both => "both",
+            Self::Client => "client",
+            Self::Server => "server",
+        }
+    }
+
+    /// 从 `mods.toml` 的写法解析；认不出按 [`Self::Both`]
+    #[must_use]
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_uppercase().as_str() {
+            "CLIENT" => Self::Client,
+            "SERVER" => Self::Server,
+            _ => Self::Both,
+        }
+    }
+
+    /// 在服务端上是否参与校验
+    ///
+    /// 只有 `Client` 被排除：`Both` 与 `Server` 都在服务端生效。
+    #[must_use]
+    pub const fn applies_to_server(self) -> bool {
+        !matches!(self, Self::Client)
+    }
+}
+
+impl fmt::Display for DepSide {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// 一条依赖声明
 ///
 /// 依赖**按声明它的加载器归类**：一个 jar 可以同时带 `fabric.mod.json` 与
@@ -444,6 +501,8 @@ pub struct ModDependency {
     pub mandatory: bool,
     /// 声明这条依赖的加载器；`None` 表示与加载器无关
     pub loader: Option<ModLoader>,
+    /// 这条依赖在哪一侧生效（Forge / `NeoForge` 的 `side`）
+    pub side: DepSide,
     /// 条件豁免：`present` 中任一 modid 存在时，本依赖不再必需
     ///
     /// 对应 Quilt 的 `unless` / `unless_any`：`{"id": "quilt_resource_loader",
@@ -461,6 +520,7 @@ impl ModDependency {
             version_range: version_range.into(),
             mandatory,
             loader: None,
+            side: DepSide::Both,
             unless: Vec::new(),
         }
     }
@@ -469,6 +529,13 @@ impl ModDependency {
     #[must_use]
     pub fn with_loader(mut self, loader: ModLoader) -> Self {
         self.loader = Some(loader);
+        self
+    }
+
+    /// 标注这条依赖生效的一侧
+    #[must_use]
+    pub fn with_side(mut self, side: DepSide) -> Self {
+        self.side = side;
         self
     }
 
@@ -483,9 +550,12 @@ impl ModDependency {
     ///
     /// `target` 为 `None`（未确定目标加载器）时，带加载器归属的依赖一律**不**
     /// 参与判定：没有目标就无从说它该被哪个加载器满足，报出来只会是噪声。
+    ///
+    /// 判定口径是**服务端**：本方法只用来回答「这台服务端起不起来吗」，
+    /// 因此 `side="CLIENT"` 的依赖不参与（见 [`DepSide::applies_to_server`]）。
     #[must_use]
     pub fn applies(&self, present: &[String], target: Option<ModLoader>) -> bool {
-        if !self.mandatory || is_builtin_dep(&self.id) {
+        if !self.mandatory || !self.side.applies_to_server() || is_builtin_dep(&self.id) {
             return false;
         }
         match (self.loader, target) {
@@ -570,7 +640,18 @@ pub struct ModCapability {
     /// 加载器归属（可能多个）
     pub loaders: Vec<ModLoader>,
     /// 目标 MC 版本区间
+    ///
+    /// 这是**收敛后**的一格：由 [`Self::set_mc_range`] 按加载器分别记录，
+    /// 这里给出的是「按已声明加载器的优先顺序」能用的那一份。展示用它，
+    /// 判定不要用它——判定要按目标加载器取值，见 [`Self::mc_range_for`]。
     pub mc_versions: VersionRange,
+    /// 各加载器各自声明的 MC 区间
+    ///
+    /// 同一个 jar 可以同时带多份清单，各写各的区间：实测
+    /// `Cell-Forge-1.19.2.jar` 的 `fabric.mod.json` 写 `~1.20`，
+    /// 而 `META-INF/mods.toml` 写 `[1.19.2]`。合成一格必然错一半——
+    /// 装在 Forge 服务端上会拿 Fabric 的区间去判，把能跑的 mod 判成不符。
+    pub mc_ranges: Vec<(ModLoader, VersionRange)>,
     /// 元数据声明的 Java 大版本
     pub java_required: Option<u32>,
     /// 字节码实测的 Java 大版本（取所有 class 的最大值）
@@ -611,6 +692,7 @@ impl ModCapability {
             version: None,
             loaders: Vec::new(),
             mc_versions: VersionRange::any(),
+            mc_ranges: Vec::new(),
             java_required: None,
             java_compiled: None,
             side: SideVerdict::unknown(),
@@ -620,6 +702,47 @@ impl ModCapability {
             provides: Vec::new(),
             is_library: false,
         }
+    }
+
+    /// 记录某个加载器声明的 MC 区间
+    ///
+    /// 同一加载器重复声明时后者生效（同一份清单里 `[[dependencies.*]]` 只会
+    /// 出现一个 `minecraft` 块，重复即为上游自相矛盾，取最后一条）。
+    /// 记录后重算收敛值 [`Self::mc_versions`]，让「只声明了一个加载器区间」
+    /// 的常见情形照旧可用。
+    pub fn set_mc_range(&mut self, loader: ModLoader, range: VersionRange) {
+        match self.mc_ranges.iter_mut().find(|(l, _)| *l == loader) {
+            Some(slot) => slot.1 = range,
+            None => self.mc_ranges.push((loader, range)),
+        }
+        self.mc_versions = self.collapse_mc_range();
+    }
+
+    /// 取 `target` 加载器可用的 MC 区间
+    ///
+    /// 目标加载器有自己那份就用它；没有则回落到收敛值——一份只写了
+    /// `mods.toml` 的 jar 拿去问 Fabric 服务端，本来就是加载器维度的
+    /// 不匹配，不该再叠一条假的 MC 不符。
+    #[must_use]
+    pub fn mc_range_for(&self, target: Option<ModLoader>) -> &VersionRange {
+        if let Some(target) = target
+            && let Some((_, range)) = self.mc_ranges.iter().find(|(l, _)| *l == target)
+        {
+            return range;
+        }
+        &self.mc_versions
+    }
+
+    /// 收敛值：按 [`Self::loaders`] 的顺序取第一份有记录的区间
+    fn collapse_mc_range(&self) -> VersionRange {
+        for loader in &self.loaders {
+            if let Some((_, range)) = self.mc_ranges.iter().find(|(l, _)| l == loader) {
+                return range.clone();
+            }
+        }
+        self.mc_ranges
+            .first()
+            .map_or_else(VersionRange::any, |(_, range)| range.clone())
     }
 
     /// 综合风险等级
@@ -957,14 +1080,18 @@ impl ModCapability {
             // 如此（它们只带资源，本来就不绑定版本）。把这种情况降成待确认，
             // 一台正常服务端里会有几十个条目永远停在「待确认」，这一列就没人
             // 看了——与「只扫到部分 class 就把整列作废」是同一个错误。
-            Some(_) if self.mc_versions.is_any() => Fit::Match,
+            //
+            // 取值按**目标加载器**那份区间：同一 jar 的多份清单各写各的，
+            // 拿别的加载器的区间来判会把能跑的 mod 判成不符。
+            Some(_) if self.mc_range_for(target.loader).is_any() => Fit::Match,
             Some(mc) => {
-                if self.mc_versions.contains(mc) {
+                let range = self.mc_range_for(target.loader);
+                if range.contains(mc) {
                     Fit::Match
                 } else {
                     issues.push(FitIssue::new(
                         FitDimension::McVersion,
-                        format!("声明区间 {}，服务端是 {mc}", self.mc_versions.raw),
+                        format!("声明区间 {}，服务端是 {mc}", range.raw),
                     ));
                     Fit::Mismatch
                 }
@@ -1266,6 +1393,69 @@ mod tests {
         cap.side = SideVerdict::declared(SideSupport::Required, SideSupport::Required);
         // 认得两侧都必需，但认不出加载器 → 仍需确认
         assert_eq!(cap.risk(), Risk::Review);
+    }
+
+    /// `side="CLIENT"` 的依赖在服务端不参与校验
+    ///
+    /// Forge 装载器校验依赖前按 dist 过滤：dedicated server 上
+    /// `DependencySide.CLIENT` 整条跳过。实测 embeddiumplus 的四个依赖块全写
+    /// `side="CLIENT"`，服务端照常启动。
+    #[test]
+    fn client_side_dependency_is_inactive_on_server() {
+        let dep = ModDependency::new("embeddium", "[0.3,)", true)
+            .with_loader(ModLoader::Forge)
+            .with_side(DepSide::Client);
+        assert!(!dep.applies(&[], Some(ModLoader::Forge)));
+
+        // BOTH / SERVER 照旧参与
+        let both = ModDependency::new("embeddium", "[0.3,)", true).with_loader(ModLoader::Forge);
+        assert!(both.applies(&[], Some(ModLoader::Forge)));
+        let server = ModDependency::new("x", "", true)
+            .with_loader(ModLoader::Forge)
+            .with_side(DepSide::Server);
+        assert!(server.applies(&[], Some(ModLoader::Forge)));
+    }
+
+    /// 缺省 `side` 是 BOTH：老数据与 Fabric 清单都不写这一格
+    #[test]
+    fn dependency_side_defaults_to_both() {
+        let dep = ModDependency::new("x", "", true);
+        assert_eq!(dep.side, DepSide::Both);
+        assert_eq!(DepSide::default(), DepSide::Both);
+        assert_eq!(DepSide::parse("client"), DepSide::Client);
+        assert_eq!(DepSide::parse("SERVER"), DepSide::Server);
+        // 认不出的写法按 BOTH，不猜成「仅客户端」
+        assert_eq!(DepSide::parse("sideways"), DepSide::Both);
+    }
+
+    /// 同一 jar 的多份清单各写各的 MC 区间：判定按目标加载器取值
+    ///
+    /// 实测 `Cell-Forge-1.19.2.jar`：`fabric.mod.json` 写 `~1.20`，
+    /// `META-INF/mods.toml` 写 `[1.19.2]`。合成一格必然错一半。
+    #[test]
+    fn mc_range_is_resolved_per_target_loader() {
+        let mut c = ModCapability::empty("/cell.jar");
+        c.loaders = vec![ModLoader::Fabric, ModLoader::Forge];
+        c.set_mc_range(ModLoader::Fabric, exact_range("1.20"));
+        c.set_mc_range(ModLoader::Forge, exact_range("1.19.2"));
+
+        let forge = target(ModLoader::Forge, "1.19.2", None);
+        assert_eq!(c.fit_for(&forge).mc_version, Fit::Match);
+        assert_eq!(c.fit_for(&forge).verdict, FitVerdict::Installable);
+
+        // 换成 Fabric 目标就按 Fabric 那份判
+        let fabric = target(ModLoader::Fabric, "1.19.2", None);
+        assert_eq!(c.fit_for(&fabric).mc_version, Fit::Mismatch);
+    }
+
+    /// 没有目标加载器对应的那份区间时，回落到收敛值，不凭空判不符
+    #[test]
+    fn mc_range_falls_back_when_target_loader_has_none() {
+        let mut c = ModCapability::empty("/x.jar");
+        c.loaders = vec![ModLoader::Forge];
+        c.set_mc_range(ModLoader::Forge, exact_range("1.19.2"));
+        assert!(c.mc_range_for(Some(ModLoader::NeoForge)).contains("1.19.2"));
+        assert!(c.mc_range_for(None).contains("1.19.2"));
     }
 
     #[test]

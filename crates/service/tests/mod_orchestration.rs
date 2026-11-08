@@ -238,8 +238,8 @@ impl ArtifactDownloader for FakeDownloader {
 struct Verdict {
     file: String,
     side: SideSupport,
-    /// 声明的必需依赖（modid，缺了就算缺失依赖）
-    depends: Vec<String>,
+    /// 声明的必需依赖（modid + 生效侧，缺了就算缺失依赖）
+    depends: Vec<(String, domain::mod_::DepSide)>,
 }
 
 /// 假检查器：按**文件名**给结论（暂存路径每次不同，不能按全路径匹配）
@@ -265,9 +265,14 @@ impl FakeInspector {
 
     /// 给某个文件追加一条必需依赖（用于「缺依赖」判定）
     fn declare_dep(&self, file: &str, dep: &str) {
+        self.declare_dep_with_side(file, dep, domain::mod_::DepSide::Both);
+    }
+
+    /// 同上，但指定这条依赖在哪一侧生效
+    fn declare_dep_with_side(&self, file: &str, dep: &str, side: domain::mod_::DepSide) {
         let mut verdicts = self.verdicts.lock().expect("verdicts");
         if let Some(verdict) = verdicts.iter_mut().find(|verdict| verdict.file == file) {
-            verdict.depends.push(dep.to_owned());
+            verdict.depends.push((dep.to_owned(), side));
         }
     }
 }
@@ -290,12 +295,13 @@ impl ModInspector for FakeInspector {
         capability.version = Some("1.0.0".to_owned());
         capability.loaders.push(ModLoader::Fabric);
         capability.side = SideVerdict::declared(SideSupport::Required, verdict.side);
-        for dep in &verdict.depends {
+        for (dep, dep_side) in &verdict.depends {
             capability.depends.push(domain::mod_::ModDependency {
                 id: dep.clone(),
                 version_range: String::new(),
                 mandatory: true,
                 loader: Some(ModLoader::Fabric),
+                side: *dep_side,
                 unless: Vec::new(),
             });
         }
@@ -841,6 +847,126 @@ async fn plan_fix_keeps_server_mod_with_unsatisfiable_dependency() {
         .expect("plan_fix");
     assert!(plan.removals.is_empty(), "{plan:?}");
     assert_eq!(plan.unresolved, vec!["some-lib".to_owned()]);
+}
+
+/// 依赖声明成 `side="CLIENT"` 时不算缺失：服务端加载器整段跳过
+///
+/// 现场：`embeddiumplus` 的四个依赖块全写 `side="CLIENT"`，装到 dedicated
+/// server 上正常启动。旧口径把它报成「缺少必需依赖 `embeddium` 与
+/// `textrues_embeddium_options`」，进而把一个能跑的 mod 规划成「必须移除」。
+#[tokio::test]
+async fn plan_fix_ignores_client_side_dependency() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[("embeddiumplus.jar", SideSupport::Optional)],
+        b"jar-bytes",
+    );
+    harness.inspector.declare_dep_with_side(
+        "embeddiumplus.jar",
+        "embeddium",
+        domain::mod_::DepSide::Client,
+    );
+    harness.write("mods/embeddiumplus.jar", b"ep");
+    harness
+        .source
+        .configure(|config| config.search_pool = Vec::new());
+
+    let plan = harness
+        .mods
+        .plan_fix("alpha", ContentKind::Mod)
+        .await
+        .expect("plan_fix");
+    assert!(plan.installs.is_empty(), "{plan:?}");
+    assert!(plan.removals.is_empty(), "{plan:?}");
+    assert!(plan.unresolved.is_empty(), "{plan:?}");
+}
+
+/// 移除不是销毁：文件进 `.mcsup-trash/`，用户随时能取回
+///
+/// 判定是工具的推断，可能是错的——实测已误删过两个能正常装载的 jar，只能
+/// 重新下载。移除动作必须可逆。
+#[tokio::test]
+async fn apply_fix_moves_removed_files_to_trash() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[("client-only.jar", SideSupport::Unsupported)],
+        b"jar-bytes",
+    );
+    harness.write("mods/client-only.jar", b"payload");
+
+    let plan = harness
+        .mods
+        .plan_fix("alpha", ContentKind::Mod)
+        .await
+        .expect("plan_fix");
+    assert_eq!(plan.removals.len(), 1, "{plan:?}");
+
+    let applied = harness
+        .mods
+        .apply_fix(
+            "alpha",
+            &plan,
+            ApplyOptions {
+                allow_blocking: false,
+                progress: None,
+                cancel: &CancellationToken::new(),
+            },
+        )
+        .await
+        .expect("apply_fix");
+
+    assert_eq!(applied.removed.len(), 1, "{applied:?}");
+    assert!(!harness.mods_dir().join("client-only.jar").exists());
+    let trashed = harness
+        .server_dir()
+        .join(service::TRASH_DIR)
+        .join("client-only.jar");
+    assert_eq!(
+        std::fs::read(&trashed).expect("回收站里应当有原文件"),
+        b"payload"
+    );
+}
+
+/// 回收站里的同名文件不覆盖：加序号，两份都留着
+#[tokio::test]
+async fn trash_never_overwrites_an_earlier_copy() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[("client-only.jar", SideSupport::Unsupported)],
+        b"jar-bytes",
+    );
+    harness.write("mods/client-only.jar", b"second");
+    // 上一轮移除时已经在回收站里放过同名文件
+    harness.write(".mcsup-trash/client-only.jar", b"first");
+
+    let plan = harness
+        .mods
+        .plan_fix("alpha", ContentKind::Mod)
+        .await
+        .expect("plan_fix");
+    harness
+        .mods
+        .apply_fix(
+            "alpha",
+            &plan,
+            ApplyOptions {
+                allow_blocking: false,
+                progress: None,
+                cancel: &CancellationToken::new(),
+            },
+        )
+        .await
+        .expect("apply_fix");
+
+    let trash = harness.server_dir().join(service::TRASH_DIR);
+    assert_eq!(
+        std::fs::read(trash.join("client-only.jar")).expect("read"),
+        b"first"
+    );
+    assert_eq!(
+        std::fs::read(trash.join("client-only-1.jar")).expect("read"),
+        b"second"
+    );
 }
 
 /// 上游命中的项目不提供要补的 modid：不许落盘

@@ -230,10 +230,10 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | --- | --- | --- |
 | `list` | `mcsup server mod list [<name>] [--kind <k>] [--project-info] [--source <s>] [--outdated]` | 扫描 `mods/` 的直接子项并做本地检查（加载器、客/服归属、依赖闭包、风险、**与这台服务端的匹配**）。默认**不联网**也不建表：目录本身是唯一权威，手工丢进去的文件同样会被列出。「适配」列答「装到这台服务端对不对得上」（加载器 / MC 版本 / Java），与「风险」列正交；`rejected` 的条目在表下逐条给出理由。`blocking` 的条目同样逐条给出原因（缺哪个必需依赖 / 仅客户端）——只打标记的话，用户只能从服务端日志里那行加载器报错反推。`--project-info` 才算 SHA1 反查上游项目与版本；`--outdated` 在此基础上逐项查候选版本，只列有更新的条目 |
 | `add` | `mcsup server mod add [<name>] [<spec>] [--version <id>] [--kind <k>] [--source <s>] [--prerelease] [--force] [--dry-run]` | `spec` 支持项目 ID / slug、`https://modrinth.com/<type>/<slug>` 链接、`@search <关键词>`。**不给 `spec` 时交互搜索**：打开即列这台服务端能跑的 mod（按下载量排序），输入框与列表同屏，回车按关键词远端搜索；命中项超过一页时列表末尾出现「下一页」「上一页」，Esc 逐级返回（搜索结果 → 推荐列表 → 取消）。列表只含**能在服务端运行**的项目（上游 `server_side` facet 过滤，仅客户端的光影加载器、小地图一类不会出现）。选中项目后同屏展示详情并选版本（默认只列正式版，`--prerelease` 放开），版本列表也由服务端的加载器与 MC 版本过滤。选完走两阶段：先算计划并展示（来源、版本、落点、是否替换），确认后才下载。`--version` 精确指定版本（版本 ID 与版本号都认），缺省按服务端加载器与 MC 版本自动挑最优候选。旧名 `install` / `in` 保留为别名 |
-| `remove` | `mcsup server mod remove [<name>] [<mod>] [--kind <k>] [--dry-run]` | 按文件名（可省略 `.jar`）或 modid 定位；modid 命中多个文件时不猜，列出候选并退 2 |
+| `remove` | `mcsup server mod remove [<name>] [<mod>] [--kind <k>] [--dry-run]` | 按文件名（可省略 `.jar`）或 modid 定位；modid 命中多个文件时不猜，列出候选并退 2。文件同样进 `.mcsup-trash/`，不直接删除 |
 | `update` | `mcsup server mod update [<name>] [<mod>] [--kind <k>] [--source <s>] [--force] [--dry-run]` | 识别 → 逐项查候选 → `decide_update` → 展示清单 → 确认后逐个安装。不给 `<mod>` 时处理全部可更新项。换名更新会把旧文件删掉，避免两份同 modid 的 jar |
 | `outdated` | `mcsup server mod outdated [<name>] [--kind <k>] [--source <s>]` | 只读版 `update`：只列可更新项，不下载 |
-| `fix` | `mcsup server mod fix [<name>] [--kind <k>] [--yes]` | 按本地审计算出修复计划（补装缺失依赖 / 移除无法装载的文件）→ 展示 → 确认 → 执行 |
+| `fix` | `mcsup server mod fix [<name>] [--kind <k>] [--yes]` | 按本地审计算出修复计划（补装缺失依赖 / 移出无法装载的文件）→ 展示 → 确认 → 执行。**移除是移进 `<server>/.mcsup-trash/`，不是删除**：判定是工具的推断，判错时用户能原样取回 |
 
 `--kind` 只接受 `mod` 与 `plugin`（默认 `mod`）：这两个类别由服务端从顶层目录
 直接装载，改动的就是 `mods/` 与 `plugins/`。其余类别落点不在这里——数据包在
@@ -289,12 +289,13 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | 检查项 | 依据 | 可靠度 |
 | --- | --- | --- |
 | 加载器类型 | `fabric.mod.json` / `mods.toml` / `neoforge.mods.toml` / `mcmod.info` / `plugin.yml` | 确定 |
-| 客/服（显式声明） | Fabric `environment`、NeoForge `side` | 确定 |
+| 客/服（显式声明） | Fabric `environment`、Forge / NeoForge `[[mods]] side` | Fabric 确定；Forge 的 `[[mods]] side` 只作证据（见下） |
 | Java 编译版本 | class 文件头第 6-7 字节，换算 `major - 44` | 确定 |
 | 依赖 / 不兼容 | `depends` / `recommends` / `breaks`，含 `provides` 别名与嵌套 jar | 确定 |
 | 依赖归属 | 依赖按声明它的清单归类（fabric / quilt / forge / neoforge），只采信目标加载器那份 | 确定 |
+| 依赖生效侧 | Forge / NeoForge `[[dependencies.x]] side`：`CLIENT` 的依赖在服务端不参与校验 | 确定 |
 | Quilt 条件依赖 | `unless` / `unless_any`：豁免项存在时该依赖不再必需 | 确定 |
-| 目标 MC 区间 | Fabric `depends.minecraft`、Forge `versionRange` | 高 |
+| 目标 MC 区间 | Fabric `depends.minecraft`、Forge `versionRange`，**按加载器分开记** | 高 |
 | 客/服（入口点推断） | 只有 `client` 入口、无 `main`/`server` | 中（有双端库反例） |
 | 客/服（字节码） | 常量池引用 `net/minecraft/client/`、`blaze3d` | 中，仅非 Fabric 生态采信 |
 
@@ -312,6 +313,25 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 **Fabric 的字节码扫不出客户端类**：Fabric mod 运行在 intermediary 名字空间，
 引用的是 `net/minecraft/class_2338` 而非 `net/minecraft/client/Minecraft`。
 这是刻意保留的已知限制，因此该信号对 Fabric 生态**不参与判定**，只作证据。
+
+### Forge 的 `side` 字段
+
+`mods.toml` 里有两种 `side`，含义完全不同，不能一起处置：
+
+| 写法 | 加载器是否读 | 判定 |
+| --- | --- | --- |
+| `[[mods]] side` | **不读**。Forge 1.19.2 的 `ModInfo` / `ModFileInfo` 常量池里没有这个字段名，它既不参与装载筛选也不参与依赖校验 | 只记证据，服务端侧留「判不出」，风险最多到 `review` |
+| `[[dependencies.x]] side` | 读。校验依赖前按当前 dist 过滤，dedicated server 上 `CLIENT` 整条跳过 | 计入判定：`CLIENT` 的依赖在服务端不算缺失 |
+
+实测反例（两条都由现场启动日志确认）：`CreativeCore` 写着
+`[[mods]] side="CLIENT"` 却能在 dedicated server 上装载；`embeddiumplus` 的
+四个依赖块全写 `side="CLIENT"`，服务端照常进 Done。旧口径把前者判成
+`blocking`、把后者报成「缺少必需依赖 `embeddium`」，两者都是误判。
+
+**MC 区间按加载器分开记**：同一 jar 可以同时带 `fabric.mod.json` 与
+`META-INF/mods.toml`，两份清单各写各的区间（实测 `Cell-Forge-1.19.2.jar`
+前者是 `~1.20`、后者是 `[1.19.2]`）。判定与展示都按**目标加载器**那一份取值，
+合成一格会必然错一半。
 
 ### 目标服务端匹配
 
