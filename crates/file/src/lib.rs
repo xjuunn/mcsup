@@ -14,14 +14,15 @@ use port::{
 };
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
+use std::collections::HashSet;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use url::Url;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
@@ -49,8 +50,6 @@ const BATCH_CONCURRENCY: usize = 8;
 const FILE_MAX_ATTEMPTS: u32 = 3;
 /// 文件级重试退避基数（随尝试次数线性放大）
 const FILE_RETRY_DELAY: Duration = Duration::from_millis(200);
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 /// 批量下载里的单文件进度换算
 ///
 /// 每个文件独立的 `download` 回调报的是「本文件从 0 开始已传字节」，直接透传
@@ -133,6 +132,8 @@ struct SegmentTask {
     bounds: RangeInclusive<u64>,
     /// 全局在途许可；`None` 表示不限（见 [`FileDownloader::with_inflight_limit`]）
     inflight: Option<Arc<Semaphore>>,
+    /// 本段在 [`plan_segments`] 结果里的下标，写完时报给编排侧记账
+    index: usize,
 }
 
 /// 编排 future 被丢弃时通知分段任务尽快退出
@@ -335,29 +336,31 @@ impl FileDownloader {
     ) -> Result<u64, DownloadError> {
         let total = stat.size;
         let bounds_list = plan_segments(total);
-        {
-            let file = tokio::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(temp_path)
-                .await
-                .map_err(DownloadError::Io)?;
-            file.set_len(total).await.map_err(DownloadError::Io)?;
-        }
+        let marks_path = marks_path_for(temp_path);
+        let done = prepare_partial(temp_path, &marks_path, total, bounds_list.len()).await?;
 
         let stop = CancellationToken::new();
         let _stop_guard = StopOnDrop(stop.clone());
         let transferred = Arc::new(AtomicU64::new(0));
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-        let mut handles = Vec::with_capacity(bounds_list.len());
-        for bounds in bounds_list {
+        // 已完成的段先把字节记进进度，否则续传时进度条会从 0 重来一遍
+        for index in &done {
+            if let Some(bounds) = bounds_list.get(*index) {
+                transferred.fetch_add(bounds.end() - bounds.start() + 1, Ordering::Relaxed);
+            }
+        }
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Option<usize>>();
+        let mut handles = Vec::with_capacity(bounds_list.len() - done.len());
+        for (index, bounds) in bounds_list.iter().enumerate() {
+            if done.contains(&index) {
+                continue;
+            }
             let task = SegmentTask {
                 range_source: range.clone(),
                 location: request.location.clone(),
                 temp_path: temp_path.to_path_buf(),
-                bounds,
+                bounds: bounds.clone(),
                 inflight: self.inflight.clone(),
+                index,
             };
             handles.push(tokio::spawn(run_segment(
                 task,
@@ -370,14 +373,15 @@ impl FileDownloader {
         drop(tx);
 
         let progress_total = request.expected_size.or(Some(stat.size));
-        while rx.recv().await.is_some()
-            && let Some(sink) = progress
-        {
-            sink.on_progress(transferred.load(Ordering::Relaxed), progress_total);
-        }
-        if let Some(sink) = progress {
-            sink.on_progress(transferred.load(Ordering::Relaxed), progress_total);
-        }
+        record_segments(
+            rx,
+            &marks_path,
+            done.is_empty(),
+            &transferred,
+            progress_total,
+            progress,
+        )
+        .await?;
         let mut cancelled = false;
         let mut failure: Option<DownloadError> = None;
         for handle in handles {
@@ -439,7 +443,8 @@ impl ArtifactDownloader for FileDownloader {
         tokio::fs::create_dir_all(&parent)
             .await
             .map_err(DownloadError::Io)?;
-        let temp_path = temp_path_for(&destination);
+        let temp_path = temp_path_for(&destination, request.expected_size);
+        let marks_path = marks_path_for(&temp_path);
         let outcome = tokio::time::timeout(
             self.timeout,
             self.transfer(&temp_path, request, progress, cancel),
@@ -448,18 +453,21 @@ impl ArtifactDownloader for FileDownloader {
         let size = match outcome {
             Ok(Ok(size)) => size,
             Ok(Err(err)) => {
-                remove_quietly(&temp_path).await;
+                discard_if_unusable(&temp_path, &marks_path, &err).await;
                 return Err(err);
             }
             Err(_elapsed) => {
-                remove_quietly(&temp_path).await;
+                // 超时是可重试的瞬态失败，残片留着供下一轮续传
                 return Err(DownloadError::Timeout);
             }
         };
         if let Err(err) = tokio::fs::rename(&temp_path, &destination).await {
             remove_quietly(&temp_path).await;
+            remove_quietly(&marks_path).await;
             return Err(DownloadError::Io(err));
         }
+        // 落盘成功，段记录随之作废；留着会让下一次同目标的下载误以为已经写完
+        remove_quietly(&marks_path).await;
         Ok(DownloadedArtifact {
             path: destination,
             size,
@@ -594,7 +602,7 @@ fn plan_segments(total: u64) -> Vec<RangeInclusive<u64>> {
 async fn run_segment(
     task: SegmentTask,
     transferred: Arc<AtomicU64>,
-    progress: UnboundedSender<()>,
+    progress: UnboundedSender<Option<usize>>,
     cancel: CancellationToken,
     stop: CancellationToken,
 ) -> Result<(), DownloadError> {
@@ -602,7 +610,11 @@ async fn run_segment(
     loop {
         attempt += 1;
         match fetch_segment(&task, transferred.clone(), &progress, &cancel, &stop).await {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                // 记账交给编排侧：并发写同一个记录文件会互相盖掉
+                let _ = progress.send(Some(task.index));
+                return Ok(());
+            }
             Err(err) => {
                 if attempt >= SEGMENT_MAX_ATTEMPTS || !err.retryable() {
                     stop.cancel();
@@ -629,7 +641,7 @@ async fn run_segment(
 async fn fetch_segment(
     task: &SegmentTask,
     transferred: Arc<AtomicU64>,
-    progress: &UnboundedSender<()>,
+    progress: &UnboundedSender<Option<usize>>,
     cancel: &CancellationToken,
     stop: &CancellationToken,
 ) -> Result<(), DownloadError> {
@@ -671,7 +683,9 @@ async fn fetch_segment(
             file.write_all(&chunks).await.map_err(DownloadError::Io)?;
             got += chunks.len() as u64;
             transferred.fetch_add(chunks.len() as u64, Ordering::Relaxed);
-            let _ = progress.send(());
+            // `None` 只表示「有字节进账」，让编排侧刷新进度；
+            // 段真正写完由 `run_segment` 发 `Some(下标)` 记账
+            let _ = progress.send(None);
         }
         if got != expected {
             return Err(DownloadError::Source(SourceError::Network(Box::new(
@@ -683,7 +697,7 @@ async fn fetch_segment(
     .await;
     if outcome.is_err() && got > 0 {
         transferred.fetch_sub(got, Ordering::Relaxed);
-        let _ = progress.send(());
+        let _ = progress.send(None);
     }
     outcome
 }
@@ -789,16 +803,138 @@ fn invalid_input(message: &str) -> DownloadError {
     ))
 }
 
-fn temp_path_for(destination: &Path) -> PathBuf {
+/// 失败时按 [`discards_partial`] 决定是否清掉残片与段记录
+async fn discard_if_unusable(temp_path: &Path, marks_path: &Path, err: &DownloadError) {
+    if discards_partial(err) {
+        remove_quietly(temp_path).await;
+        remove_quietly(marks_path).await;
+    }
+}
+
+/// 收段完成事件：记账并刷新进度，直到所有段任务结束
+///
+/// `fresh` 为真表示这一轮不是续传：残片已经重建，旧记录必须先截断，
+/// 否则上一轮的段序号会被下一轮当成已写完的段直接跳过。
+async fn record_segments(
+    mut rx: UnboundedReceiver<Option<usize>>,
+    marks_path: &Path,
+    fresh: bool,
+    transferred: &Arc<AtomicU64>,
+    progress_total: Option<u64>,
+    progress: Option<&dyn ProgressSink>,
+) -> Result<(), DownloadError> {
+    let mut marks_file = if fresh {
+        tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(marks_path)
+            .await
+    } else {
+        tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(marks_path)
+            .await
+    }
+    .map_err(DownloadError::Io)?;
+    while let Some(event) = rx.recv().await {
+        if let Some(index) = event {
+            marks_file
+                .write_all(format!("{index}\n").as_bytes())
+                .await
+                .map_err(DownloadError::Io)?;
+            marks_file.flush().await.map_err(DownloadError::Io)?;
+        }
+        if let Some(sink) = progress {
+            sink.on_progress(transferred.load(Ordering::Relaxed), progress_total);
+        }
+    }
+    if let Some(sink) = progress {
+        sink.on_progress(transferred.load(Ordering::Relaxed), progress_total);
+    }
+    Ok(())
+}
+
+/// 打开（或重建）残片，返回可以跳过的段
+///
+/// 残片只有在长度与上游一致时才可信：长度不符说明是别的版本或上次写坏了，
+/// 此时整份重来。记录读不懂同样按「没有可续进度」处理——它只是加速手段，
+/// 不该让下载失败。
+async fn prepare_partial(
+    temp_path: &Path,
+    marks_path: &Path,
+    total: u64,
+    segments: usize,
+) -> Result<HashSet<usize>, DownloadError> {
+    let complete = tokio::fs::metadata(temp_path)
+        .await
+        .is_ok_and(|meta| meta.len() == total);
+    let done: HashSet<usize> = if complete {
+        read_marks(marks_path)
+            .await
+            .into_iter()
+            .filter(|index| *index < segments)
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    let file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(done.is_empty())
+        .open(temp_path)
+        .await
+        .map_err(DownloadError::Io)?;
+    file.set_len(total).await.map_err(DownloadError::Io)?;
+    Ok(done)
+}
+
+/// 下载中的临时文件路径
+///
+/// 刻意**确定**（不再用随机名）：同一目标的重试与跨进程重跑都要落回同一个
+/// 文件，才谈得上接着上次写完的段续传。名字里带上清单声明的大小，换了版本
+/// 就不会误用上一版的残片；若上游改了内容而大小恰好相同，收尾的整体校验会
+/// 以 `ChecksumMismatch` 拒绝它——只浪费一次传输，不会落盘错内容。
+fn temp_path_for(destination: &Path, expected_size: Option<u64>) -> PathBuf {
     let name = destination
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("download");
-    let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_nanos());
-    destination.with_file_name(format!(".{name}.{nanos}.{seq}.tmp"))
+    let suffix = expected_size.map_or_else(|| "part".to_owned(), |size| format!("{size}.part"));
+    destination.with_file_name(format!(".{name}.{suffix}"))
+}
+
+/// 段完成记录：每行一个已写完的段序号
+fn marks_path_for(temp_path: &Path) -> PathBuf {
+    let mut marks = temp_path.as_os_str().to_owned();
+    marks.push(".marks");
+    PathBuf::from(marks)
+}
+
+/// 读已完成的段序号
+///
+/// 记录缺失或内容不可解析都当作「没有可续的进度」：这份记录只是加速手段，
+/// 读不懂就从零重来，不该让下载失败。
+async fn read_marks(path: &Path) -> HashSet<usize> {
+    let Ok(text) = tokio::fs::read_to_string(path).await else {
+        return HashSet::new();
+    };
+    text.lines()
+        .filter_map(|line| line.trim().parse::<usize>().ok())
+        .collect()
+}
+
+/// 失败后残片是否必须丢弃
+///
+/// 只有校验对不上时才丢：那些字节已被证明不是要的内容，续传会把错的拼进去。
+/// 其余失败（瞬态网络、超时、用户取消）一律保留——续传的全部意义正在于这些
+/// 场景，丢掉就等于每次中断都从头再来。
+fn discards_partial(err: &DownloadError) -> bool {
+    matches!(
+        err,
+        DownloadError::ChecksumMismatch { .. } | DownloadError::SizeMismatch { .. }
+    )
 }
 
 #[cfg(test)]
@@ -807,6 +943,7 @@ mod tests {
     use domain::server::artifact::Checksum;
     use port::{ByteReader, ByteSource, SourceError};
     use std::error::Error;
+    use std::fmt::Write as _;
     use std::sync::atomic::AtomicU32;
     use tempfile::tempdir;
     use url::Url;
@@ -1118,6 +1255,89 @@ mod tests {
             calls.iter().any(
                 |(transferred, total)| *transferred > 0 && *total == Some(payload.len() as u64)
             )
+        );
+        Ok(())
+    }
+
+    /// 断点续传：残片与段记录都在时，只补没写完的那一段
+    #[tokio::test]
+    async fn resumes_from_partial_segments() -> Result<(), Box<dyn Error>> {
+        let dir = tempdir()?;
+        let destination = dir.path().join("server.jar");
+        let payload = big_payload();
+        let total = payload.len() as u64;
+        let bounds = plan_segments(total);
+        assert!(bounds.len() > 1, "载荷要够大才谈得上分段");
+
+        // 造一个「除最后一段外都已完成」的残片：长度对齐上游，已完成段的字节是真的
+        let temp = temp_path_for(&destination, Some(total));
+        let marks = marks_path_for(&temp);
+        let missing = bounds.len() - 1;
+        let missing_start = usize::try_from(*bounds[missing].start())?;
+        let mut partial = vec![0_u8; payload.len()];
+        partial[..missing_start].copy_from_slice(&payload[..missing_start]);
+        std::fs::write(&temp, &partial)?;
+        let mut recorded = String::new();
+        for index in 0..missing {
+            writeln!(recorded, "{index}")?;
+        }
+        std::fs::write(&marks, recorded)?;
+
+        let range = fake_range(&payload, true);
+        let downloader =
+            FileDownloader::new(fake_source(&[&payload])).with_range_source(range.clone());
+        let request = request_for(
+            &destination,
+            &payload,
+            Some(Checksum::new(ChecksumAlgorithm::Sha1, sha1_hex(&payload))),
+        );
+        let done = downloader
+            .download(&request, None, &CancellationToken::new())
+            .await?;
+
+        assert_eq!(done.size, total);
+        assert_eq!(std::fs::read(&destination)?, payload);
+        assert_eq!(
+            range.open_calls.load(Ordering::Relaxed),
+            1,
+            "只该补最后一段，其余从残片续上"
+        );
+        // 段记录随成功作废；留着会让下一次同目标的下载以为已经写完
+        assert!(!marks.exists(), "续传记录应被清掉");
+        Ok(())
+    }
+
+    /// 残片长度与上游不符时不得续传：那是别的版本或上次写坏的
+    #[tokio::test]
+    async fn partial_with_wrong_size_is_not_resumed() -> Result<(), Box<dyn Error>> {
+        let dir = tempdir()?;
+        let destination = dir.path().join("server.jar");
+        let payload = big_payload();
+        let total = payload.len() as u64;
+        let bounds = plan_segments(total);
+
+        let temp = temp_path_for(&destination, Some(total));
+        let marks = marks_path_for(&temp);
+        std::fs::write(&temp, vec![7_u8; 16])?;
+        std::fs::write(&marks, "0\n")?;
+
+        let range = fake_range(&payload, true);
+        let downloader =
+            FileDownloader::new(fake_source(&[&payload])).with_range_source(range.clone());
+        let request = request_for(
+            &destination,
+            &payload,
+            Some(Checksum::new(ChecksumAlgorithm::Sha1, sha1_hex(&payload))),
+        );
+        downloader
+            .download(&request, None, &CancellationToken::new())
+            .await?;
+
+        assert_eq!(std::fs::read(&destination)?, payload);
+        assert_eq!(
+            range.open_calls.load(Ordering::Relaxed),
+            u32::try_from(bounds.len())?,
+            "长度不符必须整份重下，一个段都不能省"
         );
         Ok(())
     }
