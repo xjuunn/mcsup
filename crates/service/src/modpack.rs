@@ -112,6 +112,16 @@ pub struct ModpackInstallOptions<'a> {
     pub server_dir: &'a Path,
     /// 下载进度观察者
     pub progress: Option<&'a dyn ProgressSink>,
+    /// 已取回的本地归档；给出时不再联网下载
+    ///
+    /// `server create` 分两步：先取回清单拿 MC 版本（要写注册表），落库后再
+    /// 布置。默认做法是两步各取回一次，等于把 `.mrpack` 下两遍——国际链路上
+    /// 一个 20 MB 的包就是几分钟。把第一步取到的归档路径带过来，第二步直接
+    /// 复用本地文件，只多读一次 zip 索引（毫秒级）。
+    ///
+    /// 文件不存在时回退到正常下载：暂存目录可能已被清理，静默成功会让调用方
+    /// 拿到一个不存在的归档。
+    pub archive: Option<&'a Path>,
 }
 
 impl<'a> ModpackInstallOptions<'a> {
@@ -123,7 +133,15 @@ impl<'a> ModpackInstallOptions<'a> {
             version: None,
             server_dir,
             progress: None,
+            archive: None,
         }
+    }
+
+    /// 复用已取回的本地归档
+    #[must_use]
+    pub fn archive(mut self, archive: &'a Path) -> Self {
+        self.archive = Some(archive);
+        self
     }
 
     /// 指定来源
@@ -414,6 +432,7 @@ impl ModpackService {
                 destination: target.clone(),
                 expected: file.hashes.sha1_checksum(),
                 expected_size: (file.size > 0).then_some(file.size),
+                mirrors: Vec::new(),
             });
             index.push(position);
         }
@@ -472,6 +491,7 @@ impl ModpackService {
             downloaded_bytes,
             reused,
             skipped_client_only: 0,
+            skipped_bytes: 0,
             stale_hashes,
         })
     }
@@ -489,6 +509,7 @@ impl ModpackService {
             destination: destination.to_path_buf(),
             expected: file.checksum.clone(),
             expected_size: (file.size > 0).then_some(file.size),
+            mirrors: Vec::new(),
         };
         self.downloader.download(&request, progress, cancel).await?;
         Ok(())
@@ -536,6 +557,7 @@ impl ModpackService {
                 authoritative,
             )),
             expected_size: (file.size > 0).then_some(file.size),
+            mirrors: Vec::new(),
         };
         let downloaded = self.downloader.download(&retry, progress, cancel).await?;
         Ok(FetchedFile {
@@ -681,6 +703,11 @@ pub struct ModpackApplied {
     pub reused: usize,
     /// 按上游元数据判定为仅客户端、已跳过的文件数
     pub skipped_client_only: usize,
+    /// 因服务端不读取而未下载的字节数（资源包 / 光影 / `*.disabled`）
+    ///
+    /// 与 `downloaded_bytes` 是两个口径：这些字节既没下也没装，省下来的就是
+    /// 它。回显里单列，用户才知道「为什么这次快了几个数量级」。
+    pub skipped_bytes: u64,
     /// 清单哈希已过期、但按上游权威哈希接受的文件路径
     pub stale_hashes: Vec<String>,
 }

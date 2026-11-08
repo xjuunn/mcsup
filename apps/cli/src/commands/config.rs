@@ -12,7 +12,7 @@ use crate::prompts;
 use anyhow::{Context, Result};
 use comfy_table::Table;
 use mcsup::protocol::cli::{ConfigRow, ConfigSetJson, ConfigShowJson};
-use mcsup::service::{ConfigKey, ConfigValueError, ConfigValueErrorKind};
+use mcsup::service::{ConfigKey, ConfigValueError};
 use std::path::Path;
 
 pub(crate) fn run(action: ConfigAction, printer: Printer) -> Result<()> {
@@ -122,15 +122,24 @@ fn resolve_value(
 ///
 /// 判定在 `service`（[`ConfigValueErrorKind`]），文案在这里：库只给英文短语，
 /// 入口按当前语言拼装。
+///
+/// 直接匹配错误本身而不是 `kind()` 再二次解构：键与变体是一一对应的，
+/// 先取 kind 再拆字段等于把同一份信息读两遍，还得为「不可能」的分支写兜底。
 fn describe_value_error(err: &ConfigValueError) -> String {
-    match err.kind() {
-        ConfigValueErrorKind::Path => {
-            let ConfigValueError::Path {
-                key, value, reason, ..
-            } = err;
-            // 内层 `reason` 是库给出的英文短语，保留原文便于排查
-            format!("{key} 不是可用路径: {value}（{reason}）")
-        }
+    match err {
+        // 内层 `reason` 是库给出的英文短语，保留原文便于排查
+        ConfigValueError::Path {
+            key, value, reason, ..
+        } => format!("{key} 不是可用路径: {value}（{reason}）"),
+        ConfigValueError::Number {
+            key,
+            value,
+            min,
+            max,
+        } => format!("{key} 需要是 {min}–{max} 之间的整数，当前是 {value}"),
+        ConfigValueError::Entry {
+            key, value, reason, ..
+        } => format!("{key} 的项 {value} 不是可用的镜像前缀（{reason}）"),
     }
 }
 
@@ -173,7 +182,7 @@ fn show(file: &ConfigFile, printer: Printer) -> Result<()> {
         .iter()
         .map(|key| ConfigRow {
             key: key.as_str(),
-            value: cfg.effective(*key).display().to_string(),
+            value: cfg.effective(*key),
             source: if cfg.is_set(*key) { "file" } else { "default" },
         })
         .collect();
@@ -243,7 +252,7 @@ fn set(file: &ConfigFile, key: &str, value: &str, printer: Printer) -> Result<()
     })?;
     let previous = file.load().ok().and_then(|before| before.raw(key));
     file.save(&cfg)?;
-    let effective = cfg.effective(key).display().to_string();
+    let effective = cfg.effective(key);
     printer.print_outcome(
         &crate::i18n::pick(
             printer.lang(),
@@ -264,7 +273,7 @@ fn unset(file: &ConfigFile, key: &str, printer: Printer) -> Result<()> {
     let mut cfg = file.load()?;
     if !cfg.is_set(key) {
         // 已是缺省：幂等成功，但仍然回显生效值，不制造「改了什么」的错觉
-        let effective = cfg.effective(key).display().to_string();
+        let effective = cfg.effective(key);
         return printer.print_outcome(
             &crate::i18n::pick(
                 printer.lang(),
@@ -286,7 +295,7 @@ fn unset(file: &ConfigFile, key: &str, printer: Printer) -> Result<()> {
     let previous = cfg.raw(key);
     cfg.unset(key);
     file.save(&cfg)?;
-    let effective = cfg.effective(key).display().to_string();
+    let effective = cfg.effective(key);
     printer.print_outcome(
         &crate::i18n::pick(
             printer.lang(),

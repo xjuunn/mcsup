@@ -48,6 +48,11 @@ pub(crate) struct PickedModpack {
     /// 注册表存这个而不是 `modrinth-modpack`：之后 `server install` 要按变体
     /// 找核心来源，`modrinth-modpack` 本身没有可下载的核心。
     pub variant: ServerVariant,
+    /// 已取回的本地 `.mrpack` 路径；`None` 表示暂存已被清理，布置时重新下载
+    ///
+    /// `server create` 为拿 MC 版本必须先把包取回来一次。把它留着传给布置
+    /// 阶段，整包就只下一次；丢掉它等于在慢链路上白等一遍。
+    pub archive: Option<std::path::PathBuf>,
 }
 
 /// 每页整合包数量
@@ -375,10 +380,9 @@ async fn finish_pick(
     let variant = prepared
         .require_loader()
         .map_err(|err| anyhow::anyhow!(err.to_string()))?;
-    // 暂存目录用后就删：真正的产物在 server create 之后由 install_modpack 重新取回
-    if let Some(staging) = prepared.archive_path.parent() {
-        let _ = std::fs::remove_dir_all(staging);
-    }
+    // 归档留着给布置阶段复用：丢掉它就要为同一个 `.mrpack` 再付一次整包下载。
+    // 暂存目录在系统临时目录下，布置完成后由 install_modpack 清理。
+    let archive = prepared.archive_path.clone();
     Ok(PickedModpack {
         project_id: prepared.resolved.project_id,
         title: title.to_owned(),
@@ -386,6 +390,7 @@ async fn finish_pick(
         version_number: prepared.resolved.version_number,
         minecraft,
         variant,
+        archive: Some(archive),
     })
 }
 
@@ -652,16 +657,35 @@ pub(crate) async fn install_modpack(
     let source = service.select_source(None)?;
 
     // 1. 取回并读清单（此时才拿到 loader 版本）
+    //
+    // 归档已在选包阶段取回时（`archive`）不再联网：同一个 `.mrpack` 下两遍
+    // 在国际链路上是分钟级浪费。spinner 文案随之区分，用户能看出没重下。
+    let reuse = picked.archive.as_ref().is_some_and(|path| path.is_file());
     let spinner = TaskSpinner::new(
-        format!("取回整合包 {} {}", picked.title, picked.version_number),
+        crate::i18n::pick(
+            printer.lang(),
+            if reuse {
+                format!("读取整合包 {} {}", picked.title, picked.version_number)
+            } else {
+                format!("取回整合包 {} {}", picked.title, picked.version_number)
+            },
+            if reuse {
+                format!("reading modpack {} {}", picked.title, picked.version_number)
+            } else {
+                format!(
+                    "fetching modpack {} {}",
+                    picked.title, picked.version_number
+                )
+            },
+        ),
         printer.is_human(),
     );
+    let mut options = ModpackInstallOptions::new(server_dir).version(&picked.version_id);
+    if let Some(archive) = picked.archive.as_deref() {
+        options = options.archive(archive);
+    }
     let prepared = service
-        .prepare(
-            &picked.project_id,
-            ModpackInstallOptions::new(server_dir).version(&picked.version_id),
-            &CancellationToken::new(),
-        )
+        .prepare(&picked.project_id, options, &CancellationToken::new())
         .await
         .context("取回整合包失败")?;
     spinner.finish();
@@ -713,10 +737,12 @@ pub(crate) async fn install_modpack(
         downloaded_bytes: applied.downloaded_bytes,
         reused: applied.reused,
         skipped_client_only: applied.skipped_client_only,
+        skipped_bytes: applied.skipped_bytes,
         stale_hashes: applied.stale_hashes.len(),
         path: server_dir.display().to_string(),
     };
     let mut note = skipped_note(printer.lang(), applied.skipped_client_only);
+    note.push_str(&skipped_bytes_note(printer.lang(), applied.skipped_bytes));
     note.push_str(&stale_note(printer.lang(), applied.stale_hashes.len()));
     let human = crate::i18n::pick(
         printer.lang(),
@@ -760,10 +786,12 @@ pub(crate) fn report_remote_applied(
         downloaded_bytes: result.downloaded_bytes,
         reused: result.reused,
         skipped_client_only: result.skipped_client_only,
+        skipped_bytes: result.skipped_bytes,
         stale_hashes: result.stale_hashes,
         path,
     };
     let mut note = skipped_note(lang, result.skipped_client_only);
+    note.push_str(&skipped_bytes_note(lang, result.skipped_bytes));
     note.push_str(&stale_note(lang, result.stale_hashes));
     let human = crate::i18n::pick(
         lang,
@@ -817,6 +845,24 @@ fn stale_note(lang: crate::locale::Lang, stale: usize) -> String {
     )
 }
 
+/// 「服务端不读取的文件未下载」的提示后缀；没有时为空串
+///
+/// 资源包、光影、`*.disabled` 装了也不生效，为它们付传输时间是纯浪费。
+/// 不说一句，用户会以为清单里的这些文件被漏掉了。
+fn skipped_bytes_note(lang: crate::locale::Lang, bytes: u64) -> String {
+    if bytes == 0 {
+        return String::new();
+    }
+    let size = crate::output::human_bytes(bytes);
+    crate::i18n::pick(
+        lang,
+        format!("，服务端不读取的资源包 / 光影 / 已禁用文件省下 {size}"),
+        format!(
+            ", saved {size} by not fetching resource packs / shaders / disabled files the server never reads"
+        ),
+    )
+}
+
 /// 整合包布置结果的 JSON 形状
 #[derive(serde::Serialize)]
 struct ModpackInstallJson<'a> {
@@ -831,6 +877,8 @@ struct ModpackInstallJson<'a> {
     reused: usize,
     /// 按上游元数据判定为仅客户端、已跳过的模组数
     skipped_client_only: usize,
+    /// 服务端不读取而未下载的字节数
+    skipped_bytes: u64,
     /// 清单哈希过期、但按上游权威哈希接受的文件数
     stale_hashes: usize,
     path: String,

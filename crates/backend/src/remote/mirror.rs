@@ -62,6 +62,8 @@ pub struct RemoteModpackResult {
     pub reused: usize,
     /// 仅客户端、已跳过的文件数
     pub skipped_client_only: usize,
+    /// 服务端不读取而未下载的字节数
+    pub skipped_bytes: u64,
     /// 清单哈希过期、按上游权威哈希接受的文件数
     pub stale_hashes: usize,
 }
@@ -467,6 +469,7 @@ impl RemoteServerRepository {
                 downloaded_bytes,
                 reused,
                 skipped_client_only,
+                skipped_bytes,
                 stale_hashes,
             } => {
                 let result = RemoteModpackResult {
@@ -480,6 +483,7 @@ impl RemoteServerRepository {
                     downloaded_bytes,
                     reused,
                     skipped_client_only,
+                    skipped_bytes,
                     stale_hashes,
                 };
                 self.write_through();

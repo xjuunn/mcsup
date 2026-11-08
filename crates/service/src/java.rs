@@ -343,6 +343,7 @@ impl JavaService {
             destination: destination.clone(),
             expected: None,
             expected_size: resolved.expected_size,
+            mirrors: Vec::new(),
         };
         let artifact = match self.downloader.download(&request, progress, cancel).await {
             Ok(artifact) => artifact,

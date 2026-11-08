@@ -589,6 +589,7 @@ mod remote_tests {
         let cfg = mcsup::service::Config {
             data_dir: None,
             remotes: BTreeMap::from([("box".to_owned(), record("127.0.0.1:7681", Some(FPR)))]),
+            ..Default::default()
         };
         let member =
             build_member("box", cfg.remotes.get("box").expect("rec"), &creds).expect("member");

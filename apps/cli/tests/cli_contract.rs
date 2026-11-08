@@ -1038,7 +1038,10 @@ fn config_show_without_file_reports_defaults() {
         .iter()
         .map(|i| i["key"].as_str().expect("key"))
         .collect();
-    assert_eq!(keys, ["data-dir"]);
+    assert_eq!(
+        keys,
+        ["data-dir", "download-concurrency", "download-sources"]
+    );
     assert!(items.iter().all(|i| i["source"] == "default"), "{items:?}");
 }
 

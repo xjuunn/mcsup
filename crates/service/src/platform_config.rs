@@ -17,6 +17,22 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+/// 批量下载并发文件数的缺省值
+///
+/// 与 `file` crate 的 `BATCH_CONCURRENCY` 一致；这里再写一份是刻意的：
+/// 配置缺省是**产品决定**，下载器的内置缺省是实现细节，两者可以独立变。
+pub const DEFAULT_DOWNLOAD_CONCURRENCY: usize = 8;
+
+/// 并发文件数上限
+///
+/// 实测跨境链路上一味加并发收益极小（8 路到 32 路几乎不再涨），但同一份
+/// 文件被切成几十段并发拉时，服务端与中间设备更容易掐连接。给个上限既
+/// 防着用户手抖写个 1000，也不至于把真正宽裕的链路卡死。
+pub const MAX_DOWNLOAD_CONCURRENCY: usize = 64;
+
+/// 列表型配置项的分隔符（人类可读写，无需引号）
+const ENTRIES_SEPARATOR: &str = ",";
+
 /// 平台配置的磁盘形态（`config.toml` 的整体结构）
 ///
 /// 字段全部 `Option`：未设置即「用平台缺省」。`resolved_*` 系列负责
@@ -31,6 +47,16 @@ pub struct Config {
     /// 平台数据目录（缺省取系统数据目录下的 `mcsup`）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data_dir: Option<PathBuf>,
+    /// 批量下载并发文件数（缺省 [`DEFAULT_DOWNLOAD_CONCURRENCY`]）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub download_concurrency: Option<usize>,
+    /// mod 文件镜像前缀，按顺序在主源之前尝试
+    ///
+    /// 存**前缀**而不是完整地址：镜像站的路径规则跟着上游走（Modrinth 是
+    /// `https://mirror.example/data/<项目>/versions/<版本>/<文件>`），存整条
+    /// 地址就得为一个整合包写几百行配置，而且上游一换文件名全作废。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub download_sources: Vec<String>,
     /// 已配对的远端：键是远端名，值是一条配对记录
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub remotes: BTreeMap<String, RemoteRecord>,
@@ -100,17 +126,27 @@ impl std::fmt::Display for RemoteVia {
 pub enum ConfigKey {
     /// `data-dir`：平台数据目录
     DataDir,
+    /// `download-concurrency`：批量下载的并发文件数
+    DownloadConcurrency,
+    /// `download-sources`：mod 文件的镜像前缀，逗号分隔
+    DownloadSources,
 }
 
 impl ConfigKey {
     /// 全部配置键，顺序即 `config show` 与报错文案的稳定顺序
-    pub const ALL: &'static [Self] = &[Self::DataDir];
+    pub const ALL: &'static [Self] = &[
+        Self::DataDir,
+        Self::DownloadConcurrency,
+        Self::DownloadSources,
+    ];
 
     /// 配置文件里的键名（kebab-case，与 `server set` 同一口径）
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::DataDir => "data-dir",
+            Self::DownloadConcurrency => "download-concurrency",
+            Self::DownloadSources => "download-sources",
         }
     }
 
@@ -119,6 +155,8 @@ impl ConfigKey {
     pub const fn describe(self) -> &'static str {
         match self {
             Self::DataDir => "平台数据目录（workspaces / java / db 都在其下）",
+            Self::DownloadConcurrency => "批量下载并发文件数（缺省 8，范围 1–64）",
+            Self::DownloadSources => "mod 文件镜像前缀，逗号分隔（缺省只用官方源）",
         }
     }
 
@@ -133,6 +171,8 @@ impl ConfigKey {
     pub fn default_display(self) -> String {
         match self {
             Self::DataDir => Config::default_data_dir().display().to_string(),
+            Self::DownloadConcurrency => DEFAULT_DOWNLOAD_CONCURRENCY.to_string(),
+            Self::DownloadSources => ENTRIES_SEPARATOR.to_owned(),
         }
     }
 }
@@ -160,6 +200,28 @@ pub enum ConfigValueError {
         /// 具体原因（英文短语，由本 crate 给出）
         reason: &'static str,
     },
+    /// 数值型键的取值越界或不是数字
+    #[error("{key} must be a number in {min}..={max}, got {value:?}")]
+    Number {
+        /// 键名
+        key: &'static str,
+        /// 原始输入
+        value: String,
+        /// 允许的下界
+        min: usize,
+        /// 允许的上界
+        max: usize,
+    },
+    /// 列表型键的某一项不可用（空项、非 http(s)、含查询或锚点）
+    #[error("{key} entry {value:?} is not a usable base URL ({reason})")]
+    Entry {
+        /// 键名
+        key: &'static str,
+        /// 不可用的那一项
+        value: String,
+        /// 具体原因（英文短语，由本 crate 给出）
+        reason: &'static str,
+    },
 }
 
 impl ConfigValueError {
@@ -167,7 +229,9 @@ impl ConfigValueError {
     #[must_use]
     pub fn category(&self) -> port::ErrorCategory {
         match self {
-            Self::Path { .. } => port::ErrorCategory::Usage,
+            Self::Path { .. } | Self::Number { .. } | Self::Entry { .. } => {
+                port::ErrorCategory::Usage
+            }
         }
     }
 
@@ -176,6 +240,8 @@ impl ConfigValueError {
     pub fn kind(&self) -> ConfigValueErrorKind {
         match self {
             Self::Path { .. } => ConfigValueErrorKind::Path,
+            Self::Number { .. } => ConfigValueErrorKind::Number,
+            Self::Entry { .. } => ConfigValueErrorKind::Entry,
         }
     }
 }
@@ -185,6 +251,10 @@ impl ConfigValueError {
 pub enum ConfigValueErrorKind {
     /// 路径不可用
     Path,
+    /// 数值越界
+    Number,
+    /// 列表项不是可用的地址前缀
+    Entry,
 }
 
 /// 整份配置文本无法解析
@@ -240,11 +310,21 @@ impl Config {
         self.data_dir.clone().unwrap_or_else(Self::default_data_dir)
     }
 
-    /// 该键的生效值（当前只有 `data-dir`，即规范化后的绝对路径）
+    /// 该键的生效值，统一为展示用字符串
+    ///
+    /// 返回 `String` 而不是 `PathBuf`：键表里既有路径也有数值与列表，用一个
+    /// 能表达三者的形态才不会为了「多一个数值键」去改所有调用方。列表按
+    /// [`ENTRIES_SEPARATOR`] 连接，因此 `raw` 与 `effective` 对同一份配置
+    /// 产出的文本是一致的（未设置时 `effective` 给缺省、`raw` 给 `None`）。
     #[must_use]
-    pub fn effective(&self, key: ConfigKey) -> PathBuf {
+    pub fn effective(&self, key: ConfigKey) -> String {
         match key {
-            ConfigKey::DataDir => self.resolved_data_dir(),
+            ConfigKey::DataDir => self.resolved_data_dir().display().to_string(),
+            ConfigKey::DownloadConcurrency => self
+                .download_concurrency
+                .unwrap_or(DEFAULT_DOWNLOAD_CONCURRENCY)
+                .to_string(),
+            ConfigKey::DownloadSources => self.download_sources.join(ENTRIES_SEPARATOR),
         }
     }
 
@@ -253,6 +333,8 @@ impl Config {
     pub fn is_set(&self, key: ConfigKey) -> bool {
         match key {
             ConfigKey::DataDir => self.data_dir.is_some(),
+            ConfigKey::DownloadConcurrency => self.download_concurrency.is_some(),
+            ConfigKey::DownloadSources => !self.download_sources.is_empty(),
         }
     }
 
@@ -260,12 +342,19 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// 路径无法归一化或枚举取值不在表内时返回 [`ConfigValueError`]
+    /// 路径无法归一化、数值越界或列表项不是合法 URL 前缀时返回
+    /// [`ConfigValueError`]
     pub fn set(&mut self, key: ConfigKey, value: &str) -> Result<(), ConfigValueError> {
         match key {
             ConfigKey::DataDir => {
                 let path = parse_path(key.as_str(), value)?;
                 self.data_dir = Some(path);
+            }
+            ConfigKey::DownloadConcurrency => {
+                self.download_concurrency = Some(parse_concurrency(key.as_str(), value)?);
+            }
+            ConfigKey::DownloadSources => {
+                self.download_sources = parse_sources(key.as_str(), value)?;
             }
         }
         Ok(())
@@ -275,6 +364,8 @@ impl Config {
     pub fn unset(&mut self, key: ConfigKey) {
         match key {
             ConfigKey::DataDir => self.data_dir = None,
+            ConfigKey::DownloadConcurrency => self.download_concurrency = None,
+            ConfigKey::DownloadSources => self.download_sources.clear(),
         }
     }
 
@@ -286,6 +377,9 @@ impl Config {
                 .data_dir
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
+            ConfigKey::DownloadConcurrency => self.download_concurrency.map(|n| n.to_string()),
+            ConfigKey::DownloadSources => (!self.download_sources.is_empty())
+                .then(|| self.download_sources.join(ENTRIES_SEPARATOR)),
         }
     }
 
@@ -383,6 +477,54 @@ fn parse_path(key: &'static str, value: &str) -> Result<PathBuf, ConfigValueErro
     Ok(normalized)
 }
 
+/// 校验并发文件数
+///
+/// 范围收紧到 `1..=MAX_DOWNLOAD_CONCURRENCY`：`0` 在下层是「用实现内置缺省」的
+/// 哨兵值，配置里允许写会让人以为关掉了下载；上限见该常量的说明。
+fn parse_concurrency(key: &'static str, value: &str) -> Result<usize, ConfigValueError> {
+    let trimmed = value.trim();
+    let number = trimmed
+        .parse::<usize>()
+        .ok()
+        .filter(|n| (1..=MAX_DOWNLOAD_CONCURRENCY).contains(n));
+    number.ok_or_else(|| ConfigValueError::Number {
+        key,
+        value: value.to_owned(),
+        min: 1,
+        max: MAX_DOWNLOAD_CONCURRENCY,
+    })
+}
+
+/// 校验并归一化镜像前缀列表
+///
+/// 每一项都是**前缀**，不是完整地址：下载器会把上游路径原样接在后面。因此
+/// 校验必须拒掉带查询串或锚点的写法——它们拼上路径后语义不可意料，用户会
+/// 得到一个只在部分文件上失败的诡异状态，而不是一条明确的配置错误。
+///
+/// 空项被丢弃而不是报错：`a.com,,b.com` 这种手滑不该让整份配置不可用。
+fn parse_sources(key: &'static str, value: &str) -> Result<Vec<String>, ConfigValueError> {
+    let mut sources = Vec::new();
+    for entry in value.split(ENTRIES_SEPARATOR) {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let err = |reason: &'static str| ConfigValueError::Entry {
+            key,
+            value: trimmed.to_owned(),
+            reason,
+        };
+        if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
+            return Err(err("only http:// or https:// prefixes are supported"));
+        }
+        if trimmed.contains('?') || trimmed.contains('#') {
+            return Err(err("a mirror prefix cannot carry a query or a fragment"));
+        }
+        sources.push(trimmed.trim_end_matches('/').to_owned());
+    }
+    Ok(sources)
+}
+
 /// `~` / `~/x` 展开到家目录；其余原样
 fn expand_home(value: &str) -> PathBuf {
     let home = dirs::home_dir();
@@ -428,10 +570,83 @@ mod tests {
     #[test]
     fn key_names_are_stable_kebab_case() {
         let names: Vec<&str> = ConfigKey::ALL.iter().map(|k| k.as_str()).collect();
-        assert_eq!(names, vec!["data-dir"]);
+        assert_eq!(
+            names,
+            vec!["data-dir", "download-concurrency", "download-sources"]
+        );
         assert_eq!(ConfigKey::parse("data-dir"), Some(ConfigKey::DataDir));
+        assert_eq!(
+            ConfigKey::parse("download-concurrency"),
+            Some(ConfigKey::DownloadConcurrency)
+        );
+        assert_eq!(
+            ConfigKey::parse("download-sources"),
+            Some(ConfigKey::DownloadSources)
+        );
         assert_eq!(ConfigKey::parse("Data-Dir"), None);
         assert_eq!(ConfigKey::parse("nope"), None);
+    }
+
+    /// 并发数只接受 1..=上限：`0` 在下层是「用实现内置缺省」的哨兵，
+    /// 配置里写它会让人以为关掉了下载，所以必须在键表这一层就挡掉。
+    #[test]
+    fn concurrency_rejects_out_of_range() {
+        let mut cfg = Config::default();
+        for bad in ["0", "65", "abc", "", "-1", "8.5"] {
+            assert!(
+                cfg.set(ConfigKey::DownloadConcurrency, bad).is_err(),
+                "{bad:?} 应被拒绝"
+            );
+            assert!(!cfg.is_set(ConfigKey::DownloadConcurrency), "失败不得写入");
+        }
+        for good in ["1", "8", "64"] {
+            cfg.set(ConfigKey::DownloadConcurrency, good)
+                .unwrap_or_else(|err| panic!("{good:?} 应被接受: {err}"));
+            assert_eq!(cfg.effective(ConfigKey::DownloadConcurrency), good);
+        }
+        cfg.unset(ConfigKey::DownloadConcurrency);
+        assert_eq!(
+            cfg.effective(ConfigKey::DownloadConcurrency),
+            DEFAULT_DOWNLOAD_CONCURRENCY.to_string()
+        );
+    }
+
+    /// 镜像前缀必须是纯前缀：带查询串或锚点的写法拼上路径后语义不可意料，
+    /// 会让下载只在部分文件上失败，比直接报配置错误难查得多。
+    #[test]
+    fn sources_reject_non_prefix_urls() {
+        let mut cfg = Config::default();
+        for bad in [
+            "mirror.example",
+            "ftp://mirror.example",
+            "https://mirror.example/?a=1",
+            "https://mirror.example/#x",
+        ] {
+            assert!(
+                cfg.set(ConfigKey::DownloadSources, bad).is_err(),
+                "{bad:?} 应被拒绝"
+            );
+        }
+        // 空项被丢弃而不是整份报错：手滑多打一个逗号不该让配置不可用
+        cfg.set(
+            ConfigKey::DownloadSources,
+            " https://a.example/ , , https://b.example ",
+        )
+        .expect("合法");
+        assert_eq!(
+            cfg.download_sources,
+            vec![
+                "https://a.example".to_owned(),
+                "https://b.example".to_owned()
+            ]
+        );
+        assert!(cfg.is_set(ConfigKey::DownloadSources));
+        // 列表写回文本后要能被重新解析出同一份列表
+        let raw = cfg.raw(ConfigKey::DownloadSources).expect("已设置");
+        assert_eq!(raw, "https://a.example,https://b.example");
+        let mut again = Config::default();
+        again.set(ConfigKey::DownloadSources, &raw).expect("回填");
+        assert_eq!(again.download_sources, cfg.download_sources);
     }
 
     #[test]

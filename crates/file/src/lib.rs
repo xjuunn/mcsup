@@ -917,6 +917,7 @@ mod tests {
             destination: destination.to_path_buf(),
             expected,
             expected_size: Some(payload.len() as u64),
+            mirrors: Vec::new(),
         }
     }
 
@@ -933,6 +934,7 @@ mod tests {
             destination: destination.clone(),
             expected: Some(expected),
             expected_size: Some(payload.len() as u64),
+            mirrors: Vec::new(),
         };
 
         let done = downloader
@@ -960,6 +962,7 @@ mod tests {
             destination: destination.clone(),
             expected: Some(wrong),
             expected_size: None,
+            mirrors: Vec::new(),
         };
 
         let result = downloader
@@ -987,6 +990,7 @@ mod tests {
             destination: dir.path().join("server.jar"),
             expected: None,
             expected_size: None,
+            mirrors: Vec::new(),
         };
 
         let result = downloader.download(&request, None, &cancel).await;
@@ -1019,6 +1023,7 @@ mod tests {
             destination: destination.clone(),
             expected: None,
             expected_size: None,
+            mirrors: Vec::new(),
         };
 
         let token = cancel.clone();
@@ -1314,6 +1319,7 @@ mod tests {
             destination: dir.join(name),
             expected: Some(Checksum::new(ChecksumAlgorithm::Sha1, sha1_hex(payload))),
             expected_size: Some(payload.len() as u64),
+            mirrors: Vec::new(),
         }
     }
 
