@@ -656,6 +656,77 @@ async fn plan_fix_strips_trailing_digits_when_searching_provider() {
     assert_eq!(plan.installs[0].project_id, "geckolib");
 }
 
+/// 提供方被上游标成仅客户端时仍要能补上：库类 mod 的标注经常有误
+///
+/// 现场：`fancymenu` 要求 `melody >=1.0.17`。`melody` 在 Modrinth 上确实
+/// 存在且 `26.3` 有版本，jar 内 `environment: "*"`、带 `main` 入口，服务端
+/// 装载正常，但上游把项目标成 `server_side: unsupported`。按该标注过滤后
+/// 它整条从检索结果里消失，只剩 slug 里含 `melody` 的 `music-and-melody`，
+/// 补装被 `expect_modid` 拒，最后报成「上游找不到提供方」——用户看到的
+/// 结论是「这个 mod 不存在」，而它就在那儿。
+#[tokio::test]
+async fn plan_fix_finds_client_only_library_provider() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[("fancymenu.jar", SideSupport::Required)],
+        b"jar-bytes",
+    );
+    harness.inspector.declare_dep("fancymenu.jar", "melody");
+    harness.write("mods/fancymenu.jar", b"fm");
+    harness.source.configure(|config| {
+        // 上游把本体标成仅客户端；同名相近的那个服务端可用但不是本体
+        config.search_pool = vec![
+            search_hit("music-and-melody", false),
+            search_hit("melody", true),
+        ];
+    });
+    harness.set_resolved_for("melody", &[("v1", "melody.jar")]);
+
+    let plan = harness
+        .mods
+        .plan_fix("alpha", ContentKind::Mod)
+        .await
+        .expect("plan_fix");
+    assert_eq!(plan.installs.len(), 1, "{plan:?}");
+    assert_eq!(plan.installs[0].missing, "melody");
+    assert_eq!(plan.installs[0].project_id, "melody");
+    assert!(plan.unresolved.is_empty(), "{plan:?}");
+}
+
+/// 名字只是包含检索词的项目不算本体：相等优先
+///
+/// 只做子串匹配时，`melody` 会命中 `music-and-melody`；那个项目的 jar 提供
+/// 的是 `music_and_melody`，补装必然被拒。本体应当按 `slug` / `id` 相等挑。
+#[tokio::test]
+async fn plan_fix_prefers_exact_slug_over_substring_hit() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[("fancymenu.jar", SideSupport::Required)],
+        b"jar-bytes",
+    );
+    harness.inspector.declare_dep("fancymenu.jar", "melody");
+    harness.write("mods/fancymenu.jar", b"fm");
+    harness.source.configure(|config| {
+        // 顺序模拟上游按相关度排序：下载量更高的近似名排在前面
+        config.search_pool = vec![
+            search_hit("music-and-melody", false),
+            search_hit("melody", true),
+        ];
+    });
+    harness.set_resolved_for("melody", &[("v1", "melody.jar")]);
+
+    let plan = harness
+        .mods
+        .plan_fix("alpha", ContentKind::Mod)
+        .await
+        .expect("plan_fix");
+    assert_eq!(plan.installs.len(), 1, "{plan:?}");
+    assert_eq!(
+        plan.installs[0].project_id, "melody",
+        "应当选名字与 modid 完全一致的项目，而不是名字里包含它的项目"
+    );
+}
+
 /// 同一个依赖被多个文件缺：计划里只出现一次，不重复刷屏
 #[tokio::test]
 async fn plan_fix_dedupes_the_same_missing_dependency() {
@@ -792,6 +863,9 @@ async fn apply_fix_resolves_a_dependency_chain() {
 }
 
 /// 依赖补不上、文件又只是客户端功能：计划给出移除，而不是反复补装
+///
+/// 「补不上」指上游根本没有提供该 modid 的项目。上游有、只是被标成仅
+/// 客户端的库不算补不上——那类标注经常有误，安装检查才是判据。
 #[tokio::test]
 async fn plan_fix_proposes_removing_client_mod_with_unsatisfiable_dependency() {
     let harness = Harness::new(
@@ -805,10 +879,10 @@ async fn plan_fix_proposes_removing_client_mod_with_unsatisfiable_dependency() {
     harness.inspector.declare_dep("fancymenu.jar", "melody");
     harness.write("mods/fancymenu.jar", b"fm");
     harness.write("mods/good.jar", b"good");
-    // 上游只有仅客户端的 melody：服务端没有可补的提供方
-    harness.source.configure(|config| {
-        config.search_pool = vec![search_hit("melody", true)];
-    });
+    // 上游没有提供 melody 的项目
+    harness
+        .source
+        .configure(|config| config.search_pool = Vec::new());
 
     let plan = harness
         .mods
@@ -823,6 +897,40 @@ async fn plan_fix_proposes_removing_client_mod_with_unsatisfiable_dependency() {
         plan.removals[0].reason.contains("melody"),
         "reason should name the dependency: {}",
         plan.removals[0].reason
+    );
+}
+
+/// 上游有本体但被标成仅客户端：不算「补不上」，不规划移除
+///
+/// 与上一条的分界：这里上游确实存在提供 `melody` 的项目，只是标注说它
+/// 只跑客户端。移不移除的另一半判据是安装检查，计划阶段不该按上游标注
+/// 提前放弃——实测 `melody` 装到服务端正常装载，把它判成「没有提供方」
+/// 会让用户以为上游没有这个 mod。
+#[tokio::test]
+async fn plan_fix_keeps_client_mod_whose_dependency_exists_upstream() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[("fancymenu.jar", SideSupport::Optional)],
+        b"jar-bytes",
+    );
+    harness.inspector.declare_dep("fancymenu.jar", "melody");
+    harness.write("mods/fancymenu.jar", b"fm");
+    harness.source.configure(|config| {
+        config.search_pool = vec![search_hit("melody", true)];
+    });
+    harness.set_resolved_for("melody", &[("v1", "melody.jar")]);
+
+    let plan = harness
+        .mods
+        .plan_fix("alpha", ContentKind::Mod)
+        .await
+        .expect("plan_fix");
+    assert_eq!(plan.installs.len(), 1, "{plan:?}");
+    assert_eq!(plan.installs[0].project_id, "melody");
+    assert!(plan.unresolved.is_empty(), "{plan:?}");
+    assert!(
+        plan.removals.is_empty(),
+        "依赖有提供方时不该规划移除：{plan:?}"
     );
 }
 
