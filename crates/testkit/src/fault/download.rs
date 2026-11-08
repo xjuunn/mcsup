@@ -147,6 +147,7 @@ mod tests {
             destination: dest,
             expected: None,
             expected_size: None,
+            mirrors: Vec::new(),
         }
     }
 

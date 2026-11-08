@@ -211,6 +211,23 @@ pub struct DownloadRequest {
     pub expected: Option<Checksum>,
     /// 期望的字节数; 为 `None` 时跳过大小检验
     pub expected_size: Option<u64>,
+    /// 同一份字节的其它来源（镜像），按顺序在主地址失败后尝试
+    ///
+    /// 语义是**同一内容的不同入口**，不是「不同的东西」：校验和与大小对全部
+    /// 地址成立，因此切换不会放宽正确性判定。留空即只有主地址。
+    ///
+    /// 为什么值得带着走：跨境链路上单主机的错误与限速都不是个别现象（实测
+    /// 同一 CDN 单连接 0.04–0.11 MiB/s 且波动极大），同一文件换个入口常常
+    /// 立刻可用；而镜像与官方分属不同主机时吞吐还能叠加。校验仍是最后一道
+    /// 闸门，镜像给出坏字节只会换来 `ChecksumMismatch`，不会污染落盘文件。
+    pub mirrors: Vec<Url>,
+}
+
+impl DownloadRequest {
+    /// 全部候选地址：主地址在前，镜像按序在后
+    pub fn candidates(&self) -> impl Iterator<Item = &Url> {
+        std::iter::once(&self.location).chain(self.mirrors.iter())
+    }
 }
 
 /// 下载进度观察者

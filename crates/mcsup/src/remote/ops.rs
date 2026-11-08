@@ -735,6 +735,7 @@ impl Agent {
                         downloaded_bytes: applied.downloaded_bytes,
                         reused: applied.reused,
                         skipped_client_only: applied.skipped_client_only,
+                        skipped_bytes: applied.skipped_bytes,
                         stale_hashes: applied.stale_hashes.len(),
                     },
                     Err(err) => failure(ErrorKind::IO, err),

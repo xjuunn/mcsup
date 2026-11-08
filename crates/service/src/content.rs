@@ -479,6 +479,7 @@ impl ContentService {
             destination: target.clone(),
             expected: resolved.file.checksum.clone(),
             expected_size: (resolved.file.size > 0).then_some(resolved.file.size),
+            mirrors: Vec::new(),
         };
         let artifact = self.downloader.download(&request, progress, cancel).await?;
         Ok(Downloaded {

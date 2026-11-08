@@ -455,6 +455,7 @@ pub(crate) fn open_mcsup_with_remotes() -> Result<Mcsup> {
     );
     let mc = McsupBuilder::new()
         .store(store.clone())
+        .config(cfg)
         .supervisor(supervisor)
         .remote_backups(remote_backups)
         .workspace_repository(Arc::new(CombinedWorkspaceRepository::new(
@@ -498,7 +499,11 @@ pub(crate) fn workspace_service_with_remotes() -> Result<mcsup::service::Workspa
 /// 组合根即可获得与 CLI 完全一致的默认行为。
 pub(crate) fn open_mcsup() -> Result<Mcsup> {
     let data_dir = config::platform_data_dir();
-    Mcsup::open(&data_dir).context("装配 mcsup 组合根")
+    let cfg = ConfigFile::locate(None).load()?;
+    McsupBuilder::new()
+        .config(cfg)
+        .build(&data_dir)
+        .context("装配 mcsup 组合根")
 }
 
 #[cfg(test)]
@@ -589,6 +594,7 @@ mod remote_tests {
         let cfg = mcsup::service::Config {
             data_dir: None,
             remotes: BTreeMap::from([("box".to_owned(), record("127.0.0.1:7681", Some(FPR)))]),
+            ..Default::default()
         };
         let member =
             build_member("box", cfg.remotes.get("box").expect("rec"), &creds).expect("member");

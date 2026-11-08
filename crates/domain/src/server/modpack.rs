@@ -31,6 +31,18 @@ pub const INDEX_FILE: &str = "modrinth.index.json";
 /// 清单格式版本（本项目只支持 1）
 const SUPPORTED_FORMAT: u32 = 1;
 
+/// 被禁用文件的统一后缀
+///
+/// Forge / `NeoForge` / Fabric 都按后缀跳过：改名的 `x.jar.disabled` 与
+/// `x.jar.txt` 一样不会被加载，装了等于没装。
+const DISABLED_SUFFIX: &str = ".disabled";
+
+/// 服务端进程不读取的目录（小写比较）
+///
+/// 资源包与光影由客户端加载，服务端没有对应代码路径。清单里经常把它们标成
+/// `server: required`（作者用客户端视角填的），按声明装会白下几十到几百 MiB。
+const SERVER_IRRELEVANT_DIRS: [&str; 2] = ["resourcepacks/", "shaderpacks/"];
+
 /// 一个文件的环境标记（`required` / `optional` / `unsupported`）
 ///
 /// 反序列化在 `provider::modrinth::mrpack`（领域层不引入 serde，见模块文档）。
@@ -85,6 +97,34 @@ impl ModpackFile {
     #[must_use]
     pub fn installs_on_server(&self) -> bool {
         self.env.is_none_or(FileEnv::installs_on_server)
+    }
+
+    /// 服务端进程是否真的会读取这个文件
+    ///
+    /// 与 [`Self::installs_on_server`] 是两个不同的问题：后者问「清单声明的环境
+    /// 要不要装到服务端」，这里问「服务端跑起来会不会读它」。清单只声明
+    /// `client` / `server` 两个轴的**支持情况**，并不描述文件在服务端有没有用处，
+    /// 因此仅客户端素材常被整合包作者一并标成 `server: required`（实测某整合包
+    /// 113 个文件全部声明 `required`，其中 80% 的字节服务端永远用不到）。
+    ///
+    /// 以下两类装了也永远不生效：
+    ///
+    /// - `resourcepacks/`、`shaderpacks/`：资源包与光影由**客户端**加载，
+    ///   服务端进程没有任何读取它们的代码路径
+    /// - `*.disabled`：加载器按后缀跳过，等同于没装
+    ///
+    /// 只做这两条**确定性**判定，不猜「这个 mod 是不是仅客户端」——那需要上游
+    /// 元数据（见 `ModpackSource::client_only_hashes`），猜错会装出一个起不来的
+    /// 服务端，或删掉本该在的文件。
+    #[must_use]
+    pub fn is_server_loadable(&self) -> bool {
+        if self.path.ends_with(DISABLED_SUFFIX) {
+            return false;
+        }
+        let lowered = self.path.to_ascii_lowercase();
+        !SERVER_IRRELEVANT_DIRS
+            .iter()
+            .any(|dir| lowered.starts_with(dir))
     }
 
     /// 是否有可下载地址
@@ -196,6 +236,18 @@ impl ModpackIndex {
         self.server_files()
             .into_iter()
             .filter(|file| file.has_download())
+            .collect()
+    }
+
+    /// 服务端需要、有下载地址、且服务端进程真的会读取的文件
+    ///
+    /// 下载只看这一步：判定见 [`ModpackFile::is_server_loadable`]。装到服务端
+    /// 目录的文件集合仍是 [`Self::server_files`]，这里只负责不白下字节。
+    #[must_use]
+    pub fn fetchable_server_files(&self) -> Vec<&ModpackFile> {
+        self.downloadable_server_files()
+            .into_iter()
+            .filter(|file| file.is_server_loadable())
             .collect()
     }
 
@@ -498,6 +550,59 @@ mod tests {
     fn env_filtering_without_env_installs() {
         let file = file("mods/x.jar", &["https://x"], None);
         assert!(file.installs_on_server());
+    }
+
+    /// 服务端永远不读的文件不下载，但**仍然算要装的**——
+    /// 装的集合与下载的集合是两个问题，混起来会让「清单里有这个文件」
+    /// 与「下过这个文件」互相污染。
+    #[test]
+    fn server_irrelevant_files_are_not_downloaded() {
+        let required = Some(FileEnv {
+            client: EnvSupport::Required,
+            server: EnvSupport::Required,
+        });
+        let index = index(
+            vec![
+                file("mods/a.jar", &["https://x/a.jar"], required),
+                file("resourcepacks/pack.zip", &["https://x/p.zip"], required),
+                file("shaderpacks/s.zip", &["https://x/s.zip"], required),
+                file("mods/off.jar.disabled", &["https://x/o.jar"], required),
+            ],
+            deps(&[("minecraft", "1.21.1")]),
+        );
+        // 四份都要装进服务端目录
+        assert_eq!(index.server_files().len(), 4);
+        assert_eq!(index.downloadable_server_files().len(), 4);
+        // 只有 mods/a.jar 值得下
+        let fetch: Vec<&str> = index
+            .fetchable_server_files()
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        assert_eq!(fetch, vec!["mods/a.jar"]);
+    }
+
+    /// 目录名大小写不敏感：清单来自外部，`ResourcePacks/` 同样不该下
+    #[test]
+    fn server_irrelevant_dirs_match_case_insensitively() {
+        for path in [
+            "resourcepacks/a.zip",
+            "ResourcePacks/a.zip",
+            "SHADERPACKS/a.zip",
+            "mods/a.jar.disabled",
+        ] {
+            let file = file(path, &["https://x"], None);
+            assert!(!file.is_server_loadable(), "{path:?} 不该下载");
+        }
+        // 名字里含关键词但不在该目录下的正常 mod 不能被误伤
+        for path in [
+            "mods/resourcepacks.jar",
+            "config/resourcepacks.toml",
+            "mods/a.jar",
+        ] {
+            let file = file(path, &["https://x"], None);
+            assert!(file.is_server_loadable(), "{path:?} 应该下载");
+        }
     }
 
     #[test]

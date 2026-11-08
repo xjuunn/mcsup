@@ -54,8 +54,9 @@ pub use modpack::{
 };
 pub use origin::{OriginFilter, ResolveError, Selector, resolve_index};
 pub use platform_config::{
-    Config, ConfigDocumentError, ConfigKey, ConfigValueError, ConfigValueErrorKind, FEATURE_HEADER,
-    RemoteRecord, RemoteVia, lexical_normalize,
+    Config, ConfigDocumentError, ConfigKey, ConfigValueError, ConfigValueErrorKind,
+    DEFAULT_DOWNLOAD_CONCURRENCY, DEFAULT_DOWNLOAD_INFLIGHT, FEATURE_HEADER,
+    MAX_DOWNLOAD_CONCURRENCY, MAX_DOWNLOAD_INFLIGHT, RemoteRecord, RemoteVia, lexical_normalize,
 };
 pub use platform_doctor::{PlatformCheck, PlatformDoctor, PlatformFinding, PlatformReport};
 /// Java 源聚合端口（定义在 `port`，此处转出便于既有调用方）
@@ -240,6 +241,7 @@ impl ServerInstaller {
             destination: destination.clone(),
             expected: (!unverified).then(|| checksum.clone()),
             expected_size: (!unverified && known_size).then_some(resolved.artifact.size),
+            mirrors: Vec::new(),
         };
         notify(if install.runs_installer() {
             TaskStage::DownloadingInstaller

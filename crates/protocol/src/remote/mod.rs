@@ -702,6 +702,11 @@ pub enum Response {
         reused: usize,
         /// 按上游元数据判定为仅客户端、已跳过的文件数
         skipped_client_only: usize,
+        /// 服务端不读取而未下载的字节数（资源包 / 光影 / `*.disabled`）
+        ///
+        /// `default` 保住旧对端：字段缺失即 0，与「没省下任何字节」同义。
+        #[serde(default)]
+        skipped_bytes: u64,
         /// 清单哈希过期、按上游权威哈希接受的文件数
         #[serde(default)]
         stale_hashes: usize,
@@ -1259,6 +1264,7 @@ mod tests {
                 downloaded_bytes: 4_096,
                 reused: 30,
                 skipped_client_only: 2,
+                skipped_bytes: 0,
                 stale_hashes: 0,
             },
             Response::JavaUninstalled {
