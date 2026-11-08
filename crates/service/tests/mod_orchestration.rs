@@ -37,6 +37,7 @@ use port::{
 use service::{
     ApplyOptions, ContentService, InstallSpec, ListOptions, ModError, ModService, ServerRegistry,
 };
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -858,6 +859,94 @@ async fn apply_fix_tries_the_next_candidate_when_the_first_lacks_the_modid() {
         applied.unresolved.is_empty(),
         "候选还没试完就报「没有提供方」：{applied:?}"
     );
+    assert!(harness.mods_dir().join("satin.jar").is_file());
+}
+
+/// 有整合包清单快照时，补依赖按快照里的项目 / 版本 ID 直装，不再搜索
+///
+/// 搜索是按名字猜：搜 `satin` 的首位命中是毫不相干的 `satin-free-wakes`。
+/// 快照里记着「提供 satin 的是项目 fRbqPLg4、版本 Tq9qJzQz」，直接用它即可。
+#[tokio::test]
+async fn apply_fix_uses_manifest_snapshot_ids_instead_of_searching() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[
+            ("environmentz.jar", SideSupport::Required),
+            ("satin.jar", SideSupport::Required),
+        ],
+        b"jar-bytes",
+    );
+    harness.inspector.declare_dep("environmentz.jar", "satin");
+    harness.write("mods/environmentz.jar", b"env");
+    // 上游检索结果里放一个错的项目：若实现仍在搜索，会挑中它并装错
+    harness.source.configure(|config| {
+        config.search_pool = vec![search_hit("satin-free-wakes", true)];
+        config.candidates = vec![candidate("v1")];
+    });
+    harness.set_resolved_for("fRbqPLg4", &[("Tq9qJzQz", "satin.jar")]);
+
+    // 写一份清单快照：satin 由项目 fRbqPLg4 的版本 Tq9qJzQz 提供
+    let mut snapshot = service::ModpackManifestSnapshot {
+        format: service::MANIFEST_FORMAT,
+        source: "modrinth".to_owned(),
+        project_id: "i4XHCd7Q".to_owned(),
+        version_id: "kaxASXpi".to_owned(),
+        version_number: "4.0.1".to_owned(),
+        name: "Aged".to_owned(),
+        pack_version: "4.0.1".to_owned(),
+        minecraft: "1.21.1".to_owned(),
+        loader: None,
+        dependencies: BTreeMap::new(),
+        installed_at: 0,
+        files: Vec::new(),
+    };
+    snapshot.files.push(service::SnapshotFile {
+        path: "mods/satin-2.0.0.jar".to_owned(),
+        downloads: vec![
+            "https://cdn.modrinth.com/data/fRbqPLg4/versions/Tq9qJzQz/satin-2.0.0.jar".to_owned(),
+        ],
+        size: 4,
+        sha1: None,
+        sha512: None,
+        client: None,
+        server: Some("unsupported".to_owned()),
+        project_id: Some("fRbqPLg4".to_owned()),
+        version_id: Some("Tq9qJzQz".to_owned()),
+        modids: vec!["satin".to_owned()],
+        mod_version: Some("2.0.0".to_owned()),
+    });
+    snapshot.save(&harness.server_dir()).await.expect("写快照");
+
+    let plan = harness
+        .mods
+        .plan_fix("alpha", ContentKind::Mod)
+        .await
+        .expect("plan_fix");
+    assert_eq!(plan.installs.len(), 1, "{plan:?}");
+    assert_eq!(
+        plan.installs[0].project_id, "fRbqPLg4",
+        "应当用清单里的项目 ID，而不是搜索命中的 satin-free-wakes"
+    );
+    assert_eq!(
+        plan.installs[0].version_id.as_deref(),
+        Some("Tq9qJzQz"),
+        "清单点名了版本就按它装"
+    );
+
+    let applied = harness
+        .mods
+        .apply_fix(
+            "alpha",
+            &plan,
+            ApplyOptions {
+                allow_blocking: false,
+                progress: None,
+                cancel: &CancellationToken::new(),
+            },
+        )
+        .await
+        .expect("apply_fix");
+    assert_eq!(applied.installed.len(), 1, "{applied:?}");
     assert!(harness.mods_dir().join("satin.jar").is_file());
 }
 

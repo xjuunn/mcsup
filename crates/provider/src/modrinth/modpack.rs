@@ -32,7 +32,7 @@ use port::SourceError;
 use port::content::ContentSourceInfo;
 use port::modpack::{
     ModpackDetail, ModpackExtractError, ModpackExtractor, ModpackQuery, ModpackSearch,
-    ModpackSource, ModpackSummary, ModpackVersion, ResolvedModpack,
+    ModpackSource, ModpackSummary, ModpackVersion, PackMemberVerdicts, ResolvedModpack,
 };
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -201,30 +201,40 @@ impl ModpackSource for ModrinthModpackSource {
     }
 
     async fn client_only_hashes(&self, hashes: &[String]) -> Result<HashSet<String>, SourceError> {
+        Ok(self.pack_member_verdicts(hashes).await?.client_only)
+    }
+
+    async fn pack_member_verdicts(
+        &self,
+        hashes: &[String],
+    ) -> Result<PackMemberVerdicts, SourceError> {
         if hashes.is_empty() {
-            return Ok(HashSet::new());
+            return Ok(PackMemberVerdicts::default());
         }
-        let mut client_only = HashSet::new();
+        let mut verdicts = PackMemberVerdicts::default();
+        // 整包一次性看：依赖关系是包内成员之间的，分批就看不到跨批的依赖
+        let mut all_versions: HashMap<String, Version> = HashMap::new();
         for chunk in hashes.chunks(HASH_QUERY_BATCH) {
             let versions = self
                 .inner
                 .versions_from_hashes(chunk, HashAlgorithm::Sha1)
                 .await?;
-            let project_ids: Vec<String> = versions
-                .values()
-                .map(|version| version.project_id.clone())
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect();
-            if project_ids.is_empty() {
-                // 本批哈希在 Modrinth 上一个都没命中（第三方站下载的 jar），
-                // 不必再查项目详情
-                continue;
-            }
-            let projects = self.inner.projects(&project_ids).await?;
-            client_only.extend(client_only_from(&versions, &projects));
+            all_versions.extend(versions);
         }
-        Ok(client_only)
+        if all_versions.is_empty() {
+            // 一个哈希都没命中（第三方站下载的 jar），没有可判定的东西
+            return Ok(verdicts);
+        }
+        let project_ids: Vec<String> = all_versions
+            .values()
+            .map(|version| version.project_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let projects = self.inner.projects(&project_ids).await?;
+        verdicts.client_only = client_only_from(&all_versions, &projects);
+        verdicts.depended_on = depended_on_within(&all_versions);
+        Ok(verdicts)
     }
 
     async fn authoritative_hashes(
@@ -287,6 +297,32 @@ fn modrinth_version_id_from_url(url: &str) -> Option<String> {
         ["data", _proj, "versions", id, ..] => Some((*id).to_owned()),
         _ => None,
     }
+}
+
+/// 找出「被整合包内其他成员依赖」的文件（以 sha1 为键）
+///
+/// 只看 `dependency_type == required`：`optional` / `incompatible` 不构成
+/// 「必须有它才能加载」。依赖以**项目 ID** 表达，因此先收集所有被依赖的
+/// 项目，再回填到提供该项目的文件哈希上。
+///
+/// 这一步不能靠读 jar：判定发生在下载之前，此时本地没有文件可读。上游的
+/// 版本元数据是唯一权威来源，也正好是 `versions_from_hashes` 已经拿回来的
+/// 数据，不额外发请求。
+fn depended_on_within(versions: &HashMap<String, Version>) -> HashSet<String> {
+    let required: HashSet<&str> = versions
+        .values()
+        .flat_map(|version| version.dependencies.iter())
+        .filter(|dep| dep.dependency_type == "required")
+        .filter_map(|dep| dep.project_id.as_deref())
+        .collect();
+    if required.is_empty() {
+        return HashSet::new();
+    }
+    versions
+        .iter()
+        .filter(|(_hash, version)| required.contains(version.project_id.as_str()))
+        .map(|(hash, _version)| hash.clone())
+        .collect()
 }
 
 /// 从「哈希 → 版本」与「项目详情」里挑出仅客户端条目
@@ -407,19 +443,20 @@ impl ModpackExtractor for MrpackExtractor {
             .map_err(|err| ModpackExtractError::Index(serde_err(&err)))?;
         let mut files = Vec::with_capacity(raw.files.len());
         for file in raw.files {
-            files.push(ModpackFile {
-                path: file.path,
-                downloads: file.downloads,
-                size: file.file_size,
-                hashes: ModpackHashes {
+            // 项目 / 版本 ID 由领域层从下载地址里推导并保存，这里只管搬运
+            files.push(ModpackFile::new(
+                file.path,
+                file.downloads,
+                file.file_size,
+                ModpackHashes {
                     sha1: file.hashes.sha1,
                     sha512: file.hashes.sha512,
                 },
-                env: file.env.map(|env| FileEnv {
+                file.env.map(|env| FileEnv {
                     client: env.client.into(),
                     server: env.server.into(),
                 }),
-            });
+            ));
         }
         let mut dependencies = std::collections::BTreeMap::new();
         for (key, value) in raw.dependencies {

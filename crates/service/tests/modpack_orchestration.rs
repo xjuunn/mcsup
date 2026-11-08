@@ -20,7 +20,7 @@ use domain::server::modpack::{ModpackDependencies, ModpackFile, ModpackHashes, M
 use port::content::{ContentFile, ContentSourceInfo};
 use port::modpack::{
     ModpackDetail, ModpackExtractError, ModpackExtractor, ModpackQuery, ModpackSearch,
-    ModpackSource, ModpackVersion, ResolvedModpack,
+    ModpackSource, ModpackVersion, PackMemberVerdicts, ResolvedModpack,
 };
 use port::{
     ArtifactDownloader, CancellationToken, DownloadError, DownloadRequest, DownloadedArtifact,
@@ -36,6 +36,8 @@ struct FakeModpackSource {
     resolved: ResolvedModpack,
     /// 上游判定为仅客户端的文件哈希
     client_only: Vec<String>,
+    /// 被整合包内其他成员依赖的文件哈希
+    depended_on: Vec<String>,
     /// 模拟上游元数据查询失败
     metadata_fails: bool,
     /// 收到过的哈希批次（按调用顺序）
@@ -51,6 +53,7 @@ impl FakeModpackSource {
         Self {
             resolved: resolved(),
             client_only: Vec::new(),
+            depended_on: Vec::new(),
             metadata_fails: false,
             queried: Arc::new(Mutex::new(Vec::new())),
             authoritative: Vec::new(),
@@ -73,6 +76,12 @@ impl FakeModpackSource {
     /// 指定上游判成仅客户端的哈希
     fn client_only(mut self, hashes: &[&str]) -> Self {
         self.client_only = hashes.iter().map(|hash| (*hash).to_owned()).collect();
+        self
+    }
+
+    /// 指定被整合包内其他成员依赖的哈希
+    fn depended_on(mut self, hashes: &[&str]) -> Self {
+        self.depended_on = hashes.iter().map(|hash| (*hash).to_owned()).collect();
         self
     }
 
@@ -131,6 +140,28 @@ impl ModpackSource for FakeModpackSource {
             .filter(|hash| self.client_only.contains(hash))
             .cloned()
             .collect())
+    }
+
+    async fn pack_member_verdicts(
+        &self,
+        hashes: &[String],
+    ) -> Result<PackMemberVerdicts, SourceError> {
+        self.queried.lock().expect("queried").push(hashes.to_vec());
+        if self.metadata_fails {
+            return Err(SourceError::Status { status: 503 });
+        }
+        Ok(PackMemberVerdicts {
+            client_only: hashes
+                .iter()
+                .filter(|hash| self.client_only.contains(hash))
+                .cloned()
+                .collect(),
+            depended_on: hashes
+                .iter()
+                .filter(|hash| self.depended_on.contains(hash))
+                .cloned()
+                .collect(),
+        })
     }
 
     async fn authoritative_hashes(
@@ -298,12 +329,12 @@ fn deps(pairs: &[(&str, &str)]) -> ModpackDependencies {
 }
 
 fn file(path: &str, size: u64, server: EnvTag) -> ModpackFile {
-    ModpackFile {
-        path: path.to_owned(),
-        downloads: vec![format!("https://cdn.example.invalid/{path}")],
+    ModpackFile::new(
+        path.to_owned(),
+        vec![format!("https://cdn.example.invalid/{path}")],
         size,
-        hashes: ModpackHashes::default(),
-        env: match server {
+        ModpackHashes::default(),
+        match server {
             EnvTag::None => None,
             EnvTag::Required => Some(domain::server::modpack::FileEnv {
                 client: domain::server::modpack::EnvSupport::Required,
@@ -314,7 +345,7 @@ fn file(path: &str, size: u64, server: EnvTag) -> ModpackFile {
                 server: domain::server::modpack::EnvSupport::Unsupported,
             }),
         },
-    }
+    )
 }
 
 /// 带 sha1 的清单文件（仅客户端判定按 sha1 反查上游）
@@ -466,6 +497,103 @@ async fn skips_server_unsupported_files() {
         !dir.join("mods/client-only.jar").exists(),
         "客户端专属文件不该落盘"
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 头文件被上游标成仅客户端、但被包内其他成员依赖时仍然要装
+///
+/// 现场：Aged 的 `satin-2.0.0.jar` 上游 `server_side: unsupported`，而
+/// `environmentz` 硬依赖 modid `satin`。按「仅客户端」跳过它，服务端启动
+/// 直接 `HARD_DEP_NO_CANDIDATE` 起不来。
+#[tokio::test]
+async fn keeps_client_only_file_that_pack_members_depend_on() {
+    let satin = sha1(1);
+    let index = ModpackIndex::new(
+        1,
+        "minecraft",
+        "1.0.0",
+        "Pack",
+        deps(&[("minecraft", "1.21.1")]),
+        vec![
+            file_with_sha1("mods/environmentz.jar", 4, EnvTag::Required, &sha1(2)),
+            file_with_sha1("mods/satin.jar", 4, EnvTag::Required, &satin),
+            file_with_sha1("mods/sodium-extra.jar", 4, EnvTag::Required, &sha1(3)),
+        ],
+    )
+    .expect("index");
+    let source = Arc::new(
+        FakeModpackSource::new()
+            // 两者上游都标仅客户端，但只有 satin 被 environmentz 依赖
+            .client_only(&[satin.as_str(), sha1(3).as_str()])
+            .depended_on(&[satin.as_str()]),
+    );
+    let service = service_with_source(index, Vec::new(), FakeDownloader::ok(), source);
+    let dir = scratch("dep-keep");
+
+    let prepared = service
+        .prepare(
+            "P",
+            ModpackInstallOptions::new(&dir),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("prepare");
+    let applied = service
+        .apply(&prepared, &dir, None, &CancellationToken::new())
+        .await
+        .expect("apply");
+
+    assert!(
+        dir.join("mods/satin.jar").is_file(),
+        "被依赖的库必须装上，否则服务端起不来"
+    );
+    assert!(
+        !dir.join("mods/sodium-extra.jar").exists(),
+        "没人依赖的仅客户端 mod 仍然跳过"
+    );
+    assert_eq!(applied.skipped_client_only, 1);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 装完把清单快照落到 `.mcsup-modpack/manifest.json`
+#[tokio::test]
+async fn apply_writes_manifest_snapshot() {
+    let index = ModpackIndex::new(
+        1,
+        "minecraft",
+        "4.0.1",
+        "Aged",
+        deps(&[("minecraft", "1.21.1"), ("fabric-loader", "0.20.1")]),
+        vec![file("mods/satin-2.0.0.jar", 4, EnvTag::Required)],
+    )
+    .expect("index");
+    let service = service(index, Vec::new(), FakeDownloader::ok());
+    let dir = scratch("snapshot");
+
+    let prepared = service
+        .prepare(
+            "P",
+            ModpackInstallOptions::new(&dir),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("prepare");
+    service
+        .apply(&prepared, &dir, None, &CancellationToken::new())
+        .await
+        .expect("apply");
+
+    let snapshot = service::ModpackManifestSnapshot::load(&dir)
+        .await
+        .expect("快照应已写入");
+    assert_eq!(snapshot.minecraft, "1.21.1");
+    let loader = snapshot.loader.expect("记下加载器");
+    assert_eq!(loader.name, "fabric");
+    assert_eq!(loader.version, "0.20.1");
+    assert_eq!(snapshot.project_id, "P");
+    assert_eq!(snapshot.version_id, "V");
+    assert_eq!(snapshot.files.len(), 1);
+    assert_eq!(snapshot.files[0].path, "mods/satin-2.0.0.jar");
     std::fs::remove_dir_all(&dir).ok();
 }
 

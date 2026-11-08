@@ -185,6 +185,34 @@ pub struct ExtractedModpack {
     pub overrides_dir: Option<std::path::PathBuf>,
 }
 
+/// 整合包内各成员的上游判定
+///
+/// 两个集合都以**文件 sha1** 为键，Service 据此决定某个清单文件要不要装到
+/// 服务端。见 [`ModpackSource::pack_member_verdicts`]。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PackMemberVerdicts {
+    /// 上游标注仅客户端（`server_side: unsupported`）的文件
+    pub client_only: HashSet<String>,
+    /// 被整合包内其他成员的**必需依赖**指向的文件
+    ///
+    /// 这类文件即使自己被标成仅客户端也不能跳过：上游的项目级标注描述的是
+    /// 「这个项目自己需不需要服务端」，而库类项目（`satin` / `melody` 一类
+    /// 提供 API 的）常常标 `unsupported`，却是别的 mod 跑起来的硬前提。
+    /// 服务端加载器不加载它们，但依赖声明要求它们**存在于 `mods/`**。
+    pub depended_on: HashSet<String>,
+}
+
+impl PackMemberVerdicts {
+    /// 某个文件是否应当跳过（不装到服务端）
+    ///
+    /// 仅客户端 **且** 无人依赖才跳过。判定收敛在这里，Service 与各入口
+    /// 都调用它，不各写一份。
+    #[must_use]
+    pub fn skips(&self, sha1: &str) -> bool {
+        self.client_only.contains(sha1) && !self.depended_on.contains(sha1)
+    }
+}
+
 /// 整合包来源
 ///
 /// 实现必须保证：**搜索与列表只返回能在服务端运行的整合包**。
@@ -237,6 +265,33 @@ pub trait ModpackSource: ContentSourceInfo + Send + Sync {
     /// 上游不可达、状态码异常或响应无法解析时返回 [`SourceError`]
     async fn client_only_hashes(&self, _hashes: &[String]) -> Result<HashSet<String>, SourceError> {
         Ok(HashSet::new())
+    }
+
+    /// 按文件哈希查上游判定，并带上整合包内部的依赖关系
+    ///
+    /// 与 [`Self::client_only_hashes`] 的区别在于它不只回答「谁仅客户端」，
+    /// 还回答「谁被别的成员依赖」。这两个信息缺一不可：
+    ///
+    /// - 只看「仅客户端」会把 `satin-api` 判成客户端专属而跳过，但它是
+    ///   `environmentz` 的**硬依赖**，跳过之后服务端直接起不来
+    ///   （`HARD_DEP_NO_CANDIDATE`）
+    /// - 只看「被依赖」会把整合包里根本没装的普通客户端 mod 也留下
+    ///
+    /// 因此判定改为：**既是仅客户端、又没有任何成员依赖它**才跳过。默认实现
+    /// 退化为 [`Self::client_only_hashes`]，不认识依赖关系的来源行为不变。
+    ///
+    /// # Errors
+    ///
+    /// 上游不可达、状态码异常或响应无法解析时返回 [`SourceError`]
+    async fn pack_member_verdicts(
+        &self,
+        hashes: &[String],
+    ) -> Result<PackMemberVerdicts, SourceError> {
+        let client_only = self.client_only_hashes(hashes).await?;
+        Ok(PackMemberVerdicts {
+            client_only,
+            depended_on: HashSet::new(),
+        })
     }
 
     /// 按清单里的下载地址重新取上游的**权威**文件哈希

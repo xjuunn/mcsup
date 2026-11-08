@@ -90,9 +90,60 @@ pub struct ModpackFile {
     pub hashes: ModpackHashes,
     /// 环境标记
     pub env: Option<FileEnv>,
+    /// 上游项目 ID（能从下载地址解析时）
+    ///
+    /// 清单不直接给项目 / 版本 ID，但 Modrinth 的下载地址是
+    /// `https://cdn.modrinth.com/data/{project}/versions/{version}/{file}`，
+    /// 两个 ID 都在里面。解析出来存下来，后续补依赖、查更新都能直接按 ID
+    /// 定位，不必拿 modid 去搜索——搜索是猜，会挑错项目（实测 `satin`
+    /// 搜出来首位是 `satin-free-wakes`）。
+    pub project_id: Option<String>,
+    /// 上游版本 ID（同上，从下载地址解析）
+    pub version_id: Option<String>,
 }
 
 impl ModpackFile {
+    /// 按清单条目构造，顺带解析下载地址里的项目 / 版本 ID
+    ///
+    /// ID 一律由这里推导，调用方不必各写一遍：解析规则只有一份，才不会出现
+    /// 「某条路径忘了填 ID，后续拿 modid 去搜索猜错项目」。
+    #[must_use]
+    pub fn new(
+        path: String,
+        downloads: Vec<String>,
+        size: u64,
+        hashes: ModpackHashes,
+        env: Option<FileEnv>,
+    ) -> Self {
+        let ids = downloads.iter().find_map(|url| modrinth_ids_from_url(url));
+        let (project_id, version_id) = match ids {
+            Some((project, version)) => (Some(project), Some(version)),
+            None => (None, None),
+        };
+        Self {
+            path,
+            downloads,
+            size,
+            hashes,
+            env,
+            project_id,
+            version_id,
+        }
+    }
+
+    /// 是否落在 `mods/`（或 `plugins/`）下的 jar
+    ///
+    /// 只有这类文件能提供 modid，也只有它们值得按 modid 索引。
+    #[must_use]
+    pub fn is_plugin_jar(&self) -> bool {
+        let lowered = self.path.to_ascii_lowercase();
+        (lowered.starts_with("mods/") || lowered.starts_with("plugins/"))
+            && Path::new(&self.path)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("jar"))
+            && !self.path.ends_with(DISABLED_SUFFIX)
+    }
+
     /// 服务端是否需要这个文件
     #[must_use]
     pub fn installs_on_server(&self) -> bool {
@@ -132,6 +183,25 @@ impl ModpackFile {
     pub fn has_download(&self) -> bool {
         !self.downloads.is_empty()
     }
+}
+
+/// 从 Modrinth 下载地址里解析 `(项目 ID, 版本 ID)`
+///
+/// 地址形如 `https://cdn.modrinth.com/data/{project}/versions/{version}/{file}`。
+/// 不是这个形状（第三方站、自有镜像、overrides 里的相对路径）一律返回
+/// `None`——解析不出来就是不知道，不编造。
+#[must_use]
+pub fn modrinth_ids_from_url(url: &str) -> Option<(String, String)> {
+    let rest = url
+        .strip_prefix("https://cdn.modrinth.com/data/")
+        .or_else(|| url.strip_prefix("http://cdn.modrinth.com/data/"))?;
+    let mut parts = rest.split('/');
+    let project = parts.next().filter(|part| !part.is_empty())?;
+    if parts.next()? != "versions" {
+        return None;
+    }
+    let version = parts.next().filter(|part| !part.is_empty())?;
+    Some((project.to_owned(), version.to_owned()))
 }
 
 /// 清单里的哈希表
@@ -394,13 +464,13 @@ mod tests {
     }
 
     fn file(path: &str, downloads: &[&str], env: Option<FileEnv>) -> ModpackFile {
-        ModpackFile {
-            path: path.to_owned(),
-            downloads: downloads.iter().map(|url| (*url).to_owned()).collect(),
-            size: 1,
-            hashes: ModpackHashes::default(),
+        ModpackFile::new(
+            path.to_owned(),
+            downloads.iter().map(|url| (*url).to_owned()).collect(),
+            1,
+            ModpackHashes::default(),
             env,
-        }
+        )
     }
 
     fn index(files: Vec<ModpackFile>, dependencies: ModpackDependencies) -> ModpackIndex {

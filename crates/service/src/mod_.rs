@@ -29,6 +29,7 @@ use crate::fs_error::FsError;
 use crate::mod_inspect::{
     ModAudit, ModInspectService, ModInspectServiceError, ModReport, collect_jars, sha1_of,
 };
+use crate::modpack_manifest::ModpackManifestSnapshot;
 use crate::registry::{RegisteredServer, ServerRegistry, ServerRegistryError};
 use domain::mod_::{FitVerdict, InstallVerdict, ModLoader, Risk, ServerTarget, SideSupport};
 use domain::server::content::{
@@ -370,6 +371,13 @@ pub struct FixInstall {
     pub title: String,
     /// 上游项目自身是否标注仅客户端
     pub client_only: bool,
+    /// 精确版本 ID
+    ///
+    /// 整合包清单里记着这个文件的确切版本（从下载地址解析），补装时照它
+    /// 装即可，不必再按服务端条件挑版本——挑版本会漂移到更新的版本，与
+    /// 整合包作者验证过的组合不再一致。来源检索命中时没有这个信息，
+    /// 为 `None`，退回按条件挑最新合适版本。
+    pub version_id: Option<String>,
 }
 
 /// 修复计划的一项：移除带问题的 mod 文件
@@ -422,6 +430,28 @@ pub struct FixRefused {
     pub reason: String,
 }
 
+/// 一个可补装的候选（内部用，避免与对外 DTO 混淆）
+#[derive(Debug, Clone)]
+struct FixCandidate {
+    /// 上游项目 ID
+    project_id: String,
+    /// 展示名（整合包清单里取文件名，检索命中取项目标题）
+    title: String,
+    /// 上游项目自身是否标注仅客户端
+    client_only: bool,
+    /// 精确版本 ID（清单给出时）
+    version_id: Option<String>,
+}
+
+/// 一个缺失 modid 的解析结果
+#[derive(Debug, Clone)]
+enum FixTarget {
+    /// 有可补装的候选（可能多个，安装时逐个校验 modid）
+    Installs(Vec<FixCandidate>),
+    /// 上游确实没有可补装的东西
+    Unresolved,
+}
+
 /// 待补装的一项（内部工作队列元素）
 #[derive(Debug, Clone)]
 struct PendingFix {
@@ -429,6 +459,8 @@ struct PendingFix {
     project_id: String,
     /// 这次安装要补的 modid（安装时校验 jar 是否真的提供它）
     missing: Option<String>,
+    /// 精确版本 ID（整合包清单给出时按它装，避免漂移到别的版本）
+    version_id: Option<String>,
     /// 是否已经为它展开过一轮依赖（只重试一次）
     retried: bool,
 }
@@ -840,24 +872,60 @@ impl ModService {
     /// beta，若坚持 `allow_prerelease = false`，必需依赖永远补不上，修复
     /// 命令等于永远失败。排名本身让正式版胜出（见 `content` 的渠道测试），
     /// 因此这里只在「一个正式版都没有」时退一步。
+    ///
+    /// `version_id` 非空时按该版本精确安装，不再按条件挑：整合包清单给出了
+    /// 作者验证过的确切版本，重新挑会漂移。
     async fn plan_dependency_install(
         &self,
         name: &str,
         project: &str,
         kind: ContentKind,
         expect_modid: Option<&str>,
+        version_id: Option<&str>,
     ) -> Result<InstallPlan, ModError> {
-        let spec = |allow_prerelease| InstallSpec {
-            version: None,
-            source: None,
-            allow_prerelease,
+        // 清单点名了版本就不存在「挑不到正式版」的问题，不必再退一步
+        let planned = if version_id.is_some() {
+            self.plan_install(
+                name,
+                project,
+                kind,
+                InstallSpec {
+                    version: version_id,
+                    source: None,
+                    allow_prerelease: false,
+                },
+            )
+            .await?
+        } else {
+            match self
+                .plan_install(
+                    name,
+                    project,
+                    kind,
+                    InstallSpec {
+                        version: None,
+                        source: None,
+                        allow_prerelease: false,
+                    },
+                )
+                .await
+            {
+                Err(ModError::Content(ContentError::NoCandidate { .. })) => {
+                    self.plan_install(
+                        name,
+                        project,
+                        kind,
+                        InstallSpec {
+                            version: None,
+                            source: None,
+                            allow_prerelease: true,
+                        },
+                    )
+                    .await
+                }
+                other => other,
+            }?
         };
-        let planned = match self.plan_install(name, project, kind, spec(false)).await {
-            Err(ModError::Content(ContentError::NoCandidate { .. })) => {
-                self.plan_install(name, project, kind, spec(true)).await
-            }
-            other => other,
-        }?;
         Ok(InstallPlan {
             expect_modid: expect_modid.map(ToOwned::to_owned),
             ..planned
@@ -1028,6 +1096,10 @@ impl ModService {
 
         let mut installs: Vec<FixInstall> = Vec::new();
         let mut unresolved: Vec<String> = Vec::new();
+        // 整合包清单快照：装整合包时留下的权威数据，里面有每个文件的
+        // 项目 ID 与版本 ID。补依赖先查它，命中就按 ID 直装——搜索是按
+        // 名字猜，会挑错项目（`satin` 搜出来首位是 `satin-free-wakes`）
+        let mut snapshot = self.modpack_snapshot(&server).await;
         for report in &audit.mods {
             if report.missing_deps.is_empty() {
                 continue;
@@ -1042,24 +1114,31 @@ impl ModService {
                 {
                     continue;
                 }
-                let candidates = self.find_provider(missing, &server).await?;
-                if candidates.is_empty() {
-                    unresolved.push(missing.clone());
-                    continue;
-                }
-                // 全部候选都进计划：安装时逐个校验 modid，第一个不提供就
-                // 换下一个。只排第一个会让 `satin` 这类「本体换了后缀」
-                // 的依赖在计划阶段就被判死
-                for hit in candidates {
-                    installs.push(FixInstall {
-                        needed_by: needed_by.clone(),
-                        missing: missing.clone(),
-                        project_id: hit.id,
-                        title: hit.title,
-                        client_only: hit.client_only,
-                    });
+                let found = self
+                    .resolve_fix_target(missing, snapshot.as_ref(), &server)
+                    .await?;
+                match found {
+                    FixTarget::Installs(candidates) => {
+                        for item in candidates {
+                            installs.push(FixInstall {
+                                needed_by: needed_by.clone(),
+                                missing: missing.clone(),
+                                project_id: item.project_id,
+                                title: item.title,
+                                client_only: item.client_only,
+                                version_id: item.version_id,
+                            });
+                        }
+                    }
+                    FixTarget::Unresolved => unresolved.push(missing.clone()),
                 }
             }
+        }
+        // 把这次读到的 modid 回填进快照：下次「缺 X」就能直接查到提供方。
+        // 只在真有变化时重写，普通一次修复不会反复改动文件
+        if let Some(snapshot) = snapshot.as_mut() {
+            self.refresh_snapshot_modids(&server, snapshot, &audit)
+                .await;
         }
 
         let mut removals: Vec<FixRemove> = Vec::new();
@@ -1112,6 +1191,88 @@ impl ModService {
             removals,
             unresolved,
         })
+    }
+
+    /// 读取整合包清单快照
+    ///
+    /// 没有快照（不是整合包开服、装完被删、格式对不上）时返回 `None`，
+    /// 调用方退回按名字检索的旧路径。
+    async fn modpack_snapshot(&self, server: &RegisteredServer) -> Option<ModpackManifestSnapshot> {
+        ModpackManifestSnapshot::load(&server.dir).await
+    }
+
+    /// 为一个缺失的 modid 找出可补装的候选
+    ///
+    /// 优先查整合包清单快照：清单里记着每个文件的**项目 ID 与版本 ID**
+    /// （藏在下载地址里），命中就按 ID 直装，一个检索请求都不发。搜索是按
+    /// 名字猜，实测搜 `satin` 首位命中是毫不相干的 `satin-free-wakes`；
+    /// 只有快照里查不到时才退回检索。
+    async fn resolve_fix_target(
+        &self,
+        modid: &str,
+        snapshot: Option<&ModpackManifestSnapshot>,
+        server: &RegisteredServer,
+    ) -> Result<FixTarget, ModError> {
+        if let Some(hit) = snapshot.and_then(|snapshot| snapshot.file_providing(modid))
+            && let Some(project_id) = hit.project_id.clone()
+        {
+            return Ok(FixTarget::Installs(vec![FixCandidate {
+                project_id,
+                title: file_name_of(&hit.path),
+                client_only: hit.server.as_deref() == Some("unsupported"),
+                version_id: hit.version_id.clone(),
+            }]));
+        }
+        // 全部候选都要排进去：安装时逐个校验 modid，第一个不提供就换下一个。
+        // 只排第一个会让 `satin` 这类「本体换了后缀」的依赖在计划阶段就被判死
+        let hits = self.find_provider(modid, server).await?;
+        if hits.is_empty() {
+            return Ok(FixTarget::Unresolved);
+        }
+        Ok(FixTarget::Installs(
+            hits.into_iter()
+                .map(|hit| FixCandidate {
+                    project_id: hit.id,
+                    title: hit.title,
+                    client_only: hit.client_only,
+                    // 检索命中没有精确版本，安装时按服务端条件挑
+                    version_id: None,
+                })
+                .collect(),
+        ))
+    }
+
+    /// 把刚读到的 modid 回填进快照，并重写文件
+    ///
+    /// 清单只说文件名，不说 modid；装好之后读 jar 才知道谁提供什么。回填
+    /// 一次之后，「缺 modid X 该装哪个项目」就有确定答案，不必搜索。
+    async fn refresh_snapshot_modids(
+        &self,
+        server: &RegisteredServer,
+        snapshot: &mut ModpackManifestSnapshot,
+        audit: &ModAudit,
+    ) {
+        let mut changed = false;
+        for report in &audit.mods {
+            let filename = file_name_of(&report.capability.path);
+            let Some(entry) = snapshot.file_named(&filename) else {
+                continue;
+            };
+            let path = entry.path.clone();
+            // 自己声明的 modid 加上它别名提供的（`provides`），两者都能满足依赖
+            let mut modids: Vec<String> = report.capability.id.iter().cloned().collect();
+            for alias in &report.capability.provides {
+                if !modids.contains(alias) {
+                    modids.push(alias.clone());
+                }
+            }
+            let version = report.capability.version.clone();
+            changed |= snapshot.record_modids(&path, modids, version);
+        }
+        if changed && snapshot.save(&server.dir).await.is_err() {
+            // 回填失败不影响本次修复：快照只是加速后续查询的缓存
+            tracing::debug!("modpack manifest snapshot write-back skipped");
+        }
     }
 
     /// 在上游检索某个 modid 的提供方
@@ -1232,6 +1393,7 @@ impl ModService {
             .map(|item| PendingFix {
                 project_id: item.project_id.clone(),
                 missing: Some(item.missing.clone()),
+                version_id: item.version_id.clone(),
                 retried: false,
             })
             .collect();
@@ -1251,6 +1413,7 @@ impl ModService {
                     &pending.project_id,
                     kind,
                     pending.missing.as_deref(),
+                    pending.version_id.as_deref(),
                 )
                 .await
             {
@@ -1348,6 +1511,7 @@ impl ModService {
             queue.push_back(PendingFix {
                 project_id: pending.project_id.clone(),
                 missing: pending.missing.clone(),
+                version_id: pending.version_id.clone(),
                 retried: true,
             });
             return Ok(());
@@ -1370,6 +1534,9 @@ impl ModService {
     ///
     /// 同一 modid 的**全部**候选都会入队，由安装时的 `expect_modid` 逐个
     /// 校验：名字最像的未必提供这个 modid，被拒就换下一个。
+    ///
+    /// 与 [`Self::plan_fix`] 一样先查整合包清单快照：清单里有项目与版本 ID
+    /// 时按 ID 直装，只有在快照里查不到时才回到按名字检索。
     async fn queue_missing_deps(
         &self,
         missing_deps: &[String],
@@ -1377,8 +1544,26 @@ impl ModService {
         queue: &mut VecDeque<PendingFix>,
         state: &mut FixState,
     ) -> Result<bool, ModError> {
+        let snapshot = self.modpack_snapshot(server).await;
         let mut planned = false;
         for missing in missing_deps {
+            if let Some(hit) = snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.file_providing(missing))
+                && let Some(project_id) = hit.project_id.clone()
+            {
+                if !state.visited.contains(&project_id) {
+                    state.plan_candidate(missing);
+                    queue.push_back(PendingFix {
+                        project_id,
+                        missing: Some(missing.clone()),
+                        version_id: hit.version_id.clone(),
+                        retried: false,
+                    });
+                    planned = true;
+                }
+                continue;
+            }
             let fresh = self
                 .find_provider(missing, server)
                 .await?
@@ -1394,6 +1579,8 @@ impl ModService {
                 queue.push_back(PendingFix {
                     project_id: hit.id,
                     missing: Some(missing.clone()),
+                    // 检索命中没有精确版本，按服务端条件挑
+                    version_id: None,
                     retried: false,
                 });
                 planned = true;

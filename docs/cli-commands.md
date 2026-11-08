@@ -266,6 +266,14 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
   整条依赖被误报成「上游找不到提供方」——而提供方就在结果里。现在同一
   modid 的全部候选都排进计划，安装时按 modid 逐个校验，第一个不提供就换
   下一个；只有候选全部试完才记进 `unresolved`。
+- **能从整合包清单读到的，一律不搜索**：装整合包时把清单留在
+  `<server>/.mcsup-modpack/manifest.json`（详见
+  [整合包清单快照](#整合包清单快照)）。清单里的每个文件都带**项目 ID 与版本
+  ID**——Modrinth 的下载地址形如
+  `https://cdn.modrinth.com/data/{project_id}/versions/{version_id}/{file}`，
+  两个 ID 都在地址里。`fix` 先按 modid 查这份快照，命中就按项目 ID + 版本 ID
+  直装，一个检索请求都不发；只有快照里没有时才退回按名字检索。搜索是猜，
+  按 ID 是定位。
 - 上游不认识某个文件时 `update` / `outdated` 把它列进「无法判断」，不当作
   「已是最新」。
 - `remote` 条目（`--origin` 指向远端服务器）在本地直接拒绝（退出码 2）：
@@ -444,11 +452,18 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 避免启动崩溃。
 
 清单的 `env` 字段不是权威数据。安装时还会把 `mods/` 下 jar 的 sha1 批量
-反查 Modrinth（`POST /version_files` → `POST /projects`），上游标注
-`server_side = unsupported` 的文件一律不装；上一次安装留下的同名文件会被
-删除。查询失败时中止安装（避免装出一个启动必崩的服务端），来源不支持这项
-能力时退回「按清单装」。JSON 输出里的 `skipped_client_only` 与人类可读输出
-都会报告跳过数量。
+反查 Modrinth（`POST /version_files` → `POST /projects`），取上游的项目级
+标注与包内依赖关系。
+
+**上游标注 `server_side = unsupported` 不等于可以丢掉**。判定是「仅客户端
+**且** 包内无人依赖」才跳过。库类项目（提供 API 的 `satin` / `melody` 一类）
+常被标成仅客户端，实际却是别的 mod 跑起来的硬前提：服务端加载器不加载它们，
+但依赖声明要求它们**存在于 `mods/`**。实测 Aged 4.0.1 里的
+`satin-2.0.0.jar` 上游标 `unsupported`，而 `environmentz` 硬依赖 modid
+`satin`；按旧口径跳过它，服务端启动直接
+`HARD_DEP_NO_CANDIDATE` 起不来。被跳过文件的旧落盘会被删除。查询失败时
+中止安装（避免装出一个启动必崩的服务端），来源不支持这项能力时退回「按清单
+装」。JSON 输出里的 `skipped_client_only` 与人类可读输出都会报告跳过数量。
 
 清单里 `server: unsupported` 的文件不会装到服务端；`optional` 视为需要安装。
 `.mrpack` 由内置 zip 解析直接解开，不调用系统 `unzip`，归档内的 UTF-8
@@ -465,6 +480,37 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 建好的整合包服务与 `server create` 建的服务是同一种对象，后续运维都走
 `mcsup server ...`；若建站时因上游波动导致核心或文件下载失败，可用
 `mcsup server install <name>` 重试。
+
+### 整合包清单快照
+
+安装完成时把清单落在 `<server>/.mcsup-modpack/manifest.json`。它记的是
+`.mrpack` 里 `modrinth.index.json` 的**全部内容**，加上整合包身份与加载器：
+
+| 字段 | 用途 |
+| --- | --- |
+| `project_id` / `version_id` | 整包的项目与版本 ID |
+| `name` / `version_number` / `pack_version` | 包名与两个口径的版本号 |
+| `minecraft` / `loader` | 清单声明的 MC 版本与加载器 |
+| `dependencies` | 清单的 `dependencies` 原样保留（含未知键） |
+| `files[]` | 每个文件一条：`path`、`downloads`、`size`、`sha1`/`sha512`、`client`/`server`、**`project_id`/`version_id`**、`modids`、`mod_version` |
+
+两个 ID 从下载地址解析（`/data/{project_id}/versions/{version_id}/`），装完
+就有了。`modids` 是装好之后读 jar 回填的：清单只说文件名，不说 modid，
+读一次才知道谁提供什么。
+
+**为什么留这份**：
+
+- **后续操作按 ID 定位，不搜索**。`mod fix` 缺 `satin` 时直接查到提供它的
+  是项目 `fRbqPLg4` 的版本 `Tq9qJzQz`，按 ID 装即可。搜索是按名字猜，
+  实测搜 `satin` 首位是毫不相干的 `satin-free-wakes`。
+- **整合包更新要按项目 ID 比对前后版本**。清单里的 `files[]` 保留**全部**
+  条目，包括没装到服务端的仅客户端文件——只留已装文件会漏掉「上游把某个
+  仅客户端库改成服务端必需」这种情况。
+- **清单哈希是打包时的快照**，回源校验要用下载地址里的版本 ID；丢了清单
+  就只能重下整个整合包。
+
+快照是缓存不是契约：文件不存在、JSON 损坏、`format` 版本对不上时一律当作
+「没有快照」，退回按名字检索的旧路径，不让可疑数据影响安装。
 
 ## mcsup java（机器级 JVM 运行时）
 

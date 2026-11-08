@@ -10,6 +10,7 @@ mod lifecycle;
 mod mod_;
 mod mod_inspect;
 mod modpack;
+mod modpack_manifest;
 mod origin;
 mod platform_config;
 mod platform_doctor;
@@ -51,6 +52,10 @@ pub use mod_inspect::{
 pub use modpack::{
     ModpackApplied, ModpackError, ModpackInstallOptions, ModpackInstalled, ModpackPrepared,
     ModpackService, is_modpack_variant, loader_pin, variant_for_loader,
+};
+pub use modpack_manifest::{
+    MANIFEST_DIR, MANIFEST_FILE, MANIFEST_FORMAT, ModpackManifestSnapshot, SnapshotFile,
+    SnapshotLoader,
 };
 pub use origin::{OriginFilter, ResolveError, Selector, resolve_index};
 pub use platform_config::{

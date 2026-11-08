@@ -22,13 +22,14 @@
 
 use crate::fs_error::FsError;
 use crate::lifecycle::LifecycleError;
+use crate::modpack_manifest::ModpackManifestSnapshot;
 use domain::server::modpack::{ModpackFile, ModpackIndex};
 use domain::server::version::ServerVariant;
 use port::modpack::{
-    ModpackExtractError, ModpackExtractor, ModpackSource, ModpackSourceRegistry, ResolvedModpack,
+    ModpackExtractError, ModpackExtractor, ModpackSource, ModpackSourceRegistry,
+    PackMemberVerdicts, ResolvedModpack,
 };
 use port::{ArtifactDownloader, CancellationToken, DownloadRequest, ProgressSink, SourceError};
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
@@ -372,36 +373,51 @@ impl ModpackService {
         // 2. 仅客户端模组：清单的 env 字段不可全信。整合包作者常把 ETF /
         //    Embeddium 之类仅客户端模组标成 `server: required`，按清单装进
         //    服务端会在启动时加载客户端类并崩溃。能查到权威元数据时以它为准。
+        //
+        //    但不能只看「上游说它仅客户端」：库类项目（`satin` / `melody`
+        //    一类提供 API 的）常被标成 `unsupported`，实际是别的 mod 起不来的
+        //    硬前提。判定因而收敛到 `PackMemberVerdicts::skips`——仅客户端
+        //    **且** 无成员依赖才跳过。
         let source = self.select_source(Some(prepared.source))?;
         let mod_hashes: Vec<String> = prepared
             .index
             .downloadable_server_files()
             .into_iter()
-            .filter(|file| {
-                file.path.starts_with("mods/")
-                    && Path::new(&file.path)
-                        .extension()
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("jar"))
-            })
+            .filter(|file| file.path.starts_with("mods/"))
+            .filter(|file| file.is_plugin_jar())
             .filter_map(|file| file.hashes.sha1.clone())
             .collect();
         // 纯配置 / 资源包整合包没有可反查的 jar，直接省掉一次上游请求
-        let client_only = if mod_hashes.is_empty() {
-            HashSet::new()
+        let verdicts = if mod_hashes.is_empty() {
+            PackMemberVerdicts::default()
         } else {
-            source.client_only_hashes(&mod_hashes).await?
+            source.pack_member_verdicts(&mod_hashes).await?
         };
 
         // 3. 清单文件：只装服务端需要的（server: unsupported 已由领域层过滤），
         //    并行下载，进度收敛为整包口径（见 [`Self::download_files`]）
-        let (jobs, skipped_client_only) = self
-            .classify_files(prepared, server_dir, &client_only)
-            .await?;
+        let (jobs, skipped_client_only) =
+            self.classify_files(prepared, server_dir, &verdicts).await?;
         let mut applied = self
             .download_files(prepared, source.as_ref(), &jobs, progress, cancel)
             .await?;
         applied.file_count = prepared.index.server_files().len() - skipped_client_only;
         applied.skipped_client_only = skipped_client_only;
+
+        // 4. 把清单留一份：项目 / 版本 ID 都在下载地址里，装完就有了权威数据，
+        //    后续补依赖与整合包更新按 ID 直接定位，不必拿 modid 去搜索
+        let snapshot = ModpackManifestSnapshot::from_index(
+            prepared.source,
+            &prepared.resolved.project_id,
+            &prepared.resolved.version_id,
+            &prepared.resolved.version_number,
+            &prepared.index,
+            crate::atomic::unix_now(),
+        );
+        snapshot
+            .save(server_dir)
+            .await
+            .map_err(|err| ModpackError::io(&ModpackManifestSnapshot::path_in(server_dir), err))?;
         Ok(applied)
     }
 
@@ -412,7 +428,7 @@ impl ModpackService {
         &self,
         prepared: &'a ModpackPrepared,
         server_dir: &Path,
-        client_only: &HashSet<String>,
+        verdicts: &PackMemberVerdicts,
     ) -> Result<(Vec<(&'a ModpackFile, PathBuf)>, usize), ModpackError> {
         let mut skipped_client_only = 0_usize;
         let mut jobs: Vec<(&'a ModpackFile, PathBuf)> = Vec::new();
@@ -421,8 +437,8 @@ impl ModpackService {
             if file
                 .hashes
                 .sha1
-                .as_ref()
-                .is_some_and(|hash| client_only.contains(hash))
+                .as_deref()
+                .is_some_and(|hash| verdicts.skips(hash))
             {
                 // 上一次安装可能已经把它落盘；重装时顺手清掉，避免旧文件
                 // 继续让服务端起不来
@@ -1143,13 +1159,13 @@ mod tests {
 
     #[test]
     fn unsafe_download_url_is_rejected() {
-        let file = ModpackFile {
-            path: "mods/a.jar".to_owned(),
-            downloads: vec!["http://cdn/a.jar".to_owned()],
-            size: 1,
-            hashes: ModpackHashes::default(),
-            env: None,
-        };
+        let file = ModpackFile::new(
+            "mods/a.jar".to_owned(),
+            vec!["http://cdn/a.jar".to_owned()],
+            1,
+            ModpackHashes::default(),
+            None,
+        );
         assert!(first_https(&file.downloads).is_err());
     }
 }
