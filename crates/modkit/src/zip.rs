@@ -10,14 +10,15 @@
 //! | 证据 | 结论 | 可靠度 |
 //! | --- | --- | --- |
 //! | `environment: "client"` | 仅客户端 | Certain |
-//! | NeoForge `side = "CLIENT"` | 仅客户端 | Certain |
+//! | NeoForge `[[mods]] side = "CLIENT"` | 只记证据（加载器不读该字段） | — |
+//! | `[[dependencies.x]] side = "CLIENT"` | 该依赖在服务端不参与校验 | — |
 //! | 只有 `client` 入口，无 `main`/`server` | 仅客户端 | High |
 //! | 字节码引用客户端类（仅无加载器元数据的裸 jar） | 仅客户端迹象 | Medium |
 //! | mixin 有 `client` 段 | 仅记证据，不下结论 | — |
 
 use domain::mod_::{
-    Confidence, Evidence, EvidenceSource, ModCapability, ModDependency, ModLoader, SideSupport,
-    SideVerdict, VersionRange,
+    Confidence, DepSide, Evidence, EvidenceSource, ModCapability, ModDependency, ModLoader,
+    SideSupport, SideVerdict, VersionRange,
 };
 use port::mod_::{ModInspectError, ModInspector};
 use std::io::Read;
@@ -419,7 +420,7 @@ fn take_fabric_mc(depends: &serde_json::Value, cap: &mut ModCapability) {
     let Some(spec) = depends["minecraft"].as_str() else {
         return;
     };
-    cap.mc_versions = parse_mc_range(spec);
+    cap.set_mc_range(ModLoader::Fabric, parse_mc_range(spec));
 }
 
 /// 从 depends 里取 java 版本要求
@@ -716,13 +717,27 @@ fn toml_string(rest: &str) -> Option<String> {
 }
 
 /// `NeoForge` / Forge 的 `side` 声明
+///
+/// # 为什么 `CLIENT` 不再是「服务端不可用」
+///
+/// `[[mods]] side` 在 Forge 1.19.2 的 `ModInfo` / `ModFileInfo` 里根本没有对应
+/// 的字符串常量——加载器不读这个字段，它既不参与装载筛选也不参与依赖校验
+/// （真正被读的是 `[[dependencies.x]] side`，见 [`parse_toml_dependencies`]）。
+/// 实测 `CreativeCore_FORGE_v2.9.4_mc1.19.2.jar` 写着 `side="CLIENT"` 却能在
+/// dedicated server 上正常装载并进入 Done。
+///
+/// 因此这里只记一条证据，不下「不可用于服务端」的结论：结论交给上游元数据
+/// 与其余迹象，风险等级最多到 `Review`。
 fn apply_toml_side(side: Option<&str>, cap: &mut ModCapability) {
     match side.map(str::to_ascii_uppercase).as_deref() {
         Some("CLIENT") => {
-            cap.side = SideVerdict::declared(SideSupport::Required, SideSupport::Unsupported);
+            // 只有客户端侧必需：服务端不做断言
+            if cap.side.client == SideSupport::Unknown {
+                cap.side.client = SideSupport::Required;
+            }
             cap.side.evidence.push(Evidence::new(
                 EvidenceSource::Manifest,
-                "side 显式声明为 CLIENT",
+                "[[mods]] side 声明为 CLIENT（Forge 装载器不读该字段，仅作参考）",
             ));
         }
         Some("SERVER") => {
@@ -749,17 +764,35 @@ fn parse_toml_dependencies(text: &str, cap: &mut ModCapability, neoforge: bool) 
     let mut id = None;
     let mut range = String::new();
     let mut mandatory = true;
-    let flush = |cap: &mut ModCapability, id: &Option<String>, range: &str, mandatory: bool| {
+    let mut side = DepSide::Both;
+    let flush = |cap: &mut ModCapability,
+                 id: &Option<String>,
+                 range: &str,
+                 mandatory: bool,
+                 side: DepSide| {
         if let Some(id) = id {
             cap.depends.push(
-                ModDependency::new(id.clone(), range, mandatory).with_loader(if neoforge {
-                    ModLoader::NeoForge
-                } else {
-                    ModLoader::Forge
-                }),
+                ModDependency::new(id.clone(), range, mandatory)
+                    .with_loader(if neoforge {
+                        ModLoader::NeoForge
+                    } else {
+                        ModLoader::Forge
+                    })
+                    .with_side(side),
             );
-            if id == "minecraft" && cap.mc_versions.is_any() {
-                cap.mc_versions = parse_mc_range(range);
+            if id == "minecraft" {
+                // 按加载器分别记：同一个 jar 可以既有 `fabric.mod.json`
+                // （写 Fabric 版的区间）又有 `mods.toml`（写 Forge 版的区间），
+                // 实测 Cell-Forge-1.19.2.jar 前者是 `~1.20`、后者是 `[1.19.2]`。
+                // 只留先解析到的那份，会把能跑的 Forge mod 判成区间不符。
+                cap.set_mc_range(
+                    if neoforge {
+                        ModLoader::NeoForge
+                    } else {
+                        ModLoader::Forge
+                    },
+                    parse_mc_range(range),
+                );
             }
             if id == "java" && cap.java_required.is_none() {
                 cap.java_required = spec_min_major(Some(range));
@@ -770,19 +803,20 @@ fn parse_toml_dependencies(text: &str, cap: &mut ModCapability, neoforge: bool) 
         let line = line.trim();
         if line.starts_with("[[dependencies") {
             if in_dep {
-                flush(cap, &id, &range, mandatory);
+                flush(cap, &id, &range, mandatory, side);
             }
             in_dep = true;
             id = None;
             range = String::new();
             mandatory = true;
+            side = DepSide::Both;
             continue;
         }
         if !in_dep {
             continue;
         }
         if line.starts_with('[') {
-            flush(cap, &id, &range, mandatory);
+            flush(cap, &id, &range, mandatory, side);
             in_dep = false;
             continue;
         }
@@ -792,10 +826,16 @@ fn parse_toml_dependencies(text: &str, cap: &mut ModCapability, neoforge: bool) 
             range = toml_string(rest).unwrap_or_default();
         } else if let Some(rest) = line.strip_prefix("mandatory") {
             mandatory = !rest.contains("false");
+        } else if let Some(rest) = line.strip_prefix("side") {
+            // 加载器校验依赖前先按当前 dist 过滤：dedicated server 上
+            // `side="CLIENT"` 的依赖整个不参与，读不出来就会误报缺失。
+            side = toml_string(rest)
+                .as_deref()
+                .map_or(DepSide::Both, DepSide::parse);
         }
     }
     if in_dep {
-        flush(cap, &id, &range, mandatory);
+        flush(cap, &id, &range, mandatory, side);
     }
 }
 
@@ -823,11 +863,14 @@ fn parse_plugin_yml(raw: &[u8], cap: &mut ModCapability) {
                 && !api.is_empty()
                 && api.chars().next().is_some_and(|c| c.is_ascii_digit())
             {
-                cap.mc_versions = VersionRange {
-                    raw: format!(">={api}"),
-                    min: Some(api.to_owned()),
-                    max: None,
-                };
+                cap.set_mc_range(
+                    ModLoader::Bukkit,
+                    VersionRange {
+                        raw: format!(">={api}"),
+                        min: Some(api.to_owned()),
+                        max: None,
+                    },
+                );
             }
         }
     }
@@ -1068,13 +1111,76 @@ mod tests {
         assert_eq!(cap.side.client, SideSupport::Required);
     }
 
-    /// mods.toml 显式写 side=CLIENT 的 Forge mod：声明优先，字节码不再覆盖
+    /// `[[mods]] side="CLIENT"` 不再是「服务端不可用」
+    ///
+    /// Forge 的装载器不读这个字段（`ModInfo` 与 `ModFileInfo` 的字符串常量里
+    /// 都没有它），实测 `CreativeCore` 写着 `side="CLIENT"` 却能在 dedicated
+    /// server 上装载。因此：客户端侧记必需，服务端侧保持「判不出」，
+    /// 风险按 `Review` 处理而不是拦死。
     #[test]
-    fn declared_client_side_survives_bytecode_evidence() {
+    fn toml_client_side_is_evidence_not_a_verdict() {
         let text = "[[mods]]\nmodId=\"x\"\nside=\"CLIENT\"";
         let mut cap = ModCapability::empty("x.jar");
+        cap.loaders.push(ModLoader::Forge);
         parse_toml_mods(text.as_bytes(), &mut cap, false);
-        apply_client_bytecode(&mut cap);
-        assert_eq!(cap.side.server, SideSupport::Unsupported);
+        assert_eq!(cap.side.client, SideSupport::Required);
+        assert_eq!(cap.side.server, SideSupport::Unknown);
+        assert_eq!(cap.risk(), domain::mod_::Risk::Review);
+        // 依据里要说明「加载器不读」，否则用户无从判断我们是不是又在瞎判
+        assert!(cap.side.evidence.iter().any(|e| e.detail.contains("不读")));
+    }
+
+    /// `side="SERVER"` 仍是确定结论：只装服务端
+    #[test]
+    fn toml_server_side_stays_certain() {
+        let text = "[[mods]]\nmodId=\"x\"\nside=\"SERVER\"";
+        let mut cap = ModCapability::empty("x.jar");
+        parse_toml_mods(text.as_bytes(), &mut cap, false);
+        assert_eq!(cap.side.server, SideSupport::Required);
+        assert_eq!(cap.side.client, SideSupport::Unsupported);
+    }
+
+    /// `[[dependencies.x]] side="CLIENT"` 的依赖在服务端不参与校验
+    ///
+    /// 实测 embeddiumplus：四个依赖块全写 `side="CLIENT"`，装到 dedicated
+    /// server 上加载器整段跳过，服务端正常启动。不读 side 就会报「缺少必需
+    /// 依赖 embeddium」，进而把一个能跑的 mod 判成必须移除。
+    #[test]
+    fn toml_client_dependency_is_inactive_on_server() {
+        let text = "[[mods]]\nmodId=\"embeddiumplus\"\n\
+                    [[dependencies.embeddiumplus]]\nmodId=\"minecraft\"\nversionRange=\"[1.19.2]\"\nmandatory=true\nside=\"BOTH\"\n\
+                    [[dependencies.embeddiumplus]]\nmodId=\"embeddium\"\nversionRange=\"[0.3,)\"\nmandatory=true\nside=\"CLIENT\"\n\
+                    [[dependencies.embeddiumplus]]\nmodId=\"forge\"\nversionRange=\"[43,)\"\nmandatory=true\nside=\"BOTH\"\n";
+        let mut cap = ModCapability::empty("embeddiumplus.jar");
+        cap.loaders.push(ModLoader::Forge);
+        parse_toml_mods(text.as_bytes(), &mut cap, false);
+        // 依赖要读全（含 side），不能只剩 id
+        let dep = cap
+            .depends
+            .iter()
+            .find(|d| d.id == "embeddium")
+            .expect("embeddium 依赖应当被读到");
+        assert_eq!(dep.side, DepSide::Client);
+        // 服务端口径下不成立，也就不该出现在缺失列表里
+        assert!(
+            cap.missing_mandatory_deps(&[], Some(ModLoader::Forge))
+                .is_empty()
+        );
+    }
+
+    /// 同一个 jar 的两份清单各写各的 MC 区间：按目标加载器取值
+    #[test]
+    fn mc_range_is_kept_per_loader() {
+        let text = "[[mods]]\nmodId=\"cell\"\n\
+                    [[dependencies.cell]]\nmodId=\"minecraft\"\nversionRange=\"[1.19.2]\"\nmandatory=true\nside=\"BOTH\"\n";
+        let mut cap = ModCapability::empty("cell.jar");
+        cap.loaders = vec![ModLoader::Fabric, ModLoader::Forge];
+        // Fabric 清单写的是 ~1.20（先解析到的那份）
+        cap.set_mc_range(ModLoader::Fabric, parse_mc_range("~1.20"));
+        parse_toml_mods(text.as_bytes(), &mut cap, false);
+        assert!(cap.mc_range_for(Some(ModLoader::Forge)).contains("1.19.2"));
+        assert!(!cap.mc_range_for(Some(ModLoader::Forge)).contains("1.20.1"));
+        // Fabric 那份不受 Forge 覆盖
+        assert!(cap.mc_range_for(Some(ModLoader::Fabric)).contains("1.20.1"));
     }
 }

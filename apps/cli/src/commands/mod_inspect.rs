@@ -438,6 +438,8 @@ fn print_fit_detail(report: &ModReport, printer: Printer) {
 
 /// 表格：只放结论，不放长理由
 fn build_table(audit: &ModAudit, target: &ServerTarget, lang: Lang) -> Table {
+    // 区间按目标加载器取值：表里显示的必须与判定用的是同一份
+    let target_loader = target.loader.or(audit.target_loader);
     let mut table = crate::output::compact_table();
     let mut header = vec![
         text(lang, "mod", "mod"),
@@ -475,7 +477,7 @@ fn build_table(audit: &ModAudit, target: &ServerTarget, lang: Lang) -> Table {
         let mut row = vec![
             name.to_owned(),
             loaders,
-            range_text(cap, lang),
+            range_text(cap, target_loader, lang),
             java,
             side_text(cap.side.server, lang).to_owned(),
             risk_text(report.risk, lang).to_owned(),
@@ -551,8 +553,13 @@ fn file_name(path: &str) -> &str {
 }
 
 /// MC 区间展示
-fn range_text(cap: &ModCapability, lang: Lang) -> String {
-    let r = &cap.mc_versions;
+///
+/// 按**目标加载器**取值：同一个 jar 可以有多份清单各写各的区间（实测
+/// `Cell-Forge-1.19.2.jar` 的 Fabric 清单写 `~1.20`、Forge 清单写
+/// `[1.19.2]`）。表里给的是「装上这台服务端会按哪个区间校验」，与判定同源，
+/// 否则会出现「表里说不符、结论说可装」。
+fn range_text(cap: &ModCapability, loader: Option<ModLoader>, lang: Lang) -> String {
+    let r = cap.mc_range_for(loader);
     if r.is_any() {
         return text(lang, "未声明", "undeclared").to_owned();
     }
@@ -605,10 +612,15 @@ fn to_json(report: &ModReport, target_loader: Option<ModLoader>, target: &Server
         id: cap.id.clone(),
         version: cap.version.clone(),
         loaders: cap.loaders.iter().map(|l| l.as_str().to_owned()).collect(),
-        mc_versions: McRangeJson {
-            raw: cap.mc_versions.raw.clone(),
-            min: cap.mc_versions.min.clone(),
-            max: cap.mc_versions.max.clone(),
+        mc_versions: {
+            // 与判定同源：JSON 消费方拿到的区间必须就是用来判「装不装得上」
+            // 的那一份，否则会与同一份输出里的 `fit` 自相矛盾
+            let r = cap.mc_range_for(target_loader);
+            McRangeJson {
+                raw: r.raw.clone(),
+                min: r.min.clone(),
+                max: r.max.clone(),
+            }
         },
         java_required: cap.java_required,
         java_compiled: cap.java_compiled,

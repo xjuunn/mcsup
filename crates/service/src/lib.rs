@@ -43,7 +43,7 @@ pub use lifecycle::{
 pub use mod_::{
     ApplyOptions, FixInstall, FixRefused, FixRemove, InstallPlan, InstallSpec, ListOptions,
     ModEntry, ModError, ModFixApplied, ModFixPlan, ModInstalled, ModList, ModRemoved, ModService,
-    STAGING_DIR, UpdateApplied, UpdateChange, UpdateItem, UpdatePlan, server_target,
+    STAGING_DIR, TRASH_DIR, UpdateApplied, UpdateChange, UpdateItem, UpdatePlan, server_target,
 };
 pub use mod_inspect::{
     ModAudit, ModInspectService, ModInspectServiceError, ModReport, collect_jars,

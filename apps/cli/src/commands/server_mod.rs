@@ -428,8 +428,18 @@ fn remove(
     } else {
         pick(
             lang,
-            format!("已删除 {} 个文件：{}", files.len(), files.join("、")),
-            format!("removed {} file(s): {}", files.len(), files.join(", ")),
+            format!(
+                "已删除 {} 个文件：{}（可在 {} 中取回）",
+                files.len(),
+                files.join("、"),
+                mcsup::service::TRASH_DIR
+            ),
+            format!(
+                "removed {} file(s): {} (recoverable from {})",
+                files.len(),
+                files.join(", "),
+                mcsup::service::TRASH_DIR
+            ),
         )
     };
     printer.print_outcome(&human, &payload)
@@ -565,8 +575,16 @@ fn report_fix_applied(applied: &mcsup::service::ModFixApplied, printer: Printer)
         printer.print_outcome(
             &pick(
                 lang,
-                format!("已移除 {}", file.display()),
-                format!("removed {}", file.display()),
+                format!(
+                    "已移除 {}（已移入 {}，可随时取回）",
+                    file.display(),
+                    mcsup::service::TRASH_DIR
+                ),
+                format!(
+                    "removed {} (moved to {}, recoverable)",
+                    file.display(),
+                    mcsup::service::TRASH_DIR
+                ),
             ),
             &(),
         )?;
