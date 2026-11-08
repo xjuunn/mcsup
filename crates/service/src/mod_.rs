@@ -958,8 +958,10 @@ impl ModService {
     /// - 明确不可用（仅客户端且非库 / 与服务端明显不匹配）→ 规划移除该文件，
     ///   原因照实记录
     ///
-    /// 上游检索取第一个非仅客户端的命中：modid 与项目 slug 通常是同一命名，
-    /// 但这只是约定不是保证，因此应用前必须经用户确认（CLI 的确认提示）。
+    /// 上游检索按 modid 找本体：`slug` / `id` 与之相等的优先，名字只是包含
+    /// 的次之；不按「服务端可用」过滤，因为库类 mod 的侧别标注经常有误，
+    /// 侧别交给安装检查判。modid 与项目 slug
+    /// 只是约定不是保证，因此应用前必须经用户确认（CLI 的确认提示）。
     ///
     /// # Errors
     ///
@@ -1056,8 +1058,20 @@ impl ModService {
 
     /// 在上游检索某个 modid 的提供方
     ///
-    /// 按 modid 检索、取第一个非仅客户端的命中。检索是「尽力而为」：上游
-    /// 检索不到就返回 `None`，不猜也不报错——修复计划里如实进 `unresolved`。
+    /// 检索是「尽力而为」：上游检索不到就返回 `None`，不猜也不报错——修复
+    /// 计划里如实进 `unresolved`。
+    ///
+    /// 检索口径**不**按「服务端可用」过滤，与 [`Self::search`] 不同。缺依赖
+    /// 要补的是「谁提供这个 modid」，那个项目是不是被上游标成仅客户端，不能
+    /// 由这一层判掉：库类 mod 的上游标注经常有误（`satin`、`melody`），而
+    /// 真正只有客户端代码的 jar 会得到 `Blocking` 并被安装检查拒绝，带
+    /// `main` 入口的库只会得到 `Review` 并放行。实测反例：`fancymenu` 在
+    /// `fabric.mod.json` 里要求 `melody >=1.0.17`，`melody` 本体在 Modrinth
+    /// 上确实存在（`CVT4pFB2`，`26.3` 有 `1.0.17`，jar 内 `id=melody`、
+    /// `environment: "*"`、有 `main` 入口，服务端装载正常），但被上游标成
+    /// `server_side: unsupported`；按该标注过滤后整条消失，检索只剩名字里
+    /// 含 `melody` 的 `music-and-melody`（modid 是 `music_and_melody`），
+    /// 补装必然被 `expect_modid` 拒，最后报成「上游找不到提供方」。
     async fn find_provider(
         &self,
         modid: &str,
@@ -1065,26 +1079,18 @@ impl ModService {
     ) -> Result<Option<ContentProject>, ModError> {
         // 上游检索把 modid 当整词条：`geckolib3` 搜不到 `geckolib`（实测
         // 全文索引里带数字尾巴的旧命名排不进结果）。原词落空后去掉尾部
-        // 版本数字再试一次；命中同样要过「非仅客户端」过滤。
+        // 版本数字再试一次。
         for term in provider_search_terms(modid) {
             let query = ContentQuery::new().keyword(&term).page(0, 5);
-            let found = self
-                .content
-                .search(
-                    None,
-                    &server_query(
-                        &server.meta.variant,
-                        server.meta.version.as_str(),
-                        ContentKind::Mod,
-                        &query,
-                    ),
-                )
-                .await?;
-            if let Some(hit) = found
-                .hits
-                .into_iter()
-                .find(|hit| !hit.client_only && provider_hit_matches(hit, &term))
-            {
+            let mut relaxed = server_query(
+                &server.meta.variant,
+                server.meta.version.as_str(),
+                ContentKind::Mod,
+                &query,
+            );
+            relaxed.server_usable_only = false;
+            let found = self.content.search(None, &relaxed).await?;
+            if let Some(hit) = pick_provider_hit(found.hits, &term) {
                 return Ok(Some(hit));
             }
         }
@@ -1799,16 +1805,41 @@ fn provider_search_terms(modid: &str) -> Vec<String> {
     terms
 }
 
-/// 命中项目与检索词的相关性校验
+/// 命中项目与检索词的相关程度，越小越相关；不相关为 `None`
 ///
 /// 上游检索按相关度排序，但缺依赖 modid 往往命中同名无关项目——实测
 /// 反例：缺 `cupboard` 时第一个可用命中是 `aesthetic-storage`（Modrinth
 /// 上搜不到那个库本体），照单全收就会给用户装进毫不相干的 mod。
-/// 要求 slug / id / 标题至少之一包含检索词，包含不上的一律不猜。
-fn provider_hit_matches(hit: &ContentProject, term: &str) -> bool {
+///
+/// 只做「包含」判断也不够：它会把「名字里恰好带这个词」的项目排到本体
+/// 前面——搜 `melody` 时 `music-and-melody` 的 slug 也包含 `melody`。本体
+/// 判据是 `slug` / `id` **等于**该 modid（modid 与项目 slug 同名是常态），
+/// 因此相等优先（0），包含次之（1），不相关一律不猜。
+fn provider_hit_rank(hit: &ContentProject, term: &str) -> Option<u8> {
     let term = term.to_ascii_lowercase();
+    let equals = |text: &str| text.to_ascii_lowercase() == term;
     let contains = |text: &str| text.to_ascii_lowercase().contains(&term);
-    hit.slug.as_deref().is_some_and(contains) || contains(&hit.id) || contains(&hit.title)
+    if equals(&hit.id) || hit.slug.as_deref().is_some_and(equals) {
+        Some(0)
+    } else if hit.slug.as_deref().is_some_and(contains) || contains(&hit.id) || contains(&hit.title)
+    {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// 从检索结果里挑提供方：相等命中优先，其次服务端可用的命中
+///
+/// 两个排序键的顺序不能反。`melody` 本体被上游标成仅客户端，而排位更靠
+/// 后的 `music-and-melody` 是「服务端可用」；若先按服务端可用挑，挑中的
+/// 就是那个不提供 `melody` modid 的项目。名字与该 modid 完全一致的项目
+/// 才是要补的本体，它的侧别由安装检查判，不由检索判。
+fn pick_provider_hit(hits: Vec<ContentProject>, term: &str) -> Option<ContentProject> {
+    hits.into_iter()
+        .filter_map(|hit| provider_hit_rank(&hit, term).map(|rank| (rank, hit)))
+        .min_by_key(|(rank, hit)| (*rank, hit.client_only))
+        .map(|(_, hit)| hit)
 }
 
 /// 换名更新后删掉旧文件
@@ -2014,20 +2045,49 @@ mod tests {
             client_only: false,
         };
         // cupboard 搜出的无关项目不收（实测反例）
-        assert!(!provider_hit_matches(
-            &hit("aesthetic-storage", "Aesthetic Storage"),
-            "cupboard"
-        ));
+        assert_eq!(
+            provider_hit_rank(&hit("aesthetic-storage", "Aesthetic Storage"), "cupboard"),
+            None
+        );
         // slug 含词的收（geckolib 现场）
-        assert!(provider_hit_matches(
-            &hit("geckolib", "GeckoLib"),
-            "geckolib"
-        ));
-        // 去尾词命中：geckolib 含 geckolib（搜 geckolib3 去尾后的词）
-        assert!(provider_hit_matches(
-            &hit("geckolib", "GeckoLib"),
-            "geckolib"
-        ));
+        assert!(provider_hit_rank(&hit("geckolib", "GeckoLib"), "geckolib").is_some());
+        // 名字只是包含检索词的排在相等命中之后（melody 现场）
+        assert_eq!(
+            provider_hit_rank(&hit("music-and-melody", "Music and Melody"), "melody"),
+            Some(1)
+        );
+        assert_eq!(
+            provider_hit_rank(&hit("melody", "Melody"), "melody"),
+            Some(0)
+        );
+    }
+
+    /// 相等命中优先于「服务端可用」：melody 现场
+    ///
+    /// 本体被上游标成仅客户端，名字里含该词的近似项目反而标着服务端可用。
+    /// 若按服务端可用先挑，挑中的是不提供该 modid 的那个项目，补装必然失败。
+    #[test]
+    fn provider_pick_prefers_exact_slug_over_server_usable() {
+        let hit = |id: &str, client_only: bool| ContentProject {
+            id: id.to_owned(),
+            slug: Some(id.to_owned()),
+            title: id.to_owned(),
+            description: String::new(),
+            kind: ContentKind::Mod,
+            also_kinds: Vec::new(),
+            loaders: Vec::new(),
+            game_versions: Vec::new(),
+            author: None,
+            downloads: 0,
+            icon_url: None,
+            client_only,
+        };
+        let picked = pick_provider_hit(
+            vec![hit("music-and-melody", false), hit("melody", true)],
+            "melody",
+        )
+        .expect("provider");
+        assert_eq!(picked.id, "melody");
     }
 
     /// 记录的 Java 优先；没有记录时按 MC 版本推算，与启动判定同源
