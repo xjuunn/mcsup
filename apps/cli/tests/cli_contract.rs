@@ -1040,7 +1040,12 @@ fn config_show_without_file_reports_defaults() {
         .collect();
     assert_eq!(
         keys,
-        ["data-dir", "download-concurrency", "download-sources"]
+        [
+            "data-dir",
+            "download-concurrency",
+            "download-sources",
+            "download-inflight"
+        ]
     );
     assert!(items.iter().all(|i| i["source"] == "default"), "{items:?}");
 }

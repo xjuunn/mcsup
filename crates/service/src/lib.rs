@@ -55,8 +55,8 @@ pub use modpack::{
 pub use origin::{OriginFilter, ResolveError, Selector, resolve_index};
 pub use platform_config::{
     Config, ConfigDocumentError, ConfigKey, ConfigValueError, ConfigValueErrorKind,
-    DEFAULT_DOWNLOAD_CONCURRENCY, FEATURE_HEADER, MAX_DOWNLOAD_CONCURRENCY, RemoteRecord,
-    RemoteVia, lexical_normalize,
+    DEFAULT_DOWNLOAD_CONCURRENCY, DEFAULT_DOWNLOAD_INFLIGHT, FEATURE_HEADER,
+    MAX_DOWNLOAD_CONCURRENCY, MAX_DOWNLOAD_INFLIGHT, RemoteRecord, RemoteVia, lexical_normalize,
 };
 pub use platform_doctor::{PlatformCheck, PlatformDoctor, PlatformFinding, PlatformReport};
 /// Java 源聚合端口（定义在 `port`，此处转出便于既有调用方）

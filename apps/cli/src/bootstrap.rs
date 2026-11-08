@@ -455,6 +455,7 @@ pub(crate) fn open_mcsup_with_remotes() -> Result<Mcsup> {
     );
     let mc = McsupBuilder::new()
         .store(store.clone())
+        .config(cfg)
         .supervisor(supervisor)
         .remote_backups(remote_backups)
         .workspace_repository(Arc::new(CombinedWorkspaceRepository::new(
@@ -498,7 +499,11 @@ pub(crate) fn workspace_service_with_remotes() -> Result<mcsup::service::Workspa
 /// 组合根即可获得与 CLI 完全一致的默认行为。
 pub(crate) fn open_mcsup() -> Result<Mcsup> {
     let data_dir = config::platform_data_dir();
-    Mcsup::open(&data_dir).context("装配 mcsup 组合根")
+    let cfg = ConfigFile::locate(None).load()?;
+    McsupBuilder::new()
+        .config(cfg)
+        .build(&data_dir)
+        .context("装配 mcsup 组合根")
 }
 
 #[cfg(test)]

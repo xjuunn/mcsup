@@ -176,6 +176,8 @@ pub struct McsupBuilder {
     modpack_sources: Option<Vec<Arc<dyn ModpackSource>>>,
     modpack_extractor: Option<Arc<dyn ModpackExtractor>>,
     mod_inspector: Option<Arc<dyn port::mod_::ModInspector>>,
+    /// 平台配置：决定下载并发与镜像前缀；`None` 全用缺省
+    config: Option<service::Config>,
 }
 
 impl std::fmt::Debug for McsupBuilder {
@@ -208,6 +210,7 @@ impl std::fmt::Debug for McsupBuilder {
             )
             .field("modpack_extractor", &self.modpack_extractor.is_some())
             .field("mod_inspector", &self.mod_inspector.is_some())
+            .field("config", &self.config.is_some())
             .finish()
     }
 }
@@ -258,6 +261,17 @@ impl McsupBuilder {
     #[must_use]
     pub fn downloader(mut self, downloader: Arc<dyn port::ArtifactDownloader>) -> Self {
         self.downloader = Some(downloader);
+        self
+    }
+
+    /// 注入平台配置（对应 `config.toml`）
+    ///
+    /// 只影响与下载相关的键：`download-concurrency` 决定批量下载的并发文件数，
+    /// `download-sources` 决定 mod 文件的镜像前缀。其余键由调用方自行取用——
+    /// 组合根不替入口决定数据目录落在哪里。
+    #[must_use]
+    pub fn config(mut self, config: service::Config) -> Self {
+        self.config = Some(config);
         self
     }
 
@@ -392,7 +406,12 @@ impl McsupBuilder {
             HttpByteSource::new().map_err(|err| BootstrapError::Transport(Box::new(err)))?,
         );
         let downloader = self.downloader.unwrap_or_else(|| {
-            Arc::new(FileDownloader::new(bytes.clone()).with_range_source(bytes))
+            let mut downloader =
+                FileDownloader::new(bytes.clone()).with_range_source(bytes.clone());
+            if let Some(config) = &self.config {
+                downloader = downloader.with_inflight_limit(config.resolved_download_inflight());
+            }
+            Arc::new(downloader)
         });
 
         let java_root = Mcsup::java_root(data_dir)?;
@@ -471,12 +490,17 @@ impl McsupBuilder {
             Some(sources) => sources,
             None => default_modpack_sources()?,
         };
-        let modpack = ModpackService::new(
+        let mut modpack = ModpackService::new(
             Arc::new(ModpackSourceRegistry::new(modpack_sources)),
             self.modpack_extractor
                 .unwrap_or_else(|| Arc::new(MrpackExtractor::new())),
             Arc::clone(&downloader),
         );
+        if let Some(config) = &self.config {
+            modpack = modpack
+                .with_file_concurrency(config.resolved_download_concurrency())
+                .with_mirrors(config.resolved_download_sources());
+        }
 
         // mod 编排与服务端生命周期共用同一个 backend：运行中拒绝改动 mod 的
         // 判定必须问同一个 supervisor，另起一个实例会各自看到不同的运行态

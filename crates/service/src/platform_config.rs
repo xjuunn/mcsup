@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+use url::Url;
 
 /// 批量下载并发文件数的缺省值
 ///
@@ -29,6 +30,19 @@ pub const DEFAULT_DOWNLOAD_CONCURRENCY: usize = 8;
 /// 文件被切成几十段并发拉时，服务端与中间设备更容易掐连接。给个上限既
 /// 防着用户手抖写个 1000，也不至于把真正宽裕的链路卡死。
 pub const MAX_DOWNLOAD_CONCURRENCY: usize = 64;
+
+/// 全部下载在途连接数的缺省上限
+///
+/// 两层并发各自有界、乘起来没有界：8 个文件各切 24 段会同时抽 192 条连接，
+/// 远超家庭带宽与上游对单 IP 的容忍度。48 是「批量并发跑满 8 个文件、每个
+/// 各 6 段」的量级，既让大文件仍能多路跑，又不至于把链路和上游打爆。
+pub const DEFAULT_DOWNLOAD_INFLIGHT: usize = 48;
+
+/// 在途连接上限的最大值
+///
+/// 再高只会换来本地端口与上游限流上的抖动；这里给足空间（512）同时挡住
+/// 手抖写成几万的情况。
+pub const MAX_DOWNLOAD_INFLIGHT: usize = 512;
 
 /// 列表型配置项的分隔符（人类可读写，无需引号）
 const ENTRIES_SEPARATOR: &str = ",";
@@ -57,6 +71,9 @@ pub struct Config {
     /// 地址就得为一个整合包写几百行配置，而且上游一换文件名全作废。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub download_sources: Vec<String>,
+    /// 全部下载在途连接上限（缺省 [`DEFAULT_DOWNLOAD_INFLIGHT`]）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub download_inflight: Option<usize>,
     /// 已配对的远端：键是远端名，值是一条配对记录
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub remotes: BTreeMap<String, RemoteRecord>,
@@ -130,6 +147,8 @@ pub enum ConfigKey {
     DownloadConcurrency,
     /// `download-sources`：mod 文件的镜像前缀，逗号分隔
     DownloadSources,
+    /// `download-inflight`：全部下载合起来的同时在途连接数上限
+    DownloadInflight,
 }
 
 impl ConfigKey {
@@ -138,6 +157,7 @@ impl ConfigKey {
         Self::DataDir,
         Self::DownloadConcurrency,
         Self::DownloadSources,
+        Self::DownloadInflight,
     ];
 
     /// 配置文件里的键名（kebab-case，与 `server set` 同一口径）
@@ -147,6 +167,7 @@ impl ConfigKey {
             Self::DataDir => "data-dir",
             Self::DownloadConcurrency => "download-concurrency",
             Self::DownloadSources => "download-sources",
+            Self::DownloadInflight => "download-inflight",
         }
     }
 
@@ -157,6 +178,7 @@ impl ConfigKey {
             Self::DataDir => "平台数据目录（workspaces / java / db 都在其下）",
             Self::DownloadConcurrency => "批量下载并发文件数（缺省 8，范围 1–64）",
             Self::DownloadSources => "mod 文件镜像前缀，逗号分隔（缺省只用官方源）",
+            Self::DownloadInflight => "全部下载在途连接上限（缺省 48，范围 1–512）",
         }
     }
 
@@ -173,6 +195,7 @@ impl ConfigKey {
             Self::DataDir => Config::default_data_dir().display().to_string(),
             Self::DownloadConcurrency => DEFAULT_DOWNLOAD_CONCURRENCY.to_string(),
             Self::DownloadSources => ENTRIES_SEPARATOR.to_owned(),
+            Self::DownloadInflight => DEFAULT_DOWNLOAD_INFLIGHT.to_string(),
         }
     }
 }
@@ -310,11 +333,45 @@ impl Config {
         self.data_dir.clone().unwrap_or_else(Self::default_data_dir)
     }
 
+    /// 生效的批量下载并发文件数
+    ///
+    /// 未设置时给 [`DEFAULT_DOWNLOAD_CONCURRENCY`]。写入侧已由
+    /// [`ConfigKey::DownloadConcurrency`] 的校验保证落在 `1..=MAX`，这里不再
+    /// 二次夹取——真出现越界说明配置被绕过了键表，应当暴露而不是被悄悄修正。
+    #[must_use]
+    pub fn resolved_download_concurrency(&self) -> usize {
+        self.download_concurrency
+            .unwrap_or(DEFAULT_DOWNLOAD_CONCURRENCY)
+    }
+
+    /// 生效的全部下载在途连接上限
+    ///
+    /// 未设置时给 [`DEFAULT_DOWNLOAD_INFLIGHT`]。它是批量并发与分段并发
+    /// 共同的闸门，缺省值只要不比缺省并发数小就不会拖慢正常流程。
+    #[must_use]
+    pub fn resolved_download_inflight(&self) -> usize {
+        self.download_inflight.unwrap_or(DEFAULT_DOWNLOAD_INFLIGHT)
+    }
+
+    /// 生效的 mod 镜像前缀，已解析为地址
+    ///
+    /// 解析放在这里而不是入口：拼接镜像地址是下载语义的一部分，三个入口
+    /// （CLI / API / MCP）都要用同一套规则，放进任何一个入口都会分叉。
+    /// 写入侧已挡掉非法前缀，因此解析失败只会来自手改文件，按「忽略这一项」
+    /// 处理——镜像只是加速手段，为它整体失败会让一份能跑的配置突然不可用。
+    #[must_use]
+    pub fn resolved_download_sources(&self) -> Vec<Url> {
+        self.download_sources
+            .iter()
+            .filter_map(|raw| Url::parse(raw).ok())
+            .collect()
+    }
+
     /// 该键的生效值，统一为展示用字符串
     ///
     /// 返回 `String` 而不是 `PathBuf`：键表里既有路径也有数值与列表，用一个
     /// 能表达三者的形态才不会为了「多一个数值键」去改所有调用方。列表按
-    /// [`ENTRIES_SEPARATOR`] 连接，因此 `raw` 与 `effective` 对同一份配置
+    /// 逗号连接，因此 `raw` 与 `effective` 对同一份配置
     /// 产出的文本是一致的（未设置时 `effective` 给缺省、`raw` 给 `None`）。
     #[must_use]
     pub fn effective(&self, key: ConfigKey) -> String {
@@ -325,6 +382,10 @@ impl Config {
                 .unwrap_or(DEFAULT_DOWNLOAD_CONCURRENCY)
                 .to_string(),
             ConfigKey::DownloadSources => self.download_sources.join(ENTRIES_SEPARATOR),
+            ConfigKey::DownloadInflight => self
+                .download_inflight
+                .unwrap_or(DEFAULT_DOWNLOAD_INFLIGHT)
+                .to_string(),
         }
     }
 
@@ -335,6 +396,7 @@ impl Config {
             ConfigKey::DataDir => self.data_dir.is_some(),
             ConfigKey::DownloadConcurrency => self.download_concurrency.is_some(),
             ConfigKey::DownloadSources => !self.download_sources.is_empty(),
+            ConfigKey::DownloadInflight => self.download_inflight.is_some(),
         }
     }
 
@@ -356,6 +418,9 @@ impl Config {
             ConfigKey::DownloadSources => {
                 self.download_sources = parse_sources(key.as_str(), value)?;
             }
+            ConfigKey::DownloadInflight => {
+                self.download_inflight = Some(parse_inflight(key.as_str(), value)?);
+            }
         }
         Ok(())
     }
@@ -366,6 +431,7 @@ impl Config {
             ConfigKey::DataDir => self.data_dir = None,
             ConfigKey::DownloadConcurrency => self.download_concurrency = None,
             ConfigKey::DownloadSources => self.download_sources.clear(),
+            ConfigKey::DownloadInflight => self.download_inflight = None,
         }
     }
 
@@ -380,6 +446,7 @@ impl Config {
             ConfigKey::DownloadConcurrency => self.download_concurrency.map(|n| n.to_string()),
             ConfigKey::DownloadSources => (!self.download_sources.is_empty())
                 .then(|| self.download_sources.join(ENTRIES_SEPARATOR)),
+            ConfigKey::DownloadInflight => self.download_inflight.map(|n| n.to_string()),
         }
     }
 
@@ -441,7 +508,8 @@ impl Config {
 
 /// 写入文件时置顶的说明：手改的人先看到可用键
 pub const FEATURE_HEADER: &str = "# mcsup 平台配置；键表见 `mcsup config show`\n\
-     # data-dir，删除该项即回到平台缺省\n\
+     # data-dir / download-concurrency / download-sources / download-inflight，\n\
+     # 删除任一项即回到该项的平台缺省\n\
      # remotes.* 由 `mcsup remote connect` / `disconnect` 维护，不要手改\n\n";
 
 /// 校验并归一化路径
@@ -492,6 +560,21 @@ fn parse_concurrency(key: &'static str, value: &str) -> Result<usize, ConfigValu
         value: value.to_owned(),
         min: 1,
         max: MAX_DOWNLOAD_CONCURRENCY,
+    })
+}
+
+/// 校验在途连接上限
+fn parse_inflight(key: &'static str, value: &str) -> Result<usize, ConfigValueError> {
+    let trimmed = value.trim();
+    let number = trimmed
+        .parse::<usize>()
+        .ok()
+        .filter(|n| (1..=MAX_DOWNLOAD_INFLIGHT).contains(n));
+    number.ok_or_else(|| ConfigValueError::Number {
+        key,
+        value: value.to_owned(),
+        min: 1,
+        max: MAX_DOWNLOAD_INFLIGHT,
     })
 }
 
@@ -572,7 +655,12 @@ mod tests {
         let names: Vec<&str> = ConfigKey::ALL.iter().map(|k| k.as_str()).collect();
         assert_eq!(
             names,
-            vec!["data-dir", "download-concurrency", "download-sources"]
+            vec![
+                "data-dir",
+                "download-concurrency",
+                "download-sources",
+                "download-inflight"
+            ]
         );
         assert_eq!(ConfigKey::parse("data-dir"), Some(ConfigKey::DataDir));
         assert_eq!(
@@ -582,6 +670,10 @@ mod tests {
         assert_eq!(
             ConfigKey::parse("download-sources"),
             Some(ConfigKey::DownloadSources)
+        );
+        assert_eq!(
+            ConfigKey::parse("download-inflight"),
+            Some(ConfigKey::DownloadInflight)
         );
         assert_eq!(ConfigKey::parse("Data-Dir"), None);
         assert_eq!(ConfigKey::parse("nope"), None);

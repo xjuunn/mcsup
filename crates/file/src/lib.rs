@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc::UnboundedSender;
 use url::Url;
 
@@ -130,6 +131,8 @@ struct SegmentTask {
     location: Url,
     temp_path: PathBuf,
     bounds: RangeInclusive<u64>,
+    /// 全局在途许可；`None` 表示不限（见 [`FileDownloader::with_inflight_limit`]）
+    inflight: Option<Arc<Semaphore>>,
 }
 
 /// 编排 future 被丢弃时通知分段任务尽快退出
@@ -146,12 +149,25 @@ pub struct FileDownloader {
     source: Arc<dyn ByteSource>,
     range: Option<Arc<dyn RangeSource>>,
     timeout: Duration,
+    /// 全部在途连接的上限（批量并行 × 分段并行 × 重试都在它之下）
+    ///
+    /// 两层并发各自有界，乘起来没有界：8 个文件各分 24 段就是 192 条连接，
+    /// 超过多数家庭带宽与上游的连接上限，反而让每条约到的速率更低。
+    /// `None` 表示不限，保持注入自定义来源时的既有行为。
+    inflight: Option<Arc<Semaphore>>,
 }
 
 impl std::fmt::Debug for FileDownloader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FileDownloader")
             .field("timeout", &self.timeout)
+            .field(
+                "inflight_limit",
+                &self
+                    .inflight
+                    .as_ref()
+                    .map(|semaphore| semaphore.available_permits()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -164,6 +180,7 @@ impl FileDownloader {
             source,
             range: None,
             timeout: DEFAULT_TIMEOUT,
+            inflight: None,
         }
     }
 
@@ -174,7 +191,19 @@ impl FileDownloader {
             source,
             range: None,
             timeout,
+            inflight: None,
         }
+    }
+
+    /// 限制全部在途连接数
+    ///
+    /// 与批量并发、分段并发是三个独立维度：那两个决定「排多少条队」，
+    /// 这个决定「同时放几条真的出去」。`0` 视为不限——配置层已经挡掉了 0，
+    /// 真传进来时按不限处理比让下载永久阻塞安全。
+    #[must_use]
+    pub fn with_inflight_limit(mut self, limit: usize) -> Self {
+        self.inflight = (limit > 0).then(|| Arc::new(Semaphore::new(limit)));
+        self
     }
 
     /// 注入按字节范围读取的能力
@@ -255,6 +284,16 @@ impl FileDownloader {
         progress: Option<&dyn ProgressSink>,
         cancel: &CancellationToken,
     ) -> Result<u64, DownloadError> {
+        // 拿在途许可也要可打断：排队等到一半用户按了 Ctrl-C 不能继续等
+        let _permit = match self.inflight.as_ref() {
+            Some(semaphore) => Some(
+                until_cancelled(Arc::clone(semaphore).acquire_owned(), &[cancel])
+                    .await
+                    .map_err(|_| DownloadError::Cancelled)?
+                    .map_err(|_| DownloadError::Cancelled)?,
+            ),
+            None => None,
+        };
         // 建连 / 跟随重定向 / 响应头都在这里等待，取消必须能打断它
         let mut reader = until_cancelled(self.source.open(&request.location), &[cancel]).await??;
         let mut file = tokio::fs::File::create(temp_path)
@@ -318,6 +357,7 @@ impl FileDownloader {
                 location: request.location.clone(),
                 temp_path: temp_path.to_path_buf(),
                 bounds,
+                inflight: self.inflight.clone(),
             };
             handles.push(tokio::spawn(run_segment(
                 task,
@@ -596,6 +636,16 @@ async fn fetch_segment(
     if cancel.is_cancelled() || stop.is_cancelled() {
         return Err(DownloadError::Cancelled);
     }
+    // 拿在途许可也要可打断：排队等到一半用户按了 Ctrl-C 不能继续等
+    let _permit = match task.inflight.as_ref() {
+        Some(semaphore) => Some(
+            until_cancelled(Arc::clone(semaphore).acquire_owned(), &[cancel, stop])
+                .await
+                .map_err(|_| DownloadError::Cancelled)?
+                .map_err(|_| DownloadError::Cancelled)?,
+        ),
+        None => None,
+    };
     // 段连接的建立也要可打断：取消发生在建连期间不等响应头
     let mut reader = until_cancelled(
         task.range_source
@@ -1416,6 +1466,75 @@ mod tests {
             .await;
         assert_eq!(outcomes.len(), 1);
         assert!(outcomes[0].is_ok());
+        Ok(())
+    }
+
+    /// 记录并发峰值的来源：`open` 进入即占坑，读到流末尾才放
+    #[derive(Default)]
+    struct CountingState {
+        live: AtomicU32,
+        peak: AtomicU32,
+    }
+
+    struct CountingSource {
+        state: Arc<CountingState>,
+        payload: Vec<u8>,
+    }
+
+    struct CountingReader {
+        payload: Option<Vec<u8>>,
+        state: Arc<CountingState>,
+    }
+
+    #[async_trait]
+    impl ByteSource for CountingSource {
+        async fn open(&self, _location: &Url) -> Result<Box<dyn ByteReader>, SourceError> {
+            let live = self.state.live.fetch_add(1, Ordering::SeqCst) + 1;
+            self.state.peak.fetch_max(live, Ordering::SeqCst);
+            Ok(Box::new(CountingReader {
+                payload: Some(self.payload.clone()),
+                state: Arc::clone(&self.state),
+            }))
+        }
+    }
+
+    #[async_trait]
+    impl ByteReader for CountingReader {
+        async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, SourceError> {
+            let Some(payload) = self.payload.take() else {
+                return Ok(None);
+            };
+            Ok(Some(payload))
+        }
+    }
+
+    impl Drop for CountingReader {
+        fn drop(&mut self) {
+            self.state.live.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// 在途上限必须真的压住峰值：不限时 8 个文件会同时开 8 条连接
+    #[tokio::test]
+    async fn inflight_limit_caps_concurrent_connections() -> Result<(), Box<dyn Error>> {
+        let dir = tempdir()?;
+        let state = Arc::new(CountingState::default());
+        let source = Arc::new(CountingSource {
+            state: Arc::clone(&state),
+            payload: b"jar!".to_vec(),
+        });
+        let downloader = FileDownloader::new(source).with_inflight_limit(2);
+        let requests: Vec<_> = (0..8)
+            .map(|index| batch_request(dir.path(), &format!("m{index}.jar"), b"jar!"))
+            .collect();
+        let outcomes = downloader
+            .download_many(&requests, 8, None, &CancellationToken::new())
+            .await;
+        assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+        let peak = state.peak.load(Ordering::SeqCst);
+        assert!(peak <= 2, "在途上限 2 却观测到峰值 {peak}");
+        // 全部结束后坑位必须回零，否则上限会随下载次数累积泄漏
+        assert_eq!(state.live.load(Ordering::SeqCst), 0, "在途计数未归零");
         Ok(())
     }
 }

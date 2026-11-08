@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::info;
+use url::Url;
 
 /// 整合包安装失败
 #[derive(Debug, Error)]
@@ -204,12 +205,18 @@ pub struct ModpackService {
     sources: Arc<ModpackSourceRegistry>,
     extractor: Arc<dyn ModpackExtractor>,
     downloader: Arc<dyn ArtifactDownloader>,
+    /// 批量下载的并发文件数（见 [`Self::with_file_concurrency`]）
+    file_concurrency: usize,
+    /// mod 文件的镜像前缀，空表示只用清单给的地址
+    mirrors: Vec<Url>,
 }
 
 impl std::fmt::Debug for ModpackService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ModpackService")
             .field("sources", &self.sources.names())
+            .field("file_concurrency", &self.file_concurrency)
+            .field("mirrors", &self.mirrors.len())
             .finish_non_exhaustive()
     }
 }
@@ -226,7 +233,59 @@ impl ModpackService {
             sources,
             extractor,
             downloader,
+            file_concurrency: FILE_CONCURRENCY,
+            mirrors: Vec::new(),
         }
+    }
+
+    /// 指定批量下载的并发文件数
+    ///
+    /// `0` 视为「用实现内置缺省」，与 [`ArtifactDownloader::download_many`] 的
+    /// 契约一致；配置层已经在键表校验里挡掉了 0，这里只是不让下游拿到一个
+    /// 会让整批退化成串行的值。
+    #[must_use]
+    pub fn with_file_concurrency(mut self, concurrency: usize) -> Self {
+        if concurrency > 0 {
+            self.file_concurrency = concurrency;
+        }
+        self
+    }
+
+    /// 指定 mod 文件的镜像前缀
+    ///
+    /// 前缀只替换地址的 scheme 与 host，路径原样保留：镜像站按上游同样的
+    /// 路径规则回源（`data/<项目>/versions/<版本>/<文件名>`），存整条地址就得
+    /// 为一个整合包写几百行配置，上游一换文件名全作废。
+    #[must_use]
+    pub fn with_mirrors(mut self, mirrors: Vec<Url>) -> Self {
+        self.mirrors = mirrors;
+        self
+    }
+
+    /// 为一个上游地址生成镜像候选
+    ///
+    /// 只对清单实际给出的地址做前缀替换；镜像前缀本身不带路径部分以外的
+    /// 语义，因此拼接是安全的。校验和与大小对全部候选成立，镜像给坏字节只会
+    /// 换来一次 `ChecksumMismatch`，不会污染落盘文件。
+    fn mirrors_for(&self, location: &Url) -> Vec<Url> {
+        if self.mirrors.is_empty() {
+            return Vec::new();
+        }
+        let path = location.path().trim_start_matches('/');
+        self.mirrors
+            .iter()
+            .filter_map(|base| {
+                let mut base = base.clone();
+                // 前缀是**目录**：`/prefix` 与 `/prefix/` 必须等价。少了这一补，
+                // `join` 会把最后一段当文件名替换掉，`https://m.example/prefix`
+                // 会拼成 `https://m.example/data/...`，静默指到镜像站的根。
+                if !base.path().ends_with('/') {
+                    base.set_path(&format!("{}/", base.path()));
+                }
+                base.join(path).ok()
+            })
+            .filter(|candidate| candidate != location)
+            .collect()
     }
 
     /// 可选来源名
@@ -427,18 +486,24 @@ impl ModpackService {
         let mut index: Vec<usize> = Vec::with_capacity(to_download.len());
         for (position, (file, target)) in to_download.iter().enumerate() {
             let url = first_https(&file.downloads)?;
+            let mirrors = self.mirrors_for(&url);
             requests.push(DownloadRequest {
                 location: url,
                 destination: target.clone(),
                 expected: file.hashes.sha1_checksum(),
                 expected_size: (file.size > 0).then_some(file.size),
-                mirrors: Vec::new(),
+                mirrors,
             });
             index.push(position);
         }
         let outcomes = self
             .downloader
-            .download_many(&requests, FILE_CONCURRENCY, Some(&settled.sink()), cancel)
+            .download_many(
+                &requests,
+                self.file_concurrency,
+                Some(&settled.sink()),
+                cancel,
+            )
             .await;
 
         let mut downloaded_bytes = 0_u64;
@@ -504,12 +569,13 @@ impl ModpackService {
         progress: Option<&dyn ProgressSink>,
         cancel: &CancellationToken,
     ) -> Result<(), ModpackError> {
+        let mirrors = self.mirrors_for(&file.location);
         let request = DownloadRequest {
             location: file.location.clone(),
             destination: destination.to_path_buf(),
             expected: file.checksum.clone(),
             expected_size: (file.size > 0).then_some(file.size),
-            mirrors: Vec::new(),
+            mirrors,
         };
         self.downloader.download(&request, progress, cancel).await?;
         Ok(())
@@ -528,7 +594,7 @@ impl ModpackService {
         &self,
         source: &dyn ModpackSource,
         file: &ModpackFile,
-        url: url::Url,
+        url: Url,
         target: &Path,
         expected: String,
         actual: String,
@@ -549,6 +615,7 @@ impl ModpackService {
             upstream_sha1 = %actual,
             "modpack file hash is stale in manifest; accepted upstream hash"
         );
+        let mirrors = self.mirrors_for(&url);
         let retry = DownloadRequest {
             location: url,
             destination: target.to_path_buf(),
@@ -557,7 +624,7 @@ impl ModpackService {
                 authoritative,
             )),
             expected_size: (file.size > 0).then_some(file.size),
-            mirrors: Vec::new(),
+            mirrors,
         };
         let downloaded = self.downloader.download(&retry, progress, cancel).await?;
         Ok(FetchedFile {
@@ -803,14 +870,14 @@ async fn authoritative_sha1(
 /// 取第一个 `https` 下载地址
 ///
 /// 上游理论上都是 https；把非 https 当可下载目标会造成明文降级，因此直接拒绝。
-fn first_https(downloads: &[String]) -> Result<url::Url, ModpackError> {
+fn first_https(downloads: &[String]) -> Result<Url, ModpackError> {
     let raw = downloads.first().ok_or_else(|| {
         ModpackError::Source(SourceError::Decode(Box::new(std::io::Error::other(
             "modpack file has no download url",
         ))))
     })?;
     let url = raw
-        .parse::<url::Url>()
+        .parse::<Url>()
         .map_err(|err| ModpackError::Source(SourceError::Decode(Box::new(err))))?;
     if url.scheme() != "https" {
         return Err(ModpackError::Source(SourceError::Decode(Box::new(
@@ -841,6 +908,55 @@ pub fn loader_pin(index: &ModpackIndex) -> Option<(&'static str, String)> {
 mod tests {
     use super::*;
     use domain::server::modpack::{ModpackDependencies, ModpackFile, ModpackHashes};
+
+    /// 只为拿到一个能调私有方法的实例：镜像与并发断言不碰网络与磁盘
+    struct NoopDownloader;
+
+    #[async_trait::async_trait]
+    impl ArtifactDownloader for NoopDownloader {
+        async fn download(
+            &self,
+            _request: &DownloadRequest,
+            _progress: Option<&dyn ProgressSink>,
+            _cancel: &CancellationToken,
+        ) -> Result<port::DownloadedArtifact, port::DownloadError> {
+            Err(port::DownloadError::Cancelled)
+        }
+
+        async fn download_many(
+            &self,
+            _requests: &[DownloadRequest],
+            _concurrency: usize,
+            _progress: Option<&dyn ProgressSink>,
+            _cancel: &CancellationToken,
+        ) -> Vec<Result<port::DownloadedArtifact, port::DownloadError>> {
+            Vec::new()
+        }
+    }
+
+    struct NoopExtractor;
+
+    impl ModpackExtractor for NoopExtractor {
+        fn read_index(&self, _archive: &Path) -> Result<ModpackIndex, ModpackExtractError> {
+            Err(ModpackExtractError::Extract("unused".to_owned()))
+        }
+
+        fn extract_overrides(
+            &self,
+            _archive: &Path,
+            _dest: &Path,
+        ) -> Result<(), ModpackExtractError> {
+            Err(ModpackExtractError::Extract("unused".to_owned()))
+        }
+    }
+
+    fn service_for_defaults() -> ModpackService {
+        ModpackService::new(
+            Arc::new(ModpackSourceRegistry::new(Vec::new())),
+            Arc::new(NoopExtractor),
+            Arc::new(NoopDownloader),
+        )
+    }
 
     #[test]
     fn variant_for_loader_maps_known_loaders() {
@@ -881,6 +997,51 @@ mod tests {
         assert_eq!(ok.scheme(), "https");
         assert!(first_https(&["http://cdn/x.jar".to_owned()]).is_err());
         assert!(first_https(&[]).is_err());
+    }
+
+    /// 镜像只换 scheme + host，路径原样接上：镜像站按上游同一套路径回源
+    #[test]
+    fn mirrors_replace_origin_and_keep_path() {
+        let service = service_for_defaults().with_mirrors(vec![
+            Url::parse("https://a.example").expect("url"),
+            Url::parse("https://b.example/prefix").expect("url"),
+        ]);
+        let upstream =
+            Url::parse("https://cdn.modrinth.com/data/AANobbMI/versions/x/s.jar").expect("url");
+        let got: Vec<String> = service
+            .mirrors_for(&upstream)
+            .into_iter()
+            .map(|url| url.to_string())
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                "https://a.example/data/AANobbMI/versions/x/s.jar",
+                "https://b.example/prefix/data/AANobbMI/versions/x/s.jar",
+            ]
+        );
+    }
+
+    /// 没配镜像时不给候选：多一次失败尝试只会让报错变慢
+    #[test]
+    fn mirrors_empty_when_unconfigured() {
+        let service = service_for_defaults();
+        let upstream = Url::parse("https://cdn/mod/x.jar").expect("url");
+        assert!(service.mirrors_for(&upstream).is_empty());
+    }
+
+    /// 并发为 0 不能把整批退化成串行
+    #[test]
+    fn zero_concurrency_keeps_default() {
+        let service = service_for_defaults().with_file_concurrency(0);
+        assert_eq!(service.file_concurrency, FILE_CONCURRENCY);
+    }
+
+    /// 配了并发就按配的来
+    #[test]
+    fn concurrency_is_applied() {
+        let service = service_for_defaults().with_file_concurrency(16);
+        assert_eq!(service.file_concurrency, 16);
     }
 
     fn index_with(loader: Option<(&str, &str)>, mc: Option<&str>) -> ModpackIndex {
