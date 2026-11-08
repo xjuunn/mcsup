@@ -32,11 +32,12 @@ mod models;
 
 use crate::models::{JavaRuntimeEntry, ServerEntry, WorkspaceEntry, corrupt};
 use domain::java::JavaRuntime;
+use domain::mirror::SourceId;
 use domain::server::meta::{ServerMeta, ServerName};
 use domain::server::version::VersionId;
 use domain::workspace::{Workspace, WorkspaceId, WorkspaceName};
 use port::{
-    JavaRuntimeRepository, LOCAL_NAME, Origin, RepositoryError, ServerRepository,
+    JavaRuntimeRepository, LOCAL_NAME, Origin, RepositoryError, ServerRepository, SourceRouteStore,
     WorkspaceRepository, WorkspaceSelection,
 };
 use serde::de::DeserializeOwned;
@@ -53,6 +54,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 const WORKSPACE_STATE_VERSION: u32 = 3;
 /// Java 集合的 `state.json` 仍是 v1（只有扫描时间）
 const JAVA_STATE_VERSION: u32 = 1;
+/// 下载源集合的 `state.json` 版本（上游面 → 选中源）
+const DOWNLOAD_STATE_VERSION: u32 = 1;
 /// 记录文件扩展名
 const RECORD_EXT: &str = "json";
 /// 当前工作区指针文件名
@@ -98,6 +101,28 @@ struct JavaState {
     version: u32,
     /// 上次扫描时间（unix 秒）
     scanned_at: Option<i64>,
+}
+
+/// 下载源集合的全局状态：每个上游面选中的源
+///
+/// 只有一个文件、没有记录文件：这是一张「上游面 → 源」的表，条目少且总是
+/// 整体读写。拆成一条记录一个文件反而要为 `forge-maven` 这类含连字符的键
+/// 绕过文件名规则，收益为零。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct RouteState {
+    version: u32,
+    /// 上游面键 → 源标识
+    #[serde(default)]
+    routes: std::collections::BTreeMap<String, String>,
+}
+
+impl RouteState {
+    fn new() -> Self {
+        Self {
+            version: DOWNLOAD_STATE_VERSION,
+            routes: std::collections::BTreeMap::new(),
+        }
+    }
 }
 
 impl WorkspaceState {
@@ -171,6 +196,7 @@ enum Collection {
     Workspaces,
     Servers,
     Java,
+    Download,
 }
 
 impl Collection {
@@ -180,6 +206,7 @@ impl Collection {
             Self::Workspaces => "workspaces",
             Self::Servers => "servers",
             Self::Java => "java",
+            Self::Download => "download",
         }
     }
 }
@@ -229,6 +256,7 @@ impl JsonStore {
             Collection::Workspaces,
             Collection::Servers,
             Collection::Java,
+            Collection::Download,
         ] {
             std::fs::create_dir_all(store.collection_dir(collection)).map_err(storage_err)?;
         }
@@ -625,6 +653,15 @@ impl StateVersion for JavaState {
     }
     fn expected_version() -> u32 {
         JAVA_STATE_VERSION
+    }
+}
+
+impl StateVersion for RouteState {
+    fn state_version(&self) -> u32 {
+        self.version
+    }
+    fn expected_version() -> u32 {
+        DOWNLOAD_STATE_VERSION
     }
 }
 
@@ -1220,6 +1257,54 @@ impl JavaRuntimeRepository for JsonStore {
         state.scanned_at = Some(at);
         self.write_state(Collection::Java, &state)
     }
+}
+
+// --------------------------------------------------------------- 下载源选择
+
+impl JsonStore {
+    fn load_route_state(&self) -> Result<RouteState, RepositoryError> {
+        self.load_state(Collection::Download, RouteState::new)
+    }
+}
+
+impl SourceRouteStore for JsonStore {
+    fn route(&self, upstream: &str) -> Result<Option<SourceId>, RepositoryError> {
+        let _guard = self.lock()?;
+        let state = self.load_route_state()?;
+        Ok(state
+            .routes
+            .get(upstream)
+            .and_then(|raw| parse_source_id(raw)))
+    }
+
+    fn remember(&self, upstream: &str, source: &SourceId) -> Result<(), RepositoryError> {
+        let _guard = self.lock()?;
+        let mut state = self.load_route_state()?;
+        state
+            .routes
+            .insert(upstream.to_owned(), source.as_str().to_owned());
+        self.write_state(Collection::Download, &state)
+    }
+
+    fn forget(&self, upstream: &str) -> Result<(), RepositoryError> {
+        let _guard = self.lock()?;
+        let mut state = self.load_route_state()?;
+        // 本来就没有这条记录时不写盘：失败路径上无谓的写入会把状态文件
+        // 的 mtime 推到下一次成功选择之后，排查时看不出真正的选择时间
+        if state.routes.remove(upstream).is_none() {
+            return Ok(());
+        }
+        self.write_state(Collection::Download, &state)
+    }
+}
+
+/// 把状态文件里的源标识解析回领域类型
+///
+/// 解析失败按「没有记录」处理，不报 [`RepositoryError::Corrupt`]：这个文件的
+/// 唯一作用是省掉一次探测，内容不可读时重新探测即可恢复。让一条手改过的记录
+/// 把整个下载流程判成损坏，代价远大于收益。
+fn parse_source_id(raw: &str) -> Option<SourceId> {
+    SourceId::new(raw.to_owned()).ok()
 }
 
 #[cfg(test)]

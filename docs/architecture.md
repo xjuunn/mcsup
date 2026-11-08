@@ -409,11 +409,84 @@ Forge 的 Maven 元数据不声明 Java 要求，`java_major` 由
 第三方接入同一 Provider 时走 builder 注入 `maven_base` / `files_base` / `picks`，
 与 Fabric 的做法一致，不需要改 service。
 
+## 下载源（镜像）
+
+跨境链路上单主机吞吐与可达性都不可靠：同一个文件换一个入口常常立刻可用，
+镜像与官方分属不同主机时还能叠加带宽。下载源子系统把「从哪个入口下」从各条
+业务流程里抽出来，做成一张表加一次选择。
+
+三层职责，边界不重叠：
+
+| 层 | 位置 | 职责 |
+| --- | --- | --- |
+| 领域规则 | `domain::mirror` | 上游面、源、目录表、候选改写、最快选择、并列次序 |
+| IO 端口 | `port::mirror` | `SourceProbe`（探哪个能用）、`SourceRouteStore`（记在哪里） |
+| 装配与实现 | `provider::mirror` / `service::download_source` / `storage` | 内置目录表、HTTP 探测、路由下载器、JSON 记录 |
+
+术语三个词各指一件事，不要混用：
+
+- **上游面**（`Upstream`）：一份官方内容的主机前缀，如
+  `https://maven.minecraftforge.net`。它是选择与持久化的**单位**。
+- **源**（`Source`）：一个镜像站，对上可以覆盖多个上游面，每个面给一个
+  前缀（`Binding`）。官方本身也是一个源，所以「失败退回官方」没有特殊分支。
+- **目录表**（`Catalog`）：全部上游面 + 全部源。`resolve(地址)` 给出该地址的
+  全部候选，**官方恒为候选之一**。
+
+为什么以「上游面」而不是「全局一个源」为粒度：没有任何镜像覆盖全部面——
+BMCLAPI 没有 Modrinth 的 CDN，MCIM 没有 Mojang 的 maven。全局单值必然把某个
+面固定到一个不覆盖它的源上，那比不选还慢。
+
+选择时机与持久化：
+
+```
+第一次下载某个面 ──→ 并发探测该面全部候选 ──→ 取延迟最低
+                          │                        │
+                          │                        └─→ 落盘 `<data>/db/download/state.json`
+                          └─ 全部失败 → 本次用官方，**不落盘**
+之后同面的下载 ──→ 直接复用记录，不再探测
+下载失败（可重试）──→ 作废该面记录 ──→ 重新探测并落盘新结果 ──→ 换源重下一次
+```
+
+「探测全失败不落盘」是刻意的：落盘等于把一次网络抖动记成「官方最好」，此后
+再也不探镜像；不落盘则下次重探，代价只是一次注定失败的探测。
+
+每次下载按 `info` 记一行「使用下载源」，字段含上游面与源名；批量下载逐条降到
+`debug`，另给一行按源聚合的汇总——几百个文件时不刷屏，但用户仍看得出用了哪个源。
+
+回退分两层，两层都要有：
+
+- **同一次请求内换候选**：`file::FileDownloader` 按 `DownloadRequest::candidates()`
+  依次尝试，换源时丢弃残片与段记录（上一个主机的字节不能与这一轮拼接），
+  全部失败时以主地址的错误为准，但校验不符优先上报——上层凭它判断清单哈希过期
+- **跨请求换源**：路由下载器在可重试失败上作废记录并重探一次，只一次；重探仍是
+  同一源则不重试。404 一类「资源本就不存在」不作废记录，换源不会让它存在
+
+日志位置约定：选源决策与换源由 `service::download_source` 记，因为它知道
+「谁是选中的源」；字节层的重试（同源重连、续传）由 `file` 处理，不产生选源日志。
+
+扩展一条新源：往 `provider::mirror::mirrors()` 里加一个 `Source`（若干
+`Binding`），不需要改任何业务代码。若新源的主机不在 `upstreams()` 里，补一条
+`Upstream` 即可——目录表是纯数据，加表不加密。用户自定义镜像走配置项
+`download-sources`：每条前缀成为绑定到内容 CDN 的独立源，非法条目被忽略并告警，
+不影响平台启动。
+
+不是前缀替换能表达的镜像不进表：TUNA 的 Adoptium 把路径从
+`.../v3/binary/latest/<ver>/ga/<os>/<arch>/jdk/hotspot/normal/...` 重排成
+`Adoptium/<major>/<jdk|jre>/<arch>/<os>/<filename>`，属于路径改写而非前缀替换，
+需要单独的上游面类型；BMCLAPI 的 `/v1/objects` 会 302 回官方且并发一高就 429，
+收益不足，也不进表。
+
 # Storage
 
 Storage 持久化元数据：Workspace、Server、配置、Backup / Snapshot 元数据、
 User / Role / Permission、Agent、Task、Audit 等，只存 metadata / index /
 relationship / configuration / state。大文件不进数据库。
+
+四个集合各有目录与 `state.json`：`workspaces` / `servers` / `java` / `download`。
+`download` 只有一个状态文件、没有记录文件——它是一张「上游面 → 选中源」的表，
+条目少且总是整体读写；拆成一条记录一个文件反而要为 `forge-maven` 这类含连字符
+的键绕开文件名规则，收益为零。表里读不懂的源标识按「没有记录」处理而非判损坏：
+这份文件唯一的作用是省掉一次探测，重探即可恢复。
 
 # File
 

@@ -85,6 +85,7 @@ bootstrap = [
     "dep:modkit",
     "dep:provider",
     "dep:runtime",
+    "dep:tracing",
     "port",
     "protocol",
     "transport",
