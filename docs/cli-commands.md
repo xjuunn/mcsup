@@ -257,9 +257,15 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
   的侧别标注经常有误（`satin`、`melody` 都是服务端必需的依赖，上游却标
   `server_side: unsupported`），先按该标注筛会把本体整条滤掉，只剩名字里
   恰好含该词的近似项目，补装必然失败并报成「上游找不到提供方」。检索取
-  `slug` / `id` 与 modid **相等**的命中优先，只包含的次之；侧别交给安装
-  检查判——真正只有客户端代码的 jar 会得 `blocking` 并被拒，带 `main`
-  入口的库只会得 `review` 并放行。
+  `slug` / `id` 与 modid **相等**的命中优先，`<modid>-<后缀>` 次之，只包含
+  的最后；侧别交给安装检查判——真正只有客户端代码的 jar 会得 `blocking`
+  并被拒，带 `main` 入口的库只会得 `review` 并放行。
+- **候选逐个试，不因第一个不合格就放弃**：上游按名字检索，名字最像的未必
+  提供该 modid。实测 `satin` 首位是 `satin-free-wakes`（modid 是 `wakes`），
+  本体 `satin-api` 排第二；只取首位会让补装被 `expect_modid` 拒掉，然后
+  整条依赖被误报成「上游找不到提供方」——而提供方就在结果里。现在同一
+  modid 的全部候选都排进计划，安装时按 modid 逐个校验，第一个不提供就换
+  下一个；只有候选全部试完才记进 `unresolved`。
 - 上游不认识某个文件时 `update` / `outdated` 把它列进「无法判断」，不当作
   「已是最新」。
 - `remote` 条目（`--origin` 指向远端服务器）在本地直接拒绝（退出码 2）：

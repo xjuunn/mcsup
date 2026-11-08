@@ -433,6 +433,55 @@ struct PendingFix {
     retried: bool,
 }
 
+/// 补装过程中的可变状态
+///
+/// 这几样东西在队列推进、依赖展开、逐项安装里都要原地改，散成多个参数
+/// 会让 `expand_dependency_chain` 一路膨胀到 clippy 的阈值之上。聚成一个
+/// 结构后，新增状态不必再改每个签名。
+#[derive(Debug, Default)]
+struct FixState {
+    /// 已尝试过的项目，避免互相依赖时死循环
+    visited: HashSet<String>,
+    /// 真的没补上的 modid（展示给用户）
+    unresolved: Vec<String>,
+    /// 被拒的项目与原因（展示给用户）
+    refused: Vec<FixRefused>,
+    /// 每个待补 modid 还剩几个候选没试
+    pending_candidates: HashMap<String, usize>,
+}
+
+impl FixState {
+    /// 登记一个待补 modid 的一个候选
+    fn plan_candidate(&mut self, missing: &str) {
+        *self
+            .pending_candidates
+            .entry(missing.to_owned())
+            .or_insert(0) += 1;
+    }
+
+    /// 记一个候选不提供该 modid，试完最后一个才进 `unresolved`
+    ///
+    /// 中途就记会把「第一个名字最像的不是本体」说成「上游没有提供方」——
+    /// 实测 `satin` 就是这么被误报的：首位是 `satin-free-wakes`（modid
+    /// 是 `wakes`），真正的 `satin-api` 排第二。
+    fn candidate_rejected(&mut self, missing: &str) {
+        if let Some(left) = self.pending_candidates.get_mut(missing) {
+            *left = left.saturating_sub(1);
+            if *left > 0 {
+                return;
+            }
+        }
+        self.no_provider(missing);
+    }
+
+    /// 记为「没有可补装的提供方」
+    fn no_provider(&mut self, missing: &str) {
+        if !self.unresolved.iter().any(|item| item == missing) {
+            self.unresolved.push(missing.to_owned());
+        }
+    }
+}
+
 /// 更新计划的一项
 #[derive(Debug, Clone)]
 pub struct UpdateItem {
@@ -985,21 +1034,30 @@ impl ModService {
             }
             let needed_by = file_name_of(&report.capability.path);
             for missing in &report.missing_deps {
-                // 同一个依赖被多个文件缺：只检索一次，计划里不重复刷屏
+                // 同一个依赖被多个文件缺：只检索一次，计划里不重复刷屏。
+                // 判重按「已为该 modid 排过候选」而不是「该 modid 出现过」，
+                // 多候选才可能都排进来
                 if unresolved.iter().any(|seen| seen == missing)
                     || installs.iter().any(|seen| &seen.missing == missing)
                 {
                     continue;
                 }
-                match self.find_provider(missing, &server).await? {
-                    Some(hit) => installs.push(FixInstall {
+                let candidates = self.find_provider(missing, &server).await?;
+                if candidates.is_empty() {
+                    unresolved.push(missing.clone());
+                    continue;
+                }
+                // 全部候选都进计划：安装时逐个校验 modid，第一个不提供就
+                // 换下一个。只排第一个会让 `satin` 这类「本体换了后缀」
+                // 的依赖在计划阶段就被判死
+                for hit in candidates {
+                    installs.push(FixInstall {
                         needed_by: needed_by.clone(),
                         missing: missing.clone(),
                         project_id: hit.id,
                         title: hit.title,
                         client_only: hit.client_only,
-                    }),
-                    None => unresolved.push(missing.clone()),
+                    });
                 }
             }
         }
@@ -1076,10 +1134,16 @@ impl ModService {
         &self,
         modid: &str,
         server: &RegisteredServer,
-    ) -> Result<Option<ContentProject>, ModError> {
+    ) -> Result<Vec<ContentProject>, ModError> {
         // 上游检索把 modid 当整词条：`geckolib3` 搜不到 `geckolib`（实测
         // 全文索引里带数字尾巴的旧命名排不进结果）。原词落空后去掉尾部
         // 版本数字再试一次。
+        //
+        // 返回**全部**候选而不是第一个：上游按名字检索，名字最像的未必
+        // 提供该 modid。实测 `satin` 的首位是 `satin-free-wakes`（modid
+        // 是 `wakes`），真正的 `satin-api` 排第二；只取首位会被
+        // `expect_modid` 拒掉，然后整条依赖被判成「上游找不到提供方」，
+        // 明明提供方就在结果里。
         for term in provider_search_terms(modid) {
             let query = ContentQuery::new().keyword(&term).page(0, 5);
             let mut relaxed = server_query(
@@ -1090,11 +1154,12 @@ impl ModService {
             );
             relaxed.server_usable_only = false;
             let found = self.content.search(None, &relaxed).await?;
-            if let Some(hit) = pick_provider_hit(found.hits, &term) {
-                return Ok(Some(hit));
+            let candidates = rank_provider_hits(found.hits, &term);
+            if !candidates.is_empty() {
+                return Ok(candidates);
             }
         }
-        Ok(None)
+        Ok(Vec::new())
     }
 
     /// 执行修复计划：移除带问题的文件，补装缺失依赖
@@ -1161,7 +1226,6 @@ impl ModService {
         unresolved: &mut Vec<String>,
     ) -> Result<(Vec<ModInstalled>, Vec<FixRefused>), ModError> {
         let mut installed: Vec<ModInstalled> = Vec::new();
-        let mut refused: Vec<FixRefused> = Vec::new();
         let mut queue: VecDeque<PendingFix> = plan
             .installs
             .iter()
@@ -1171,12 +1235,14 @@ impl ModService {
                 retried: false,
             })
             .collect();
-        // 已尝试过的项目 + 已成链展开过的依赖，避免互相依赖时死循环
-        let mut visited: HashSet<String> = HashSet::new();
+        let mut state = FixState::default();
+        for item in &plan.installs {
+            state.plan_candidate(&item.missing);
+        }
         let mut expansions = 0usize;
 
         while let Some(pending) = queue.pop_front() {
-            if visited.contains(&pending.project_id) {
+            if state.visited.contains(&pending.project_id) {
                 continue;
             }
             let install_plan = match self
@@ -1192,8 +1258,11 @@ impl ModService {
                 // 逐项汇总：某一项在上游没有匹配版本（或上游本身出错）不该
                 // 让整批停下——其余待修项仍然可以装好
                 Err(err) => {
-                    visited.insert(pending.project_id.clone());
-                    refused.push(FixRefused {
+                    state.visited.insert(pending.project_id.clone());
+                    if let Some(missing) = pending.missing.as_deref() {
+                        state.candidate_rejected(missing);
+                    }
+                    state.refused.push(FixRefused {
                         project_id: pending.project_id.clone(),
                         reason: err.to_string(),
                     });
@@ -1213,7 +1282,7 @@ impl ModService {
                 .await
             {
                 Ok(installed_mod) => {
-                    visited.insert(pending.project_id.clone());
+                    state.visited.insert(pending.project_id.clone());
                     installed.push(installed_mod);
                 }
                 // 缺依赖被拒：先补它自己的依赖，再回头重试本项
@@ -1225,30 +1294,31 @@ impl ModService {
                         &pending,
                         &missing_deps,
                         server,
-                        &visited,
                         &mut queue,
-                        unresolved,
-                        &mut refused,
+                        &mut state,
                     )
                     .await?;
                 }
                 Err(ModError::Refused { risk, evidence, .. }) => {
-                    visited.insert(pending.project_id.clone());
-                    refused.push(FixRefused {
+                    state.visited.insert(pending.project_id.clone());
+                    if let Some(missing) = pending.missing.as_deref() {
+                        state.candidate_rejected(missing);
+                    }
+                    state.refused.push(FixRefused {
                         project_id: pending.project_id.clone(),
                         reason: refusal_reason(risk, &evidence),
                     });
                 }
                 Err(err) => {
-                    // 命中的项目不提供这个 modid：记进 unresolved，让用户
-                    // 知道缺的依赖仍然缺着，而不是以为已经补上了
-                    if let ModError::WrongProvider { need, .. } = &err
-                        && !unresolved.contains(need)
-                    {
-                        unresolved.push(need.clone());
+                    // 命中的项目不提供这个 modid：还有别的候选没试完就该
+                    // 换下一个，只有全部试完才算「上游没有提供方」
+                    if let ModError::WrongProvider { need, .. } = &err {
+                        state.candidate_rejected(need);
+                    } else if let Some(missing) = pending.missing.as_deref() {
+                        state.candidate_rejected(missing);
                     }
-                    visited.insert(pending.project_id.clone());
-                    refused.push(FixRefused {
+                    state.visited.insert(pending.project_id.clone());
+                    state.refused.push(FixRefused {
                         project_id: pending.project_id.clone(),
                         reason: err.to_string(),
                     });
@@ -1256,28 +1326,23 @@ impl ModService {
             }
         }
 
-        Ok((installed, refused))
+        *unresolved = state.unresolved;
+        Ok((installed, state.refused))
     }
 
     /// 缺依赖被拒后展开一层：依赖排进队列，本项排在其后重试
     ///
     /// 依赖一项都排不进去时，本项记为 refused 并说明缺哪个 modid。
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "队列、visited、unresolved 都要原地改"
-    )]
     async fn expand_dependency_chain(
         &self,
         pending: &PendingFix,
         missing_deps: &[String],
         server: &RegisteredServer,
-        visited: &HashSet<String>,
         queue: &mut VecDeque<PendingFix>,
-        unresolved: &mut Vec<String>,
-        refused: &mut Vec<FixRefused>,
+        state: &mut FixState,
     ) -> Result<(), ModError> {
         let planned = self
-            .queue_missing_deps(missing_deps, server, visited, queue, unresolved)
+            .queue_missing_deps(missing_deps, server, queue, state)
             .await?;
         if planned {
             queue.push_back(PendingFix {
@@ -1287,7 +1352,7 @@ impl ModService {
             });
             return Ok(());
         }
-        refused.push(FixRefused {
+        state.refused.push(FixRefused {
             project_id: pending.project_id.clone(),
             reason: format!(
                 "缺少必需依赖 {}，上游找不到可自动补装的提供方",
@@ -1302,31 +1367,36 @@ impl ModService {
     /// 返回「是否至少排进去一项」：一项都排不进去说明上游确实没有可补的
     /// 东西，调用方据此把该项记为 refused 而不是反复重试。找不到提供方的
     /// 依赖同时进 `unresolved`，让用户看到缺的到底是哪个 modid。
+    ///
+    /// 同一 modid 的**全部**候选都会入队，由安装时的 `expect_modid` 逐个
+    /// 校验：名字最像的未必提供这个 modid，被拒就换下一个。
     async fn queue_missing_deps(
         &self,
         missing_deps: &[String],
         server: &RegisteredServer,
-        visited: &HashSet<String>,
         queue: &mut VecDeque<PendingFix>,
-        unresolved: &mut Vec<String>,
+        state: &mut FixState,
     ) -> Result<bool, ModError> {
         let mut planned = false;
         for missing in missing_deps {
-            match self.find_provider(missing, server).await? {
-                Some(hit) if !visited.contains(&hit.id) => {
-                    queue.push_back(PendingFix {
-                        project_id: hit.id,
-                        missing: Some(missing.clone()),
-                        retried: false,
-                    });
-                    planned = true;
-                }
-                Some(_) => {}
-                None => {
-                    if !unresolved.contains(missing) {
-                        unresolved.push(missing.clone());
-                    }
-                }
+            let fresh = self
+                .find_provider(missing, server)
+                .await?
+                .into_iter()
+                .filter(|hit| !state.visited.contains(&hit.id))
+                .collect::<Vec<_>>();
+            if fresh.is_empty() {
+                state.no_provider(missing);
+                continue;
+            }
+            for hit in fresh {
+                state.plan_candidate(missing);
+                queue.push_back(PendingFix {
+                    project_id: hit.id,
+                    missing: Some(missing.clone()),
+                    retried: false,
+                });
+                planned = true;
             }
         }
         Ok(planned)
@@ -1812,34 +1882,58 @@ fn provider_search_terms(modid: &str) -> Vec<String> {
 /// 上搜不到那个库本体），照单全收就会给用户装进毫不相干的 mod。
 ///
 /// 只做「包含」判断也不够：它会把「名字里恰好带这个词」的项目排到本体
-/// 前面——搜 `melody` 时 `music-and-melody` 的 slug 也包含 `melody`。本体
-/// 判据是 `slug` / `id` **等于**该 modid（modid 与项目 slug 同名是常态），
-/// 因此相等优先（0），包含次之（1），不相关一律不猜。
+/// 前面——搜 `melody` 时 `music-and-melody` 的 slug 也包含 `melody`。
+///
+/// 因此分三档：
+///
+/// - `0`：`slug` / `id` **等于** modid，本体（modid 与项目 slug 同名是常态）
+/// - `1`：`slug` 以 `<modid>-` 开头，本体换了后缀命名。实测 `satin` 的
+///   本体叫 `satin-api`，而首位是 `satin-free-wakes`；这两者按「包含」
+///   同档时只能靠 `client_only` 分先后，于是选中了那个不提供 `satin`
+///   的项目。带连字符的后缀是命名惯例（`-api` / `-lib` / `-core`），
+///   与「名字里恰好含这个词」是两件事
+/// - `2`：其余包含，最后才考虑
 fn provider_hit_rank(hit: &ContentProject, term: &str) -> Option<u8> {
     let term = term.to_ascii_lowercase();
     let equals = |text: &str| text.to_ascii_lowercase() == term;
+    let prefixed = |text: &str| {
+        text.to_ascii_lowercase()
+            .strip_prefix(&term)
+            .is_some_and(|rest| rest.starts_with('-'))
+    };
     let contains = |text: &str| text.to_ascii_lowercase().contains(&term);
-    if equals(&hit.id) || hit.slug.as_deref().is_some_and(equals) {
+    let slug = hit.slug.as_deref();
+    if equals(&hit.id) || slug.is_some_and(equals) {
         Some(0)
-    } else if hit.slug.as_deref().is_some_and(contains) || contains(&hit.id) || contains(&hit.title)
-    {
+    } else if slug.is_some_and(prefixed) {
         Some(1)
+    } else if slug.is_some_and(contains) || contains(&hit.id) || contains(&hit.title) {
+        Some(2)
     } else {
         None
     }
 }
 
-/// 从检索结果里挑提供方：相等命中优先，其次服务端可用的命中
+/// 按相关度排好全部候选，供逐个尝试
 ///
-/// 两个排序键的顺序不能反。`melody` 本体被上游标成仅客户端，而排位更靠
-/// 后的 `music-and-melody` 是「服务端可用」；若先按服务端可用挑，挑中的
-/// 就是那个不提供 `melody` modid 的项目。名字与该 modid 完全一致的项目
-/// 才是要补的本体，它的侧别由安装检查判，不由检索判。
-fn pick_provider_hit(hits: Vec<ContentProject>, term: &str) -> Option<ContentProject> {
-    hits.into_iter()
+/// 排序键的顺序不能反：`melody` 本体被上游标成仅客户端，而排位更靠后的
+/// `music-and-melody` 是「服务端可用」；若先按服务端可用挑，挑中的就是
+/// 那个不提供 `melody` modid 的项目。名字与该 modid 一致的项目才是要补
+/// 的本体，它的侧别由安装检查判，不由检索判。
+///
+/// 并列时按下载量降序：同档候选里更主流的那个更可能是本体。
+fn rank_provider_hits(hits: Vec<ContentProject>, term: &str) -> Vec<ContentProject> {
+    let mut ranked: Vec<(u8, ContentProject)> = hits
+        .into_iter()
         .filter_map(|hit| provider_hit_rank(&hit, term).map(|rank| (rank, hit)))
-        .min_by_key(|(rank, hit)| (*rank, hit.client_only))
-        .map(|(_, hit)| hit)
+        .collect();
+    ranked.sort_by(|(left_rank, left), (right_rank, right)| {
+        left_rank
+            .cmp(right_rank)
+            .then_with(|| left.client_only.cmp(&right.client_only))
+            .then_with(|| right.downloads.cmp(&left.downloads))
+    });
+    ranked.into_iter().map(|(_, hit)| hit).collect()
 }
 
 /// 换名更新后删掉旧文件
@@ -2051,14 +2145,23 @@ mod tests {
         );
         // slug 含词的收（geckolib 现场）
         assert!(provider_hit_rank(&hit("geckolib", "GeckoLib"), "geckolib").is_some());
-        // 名字只是包含检索词的排在相等命中之后（melody 现场）
+        // 名字只是包含检索词的排最后（melody 现场）
         assert_eq!(
             provider_hit_rank(&hit("music-and-melody", "Music and Melody"), "melody"),
-            Some(1)
+            Some(2)
         );
         assert_eq!(
             provider_hit_rank(&hit("melody", "Melody"), "melody"),
             Some(0)
+        );
+        // 本体带后缀：`satin` 的真身是 `satin-api`，排在纯包含之前
+        assert_eq!(
+            provider_hit_rank(&hit("satin-api", "Satin API"), "satin"),
+            Some(1)
+        );
+        assert_eq!(
+            provider_hit_rank(&hit("satin-free-wakes", "Satin Free Wakes"), "satin"),
+            Some(1)
         );
     }
 
@@ -2082,12 +2185,43 @@ mod tests {
             icon_url: None,
             client_only,
         };
-        let picked = pick_provider_hit(
+        let picked = rank_provider_hits(
             vec![hit("music-and-melody", false), hit("melody", true)],
             "melody",
-        )
-        .expect("provider");
-        assert_eq!(picked.id, "melody");
+        );
+        assert_eq!(picked.first().expect("provider").id, "melody");
+    }
+
+    /// `satin` 现场：候选全部返回，由安装时的 modid 校验逐个筛
+    ///
+    /// 上游搜 `satin` 的首位是 `satin-free-wakes`（modid 是 `wakes`），
+    /// 真正的 `satin-api` 排第二。只取首位会让补装被 `expect_modid`
+    /// 拒掉，然后整条依赖被误报成「上游找不到提供方」。
+    #[test]
+    fn provider_rank_keeps_every_candidate() {
+        let hit = |id: &str, client_only: bool, downloads: u64| ContentProject {
+            id: id.to_owned(),
+            slug: Some(id.to_owned()),
+            title: id.to_owned(),
+            description: String::new(),
+            kind: ContentKind::Mod,
+            also_kinds: Vec::new(),
+            loaders: Vec::new(),
+            game_versions: Vec::new(),
+            author: None,
+            downloads,
+            icon_url: None,
+            client_only,
+        };
+        let ranked = rank_provider_hits(
+            vec![
+                hit("satin-free-wakes", true, 500),
+                hit("satin-api", true, 1_800_000),
+            ],
+            "satin",
+        );
+        let ids: Vec<&str> = ranked.iter().map(|hit| hit.id.as_str()).collect();
+        assert_eq!(ids, vec!["satin-api", "satin-free-wakes"], "下载量高的排前");
     }
 
     /// 记录的 Java 优先；没有记录时按 MC 版本推算，与启动判定同源

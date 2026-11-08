@@ -687,9 +687,12 @@ async fn plan_fix_finds_client_only_library_provider() {
         .plan_fix("alpha", ContentKind::Mod)
         .await
         .expect("plan_fix");
-    assert_eq!(plan.installs.len(), 1, "{plan:?}");
+    // 候选全部进计划，第一个必须是本体：安装时逐个按 modid 校验，
+    // 名字相近的那个排在后面当备份
+    assert_eq!(plan.installs.len(), 2, "{plan:?}");
     assert_eq!(plan.installs[0].missing, "melody");
     assert_eq!(plan.installs[0].project_id, "melody");
+    assert_eq!(plan.installs[1].project_id, "music-and-melody");
     assert!(plan.unresolved.is_empty(), "{plan:?}");
 }
 
@@ -720,10 +723,14 @@ async fn plan_fix_prefers_exact_slug_over_substring_hit() {
         .plan_fix("alpha", ContentKind::Mod)
         .await
         .expect("plan_fix");
-    assert_eq!(plan.installs.len(), 1, "{plan:?}");
+    assert_eq!(plan.installs.len(), 2, "{plan:?}");
     assert_eq!(
         plan.installs[0].project_id, "melody",
-        "应当选名字与 modid 完全一致的项目，而不是名字里包含它的项目"
+        "应当把名字与 modid 完全一致的项目排在前面，而不是名字里包含它的项目"
+    );
+    assert_eq!(
+        plan.installs[1].project_id, "music-and-melody",
+        "不提供该 modid 的项目留作备选，安装时会被逐个校验筛掉"
     );
 }
 
@@ -796,6 +803,62 @@ async fn apply_fix_installs_the_missing_dependency() {
     assert!(applied.refused.is_empty());
     // 补装后的文件在 mods/ 目录里
     assert!(harness.mods_dir().join("some-lib.jar").is_file());
+}
+
+/// 首个候选不提供该 modid 时自动改用下一个：`satin` 现场
+///
+/// 上游搜 `satin` 首位是 `satin-free-wakes`（modid 是 `wakes`），真正的
+/// `satin-api` 排第二。只排第一个会让补装被 `expect_modid` 拒，然后整条
+/// 依赖被误报成「上游找不到提供方」——提供方就在结果里。
+#[tokio::test]
+async fn apply_fix_tries_the_next_candidate_when_the_first_lacks_the_modid() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[
+            ("environmentz.jar", SideSupport::Required),
+            ("satin.jar", SideSupport::Required),
+        ],
+        b"jar-bytes",
+    );
+    harness.inspector.declare_dep("environmentz.jar", "satin");
+    harness.write("mods/environmentz.jar", b"env");
+    harness.source.configure(|config| {
+        config.search_pool = vec![
+            search_hit("satin-free-wakes", true),
+            search_hit("satin-api", true),
+        ];
+        config.candidates = vec![candidate("v1")];
+    });
+    // 只有 `satin-api` 的 jar 真的提供 modid `satin`
+    harness.set_resolved_for("satin-free-wakes", &[("v1", "wakes.jar")]);
+    harness.add_resolved_for("satin-api", &[("v1", "satin.jar")]);
+
+    let plan = harness
+        .mods
+        .plan_fix("alpha", ContentKind::Mod)
+        .await
+        .expect("plan_fix");
+    assert!(plan.unresolved.is_empty(), "{plan:?}");
+
+    let applied = harness
+        .mods
+        .apply_fix(
+            "alpha",
+            &plan,
+            ApplyOptions {
+                allow_blocking: false,
+                progress: None,
+                cancel: &CancellationToken::new(),
+            },
+        )
+        .await
+        .expect("apply_fix");
+    assert_eq!(applied.installed.len(), 1, "{applied:?}");
+    assert!(
+        applied.unresolved.is_empty(),
+        "候选还没试完就报「没有提供方」：{applied:?}"
+    );
+    assert!(harness.mods_dir().join("satin.jar").is_file());
 }
 
 /// 依赖是链不是一层：补装的 mod 自己还缺依赖时继续往下解析
