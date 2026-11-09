@@ -66,8 +66,22 @@ pub struct RemoteModpackResult {
     pub skipped_bytes: u64,
     /// 清单哈希过期、按上游权威哈希接受的文件数
     pub stale_hashes: usize,
-    /// 装完按文件本身判定为服务端不可装载、已移进回收站的文件数
-    pub removed_local: usize,
+    /// 装完复核出的、会让服务端起不来的条目
+    pub blocked: Vec<RemoteModBlocked>,
+}
+
+/// 远端复核出的阻断项（事实，不含文案）
+///
+/// 与 [`crate::remote::RemoteModpackResult`] 同位：backend 把线格式翻成自己的
+/// 结果类型，入口不必认识协议类型。渲染成一句话由入口按语言做。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteModBlocked {
+    /// 相对服务端目录的路径
+    pub file: String,
+    /// 原因类别：`missing_deps` / `client_only` / `mismatch`
+    pub kind: String,
+    /// 类别相关的细节
+    pub detail: Vec<String>,
 }
 
 /// `server link --origin` 的结果
@@ -473,7 +487,7 @@ impl RemoteServerRepository {
                 skipped_client_only,
                 skipped_bytes,
                 stale_hashes,
-                removed_local,
+                blocked,
             } => {
                 let result = RemoteModpackResult {
                     meta: ServerMeta::try_from(server)?,
@@ -488,7 +502,14 @@ impl RemoteServerRepository {
                     skipped_client_only,
                     skipped_bytes,
                     stale_hashes,
-                    removed_local,
+                    blocked: blocked
+                        .into_iter()
+                        .map(|entry| RemoteModBlocked {
+                            file: entry.file,
+                            kind: entry.kind,
+                            detail: entry.detail,
+                        })
+                        .collect(),
                 };
                 self.write_through();
                 Ok(result)

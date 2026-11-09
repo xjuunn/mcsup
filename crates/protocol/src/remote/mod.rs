@@ -31,8 +31,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Write};
 use wire::{
-    WireClient, WireJava, WirePropUpdate, WireServer, WireSettings, WireSnapshot, WireStartOutcome,
-    WireStatusEntry, WireStop, WireVersion, WireWorkspace,
+    WireClient, WireJava, WireModBlocked, WirePropUpdate, WireServer, WireSettings, WireSnapshot,
+    WireStartOutcome, WireStatusEntry, WireStop, WireVersion, WireWorkspace,
 };
 
 /// 远端协议版本；不匹配直接拒绝，禁止猜测兼容
@@ -710,11 +710,11 @@ pub enum Response {
         /// 清单哈希过期、按上游权威哈希接受的文件数
         #[serde(default)]
         stale_hashes: usize,
-        /// 装完按文件本身判定为服务端不可装载、已移进回收站的文件数
+        /// 装完复核出的、会让服务端起不来的条目
         ///
-        /// `default` 保住旧对端：字段缺失即 0，与「一个都没移出」同义。
+        /// `default` 保住旧对端：字段缺失即空，与「没有阻断项」同义。
         #[serde(default)]
-        removed_local: usize,
+        blocked: Vec<WireModBlocked>,
     },
     /// Java 卸载结果
     JavaUninstalled {
@@ -1271,7 +1271,11 @@ mod tests {
                 skipped_client_only: 2,
                 skipped_bytes: 0,
                 stale_hashes: 0,
-                removed_local: 1,
+                blocked: vec![WireModBlocked {
+                    file: "mods/sodium.jar".to_owned(),
+                    kind: "client_only".to_owned(),
+                    detail: Vec::new(),
+                }],
             },
             Response::JavaUninstalled {
                 path: "/opt/java/temurin-21".to_owned(),

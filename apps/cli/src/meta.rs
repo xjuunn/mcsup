@@ -762,6 +762,22 @@ pub(crate) fn server_mod_remove() -> &'static str {
 }
 
 #[must_use]
+pub(crate) fn server_mod_disable() -> &'static str {
+    t(
+        "停用 mod：移进 mods/disabled/，加载器不再读取，文件保留可随时恢复",
+        "disable mods: move them into mods/disabled/ so the loader skips them, keeping the files recoverable",
+    )
+}
+
+#[must_use]
+pub(crate) fn server_mod_disable_arg() -> &'static str {
+    t(
+        "要停用的文件名（可重复；缺省时交互选择）",
+        "file names to disable (repeatable; picked interactively when omitted)",
+    )
+}
+
+#[must_use]
 pub(crate) fn server_mod_update() -> &'static str {
     t(
         "按上游最新兼容版本更新服务端的 mod",

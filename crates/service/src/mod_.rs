@@ -352,6 +352,13 @@ pub struct ModRemoved {
     pub dry_run: bool,
 }
 
+/// 一次停用的结果
+#[derive(Debug, Clone)]
+pub struct ModDisabled {
+    /// 已移进停用目录的条目：原相对路径 → 新相对路径
+    pub moved: Vec<(String, String)>,
+}
+
 /// 修复计划的一项：补装缺失依赖
 #[derive(Debug, Clone)]
 pub struct FixInstall {
@@ -1058,6 +1065,56 @@ impl ModService {
             files: hits,
             dry_run,
         })
+    }
+
+    /// 把若干 mod 文件移进停用目录
+    ///
+    /// `files` 是相对服务端目录的路径（`mods/x.jar`），通常直接来自安装后
+    /// 复核的 [`crate::ModBlocked::file`]。与 [`Self::remove`] 的区别是**语义**：
+    /// 移除表达「不要了」，停用表达「暂时不用」，文件留在
+    /// [`crate::DISABLED_DIR`] 里，原名不变，用户随时能搬回来。
+    ///
+    /// 只接受 `mods/` 与 `plugins/` 下的文件：这两个目录之外的东西不是加载
+    /// 器读的 mod，把 `server.properties` 挪进停用目录只会让人以为配置丢了。
+    ///
+    /// # Errors
+    ///
+    /// 服务器不存在、位于远端、正在运行、路径越界、目标不是普通文件或移动
+    /// 失败时返回 [`ModError`]。任一条目失败即整体返回错误——已移动的部分
+    /// 保留在停用目录里（可回滚），不试图「回滚一半」再失败一次。
+    pub fn disable(&self, name: &str, files: &[String]) -> Result<ModDisabled, ModError> {
+        let server = self.local_server(name)?;
+        self.ensure_stopped(&server)?;
+        let mut moved = Vec::new();
+        for file in files {
+            let path = server.dir.join(file);
+            // 路径来自用户输入（可能是远端帧、可能是手敲），必须确认它落在
+            // 加载器会读的两个目录里，且规范化后没有借 `..` 跑出去
+            let relative = path
+                .strip_prefix(&server.dir)
+                .map_err(|_| ModError::Escapes { path: path.clone() })?;
+            let inside = relative
+                .components()
+                .next()
+                .is_some_and(|first| first.as_os_str() == "mods" || first.as_os_str() == "plugins");
+            if !inside || relative.components().any(|c| c.as_os_str() == "..") {
+                return Err(ModError::Escapes { path: path.clone() });
+            }
+            if !path.is_file() {
+                return Err(ModError::NotFound {
+                    selector: file.clone(),
+                    dir: server.dir.clone(),
+                });
+            }
+            let target = crate::disabled::disable_file(&server.dir, &path)?;
+            let to = target.strip_prefix(&server.dir).map_or_else(
+                |_| target.display().to_string(),
+                |rel| rel.display().to_string(),
+            );
+            info!(server = name, from = %file, to = %to, "mod disabled");
+            moved.push((file.clone(), to));
+        }
+        Ok(ModDisabled { moved })
     }
 
     /// 规划一次修复：找出会让服务端起不来的问题并给出处置，**不写盘**

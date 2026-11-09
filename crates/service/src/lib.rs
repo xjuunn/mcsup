@@ -1,6 +1,7 @@
 mod atomic;
 mod backup;
 mod content;
+mod disabled;
 mod doctor;
 mod download_source;
 mod fs;
@@ -31,6 +32,7 @@ pub use backup::{
 pub use content::{
     ContentError, ContentInstall, ContentService, InstallOptions, existing_matches, request_for,
 };
+pub use disabled::DISABLED_DIR;
 pub use doctor::{CheckKind, DoctorError, DoctorService, Finding, Report, Severity};
 use domain::server::download::DownloadStatus;
 use domain::server::error::InvalidTransition;
@@ -47,11 +49,13 @@ pub use lifecycle::{
 };
 pub use mod_::{
     ApplyOptions, FixInstall, FixRefused, FixRemove, InstallPlan, InstallSpec, ListOptions,
-    ModEntry, ModError, ModFixApplied, ModFixPlan, ModInstalled, ModList, ModRemoved, ModService,
-    STAGING_DIR, TRASH_DIR, UpdateApplied, UpdateChange, UpdateItem, UpdatePlan, server_target,
+    ModDisabled, ModEntry, ModError, ModFixApplied, ModFixPlan, ModInstalled, ModList, ModRemoved,
+    ModService, STAGING_DIR, TRASH_DIR, UpdateApplied, UpdateChange, UpdateItem, UpdatePlan,
+    server_target,
 };
 pub use mod_inspect::{
-    ModAudit, ModInspectService, ModInspectServiceError, ModReport, collect_jars,
+    ModAudit, ModBlocked, ModBlocker, ModInspectService, ModInspectServiceError, ModReport,
+    collect_jars,
 };
 pub use modpack::{
     ModpackApplied, ModpackError, ModpackInstallOptions, ModpackInstalled, ModpackPrepared,

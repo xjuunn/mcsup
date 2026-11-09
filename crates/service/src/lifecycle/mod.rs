@@ -7,10 +7,9 @@
 use crate::java::JavaService;
 use crate::{
     InstallJarError, ServerRegistry, ServerRegistryError,
-    mod_inspect::{ModInspectService, ModReport},
+    mod_inspect::{ModBlocked, ModBlocker, ModInspectService},
 };
 use domain::java::java_bin_under;
-use domain::mod_::{FitVerdict, Risk};
 use domain::server::eula::{EULA_FILE, eula_accepted, render_eula};
 use domain::server::layout::console_log_path;
 use domain::server::version::VersionId;
@@ -474,24 +473,14 @@ impl ServerLifecycleService {
         let Some(inspector) = &self.mod_inspector else {
             return Ok(());
         };
-        let mut issues: Vec<String> = Vec::new();
-        for dir in ["mods", "plugins"] {
-            let dir = server.dir.join(dir);
-            if !dir.is_dir() {
-                continue;
-            }
-            let jars = crate::mod_inspect::collect_jars(&dir)
-                .map_err(|err| LifecycleError::Io(std::io::Error::other(err.to_string())))?;
-            if jars.is_empty() {
-                continue;
-            }
-            let service = ModInspectService::local(Arc::clone(inspector));
-            let target = crate::mod_::server_target(server);
-            // 预检不联网：启动是本地决策，上游挂了不该拦着人开服；检查本身
-            // 是同步的（`start` 会被异步调用方调，不能起运行时也不能 `block_on`）
-            let audit = service.inspect_paths_for_sync(&jars, Some(&target));
-            issues.extend(audit.mods.iter().filter_map(blocking_issue));
-        }
+        let service = ModInspectService::local(Arc::clone(inspector));
+        let target = crate::mod_::server_target(server);
+        // 预检不联网：启动是本地决策，上游挂了不该拦着人开服；检查本身
+        // 是同步的（`start` 会被异步调用方调，不能起运行时也不能 `block_on`）
+        let blocked = service
+            .blockers_in_dir(&server.dir, &target)
+            .map_err(|err| LifecycleError::Io(std::io::Error::other(err.to_string())))?;
+        let issues: Vec<String> = blocked.iter().map(blocking_issue).collect();
         if issues.is_empty() {
             return Ok(());
         }
@@ -898,34 +887,24 @@ fn meta_java_major(
 }
 
 /// 一个 mod 会让启动失败的理由；没有则 `None`
-fn blocking_issue(report: &ModReport) -> Option<String> {
-    let file = Path::new(&report.capability.path).file_name().map_or_else(
-        || report.capability.path.clone(),
+/// 把结构化原因渲染成一行中文（`LifecycleError` 只带文本，不再细分类型）
+fn blocking_issue(entry: &ModBlocked) -> String {
+    let file = Path::new(&entry.file).file_name().map_or_else(
+        || entry.file.clone(),
         |name| name.to_string_lossy().into_owned(),
     );
-    if !report.missing_deps.is_empty() {
-        return Some(format!(
+    match &entry.blocker {
+        ModBlocker::MissingDeps { mods } => format!(
             "{file}: 缺少必需依赖 {}（可执行 mcsup server mod fix 自动补装）",
-            report.missing_deps.join("、")
-        ));
+            mods.join("、")
+        ),
+        ModBlocker::ClientOnly => {
+            format!("{file}: 清单或上游判定仅客户端，服务端无法装载（可停用该文件）")
+        }
+        ModBlocker::Mismatch { detail } => {
+            format!("{file}: {detail}（与目标服务端的版本区间不符，可停用或更换适配版本）")
+        }
     }
-    if report.risk == Risk::Blocking {
-        return Some(format!(
-            "{file}: 清单或上游判定仅客户端，服务端无法装载（可 mcsup server mod remove 移除）"
-        ));
-    }
-    if let Some(fit) = &report.fit
-        && fit.verdict == FitVerdict::Rejected
-    {
-        let detail = fit
-            .issues
-            .first()
-            .map_or_else(|| "与服务端不匹配".to_owned(), |issue| issue.detail.clone());
-        return Some(format!(
-            "{file}: {detail}（与目标服务端的版本区间不符，可移除该文件或更换适配版本）"
-        ));
-    }
-    None
 }
 
 /// Java 选择：`server set java-version` 绑定大版本时取该版本的运行时，

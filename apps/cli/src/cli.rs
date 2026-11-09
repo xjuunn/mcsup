@@ -545,6 +545,14 @@ pub(crate) enum ModAction {
         #[arg(long, help = crate::meta::server_mod_dry_run_arg())]
         dry_run: bool,
     },
+    #[command(about = crate::meta::server_mod_disable())]
+    #[command(visible_alias = "dis")]
+    Disable {
+        #[arg(value_name = "NAME", help = crate::meta::server_mod_name_arg())]
+        name: Option<String>,
+        #[arg(value_name = "MOD", help = crate::meta::server_mod_disable_arg())]
+        mods: Vec<String>,
+    },
     #[command(about = crate::meta::server_mod_update())]
     #[command(visible_alias = "up")]
     Update {

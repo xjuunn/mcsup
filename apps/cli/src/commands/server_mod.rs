@@ -86,6 +86,7 @@ pub(crate) async fn run(action: ModAction, printer: Printer) -> Result<()> {
             kind,
             dry_run,
         } => remove(name.as_deref(), m, kind.as_deref(), dry_run, printer),
+        ModAction::Disable { name, mods } => disable(name.as_deref(), &mods, printer),
         ModAction::Update {
             name,
             m,
@@ -721,6 +722,53 @@ fn fix_plan_json(plan: &ModFixPlan) -> FixPlanJson<'_> {
             .collect(),
         unresolved: &plan.unresolved,
     }
+}
+
+// ---------------------------------------------------------------- disable
+
+/// `server mod disable`
+///
+/// 与 `remove` 的区别是语义：移除表达「不要了」，停用表达「暂时不用」。
+/// 文件移进 `mods/disabled/`，原名不变，加载器不再读取，用户随时能搬回来。
+fn disable(name: Option<&str>, mods: &[String], printer: Printer) -> Result<()> {
+    let lang = printer.lang();
+    let name =
+        crate::commands::server_ops::require_server_name(name, "server mod disable", printer)?;
+    if mods.is_empty() {
+        return Err(anyhow::anyhow!(pick(
+            lang,
+            format!(
+                "缺少要停用的文件；用法：mcsup server mod disable {name} <文件> [文件…]（文件名见 mcsup server mod list）"
+            ),
+            format!(
+                "missing files to disable; usage: mcsup server mod disable {name} <file> [file...] (see mcsup server mod list)"
+            ),
+        )));
+    }
+    let mc = bootstrap::open_mcsup_with_remotes()?;
+    let done = mc.mods.disable(&name, mods)?;
+    let moved: Vec<&str> = done.moved.iter().map(|(_, to)| to.as_str()).collect();
+    let payload = DisableJson {
+        server: &name,
+        dir: mcsup::service::DISABLED_DIR,
+        disabled: &moved,
+    };
+    let human = pick(
+        lang,
+        format!(
+            "已停用 {} 个文件，移到 {}：{}",
+            done.moved.len(),
+            mcsup::service::DISABLED_DIR,
+            moved.join("、")
+        ),
+        format!(
+            "disabled {} file(s) into {}: {}",
+            done.moved.len(),
+            mcsup::service::DISABLED_DIR,
+            moved.join(", ")
+        ),
+    );
+    printer.print_outcome(&human, &payload)
 }
 
 // ---------------------------------------------------------------- update
@@ -1442,6 +1490,16 @@ struct RemoveJson<'a> {
     server: &'a str,
     removed: &'a [String],
     dry_run: bool,
+}
+
+/// `server mod disable` 的 JSON 形状
+#[derive(Debug, Serialize)]
+struct DisableJson<'a> {
+    server: &'a str,
+    /// 停用目录（相对服务端目录）
+    dir: &'a str,
+    /// 已移入停用目录的相对路径
+    disabled: &'a [&'a str],
 }
 
 #[derive(Debug, Serialize)]

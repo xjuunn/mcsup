@@ -739,11 +739,10 @@ pub(crate) async fn install_modpack(
         skipped_client_only: applied.skipped_client_only,
         skipped_bytes: applied.skipped_bytes,
         stale_hashes: applied.stale_hashes.len(),
-        removed_local: applied.removed_local.len(),
+        blocked: applied.blocked.len(),
         path: server_dir.display().to_string(),
     };
     let mut note = skipped_note(printer.lang(), applied.skipped_client_only);
-    note.push_str(&removed_local_note(printer.lang(), &applied.removed_local));
     note.push_str(&skipped_bytes_note(printer.lang(), applied.skipped_bytes));
     note.push_str(&stale_note(printer.lang(), applied.stale_hashes.len()));
     let human = crate::i18n::pick(
@@ -763,7 +762,15 @@ pub(crate) async fn install_modpack(
             crate::output::human_bytes(applied.downloaded_bytes)
         ),
     );
-    printer.print_outcome(&human, &payload)
+    printer.print_outcome(&human, &payload)?;
+
+    // 5. 装完复核：声明说能装，不等于装完真能跑
+    //
+    //    清单的 env 与上游的 server_side 都是声明，与实际不符是常态。结论在
+    //    `apply` 里已经算好（与 `server start` 的预检同一份扫描），这里只负责
+    //    摆出表格、收一个选择。放在「已布置」之后：用户先看到装完了，再看
+    //    下一步要处置什么。
+    super::mod_review::review_local(name, &applied.blocked, printer)
 }
 
 /// 远端布置结果的回显：与本地同一 JSON 形状，文案标注目标机器
@@ -790,7 +797,7 @@ pub(crate) fn report_remote_applied(
         skipped_client_only: result.skipped_client_only,
         skipped_bytes: result.skipped_bytes,
         stale_hashes: result.stale_hashes,
-        removed_local: result.removed_local,
+        blocked: result.blocked.len(),
         path,
     };
     let mut note = skipped_note(lang, result.skipped_client_only);
@@ -813,7 +820,10 @@ pub(crate) fn report_remote_applied(
             crate::output::human_bytes(result.downloaded_bytes)
         ),
     );
-    printer.print_outcome(&human, &payload)
+    printer.print_outcome(&human, &payload)?;
+    // 文件在对端，客户端没有执行权：只摆表和说清去哪儿停用，不假装已处理
+    super::mod_review::report_remote(&result.blocked, origin, printer);
+    Ok(())
 }
 
 /// 「跳过仅客户端模组」的提示后缀；没跳过时为空串
@@ -828,29 +838,6 @@ fn skipped_note(lang: crate::locale::Lang, skipped: usize) -> String {
         lang,
         format!("，跳过 {skipped} 个仅客户端模组"),
         format!(", skipped {skipped} client-only mods"),
-    )
-}
-
-/// 装完判定移出 mods/ 的文件说明
-///
-/// 与「跳过仅客户端模组」分开讲：那一个是按声明跳过的，用户没付出下载代价；
-/// 这一个下完之后才发现装不了，文件在 `<server>/.mcsup-trash/`，能取回。
-fn removed_local_note(lang: crate::locale::Lang, removed: &[String]) -> String {
-    if removed.is_empty() {
-        return String::new();
-    }
-    crate::i18n::pick(
-        lang,
-        format!(
-            "，按文件判定移出 {} 个服务端装不了的模组（在 {}/，可随时取回）",
-            removed.len(),
-            mcsup::service::TRASH_DIR
-        ),
-        format!(
-            ", moved {} mods the server cannot load to {}/ (recoverable)",
-            removed.len(),
-            mcsup::service::TRASH_DIR
-        ),
     )
 }
 
@@ -907,8 +894,8 @@ struct ModpackInstallJson<'a> {
     skipped_bytes: u64,
     /// 清单哈希过期、但按上游权威哈希接受的文件数
     stale_hashes: usize,
-    /// 装完按文件本身判定为服务端不可装载、已移进回收站的文件数
-    removed_local: usize,
+    /// 装完复核出的、会让服务端起不来的条目数
+    blocked: usize,
     path: String,
 }
 

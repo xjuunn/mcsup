@@ -42,7 +42,8 @@ pub use combined::{
 };
 pub use link::{RemoteLink, TokenResolver};
 pub use mirror::{
-    RemoteJavaRepository, RemoteModpackResult, RemoteServerRepository, RemoteWorkspaceRepository,
+    RemoteJavaRepository, RemoteModBlocked, RemoteModpackResult, RemoteServerRepository,
+    RemoteWorkspaceRepository,
 };
 pub use router::RoutingSupervisor;
 pub use supervisor::RemoteSupervisor;

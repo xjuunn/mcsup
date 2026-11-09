@@ -233,6 +233,7 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | `remove` | `mcsup server mod remove [<name>] [<mod>] [--kind <k>] [--dry-run]` | 按文件名（可省略 `.jar`）或 modid 定位；modid 命中多个文件时不猜，列出候选并退 2。文件同样进 `.mcsup-trash/`，不直接删除 |
 | `update` | `mcsup server mod update [<name>] [<mod>] [--kind <k>] [--source <s>] [--force] [--dry-run]` | 识别 → 逐项查候选 → `decide_update` → 展示清单 → 确认后逐个安装。不给 `<mod>` 时处理全部可更新项。换名更新会把旧文件删掉，避免两份同 modid 的 jar |
 | `outdated` | `mcsup server mod outdated [<name>] [--kind <k>] [--source <s>]` | 只读版 `update`：只列可更新项，不下载 |
+| `disable` | `mcsup server mod disable [<name>] <文件>…` | 把文件移进 `<server>/mods/disabled/`：加载器不扫描子目录，原名不变，随时能搬回来。与 `remove` 的区别是语义——移除表达「不要了」，停用表达「暂时不用」 |
 | `fix` | `mcsup server mod fix [<name>] [--kind <k>] [--yes]` | 按本地审计算出修复计划（补装缺失依赖 / 移出无法装载的文件）→ 展示 → 确认 → 执行。**移除是移进 `<server>/.mcsup-trash/`，不是删除**：判定是工具的推断，判错时用户能原样取回 |
 
 `--kind` 只接受 `mod` 与 `plugin`（默认 `mod`）：这两个类别由服务端从顶层目录
@@ -475,15 +476,36 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 `PackMemberGraph::retained`）。反过来，留下的成员需要的库即使自己被标成仅
 客户端也必须装，同一条规则两向都成立。
 
-**装完再按文件本身判一次**。前面两步信的都是声明：清单的 `env`、上游项目的
+**装完再按文件本身复核一次**。前面两步信的都是声明：清单的 `env`、上游项目的
 `server_side`。声明与实际不符时只有读 jar 才能发现（Fabric 的
-`environment: client`、Forge 的 `displayMode` 都在文件里）。`apply` 结束后
-对本次装进 `mods/` 的 jar 跑一次本地检测，把服务端加载器明确装载不了的移进
-`<server>/.mcsup-trash/`：只移不删，因为判定是工具的推断、可能是错的
-（`side="CLIENT"` 的 `CreativeCore` 一类实测能正常装载）。只看「文件自己属于
-哪一侧」，缺依赖不在此列——那不是删文件能解决的问题。数量见 JSON 的
-`removed_local`，人类可读输出会说明回收站位置。库类项目不参与这一步的移除
-（`environment: client` 是误标高发区）。
+`environment: client`、Forge 的 `displayMode` 都在文件里）；依赖齐不齐、加载器
+对不对得上，更是只有把整批文件摆在一起才判得出来。`apply` 结束后对整台服务端的
+`mods/` 与 `plugins/` 跑一次本地检测，列出会让服务端起不来的条目：缺必需依赖、
+仅客户端、与目标服务端不匹配（加载器 / MC 版本 / Java）。
+
+判定与 `server start` 的预检是**同一份代码**（`ModInspectService::blockers_in_dir`），
+因此这里报空就等于启动不会被 mod 拦住。两处各判一套迟早分叉成「装完说没事、
+启动却被拦下」。
+
+安装本身**不动这些文件**：怎么处置是用户的决定。交互式终端里会打印一张无边框
+表格（序号 / 文件 / 原因），然后收一个选择：
+
+```
+#  文件                                          原因
+1  numismatic-overhaul-0.2.18+1.20.jar           只支持 fabric，服务端是 forge（可停用或换适配版本）
+2  PuzzlesLib-v8.1.33-1.20.1-Forge.jar            缺少依赖 puzzlesaccessapi（可 mod fix 补装）
+3  owo-lib-0.11.2+1.20.jar                        只支持 fabric，服务端是 forge（可停用或换适配版本）
+4  sophisticatedbackpacks-1.20.1-3.24.12.1411.jar 缺少依赖 sophisticatedcore（可 mod fix 补装）
+
+停用哪些 [N]: 1,3
+```
+
+输入逗号分隔的序号（全角逗号也接受）、`A` 全选、`N` 不选（回车即 `N`）。输入
+非法时说明错在哪（不是序号 / 序号越界 / 没读到序号）再问一次，不把用户踢回上
+一步。选中的文件移进 `<server>/mods/disabled/`：加载器不扫描子目录，原名不变，
+用户随时能搬回来。非交互（`--output json` / 管道）不提问，只打印结论与下一步。
+
+库类项目不参与「仅客户端」这一类（`environment: client` 是误标高发区）。
 
 清单里 `server: unsupported` 的文件不会装到服务端；`optional` 视为需要安装。
 `.mrpack` 由内置 zip 解析直接解开，不调用系统 `unzip`，归档内的 UTF-8

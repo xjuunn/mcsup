@@ -16,7 +16,7 @@
 #![allow(clippy::expect_used)]
 
 use async_trait::async_trait;
-use domain::mod_::SideSupport;
+use domain::mod_::{ModLoader, SideSupport};
 use domain::server::modpack::{ModpackDependencies, ModpackFile, ModpackHashes, ModpackIndex};
 use port::content::{ContentFile, ContentSourceInfo};
 use port::modpack::{
@@ -27,7 +27,9 @@ use port::{
     ArtifactDownloader, CancellationToken, DownloadError, DownloadRequest, DownloadedArtifact,
     ProgressSink, SourceError,
 };
-use service::{ModpackError, ModpackInstallOptions, ModpackPrepared, ModpackService};
+use service::{
+    ModBlocked, ModBlocker, ModpackError, ModpackInstallOptions, ModpackPrepared, ModpackService,
+};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -239,23 +241,35 @@ impl ModpackExtractor for FakeExtractor {
     }
 }
 
-/// 假读取器：按文件名给固定的客 / 服结论，其余按「读不出来」处理
+/// 假读取器：按文件名给固定结论，其余按「读不出来」处理
 ///
-/// 装完判定只关心「这个 jar 服务端能不能装载」，因此这里只需要能返回
-/// `side.server` 与一个可辨识的 `path`。
+/// 装完复核只关心「这个 jar 服务端能不能装载」，因此这里只需要能返回
+/// 服务端侧结论与加载器归属。
 struct FakeInspector {
-    /// 文件名 → 服务端侧结论
-    server: Vec<(String, SideSupport)>,
+    /// 文件名 → 结论
+    specs: Vec<FakeSpec>,
     /// 是否为库（影响 `risk()` 的降级）
     library: bool,
+}
+
+/// 单个文件的固定结论
+struct FakeSpec {
+    name: String,
+    server: SideSupport,
+    /// 声明的加载器；空表示「没有加载器元数据」，不参与匹配判定
+    loaders: Vec<ModLoader>,
 }
 
 impl FakeInspector {
     fn new(server: &[(&str, SideSupport)]) -> Self {
         Self {
-            server: server
+            specs: server
                 .iter()
-                .map(|(name, support)| ((*name).to_owned(), *support))
+                .map(|(name, support)| FakeSpec {
+                    name: (*name).to_owned(),
+                    server: *support,
+                    loaders: Vec::new(),
+                })
                 .collect(),
             library: false,
         }
@@ -263,6 +277,14 @@ impl FakeInspector {
 
     fn library(mut self) -> Self {
         self.library = true;
+        self
+    }
+
+    /// 指定某个文件声明的加载器（用于构造加载器不匹配）
+    fn with_loaders(mut self, name: &str, loaders: &[ModLoader]) -> Self {
+        if let Some(spec) = self.specs.iter_mut().find(|spec| spec.name == name) {
+            spec.loaders = loaders.to_vec();
+        }
         self
     }
 }
@@ -276,13 +298,14 @@ impl port::mod_::ModInspector for FakeInspector {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let Some((_name, server)) = self.server.iter().find(|(n, _)| *n == name) else {
+        let Some(spec) = self.specs.iter().find(|spec| spec.name == name) else {
             return Err(port::mod_::ModInspectError::NotAnArchive {
                 path: path.to_path_buf(),
             });
         };
         let mut cap = domain::mod_::ModCapability::empty(path.display().to_string());
-        cap.side = domain::mod_::SideVerdict::declared(SideSupport::Required, *server);
+        cap.side = domain::mod_::SideVerdict::declared(SideSupport::Required, spec.server);
+        cap.loaders.clone_from(&spec.loaders);
         cap.is_library = self.library;
         Ok(cap)
     }
@@ -614,12 +637,13 @@ async fn keeps_client_only_file_that_pack_members_depend_on() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// 装完读 jar：服务端装载不了的 mod 移进回收站，不留在 `mods/`
+/// 装完读 jar：服务端装载不了的 mod 报出来，但**不动**文件
 ///
 /// 清单与上游声明都写 `server: required` 也可能装错——整合包作者常把
-/// Sodium / ETF 一类纯客户端模组标成必需。装完这次读文件是唯一的兜底。
+/// Sodium / ETF 一类纯客户端模组标成必需。装完这次读文件是唯一的兜底，
+/// 结论交给用户处置：工具单方面移走文件，用户只能从结果反推发生了什么。
 #[tokio::test]
-async fn settles_mods_that_cannot_load_on_a_server() {
+async fn reports_mods_that_cannot_load_on_a_server() {
     let index = ModpackIndex::new(
         1,
         "minecraft",
@@ -640,7 +664,7 @@ async fn settles_mods_that_cannot_load_on_a_server() {
             ("client-only.jar", SideSupport::Unsupported),
         ]),
     );
-    let dir = scratch("settle-client-only");
+    let dir = scratch("report-client-only");
 
     let prepared = service
         .prepare(
@@ -655,24 +679,78 @@ async fn settles_mods_that_cannot_load_on_a_server() {
         .await
         .expect("apply");
 
-    assert!(dir.join("mods/good.jar").is_file(), "能装的要留下");
-    assert!(
-        !dir.join("mods/client-only.jar").exists(),
-        "服务端装载不了的不能留在 mods/"
+    assert_eq!(
+        applied.blocked,
+        vec![ModBlocked {
+            file: "mods/client-only.jar".to_owned(),
+            blocker: ModBlocker::ClientOnly,
+        }],
+        "只有装载不了的那一个被报出来"
     );
-    let trash = dir.join(service::TRASH_DIR);
     assert!(
-        trash.join("client-only.jar").is_file(),
-        "判定可能出错，文件必须还在回收站里: {trash:?}"
+        dir.join("mods/client-only.jar").is_file(),
+        "安装不替用户做处置决定，文件留在原地"
     );
-    assert_eq!(applied.removed_local, vec!["mods/client-only.jar"]);
-    assert_eq!(applied.file_count, 1, "文件数只算真正落地的");
+    assert_eq!(applied.file_count, 2, "文件数按清单实际落地算");
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// 库的 `environment: client` 是误标高发区：判成不可卸载会删掉别人的硬依赖
+/// 加载器对不上要报出来——这是 forge 整合包里混进 fabric jar 的现场
+///
+/// 这类文件在 `mods/` 里加载器根本不会尝试装载，但会以「找不到入口点」的
+/// 形式让整次启动失败，报错里只有类名。
 #[tokio::test]
-async fn settle_keeps_library_marked_client() {
+async fn reports_mods_from_another_loader() {
+    let index = ModpackIndex::new(
+        1,
+        "minecraft",
+        "1.20.1",
+        "Pack",
+        deps(&[("minecraft", "1.20.1"), ("forge", "47.2.0")]),
+        vec![
+            file("mods/forge-mod.jar", 4, EnvTag::Required),
+            file("mods/fabric-mod.jar", 4, EnvTag::Required),
+        ],
+    )
+    .expect("index");
+    let service = service_with_inspector(
+        index,
+        FakeDownloader::ok(),
+        FakeInspector::new(&[
+            ("forge-mod.jar", SideSupport::Required),
+            ("fabric-mod.jar", SideSupport::Required),
+        ])
+        .with_loaders("forge-mod.jar", &[ModLoader::Forge])
+        .with_loaders("fabric-mod.jar", &[ModLoader::Fabric]),
+    );
+    let dir = scratch("report-loader");
+
+    let prepared = service
+        .prepare(
+            "P",
+            ModpackInstallOptions::new(&dir),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("prepare");
+    let applied = service
+        .apply(&prepared, &dir, None, &CancellationToken::new())
+        .await
+        .expect("apply");
+
+    assert_eq!(applied.blocked.len(), 1, "{:?}", applied.blocked);
+    assert_eq!(applied.blocked[0].file, "mods/fabric-mod.jar");
+    assert!(
+        matches!(applied.blocked[0].blocker, ModBlocker::Mismatch { .. }),
+        "原因要落在加载器维度上: {:?}",
+        applied.blocked[0].blocker
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 库的 `environment: client` 是误标高发区：判成不可装载会把别人的硬依赖删掉
+#[tokio::test]
+async fn library_marked_client_is_not_reported_as_blocking() {
     let index = ModpackIndex::new(
         1,
         "minecraft",
@@ -687,7 +765,7 @@ async fn settle_keeps_library_marked_client() {
         FakeDownloader::ok(),
         FakeInspector::new(&[("lib.jar", SideSupport::Unsupported)]).library(),
     );
-    let dir = scratch("settle-library");
+    let dir = scratch("report-library");
 
     let prepared = service
         .prepare(
@@ -703,16 +781,16 @@ async fn settle_keeps_library_marked_client() {
         .expect("apply");
 
     assert!(
-        dir.join("mods/lib.jar").is_file(),
-        "库类项目标 client 多半是误标，不能直接移走"
+        applied.blocked.is_empty(),
+        "库类项目标 client 多半是误标，不该报成阻断: {:?}",
+        applied.blocked
     );
-    assert!(applied.removed_local.is_empty());
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// 非 `mods/` 的文件不参与装完判定：服务端根本不加载它们
+/// 非 `mods/` 的文件不参与装完复核：服务端根本不加载它们
 #[tokio::test]
-async fn settle_ignores_files_outside_mods() {
+async fn audit_ignores_files_outside_mods() {
     let index = ModpackIndex::new(
         1,
         "minecraft",
@@ -727,7 +805,7 @@ async fn settle_ignores_files_outside_mods() {
         FakeDownloader::ok(),
         FakeInspector::new(&[("x.toml", SideSupport::Unsupported)]),
     );
-    let dir = scratch("settle-nonmod");
+    let dir = scratch("audit-nonmod");
 
     let prepared = service
         .prepare(
@@ -743,7 +821,7 @@ async fn settle_ignores_files_outside_mods() {
         .expect("apply");
 
     assert!(dir.join("config/x.toml").is_file(), "配置文件不该被动");
-    assert!(applied.removed_local.is_empty());
+    assert!(applied.blocked.is_empty());
     std::fs::remove_dir_all(&dir).ok();
 }
 

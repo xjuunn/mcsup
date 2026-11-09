@@ -395,12 +395,18 @@ Modrinth 同一版本可以同时提供客户端与服务端文件，服务端�
 成员不该为别人提供保护（`sodium` 被同为仅客户端的 `indium` / `iris` 依赖，
 一次统计会把它误留下来）。查询失败即中止安装，不带着未知状态落盘。
 
-装完还有一道按**文件本身**的判定（`ModpackService::settle_mods`）：对本次装进
-`mods/` 的 jar 跑一次本地检测，把服务端加载器明确装载不了的移进
-`<server>/.mcsup-trash/`。只移不删——判定是工具的推断，可能是错的；只看
-「文件自己属于哪一侧」，缺依赖不在此列。整合包服务与 `server mod list` /
-`server start` 共用同一个 `ModInspector` 与同一套口径（`ModCapability::risk`），
-入口只负责展示 `skipped_client_only` 与 `removed_local`。
+装完还有一道按**文件本身**的复核（`ModpackService::audit_mods`）：对整台服务端
+的 `mods/` 与 `plugins/` 跑一次本地检测，列出会让服务端起不来的条目——缺必需
+依赖、仅客户端、与目标服务端不匹配（加载器 / MC 版本 / Java）。判定收敛在
+`ModReport::blocker`，扫描收敛在 `ModInspectService::blockers_in_dir`，与
+`server start` 的预检是同一份代码：两处各判一套迟早分叉成「装完说没事、启动却
+被拦下」。
+
+安装本身不动这些文件。处置是用户的决定，入口负责问：交互式终端打印无边框表格
+（序号 / 文件 / 原因），收逗号分隔序号 / `A` / `N`，选中的移进
+`<server>/mods/disabled/`（`service::DISABLED_DIR`）。加载器不扫描 `mods/` 的
+子目录，原名不变，用户随时能搬回来——与 `.mcsup-trash/` 同一条理由：判定是工具
+的推断，可能是错的。非交互入口只展示 `blocked`，不替用户做决定。
 
 ```
 server create --variant modrinth-modpack

@@ -14,14 +14,15 @@ use domain::server::version::{ServerVariant, ServerVersion, VersionId};
 use file::FileCoreInspector;
 use port::TaskObserver;
 use protocol::remote::wire::{
-    WirePropUpdate, WireServer, WireSettings, WireSnapshot, WireStatusEntry, WireVersion,
+    WireModBlocked, WirePropUpdate, WireServer, WireSettings, WireSnapshot, WireStatusEntry,
+    WireVersion,
 };
 use protocol::remote::{ErrorKind, Request, Response};
 use service::{
-    InitOutcome, InstallJarError, InstallerContext, JavaError, LifecycleError, ModpackError,
-    ModpackInstallOptions, PropsError, ServerInstaller, ServerPropsService, ServerRegistryError,
-    ServerRegistryErrorKind, ServerSettingsService, SettingsError, StartOptions, UninstallOutcome,
-    WorkspaceError, WorkspaceErrorKind,
+    InitOutcome, InstallJarError, InstallerContext, JavaError, LifecycleError, ModBlocked,
+    ModBlocker, ModpackError, ModpackInstallOptions, PropsError, ServerInstaller,
+    ServerPropsService, ServerRegistryError, ServerRegistryErrorKind, ServerSettingsService,
+    SettingsError, StartOptions, UninstallOutcome, WorkspaceError, WorkspaceErrorKind,
 };
 use transport::{RemoteFailure, SessionInfo};
 
@@ -737,7 +738,7 @@ impl Agent {
                         skipped_client_only: applied.skipped_client_only,
                         skipped_bytes: applied.skipped_bytes,
                         stale_hashes: applied.stale_hashes.len(),
-                        removed_local: applied.removed_local.len(),
+                        blocked: applied.blocked.iter().map(wire_mod_blocked).collect(),
                     },
                     Err(err) => failure(ErrorKind::IO, err),
                 }
@@ -1194,6 +1195,24 @@ fn workspace_failure(err: &WorkspaceError) -> Response {
         _ => wire_kind(err.category()),
     };
     failure_ref(kind, err)
+}
+
+/// 阻断原因转线格式
+///
+/// 只搬运事实，不搬运文案：`kind` 是稳定机器名，`detail` 是缺的 modid 或不
+/// 匹配的维度说明。渲染成一句话由客户端按自己的语言做——协议层不知道也不该
+/// 知道用户界面长什么样。
+fn wire_mod_blocked(entry: &ModBlocked) -> WireModBlocked {
+    let (kind, detail) = match &entry.blocker {
+        ModBlocker::MissingDeps { mods } => ("missing_deps", mods.clone()),
+        ModBlocker::ClientOnly => ("client_only", Vec::new()),
+        ModBlocker::Mismatch { detail } => ("mismatch", vec![detail.clone()]),
+    };
+    WireModBlocked {
+        file: entry.file.clone(),
+        kind: kind.to_owned(),
+        detail,
+    }
 }
 
 fn registry_failure(err: &ServerRegistryError) -> Response {
