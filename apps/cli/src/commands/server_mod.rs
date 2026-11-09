@@ -609,7 +609,10 @@ async fn fix(
 }
 
 /// 逐条交代执行结果：装了什么、删了什么、哪些被门禁拒了、哪些找不到提供方
-fn report_fix_applied(applied: &mcsup::service::ModFixApplied, printer: Printer) -> Result<()> {
+pub(crate) fn report_fix_applied(
+    applied: &mcsup::service::ModFixApplied,
+    printer: Printer,
+) -> Result<()> {
     let lang = printer.lang();
     for item in &applied.installed {
         printer.print_outcome(

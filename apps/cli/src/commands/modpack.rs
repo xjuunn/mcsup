@@ -770,7 +770,7 @@ pub(crate) async fn install_modpack(
     //    `apply` 里已经算好（与 `server start` 的预检同一份扫描），这里只负责
     //    摆出表格、收一个选择。放在「已布置」之后：用户先看到装完了，再看
     //    下一步要处置什么。
-    super::mod_review::review_local(name, &applied.blocked, printer)
+    super::mod_review::review_local(name, &applied.blocked, printer).await
 }
 
 /// 远端布置结果的回显：与本地同一 JSON 形状，文案标注目标机器

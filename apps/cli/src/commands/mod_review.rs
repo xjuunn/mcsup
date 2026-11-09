@@ -17,12 +17,15 @@
 
 use anyhow::Result;
 use mcsup::backend::remote::RemoteModBlocked;
-use mcsup::service::{ModBlocked, ModBlocker};
+use mcsup::domain::server::content::ContentKind;
+use mcsup::port::CancellationToken;
+use mcsup::service::{ApplyOptions, ModBlocked, ModBlocker};
 use std::path::Path;
 
 use crate::i18n::pick;
 use crate::locale::Lang;
 use crate::output::{Printer, compact_table};
+use crate::progress::TaskSpinner;
 use crate::prompts::input_text;
 
 /// 表格的一行：文件名 + 一句话原因
@@ -34,84 +37,183 @@ struct Row {
     reason: String,
 }
 
-/// 复核结果：本地可停用
+/// 复核结果：分两阶段处置
 ///
 /// `name` 是服务端名，停用要经 `ModService`（它负责「运行中不许动文件」与
 /// 路径越界检查），因此这里不直接操作文件系统。
 ///
+/// 阶段一：只有「仅客户端」与「不匹配」进停用表并提问；「缺依赖」条目不
+/// 进停用表——它们靠补装解决，停用是错的动作。
+/// 阶段二：停用之后，缺依赖那批自动补装（见 [`auto_install_missing_deps`]）。
+///
 /// # Errors
 ///
-/// 停用失败（服务端在跑、文件已被移走、目录不可写）时返回错误
-pub(crate) fn review_local(name: &str, blocked: &[ModBlocked], printer: Printer) -> Result<()> {
+/// 停用失败（服务端在跑、文件已被移走、目录不可写）或补装失败时返回错误
+pub(crate) async fn review_local(
+    name: &str,
+    blocked: &[ModBlocked],
+    printer: Printer,
+) -> Result<()> {
     if blocked.is_empty() {
         return Ok(());
     }
     let lang = printer.lang();
-    let rows: Vec<Row> = blocked
-        .iter()
-        .map(|entry| Row {
-            file: file_name(&entry.file),
-            reason: reason_text(&entry.blocker, lang),
-        })
-        .collect();
-    print_table(&rows, lang, printer);
+    let (disableable, missing) = partition(blocked);
 
+    // 阶段一：停用。有可停用条目才摆表、才问；缺依赖那批完全不出现在这里。
+    if !disableable.is_empty() {
+        let rows: Vec<Row> = disableable
+            .iter()
+            .map(|entry| Row {
+                file: file_name(&entry.file),
+                reason: reason_text(&entry.blocker, lang),
+            })
+            .collect();
+        print_table(&rows, lang, printer);
+
+        if printer.is_interactive() {
+            let picked = ask_selection(disableable.len(), lang, printer)?;
+            if picked.is_empty() {
+                printer.print_outcome(
+                    &pick(
+                        lang,
+                        "未停用任何文件；启动时仍会被预检拦下".to_owned(),
+                        "nothing disabled; the start pre-check will still block".to_owned(),
+                    ),
+                    &serde_json::json!({ "disabled": 0 }),
+                )?;
+            } else {
+                let files: Vec<String> = picked
+                    .iter()
+                    .map(|&i| disableable[i].file.clone())
+                    .collect();
+                let mc = crate::bootstrap::open_mcsup()?;
+                let done = mc.mods.disable(name, &files)?;
+                let moved: Vec<&str> = done.moved.iter().map(|(_, to)| to.as_str()).collect();
+                printer.print_outcome(
+                    &pick(
+                        lang,
+                        format!(
+                            "已停用 {} 个 mod，移到 {}：{}",
+                            done.moved.len(),
+                            mcsup::service::DISABLED_DIR,
+                            moved.join("、")
+                        ),
+                        format!(
+                            "disabled {} mod(s) into {}: {}",
+                            done.moved.len(),
+                            mcsup::service::DISABLED_DIR,
+                            moved.join(", ")
+                        ),
+                    ),
+                    &serde_json::json!({
+                        "disabled": done.moved.len(),
+                        "dir": mcsup::service::DISABLED_DIR,
+                        "files": moved,
+                    }),
+                )?;
+            }
+        } else {
+            // 非交互（`--output json` / 管道）不能提问：把结论和下一步说清楚，
+            // 副作用（停用 / 补装都写文件系统）留给用户显式发起，不在脚本路径
+            // 偷偷落盘
+            printer.print_warning(&pick(
+                lang,
+                format!(
+                    "以上 {} 个 mod 会让服务端起不来；用 mcsup server mod disable 停用",
+                    disableable.len()
+                ),
+                format!(
+                    "{} mod(s) above would stop the server; run mcsup server mod disable",
+                    disableable.len()
+                ),
+            ));
+        }
+    }
+
+    // 阶段二：停用之后自动补装缺失依赖。没缺依赖就没有这一步。
+    if missing.is_empty() {
+        return Ok(());
+    }
     if !printer.is_interactive() {
-        // 非交互（`--output json` / 管道）不能提问：把结论和下一步说清楚，
-        // 让脚本与人都能接着做，而不是静默吞掉
         printer.print_warning(&pick(
             lang,
             format!(
-                "以上 {} 个 mod 会让服务端起不来；用 mcsup server mod disable 停用，或 mcsup server mod fix 补依赖",
-                blocked.len()
+                "另有 {} 个 mod 缺少依赖；用 mcsup server mod fix 补装",
+                missing.len()
             ),
             format!(
-                "{} mod(s) above would stop the server; run mcsup server mod disable or mcsup server mod fix",
-                blocked.len()
+                "{} more mod(s) have missing dependencies; run mcsup server mod fix",
+                missing.len()
             ),
         ));
         return Ok(());
     }
+    auto_install_missing_deps(name, printer).await
+}
 
-    let picked = ask_selection(blocked.len(), lang, printer)?;
-    if picked.is_empty() {
+/// 把阻断项分成两个处置阶段
+///
+/// 返回 `(可停用, 缺依赖)`：缺依赖靠补装解决、不靠停用，因此不进停用表。
+/// `可停用` 是「仅客户端」或「与服务端不匹配」，只能停用或换版本。
+fn partition(blocked: &[ModBlocked]) -> (Vec<&ModBlocked>, Vec<&ModBlocked>) {
+    blocked
+        .iter()
+        .partition(|entry| !matches!(&entry.blocker, ModBlocker::MissingDeps { .. }))
+}
+
+/// 停用之后自动补装缺失依赖：先计划（零写入）再落盘，不询问
+///
+/// 复用 `server mod fix` 的判定（[`mcsup::service::ModService::plan_fix`]），
+/// 但只取「补装」那一半：计划里的 `removals` 针对「仅客户端 / 不匹配」，那批
+/// 已经在停用阶段由用户决定过了，这里清空，绝不替用户把他们选择保留的文件
+/// 移走。补不上的进 `unresolved` 报告，不擅自移除。
+async fn auto_install_missing_deps(name: &str, printer: Printer) -> Result<()> {
+    let lang = printer.lang();
+    let mc = crate::bootstrap::open_mcsup()?;
+
+    let spinner = TaskSpinner::new(
+        pick(lang, "正在分析缺失依赖…", "analyzing missing dependencies…"),
+        printer.is_human(),
+    );
+    let mut plan = mc.mods.plan_fix(name, ContentKind::Mod).await?;
+    spinner.finish();
+    plan.removals.clear();
+
+    if plan.installs.is_empty() {
         printer.print_outcome(
             &pick(
                 lang,
-                "未停用任何文件；启动时仍会被预检拦下".to_owned(),
-                "nothing disabled; the start pre-check will still block".to_owned(),
+                "缺失依赖没有找到可自动补装的提供方，需人工处置".to_owned(),
+                "missing dependencies have no auto-installable provider".to_owned(),
             ),
-            &serde_json::json!({ "disabled": 0 }),
+            &serde_json::json!({ "installed": 0, "unresolved": plan.unresolved.len() }),
         )?;
         return Ok(());
     }
 
-    let files: Vec<String> = picked.iter().map(|&i| blocked[i].file.clone()).collect();
-    let mc = crate::bootstrap::open_mcsup()?;
-    let done = mc.mods.disable(name, &files)?;
-    let moved: Vec<&str> = done.moved.iter().map(|(_, to)| to.as_str()).collect();
-    printer.print_outcome(
-        &pick(
+    let apply_spinner = TaskSpinner::new(
+        pick(
             lang,
-            format!(
-                "已停用 {} 个 mod，移到 {}：{}",
-                done.moved.len(),
-                mcsup::service::DISABLED_DIR,
-                moved.join("、")
-            ),
-            format!(
-                "disabled {} mod(s) into {}: {}",
-                done.moved.len(),
-                mcsup::service::DISABLED_DIR,
-                moved.join(", ")
-            ),
+            "正在补装缺失依赖…",
+            "installing missing dependencies…",
         ),
-        &serde_json::json!({
-            "disabled": done.moved.len(),
-            "dir": mcsup::service::DISABLED_DIR,
-            "files": moved,
-        }),
-    )
+        printer.is_human(),
+    );
+    let applied = mc
+        .mods
+        .apply_fix(
+            name,
+            &plan,
+            ApplyOptions {
+                allow_blocking: false,
+                progress: None,
+                cancel: &CancellationToken::new(),
+            },
+        )
+        .await;
+    apply_spinner.finish();
+    super::server_mod::report_fix_applied(&applied?, printer)
 }
 
 /// 复核结果：文件在远端，只能报告
@@ -377,5 +479,46 @@ mod tests {
     #[test]
     fn rejects_separator_only() {
         assert_eq!(parse_selection(",,", 3), Err(SelectionError::Empty));
+    }
+
+    #[test]
+    fn partition_separates_missing_deps_from_disableable() {
+        let blocked = vec![
+            ModBlocked {
+                file: "mods/a.jar".to_owned(),
+                blocker: ModBlocker::MissingDeps {
+                    mods: vec!["lib".to_owned()],
+                },
+            },
+            ModBlocked {
+                file: "mods/b.jar".to_owned(),
+                blocker: ModBlocker::ClientOnly,
+            },
+            ModBlocked {
+                file: "mods/c.jar".to_owned(),
+                blocker: ModBlocker::Mismatch {
+                    detail: "loader".to_owned(),
+                },
+            },
+            ModBlocked {
+                file: "mods/d.jar".to_owned(),
+                blocker: ModBlocker::MissingDeps {
+                    mods: vec!["other".to_owned()],
+                },
+            },
+        ];
+        let (disableable, missing) = partition(&blocked);
+        assert_eq!(disableable.len(), 2);
+        assert_eq!(missing.len(), 2);
+        assert!(
+            disableable
+                .iter()
+                .all(|e| !matches!(&e.blocker, ModBlocker::MissingDeps { .. }))
+        );
+        assert!(
+            missing
+                .iter()
+                .all(|e| matches!(&e.blocker, ModBlocker::MissingDeps { .. }))
+        );
     }
 }
