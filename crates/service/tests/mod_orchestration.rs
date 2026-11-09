@@ -38,6 +38,7 @@ use service::{
     ApplyOptions, ContentService, InstallSpec, ListOptions, ModError, ModService, ServerRegistry,
 };
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -246,6 +247,8 @@ struct Verdict {
 /// 假检查器：按**文件名**给结论（暂存路径每次不同，不能按全路径匹配）
 struct FakeInspector {
     verdicts: Mutex<Vec<Verdict>>,
+    /// 文件名 → 归档内的类名（内部名），供崩溃归因反查
+    classes: Mutex<BTreeMap<String, Vec<String>>>,
 }
 
 impl FakeInspector {
@@ -261,7 +264,16 @@ impl FakeInspector {
                     })
                     .collect(),
             ),
+            classes: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// 声明某个文件包含哪些类（内部名）
+    fn declares_classes(&self, file: &str, classes: &[&str]) {
+        self.classes.lock().expect("classes").insert(
+            file.to_owned(),
+            classes.iter().map(|class| (*class).to_owned()).collect(),
+        );
     }
 
     /// 给某个文件追加一条必需依赖（用于「缺依赖」判定）
@@ -307,6 +319,15 @@ impl ModInspector for FakeInspector {
             });
         }
         Ok(capability)
+    }
+
+    fn class_names(&self, path: &Path) -> Result<Option<Vec<String>>, ModInspectError> {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let classes = self.classes.lock().expect("classes");
+        Ok(Some(classes.get(&name).cloned().unwrap_or_default()))
     }
 }
 
@@ -761,6 +782,222 @@ async fn plan_fix_dedupes_the_same_missing_dependency() {
         .expect("plan_fix");
     assert!(plan.installs.is_empty());
     assert_eq!(plan.unresolved, vec!["geckolib3".to_owned()]);
+}
+
+// ---------------------------------------------------------------- 崩溃归因
+
+/// 现场日志：CalcMod 在服务端注册命令时碰到客户端类
+///
+/// 这个 mod 的 `fabric.mod.json` 是 `environment: "*"` 且 `client` / `server`
+/// 两个入口点都有，上游标 `server_side: optional`——元数据层面毫无破绽，
+/// 三层静态判定全都放行，只有真的启动崩一次才能发现。
+const CALCMOD_CRASH_LOG: &str = r"
+[10:13:47] [main/WARN]: Failed to load datapacks, can't proceed with server load.
+java.util.concurrent.ExecutionException: java.lang.NoClassDefFoundError: net/minecraft/client/player/LocalPlayer
+	at java.base/java.util.concurrent.CompletableFuture.wrapInExecutionException(CompletableFuture.java:345)
+	at knot//net.minecraft.server.Main.main(Main.java:193)
+Caused by: java.lang.NoClassDefFoundError: net/minecraft/client/player/LocalPlayer
+	at knot//net.jsa2025.calcmod.commands.CalcCommand.registerServer(CalcCommand.java:89)
+	at knot//net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback.lambda$static$1(CommandRegistrationCallback.java:43)
+	at knot//net.minecraft.commands.Commands.<init>(Commands.java:339)
+	... 14 more
+Caused by: java.lang.ClassNotFoundException: net.minecraft.client.player.LocalPlayer
+";
+
+/// 崩溃栈能落到具体文件：规划移除该 jar，并带上缺失类作为理由
+#[tokio::test]
+async fn plan_fix_from_log_removes_the_jar_the_stack_points_at() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[("calcmod.jar", SideSupport::Required)],
+        b"jar-bytes",
+    );
+    harness.write("mods/calcmod.jar", b"payload");
+    harness
+        .inspector
+        .declares_classes("calcmod.jar", &["net/jsa2025/calcmod/commands/CalcCommand"]);
+    harness.write("console.log", CALCMOD_CRASH_LOG.as_bytes());
+
+    let plan = harness
+        .mods
+        .plan_fix_from_log("alpha", ContentKind::Mod, 500)
+        .await
+        .expect("plan_fix_from_log");
+
+    assert_eq!(plan.removals.len(), 1, "{plan:?}");
+    assert_eq!(
+        plan.removals[0].file,
+        harness.mods_dir().join("calcmod.jar"),
+        "{plan:?}"
+    );
+    // 原因里要能看出「谁引用了什么」，用户才能自己核对结论
+    assert!(
+        plan.removals[0].reason.contains("CalcCommand"),
+        "{:?}",
+        plan.removals[0].reason
+    );
+    assert!(
+        plan.removals[0].reason.contains("LocalPlayer"),
+        "{:?}",
+        plan.removals[0].reason
+    );
+    let crash = plan.crash.as_ref().expect("归因结果");
+    assert_eq!(
+        crash.missing,
+        vec!["net/minecraft/client/player/LocalPlayer"]
+    );
+    assert!(plan.unattributed.is_empty(), "{plan:?}");
+}
+
+/// 栈里的类不属于任何文件：如实列进 unattributed，不猜文件
+#[tokio::test]
+async fn plan_fix_from_log_reports_unattributed_classes() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[("innocent.jar", SideSupport::Required)],
+        b"jar-bytes",
+    );
+    harness.write("mods/innocent.jar", b"payload");
+    harness
+        .inspector
+        .declares_classes("innocent.jar", &["com/example/innocent/Main"]);
+    harness.write("console.log", CALCMOD_CRASH_LOG.as_bytes());
+
+    let plan = harness
+        .mods
+        .plan_fix_from_log("alpha", ContentKind::Mod, 500)
+        .await
+        .expect("plan_fix_from_log");
+
+    assert!(plan.removals.is_empty(), "{plan:?}");
+    assert_eq!(
+        plan.unattributed,
+        vec!["net.jsa2025.calcmod.commands.CalcCommand".to_owned()]
+    );
+}
+
+/// 日志里没有崩溃栈（没崩过、日志被清空）：空计划，不误伤任何文件
+#[tokio::test]
+async fn plan_fix_from_log_without_stack_is_empty() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[("innocent.jar", SideSupport::Required)],
+        b"jar-bytes",
+    );
+    harness.write("mods/innocent.jar", b"payload");
+    harness
+        .inspector
+        .declares_classes("innocent.jar", &["com/example/innocent/Main"]);
+    harness.write(
+        "console.log",
+        b"[10:00:00] [main/INFO]: Done (12.3s)! For help, type \"help\"\n",
+    );
+
+    let plan = harness
+        .mods
+        .plan_fix_from_log("alpha", ContentKind::Mod, 500)
+        .await
+        .expect("plan_fix_from_log");
+
+    assert!(plan.removals.is_empty(), "{plan:?}");
+    assert!(plan.unattributed.is_empty(), "{plan:?}");
+    assert!(
+        plan.crash
+            .as_ref()
+            .is_some_and(domain::mod_::CrashAttribution::is_empty)
+    );
+}
+
+/// 归因只看日志末尾：更早那次崩溃的栈不该被当成这次的证据
+///
+/// supervisor 以追加方式写 `console.log`，跨多次启动的栈会同时存在。
+/// 取固定行数尾部既覆盖「最后一次启动」，又不会把历史问题翻出来。
+#[tokio::test]
+async fn plan_fix_from_log_reads_only_the_log_tail() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[
+            ("old.jar", SideSupport::Required),
+            ("new.jar", SideSupport::Required),
+        ],
+        b"jar-bytes",
+    );
+    harness.write("mods/old.jar", b"old");
+    harness.write("mods/new.jar", b"new");
+    harness
+        .inspector
+        .declares_classes("old.jar", &["com/old/Crash"]);
+    harness
+        .inspector
+        .declares_classes("new.jar", &["com/new/Crash"]);
+    // 旧崩溃在前，几十行填充隔开，最后一次崩溃在末尾
+    let mut log = String::from(CALCMOD_CRASH_LOG);
+    log = log.replace("net.jsa2025.calcmod.commands.CalcCommand", "com.old.Crash");
+    for i in 0..40 {
+        let _ = writeln!(log, "[10:00:{i:02}] [main/INFO]: tick {i}");
+    }
+    let mut tail =
+        CALCMOD_CRASH_LOG.replace("net.jsa2025.calcmod.commands.CalcCommand", "com.new.Crash");
+    if !tail.ends_with('\n') {
+        tail.push('\n');
+    }
+    log.push_str(&tail);
+    harness.write("console.log", log.as_bytes());
+
+    // 尾部只留 12 行：旧崩溃在窗口外
+    let plan = harness
+        .mods
+        .plan_fix_from_log("alpha", ContentKind::Mod, 12)
+        .await
+        .expect("plan_fix_from_log");
+
+    assert_eq!(plan.removals.len(), 1, "{plan:?}");
+    assert_eq!(plan.removals[0].file, harness.mods_dir().join("new.jar"));
+}
+
+/// 执行修复：按日志归因的移除同样进回收站，不直接删除
+#[tokio::test]
+async fn apply_fix_from_log_moves_the_blamed_jar_to_trash() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[("calcmod.jar", SideSupport::Required)],
+        b"jar-bytes",
+    );
+    harness.write("mods/calcmod.jar", b"payload");
+    harness
+        .inspector
+        .declares_classes("calcmod.jar", &["net/jsa2025/calcmod/commands/CalcCommand"]);
+    harness.write("console.log", CALCMOD_CRASH_LOG.as_bytes());
+
+    let plan = harness
+        .mods
+        .plan_fix_from_log("alpha", ContentKind::Mod, 500)
+        .await
+        .expect("plan_fix_from_log");
+    let applied = harness
+        .mods
+        .apply_fix(
+            "alpha",
+            &plan,
+            ApplyOptions {
+                allow_blocking: false,
+                progress: None,
+                cancel: &CancellationToken::new(),
+            },
+        )
+        .await
+        .expect("apply_fix");
+
+    assert_eq!(applied.removed.len(), 1, "{applied:?}");
+    assert!(!harness.mods_dir().join("calcmod.jar").exists());
+    let trashed = harness
+        .server_dir()
+        .join(service::TRASH_DIR)
+        .join("calcmod.jar");
+    assert_eq!(
+        std::fs::read(&trashed).expect("回收站里应当有原文件"),
+        b"payload"
+    );
 }
 
 /// 执行修复：补装落盘

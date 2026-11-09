@@ -31,6 +31,22 @@ pub trait ModInspector: Send + Sync {
     /// 文件不可读、不是 zip、或归档结构损坏时返回 [`ModInspectError`]。
     /// 元数据文件内容非法**不算**错误：按「认不出」处理，仍返回结果。
     fn inspect(&self, path: &Path) -> Result<ModCapability, ModInspectError>;
+
+    /// 列出归档里的全部类（内部名，`a/b/C`）
+    ///
+    /// 只给启动崩溃归因用：把日志栈帧里的类反查回具体 jar。
+    ///
+    /// 默认实现返回 `None`，表示该实现不支持按类名检索。调用方必须把
+    /// `None` 当作「不知道」而不是「不含」——后者会让归因静默漏掉整个 mod，
+    /// 报告出一份「什么都没查到」的空计划。
+    ///
+    /// # Errors
+    ///
+    /// 文件不可读或不是 zip 归档时返回 [`ModInspectError`]
+    fn class_names(&self, path: &Path) -> Result<Option<Vec<String>>, ModInspectError> {
+        let _ = path;
+        Ok(None)
+    }
 }
 
 /// 本地读取失败

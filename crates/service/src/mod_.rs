@@ -31,10 +31,14 @@ use crate::mod_inspect::{
 };
 use crate::modpack_manifest::ModpackManifestSnapshot;
 use crate::registry::{RegisteredServer, ServerRegistry, ServerRegistryError};
-use domain::mod_::{FitVerdict, InstallVerdict, ModLoader, Risk, ServerTarget, SideSupport};
+use domain::mod_::{
+    CrashAttribution, FitVerdict, InstallVerdict, ModLoader, Risk, ServerTarget, SideSupport,
+    attribute_crash,
+};
 use domain::server::content::{
     ContentCandidate, ContentIdentity, ContentKind, ContentRequest, UpdateDecision, decide_update,
 };
+use domain::server::layout::console_log_path;
 use domain::server::version::ServerVariant;
 use port::content::{ContentProject, ContentQuery, ContentSearch, safe_filename};
 use port::mod_::ModInspector;
@@ -391,8 +395,8 @@ pub struct FixRemove {
 
 /// 一次修复计划（预览，不写盘）
 ///
-/// 由 [`ModService::plan_fix`] 产出：缺失依赖补装、带问题的文件移除、
-/// 上游找不到提供方的依赖如实列出。
+/// 由 [`ModService::plan_fix`] 或 [`ModService::plan_fix_from_log`] 产出：
+/// 缺失依赖补装、带问题的文件移除、上游找不到提供方的依赖如实列出。
 #[derive(Debug, Clone)]
 pub struct ModFixPlan {
     /// 服务器名
@@ -403,6 +407,15 @@ pub struct ModFixPlan {
     pub removals: Vec<FixRemove>,
     /// 上游找不到提供方的依赖（不猜，交给用户）
     pub unresolved: Vec<String>,
+    /// 启动日志的归因结果；只有 `plan_fix_from_log` 会填
+    ///
+    /// 保留完整结果（含缺失类与原始栈帧）而不只留结论：用户要能自己核对
+    /// 「工具凭什么认定是这个 mod」。
+    pub crash: Option<CrashAttribution>,
+    /// 归因到、但本机 `mods/` 里找不到对应文件的类
+    ///
+    /// 常见于类来自内嵌 jar、或日志来自另一份安装。如实列出，不猜文件。
+    pub unattributed: Vec<String>,
 }
 
 /// 修复执行结果
@@ -1190,6 +1203,113 @@ impl ModService {
             installs,
             removals,
             unresolved,
+            crash: None,
+            unattributed: Vec::new(),
+        })
+    }
+
+    /// 规划一次**按启动崩溃栈**的修复：定位到具体文件并规划移除，**不写盘**
+    ///
+    /// 与 [`Self::plan_fix`] 的分工：那个看的是「文件自己声称什么」（元数据、
+    /// 上游标注），本函数看的是「加载器实际崩在哪里」。后者是事后事实，
+    /// 因此不需要猜——实测里 `environment: "*"` 且声明了 `server` 入口点的
+    /// mod（CalcMod）在服务端注册命令时才触发客户端类加载，任何静态判定
+    /// 都看不出来。
+    ///
+    /// # 归因口径
+    ///
+    /// 栈帧里的类名反查回 `mods/` 下的具体 jar：命中即规划移除该文件。
+    /// 一个文件都不命中的类进 `unattributed`，不猜、不按名字相似度匹配。
+    ///
+    /// # 不做什么
+    ///
+    /// 不自动补装、不检查依赖：崩溃栈只说明「谁炸了」，不说明「缺什么」。
+    /// 把两类问题混进一份计划会让用户无法判断该执行哪一半。
+    ///
+    /// # Errors
+    ///
+    /// 服务器不存在、位于远端、正在运行、日志不可读或目录无法遍历时返回
+    /// 对应的 [`ModError`]
+    pub async fn plan_fix_from_log(
+        &self,
+        name: &str,
+        kind: ContentKind,
+        lines: usize,
+    ) -> Result<ModFixPlan, ModError> {
+        let server = self.local_server(name)?;
+        self.ensure_stopped(&server)?;
+        if !kind.is_server_usable() {
+            return Err(ModError::ClientOnly { kind });
+        }
+
+        let log_path = console_log_path(&server.dir);
+        let tail = crate::lifecycle::tail_lines(&log_path, lines)
+            .map_err(|err| FsError::io(&log_path, err))?;
+        let crash = attribute_crash(&tail.join("\n"));
+
+        // 类名 → 文件索引：每个 jar 读一次中央目录。日志行数越多可疑帧越多，
+        // 但文件数固定，因此索引一次比「每个可疑帧重扫一遍 jar」快得多。
+        //
+        // 读 zip 是阻塞 IO 且要遍历中央目录，放到阻塞线程池：这条路径由 CLI
+        // 调用，跑在异步运行时上，几百 MB 的 jar 直接在这里读会占住工作线程。
+        let dir = mods_dir(&server, kind);
+        let jars = jars_in(&dir)?;
+        let inspector = Arc::clone(&self.inspector);
+        let owners: Vec<(PathBuf, HashSet<String>)> = tokio::task::spawn_blocking(move || {
+            let mut owners: Vec<(PathBuf, HashSet<String>)> = Vec::with_capacity(jars.len());
+            for jar in jars {
+                // 读不出类的文件不参与归因：它要么是坏归档（别的问题），要么
+                // 实现不支持按类名检索（`None`）。两种情况都不该让它成为结论，
+                // 更不该让一个坏 jar 让整次归因失败
+                if let Ok(Some(classes)) = inspector.class_names(&jar) {
+                    owners.push((jar, classes.into_iter().collect()));
+                }
+            }
+            owners
+        })
+        .await
+        .map_err(|err| {
+            FsError::io(
+                &dir,
+                std::io::Error::other(format!("blocking task failed: {err}")),
+            )
+        })?;
+
+        let mut removals: Vec<FixRemove> = Vec::new();
+        let mut unattributed: Vec<String> = Vec::new();
+        for suspect in &crash.suspects {
+            let owner = owners
+                .iter()
+                .find(|(_, classes)| classes.contains(&suspect.class));
+            match owner {
+                Some((file, _)) => {
+                    let reason = match &crash.missing {
+                        // 缺失类是崩溃的直接原因，写进原因里用户才能核对
+                        missing if !missing.is_empty() => format!(
+                            "启动崩溃归因：{} 引用了服务端不存在的 {}",
+                            suspect.dotted_class(),
+                            missing.join("、").replace('/', ".")
+                        ),
+                        _ => format!("启动崩溃归因：崩在 {}", suspect.dotted_class()),
+                    };
+                    if !removals.iter().any(|item| item.file == *file) {
+                        removals.push(FixRemove {
+                            file: file.clone(),
+                            reason,
+                        });
+                    }
+                }
+                None => unattributed.push(suspect.dotted_class()),
+            }
+        }
+
+        Ok(ModFixPlan {
+            server: server.meta.name.as_str().to_owned(),
+            installs: Vec::new(),
+            removals,
+            unresolved: Vec::new(),
+            crash: Some(crash),
+            unattributed,
         })
     }
 

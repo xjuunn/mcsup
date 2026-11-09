@@ -65,13 +65,29 @@ fn broken_json_still_yields_metadata() {
     assert!(cap.mc_versions.contains("1.21.1"));
 }
 
+/// Forge 的 `[[mods]] side` 只作证据，不下「不可用于服务端」的结论
+///
+/// 该字段在 Forge 的 `ModInfo` 里没有对应常量，加载器既不据它筛选也不据它
+/// 校验依赖（真正被读的是 `[[dependencies.x]] side`）。实测
+/// `CreativeCore_FORGE_v2.9.4_mc1.19.2.jar` 写着 `side="CLIENT"` 却在
+/// dedicated server 上正常装载。因此结论停在「客户端必需 + 服务端未知」，
+/// 风险是 `Review`（交给人工确认），不是 `Blocking`。
 #[test]
-fn forge_client_side_is_detected() {
+fn forge_client_side_is_recorded_but_not_blocking() {
     let cap = inspect("forge_client.jar");
     assert_eq!(cap.id.as_deref(), Some("sodiumlike"));
     assert_eq!(cap.loaders, vec![ModLoader::Forge]);
-    assert_eq!(cap.side.server, SideSupport::Unsupported);
-    assert_eq!(cap.risk(), Risk::Blocking);
+    assert_eq!(cap.side.client, SideSupport::Required);
+    assert_eq!(cap.side.server, SideSupport::Unknown);
+    assert_eq!(cap.risk(), Risk::Review);
+    assert!(
+        cap.side
+            .evidence
+            .iter()
+            .any(|e| e.detail.contains("装载器不读该字段")),
+        "应当留下「加载器不读该字段」的证据：{:?}",
+        cap.side.evidence
+    );
 }
 
 #[test]
@@ -130,4 +146,62 @@ fn non_zip_file_is_rejected() {
         err,
         port::mod_::ModInspectError::NotAnArchive { .. }
     ));
+}
+
+/// 类名清单用于崩溃归因：必须是内部名且不带 `.class` 后缀
+#[test]
+fn class_names_lists_internal_names() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("plain.jar");
+    write_jar(
+        &path,
+        &["a/b/Outer.class", "a/b/Outer$Inner.class", "readme.txt"],
+    );
+
+    let names = ZipModInspector::new()
+        .class_names(&path)
+        .expect("readable")
+        .expect("本实现支持按类名检索");
+    assert_eq!(names, vec!["a/b/Outer", "a/b/Outer$Inner"]);
+}
+
+/// 壳 jar 的内层实现也要收：崩溃帧落在 `META-INF/jars/` 里的实现上时，
+/// 归因仍要指回外层文件（移除外层，内层随之消失）
+#[test]
+fn class_names_includes_nested_jars() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let inner = dir.path().join("inner.jar");
+    write_jar(&inner, &["com/inner/Impl.class"]);
+
+    let outer = dir.path().join("shell.jar");
+    let file = std::fs::File::create(&outer).expect("create");
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default();
+    zip.start_file("com/shell/Shell.class", options)
+        .expect("start");
+    std::io::Write::write_all(&mut zip, &[0u8]).expect("write");
+    zip.start_file("META-INF/jars/inner.jar", options)
+        .expect("start");
+    let inner_bytes = std::fs::read(&inner).expect("read inner");
+    std::io::Write::write_all(&mut zip, &inner_bytes).expect("write");
+    zip.finish().expect("finish");
+
+    let names = ZipModInspector::new()
+        .class_names(&outer)
+        .expect("readable")
+        .expect("supports class listing");
+    assert!(names.contains(&"com/shell/Shell".to_owned()), "{names:?}");
+    assert!(names.contains(&"com/inner/Impl".to_owned()), "{names:?}");
+}
+
+/// 构造最小 jar：每个条目一个字面量字节，只为验证「读出名字」这条链路
+fn write_jar(path: &std::path::Path, entries: &[&str]) {
+    let file = std::fs::File::create(path).expect("create");
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default();
+    for entry in entries {
+        zip.start_file(*entry, options).expect("start");
+        std::io::Write::write_all(&mut zip, &[0u8]).expect("write");
+    }
+    zip.finish().expect("finish");
 }

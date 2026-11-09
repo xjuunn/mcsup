@@ -579,6 +579,8 @@ pub(crate) enum ModAction {
         kind: Option<String>,
         #[arg(long, help = crate::meta::server_mod_yes_arg())]
         yes: bool,
+        #[arg(long, help = crate::meta::server_mod_from_log_arg())]
+        from_log: bool,
     },
 }
 

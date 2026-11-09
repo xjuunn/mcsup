@@ -855,6 +855,14 @@ pub(crate) fn server_mod_yes_arg() -> &'static str {
 }
 
 #[must_use]
+pub(crate) fn server_mod_from_log_arg() -> &'static str {
+    t(
+        "按启动崩溃日志归因：读控制台日志，把崩溃栈里的类反查到 mods 下的具体文件",
+        "attribute the startup crash from the console log instead of inspecting metadata",
+    )
+}
+
+#[must_use]
 pub(crate) fn server_mod_prerelease_arg() -> &'static str {
     t("允许测试版 / 内测版", "allow beta and alpha versions")
 }

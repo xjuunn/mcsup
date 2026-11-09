@@ -1021,8 +1021,9 @@ fn tail_lines_upto(path: &Path, max_lines: usize) -> std::io::Result<(Vec<String
 
 /// 反向读取文件末尾 `max_lines` 行；文件不存在返回空
 ///
-/// 见 [`tail_lines_upto`]。
-fn tail_lines(path: &Path, max_lines: usize) -> std::io::Result<Vec<String>> {
+/// 见 [`tail_lines_upto`]。`crate::ModService` 的崩溃归因也用它读
+/// `console.log`，因此对 crate 内可见。
+pub(crate) fn tail_lines(path: &Path, max_lines: usize) -> std::io::Result<Vec<String>> {
     tail_lines_upto(path, max_lines).map(|(lines, _)| lines)
 }
 
