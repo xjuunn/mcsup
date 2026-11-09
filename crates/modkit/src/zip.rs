@@ -52,19 +52,7 @@ impl ModInspector for ZipModInspector {
 
         // 文件名清单一次取全：后面多次判断「有没有某个文件」都靠它，
         // 避免反复读 central directory
-        let names: Vec<String> = {
-            let mut v = Vec::with_capacity(zip.len());
-            for i in 0..zip.len() {
-                if let Ok(entry) = zip.by_index_raw(i)
-                    // 名字不是合法 UTF-8 的条目（极少见）跳过：它的元数据
-                    // 也不可能是我们要找的那几个固定文件名
-                    && let Ok(name) = entry.name().map(std::borrow::Cow::into_owned)
-                {
-                    v.push(name);
-                }
-            }
-            v
-        };
+        let names = entry_names(&mut zip);
 
         let display = path.display().to_string();
         let mut cap = ModCapability::empty(display);
@@ -124,6 +112,68 @@ impl ModInspector for ZipModInspector {
 
         Ok(cap)
     }
+
+    fn class_names(&self, path: &Path) -> Result<Option<Vec<String>>, ModInspectError> {
+        let file = std::fs::File::open(path).map_err(|source| ModInspectError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let mut zip = ZipArchive::new(file).map_err(|_| ModInspectError::NotAnArchive {
+            path: path.to_path_buf(),
+        })?;
+
+        let names = entry_names(&mut zip);
+        let mut out = class_names_of(&names);
+
+        // 壳 jar 把真正的实现放在 `META-INF/jars/`：内层类名也要收，否则
+        // 崩溃帧落在内层实现上时归因不到外层文件（实测 c2me 就是这个形状）。
+        // 归因的落点是外层文件——移除它，内层实现随之消失。
+        let nested: Vec<String> = names
+            .iter()
+            .filter(|n| n.starts_with("META-INF/jars/") && has_ext(n, "jar"))
+            .cloned()
+            .collect();
+        for entry_name in nested {
+            let Ok(entry) = zip.by_name(&entry_name) else {
+                continue;
+            };
+            let mut raw = Vec::new();
+            if entry.take(NESTED_JAR_LIMIT).read_to_end(&mut raw).is_err() {
+                continue;
+            }
+            let Ok(mut inner) = ZipArchive::new(std::io::Cursor::new(raw)) else {
+                continue;
+            };
+            out.extend(class_names_of(&entry_names(&mut inner)));
+        }
+
+        Ok(Some(out))
+    }
+}
+
+/// 取归档内全部条目名
+///
+/// 名字不是合法 UTF-8 的条目（极少见）跳过：元数据与类名都只可能是
+/// ASCII，跳过不会漏掉要判定东西。
+fn entry_names<R: Read + std::io::Seek>(zip: &mut ZipArchive<R>) -> Vec<String> {
+    let mut names = Vec::with_capacity(zip.len());
+    for i in 0..zip.len() {
+        if let Ok(entry) = zip.by_index_raw(i)
+            && let Ok(name) = entry.name().map(std::borrow::Cow::into_owned)
+        {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// 从条目名里挑出类名（内部名，去掉 `.class` 后缀）
+fn class_names_of(names: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .filter(|name| has_ext(name, "class"))
+        .map(|name| name[..name.len() - ".class".len()].to_owned())
+        .collect()
 }
 
 /// 路径是否以给定扩展名结尾（大小写不敏感）

@@ -22,6 +22,10 @@
 //! `mod` 是 Rust 关键字，文件与模块名统一用 `mod_`，对外经 [`crate::mod_`]
 //! 暴露。
 
+mod crash;
+
+pub use crash::{CrashAttribution, CrashSuspect, attribute_crash};
+
 use std::fmt;
 
 /// 加载器 / 生态归属

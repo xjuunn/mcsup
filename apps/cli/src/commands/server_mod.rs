@@ -37,6 +37,12 @@ use mcsup::service::{
 };
 use serde::Serialize;
 
+/// `--from-log` 读控制台日志末尾多少行
+///
+/// 一次崩溃的栈通常几十行，但前面还有大量加载日志；取 500 行足够覆盖
+/// 「最后一次启动」的全部输出，又不会把上一次启动的遗留栈也读进来。
+const LOG_TAIL_LINES: usize = 500;
+
 /// 子命令入口
 pub(crate) async fn run(action: ModAction, printer: Printer) -> Result<()> {
     match action {
@@ -109,9 +115,12 @@ pub(crate) async fn run(action: ModAction, printer: Printer) -> Result<()> {
         ModAction::Outdated { name, kind, source } => {
             outdated(name.as_deref(), kind.as_deref(), source.as_deref(), printer).await
         }
-        ModAction::Fix { name, kind, yes } => {
-            fix(name.as_deref(), kind.as_deref(), yes, printer).await
-        }
+        ModAction::Fix {
+            name,
+            kind,
+            yes,
+            from_log,
+        } => fix(name.as_deref(), kind.as_deref(), yes, from_log, printer).await,
     }
 }
 
@@ -491,26 +500,70 @@ async fn outdated(
 ///
 /// 与 `add` / `update` 同一条两阶段流程：先算计划（零写入）→ 展示 →
 /// 确认 → 执行。`--yes` 跳过确认提问，不跳过计划展示。
-async fn fix(name: Option<&str>, kind: Option<&str>, yes: bool, printer: Printer) -> Result<()> {
+///
+/// `--from-log` 换掉计划来源：不看元数据，改为读控制台日志里的崩溃栈并把
+/// 帧归因到具体文件。两条来源不能合并——元数据判定回答「装之前能不能装」，
+/// 崩溃归因回答「装完了为什么起不来」，混成一份计划用户无法判断该执行哪半。
+async fn fix(
+    name: Option<&str>,
+    kind: Option<&str>,
+    yes: bool,
+    from_log: bool,
+    printer: Printer,
+) -> Result<()> {
     let lang = printer.lang();
     let name = crate::commands::server_ops::require_server_name(name, "server mod fix", printer)?;
     let kind = parse_kind(kind, lang)?;
     let mc = bootstrap::open_mcsup_with_remotes()?;
 
     let spinner = TaskSpinner::new(
-        pick(
-            lang,
-            format!("正在分析 {name} 的 mods 目录…"),
-            format!("analyzing the mods directory of {name}…"),
-        ),
+        if from_log {
+            pick(
+                lang,
+                format!("正在按启动日志归因 {name} 的崩溃…"),
+                format!("attributing the startup crash of {name}…"),
+            )
+        } else {
+            pick(
+                lang,
+                format!("正在分析 {name} 的 mods 目录…"),
+                format!("analyzing the mods directory of {name}…"),
+            )
+        },
         printer.is_human(),
     );
-    let planned = mc.mods.plan_fix(&name, kind).await;
+    let planned = if from_log {
+        mc.mods.plan_fix_from_log(&name, kind, LOG_TAIL_LINES).await
+    } else {
+        mc.mods.plan_fix(&name, kind).await
+    };
     spinner.finish();
     let plan = planned?;
 
+    if from_log {
+        report_crash(&plan, printer)?;
+    }
+
     if plan.installs.is_empty() && plan.removals.is_empty() {
-        let human = if plan.unresolved.is_empty() {
+        let human = if from_log {
+            if plan
+                .crash
+                .as_ref()
+                .is_some_and(mcsup::domain::mod_::CrashAttribution::is_empty)
+            {
+                pick(
+                    lang,
+                    "控制台日志里没有崩溃栈，无法归因（先让服务器启动失败一次，或确认日志没被清空）",
+                    "no stack trace in the console log; nothing to attribute",
+                )
+            } else {
+                pick(
+                    lang,
+                    "崩溃栈没有指向 mods 目录里的任何文件",
+                    "the stack trace does not point at any file in mods/",
+                )
+            }
+        } else if plan.unresolved.is_empty() {
             pick(lang, "没有需要修复的 mod", "nothing to fix")
         } else {
             pick(
@@ -630,6 +683,48 @@ fn report_fix_applied(applied: &mcsup::service::ModFixApplied, printer: Printer)
     )
 }
 
+/// 展示崩溃归因：先给出「凭什么」，再给处置
+///
+/// 顺序固定为缺失类 → 可疑帧 → 归因不到的文件。文本模式给类名，JSON 模式
+/// 另带原始栈帧（`frame`）：用户与下游都要能自己核对工具的结论。
+fn report_crash(plan: &ModFixPlan, printer: Printer) -> Result<()> {
+    let lang = printer.lang();
+    let Some(crash) = &plan.crash else {
+        return Ok(());
+    };
+    for missing in &crash.missing {
+        printer.print_outcome(
+            &pick(
+                lang,
+                format!("日志显示缺失类：{}", missing.replace('/', ".")),
+                format!("log reports a missing class: {}", missing.replace('/', ".")),
+            ),
+            &(),
+        )?;
+    }
+    for suspect in &crash.suspects {
+        printer.print_outcome(
+            &pick(
+                lang,
+                format!("崩溃栈落在：{}", suspect.dotted_class()),
+                format!("crash frame in: {}", suspect.dotted_class()),
+            ),
+            &(),
+        )?;
+    }
+    for class in &plan.unattributed {
+        printer.print_outcome(
+            &pick(
+                lang,
+                format!("{class} 不属于 mods 目录里的任何文件（可能来自内嵌 jar 或另一份安装）"),
+                format!("{class} does not belong to any file in mods/"),
+            ),
+            &(),
+        )?;
+    }
+    Ok(())
+}
+
 /// 展示修复计划：每一条都带原因，不写盘前用户能看到全部动作
 fn report_fix_plan(plan: &ModFixPlan, printer: Printer, actionable: bool) -> Result<()> {
     let lang = printer.lang();
@@ -683,6 +778,26 @@ struct FixPlanJson<'a> {
     installs: Vec<FixInstallJson<'a>>,
     removals: Vec<FixRemoveJson<'a>>,
     unresolved: &'a [String],
+    /// 崩溃归因结果；非 `--from-log` 时为 `null`
+    crash: Option<FixCrashJson<'a>>,
+    /// 归因到、但不属于 `mods/` 任何文件的类
+    unattributed: &'a [String],
+}
+
+/// 崩溃归因的机器可读形状
+///
+/// 保留原始栈帧：`suspects` 是结论，`frame` 是依据。只给结论会让下游无法
+/// 复核，也无法在归因出错时提供线索。
+#[derive(Serialize)]
+struct FixCrashJson<'a> {
+    missing: &'a [String],
+    suspects: Vec<FixSuspectJson<'a>>,
+}
+
+#[derive(Serialize)]
+struct FixSuspectJson<'a> {
+    class: String,
+    frame: &'a str,
 }
 
 #[derive(Serialize)]
@@ -721,6 +836,18 @@ fn fix_plan_json(plan: &ModFixPlan) -> FixPlanJson<'_> {
             })
             .collect(),
         unresolved: &plan.unresolved,
+        crash: plan.crash.as_ref().map(|crash| FixCrashJson {
+            missing: &crash.missing,
+            suspects: crash
+                .suspects
+                .iter()
+                .map(|suspect| FixSuspectJson {
+                    class: suspect.dotted_class(),
+                    frame: &suspect.frame,
+                })
+                .collect(),
+        }),
+        unattributed: &plan.unattributed,
     }
 }
 
