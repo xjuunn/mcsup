@@ -507,6 +507,11 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 
 库类项目不参与「仅客户端」这一类（`environment: client` 是误标高发区）。
 
+装了 Sinytra Connector（Forge↔Fabric 桥）的服务端会被自动识别：桥 jar 本身不再
+被误判成「仅客户端」，目录里的 Fabric mod 也不再被算作「只支持 fabric，服务端是
+forge」——桥把 Fabric 并入了目标服务端可装载的加载器集合，因此这些 mod 会保留而
+不是默认停用。
+
 清单里 `server: unsupported` 的文件不会装到服务端；`optional` 视为需要安装。
 `.mrpack` 由内置 zip 解析直接解开，不调用系统 `unzip`，归档内的 UTF-8
 文件名按原样落盘。

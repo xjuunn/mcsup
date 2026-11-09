@@ -683,6 +683,15 @@ pub struct ModCapability {
     /// 后加载器正常装载，`client` 入口不会被调用。库身份把这类误标从
     /// 「明确不可用」降级为「待确认」，最终裁决留给实测启动。
     pub is_library: bool,
+    /// 本 jar 是让宿主加载器额外装载其它加载器 mod 的桥
+    ///
+    /// 目前唯一实例是 Sinytra Connector：装在 Forge 服务端，让 Forge 同时
+    /// 装载 Fabric mod（`bridges_to = Some(Fabric)`）。它自己没有任何模组
+    /// 元数据（只是个 transformation service / mod locator），字节码又引用
+    /// 客户端类，会被「裸 jar」启发式误判成仅客户端。单独成字段，让领域判定
+    /// 据此把它当作服务端基础设施，并把 `bridges_to` 并入目标服务端可装载的
+    /// 加载器集合（见 [`ServerTarget::bridged_loaders`]）。
+    pub bridges_to: Option<ModLoader>,
 }
 
 impl ModCapability {
@@ -705,6 +714,7 @@ impl ModCapability {
             nested_jars: 0,
             provides: Vec::new(),
             is_library: false,
+            bridges_to: None,
         }
     }
 
@@ -760,6 +770,12 @@ impl ModCapability {
     /// 该验证的验证流程一个不少，只是不替用户下死刑。
     #[must_use]
     pub fn risk(&self) -> Risk {
+        // 加载器桥（Sinytra Connector）是服务端基础设施：没有模组元数据、
+        // 字节码引用客户端类，都会把它推到「判不出」甚至「仅客户端」。但它
+        // 必须在两侧装载，且无害——单独放行，不参与客/服启发式。
+        if self.bridges_to.is_some() {
+            return Risk::Ok;
+        }
         let base = Risk::of(&self.side);
         // 没有任何模组加载器元数据：可能是资源包 / 数据包 / 损坏文件，
         // 也可能只是我们认不出。判不出就降级为待确认，而不是放行。
@@ -883,6 +899,12 @@ pub struct ServerTarget {
     pub mc_version: Option<String>,
     /// 目标 Java 大版本（服务端实际会用的那个）
     pub java_major: Option<u32>,
+    /// 目标服务端额外能装载的加载器（由桥接 mod 提供）
+    ///
+    /// 例如 Forge 服务端装了 Sinytra Connector 后也接受 Fabric mod。这里
+    /// 由上一轮扫描在目录里发现桥接 jar 时填入，正常按变体换算的 `loader`
+    /// 不含它——变体只有 forge/fabric 两个可选值，不知道目录里装了桥。
+    pub bridged_loaders: Vec<ModLoader>,
 }
 
 impl ServerTarget {
@@ -890,6 +912,13 @@ impl ServerTarget {
     #[must_use]
     pub fn none() -> Self {
         Self::default()
+    }
+
+    /// 并入一组桥接加载器
+    #[must_use]
+    pub fn with_bridged_loaders(mut self, bridged: Vec<ModLoader>) -> Self {
+        self.bridged_loaders = bridged;
+        self
     }
 
     /// 是否一维都没问
@@ -1064,7 +1093,11 @@ impl ModCapability {
                         format!("jar 内没有可识别的加载器元数据，判不出是否支持 {want}"),
                     ));
                     Fit::Unknown
-                } else if self.loaders.iter().any(|have| loads(want, *have)) {
+                } else if self
+                    .loaders
+                    .iter()
+                    .any(|have| loads(want, *have, &target.bridged_loaders))
+                {
                     Fit::Match
                 } else {
                     let have: Vec<&str> = self.loaders.iter().map(|l| l.as_str()).collect();
@@ -1141,14 +1174,21 @@ impl ModCapability {
 }
 
 /// `target` 加载器能否载入 `have` 声明的 mod
-fn loads(target: ModLoader, have: ModLoader) -> bool {
+///
+/// `bridged` 是目标服务端通过桥（Sinytra Connector）额外支持的加载器：装了
+/// 桥的 Forge 服务端能装 Fabric mod，反过来同理。桥只开通一条方向明确的
+/// 通道，不改变其它加载器之间的兼容关系。
+fn loads(target: ModLoader, have: ModLoader, bridged: &[ModLoader]) -> bool {
     if target == have {
         return true;
     }
     // Quilt Loader 保留 Fabric 兼容层；反向不成立。
     // NeoForge 与 Forge 的兼容性随版本变化（1.20.1 是同一血统，1.20.2 起
     // 分道扬镳），无法用「加载器」这一维表达，因此不猜。
-    matches!((target, have), (ModLoader::Quilt, ModLoader::Fabric))
+    if matches!((target, have), (ModLoader::Quilt, ModLoader::Fabric)) {
+        return true;
+    }
+    bridged.contains(&have)
 }
 
 #[cfg(test)]
@@ -1515,6 +1555,17 @@ mod tests {
             loader: Some(loader),
             mc_version: Some(mc.to_owned()),
             java_major: java,
+            bridged_loaders: Vec::new(),
+        }
+    }
+
+    /// 目标 + 桥接加载器（Sinytra Connector 场景）
+    fn target_bridged(loader: ModLoader, bridged: &[ModLoader]) -> ServerTarget {
+        ServerTarget {
+            loader: Some(loader),
+            mc_version: None,
+            java_major: None,
+            bridged_loaders: bridged.to_vec(),
         }
     }
 
@@ -1570,6 +1621,69 @@ mod tests {
                 .loader,
             Fit::Mismatch
         );
+    }
+
+    /// Sinytra Connector：Forge 服务端装了桥后，Fabric mod 不再判不匹配
+    #[test]
+    fn connector_bridge_accepts_fabric_mod_on_forge() {
+        let fabric_mod = cap(&[ModLoader::Fabric], "", None);
+        assert_eq!(
+            fabric_mod
+                .fit_for(&target_bridged(ModLoader::Forge, &[ModLoader::Fabric]))
+                .loader,
+            Fit::Match
+        );
+        assert_eq!(
+            fabric_mod
+                .fit_for(&target_bridged(ModLoader::Forge, &[ModLoader::Fabric]))
+                .verdict,
+            FitVerdict::Installable
+        );
+    }
+
+    /// 桥只开一条通道：Quilt mod 不会因 Forge 装了 Connector 而被放行
+    #[test]
+    fn bridge_does_not_accept_unrelated_loaders() {
+        let quilt_mod = cap(&[ModLoader::Quilt], "", None);
+        assert_eq!(
+            quilt_mod
+                .fit_for(&target_bridged(ModLoader::Forge, &[ModLoader::Fabric]))
+                .loader,
+            Fit::Mismatch
+        );
+    }
+
+    /// 桥是方向无关的机制：未来若有 Fabric→Forge 的桥，同样生效
+    #[test]
+    fn bridge_supports_reverse_direction() {
+        let forge_mod = cap(&[ModLoader::Forge], "", None);
+        assert_eq!(
+            forge_mod
+                .fit_for(&target_bridged(ModLoader::Fabric, &[ModLoader::Forge]))
+                .loader,
+            Fit::Match
+        );
+    }
+
+    /// 没桥时 Fabric mod 在 Forge 服务端仍然不匹配（回归：桥不能改变默认口径）
+    #[test]
+    fn fabric_mod_on_forge_without_bridge_still_mismatches() {
+        let fabric_mod = cap(&[ModLoader::Fabric], "", None);
+        assert_eq!(
+            fabric_mod
+                .fit_for(&target(ModLoader::Forge, "", None))
+                .loader,
+            Fit::Mismatch
+        );
+    }
+
+    /// 桥接 jar 自己没有加载器元数据、字节码又疑似客户端，仍视为服务端基础设施
+    #[test]
+    fn bridge_jar_risk_is_ok_despite_no_metadata() {
+        let mut cap = ModCapability::empty("connector.jar");
+        cap.bridges_to = Some(ModLoader::Fabric);
+        // 刻意不给 loaders / side，模拟「裸 jar + 客户端类引用」的最坏情形
+        assert_eq!(cap.risk(), Risk::Ok);
     }
 
     #[test]
@@ -1633,6 +1747,7 @@ mod tests {
             loader: Some(ModLoader::Fabric),
             mc_version: None,
             java_major: None,
+            bridged_loaders: Vec::new(),
         });
         assert_eq!(fit.mc_version, Fit::Unknown);
         assert_eq!(fit.java, Fit::Unknown);

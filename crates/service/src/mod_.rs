@@ -2083,6 +2083,7 @@ pub fn server_target(server: &RegisteredServer) -> ServerTarget {
         loader: loader_of(&meta.variant),
         mc_version: Some(meta.version.as_str().to_owned()),
         java_major: target_java(meta.java_major, meta.version.as_str()),
+        bridged_loaders: Vec::new(),
     }
 }
 

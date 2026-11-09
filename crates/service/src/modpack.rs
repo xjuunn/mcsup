@@ -487,6 +487,7 @@ impl ModpackService {
                 .and_then(|(name, _version)| ModLoader::parse(name)),
             mc_version: prepared.index.dependencies.minecraft().map(str::to_owned),
             java_major: None,
+            bridged_loaders: Vec::new(),
         };
         let dir = server_dir.to_path_buf();
         // 读 jar 是同步 IO：放进阻塞线程池，别占住异步 executor

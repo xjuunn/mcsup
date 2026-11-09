@@ -59,6 +59,8 @@ impl ModInspector for ZipModInspector {
 
         cap.loaders = detect_loaders(&names);
 
+        cap.bridges_to = detect_bridge(&names);
+
         cap.nested_jars = names.iter().filter(|n| is_nested_jar(n)).count();
 
         parse_metadata(&mut zip, &mut cap);
@@ -225,6 +227,26 @@ fn detect_loaders(names: &[String]) -> Vec<ModLoader> {
     loaders
 }
 
+/// 识别 Sinytra Connector：让 Forge 服务端能装 Fabric mod 的桥
+///
+/// Connector 没有 `fabric.mod.json` 也没有 `mods.toml`，只是个注册进 Forge
+/// modlauncher 的 transformation service / mod locator，并内嵌 Fabric Loader。
+/// 两个信号同时出现才判为桥：单有 transformation service（LibrarianLib 一类
+/// 普通 Forge 加载器插件）不带 Fabric Loader，不会误判。
+const CONNECTOR_TRANSFORMATION_SERVICE: &str =
+    "META-INF/services/cpw.mods.modlauncher.api.ITransformationService";
+const FABRIC_LOADER_PREFIX: &str = "net/fabricmc/loader/";
+
+fn detect_bridge(names: &[String]) -> Option<ModLoader> {
+    let registers_service = names.iter().any(|n| n == CONNECTOR_TRANSFORMATION_SERVICE);
+    let bundles_fabric_loader = names.iter().any(|n| n.starts_with(FABRIC_LOADER_PREFIX));
+    if registers_service && bundles_fabric_loader {
+        Some(ModLoader::Fabric)
+    } else {
+        None
+    }
+}
+
 /// 逐加载器解析元数据
 ///
 /// `neoforge.mods.toml` 优先于 `mods.toml`：同时存在时前者是 `NeoForge` 的
@@ -337,6 +359,11 @@ fn scan_classes(zip: &mut ZipArchive<std::fs::File>, names: &[String]) -> (Optio
 ///
 /// 裸 jar 没有更好的解释，引用客户端类才是最强信号
 fn apply_client_bytecode(cap: &mut ModCapability) {
+    // 桥（Sinytra Connector）内嵌 Fabric 客户端 API 类，字节码里的客户端引用
+    // 是它自身的库成分，不是「仅客户端」信号。服务端要装在两侧，故不采信。
+    if cap.bridges_to.is_some() {
+        return;
+    }
     cap.side.evidence.push(Evidence::new(
         EvidenceSource::Bytecode,
         "字节码引用客户端专属类（net/minecraft/client/ 或 blaze3d）",
@@ -1217,6 +1244,34 @@ mod tests {
         apply_client_bytecode(&mut cap);
         assert_eq!(cap.side.server, SideSupport::Unsupported);
         assert_eq!(cap.side.client, SideSupport::Required);
+    }
+
+    /// 桥（Sinytra Connector）的识别：transformation service + 内嵌 Fabric Loader
+    #[test]
+    fn detects_connector_bridge() {
+        let names = vec![
+            "META-INF/services/cpw.mods.modlauncher.api.ITransformationService".to_owned(),
+            "net/fabricmc/loader/FabricLoader.class".to_owned(),
+        ];
+        assert_eq!(detect_bridge(&names), Some(ModLoader::Fabric));
+    }
+
+    /// 普通 transformation service（不带 Fabric Loader）不是桥
+    #[test]
+    fn transformation_service_without_fabric_loader_is_not_bridge() {
+        let names =
+            vec!["META-INF/services/cpw.mods.modlauncher.api.ITransformationService".to_owned()];
+        assert_eq!(detect_bridge(&names), None);
+    }
+
+    /// 桥 jar 的客户端类引用不下「仅客户端」结论
+    #[test]
+    fn bridge_jar_client_refs_are_not_condemned() {
+        let mut cap = ModCapability::empty("connector.jar");
+        cap.bridges_to = Some(ModLoader::Fabric);
+        apply_client_bytecode(&mut cap);
+        assert_eq!(cap.side.server, SideSupport::Unknown);
+        assert_eq!(cap.side.client, SideSupport::Unknown);
     }
 
     /// `[[mods]] side="CLIENT"` 不再是「服务端不可用」

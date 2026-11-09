@@ -223,6 +223,7 @@ fn build_target(
         loader,
         mc_version: mc.map(ToOwned::to_owned),
         java_major: None,
+        bridged_loaders: Vec::new(),
     })
 }
 

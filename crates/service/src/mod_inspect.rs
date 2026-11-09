@@ -362,9 +362,15 @@ impl ModInspectService {
         // 上下文文件只贡献 modid，不进结果：读不出来就少一个可满足的依赖，
         // 与「文件不在」等价，不必单独报告
         let mut provided: Vec<String> = Vec::new();
+        let mut bridged: Vec<ModLoader> = Vec::new();
         for path in context {
             match self.inspector.inspect(path) {
-                Ok(cap) => provided.extend(cap.provided_ids()),
+                Ok(cap) => {
+                    provided.extend(cap.provided_ids());
+                    if let Some(bridge) = cap.bridges_to {
+                        bridged.push(bridge);
+                    }
+                }
                 Err(err) => {
                     debug!(path = %path.display(), error = %err, "context mod unreadable");
                 }
@@ -382,6 +388,11 @@ impl ModInspectService {
         let loader = target
             .and_then(|t| t.loader)
             .or_else(|| common_loader(&audit.mods));
+        // 桥接（Sinytra Connector）：这批文件（含上下文）里若有桥 jar，把桥出的
+        // 加载器并入目标。否则 Forge 服务端上的 Fabric mod 会被判成「只支持
+        // fabric，服务端是 forge」而误删。
+        bridged.extend(audit.mods.iter().filter_map(|r| r.capability.bridges_to));
+        let effective_target = target.map(|t| t.clone().with_bridged_loaders(bridged));
         for report in &mut audit.mods {
             report.missing_deps = report.capability.missing_mandatory_deps(&present, loader);
             let mut risk = report.capability.risk();
@@ -392,7 +403,8 @@ impl ModInspectService {
             report.risk = risk;
             // 匹配判定与风险互不覆盖：一个答「是不是服务端的东西」，
             // 一个答「和这台服务端对不对得上」
-            report.fit = target
+            report.fit = effective_target
+                .as_ref()
                 .filter(|t| !t.is_empty())
                 .map(|t| report.capability.fit_for(t));
         }
@@ -674,6 +686,7 @@ mod tests {
             loader: Some(ModLoader::Fabric),
             mc_version: Some("1.21.1".to_owned()),
             java_major: Some(21),
+            bridged_loaders: Vec::new(),
         };
         let audit = svc
             .inspect_paths_for(&[PathBuf::from("/a.jar")], false, Some(&target))
@@ -685,6 +698,45 @@ mod tests {
         assert!(!fit.issues.is_empty());
         // 匹配结论不覆盖风险：客/服归属照旧
         assert_eq!(audit.mods[0].risk, Risk::Ok);
+    }
+
+    /// Forge 服务端目录里有 Sinytra Connector 桥时，Fabric mod 判为可装
+    ///
+    /// 无此桥时同一条 Fabric mod 会被 `mismatched_loader_is_rejected` 判成
+    /// 不匹配；桥的存在改变了目标服务端「能装哪些加载器」，判定收敛在领域层
+    /// 的 `loads`，service 只负责把桥从扫描结果里收集出来。
+    #[tokio::test]
+    async fn connector_bridge_makes_fabric_mod_installable() {
+        let mut bridge = cap("/mods/connector.jar", "connector", SideSupport::Required);
+        bridge.loaders = Vec::new();
+        bridge.bridges_to = Some(ModLoader::Fabric);
+        let fabric_mod = cap("/mods/numismatic.jar", "numismatic", SideSupport::Required);
+        let svc = ModInspectService::local(Arc::new(FakeInspector(vec![bridge, fabric_mod])));
+        let target = ServerTarget {
+            loader: Some(ModLoader::Forge),
+            mc_version: Some("1.20.1".to_owned()),
+            java_major: Some(17),
+            bridged_loaders: Vec::new(),
+        };
+        let audit = svc
+            .inspect_paths_for(
+                &[
+                    PathBuf::from("/mods/connector.jar"),
+                    PathBuf::from("/mods/numismatic.jar"),
+                ],
+                false,
+                Some(&target),
+            )
+            .await
+            .expect("audit");
+        let fabric = audit
+            .mods
+            .iter()
+            .find(|m| m.capability.id.as_deref() == Some("numismatic"))
+            .expect("fabric mod");
+        let fit = fabric.fit.as_ref().expect("fit");
+        assert_eq!(fit.loader, domain::mod_::Fit::Match);
+        assert_eq!(fit.verdict, FitVerdict::Installable);
     }
 
     /// 整批文件共同支持的唯一加载器被识别为目标加载器
