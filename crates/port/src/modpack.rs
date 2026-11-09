@@ -13,6 +13,10 @@
 //!
 //! 整合包不一定能在服务端跑（许多是纯客户端整合）。来源实现必须按自身能力
 //! 只返回可开服的整合包，调用方不再二次过滤——判定口径只在一处。
+//!
+//! 注意上游的 facet 只是粗筛：Modrinth 带 `server_side:required|optional` 的
+//! 查询实测仍会返回 `server_side=unsupported` 的整合包。因此来源不能只靠
+//! facet，还要按响应体里的逐条字段再筛一次。
 
 use async_trait::async_trait;
 use domain::server::modpack::ModpackIndex;
@@ -199,6 +203,11 @@ pub struct PackMemberVerdicts {
     /// 「这个项目自己需不需要服务端」，而库类项目（`satin` / `melody` 一类
     /// 提供 API 的）常常标 `unsupported`，却是别的 mod 跑起来的硬前提。
     /// 服务端加载器不加载它们，但依赖声明要求它们**存在于 `mods/`**。
+    ///
+    /// 注意只有**会装**的成员的依赖才算数：被跳过的成员不该为别人提供保护。
+    /// 这是不动点问题，不能一次统计——算法在
+    /// [`domain::server::modpack::PackMemberGraph::depended_on`]，来源只需把上游
+    /// 事实摆成图。
     pub depended_on: HashSet<String>,
 }
 
@@ -216,6 +225,8 @@ impl PackMemberVerdicts {
 /// 整合包来源
 ///
 /// 实现必须保证：**搜索与列表只返回能在服务端运行的整合包**。
+///
+/// 上游 facet 不可全信（见模块文档），实现要按响应体里的字段复核。
 #[async_trait]
 pub trait ModpackSource: ContentSourceInfo + Send + Sync {
     /// 搜索可开服的整合包
@@ -277,7 +288,7 @@ pub trait ModpackSource: ContentSourceInfo + Send + Sync {
     ///   （`HARD_DEP_NO_CANDIDATE`）
     /// - 只看「被依赖」会把整合包里根本没装的普通客户端 mod 也留下
     ///
-    /// 因此判定改为：**既是仅客户端、又没有任何成员依赖它**才跳过。默认实现
+    /// 因此判定改为：**既是仅客户端、又没有会装的成员依赖它**才跳过。默认实现
     /// 退化为 [`Self::client_only_hashes`]，不认识依赖关系的来源行为不变。
     ///
     /// # Errors

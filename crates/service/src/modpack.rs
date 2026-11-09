@@ -23,8 +23,10 @@
 use crate::fs_error::FsError;
 use crate::lifecycle::LifecycleError;
 use crate::modpack_manifest::ModpackManifestSnapshot;
+use domain::mod_::{ModLoader, Risk, ServerTarget};
 use domain::server::modpack::{ModpackFile, ModpackIndex};
 use domain::server::version::ServerVariant;
+use port::mod_::ModInspector;
 use port::modpack::{
     ModpackExtractError, ModpackExtractor, ModpackSource, ModpackSourceRegistry,
     PackMemberVerdicts, ResolvedModpack,
@@ -33,7 +35,7 @@ use port::{ArtifactDownloader, CancellationToken, DownloadRequest, ProgressSink,
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
-use tracing::info;
+use tracing::{info, warn};
 use url::Url;
 
 /// 整合包安装失败
@@ -206,6 +208,12 @@ pub struct ModpackService {
     sources: Arc<ModpackSourceRegistry>,
     extractor: Arc<dyn ModpackExtractor>,
     downloader: Arc<dyn ArtifactDownloader>,
+    /// 落盘后的本地检测器；`None` 表示不做装完判定
+    ///
+    /// 有它才能在装完时按**文件本身**判一次：清单的 `env` 与上游的
+    /// `server_side` 都是作者的声明，声明错的时候只有读 jar 才能发现。
+    /// 见 [`Self::settle_mods`]。
+    inspector: Option<Arc<dyn ModInspector>>,
     /// 批量下载的并发文件数（见 [`Self::with_file_concurrency`]）
     file_concurrency: usize,
     /// mod 文件的镜像前缀，空表示只用清单给的地址
@@ -234,9 +242,22 @@ impl ModpackService {
             sources,
             extractor,
             downloader,
+            inspector: None,
             file_concurrency: FILE_CONCURRENCY,
             mirrors: Vec::new(),
         }
+    }
+
+    /// 指定落盘后的本地检测器
+    ///
+    /// 装上它之后，[`Self::apply`] 会在下载完成后按**文件本身**再判一次，
+    /// 把服务端加载器明确不接受的 jar 移进回收站。整合包的 `env` 字段与上游
+    /// 的 `server_side` 都是作者声明，声明与实际不符时只有读 jar 才能发现；
+    /// 不装则只按声明装，行为与旧版本一致。
+    #[must_use]
+    pub fn with_inspector(mut self, inspector: Arc<dyn ModInspector>) -> Self {
+        self.inspector = Some(inspector);
+        self
     }
 
     /// 指定批量下载的并发文件数
@@ -401,10 +422,24 @@ impl ModpackService {
         let mut applied = self
             .download_files(prepared, source.as_ref(), &jobs, progress, cancel)
             .await?;
-        applied.file_count = prepared.index.server_files().len() - skipped_client_only;
+
+        // 4. 落盘后再按文件本身判一次
+        //
+        //    前三步信的都是「别人怎么说」：清单的 env、上游的 server_side。
+        //    整合包作者把仅客户端模组标成 `server: required` 是常见情况
+        //    （实测 Sodium / ETF / malilib 一类都在清单里声明 required），
+        //    上游标注也可能迟到或写错。装完这次读 jar，是唯一能对「文件到底
+        //    是什么」下结论的一步，也是启动预检用的同一套判定。
+        applied.removed_local = self.settle_mods(prepared, server_dir, &jobs).await;
+        applied.file_count = prepared
+            .index
+            .server_files()
+            .len()
+            .saturating_sub(skipped_client_only)
+            .saturating_sub(applied.removed_local.len());
         applied.skipped_client_only = skipped_client_only;
 
-        // 4. 把清单留一份：项目 / 版本 ID 都在下载地址里，装完就有了权威数据，
+        // 5. 把清单留一份：项目 / 版本 ID 都在下载地址里，装完就有了权威数据，
         //    后续补依赖与整合包更新按 ID 直接定位，不必拿 modid 去搜索
         let snapshot = ModpackManifestSnapshot::from_index(
             prepared.source,
@@ -419,6 +454,109 @@ impl ModpackService {
             .await
             .map_err(|err| ModpackError::io(&ModpackManifestSnapshot::path_in(server_dir), err))?;
         Ok(applied)
+    }
+
+    /// 装完的本地判定：把服务端加载器明确不接受的 mod 移进回收站
+    ///
+    /// 前面几步信的都是「别人怎么说」——清单的 `env`、上游项目的
+    /// `server_side`。声明与实际不符时，装完这次读 jar 是唯一能对「文件到底
+    /// 是什么」下结论的一步：Fabric 的 `environment: client`、Forge 的
+    /// `displayTest` 都在文件里，读一眼就能把启动必崩的 jar 挡在 `mods/` 之外。
+    ///
+    /// # 只按「文件自己属于哪一侧」处置
+    ///
+    /// 检测结果里的 `risk` 把「缺必需依赖」也升级成 `Blocking`，但缺依赖不
+    /// 是删文件能解决的：依赖可能被上游判定跳过、可能由 `overrides/` 提供、
+    /// 也可能本来就该由用户自己装。因此这里只看
+    /// [`domain::mod_::ModCapability::risk`]——它只回答「这个文件服务端能不能
+    /// 装载」，不看依赖闭包。
+    ///
+    /// # 判定可能错，所以只移不删
+    ///
+    /// `side="CLIENT"` 的 `CreativeCore` 一类能在 dedicated server 上正常
+    /// 装载。判错时用户手上不能没有原件，统一移进 `.mcsup-trash/`（见
+    /// [`crate::trash`]），并在结果里回报路径。
+    ///
+    /// 没有装检测器时直接返回空：不做判定比按猜测删文件安全。
+    async fn settle_mods(
+        &self,
+        prepared: &ModpackPrepared,
+        server_dir: &Path,
+        jobs: &[(&ModpackFile, PathBuf)],
+    ) -> Vec<String> {
+        let Some(inspector) = self.inspector.clone() else {
+            return Vec::new();
+        };
+        // 只看清单声明的 `mods/*.jar`：服务端目录里可能还有用户自己放的文件
+        // 与 overrides 铺进来的文件，动它们超出「装这份整合包」的职责范围
+        // 与反查上游归属时用的是同一个谓词（`ModpackFile::is_plugin_jar`）：
+        // 两处口径不一致会让「装完判定」去动一些本来就不会被加载的文件
+        let jars: Vec<PathBuf> = jobs
+            .iter()
+            .filter(|(file, _target)| file.is_plugin_jar())
+            .map(|(_file, target)| target.clone())
+            .collect();
+        if jars.is_empty() {
+            return Vec::new();
+        }
+        let target = ServerTarget {
+            loader: prepared
+                .index
+                .loader()
+                .and_then(|(name, _version)| ModLoader::parse(name)),
+            mc_version: prepared.index.dependencies.minecraft().map(str::to_owned),
+            java_major: None,
+        };
+        // 读 jar 是同步 IO：放进阻塞线程池，别占住异步 executor
+        let audit = tokio::task::spawn_blocking(move || {
+            crate::mod_inspect::ModInspectService::local(inspector)
+                .inspect_paths_for_sync(&jars, Some(&target))
+        })
+        .await;
+        let Ok(audit) = audit else {
+            warn!("install-time mod audit did not finish; keeping the pack as declared");
+            return Vec::new();
+        };
+
+        let mut removed = Vec::new();
+        for report in &audit.mods {
+            if report.capability.risk() != Risk::Blocking {
+                continue;
+            }
+            let path = Path::new(&report.capability.path);
+            // 回报用整合包口径的相对路径：与 `stale_hashes` / 清单条目同构，
+            // 用户能直接对回清单里的那一行
+            let relative = path
+                .strip_prefix(server_dir)
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            match crate::trash::trash_file(server_dir, path) {
+                Ok(trashed) => {
+                    info!(
+                        path = %relative,
+                        trashed = %trashed.display(),
+                        "mod does not load on a server; moved out of mods/"
+                    );
+                    removed.push(relative);
+                }
+                Err(err) => {
+                    // 移不动不是致命错误：文件留在原位，启动预检会再拦一次
+                    warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "cannot move unusable mod out of mods/"
+                    );
+                }
+            }
+        }
+        if !removed.is_empty() {
+            info!(
+                removed = removed.len(),
+                "install-time mod judgement applied"
+            );
+        }
+        removed
     }
 
     /// 把清单文件分类：要下载的、仅客户端剔除的
@@ -574,6 +712,8 @@ impl ModpackService {
             skipped_client_only: 0,
             skipped_bytes: 0,
             stale_hashes,
+            // 下载阶段还不知道文件本身是什么，装完判定在 `apply` 里补
+            removed_local: Vec::new(),
         })
     }
 
@@ -793,6 +933,12 @@ pub struct ModpackApplied {
     pub skipped_bytes: u64,
     /// 清单哈希已过期、但按上游权威哈希接受的文件路径
     pub stale_hashes: Vec<String>,
+    /// 装完后按文件本身判定为服务端不可装载、已移进回收站的路径
+    ///
+    /// 与 `skipped_client_only` 是两个口径：那一个按**声明**跳过、从未下载；
+    /// 这一个已经下了盘，读 jar 才发现服务端装载不了，移进 `.mcsup-trash/`
+    /// 后用户可取回。两者都为 0 才说明整包在服务端侧是干净的。
+    pub removed_local: Vec<String>,
 }
 
 /// 加载器名 → 服务端变体

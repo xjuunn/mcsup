@@ -710,6 +710,11 @@ pub enum Response {
         /// 清单哈希过期、按上游权威哈希接受的文件数
         #[serde(default)]
         stale_hashes: usize,
+        /// 装完按文件本身判定为服务端不可装载、已移进回收站的文件数
+        ///
+        /// `default` 保住旧对端：字段缺失即 0，与「一个都没移出」同义。
+        #[serde(default)]
+        removed_local: usize,
     },
     /// Java 卸载结果
     JavaUninstalled {
@@ -1266,6 +1271,7 @@ mod tests {
                 skipped_client_only: 2,
                 skipped_bytes: 0,
                 stale_hashes: 0,
+                removed_local: 1,
             },
             Response::JavaUninstalled {
                 path: "/opt/java/temurin-21".to_owned(),

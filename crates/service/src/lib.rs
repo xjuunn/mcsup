@@ -18,6 +18,7 @@ mod platform_doctor;
 mod props;
 mod registry;
 mod settings;
+mod trash;
 mod workspace;
 
 /// `workspace doctor` 的检查项标识清单（`--only` 校验与帮助文案共用）

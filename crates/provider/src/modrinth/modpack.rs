@@ -26,7 +26,7 @@ use super::manifest::{Project, SearchHit, Version};
 use super::{server_archive, server_file};
 use async_trait::async_trait;
 use domain::server::modpack::{
-    FileEnv, ModpackDependencies, ModpackFile, ModpackHashes, ModpackIndex,
+    FileEnv, ModpackDependencies, ModpackFile, ModpackHashes, ModpackIndex, PackMemberGraph,
 };
 use port::SourceError;
 use port::content::ContentSourceInfo;
@@ -39,6 +39,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use tracing::debug;
 use zip::ZipArchive;
 use zip::result::ZipError;
 
@@ -133,10 +134,35 @@ impl ModpackSource for ModrinthModpackSource {
             request = request.query(keyword);
         }
         let results = self.inner.search(&request).await?;
+        // facet 是「粗筛」：实测带 `server_side:required|optional` 的查询仍会
+        // 返回 `server_side=unsupported` 的整合包（纯客户端整合包出现在服务端
+        // 列表里）。返回体里的字段才是逐条事实，因此在这里按字段再筛一遍——
+        // 不额外发请求，因为判定要的数据已经在手里。
+        let mut hits = Vec::with_capacity(results.hits.len());
+        let mut dropped = 0usize;
+        for hit in &results.hits {
+            if hit.server_side.as_deref() == Some("unsupported") {
+                dropped += 1;
+                continue;
+            }
+            hits.push(summary_from_hit(hit));
+        }
+        if dropped > 0 {
+            // 上游 facet 与字段不一致时留痕：这不是本项目的判定错误，
+            // 而是能观测到上游数据自相矛盾
+            debug!(
+                dropped,
+                keyword = query.keyword.as_deref().unwrap_or_default(),
+                "upstream returned client-only modpacks despite the server_side facet"
+            );
+        }
+        let total = u64::try_from(results.total_hits).unwrap_or_default();
         Ok(ModpackSearch {
-            hits: results.hits.iter().map(summary_from_hit).collect(),
+            hits,
             offset: u32::try_from(results.offset).unwrap_or_default(),
-            total: u64::try_from(results.total_hits).unwrap_or_default(),
+            // 被剔除的条目来自本页，命中总数按它下调：明细由字段给出，
+            // 总数只能给个下限，多报会让「共 N 个」与翻页对不上
+            total: total.saturating_sub(dropped as u64),
         })
     }
 
@@ -233,7 +259,10 @@ impl ModpackSource for ModrinthModpackSource {
             .collect();
         let projects = self.inner.projects(&project_ids).await?;
         verdicts.client_only = client_only_from(&all_versions, &projects);
-        verdicts.depended_on = depended_on_within(&all_versions);
+        // 「谁被依赖」不能一次统计：被跳过的成员不该为别人提供保护。判定
+        // 需要迭代到不动点，放在领域层，这里只把上游事实摊成依赖图。
+        let graph = member_graph(&all_versions, &verdicts.client_only);
+        verdicts.depended_on = graph.depended_on().into_iter().collect();
         Ok(verdicts)
     }
 
@@ -299,30 +328,39 @@ fn modrinth_version_id_from_url(url: &str) -> Option<String> {
     }
 }
 
-/// 找出「被整合包内其他成员依赖」的文件（以 sha1 为键）
+/// 把上游元数据摊成领域层的成员依赖图
 ///
 /// 只看 `dependency_type == required`：`optional` / `incompatible` 不构成
-/// 「必须有它才能加载」。依赖以**项目 ID** 表达，因此先收集所有被依赖的
-/// 项目，再回填到提供该项目的文件哈希上。
+/// 「必须有它才能加载」。依赖以**项目 ID** 表达，因此图里同时保留
+/// 「文件 → 项目」与「文件 → 必需依赖的项目」两张表。
 ///
 /// 这一步不能靠读 jar：判定发生在下载之前，此时本地没有文件可读。上游的
 /// 版本元数据是唯一权威来源，也正好是 `versions_from_hashes` 已经拿回来的
 /// 数据，不额外发请求。
-fn depended_on_within(versions: &HashMap<String, Version>) -> HashSet<String> {
-    let required: HashSet<&str> = versions
-        .values()
-        .flat_map(|version| version.dependencies.iter())
-        .filter(|dep| dep.dependency_type == "required")
-        .filter_map(|dep| dep.project_id.as_deref())
-        .collect();
-    if required.is_empty() {
-        return HashSet::new();
+///
+/// 真正的「谁留下」由 [`PackMemberGraph::retained`] 算——那是需要迭代到
+/// 不动点的判定，收敛在领域层，来源只负责把事实摆好。
+fn member_graph(
+    versions: &HashMap<String, Version>,
+    client_only: &HashSet<String>,
+) -> PackMemberGraph {
+    let mut graph = PackMemberGraph::default();
+    for (hash, version) in versions {
+        graph
+            .project_of
+            .insert(hash.clone(), version.project_id.clone());
+        let requires: Vec<String> = version
+            .dependencies
+            .iter()
+            .filter(|dep| dep.dependency_type == "required")
+            .filter_map(|dep| dep.project_id.clone())
+            .collect();
+        graph.requires.insert(hash.clone(), requires);
+        if client_only.contains(hash) {
+            graph.client_only.insert(hash.clone());
+        }
     }
-    versions
-        .iter()
-        .filter(|(_hash, version)| required.contains(version.project_id.as_str()))
-        .map(|(hash, _version)| hash.clone())
-        .collect()
+    graph
 }
 
 /// 从「哈希 → 版本」与「项目详情」里挑出仅客户端条目

@@ -273,6 +273,45 @@ async fn modpack_default_search_sends_no_keyword() {
     assert!(target.contains("limit=20"), "{target}");
 }
 
+/// 上游 facet 会漏：命中项自己写着 `server_side=unsupported` 时必须剔除
+///
+/// 实测带 `server_side:required|optional` 的查询仍返回纯客户端整合包
+/// （Sodium Plus 一类）。facet 是粗筛，返回体里的字段才是逐条事实。
+#[tokio::test]
+async fn modpack_search_drops_hits_that_declare_server_unsupported() {
+    let body = r#"{
+      "hits": [
+        {"project_id": "AAA", "project_type": "modpack", "title": "Server Pack",
+         "description": "", "author": "a", "downloads": 1, "follows": 0,
+         "date_created": "2024-01-01T00:00:00Z", "date_modified": "2024-01-01T00:00:00Z",
+         "license": "MIT", "server_side": "required"},
+        {"project_id": "BBB", "project_type": "modpack", "title": "Client Pack",
+         "description": "", "author": "b", "downloads": 1, "follows": 0,
+         "date_created": "2024-01-01T00:00:00Z", "date_modified": "2024-01-01T00:00:00Z",
+         "license": "MIT", "server_side": "unsupported"}
+      ],
+      "offset": 0, "limit": 20, "total_hits": 2
+    }"#;
+    let mock = Mock::start(vec![("GET", "/v2/search", 200, body.to_owned())]).await;
+    let source = ModrinthModpackSource::from_source(source_for(&mock));
+
+    let search = source.search(&ModpackQuery::new()).await.expect("搜索");
+    let ids: Vec<&str> = search.hits.iter().map(|hit| hit.id.as_str()).collect();
+    assert_eq!(ids, vec!["AAA"], "仅有客户端标记的整合包必须剔除");
+    assert_eq!(search.total, 1, "剔除后总数不该再把它算进去");
+}
+
+/// 返回体没带 `server_side` 时不能凭猜测剔除：上游没说就不做否定判定
+#[tokio::test]
+async fn modpack_search_keeps_hits_without_server_side() {
+    let mock = Mock::start(vec![("GET", "/v2/search", 200, SEARCH.to_owned())]).await;
+    let source = ModrinthModpackSource::from_source(source_for(&mock));
+
+    let search = source.search(&ModpackQuery::new()).await.expect("搜索");
+    assert_eq!(search.hits.len(), 2);
+    assert_eq!(search.total, 2);
+}
+
 /// 服务端安装用的检索：仅客户端的项目必须挡在上游
 ///
 /// 光影加载器一类项目同样能塞进 `mods/`，装上去服务端却起不来。等用户选完、
