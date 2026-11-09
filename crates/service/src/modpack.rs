@@ -22,8 +22,9 @@
 
 use crate::fs_error::FsError;
 use crate::lifecycle::LifecycleError;
+use crate::mod_inspect::ModBlocked;
 use crate::modpack_manifest::ModpackManifestSnapshot;
-use domain::mod_::{ModLoader, Risk, ServerTarget};
+use domain::mod_::{ModLoader, ServerTarget};
 use domain::server::modpack::{ModpackFile, ModpackIndex};
 use domain::server::version::ServerVariant;
 use port::mod_::ModInspector;
@@ -208,11 +209,11 @@ pub struct ModpackService {
     sources: Arc<ModpackSourceRegistry>,
     extractor: Arc<dyn ModpackExtractor>,
     downloader: Arc<dyn ArtifactDownloader>,
-    /// 落盘后的本地检测器；`None` 表示不做装完判定
+    /// 落盘后的本地检测器；`None` 表示不做装完复核
     ///
     /// 有它才能在装完时按**文件本身**判一次：清单的 `env` 与上游的
     /// `server_side` 都是作者的声明，声明错的时候只有读 jar 才能发现。
-    /// 见 [`Self::settle_mods`]。
+    /// 见 [`Self::audit_mods`]。
     inspector: Option<Arc<dyn ModInspector>>,
     /// 批量下载的并发文件数（见 [`Self::with_file_concurrency`]）
     file_concurrency: usize,
@@ -423,20 +424,20 @@ impl ModpackService {
             .download_files(prepared, source.as_ref(), &jobs, progress, cancel)
             .await?;
 
-        // 4. 落盘后再按文件本身判一次
+        // 4. 落盘后按文件本身复核一次
         //
         //    前三步信的都是「别人怎么说」：清单的 env、上游的 server_side。
         //    整合包作者把仅客户端模组标成 `server: required` 是常见情况
         //    （实测 Sodium / ETF / malilib 一类都在清单里声明 required），
-        //    上游标注也可能迟到或写错。装完这次读 jar，是唯一能对「文件到底
-        //    是什么」下结论的一步，也是启动预检用的同一套判定。
-        applied.removed_local = self.settle_mods(prepared, server_dir, &jobs).await;
+        //    上游标注也可能迟到或写错；依赖齐不齐、加载器对不对得上，更是
+        //    只有把整批文件摆在一起才判得出来。这一步与 `server start` 的
+        //    预检共用同一个扫描，因此这里报空就等于启动不会被 mod 拦住。
+        applied.blocked = self.audit_mods(prepared, server_dir).await;
         applied.file_count = prepared
             .index
             .server_files()
             .len()
-            .saturating_sub(skipped_client_only)
-            .saturating_sub(applied.removed_local.len());
+            .saturating_sub(skipped_client_only);
         applied.skipped_client_only = skipped_client_only;
 
         // 5. 把清单留一份：项目 / 版本 ID 都在下载地址里，装完就有了权威数据，
@@ -456,49 +457,29 @@ impl ModpackService {
         Ok(applied)
     }
 
-    /// 装完的本地判定：把服务端加载器明确不接受的 mod 移进回收站
+    /// 装完的本地复核：列出会让服务端起不来的条目
     ///
     /// 前面几步信的都是「别人怎么说」——清单的 `env`、上游项目的
-    /// `server_side`。声明与实际不符时，装完这次读 jar 是唯一能对「文件到底
-    /// 是什么」下结论的一步：Fabric 的 `environment: client`、Forge 的
-    /// `displayTest` 都在文件里，读一眼就能把启动必崩的 jar 挡在 `mods/` 之外。
+    /// `server_side`。声明与实际不符是常态：作者把仅客户端模组标成
+    /// `server: required`、上游 `server_side` 写错、整合包里混进别的加载器
+    /// 的 jar、依赖没有一并打包。这些在装完的那一刻全都查得出来，等到
+    /// `server start` 再拦，用户已经以为装好了。
     ///
-    /// # 只按「文件自己属于哪一侧」处置
+    /// 扫描范围是整台服务端的 `mods/` 与 `plugins/`，不是本次下载的那批：
+    /// 依赖闭包要拿全量文件才算得准，`overrides/` 铺进来的 jar 同样是加载器
+    /// 会读的。判定本身复用 [`ModInspectService::blockers_in_dir`]，与
+    /// `server start` 的预检是同一份代码——两处各判一套迟早分叉成「装完说
+    /// 没事、启动却被拦下」。
     ///
-    /// 检测结果里的 `risk` 把「缺必需依赖」也升级成 `Blocking`，但缺依赖不
-    /// 是删文件能解决的：依赖可能被上游判定跳过、可能由 `overrides/` 提供、
-    /// 也可能本来就该由用户自己装。因此这里只看
-    /// [`domain::mod_::ModCapability::risk`]——它只回答「这个文件服务端能不能
-    /// 装载」，不看依赖闭包。
+    /// 这里**不动任何文件**：怎么处置由用户决定，入口负责问（见
+    /// `mcsup server mod` 的停用流程）。工具单方面移走文件，用户就只能从
+    /// 结果反推发生了什么。
     ///
-    /// # 判定可能错，所以只移不删
-    ///
-    /// `side="CLIENT"` 的 `CreativeCore` 一类能在 dedicated server 上正常
-    /// 装载。判错时用户手上不能没有原件，统一移进 `.mcsup-trash/`（见
-    /// [`crate::trash`]），并在结果里回报路径。
-    ///
-    /// 没有装检测器时直接返回空：不做判定比按猜测删文件安全。
-    async fn settle_mods(
-        &self,
-        prepared: &ModpackPrepared,
-        server_dir: &Path,
-        jobs: &[(&ModpackFile, PathBuf)],
-    ) -> Vec<String> {
+    /// 没有装检测器时直接返回空：不做判定比按猜测处置安全。
+    async fn audit_mods(&self, prepared: &ModpackPrepared, server_dir: &Path) -> Vec<ModBlocked> {
         let Some(inspector) = self.inspector.clone() else {
             return Vec::new();
         };
-        // 只看清单声明的 `mods/*.jar`：服务端目录里可能还有用户自己放的文件
-        // 与 overrides 铺进来的文件，动它们超出「装这份整合包」的职责范围
-        // 与反查上游归属时用的是同一个谓词（`ModpackFile::is_plugin_jar`）：
-        // 两处口径不一致会让「装完判定」去动一些本来就不会被加载的文件
-        let jars: Vec<PathBuf> = jobs
-            .iter()
-            .filter(|(file, _target)| file.is_plugin_jar())
-            .map(|(_file, target)| target.clone())
-            .collect();
-        if jars.is_empty() {
-            return Vec::new();
-        }
         let target = ServerTarget {
             loader: prepared
                 .index
@@ -507,56 +488,32 @@ impl ModpackService {
             mc_version: prepared.index.dependencies.minecraft().map(str::to_owned),
             java_major: None,
         };
+        let dir = server_dir.to_path_buf();
         // 读 jar 是同步 IO：放进阻塞线程池，别占住异步 executor
-        let audit = tokio::task::spawn_blocking(move || {
-            crate::mod_inspect::ModInspectService::local(inspector)
-                .inspect_paths_for_sync(&jars, Some(&target))
+        let scanned = tokio::task::spawn_blocking(move || {
+            crate::mod_inspect::ModInspectService::local(inspector).blockers_in_dir(&dir, &target)
         })
         .await;
-        let Ok(audit) = audit else {
-            warn!("install-time mod audit did not finish; keeping the pack as declared");
-            return Vec::new();
-        };
-
-        let mut removed = Vec::new();
-        for report in &audit.mods {
-            if report.capability.risk() != Risk::Blocking {
-                continue;
-            }
-            let path = Path::new(&report.capability.path);
-            // 回报用整合包口径的相对路径：与 `stale_hashes` / 清单条目同构，
-            // 用户能直接对回清单里的那一行
-            let relative = path
-                .strip_prefix(server_dir)
-                .unwrap_or(path)
-                .display()
-                .to_string();
-            match crate::trash::trash_file(server_dir, path) {
-                Ok(trashed) => {
+        match scanned {
+            Ok(Ok(blocked)) => {
+                if !blocked.is_empty() {
                     info!(
-                        path = %relative,
-                        trashed = %trashed.display(),
-                        "mod does not load on a server; moved out of mods/"
-                    );
-                    removed.push(relative);
-                }
-                Err(err) => {
-                    // 移不动不是致命错误：文件留在原位，启动预检会再拦一次
-                    warn!(
-                        path = %path.display(),
-                        error = %err,
-                        "cannot move unusable mod out of mods/"
+                        blocked = blocked.len(),
+                        "installed pack has mods that would stop the server"
                     );
                 }
+                blocked
+            }
+            Ok(Err(err)) => {
+                // 扫不动不是致命错误：文件已经装好，启动预检会再拦一次
+                warn!(error = %err, "post-install mod audit failed; skipping");
+                Vec::new()
+            }
+            Err(err) => {
+                warn!(error = %err, "post-install mod audit did not finish");
+                Vec::new()
             }
         }
-        if !removed.is_empty() {
-            info!(
-                removed = removed.len(),
-                "install-time mod judgement applied"
-            );
-        }
-        removed
     }
 
     /// 把清单文件分类：要下载的、仅客户端剔除的
@@ -713,7 +670,7 @@ impl ModpackService {
             skipped_bytes: 0,
             stale_hashes,
             // 下载阶段还不知道文件本身是什么，装完判定在 `apply` 里补
-            removed_local: Vec::new(),
+            blocked: Vec::new(),
         })
     }
 
@@ -933,12 +890,16 @@ pub struct ModpackApplied {
     pub skipped_bytes: u64,
     /// 清单哈希已过期、但按上游权威哈希接受的文件路径
     pub stale_hashes: Vec<String>,
-    /// 装完后按文件本身判定为服务端不可装载、已移进回收站的路径
+    /// 装完复核出的、会让服务端起不来的条目
     ///
     /// 与 `skipped_client_only` 是两个口径：那一个按**声明**跳过、从未下载；
-    /// 这一个已经下了盘，读 jar 才发现服务端装载不了，移进 `.mcsup-trash/`
-    /// 后用户可取回。两者都为 0 才说明整包在服务端侧是干净的。
-    pub removed_local: Vec<String>,
+    /// 这一个已经下了盘，读 jar 才发现装载不了或依赖不齐。判定口径与
+    /// `server start` 的预检完全一致（同一个
+    /// [`crate::ModInspectService::blockers_in_dir`]），因此这里为空就等于
+    /// 「启动不会被 mod 拦住」。
+    ///
+    /// 安装本身不动这些文件：怎么处置是用户的决定，入口负责问。
+    pub blocked: Vec<ModBlocked>,
 }
 
 /// 加载器名 → 服务端变体

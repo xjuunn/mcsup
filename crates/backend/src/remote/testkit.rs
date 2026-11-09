@@ -348,7 +348,7 @@ pub(crate) mod mcsup_agent_shim {
                         skipped_client_only: 0,
                         skipped_bytes: 0,
                         stale_hashes: 0,
-                        removed_local: 0,
+                        blocked: Vec::new(),
                     }
                 }
                 Request::PropsGet { .. } => Response::Props {

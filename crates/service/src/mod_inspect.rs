@@ -27,7 +27,7 @@
 //! 因此只在需要联网兜底时才计算。
 
 use crate::fs_error::FsError;
-use domain::mod_::{ModCapability, ModLoader, Risk, ServerFit, ServerTarget};
+use domain::mod_::{FitVerdict, ModCapability, ModLoader, Risk, ServerFit, ServerTarget};
 use port::mod_::{ModInspectError, ModInspector, ModMetadataSource};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -66,6 +66,67 @@ pub struct ModReport {
     /// `--server`）时为 `None`——没问就不给结论，别让「没问」看起来像
     /// 「查过了」
     pub fit: Option<ServerFit>,
+}
+
+/// 让服务端起不来的原因
+///
+/// 加载器在解析阶段就终止启动，服务端日志里只剩一行英文报错，用户得自己
+/// 把 modid 对上文件名。这里把「为什么起不来」结构化：`start` 的预检与
+/// 整合包装完的复核共用同一份结论，两处不会各判一套。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModBlocker {
+    /// 缺少必需依赖
+    ///
+    /// 依赖可能由上游判定跳过、可能写在 `overrides/` 里、也可能本来就该
+    /// 用户自己装——补装能解决，因此单独一类。
+    MissingDeps {
+        /// 缺失的 modid
+        mods: Vec<String>,
+    },
+    /// 文件本身只能在客户端装载
+    ClientOnly,
+    /// 与目标服务端不匹配（加载器 / MC 版本 / Java 维度）
+    Mismatch {
+        /// 维度说明（`[加载器] 只支持 fabric，服务端是 forge` 之类）
+        detail: String,
+    },
+}
+
+/// 一条会阻断启动的条目
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModBlocked {
+    /// 相对服务端目录的路径（`mods/x.jar`）
+    pub file: String,
+    /// 阻断原因
+    pub blocker: ModBlocker,
+}
+
+impl ModReport {
+    /// 本条目是否会让服务端起不来
+    ///
+    /// 判定顺序即处置顺序：缺依赖可以补装，仅客户端只能排除，不匹配只能
+    /// 换版本。先报先能修的那一类，用户不会在「换个版本」上白费力气。
+    #[must_use]
+    pub fn blocker(&self) -> Option<ModBlocker> {
+        if !self.missing_deps.is_empty() {
+            return Some(ModBlocker::MissingDeps {
+                mods: self.missing_deps.clone(),
+            });
+        }
+        if self.risk == Risk::Blocking {
+            return Some(ModBlocker::ClientOnly);
+        }
+        let fit = self.fit.as_ref()?;
+        if fit.verdict != FitVerdict::Rejected {
+            return None;
+        }
+        Some(ModBlocker::Mismatch {
+            detail: fit
+                .issues
+                .first()
+                .map_or_else(|| "与服务端不匹配".to_owned(), |issue| issue.detail.clone()),
+        })
+    }
 }
 
 /// 整批检测结果
@@ -359,6 +420,48 @@ impl ModInspectService {
         self.inspect_locally(paths, &[], target)
     }
 
+    /// 扫一台服务端的 `mods/` 与 `plugins/`，列出会阻断启动的条目
+    ///
+    /// `start` 的预检与整合包装完的复核共用这一处：两处各写一份判定，迟早
+    /// 分叉成「装完说没事、启动却被拦下」。扫描不联网——开服是本地决策，
+    /// 上游挂了不该拦着人。
+    ///
+    /// 返回的路径相对 `server_dir`（`mods/x.jar`），直接可对回清单与用户
+    /// 手上的文件名。
+    ///
+    /// # Errors
+    ///
+    /// 目录遍历失败时返回 [`FsError`]；单个文件读不出来不算失败，跳过即可
+    /// （一个坏文件不该让其余结论消失）。
+    pub fn blockers_in_dir(
+        &self,
+        server_dir: &Path,
+        target: &ServerTarget,
+    ) -> Result<Vec<ModBlocked>, FsError> {
+        let mut out = Vec::new();
+        for sub in ["mods", "plugins"] {
+            let dir = server_dir.join(sub);
+            if !dir.is_dir() {
+                continue;
+            }
+            let jars = collect_jars(&dir)?;
+            if jars.is_empty() {
+                continue;
+            }
+            let audit = self.inspect_paths_for_sync(&jars, Some(target));
+            for report in &audit.mods {
+                let Some(blocker) = report.blocker() else {
+                    continue;
+                };
+                out.push(ModBlocked {
+                    file: relative(server_dir, &report.capability.path),
+                    blocker,
+                });
+            }
+        }
+        Ok(out)
+    }
+
     /// 向上游补齐服务端归属
     ///
     /// 需要 SHA1，而 `ModCapability` 不带哈希（领域模型不关心传输细节），
@@ -460,6 +563,16 @@ pub fn collect_jars(dir: &Path) -> Result<Vec<PathBuf>, FsError> {
     }
     out.sort();
     Ok(out)
+}
+
+/// 相对服务端目录的展示路径：`mods/x.jar`
+///
+/// 用户看到的是相对路径——绝对路径既长又会随工作区搬动而变化，报错信息
+/// 里的路径应该能直接粘进 `mods/` 下的 ls。
+fn relative(server_dir: &Path, path: &str) -> String {
+    Path::new(path)
+        .strip_prefix(server_dir)
+        .map_or_else(|_| path.to_owned(), |rel| rel.display().to_string())
 }
 
 #[cfg(test)]
@@ -567,7 +680,7 @@ mod tests {
             .await
             .expect("audit");
         let fit = audit.mods[0].fit.as_ref().expect("fit");
-        assert_eq!(fit.verdict, domain::mod_::FitVerdict::Rejected);
+        assert_eq!(fit.verdict, FitVerdict::Rejected);
         assert_eq!(fit.loader, domain::mod_::Fit::Mismatch);
         assert!(!fit.issues.is_empty());
         // 匹配结论不覆盖风险：客/服归属照旧

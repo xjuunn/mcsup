@@ -32,6 +32,22 @@ pub fn corrupt(
     RepositoryError::Corrupt(format!("{label} {value}: {err}"))
 }
 
+/// 装完复核出的一条阻断原因
+///
+/// 线格式只搬运**事实**，不搬运文案：`kind` 是稳定机器名，`detail` 是缺的
+/// modid 或不匹配的具体维度。渲染成人类可读的一句话由各入口按自己的语言做，
+/// 协议层不知道也不该知道用户界面长什么样。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireModBlocked {
+    /// 相对服务端目录的路径（`mods/x.jar`）
+    pub file: String,
+    /// 原因类别：`missing_deps` / `client_only` / `mismatch`
+    pub kind: String,
+    /// 类别相关的细节：缺的 modid 列表，或不匹配的维度说明
+    #[serde(default)]
+    pub detail: Vec<String>,
+}
+
 /// 已配对客户端的线格式
 ///
 /// 刻意不含 `digest`：客户端列表是给管理员看的，摘要对展示无用，多传一次就

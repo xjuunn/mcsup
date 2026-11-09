@@ -5,6 +5,7 @@ mod install;
 mod java;
 mod lifecycle;
 mod mod_inspect;
+mod mod_review;
 mod modpack;
 mod origin;
 mod props;
