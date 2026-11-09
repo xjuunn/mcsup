@@ -82,6 +82,23 @@ impl Drop for RawMode {
     }
 }
 
+/// 丢弃提问前已缓冲的输入
+///
+/// 长耗时步骤（下载、扫描）期间用户按下的回车会留在终端输入缓冲里，下一个
+/// 交互提问会立刻把它们当成「空输入 + 回车」读走——用户还没看到问题就已经
+/// 答完了。提问前先排空，保证读到的是用户看到问题之后敲的键。
+///
+/// 只在交互式提问前调用：非交互路径不读 stdin，排空没有意义。
+pub(crate) fn discard_pending_input() {
+    // `poll` 零超时只检查「有没有待读事件」，不阻塞；读失败就停，不把
+    // 排空失败升级成提问失败
+    while crossterm::event::poll(std::time::Duration::ZERO).unwrap_or(false) {
+        if crossterm::event::read().is_err() {
+            break;
+        }
+    }
+}
+
 /// 阻塞读取一个语义按键：忽略 resize / 鼠标 / 按键释放等非按键事件
 ///
 /// # Errors

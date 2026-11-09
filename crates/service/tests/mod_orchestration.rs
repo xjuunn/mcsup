@@ -1510,11 +1510,11 @@ async fn apply_fix_refuses_a_provider_that_does_not_provide_the_modid() {
         .expect("apply_fix");
     assert!(applied.installed.is_empty(), "{applied:?}");
     assert!(!harness.mods_dir().join("music-and-melody.jar").exists());
-    let refused = applied.refused.first().expect("refused entry");
+    // 候选不提供该 modid 是检索噪声，不逐条报「未完成」：最终由 unresolved
+    // 汇总成一行，用户不必读一串同义报错
     assert!(
-        refused.reason.contains("melody"),
-        "reason should name the modid: {}",
-        refused.reason
+        applied.refused.is_empty(),
+        "wrong-provider candidates should not be reported one by one: {applied:?}"
     );
     assert!(
         applied.unresolved.contains(&"melody".to_owned()),

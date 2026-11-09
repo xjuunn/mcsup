@@ -94,6 +94,8 @@ pub(crate) fn init_render_config() {
 ///
 /// 读取终端输入失败时返回底层错误
 pub(crate) fn confirm_yes(lang: Lang, message: &str, default: bool) -> Result<bool> {
+    // 长耗时步骤期间按下的回车会留在缓冲里，先排空再提问
+    crate::input::discard_pending_input();
     Confirm::new(message)
         .with_default(default)
         .prompt()
@@ -405,6 +407,9 @@ pub(crate) fn validate_remote_name(lang: Lang, input: &str) -> Validation {
 ///
 /// 读取终端输入失败时返回底层错误
 pub(crate) fn input_text(lang: Lang, label: &str, default: &str, help: &str) -> Result<String> {
+    // 长耗时步骤期间按下的回车会留在缓冲里，先排空再提问：否则用户还没看到
+    // 问题，缓冲里的回车就已经把默认值提交了
+    crate::input::discard_pending_input();
     let input: String =
         text_input(label, default, help)
             .prompt()

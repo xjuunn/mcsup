@@ -1644,18 +1644,8 @@ impl ModService {
                     });
                 }
                 Err(err) => {
-                    // 命中的项目不提供这个 modid：还有别的候选没试完就该
-                    // 换下一个，只有全部试完才算「上游没有提供方」
-                    if let ModError::WrongProvider { need, .. } = &err {
-                        state.candidate_rejected(need);
-                    } else if let Some(missing) = pending.missing.as_deref() {
-                        state.candidate_rejected(missing);
-                    }
                     state.visited.insert(pending.project_id.clone());
-                    state.refused.push(FixRefused {
-                        project_id: pending.project_id.clone(),
-                        reason: err.to_string(),
-                    });
+                    record_install_failure(&pending, &err, &mut state);
                 }
             }
         }
@@ -2171,6 +2161,26 @@ fn refusal_reason(risk: Risk, evidence: &[String]) -> String {
     } else {
         format!("安装检查判定为 {}：{}", risk.as_str(), evidence.join("；"))
     }
+}
+
+/// 记下一项补装失败
+///
+/// 命中的项目不提供要补的 modid 时只是「这个候选不是本体」——还有别的候选
+/// 没试完，只有全部试完才算「上游没有提供方」。这类候选是检索噪声（名字像
+/// 但不是本体），不逐条进 `refused`，最终由 `unresolved` 汇总成一行，用户
+/// 不必读一串同义报错。
+fn record_install_failure(pending: &PendingFix, err: &ModError, state: &mut FixState) {
+    if let ModError::WrongProvider { need, .. } = err {
+        state.candidate_rejected(need);
+        return;
+    }
+    if let Some(missing) = pending.missing.as_deref() {
+        state.candidate_rejected(missing);
+    }
+    state.refused.push(FixRefused {
+        project_id: pending.project_id.clone(),
+        reason: err.to_string(),
+    });
 }
 
 /// 路径的最后一段（展示用文件名）

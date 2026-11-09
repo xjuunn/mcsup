@@ -351,13 +351,22 @@ impl ModpackService {
     ) -> Result<ModpackPrepared, ModpackError> {
         let source = self.select_source(options.source)?;
         let resolved = source.resolve(project, options.version).await?;
-        let staging = options.server_dir.join("modpack-staging");
-        tokio::fs::create_dir_all(&staging)
-            .await
-            .map_err(|err| ModpackError::io(&staging, err))?;
-        let archive_path = staging.join(&resolved.file.filename);
-        self.download_file(&resolved.file, &archive_path, options.progress, cancel)
-            .await?;
+        // 已取回的归档直接复用：`server create` 在选包阶段已经把 `.mrpack`
+        // 下到本地，再下一遍在国际链路上是分钟级浪费。文件不在时才回退到
+        // 下载——暂存目录可能已被清理，静默成功会让 `apply` 拿到不存在的归档。
+        let archive_path = match options.archive {
+            Some(path) if path.is_file() => path.to_path_buf(),
+            _ => {
+                let staging = options.server_dir.join("modpack-staging");
+                tokio::fs::create_dir_all(&staging)
+                    .await
+                    .map_err(|err| ModpackError::io(&staging, err))?;
+                let archive_path = staging.join(&resolved.file.filename);
+                self.download_file(&resolved.file, &archive_path, options.progress, cancel)
+                    .await?;
+                archive_path
+            }
+        };
 
         let index = self.extractor.read_index(&archive_path)?;
         Ok(ModpackPrepared {

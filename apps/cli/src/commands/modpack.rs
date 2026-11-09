@@ -719,9 +719,10 @@ pub(crate) async fn install_modpack(
     let applied = result?;
 
     // 4. 暂存目录（.mrpack）用完即删
-    if let Some(staging) = prepared.archive_path.parent() {
-        let _ = std::fs::remove_dir_all(staging);
-    }
+    //
+    //    只删本流程自己的暂存目录，不按 `archive_path.parent()` 推断：归档
+    //    可能由调用方从别处传入，删它的父目录会连带删掉用户文件。
+    let _ = std::fs::remove_dir_all(server_dir.join("modpack-staging"));
 
     let payload = ModpackInstallJson {
         source: source.name(),

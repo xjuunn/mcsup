@@ -543,6 +543,48 @@ async fn applies_files_and_overrides() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// 已取回的归档直接复用：不再下载 `.mrpack`
+///
+/// 现场：`server create` 在选包阶段已经把 `.mrpack` 下到本地，`prepare`
+/// 若仍按清单重新下载，国际链路上等于把同一个包下两遍。
+#[tokio::test]
+async fn reuses_a_provided_archive_without_downloading() {
+    let index = ModpackIndex::new(
+        1,
+        "minecraft",
+        "1.0.0",
+        "Pack",
+        deps(&[("minecraft", "1.21.1")]),
+        vec![file("mods/a.jar", 4, EnvTag::Required)],
+    )
+    .expect("index");
+    let downloader = FakeDownloader::ok();
+    let seen = downloader.requests.clone();
+    let service = service(index, Vec::new(), downloader);
+    let dir = scratch("reuse-archive");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    // 调用方已取回的归档
+    let archive = dir.join("cached.mrpack");
+    std::fs::write(&archive, b"mrpack").expect("write");
+
+    let prepared = service
+        .prepare(
+            "P",
+            ModpackInstallOptions::new(&dir).archive(&archive),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("prepare");
+
+    assert_eq!(prepared.archive_path, archive);
+    assert!(
+        seen.lock().expect("seen").is_empty(),
+        "复用归档时不该再下载: {:?}",
+        seen.lock().expect("seen")
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// `server: unsupported` 的文件不落盘
 #[tokio::test]
 async fn skips_server_unsupported_files() {
