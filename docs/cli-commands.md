@@ -422,7 +422,10 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
   Esc 回到推荐列表；推荐列表本身按 Esc 取消整个建站。
 - 搜索返回 0 条也留在结果页：标题说明没有匹配，继续输入新关键词回车即可
   重搜，按 Esc 回到推荐列表，而不是直接结束整个建站流程。
-- 搜索结果只包含支持服务端的整合包（`server_side` facet 过滤纯客户端整合包）。
+- 搜索结果只包含支持服务端的整合包。上游 facet 是粗筛：实测带
+  `server_side:required|optional` 的查询仍会返回 `server_side=unsupported` 的
+  整合包（Sodium Plus 一类纯客户端包），因此命中项还会按响应体里的字段再筛
+  一遍——判定口径一处收敛，不额外发请求。
 - 详情与版本列表在同一屏：两者并行取回后一次性呈现，详情打完紧接着就是版本
   选择，不会先出简介再刷出版本列表。版本列表即使只有一个候选也照常提问，
   选中后还必须确认一次（默认「是」）才开始下载——整合包动辄几百 MB，不能让
@@ -464,6 +467,23 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 `HARD_DEP_NO_CANDIDATE` 起不来。被跳过文件的旧落盘会被删除。查询失败时
 中止安装（避免装出一个启动必崩的服务端），来源不支持这项能力时退回「按清单
 装」。JSON 输出里的 `skipped_client_only` 与人类可读输出都会报告跳过数量。
+
+**「谁被依赖」要迭代到不动点**。被跳过的成员不该为别人提供保护：`sodium`
+被 `indium` / `iris` / `reeses` 依赖，而这三个自己都是仅客户端、都会被跳过，
+一次统计会把 `sodium` 判成「有人依赖」而留下，服务端照样起不来。判定因此从
+「服务端可用」的成员出发，沿必需依赖反复扩张到不再有新成员（详见
+`PackMemberGraph::retained`）。反过来，留下的成员需要的库即使自己被标成仅
+客户端也必须装，同一条规则两向都成立。
+
+**装完再按文件本身判一次**。前面两步信的都是声明：清单的 `env`、上游项目的
+`server_side`。声明与实际不符时只有读 jar 才能发现（Fabric 的
+`environment: client`、Forge 的 `displayMode` 都在文件里）。`apply` 结束后
+对本次装进 `mods/` 的 jar 跑一次本地检测，把服务端加载器明确装载不了的移进
+`<server>/.mcsup-trash/`：只移不删，因为判定是工具的推断、可能是错的
+（`side="CLIENT"` 的 `CreativeCore` 一类实测能正常装载）。只看「文件自己属于
+哪一侧」，缺依赖不在此列——那不是删文件能解决的问题。数量见 JSON 的
+`removed_local`，人类可读输出会说明回收站位置。库类项目不参与这一步的移除
+（`environment: client` 是误标高发区）。
 
 清单里 `server: unsupported` 的文件不会装到服务端；`optional` 视为需要安装。
 `.mrpack` 由内置 zip 解析直接解开，不调用系统 `unzip`，归档内的 UTF-8

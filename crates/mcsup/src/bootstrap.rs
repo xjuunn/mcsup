@@ -535,12 +535,20 @@ impl McsupBuilder {
             Some(sources) => sources,
             None => default_modpack_sources()?,
         };
+        // 整合包布置与 mod 编排共用同一个读取器：装完判定与 `mod fix` /
+        // 启动预检必须对「这个 jar 服务端能不能装」给出一致结论，各建一个
+        // 实例就等于各有一套判定
+        let inspector = self
+            .mod_inspector
+            .unwrap_or_else(|| Arc::new(modkit::ZipModInspector::new()));
+
         let mut modpack = ModpackService::new(
             Arc::new(ModpackSourceRegistry::new(modpack_sources)),
             self.modpack_extractor
                 .unwrap_or_else(|| Arc::new(MrpackExtractor::new())),
             Arc::clone(&downloader),
-        );
+        )
+        .with_inspector(Arc::clone(&inspector));
         if let Some(config) = &self.config {
             modpack = modpack.with_file_concurrency(config.resolved_download_concurrency());
         }
@@ -551,8 +559,7 @@ impl McsupBuilder {
             Arc::clone(&registry),
             Arc::clone(&backend),
             content.clone(),
-            self.mod_inspector
-                .unwrap_or_else(|| Arc::new(modkit::ZipModInspector::new())),
+            inspector,
         );
 
         Ok(Mcsup {

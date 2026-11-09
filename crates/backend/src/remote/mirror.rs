@@ -66,6 +66,8 @@ pub struct RemoteModpackResult {
     pub skipped_bytes: u64,
     /// 清单哈希过期、按上游权威哈希接受的文件数
     pub stale_hashes: usize,
+    /// 装完按文件本身判定为服务端不可装载、已移进回收站的文件数
+    pub removed_local: usize,
 }
 
 /// `server link --origin` 的结果
@@ -471,6 +473,7 @@ impl RemoteServerRepository {
                 skipped_client_only,
                 skipped_bytes,
                 stale_hashes,
+                removed_local,
             } => {
                 let result = RemoteModpackResult {
                     meta: ServerMeta::try_from(server)?,
@@ -485,6 +488,7 @@ impl RemoteServerRepository {
                     skipped_client_only,
                     skipped_bytes,
                     stale_hashes,
+                    removed_local,
                 };
                 self.write_through();
                 Ok(result)

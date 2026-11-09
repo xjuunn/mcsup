@@ -66,12 +66,15 @@ fn broken_json_still_yields_metadata() {
 }
 
 #[test]
-fn forge_client_side_is_detected() {
+fn forge_client_side_is_recorded_but_not_blocking() {
+    // Forge 的 `[[mods]] side="CLIENT"` 装载器并不读，实测有大量服务端可用
+    // 的 mod 这么写。只当证据留着，不据此判死。
     let cap = inspect("forge_client.jar");
     assert_eq!(cap.id.as_deref(), Some("sodiumlike"));
     assert_eq!(cap.loaders, vec![ModLoader::Forge]);
-    assert_eq!(cap.side.server, SideSupport::Unsupported);
-    assert_eq!(cap.risk(), Risk::Blocking);
+    assert_eq!(cap.side.client, SideSupport::Required);
+    assert_eq!(cap.side.server, SideSupport::Unknown);
+    assert_eq!(cap.risk(), Risk::Review);
 }
 
 #[test]

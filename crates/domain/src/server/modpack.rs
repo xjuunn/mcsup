@@ -19,7 +19,7 @@
 //! `config/x.toml`）。服务端目录与整合包根同构，因此这里只做路径安全校验，
 //! 不重新映射目录。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 
@@ -338,6 +338,89 @@ impl ModpackIndex {
     #[must_use]
     pub fn loader(&self) -> Option<(&'static str, &str)> {
         self.dependencies.loader()
+    }
+}
+
+/// 整合包成员的依赖关系图
+///
+/// 用来回答一个问题：**服务端到底要装哪些成员**。输入是三份上游事实
+/// （谁属于哪个项目、谁声明了哪些必需依赖、哪个项目被标成仅客户端），
+/// 输出是「真正会装」的成员集合。
+///
+/// # 为什么需要不动点
+///
+/// 只做一次「谁被依赖」的统计是错的，因为**被跳过的成员不该为别人提供
+/// 依赖保护**。反例来自真实整合包：`sodium` 被 `indium` / `iris` /
+/// `reeses` 依赖，而这三个自己都是仅客户端、都会被跳过。一次统计会把
+/// `sodium` 判成「有人依赖」而留下，服务端照样起不来。跳出这一步的
+/// 依赖关系不复存在，必须先删掉跳过者，再看剩下的人需要什么。
+///
+/// 反过来，留下的成员需要的库即使自己被标成仅客户端也必须装（`satin`
+/// 一类提供 API 的项目常被标 `unsupported`，却是别的 mod 的硬依赖）。
+/// 因此从「服务端可用」的成员出发，沿必需依赖反复扩张到不再有新成员，
+/// 就是最终要装的集合。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PackMemberGraph {
+    /// 文件哈希 → 该文件所属的项目 ID
+    pub project_of: BTreeMap<String, String>,
+    /// 文件哈希 → 该文件声明为必需依赖的项目 ID
+    pub requires: BTreeMap<String, Vec<String>>,
+    /// 上游把整个项目标成仅客户端的文件哈希
+    pub client_only: BTreeSet<String>,
+}
+
+impl PackMemberGraph {
+    /// 服务端真正会安装的成员（文件哈希）
+    ///
+    /// 起点是「自己不是仅客户端」的成员——它们无论如何都要装；然后反复
+    /// 把「被已装成员必需依赖、且自己能提供该项目」的仅客户端成员并进来，
+    /// 直到集合不再变大。两者都装之后，其余仅客户端成员才是真的该跳过。
+    #[must_use]
+    pub fn retained(&self) -> BTreeSet<String> {
+        let mut kept: BTreeSet<String> = self
+            .project_of
+            .keys()
+            .filter(|hash| !self.client_only.contains(*hash))
+            .cloned()
+            .collect();
+        loop {
+            // 只有「会装」的成员声明的必需依赖才提供保护
+            let mut needed: BTreeSet<&str> = BTreeSet::new();
+            for hash in &kept {
+                if let Some(requires) = self.requires.get(hash) {
+                    needed.extend(requires.iter().map(String::as_str));
+                }
+            }
+            let mut grew = false;
+            for hash in &self.client_only {
+                if kept.contains(hash) {
+                    continue;
+                }
+                let Some(project) = self.project_of.get(hash) else {
+                    continue;
+                };
+                if needed.contains(project.as_str()) {
+                    kept.insert(hash.clone());
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        kept
+    }
+
+    /// 仅客户端、但被留下的成员需要、因此不能跳过的文件哈希
+    ///
+    /// 判定口径与 [`Self::retained`] 一致：`retained` 里那些上游标成仅客户端的
+    /// 条目。
+    #[must_use]
+    pub fn depended_on(&self) -> BTreeSet<String> {
+        self.retained()
+            .into_iter()
+            .filter(|hash| self.client_only.contains(hash))
+            .collect()
     }
 }
 
@@ -690,5 +773,80 @@ mod tests {
             };
             assert!(hashes.sha1_checksum().is_none());
         }
+    }
+
+    /// 建一张成员依赖图：`(哈希, 项目ID, 必需依赖的项目ID, 是否仅客户端)`
+    fn graph(members: &[(&str, &str, &[&str], bool)]) -> PackMemberGraph {
+        let mut out = PackMemberGraph::default();
+        for (hash, project, requires, client_only) in members {
+            out.project_of
+                .insert((*hash).to_owned(), (*project).to_owned());
+            out.requires.insert(
+                (*hash).to_owned(),
+                requires.iter().map(|id| (*id).to_owned()).collect(),
+            );
+            if *client_only {
+                out.client_only.insert((*hash).to_owned());
+            }
+        }
+        out
+    }
+
+    fn names<'a>(set: impl IntoIterator<Item = &'a String>) -> Vec<&'a str> {
+        set.into_iter().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn only_client_member_without_dependents_is_skipped() {
+        let g = graph(&[
+            ("h-api", "fabric-api", &[], false),
+            ("h-etf", "etf", &[], true),
+        ]);
+        assert!(g.depended_on().is_empty());
+        assert_eq!(names(&g.retained()), vec!["h-api"]);
+    }
+
+    #[test]
+    fn library_needed_by_server_member_is_kept() {
+        // satin 一类：自己被标仅客户端，却是 environmentz 的硬依赖
+        let g = graph(&[
+            ("h-env", "environmentz", &["satin"], false),
+            ("h-satin", "satin", &[], true),
+        ]);
+        assert_eq!(names(&g.depended_on()), vec!["h-satin"]);
+        assert_eq!(names(&g.retained()), vec!["h-env", "h-satin"]);
+    }
+
+    #[test]
+    fn dependency_of_a_skipped_member_protects_nothing() {
+        // 真实反例：indium 依赖 sodium，而 indium 自己被跳过，
+        // 于是 sodium 也不该留下
+        let g = graph(&[
+            ("h-fabric-api", "fabric-api", &[], false),
+            ("h-indium", "indium", &["sodium"], true),
+            ("h-sodium", "sodium", &["fabric-api"], true),
+        ]);
+        assert!(g.depended_on().is_empty());
+        assert_eq!(names(&g.retained()), vec!["h-fabric-api"]);
+    }
+
+    #[test]
+    fn closure_follows_chained_dependencies_to_a_fixed_point() {
+        // a（服务端可用）→ b（仅客户端）→ c（仅客户端）
+        let g = graph(&[
+            ("h-a", "a", &["b"], false),
+            ("h-b", "b", &["c"], true),
+            ("h-c", "c", &[], true),
+            ("h-orphan", "orphan", &[], true),
+        ]);
+        assert_eq!(names(&g.retained()), vec!["h-a", "h-b", "h-c"]);
+        assert_eq!(names(&g.depended_on()), vec!["h-b", "h-c"]);
+    }
+
+    #[test]
+    fn dependency_on_a_project_outside_the_pack_changes_nothing() {
+        // 整合包里没有 fabric-api（由加载器或用户另行提供），不该凭空留下东西
+        let g = graph(&[("h-x", "x", &["fabric-api"], true)]);
+        assert!(g.retained().is_empty());
     }
 }

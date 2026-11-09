@@ -739,9 +739,11 @@ pub(crate) async fn install_modpack(
         skipped_client_only: applied.skipped_client_only,
         skipped_bytes: applied.skipped_bytes,
         stale_hashes: applied.stale_hashes.len(),
+        removed_local: applied.removed_local.len(),
         path: server_dir.display().to_string(),
     };
     let mut note = skipped_note(printer.lang(), applied.skipped_client_only);
+    note.push_str(&removed_local_note(printer.lang(), &applied.removed_local));
     note.push_str(&skipped_bytes_note(printer.lang(), applied.skipped_bytes));
     note.push_str(&stale_note(printer.lang(), applied.stale_hashes.len()));
     let human = crate::i18n::pick(
@@ -788,6 +790,7 @@ pub(crate) fn report_remote_applied(
         skipped_client_only: result.skipped_client_only,
         skipped_bytes: result.skipped_bytes,
         stale_hashes: result.stale_hashes,
+        removed_local: result.removed_local,
         path,
     };
     let mut note = skipped_note(lang, result.skipped_client_only);
@@ -825,6 +828,29 @@ fn skipped_note(lang: crate::locale::Lang, skipped: usize) -> String {
         lang,
         format!("，跳过 {skipped} 个仅客户端模组"),
         format!(", skipped {skipped} client-only mods"),
+    )
+}
+
+/// 装完判定移出 mods/ 的文件说明
+///
+/// 与「跳过仅客户端模组」分开讲：那一个是按声明跳过的，用户没付出下载代价；
+/// 这一个下完之后才发现装不了，文件在 `<server>/.mcsup-trash/`，能取回。
+fn removed_local_note(lang: crate::locale::Lang, removed: &[String]) -> String {
+    if removed.is_empty() {
+        return String::new();
+    }
+    crate::i18n::pick(
+        lang,
+        format!(
+            "，按文件判定移出 {} 个服务端装不了的模组（在 {}/，可随时取回）",
+            removed.len(),
+            mcsup::service::TRASH_DIR
+        ),
+        format!(
+            ", moved {} mods the server cannot load to {}/ (recoverable)",
+            removed.len(),
+            mcsup::service::TRASH_DIR
+        ),
     )
 }
 
@@ -881,6 +907,8 @@ struct ModpackInstallJson<'a> {
     skipped_bytes: u64,
     /// 清单哈希过期、但按上游权威哈希接受的文件数
     stale_hashes: usize,
+    /// 装完按文件本身判定为服务端不可装载、已移进回收站的文件数
+    removed_local: usize,
     path: String,
 }
 

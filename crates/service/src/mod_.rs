@@ -52,13 +52,7 @@ use tracing::{info, warn};
 /// 常见过滤口径。
 pub const STAGING_DIR: &str = ".mcsup-staging";
 
-/// 移除文件的暂存目录名（相对服务端目录）
-///
-/// 修复计划里的「移除」是工具的推断，不是用户的决定：判定可能出错（实测
-/// `side="CLIENT"` 的 CreativeCore、依赖全写 `side="CLIENT"` 的 embeddiumplus
-/// 都能在 dedicated server 上正常装载）。直接删掉就把用户的文件连同「判错了
-/// 怎么办」一起消灭了。移到同级的回收目录，用户随时能取回。
-pub const TRASH_DIR: &str = ".mcsup-trash";
+pub use crate::trash::TRASH_DIR;
 
 /// 一次修复最多向下展开多少层依赖
 ///
@@ -1056,7 +1050,7 @@ impl ModService {
         if !dry_run {
             self.ensure_stopped(&server)?;
             for path in &hits {
-                trash_file(&server.dir, path)?;
+                crate::trash::trash_file(&server.dir, path)?;
             }
             info!(server = name, removed = hits.len(), "mods removed");
         }
@@ -1353,7 +1347,7 @@ impl ModService {
                 });
             }
             if item.file.is_file() {
-                trash_file(&server.dir, &item.file)?;
+                crate::trash::trash_file(&server.dir, &item.file)?;
                 removed.push(item.file.clone());
             }
         }
@@ -1896,44 +1890,6 @@ fn jars_in(dir: &Path) -> Result<Vec<PathBuf>, ModError> {
 /// 服务端变体对应的 mod 加载器
 fn loader_of(variant: &ServerVariant) -> Option<ModLoader> {
     variant.content_loader().and_then(ModLoader::parse)
-}
-
-/// 把文件移进服务端目录下的回收站，而不是直接删除
-///
-/// 移除是工具的推断，可能是错的：判错时用户手上就没了原文件——实测里
-/// `Cell-Forge`、`CreativeCore` 已被误删并需要重新下载。移到
-/// `<server>/.mcsup-trash/` 后文件仍在本地，用户能一键取回。
-///
-/// 同名冲突时加序号，不覆盖：回收站里已有的同名文件同样可能是唯一副本。
-/// 回收站不是备份，会在下次成功启动后由用户自行清理——这里只保证「不销毁」。
-fn trash_file(server_dir: &Path, path: &Path) -> Result<PathBuf, ModError> {
-    let trash = server_dir.join(TRASH_DIR);
-    crate::fs::create_dir_all(&trash).map_err(|err| FsError::io(&trash, err))?;
-    let name = path.file_name().map_or_else(
-        || std::ffi::OsString::from("unnamed"),
-        std::ffi::OsStr::to_os_string,
-    );
-    let mut target = trash.join(&name);
-    let mut seq = 1u32;
-    // 冲突时在扩展名前加序号：`a.jar` → `a-1.jar`，保持可识别
-    let stem = Path::new(&name)
-        .file_stem()
-        .unwrap_or_else(|| std::ffi::OsStr::new("unnamed"));
-    let ext = Path::new(&name)
-        .extension()
-        .map(std::ffi::OsStr::to_os_string);
-    while target.exists() {
-        let mut cand = stem.to_os_string();
-        cand.push(format!("-{seq}"));
-        if let Some(ext) = &ext {
-            cand.push(".");
-            cand.push(ext);
-        }
-        target = trash.join(cand);
-        seq += 1;
-    }
-    crate::fs::rename(path, &target).map_err(|err| FsError::io(path, err))?;
-    Ok(target)
 }
 
 /// 这台服务端的安装条件

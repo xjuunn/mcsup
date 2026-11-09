@@ -386,10 +386,21 @@ Modrinth 同一版本可以同时提供客户端与服务端文件，服务端�
 会在启动阶段崩溃。
 
 清单的 `env` 字段同样不可全信。`apply` 会把 `mods/` 下 jar 的 sha1 交给
-`port::ModpackSource::client_only_hashes`（默认实现返回空集合），由来源用
-上游元数据判定 `server_side = unsupported` 的文件；命中者不落盘，旧文件一并
-删除。判定逻辑留在 Provider（上游字段语义）与 Service（安装编排）里，入口
-只负责展示 `skipped_client_only`。查询失败即中止安装，不带着未知状态落盘。
+`port::ModpackSource::pack_member_verdicts`（默认实现退化为
+`client_only_hashes`），由来源给出两份事实：哪些文件被上游标注
+`server_side = unsupported`、哪些文件被包内其他成员必需依赖。
+
+「谁该留下」由领域层算：`domain::server::modpack::PackMemberGraph::retained`
+从服务端可用的成员出发，沿必需依赖迭代到不动点。一次统计是错的——被跳过的
+成员不该为别人提供保护（`sodium` 被同为仅客户端的 `indium` / `iris` 依赖，
+一次统计会把它误留下来）。查询失败即中止安装，不带着未知状态落盘。
+
+装完还有一道按**文件本身**的判定（`ModpackService::settle_mods`）：对本次装进
+`mods/` 的 jar 跑一次本地检测，把服务端加载器明确装载不了的移进
+`<server>/.mcsup-trash/`。只移不删——判定是工具的推断，可能是错的；只看
+「文件自己属于哪一侧」，缺依赖不在此列。整合包服务与 `server mod list` /
+`server start` 共用同一个 `ModInspector` 与同一套口径（`ModCapability::risk`），
+入口只负责展示 `skipped_client_only` 与 `removed_local`。
 
 ```
 server create --variant modrinth-modpack
