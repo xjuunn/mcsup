@@ -134,3 +134,34 @@ fn non_zip_file_is_rejected() {
         port::mod_::ModInspectError::NotAnArchive { .. }
     ));
 }
+
+#[test]
+fn mods_toml_header_comment_still_yields_modid() {
+    // ForgeMDK 模板把块头和 modId 都写成带尾注释的形态
+    // （`[[mods]] #mandatory`）。块头用全等判断会整块跳过，modid 读不出来，
+    // 依赖它的 mod 全被误报缺依赖。
+    let cap = inspect("forge_mods_toml_comment.jar");
+    assert_eq!(cap.id.as_deref(), Some("jeilike"));
+    assert_eq!(cap.loaders, vec![ModLoader::Forge]);
+    assert!(cap.provided_ids().iter().any(|id| id == "jeilike"));
+    // version 写的是 `${file.jarVersion}`，由 MANIFEST 的
+    // Implementation-Version 替换，不能把占位符原样展示给用户
+    assert_eq!(cap.version.as_deref(), Some("15.20.0.127"));
+}
+
+#[test]
+fn forge_jarjar_nested_jar_counts_as_provided() {
+    // Forge 的 JarJar 放 META-INF/jarjar/，与 Fabric 的 META-INF/jars/ 不同。
+    // 只认后者会把已满足的依赖误报成缺失（实测 PuzzlesLib 把
+    // puzzlesaccessapi 打在 META-INF/jarjar/ 内）。
+    let cap = inspect("forge_jarjar.jar");
+    assert_eq!(cap.id.as_deref(), Some("puzzleslib"));
+    assert_eq!(cap.nested_jars, 1);
+    assert!(
+        cap.provided_ids().iter().any(|id| id == "puzzlesaccessapi"),
+        "JarJar 内层 modid 应当算本 jar 提供，实际为 {:?}",
+        cap.provided_ids()
+    );
+    // 依赖本身还在（供上层校验），但提供方已在自己身上找到
+    assert!(cap.depends.iter().any(|d| d.id == "puzzlesaccessapi"));
+}

@@ -71,10 +71,7 @@ impl ModInspector for ZipModInspector {
 
         cap.loaders = detect_loaders(&names);
 
-        cap.nested_jars = names
-            .iter()
-            .filter(|n| n.starts_with("META-INF/jars/") && has_ext(n, "jar"))
-            .count();
+        cap.nested_jars = names.iter().filter(|n| is_nested_jar(n)).count();
 
         parse_metadata(&mut zip, &mut cap);
 
@@ -87,15 +84,13 @@ impl ModInspector for ZipModInspector {
             apply_client_bytecode(&mut cap);
         }
 
-        // 嵌套 jar：整合包里的「壳 jar」常把真正的实现放在 META-INF/jars/，
+        // 嵌套 jar：整合包里的「壳 jar」常把真正的实现放在 `META-INF/jars/`
+        // （Fabric 的 Jar-in-Jar）或 `META-INF/jarjar/`（Forge 的 JarJar），
         // 依赖方引用的是内层 modid（实测 c2me 依赖 c2me-base，而 c2me-base
-        // 只存在于本 jar 的 META-INF/jars/ 内）。不读就会把已满足的依赖
-        // 误报成缺失。
-        let nested: Vec<String> = names
-            .iter()
-            .filter(|n| n.starts_with("META-INF/jars/") && has_ext(n, "jar"))
-            .cloned()
-            .collect();
+        // 只存在于本 jar 的 `META-INF/jars/` 内；PuzzlesLib 把
+        // `puzzlesaccessapi` 放在 `META-INF/jarjar/` 内）。不读就会把已满足
+        // 的依赖误报成缺失。
+        let nested: Vec<String> = names.iter().filter(|n| is_nested_jar(n)).cloned().collect();
         for entry_name in nested {
             if let Some(inner_id) = nested_mod_id(&mut zip, &entry_name) {
                 cap.provides.push(inner_id);
@@ -109,13 +104,22 @@ impl ModInspector for ZipModInspector {
         // 1.14–26.x），但构建于 MC 26.2。把编译期版本当成运行区间会把
         // 它判成「装不进 1.21.1」。没声明 `minecraft` 就是没有运行约束——
         // 编译期版本只说明「作者用什么版本开发」，不是兼容性声明。
-        if let Some(raw) = read_entry(&mut zip, "META-INF/MANIFEST.MF")
-            && let Some(mc) = manifest_mc_version(&raw)
-        {
-            cap.side.evidence.push(Evidence::new(
-                EvidenceSource::Archive,
-                format!("MANIFEST 记录编译期 MC 版本 {mc}（非兼容性声明）"),
-            ));
+        if let Some(raw) = read_entry(&mut zip, "META-INF/MANIFEST.MF") {
+            if let Some(mc) = manifest_mc_version(&raw) {
+                cap.side.evidence.push(Evidence::new(
+                    EvidenceSource::Archive,
+                    format!("MANIFEST 记录编译期 MC 版本 {mc}（非兼容性声明）"),
+                ));
+            }
+            // `mods.toml` 里写 `${file.jarVersion}` 是 Forge 的占位符，加载器
+            // 装载时用 MANIFEST 的 `Implementation-Version` 替换。不解析就只
+            // 能把占位符原样展示给用户（实测 JEI、`sophisticatedcore`、
+            // guardvillagers 等大量 Forge mod 都这么写）。
+            if cap.version.as_deref() == Some(FILE_JAR_VERSION)
+                && let Some(version) = manifest_jar_version(&raw)
+            {
+                cap.version = Some(version);
+            }
         }
 
         Ok(cap)
@@ -175,7 +179,7 @@ fn detect_loaders(names: &[String]) -> Vec<ModLoader> {
 ///
 /// `neoforge.mods.toml` 优先于 `mods.toml`：同时存在时前者是 `NeoForge` 的
 /// 权威描述。两者内容通常一致，取其一避免重复记依赖。
-fn parse_metadata(zip: &mut ZipArchive<std::fs::File>, cap: &mut ModCapability) {
+fn parse_metadata<R: Read + std::io::Seek>(zip: &mut ZipArchive<R>, cap: &mut ModCapability) {
     if let Some(raw) = read_entry(zip, "fabric.mod.json") {
         parse_fabric(&raw, cap);
     }
@@ -194,7 +198,9 @@ fn parse_metadata(zip: &mut ZipArchive<std::fs::File>, cap: &mut ModCapability) 
 
 /// 从嵌套 jar 里读 modid
 ///
-/// 只认 `fabric.mod.json` 的 `id`：其它生态的嵌套 jar 极少见于 Fabric 壳。
+/// 复用 [`parse_metadata`]，因此 Fabric / Quilt / Forge / `NeoForge` 四种
+/// 元数据都能读。内层 modid 同样算「本 jar 提供」：加载器会在装载时自动
+/// 解出嵌套 jar。
 fn nested_mod_id(zip: &mut ZipArchive<std::fs::File>, entry_name: &str) -> Option<String> {
     let mut raw = Vec::new();
     zip.by_name(entry_name)
@@ -204,25 +210,31 @@ fn nested_mod_id(zip: &mut ZipArchive<std::fs::File>, entry_name: &str) -> Optio
         .ok()?;
     let cursor = std::io::Cursor::new(raw);
     let mut inner = ZipArchive::new(cursor).ok()?;
-    let mut meta = Vec::new();
-    inner
-        .by_name("fabric.mod.json")
-        .ok()?
-        .take(META_LIMIT)
-        .read_to_end(&mut meta)
-        .ok()?;
-    let value = json::parse_lenient(&meta)?;
-    value["id"].as_str().map(ToOwned::to_owned)
+    let mut cap = ModCapability::empty(entry_name);
+    parse_metadata(&mut inner, &mut cap);
+    cap.id
 }
 
 /// 嵌套 jar 最多读多少字节
 const NESTED_JAR_LIMIT: u64 = 8 * 1024 * 1024;
 
-/// 元数据文件最多读多少字节
-const META_LIMIT: u64 = 1024 * 1024;
+/// 嵌套 jar 的两套约定
+///
+/// Fabric 的 Jar-in-Jar 放 `META-INF/jars/`，Forge 的 `JarJar` 放
+/// `META-INF/jarjar/`。两者都由加载器在装载时自动解出，内层 modid 因此
+/// 同样算「本 jar 提供」——只认前者会把 Forge 的已满足依赖误报成缺失。
+const NESTED_JAR_PREFIXES: [&str; 2] = ["META-INF/jars/", "META-INF/jarjar/"];
+
+/// 归档里的某个条目是不是嵌套 jar
+fn is_nested_jar(name: &str) -> bool {
+    NESTED_JAR_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+        && has_ext(name, "jar")
+}
 
 /// 读一个条目的全部字节
-fn read_entry(zip: &mut ZipArchive<std::fs::File>, name: &str) -> Option<Vec<u8>> {
+fn read_entry<R: Read + std::io::Seek>(zip: &mut ZipArchive<R>, name: &str) -> Option<Vec<u8>> {
     let mut entry = zip.by_name(name).ok()?;
     let mut buf = Vec::new();
     entry.read_to_end(&mut buf).ok()?;
@@ -664,17 +676,22 @@ fn parse_toml_mods(raw: &[u8], cap: &mut ModCapability, neoforge: bool) {
         return;
     };
     // 只取第一个 [[mods]] 块
+    //
+    // 块头后面常带尾注释：ForgeMDK 模板生成的 `mods.toml` 一律写
+    // `[[mods]] #mandatory`（实测 JEI、`sophisticatedcore`、Placebo、Xaero's
+    // 等 17 个 mod 都是这个形态）。用全等判断会把整块跳过去，`modId` 读不
+    // 出来，这个 jar 就「不提供任何 modid」，依赖它的 mod 全被误报缺依赖。
     let mut in_first_mod = false;
     for line in text.lines() {
         let line = line.trim();
-        if line == "[[mods]]" {
+        if line.starts_with("[[mods]]") {
             if in_first_mod {
                 break;
             }
             in_first_mod = true;
             continue;
         }
-        if line.starts_with("[[") && in_first_mod && line != "[[mods]]" {
+        if line.starts_with("[[") && in_first_mod {
             in_first_mod = false;
         }
         if !in_first_mod {
@@ -900,6 +917,32 @@ fn manifest_mc_version(raw: &[u8]) -> Option<String> {
     None
 }
 
+/// `mods.toml` 里 `version` 的占位符，加载器用 MANIFEST 替换
+const FILE_JAR_VERSION: &str = "${file.jarVersion}";
+
+/// 从 MANIFEST.MF 取 `Implementation-Version`
+///
+/// 这是 Forge 替换 `${file.jarVersion}` 时用的字段。缺失时退回
+/// `Specification-Version`：部分 mod 只写后者。
+fn manifest_jar_version(raw: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(raw).ok()?;
+    let mut fallback = None;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("Implementation-Version:") {
+            let v = rest.trim();
+            if !v.is_empty() {
+                return Some(v.to_owned());
+            }
+        } else if let Some(rest) = line.strip_prefix("Specification-Version:") {
+            let v = rest.trim();
+            if !v.is_empty() {
+                fallback = Some(v.to_owned());
+            }
+        }
+    }
+    fallback
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1074,6 +1117,21 @@ mod tests {
     #[test]
     fn manifest_without_field_returns_none() {
         assert_eq!(manifest_mc_version(b"Manifest-Version: 1.0\r\n"), None);
+    }
+
+    /// `${file.jarVersion}` 由 `Implementation-Version` 替换
+    #[test]
+    fn manifest_jar_version_prefers_implementation() {
+        let raw = b"Manifest-Version: 1.0\r\nSpecification-Version: 15.20.0\r\nImplementation-Version: 15.20.0.127\r\n";
+        assert_eq!(manifest_jar_version(raw), Some("15.20.0.127".to_owned()));
+    }
+
+    /// 只有 `Specification-Version` 时退回它
+    #[test]
+    fn manifest_jar_version_falls_back_to_specification() {
+        let raw = b"Manifest-Version: 1.0\r\nSpecification-Version: 1.2.3\r\n";
+        assert_eq!(manifest_jar_version(raw), Some("1.2.3".to_owned()));
+        assert_eq!(manifest_jar_version(b"Manifest-Version: 1.0\r\n"), None);
     }
 
     /// Forge mod 的 mods.toml 不写 side 是常态，字节码引用客户端类不能
