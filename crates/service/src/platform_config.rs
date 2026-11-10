@@ -22,21 +22,27 @@ use url::Url;
 ///
 /// 与 `file` crate 的 `BATCH_CONCURRENCY` 一致；这里再写一份是刻意的：
 /// 配置缺省是**产品决定**，下载器的内置缺省是实现细节，两者可以独立变。
-pub const DEFAULT_DOWNLOAD_CONCURRENCY: usize = 8;
+///
+/// 实测单连接约 45 KiB/s，小于分段阈值的小文件只能单流，批量吞吐完全由
+/// 这个并发数决定；24 路在小文件占多数的整合包清单上能把吞吐拉满（详见
+/// `docs/concurrency-performance.md` 的下载并发一节）。
+pub const DEFAULT_DOWNLOAD_CONCURRENCY: usize = 24;
 
 /// 并发文件数上限
 ///
-/// 实测跨境链路上一味加并发收益极小（8 路到 32 路几乎不再涨），但同一份
-/// 文件被切成几十段并发拉时，服务端与中间设备更容易掐连接。给个上限既
-/// 防着用户手抖写个 1000，也不至于把真正宽裕的链路卡死。
+/// 高于缺省的加并发只在大量中大型文件同时下载时才继续有收益，且同一份文件被
+/// 切成几十段并发拉时，服务端与中间设备更容易掐连接。给个上限既防着用户手抖
+/// 写个 1000，也不至于把真正宽裕的链路卡死。
 pub const MAX_DOWNLOAD_CONCURRENCY: usize = 64;
 
 /// 全部下载在途连接数的缺省上限
 ///
-/// 两层并发各自有界、乘起来没有界：8 个文件各切 24 段会同时抽 192 条连接，
-/// 远超家庭带宽与上游对单 IP 的容忍度。48 是「批量并发跑满 8 个文件、每个
-/// 各 6 段」的量级，既让大文件仍能多路跑，又不至于把链路和上游打爆。
-pub const DEFAULT_DOWNLOAD_INFLIGHT: usize = 48;
+/// 两层并发各自有界、乘起来没有界；单连接约 45 KiB/s 的限速下，聚合吞吐随
+/// 在途连接数近似线性增长，直到约 15 MiB/s 的单节点容量（详见
+/// `docs/concurrency-performance.md`）。256 是「批量并发 24 路 × 每个大文件
+/// 约 10 段」的量级，实测把 109 文件 / 594 MiB 的整合包从约 1.4 MiB/s 提到
+/// 约 8 MiB/s，同时仍低于单节点容量、不触发上游限流。
+pub const DEFAULT_DOWNLOAD_INFLIGHT: usize = 256;
 
 /// 在途连接上限的最大值
 ///
@@ -180,9 +186,9 @@ impl ConfigKey {
     pub const fn describe(self) -> &'static str {
         match self {
             Self::DataDir => "平台数据目录（workspaces / java / db 都在其下）",
-            Self::DownloadConcurrency => "批量下载并发文件数（缺省 8，范围 1–64）",
+            Self::DownloadConcurrency => "批量下载并发文件数（缺省 24，范围 1–64）",
             Self::DownloadSources => "mod 文件镜像前缀，逗号分隔（缺省只用官方源）",
-            Self::DownloadInflight => "全部下载在途连接上限（缺省 48，范围 1–512）",
+            Self::DownloadInflight => "全部下载在途连接上限（缺省 256，范围 1–512）",
         }
     }
 

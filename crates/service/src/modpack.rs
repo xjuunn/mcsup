@@ -767,10 +767,12 @@ struct FetchedFile {
 
 /// 清单文件并发下载上限
 ///
-/// 清单文件通常是几十到几百个小 jar：并发太高（几十路）只会放大对 CDN
-/// 的压力，收益递减；8 路在常见家庭带宽上已能把吞吐跑满，同时单文件
-/// 内部的分片下载仍在 file crate 里按需并发，两层不叠加失控。
-const FILE_CONCURRENCY: usize = 8;
+/// 清单里小文件占多数，低于分段阈值的文件只能单流，它们的吞吐由这个并发数
+/// 决定；单连接约 45 KiB/s 的限速下，几十路并发是必要而非浪费。24 路在实测里
+/// 与更高取值吞吐持平（详见 `docs/concurrency-performance.md`），再高只放大对
+/// CDN 的连接压力。此处是 service 侧缺省，实际值由平台配置
+/// （`download-concurrency`）经 [`Self::with_file_concurrency`] 覆盖。
+const FILE_CONCURRENCY: usize = 24;
 
 /// 复用文件的进度起点
 ///

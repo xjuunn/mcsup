@@ -16,9 +16,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// 每个 host 保留的空闲连接数
 ///
-/// 要覆盖两层并发：批量下载的文件级并发（8）与单文件内的分片并发（24）。
-/// 取 32 让两层都能命中已建立的连接，又不会无节制占用文件句柄。
-const IDLE_CONNECTIONS_PER_HOST: usize = 32;
+/// 要覆盖三层并发：批量下载的文件级并发、单文件内的分片并发，以及两者合起来
+/// 的在途连接上限（`download-inflight`，缺省 256）。取 256 让在途连接在段与段、
+/// 文件与文件之间都能复用到已建立的连接，不为握手反复付钱。
+const IDLE_CONNECTIONS_PER_HOST: usize = 256;
 /// 空闲连接保留时长
 ///
 /// 批量下载的文件是一个接一个取走的，间隔通常是毫秒级；留 90 秒足够跨过
@@ -54,7 +55,7 @@ pub(crate) fn build_client() -> Result<Client, SourceError> {
 /// 大文件客户端
 ///
 /// 空闲连接池按**并发下载路数**留足：reqwest 默认每个 host 只留 1 条空闲连接，
-/// 批量下载（整合包清单动辄上百个文件、并发 8 路，单文件内还有分段并发）会
+/// 批量下载（整合包清单动辄上百个文件、并发 24 路，单文件内还有分段并发）会
 /// 反复丢弃并重建连接，每次都交一次 TCP + TLS 握手的钱。池子留够之后，同一
 /// CDN host 的连接被复用，握手成本摊薄到接近零——大整合包的下载时间差别相当
 /// 明显。

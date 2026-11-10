@@ -27,7 +27,12 @@ use url::Url;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 /// 分段并发上限
-const SEGMENT_CONCURRENCY: usize = 24;
+///
+/// 实测跨境 CDN 单连接被限速在约 45 KiB/s，聚合吞吐随**在途连接数**近似线性
+/// 增长（直到约 15 MiB/s 的单节点容量）。单个大文件（如 `.mrpack`）是「取回
+/// 整合包」一步的唯一事务，段并发就是它全部的加速手段：24 段约 1.0 MiB/s，
+/// 128 段约 7.5 MiB/s。取 128 是该文件的实测拐点，再往上连接开销吃掉收益。
+const SEGMENT_CONCURRENCY: usize = 128;
 /// 切片数相对并发度的富余倍数
 ///
 /// 切片数与并发度相等时，先跑完的切片不会被补位：在途连接数一路
@@ -48,7 +53,10 @@ const CANCEL_POLL: Duration = Duration::from_millis(25);
 ///
 /// 与单文件内分段并发（[`SEGMENT_CONCURRENCY`]）是两层：批量并行让多个小文件
 /// 同时在途，分段并行让单个大文件跑满一条链路。两者按场景各自生效，不叠加。
-const BATCH_CONCURRENCY: usize = 8;
+///
+/// 低于 [`MIN_SEGMENTED_SIZE`] 的小文件只有单流，批量里的吞吐完全由这个并发数
+/// 决定：单连接约 45 KiB/s，24 路才能把动辄几十 MiB 的小文件部分压进秒级。
+const BATCH_CONCURRENCY: usize = 24;
 /// 文件级重试的最多尝试次数（含首次）
 ///
 /// 清单类批量下载动辄数百个请求，瞬态 5xx / 连接重置必然出现；整批因此报废
@@ -160,7 +168,7 @@ pub struct FileDownloader {
     timeout: Duration,
     /// 全部在途连接的上限（批量并行 × 分段并行 × 重试都在它之下）
     ///
-    /// 两层并发各自有界，乘起来没有界：8 个文件各分 24 段就是 192 条连接，
+    /// 两层并发各自有界，乘起来没有界：24 个文件各分 128 段就会想抽 3072 条连接，
     /// 超过多数家庭带宽与上游的连接上限，反而让每条约到的速率更低。
     /// `None` 表示不限，保持注入自定义来源时的既有行为。
     inflight: Option<Arc<Semaphore>>,
@@ -243,6 +251,17 @@ impl FileDownloader {
                 total: request.expected_size,
             });
         };
+        // 已知大小且低于分段阈值：不探测直接单流。小文件占整合包清单的绝大多数，
+        // 为它们各发一次 HEAD 只是纯往返；大小已知时「会不会分段」已可判定，
+        // 单流本来也不需要范围能力，省下这一跳没有正确性风险。
+        if request
+            .expected_size
+            .is_some_and(|size| size < MIN_SEGMENTED_SIZE)
+        {
+            return Ok(TransferPlan::Single {
+                total: request.expected_size,
+            });
+        }
         let Ok(stat) = until_cancelled(range.stat(&request.location), &[cancel]).await? else {
             return Ok(TransferPlan::Single {
                 total: request.expected_size,
@@ -1542,8 +1561,10 @@ mod tests {
         Ok(())
     }
 
+    /// 已知大小的小文件既不探测也不分段：`expected_size` 已能判定它无需分段，
+    /// HEAD 与范围请求都省掉，只剩一次单流拉取
     #[tokio::test]
-    async fn small_file_skips_segmentation() -> Result<(), Box<dyn Error>> {
+    async fn small_file_skips_probe_and_segmentation() -> Result<(), Box<dyn Error>> {
         let dir = tempdir()?;
         let destination = dir.path().join("server.jar");
         let payload = vec![0x5A; 1024 * 1024];
@@ -1560,7 +1581,7 @@ mod tests {
         assert_eq!(done.size, payload.len() as u64);
         assert_eq!(std::fs::read(&destination)?, payload);
         assert_eq!(range.open_calls.load(Ordering::Relaxed), 0);
-        assert_eq!(range.stat_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(range.stat_calls.load(Ordering::Relaxed), 0);
         Ok(())
     }
 
