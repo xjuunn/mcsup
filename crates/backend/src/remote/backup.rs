@@ -1,7 +1,7 @@
 //! 远端备份执行：`port::RemoteBackupPort` 的 RPC 实现
 //!
 //! 与 [`super::supervisor::RemoteSupervisor`] 对偶：跨线只走元数据帧
-//! （`WireSnapshot`），扫描、CAS、恢复写盘全部发生在对端——远端的
+//! （`WireSnapshotSummary`），扫描、CAS、恢复写盘全部发生在对端——远端的
 //! `BackupLayout` 依赖对端目录事实，客户端拼不出来。判定全部在对端
 //! `service`（agent 的 ops 分发），这里只做参数搬运、解帧与错误映射。
 
@@ -11,7 +11,7 @@ use port::{
     RemoteDeleteOutcome, RemotePruneOutcome, RemoteRestoreOutcome, RemoteSnapshotPage,
     RemoteVerifyOutcome,
 };
-use protocol::remote::wire::WireSnapshot;
+use protocol::remote::wire::WireSnapshotSummary;
 use protocol::remote::{ErrorKind, Request, Response};
 use std::sync::Arc;
 
@@ -203,8 +203,10 @@ impl RemoteBackups {
     }
 
     /// 响应里必带的快照：解码失败按对端协议错误上报
-    fn decode_snapshot(wire: WireSnapshot) -> Result<domain::backup::Snapshot, RemoteBackupError> {
-        domain::backup::Snapshot::try_from(wire)
+    fn decode_summary(
+        wire: WireSnapshotSummary,
+    ) -> Result<domain::backup::SnapshotSummary, RemoteBackupError> {
+        domain::backup::SnapshotSummary::try_from(wire)
             .map_err(|err| RemoteBackupError::Protocol(err.to_string()))
     }
 }
@@ -224,7 +226,7 @@ impl RemoteBackupPort for RemoteBackups {
         })?;
         match response {
             Response::SnapshotCreated { snapshot, skipped } => Ok(RemoteCreateOutcome {
-                snapshot: Self::decode_snapshot(snapshot)?,
+                snapshot: Self::decode_summary(snapshot)?,
                 skipped,
             }),
             other => Err(RemoteBackupError::Protocol(format!(
@@ -252,7 +254,7 @@ impl RemoteBackupPort for RemoteBackups {
             } => {
                 let mut out = Vec::with_capacity(items.len());
                 for wire in items {
-                    out.push(Self::decode_snapshot(wire)?);
+                    out.push(Self::decode_summary(wire)?);
                 }
                 Ok(RemoteSnapshotPage {
                     items: out,
@@ -287,7 +289,7 @@ impl RemoteBackupPort for RemoteBackups {
                 safety_snapshot,
                 deleted,
             } => Ok(RemoteRestoreOutcome {
-                snapshot: Self::decode_snapshot(snapshot)?,
+                snapshot: Self::decode_summary(snapshot)?,
                 destination,
                 files,
                 bytes,
@@ -316,7 +318,7 @@ impl RemoteBackupPort for RemoteBackups {
         })?;
         match response {
             Response::SnapshotDeleted { snapshot, orphaned } => Ok(RemoteDeleteOutcome {
-                snapshot: Self::decode_snapshot(snapshot)?,
+                snapshot: Self::decode_summary(snapshot)?,
                 orphaned,
             }),
             other => Err(RemoteBackupError::Protocol(format!(
@@ -349,7 +351,7 @@ impl RemoteBackupPort for RemoteBackups {
                     );
                 }
                 Ok(RemoteVerifyOutcome {
-                    snapshot: Self::decode_snapshot(snapshot)?,
+                    snapshot: Self::decode_summary(snapshot)?,
                     objects,
                     bytes,
                     broken: hashes,
@@ -393,7 +395,7 @@ impl RemoteBackupPort for RemoteBackups {
             } => {
                 let mut out = Vec::with_capacity(removed.len());
                 for wire in removed {
-                    out.push(Self::decode_snapshot(wire)?);
+                    out.push(Self::decode_summary(wire)?);
                 }
                 Ok(RemotePruneOutcome {
                     removed: out,

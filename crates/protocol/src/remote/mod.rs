@@ -31,15 +31,18 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Write};
 use wire::{
-    WireClient, WireJava, WireModBlocked, WirePropUpdate, WireServer, WireSettings, WireSnapshot,
-    WireStartOutcome, WireStatusEntry, WireStop, WireVersion, WireWorkspace,
+    WireClient, WireJava, WireModBlocked, WirePropUpdate, WireServer, WireSettings,
+    WireSnapshotSummary, WireStartOutcome, WireStatusEntry, WireStop, WireVersion, WireWorkspace,
 };
 
 /// 远端协议版本；不匹配直接拒绝，禁止猜测兼容
 ///
 /// 2：新增中间帧 [`Response::Task`]（长任务的阶段 / 进度 / 输出）。旧客户端
 /// 收到不认识的 `op` 会整条报错，因此这是破坏性变更，必须随帧集一起升版。
-pub const REMOTE_PROTOCOL_VERSION: u32 = 2;
+///
+/// 3：备份帧的载荷由完整快照清单（`entries` / `stamps`）改为摘要，只带清单
+/// 规模。字段集合变了，旧对端解不出新帧、新对端也解不出旧帧——同样必须升版。
+pub const REMOTE_PROTOCOL_VERSION: u32 = 3;
 
 /// 单帧字节上限
 ///
@@ -727,15 +730,15 @@ pub enum Response {
     // ---- backup（阶段 9） ----
     /// 快照创建结果
     SnapshotCreated {
-        /// 新建的快照
-        snapshot: WireSnapshot,
+        /// 新建的快照摘要
+        snapshot: WireSnapshotSummary,
         /// 扫描期跳过的条目数
         skipped: usize,
     },
     /// 快照列表一页（顺序与请求一致）
     Snapshots {
-        /// 本页快照
-        items: Vec<WireSnapshot>,
+        /// 本页快照摘要（不带内容清单：一页几十份的清单装不进单帧）
+        items: Vec<WireSnapshotSummary>,
         /// 该服务器的快照总数
         total: usize,
         /// 当前页码
@@ -745,8 +748,8 @@ pub enum Response {
     },
     /// 恢复结果
     Restored {
-        /// 被恢复的快照
-        snapshot: WireSnapshot,
+        /// 被恢复的快照摘要
+        snapshot: WireSnapshotSummary,
         /// 对端上的恢复目标目录
         destination: String,
         /// 写回的文件数
@@ -760,15 +763,15 @@ pub enum Response {
     },
     /// 删除结果
     SnapshotDeleted {
-        /// 被删除的快照
-        snapshot: WireSnapshot,
+        /// 被删除的快照摘要
+        snapshot: WireSnapshotSummary,
         /// 该快照释放的 CAS 引用计数缺口（待 prune 回收）
         orphaned: usize,
     },
     /// 校验结果
     SnapshotVerified {
-        /// 被校验的快照
-        snapshot: WireSnapshot,
+        /// 被校验的快照摘要
+        snapshot: WireSnapshotSummary,
         /// 被引用的对象数（去重后）
         objects: usize,
         /// 校验通过的字节数
@@ -778,8 +781,8 @@ pub enum Response {
     },
     /// 清理结果
     Pruned {
-        /// 被删除的快照
-        removed: Vec<WireSnapshot>,
+        /// 被删除的快照摘要
+        removed: Vec<WireSnapshotSummary>,
         /// 回收的 CAS 对象数
         objects_reclaimed: usize,
         /// 回收的字节数
@@ -1032,9 +1035,9 @@ mod tests {
         read_response(&mut cursor).expect("read")
     }
 
-    /// 一条最小合法的 `WireSnapshot`（完整内容清单，验编解码不丢字段）
-    fn snapshot_wire() -> WireSnapshot {
-        WireSnapshot {
+    /// 一条最小合法的快照摘要（验编解码不丢字段）
+    fn snapshot_wire() -> WireSnapshotSummary {
+        WireSnapshotSummary {
             id: "20260101t000000-abc123".to_owned(),
             workspace_id: "survival".to_owned(),
             server: "web".to_owned(),
@@ -1042,9 +1045,8 @@ mod tests {
             parent: None,
             scope: vec!["world".to_owned()],
             status: "complete".to_owned(),
-            entries: vec![("world/level.dat".to_owned(), "a".repeat(64))],
-            deleted: vec!["logs/old.log".to_owned()],
-            stamps: vec![("world/level.dat".to_owned(), 4096, 1_700_000_000)],
+            files: 1,
+            deleted: 1,
             added: 1,
             reused: 0,
             total_bytes: 4096,
@@ -1324,6 +1326,34 @@ mod tests {
                 serde_json::to_value(&response).expect("json")
             );
         }
+    }
+
+    /// 一页快照必须装得进单帧
+    ///
+    /// 回归：帧载荷曾经是完整内容清单（`entries` / `stamps`），5000 文件的
+    /// 服务器一份就 700 KB，默认 20 份/页 达到 14 MB，必然超出单帧上限——
+    /// 远端 `backup ls` 在真实服务器上永远失败。清单留在对端，帧里只带规模。
+    #[test]
+    fn snapshot_page_fits_one_frame() {
+        let items: Vec<WireSnapshotSummary> = (0..20)
+            .map(|index| WireSnapshotSummary {
+                id: format!("20260101t000000-{index:06x}"),
+                ..snapshot_wire()
+            })
+            .collect();
+        let response = Response::Snapshots {
+            items,
+            total: 200,
+            page: 1,
+            page_size: 20,
+        };
+        let mut buf = Vec::new();
+        write_response(&mut buf, &response).expect("encode");
+        assert!(
+            buf.len() < MAX_FRAME_BYTES / 16,
+            "一页摘要不应接近单帧上限：{} bytes",
+            buf.len()
+        );
     }
 
     #[test]

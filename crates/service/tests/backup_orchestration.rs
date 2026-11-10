@@ -456,9 +456,8 @@ fn cas_dedups_identical_content_within_a_workspace() {
 
     let outcome = create_now(&service).expect("create");
     // 两个文件 → 两条条目，但 added 只数新对象：同内容第二次命中去重
-    assert_invariant(outcome.snapshot.content.entries().len() >= 2, || {
-        Failure::invariant("两个不同路径都必须进快照")
-            .actual(format!("{}", outcome.snapshot.content.entries().len()))
+    assert_invariant(outcome.snapshot.files >= 2, || {
+        Failure::invariant("两个不同路径都必须进快照").actual(format!("{}", outcome.snapshot.files))
     });
     let cas = CasStore::new(&fixture.backups_root());
     let listed = cas.list().expect("list");

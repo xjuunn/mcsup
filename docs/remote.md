@@ -304,7 +304,7 @@ error: “web” 存在于多个位置
 | `server start` / `stop` / `restart` / `status` / `send` | 生命周期帧，经 `RoutingSupervisor` 按来源分派；远端条目的核心 / Java / EULA 预检在**对端**执行，客户端不得用本地路径判定（见下「预检在哪里跑」） |
 | `server remove` | `ServerRemove`（可选 `--purge` 删盘），判定与删盘在对端；未给 `--origin` 时先解析来源——远端条目不会被当成本地条目（本地有同名则仍本地优先） |
 | `server version` | 组合注册表 `get`（不新增帧） |
-| `server backup ...` | 备份帧族（快照元数据跨线，CAS 在对端） |
+| `server backup ...` | 备份帧族（快照元数据 + 清单规模跨线，内容清单与 CAS 在对端） |
 | `java scan` / `install` / `uninstall` | `JavaScan` / `JavaInstall` / `JavaUninstall`，下载与登记在对端 |
 | `java list` / `server list` / `workspace list` | 读本地缓存（零网络），过期时后台刷新 |
 | `server link --origin` | `ServerLink`：符号链接、marker 与入库全在对端 |
@@ -496,7 +496,8 @@ remotes/<name>/
 - 复用 `protocol::Frame`，首帧为 `Hello { protocol_version, agent_version,
   capabilities }`。
 - `PROTOCOL_VERSION` 不匹配直接拒绝，不猜测兼容；破坏性变更走新增字段 +
-  版本递增。当前 `REMOTE_PROTOCOL_VERSION = 2`（新增中间帧 `Response::Task`）。
+  版本递增。当前 `REMOTE_PROTOCOL_VERSION = 3`（2 新增中间帧
+  `Response::Task`；3 把备份帧载荷由完整快照清单改为摘要）。
 - 能力协商决定可选能力（backup / file / java / streaming）是否可用。
 - 日志 follow 用 `LogsFollow` 长轮询帧承载（断线即取消，无会话状态）。
 - **进度通道**：长任务（装核心 / 装 Java / 整合包布置）在终结响应之前回若干
@@ -539,8 +540,10 @@ service ──TaskObserver──▶ 本地：apps/cli/src/progress.rs
    拉起 `mcsup __supervise`。
 8. 远端备份：`RemoteBackupPort`（按服务器身份寻址、域类型出入参），
    `BackupService` 按条目来源路由——远端条目整段转发到对端执行（扫描、
-   CAS、恢复写盘都在对端），跨线只走元数据帧（`WireSnapshot`），CAS 对象
-   留在对端；agent 侧复用与本地 CLI 同一份 `BackupService`。
+   CAS、恢复写盘都在对端），跨线只走元数据帧（`WireSnapshotSummary`：
+   元数据 + 清单规模，不含 `entries` / `stamps`），CAS 对象与内容清单都留在
+   对端——完整清单随文件数线性增长，一页几十份会超出单帧上限；agent 侧复用
+   与本地 CLI 同一份 `BackupService`。
 9. CLI：`remote serve/connect/reconnect/list/status/ping/disconnect/revoke`，
    `--origin` 过滤与 `ORIGIN` 列，创建 / 删除 / 扫描的远端路由，退出码 6。
 10. 流式日志 follow 与备份进度（未做）；此时再评估 `transport` 是否切换为
