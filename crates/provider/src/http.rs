@@ -70,6 +70,92 @@ pub(crate) fn build_stream_client() -> Result<Client, SourceError> {
         .map_err(|e| SourceError::Init(Box::new(e)))
 }
 
+/// 元数据响应体的上限
+///
+/// 上游正常返回是 KB 到数 MB（搜索结果、版本列表）；上限只兜异常响应，
+/// 避免一次请求把任意大的 body 读进内存。
+const RESPONSE_LIMIT: usize = 16 * 1024 * 1024;
+/// 失败后重试一次前的等待
+///
+/// 上游的 429 / 5xx 多是瞬时排队或实例切换；一次短退避足以跨过，过长的
+/// 退避会把单条命令拖慢，调用方自己的重试策略仍然保留。
+const RETRY_DELAY: Duration = Duration::from_millis(250);
+
+/// 发一个幂等请求，传输错误或 429 / 5xx 时重试一次
+///
+/// 只用于元数据 GET / HEAD。POST 不在此列：写请求重放可能重复生效，重试
+/// 必须由明确知道语义的调用方决定。
+async fn send_with_retry<F>(mut build: F, url: &str) -> Result<reqwest::Response, SourceError>
+where
+    F: FnMut() -> reqwest::RequestBuilder,
+{
+    match build().send().await {
+        Ok(response) if is_retryable_status(response.status()) => {
+            tracing::debug!(
+                %url,
+                status = response.status().as_u16(),
+                "metadata request returned a retryable status; retrying once"
+            );
+            tokio::time::sleep(RETRY_DELAY).await;
+            build().send().await.map_err(map_transport)
+        }
+        Ok(response) => Ok(response),
+        Err(err) => {
+            tracing::debug!(%url, %err, "metadata request failed; retrying once");
+            tokio::time::sleep(RETRY_DELAY).await;
+            build().send().await.map_err(map_transport)
+        }
+    }
+}
+
+/// 上游状态是否值得原样重试一次
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+/// 读取响应体，超过 [`RESPONSE_LIMIT`] 时报解码错误
+///
+/// `content_length` 只能提前拦住声明过大的响应；分块传输没有长度，必须
+/// 边读边计数，否则上限形同虚设。
+async fn read_body_limited(mut response: reqwest::Response) -> Result<Vec<u8>, SourceError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > RESPONSE_LIMIT as u64)
+    {
+        return Err(SourceError::Decode(Box::new(std::io::Error::other(
+            format!("response body exceeds {RESPONSE_LIMIT} bytes"),
+        ))));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(map_transport)? {
+        if body.len() + chunk.len() > RESPONSE_LIMIT {
+            return Err(SourceError::Decode(Box::new(std::io::Error::other(
+                format!("response body exceeds {RESPONSE_LIMIT} bytes"),
+            ))));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// 只读响应体开头 `limit` 字节并转成文本
+///
+/// 用于错误说明：不关心完整 body，也不该为了一句文案把超大响应读完。
+async fn read_text_prefix(mut response: reqwest::Response, limit: usize) -> String {
+    let mut body = Vec::new();
+    while body.len() < limit {
+        let Ok(Some(chunk)) = response.chunk().await else {
+            break;
+        };
+        let take = (limit - body.len()).min(chunk.len());
+        body.extend_from_slice(&chunk[..take]);
+        if take < chunk.len() {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&body).into_owned()
+}
+
 /// 基于 HTTP 的字节来源
 #[derive(Debug)]
 pub struct HttpByteSource {
@@ -114,7 +200,7 @@ impl ByteSource for HttpByteSource {
 const MESSAGE_LIMIT: usize = 512;
 
 async fn extract_message(response: reqwest::Response) -> Option<String> {
-    let text = response.text().await.ok()?;
+    let text = read_text_prefix(response, MESSAGE_LIMIT * 4).await;
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return None;
@@ -166,7 +252,7 @@ pub(crate) async fn get_json<T>(
 where
     T: DeserializeOwned,
 {
-    let response = client.get(url).send().await.map_err(map_transport)?;
+    let response = send_with_retry(|| client.get(url), url).await?;
     let status = response.status();
     if !status.is_success() {
         let code = status.as_u16();
@@ -178,13 +264,8 @@ where
         }
         return Err(rejection(code, extract_message(response).await));
     }
-    response.json().await.map_err(|err| {
-        if err.is_decode() {
-            SourceError::Decode(Box::new(err))
-        } else {
-            SourceError::Network(Box::new(err))
-        }
-    })
+    let body = read_body_limited(response).await?;
+    serde_json::from_slice(&body).map_err(|err| SourceError::Decode(Box::new(err)))
 }
 
 /// POST 一段 JSON body 并反序列化 JSON 响应
@@ -214,13 +295,8 @@ where
     if !status.is_success() {
         return Err(rejection(status.as_u16(), extract_message(response).await));
     }
-    response.json().await.map_err(|err| {
-        if err.is_decode() {
-            SourceError::Decode(Box::new(err))
-        } else {
-            SourceError::Network(Box::new(err))
-        }
-    })
+    let body = read_body_limited(response).await?;
+    serde_json::from_slice(&body).map_err(|err| SourceError::Decode(Box::new(err)))
 }
 
 /// GET 并读取为纯文本，用于非 JSON 的小文件（如 Forge 的 `.sha1` 侧车）
@@ -237,7 +313,7 @@ pub(crate) async fn get_text(
     url: &str,
     not_found_id: Option<VersionId>,
 ) -> Result<String, SourceError> {
-    let response = client.get(url).send().await.map_err(map_transport)?;
+    let response = send_with_retry(|| client.get(url), url).await?;
     let status = response.status();
     if !status.is_success() {
         let code = status.as_u16();
@@ -248,7 +324,8 @@ pub(crate) async fn get_text(
         }
         return Err(rejection(code, extract_message(response).await));
     }
-    response.text().await.map_err(map_transport)
+    let body = read_body_limited(response).await?;
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 /// 用 `HEAD` 取资源大小（字节）
@@ -262,7 +339,7 @@ pub(crate) async fn get_text(
 /// 网络失败或非成功状态码时返回 [`SourceError`]；仅在「服务器不返回
 /// `Content-Length`」时返回 `Ok(None)`
 pub(crate) async fn head_size(client: &Client, url: &str) -> Result<Option<u64>, SourceError> {
-    let response = client.head(url).send().await.map_err(map_transport)?;
+    let response = send_with_retry(|| client.head(url), url).await?;
     let status = response.status();
     if !status.is_success() {
         return Err(SourceError::Status {
@@ -348,5 +425,78 @@ impl RangeSource for HttpByteSource {
             ))));
         }
         Ok(Box::new(HttpBody { response }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "测试夹具，失败直接 panic 才有用"
+    )]
+
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// 读掉一个请求头，再按给定状态码与 body 回应并关闭连接
+    async fn respond(stream: &mut TcpStream, status: u16, body: &str) {
+        let mut buf = [0_u8; 1024];
+        let _ = stream.read(&mut buf).await;
+        let response = format!(
+            "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.flush().await;
+    }
+
+    /// 只回响应头，声明一个超大的 `Content-Length`
+    async fn respond_with_length(stream: &mut TcpStream, length: usize) {
+        let mut buf = [0_u8; 1024];
+        let _ = stream.read(&mut buf).await;
+        let response =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n");
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.flush().await;
+    }
+
+    /// 429 / 5xx 是瞬时失败：GET 应重试一次并拿到第二次的结果
+    #[tokio::test]
+    async fn get_retries_once_on_server_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.expect("first");
+            respond(&mut first, 503, "busy").await;
+            let (mut second, _) = listener.accept().await.expect("second");
+            respond(&mut second, 200, "ok").await;
+        });
+
+        let client = build_client().expect("client");
+        let text = get_text(&client, &format!("http://{addr}/x"), None)
+            .await
+            .expect("重试后应当成功");
+        assert_eq!(text, "ok");
+        server.await.expect("server");
+    }
+
+    /// 声明超大的响应体在读取前就被拒绝，不按 Content-Length 预分配内存
+    #[tokio::test]
+    async fn rejects_oversized_response_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            respond_with_length(&mut stream, RESPONSE_LIMIT + 1).await;
+        });
+
+        let client = build_client().expect("client");
+        let err = get_text(&client, &format!("http://{addr}/x"), None)
+            .await
+            .expect_err("超限响应应报错");
+        assert!(matches!(err, SourceError::Decode(_)), "{err:?}");
+        server.await.expect("server");
     }
 }

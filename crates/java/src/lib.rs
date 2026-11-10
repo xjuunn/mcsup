@@ -70,29 +70,117 @@ fn collect_homes() -> Vec<PathBuf> {
     homes
 }
 
+/// 单次外部命令的最长执行时间
+///
+/// 这里跑的都是「问一句就返回」的探测命令（`java -version`、`java_home -V`、
+/// `reg query`），正常是毫秒级。坏掉的 JVM、被锁住的安装目录或卡住的
+/// `update-alternatives` 不该让扫描无限等下去。
+const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// 轮询子进程状态的间隔
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+/// 子进程结束后等待管道读完的时间
+///
+/// 子进程自己已经退出，正常情况下管道立刻 EOF；留一个上限兜「孙进程还
+/// 攥着写端」这类异常，避免收尾再次无限等待。
+const PIPE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// 运行命令并捕获输出
 ///
 /// spawn 失败返回 `None` 并记 warn；`require_success` 为 `true` 且退出码非零时
 /// 同样返回 `None`——失败命令的 stdout 往往是半截或误导性文本，
 /// 拿它解析会把坏路径登记成 JVM home。
+///
+/// 超过 [`COMMAND_TIMEOUT`] 时杀掉子进程并按失败处理。
 fn run_capture(
     cmd: &mut Command,
     label: &str,
     require_success: bool,
 ) -> Option<std::process::Output> {
-    match cmd.output() {
-        Ok(output) => {
-            if require_success && !output.status.success() {
-                tracing::warn!("{label} exited with {}; discarding output", output.status);
-                return None;
-            }
-            Some(output)
-        }
+    run_capture_with_timeout(cmd, label, require_success, COMMAND_TIMEOUT)
+}
+
+/// [`run_capture`] 的可配超时版本（测试用短超时）
+fn run_capture_with_timeout(
+    cmd: &mut Command,
+    label: &str,
+    require_success: bool,
+    timeout: std::time::Duration,
+) -> Option<std::process::Output> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::sync::mpsc;
+
+    let mut child = match cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
         Err(err) => {
             tracing::warn!(?err, "failed to run {label}");
-            None
+            return None;
         }
+    };
+
+    // 必须并发读管道：子进程写满管道缓冲区后会阻塞在 write 上，永远不退出，
+    // 只轮询 `try_wait` 就会把「输出很多」误判成「卡死」。
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        let (tx, rx) = mpsc::channel();
+        if let Some(mut pipe) = pipe {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = pipe.read_to_end(&mut buf);
+                let _ = tx.send(buf);
+            });
+        }
+        rx
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|pipe| Box::new(pipe) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|pipe| Box::new(pipe) as Box<dyn Read + Send>),
+    );
+
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                tracing::warn!("{label} did not finish within {timeout:?}; killing it");
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            Ok(None) => std::thread::sleep(POLL_INTERVAL),
+            Err(err) => {
+                tracing::warn!(?err, "failed to wait for {label}");
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+
+    let collect =
+        |rx: mpsc::Receiver<Vec<u8>>| rx.recv_timeout(PIPE_DRAIN_TIMEOUT).unwrap_or_default();
+    let output = std::process::Output {
+        status: status?,
+        stdout: collect(stdout),
+        stderr: collect(stderr),
+    };
+    if require_success && !output.status.success() {
+        tracing::warn!("{label} exited with {}; discarding output", output.status);
+        return None;
     }
+    Some(output)
 }
 
 fn collect_env_home(homes: &mut Vec<PathBuf>) {
@@ -464,6 +552,39 @@ mod tests {
     #[test]
     fn extracts_major_from_legacy_8() {
         assert_eq!(extract_major("1.8.0_392").map(JavaMajor::as_i64), Some(8));
+    }
+
+    /// 超时的探测命令必须被杀掉并快速返回，不能把扫描拖死
+    #[cfg(unix)]
+    #[test]
+    fn hung_command_is_killed_after_timeout() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("60");
+        let started = std::time::Instant::now();
+        let output = run_capture_with_timeout(
+            &mut cmd,
+            "sleep",
+            false,
+            std::time::Duration::from_millis(100),
+        );
+        assert!(output.is_none(), "超时命令不应返回输出");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "超时后必须立刻返回，实际耗时 {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// 正常命令照常拿到 stdout / stderr 与退出状态
+    #[cfg(unix)]
+    #[test]
+    fn captures_command_output() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo out; echo err >&2"]);
+        let output = run_capture(&mut cmd, "sh", true).expect("command should succeed");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "out\n");
+        assert_eq!(String::from_utf8_lossy(&output.stderr), "err\n");
     }
 
     /// 目录搜索的测试：独立模块只在支持搜索的平台编译

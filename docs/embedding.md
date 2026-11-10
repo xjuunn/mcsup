@@ -299,13 +299,14 @@ backup   = ["dep:backup", "port"]
 backend  = ["dep:backend", "port"]
 file     = ["dep:file", "port"]
 java     = ["dep:java", "port"]
+modkit   = ["dep:modkit", "port"]
 provider = ["dep:provider", "port"]
 storage  = ["dep:storage", "port"]
 runtime  = ["dep:runtime", "port", "protocol"]
 transport = ["dep:transport", "protocol"]
 auth     = ["dep:auth"]
 bootstrap = ["storage", "service", "backup", "backend", "file", "java",
-             "provider", "runtime", "port", "protocol", "transport"]
+             "modkit", "provider", "runtime", "port", "protocol", "transport"]
 remote    = ["bootstrap", "transport", "runtime", "auth", "service", "protocol"]
 ```
 
@@ -341,7 +342,7 @@ Cargo 不会为依赖构建 bin target。第三方写 `mcsup = { version = "0.1"
 
 ```toml
 [dependencies]
-mcsup = { version = "0.1", default-features = false, features = ["full"] }
+mcsup = { version = "0.1", default-features = false, features = ["bootstrap"] }
 ```
 
 ### 非 Rust 第三方（Prism / HMCL / ATLauncher）

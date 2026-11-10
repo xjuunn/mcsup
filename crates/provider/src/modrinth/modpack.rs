@@ -457,13 +457,29 @@ impl ModpackExtractor for MrpackExtractor {
         let mut zip = open_archive(archive)?;
         let mut text = String::new();
         match zip.by_name(domain::server::modpack::INDEX_FILE) {
-            Ok(mut entry) => {
-                entry.read_to_string(&mut text).map_err(|err| {
-                    ModpackExtractError::Extract(format!(
-                        "read {}: {err}",
+            Ok(entry) => {
+                if entry.size() > INDEX_LIMIT {
+                    return Err(ModpackExtractError::Extract(format!(
+                        "{} is {} bytes, over the {INDEX_LIMIT}-byte limit",
+                        domain::server::modpack::INDEX_FILE,
+                        entry.size()
+                    )));
+                }
+                entry
+                    .take(INDEX_LIMIT + 1)
+                    .read_to_string(&mut text)
+                    .map_err(|err| {
+                        ModpackExtractError::Extract(format!(
+                            "read {}: {err}",
+                            domain::server::modpack::INDEX_FILE
+                        ))
+                    })?;
+                if text.len() as u64 > INDEX_LIMIT {
+                    return Err(ModpackExtractError::Extract(format!(
+                        "{} is over the {INDEX_LIMIT}-byte limit",
                         domain::server::modpack::INDEX_FILE
-                    ))
-                })?;
+                    )));
+                }
             }
             Err(ZipError::FileNotFound) => {
                 return Err(ModpackExtractError::MissingIndex(
@@ -530,6 +546,12 @@ impl ModpackExtractor for MrpackExtractor {
         Ok(())
     }
 }
+
+/// 清单最多允许多大
+///
+/// 正规 `.mrpack` 清单是 KB 级；上限只用来兜损坏或恶意归档声明的巨大条目，
+/// 避免把整个归档的大小读进内存。
+const INDEX_LIMIT: u64 = 4 * 1024 * 1024;
 
 /// 打开归档并给出统一的错误文本
 fn open_archive(archive: &Path) -> Result<ZipArchive<File>, ModpackExtractError> {
