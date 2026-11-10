@@ -1,15 +1,19 @@
 [package]
-name = "runtime"
+name = "mcsup-runtime"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish = false
+description = "Minecraft process and JVM runtime management for MCSUP"
+repository.workspace = true
+
+[lib]
+name = "runtime"
 
 [dependencies]
-domain = { version = "0.1.0", path = "../domain" }
-port = { version = "0.1.0", path = "../port" }
-protocol = { version = "0.1.0", path = "../protocol" }
+domain = { package = "mcsup-domain", version = "0.1.0", path = "../domain" }
+port = { package = "mcsup-port", version = "0.1.0", path = "../port" }
+protocol = { package = "mcsup-protocol", version = "0.1.0", path = "../protocol" }
 interprocess = "2.4.6"
 serde_json.workspace = true
 tracing.workspace = true

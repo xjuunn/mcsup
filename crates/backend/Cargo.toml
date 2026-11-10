@@ -1,26 +1,30 @@
 [package]
-name = "backend"
+name = "mcsup-backend"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish = false
+description = "Local and remote execution backends for MCSUP"
+repository.workspace = true
+
+[lib]
+name = "backend"
 
 [dependencies]
-backup = { version = "0.1.0", path = "../backup" }
-domain = { version = "0.1.0", path = "../domain" }
-port = { version = "0.1.0", path = "../port" }
-protocol = { version = "0.1.0", path = "../protocol" }
-runtime = { version = "0.1.0", path = "../runtime" }
+backup = { package = "mcsup-backup", version = "0.1.0", path = "../backup" }
+domain = { package = "mcsup-domain", version = "0.1.0", path = "../domain" }
+port = { package = "mcsup-port", version = "0.1.0", path = "../port" }
+protocol = { package = "mcsup-protocol", version = "0.1.0", path = "../protocol" }
+runtime = { package = "mcsup-runtime", version = "0.1.0", path = "../runtime" }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-transport = { version = "0.1.0", path = "../transport" }
+transport = { package = "mcsup-transport", version = "0.1.0", path = "../transport" }
 
 [lints]
 workspace = true
 
 [dev-dependencies]
-auth = { version = "0.1.0", path = "../auth" }
-tempfile.workspace = true
+auth = { package = "mcsup-auth", path = "../auth" }

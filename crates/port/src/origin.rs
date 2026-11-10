@@ -40,6 +40,14 @@ pub enum OriginError {
     /// 含 `[A-Za-z0-9_.-]` 以外的字符
     #[error("origin name has invalid character: {0}")]
     InvalidChar(String),
+    /// 形如 `.` / `..`，或首尾是 `.` / `-`
+    ///
+    /// 名字会直接成为 `{data_dir}/remotes/<name>` 的最后一段：`.` / `..`
+    /// 会让缓存目录指向上级，`remote disconnect` 删缓存时就会删到数据目录
+    /// 本体。首尾的 `.` / `-` 在 Windows 上会被静默折叠，导致配置键与目录名
+    /// 不是同一个名字。
+    #[error("origin name must not be a path-like segment: {0}")]
+    PathLike(String),
     /// 与保留字冲突
     #[error("'{0}' is a reserved origin keyword")]
     Reserved(String),
@@ -63,8 +71,10 @@ pub struct RemoteName(String);
 impl RemoteName {
     /// 校验并构造
     ///
-    /// 规则：非空、≤ [`MAX_NAME_LEN`] 字符、仅 `[A-Za-z0-9_.-]`、不是保留字。
-    /// 允许 `.` 与 `-` 是为了能直接拿主机名 / `prod-box.local` 当默认名。
+    /// 规则：非空、≤ [`MAX_NAME_LEN`] 字符、仅 `[A-Za-z0-9_.-]`、不是保留字，
+    /// 且不是 `.` / `..`、首尾不是 `.` / `-`。允许中间出现 `.` 与 `-` 是为了
+    /// 能直接拿主机名 / `prod-box.local` 当默认名；首尾不允许是因为这个名字
+    /// 会原样成为目录名。
     ///
     /// # Errors
     ///
@@ -84,6 +94,11 @@ impl RemoteName {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
         {
             return Err(OriginError::InvalidChar(raw.to_owned()));
+        }
+        // 名字会成为目录项：`.` / `..` 是目录跳转，首尾的 `.` / `-` 在
+        // Windows 上会被折叠，配置键与目录名就对不上了
+        if matches!(raw, "." | "..") || raw.starts_with(['.', '-']) || raw.ends_with(['.', '-']) {
+            return Err(OriginError::PathLike(raw.to_owned()));
         }
         if RESERVED_NAMES.contains(&raw) {
             return Err(OriginError::Reserved(raw.to_owned()));
@@ -105,6 +120,9 @@ impl fmt::Display for RemoteName {
 }
 
 /// 资源来源
+///
+/// 刻意不加 `#[non_exhaustive]`：来源决定把操作路由到本机还是某个远端，
+/// 未知来源无法安全猜测（猜错会写错主机）。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Origin {
     /// 本机
@@ -274,6 +292,22 @@ mod tests {
             Err(OriginError::TooLong(_))
         ));
         assert!(RemoteName::parse("prod-box.local_2").is_ok());
+    }
+
+    /// 名字会直接拼进 `{data_dir}/remotes/<name>`，`.` / `..` 不能是远端名
+    ///
+    /// 回归：`remote disconnect ..` 的缓存目录是 `{data_dir}/remotes/..`，
+    /// 随后的 `remove_dir_all` 会删掉 `{data_dir}/mcsup` 本身。
+    #[test]
+    fn remote_names_must_not_be_path_segments() {
+        for raw in [".", "..", ".hidden", "trailing.", "-lead", "trail-"] {
+            assert!(
+                matches!(RemoteName::parse(raw), Err(OriginError::PathLike(_))),
+                "{raw:?} 不能当远端名"
+            );
+        }
+        assert!(RemoteName::parse("prod.box").is_ok());
+        assert!(RemoteName::parse("prod_box").is_ok());
     }
 
     #[test]

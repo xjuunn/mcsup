@@ -72,6 +72,7 @@ impl std::fmt::Display for ClientId {
 /// 时只会变成负担（`docs/architecture.md`「Auth」一节）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum Permission {
     /// 读工作区 / 服务器 / Java / 备份的元数据
     Read,
@@ -121,6 +122,7 @@ impl std::fmt::Display for Permission {
 /// 角色：Admin / Operator / Viewer
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum Role {
     /// 只读
     Viewer,

@@ -24,8 +24,21 @@ use std::time::{Duration, Instant};
 /// 失败时保留的输出尾部行数
 const TAIL_LINES: usize = 20;
 
+/// 失败时保留的原始输出上限（stdout / stderr 各自）：256 KiB
+///
+/// 尾部只需要最后 [`TAIL_LINES`] 行，留一个数量级的余量，让超长行也有内容
+/// 可显示；再多就没有读者了。
+const OUTPUT_TAIL_BYTES: usize = 256 * 1024;
+
 /// 轮询子进程状态的间隔：够小以保证取消及时，够大以免空转
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// 未遇到换行时单次交付的最大字节数
+///
+/// 交付出去的行会进远端帧（`TaskEvent::Output`），而帧有 8 MiB 上限：一行
+/// 无限长时要么把对端内存吃掉，要么整帧编码失败被静默丢弃。超出这段就当成
+/// 一行交出，剩下的继续攒——截断显示优于拖垮进程。
+const MAX_PENDING_LINE: usize = 4 * 1024;
 
 /// 安装器允许的最长运行时间
 ///
@@ -266,10 +279,23 @@ fn drain(
     while let Ok((is_stdout, chunk)) = rx.try_recv() {
         if is_stdout {
             stdout.extend_from_slice(&chunk);
+            keep_tail(stdout);
         } else {
             stderr.extend_from_slice(&chunk);
+            keep_tail(stderr);
         }
         pending.push(&chunk, output);
+    }
+}
+
+/// 原始输出只留末尾一段：失败时只用最后 [`TAIL_LINES`] 行
+///
+/// 不裁剪就是「安装器输出多少，agent 就常驻多少」：一个刷屏的安装器跑满
+/// 超时上限能吃掉几个 GB。尾部之外的字节没有任何读者。
+fn keep_tail(buf: &mut Vec<u8>) {
+    if buf.len() > OUTPUT_TAIL_BYTES {
+        let excess = buf.len() - OUTPUT_TAIL_BYTES;
+        buf.drain(..excess);
     }
 }
 
@@ -300,6 +326,12 @@ impl LineBuffer {
             if !line.is_empty() {
                 sink.on_output(&String::from_utf8_lossy(&line));
             }
+        }
+        // 迟迟不换行的长行也要交出：安装器的进度条、二进制杂音可能一直不写
+        // 换行，没有这一步 `partial` 会跟着输出总量一起涨到进程退出。
+        while self.partial.len() > MAX_PENDING_LINE {
+            let head: Vec<u8> = self.partial.drain(..MAX_PENDING_LINE).collect();
+            sink.on_output(&String::from_utf8_lossy(&head));
         }
     }
 
@@ -784,6 +816,44 @@ mod tests {
             sink.0.into_inner().expect("lock"),
             vec!["downloading".to_owned(), "second".to_owned()]
         );
+    }
+
+    /// 迟迟不换行的长行必须分段交出，不能让缓冲跟着输出总量一起涨
+    ///
+    /// 回归：`LineBuffer` 只按换行切行，安装器写一整段无换行的输出时
+    /// `partial` 会一直增长；这些行还会进远端 `TaskEvent::Output` 帧。
+    #[test]
+    fn line_buffer_bounds_unterminated_line() {
+        struct Collector(std::sync::Mutex<Vec<String>>);
+        impl InstallerOutputSink for Collector {
+            fn on_output(&self, line: &str) {
+                self.0.lock().expect("lock").push(line.to_owned());
+            }
+        }
+
+        let sink = Collector(std::sync::Mutex::new(Vec::new()));
+        let mut buffer = LineBuffer::default();
+        let blob = vec![b'x'; MAX_PENDING_LINE * 2 + 16];
+        buffer.push(&blob, Some(&sink));
+        let lines = sink.0.lock().expect("lock");
+        // 两段满行已交出，剩余不足一段的尾巴仍留在缓冲里
+        assert_eq!(lines.len(), 2, "{}", lines.len());
+        assert!(lines.iter().all(|line| line.len() == MAX_PENDING_LINE));
+        drop(lines);
+        assert_eq!(buffer.partial.len(), 16);
+    }
+
+    /// 原始输出只留尾部：失败时只需要最后几行
+    #[test]
+    fn captured_output_is_truncated_to_tail() {
+        let mut buf = vec![b'a'; OUTPUT_TAIL_BYTES + 128];
+        keep_tail(&mut buf);
+        assert_eq!(buf.len(), OUTPUT_TAIL_BYTES);
+        assert!(buf.iter().rev().take(128).all(|byte| *byte == b'a'));
+
+        let mut small = b"ok".to_vec();
+        keep_tail(&mut small);
+        assert_eq!(small, b"ok");
     }
 
     /// 退出码 0 但没有产物 → NoOutput（退出码 0 不等于装好了）

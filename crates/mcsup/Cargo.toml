@@ -16,20 +16,20 @@ categories = ["command-line-utilities", "database", "network-programming"]
 workspace = true
 
 [dependencies]
-auth = { path = "../auth", version = "0.1.0", optional = true }
-domain = { path = "../domain", version = "0.1.0", optional = true }
-port = { path = "../port", version = "0.1.0", optional = true }
-protocol = { path = "../protocol", version = "0.1.0", optional = true }
-service = { path = "../service", version = "0.1.0", optional = true }
-backup = { path = "../backup", version = "0.1.0", optional = true }
-backend = { path = "../backend", version = "0.1.0", optional = true }
-transport = { path = "../transport", version = "0.1.0", optional = true }
-file = { path = "../file", version = "0.1.0", optional = true }
-java = { path = "../java", version = "0.1.0", optional = true }
-modkit = { path = "../modkit", version = "0.1.0", optional = true }
-provider = { path = "../provider", version = "0.1.0", optional = true }
-storage = { path = "../storage", version = "0.1.0", optional = true }
-runtime = { path = "../runtime", version = "0.1.0", optional = true }
+auth = { package = "mcsup-auth", path = "../auth", version = "0.1.0", optional = true }
+domain = { package = "mcsup-domain", path = "../domain", version = "0.1.0", optional = true }
+port = { package = "mcsup-port", path = "../port", version = "0.1.0", optional = true }
+protocol = { package = "mcsup-protocol", path = "../protocol", version = "0.1.0", optional = true }
+service = { package = "mcsup-service", path = "../service", version = "0.1.0", optional = true }
+backup = { package = "mcsup-backup", path = "../backup", version = "0.1.0", optional = true }
+backend = { package = "mcsup-backend", path = "../backend", version = "0.1.0", optional = true }
+transport = { package = "mcsup-transport", path = "../transport", version = "0.1.0", optional = true }
+file = { package = "mcsup-file", path = "../file", version = "0.1.0", optional = true }
+java = { package = "mcsup-java", path = "../java", version = "0.1.0", optional = true }
+modkit = { package = "mcsup-modkit", path = "../modkit", version = "0.1.0", optional = true }
+provider = { package = "mcsup-provider", path = "../provider", version = "0.1.0", optional = true }
+storage = { package = "mcsup-storage", path = "../storage", version = "0.1.0", optional = true }
+runtime = { package = "mcsup-runtime", path = "../runtime", version = "0.1.0", optional = true }
 thiserror = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 # 远端安装（`ServerInstall` 帧）要在同步的分发线程里跑 async 的下载编排：

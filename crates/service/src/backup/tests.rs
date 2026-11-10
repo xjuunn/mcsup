@@ -344,6 +344,14 @@ impl Fixture {
             )
             .expect("create")
     }
+
+    /// 从快照索引导出完整记录：结果类型只回摘要，清单仍在执行备份的机器上
+    fn load(&self, id: &SnapshotId) -> Snapshot {
+        use port::SnapshotRepository;
+        backup::SnapshotIndex::new(&self.backups_root())
+            .get(id)
+            .expect("snapshot record")
+    }
 }
 
 // ---- create ----
@@ -360,7 +368,7 @@ fn create_backs_up_everything_by_default() {
 
     let outcome = fx.create();
     // 4 = 3 个业务文件 + mcsup.json（恢复为独立目录时要用）
-    assert_eq!(outcome.snapshot.content.len(), 4);
+    assert_eq!(outcome.snapshot.files, 4);
     assert_eq!(outcome.snapshot.added, 4);
     assert_eq!(outcome.snapshot.status, SnapshotStatus::Complete);
     assert_eq!(outcome.snapshot.server, "alpha");
@@ -399,8 +407,8 @@ fn create_uses_server_scope_setting() {
     fx.set_scope("world");
 
     let outcome = fx.create();
-    let paths: Vec<&str> = outcome
-        .snapshot
+    let loaded = fx.load(&outcome.snapshot.id);
+    let paths: Vec<&str> = loaded
         .content
         .entries()
         .iter()
@@ -429,7 +437,7 @@ fn create_scope_option_overrides_setting() {
         )
         .expect("create");
     // world + plugins + mcsup.json
-    assert_eq!(outcome.snapshot.content.len(), 3);
+    assert_eq!(outcome.snapshot.files, 3);
 }
 
 /// 增量：未改动的文件走复用提示，第二次备份不新增对象
@@ -454,11 +462,11 @@ fn changed_file_produces_new_object() {
     let fx = Fixture::new(FakeSupervisor::stopped());
     fx.write("world/level.dat", b"v1");
     let first = fx.create();
+    let first_loaded = fx.load(&first.snapshot.id);
     fx.write("world/level.dat", b"v2-different");
 
     // 复用提示依赖 (size, mtime)：显式确认这两项确实变了
-    let before = first
-        .snapshot
+    let before = first_loaded
         .content
         .entries()
         .iter()
@@ -470,8 +478,8 @@ fn changed_file_produces_new_object() {
 
     let second = fx.create();
     assert_eq!(second.snapshot.added, 1);
-    let changed = second
-        .snapshot
+    let second_loaded = fx.load(&second.snapshot.id);
+    let changed = second_loaded
         .content
         .entries()
         .iter()
@@ -491,9 +499,9 @@ fn deleted_file_is_recorded_as_tombstone() {
 
     let second = fx.create();
     // level.dat + mcsup.json 仍在，old.dat 进墓碑
-    assert_eq!(second.snapshot.content.len(), 2);
-    let deleted: Vec<&str> = second
-        .snapshot
+    assert_eq!(second.snapshot.files, 2);
+    let second_loaded = fx.load(&second.snapshot.id);
+    let deleted: Vec<&str> = second_loaded
         .content
         .deleted()
         .iter()
@@ -1000,7 +1008,7 @@ fn verify_reports_healthy_snapshot() {
     assert_eq!(last, 3);
     // 字节数 = 各对象大小之和（mcsup.json 大小随内容变化，不做硬编码）
     let mut expected = 0u64;
-    for (_, hash) in outcome.snapshot.content.entries() {
+    for (_, hash) in fx.load(&outcome.snapshot.id).content.entries() {
         expected += crate::fs::metadata(CasStore::new(&fx.backups_root()).object_path(hash))
             .expect("object")
             .len();
@@ -1016,8 +1024,8 @@ fn verify_detects_missing_and_tampered_objects() {
     fx.write("a", b"alpha");
     fx.write("b", b"bravo");
     let outcome = fx.create();
-    let hashes: Vec<ContentHash> = outcome
-        .snapshot
+    let hashes: Vec<ContentHash> = fx
+        .load(&outcome.snapshot.id)
         .content
         .referenced_hashes()
         .cloned()
@@ -1070,7 +1078,15 @@ fn prune_keep_removes_oldest_and_gc_orphans() {
 
     let page = fx.service.list("alpha", Page::new(1, 10)).expect("list");
     assert_eq!(page.total, 1);
-    assert_eq!(page.items[0].content.entries()[0].1.as_str().len(), 64);
+    // 列表只回摘要：清单留在对端 / 索引里，`files` 仍可核对（f + mcsup.json）
+    assert_eq!(page.items[0].files, 2);
+    assert_eq!(
+        fx.load(&page.items[0].id).content.entries()[0]
+            .1
+            .as_str()
+            .len(),
+        64
+    );
 }
 
 #[test]
@@ -1216,8 +1232,8 @@ fn prune_fails_closed_when_snapshot_record_is_corrupt() {
     let fx = Fixture::new(FakeSupervisor::stopped());
     fx.write("a", b"only-here");
     let outcome = fx.create();
-    let hash = outcome
-        .snapshot
+    let hash = fx
+        .load(&outcome.snapshot.id)
         .content
         .referenced_hashes()
         .next()

@@ -23,6 +23,24 @@ pub const MAX_LOG_WAIT: Duration = Duration::from_secs(30);
 /// 备份前等待 `save-all` 落盘的上限：30 秒
 pub const MAX_FLUSH_WAIT: Duration = Duration::from_secs(30);
 
+/// 单次日志请求的行数上限
+///
+/// 远端帧里的 `lines` 是 `usize`，对端可以传 `usize::MAX`。日志扫描按行
+/// 收集，行数不夹紧会让一个格式正确的请求把 agent 内存打满。
+pub const MAX_LOG_LINES: usize = 10_000;
+
+/// 日志尾部 / 单次增量读取的字节上限：8 MiB
+///
+/// 行数不是唯一维度：一行可以不换行地写到几 GB，只夹行数仍会把整个文件读进
+/// 内存。超过上限时只保留末尾部分，日志是排障数据，截断优于拖垮进程。
+pub const MAX_LOG_TAIL_BYTES: usize = 8 * 1024 * 1024;
+
+/// 把外部给的日志行数夹到 [`MAX_LOG_LINES`]
+#[must_use]
+pub fn log_lines(lines: usize) -> usize {
+    lines.min(MAX_LOG_LINES)
+}
+
 /// 把外部给的停机宽限秒数夹到 [`MAX_STOP_GRACE`]
 #[must_use]
 pub fn stop_grace(secs: u64) -> Duration {

@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use domain::backup::{
     BackupScope, ContentHash, Page, RelPath, RestoreTarget, RetentionInput, Snapshot, SnapshotId,
-    SnapshotStatus, ensure_restore_stopped,
+    SnapshotStatus, SnapshotSummary, ensure_restore_stopped,
 };
 use port::{
     Backend, ContentStore, ScanError, ScanRules, SnapshotRepository, SnapshotStoreError,
@@ -256,8 +256,8 @@ pub struct CreateOptions {
 /// `backup create` 的结果
 #[derive(Debug, Clone)]
 pub struct CreateOutcome {
-    /// 新建的快照
-    pub snapshot: Snapshot,
+    /// 新建的快照摘要（内容清单留在执行备份的机器上）
+    pub snapshot: SnapshotSummary,
     /// 扫描期跳过的条目数（运行期文件、范围外、符号链接）
     pub skipped: usize,
 }
@@ -265,8 +265,8 @@ pub struct CreateOutcome {
 /// 快照列表的一页
 #[derive(Debug, Clone)]
 pub struct SnapshotPage {
-    /// 本页快照（按时间倒序：最新在前）
-    pub items: Vec<Snapshot>,
+    /// 本页快照摘要（按时间倒序：最新在前）
+    pub items: Vec<SnapshotSummary>,
     /// 该服务器的快照总数
     pub total: usize,
     /// 当前页码
@@ -286,8 +286,8 @@ impl SnapshotPage {
 /// `backup restore` 的结果
 #[derive(Debug, Clone)]
 pub struct RestoreOutcome {
-    /// 被恢复的快照
-    pub snapshot: Snapshot,
+    /// 被恢复的快照摘要
+    pub snapshot: SnapshotSummary,
     /// 恢复目标目录
     pub destination: PathBuf,
     /// 写回的文件数
@@ -306,8 +306,8 @@ pub struct RestoreOutcome {
 /// `backup delete` 的结果
 #[derive(Debug, Clone)]
 pub struct DeleteOutcome {
-    /// 被删除的快照
-    pub snapshot: Snapshot,
+    /// 被删除的快照摘要
+    pub snapshot: SnapshotSummary,
     /// 该快照释放的 CAS 对象数（引用计数归零、可被 prune 回收的部分）
     pub orphaned: usize,
 }
@@ -315,8 +315,8 @@ pub struct DeleteOutcome {
 /// `backup verify` 的结果
 #[derive(Debug, Clone)]
 pub struct VerifyOutcome {
-    /// 校验的快照
-    pub snapshot: Snapshot,
+    /// 校验的快照摘要
+    pub snapshot: SnapshotSummary,
     /// 被引用的对象数（去重后）
     pub objects: usize,
     /// 校验通过的字节数
@@ -336,8 +336,8 @@ impl VerifyOutcome {
 /// `backup prune` 的结果
 #[derive(Debug, Clone, Default)]
 pub struct PruneOutcome {
-    /// 被删掉的快照
-    pub removed: Vec<Snapshot>,
+    /// 被删掉的快照摘要
+    pub removed: Vec<SnapshotSummary>,
     /// 回收的 CAS 对象数
     pub objects_reclaimed: usize,
     /// 回收的字节数
@@ -595,7 +595,10 @@ impl BackupService {
                 snapshot: snapshot.id.as_str().to_owned(),
                 added_bytes: snapshot.added_bytes,
             });
-        Ok(CreateOutcome { snapshot, skipped })
+        Ok(CreateOutcome {
+            snapshot: snapshot.summary(),
+            skipped,
+        })
     }
 
     /// 服务器配置的备份范围；服务器不存在时退回「全部」
@@ -684,7 +687,7 @@ impl BackupService {
         let total = items.len();
         let window = Page::new(page.number, page.size);
         Ok(SnapshotPage {
-            items: window.slice(&items).to_vec(),
+            items: window.slice(&items).iter().map(Snapshot::summary).collect(),
             total,
             page: window.number,
             page_size: window.size,
@@ -798,7 +801,7 @@ impl BackupService {
             self.registry.assign_new_identity(&destination, new_name)?;
         }
         Ok(RestoreOutcome {
-            snapshot,
+            snapshot: snapshot.summary(),
             destination: outcome.destination,
             files: outcome.files,
             bytes: outcome.bytes,
@@ -844,7 +847,10 @@ impl BackupService {
             .keys()
             .filter(|hash| !after.contains_key(*hash))
             .count();
-        Ok(DeleteOutcome { snapshot, orphaned })
+        Ok(DeleteOutcome {
+            snapshot: snapshot.summary(),
+            orphaned,
+        })
     }
 
     // ---- verify ----
@@ -894,7 +900,7 @@ impl BackupService {
         }
         let broken = layout.cas.verify(&hashes, on_progress)?;
         Ok(VerifyOutcome {
-            snapshot,
+            snapshot: snapshot.summary(),
             objects: hashes.len(),
             bytes,
             broken,
@@ -973,7 +979,7 @@ impl BackupService {
             dry_run,
         };
         for snapshot in candidates.iter().filter(|s| victims.contains(&s.id)) {
-            outcome.removed.push(snapshot.clone());
+            outcome.removed.push(snapshot.summary());
         }
         if dry_run {
             let live = layout.cas.list()?;

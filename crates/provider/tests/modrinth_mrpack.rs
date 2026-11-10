@@ -215,6 +215,25 @@ fn non_zip_reports_error() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// 声明超大的清单不读进内存：损坏或恶意归档不该拖垮进程
+#[test]
+fn rejects_oversized_index() {
+    let dir = scratch("oversized-index");
+    let archive = dir.join("oversized.mrpack");
+    let payload = vec![b' '; 4 * 1024 * 1024 + 1];
+    build_archive(&archive, &[("modrinth.index.json", payload.as_slice())]);
+
+    let err = MrpackExtractor::new()
+        .read_index(&archive)
+        .expect_err("超限清单应报错");
+    assert!(
+        matches!(err, port::modpack::ModpackExtractError::Extract(_)),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("limit"), "{err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// 外部真实夹具（可选）：设 `MCSUP_MRPACK_FIXTURE=/path/x.mrpack` 时验证
 #[test]
 fn reads_external_fixture_when_provided() {

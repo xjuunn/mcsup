@@ -10,6 +10,9 @@ use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use tempfile::TempDir;
 
+/// 不可达代理：让上游请求确定失败，不依赖本机网络与上游可用性
+const DEAD_PROXY: &str = "http://127.0.0.1:1";
+
 /// 隔离用临时 HOME
 ///
 /// Windows 上 `dirs::data_dir()` 走 Known Folder API，按 `%USERPROFILE%` 展开
@@ -415,9 +418,9 @@ fn server_purge_from_inside_dir_is_localized() {
     );
     assert_eq!(init.status.code(), Some(0), "stderr: {}", stderr(&init));
 
-    // 建一台「已登记但没装成核心」的服务器：`--version 99.99` 在上游不存在，
-    // 登记仍然落库（文档：下载失败保留已注册结果），退出码 3。这样不必真去
-    // 下载 JAR——cwd 闸在装核心之前就会命中。
+    // 建一台「已登记但没装成核心」的服务器：死代理让下载确定失败，
+    // 登记仍然落库（文档：下载失败保留已注册结果），退出码 5。不依赖
+    // 真实网络，也不依赖上游是否收录某个版本。
     let create = run_full(
         home.path(),
         home.path(),
@@ -428,15 +431,19 @@ fn server_purge_from_inside_dir_is_localized() {
             "--variant",
             "vanilla",
             "--version",
-            "99.99",
+            "1.21.1",
             "--output",
             "json",
         ],
-        &[],
+        &[
+            ("HTTPS_PROXY", DEAD_PROXY),
+            ("HTTP_PROXY", DEAD_PROXY),
+            ("ALL_PROXY", DEAD_PROXY),
+        ],
     );
     assert_eq!(
         create.status.code(),
-        Some(3),
+        Some(5),
         "预置服务器应「已登记但安装失败」: {}",
         stderr(&create)
     );
@@ -567,6 +574,16 @@ fn workspace_doctor_missing_dir_exits_1() {
 
     let out = run(home.path(), &["workspace", "doctor", "--output", "json"]);
     assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    // JSON 是机器契约：message 不随界面语言变化
+    let zh = run(
+        home.path(),
+        &["workspace", "doctor", "--output", "json", "--lang", "zh"],
+    );
+    let en = run(
+        home.path(),
+        &["workspace", "doctor", "--output", "json", "--lang", "en"],
+    );
+    assert_eq!(zh.stdout, en.stdout, "workspace doctor JSON 不得随语言变化");
     let payload: serde_json::Value = serde_json::from_slice(&out.stdout).expect("JSON");
     assert_eq!(payload["has_errors"], true);
     let findings = payload["findings"].as_array().expect("array");
@@ -979,6 +996,42 @@ fn json_stdout_is_language_independent() {
     assert!(zh.status.success(), "stderr: {}", stderr(&zh));
     assert_eq!(zh.stdout, en.stdout, "JSON 输出不得随语言变化");
     assert!(zh.stderr.is_empty(), "stderr: {}", stderr(&zh));
+}
+
+/// `doctor` 的 JSON 文案是机器契约：message / fix 不随界面语言变化
+#[test]
+fn doctor_json_is_language_independent() {
+    let home = temp_home();
+    let config = home.path().join("config.toml");
+    std::fs::write(&config, "java-source = \"nope\"\n").expect("写入非法配置");
+    let config_path = config.to_str().expect("utf8");
+    let zh = run(
+        home.path(),
+        &[
+            "--config",
+            config_path,
+            "doctor",
+            "--output",
+            "json",
+            "--lang",
+            "zh",
+        ],
+    );
+    let en = run(
+        home.path(),
+        &[
+            "--config",
+            config_path,
+            "doctor",
+            "--output",
+            "json",
+            "--lang",
+            "en",
+        ],
+    );
+    assert_eq!(zh.status.code(), en.status.code());
+    assert_eq!(zh.status.code(), Some(1), "stderr: {}", stderr(&zh));
+    assert_eq!(zh.stdout, en.stdout, "doctor JSON 不得随语言变化");
 }
 
 /// `--version` 走中文化后的帮助通道，仍退 0 且只写 stdout

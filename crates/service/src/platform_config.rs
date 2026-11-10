@@ -109,6 +109,9 @@ pub struct RemoteRecord {
 }
 
 /// 远端接入方式
+///
+/// 刻意不加 `#[non_exhaustive]`：每种方式要装配不同的连接实现（SSH 隧道或
+/// 直连），未知方式不能静默按其中一种连接。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RemoteVia {
@@ -140,6 +143,7 @@ impl std::fmt::Display for RemoteVia {
 /// 每个变体锁死一个键名与一种类型：键表（[`ConfigKey::ALL`]）是 `show` /
 /// `set` 的枚举来源，`--key` 拼错时能列出全部可用键。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ConfigKey {
     /// `data-dir`：平台数据目录
     DataDir,
@@ -212,6 +216,7 @@ impl std::fmt::Display for ConfigKey {
 /// 的「判定与文案分离」）。面向用户的中文说明由入口用 [`Self::kind`] 与各字段
 /// 自行拼装。
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum ConfigValueError {
     /// 路径为空或无法归一化
     #[error("{key} is not a usable path: {value} ({reason})")]
@@ -271,6 +276,7 @@ impl ConfigValueError {
 
 /// [`ConfigValueError`] 的可本地化种类
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ConfigValueErrorKind {
     /// 路径不可用
     Path,
@@ -285,6 +291,7 @@ pub enum ConfigValueErrorKind {
 /// 与 [`ConfigValueError`]（单个键的取值问题）分开：调用方对「整份文件读不懂」
 /// 与「某个键的值不对」的处置不同，混成一个 `String` 就再也分不开。
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum ConfigDocumentError {
     /// TOML 语法错误
     #[error("config file is not valid TOML: {reason}")]

@@ -33,7 +33,7 @@ pub mod handler;
 pub mod identity;
 pub mod server;
 pub mod session;
-pub mod tls;
+mod tls;
 
 pub use client::{Client, Probe};
 pub use error::TransportError;

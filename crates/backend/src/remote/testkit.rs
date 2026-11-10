@@ -133,7 +133,7 @@ pub(crate) mod mcsup_agent_shim {
         /// 服务器身份 → 运行状态（supervisor 垫片）
         running: Mutex<Vec<RunningServer>>,
         /// 备份垫片的快照索引
-        snapshots: Mutex<Vec<protocol::remote::wire::WireSnapshot>>,
+        snapshots: Mutex<Vec<protocol::remote::wire::WireSnapshotSummary>>,
         /// `server.properties` 垫片：键值表（保持写入顺序）
         props: Mutex<Vec<(String, String)>>,
     }
@@ -143,8 +143,8 @@ pub(crate) mod mcsup_agent_shim {
 
     impl MemAgent {
         /// 一条固定内容的快照（id 随机后缀避免同秒撞名）
-        fn snapshot(server: &str) -> protocol::remote::wire::WireSnapshot {
-            protocol::remote::wire::WireSnapshot {
+        fn snapshot(server: &str) -> protocol::remote::wire::WireSnapshotSummary {
+            protocol::remote::wire::WireSnapshotSummary {
                 id: format!("20990101t000000-{:06x}", fastrand()),
                 workspace_id: "survival".to_owned(),
                 server: server.to_owned(),
@@ -152,9 +152,8 @@ pub(crate) mod mcsup_agent_shim {
                 parent: None,
                 scope: Vec::new(),
                 status: "complete".to_owned(),
-                entries: vec![("world/level.dat".to_owned(), "a".repeat(64))],
-                deleted: Vec::new(),
-                stamps: vec![("world/level.dat".to_owned(), 100, 1)],
+                files: 1,
+                deleted: 0,
                 added: 1,
                 reused: 0,
                 total_bytes: 100,

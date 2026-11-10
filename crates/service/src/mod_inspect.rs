@@ -73,6 +73,8 @@ pub struct ModReport {
 /// 加载器在解析阶段就终止启动，服务端日志里只剩一行英文报错，用户得自己
 /// 把 modid 对上文件名。这里把「为什么起不来」结构化：`start` 的预检与
 /// 整合包装完的复核共用同一份结论，两处不会各判一套。
+/// 刻意不加 `#[non_exhaustive]`：每个原因都要映射成线上 `kind` 与入口提示，
+/// 未知原因不能静默降级成空的阻断说明。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModBlocker {
     /// 缺少必需依赖

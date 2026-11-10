@@ -423,7 +423,7 @@ impl SnapshotContent {
         self
     }
 
-    /// 备份时的 `(路径, 大小, 修改时间秒)` 观察值
+    /// 备份时的 `(路径, 大小, 修改时间纳秒)` 观察值
     #[must_use]
     pub fn stamps(&self) -> &[(RelPath, u64, i64)] {
         &self.stamps
@@ -586,9 +586,85 @@ impl Snapshot {
     pub fn is_redundant(&self) -> bool {
         self.added == 0 && !self.content.is_empty()
     }
+
+    /// 去掉内容清单的元数据视图
+    ///
+    /// 列表 / 摘要只说明「这份快照是什么样」，不说明「它由哪些文件组成」：
+    /// 一份几万文件的快照，清单本身就有几 MB，一页几十份必然超出单帧上限。
+    /// 清单属于拥有这些文件的机器（CAS 也在那里），跨机器只需要条数。
+    #[must_use]
+    pub fn summary(&self) -> SnapshotSummary {
+        SnapshotSummary {
+            id: self.id.clone(),
+            workspace_id: self.workspace_id.clone(),
+            server: self.server.clone(),
+            label: self.label.clone(),
+            parent: self.parent.clone(),
+            scope: self.scope.clone(),
+            status: self.status,
+            files: self.content.len(),
+            deleted: self.content.deleted().len(),
+            added: self.added,
+            reused: self.reused,
+            total_bytes: self.total_bytes,
+            added_bytes: self.added_bytes,
+            server_online: self.server_online,
+            created_at: self.created_at,
+        }
+    }
+}
+
+/// 快照元数据（不含内容清单）
+///
+/// [`Snapshot`] 去掉 `content` 后的视图：跨机器传递列表 / 摘要时用它。
+/// `files` / `deleted` 保留清单的规模信息，`SnapshotContent` 本身留在
+/// 拥有这些文件的机器上。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotSummary {
+    /// 快照 id
+    pub id: SnapshotId,
+    /// 所属工作区（CAS 与快照目录的归属）
+    pub workspace_id: String,
+    /// 所属服务器名
+    pub server: String,
+    /// 用户标签，如 `before-upgrade`
+    pub label: Option<String>,
+    /// 父快照：增量基线；首份为 `None`
+    pub parent: Option<SnapshotId>,
+    /// 备份范围
+    pub scope: BackupScope,
+    /// 状态
+    pub status: SnapshotStatus,
+    /// 条目数（清单规模，不是清单本身）
+    pub files: usize,
+    /// 删除墓碑数
+    pub deleted: usize,
+    /// 本次新建的 CAS 对象数（父快照中没有的哈希）
+    pub added: usize,
+    /// 复用已存在 CAS 对象的文件数
+    pub reused: usize,
+    /// 逻辑总字节数（文件大小之和）
+    pub total_bytes: u64,
+    /// 本次实际写入 CAS 的字节数（增量净增）
+    pub added_bytes: u64,
+    /// 备份时服务器是否在运行（决定 `save-off` 是否被发过）
+    pub server_online: bool,
+    /// Unix 秒
+    pub created_at: i64,
+}
+
+impl SnapshotSummary {
+    /// 逻辑大小是否全部来自复用（与 [`Snapshot::is_redundant`] 同一判定）
+    #[must_use]
+    pub fn is_redundant(&self) -> bool {
+        self.added == 0 && self.files > 0
+    }
 }
 
 /// 恢复目标：原地，或恢复为一个新服务
+///
+/// 刻意不加 `#[non_exhaustive]`：未知目标无法安全落到「原地」或「新目录」——
+/// 前者会覆盖现有服务器，后者会写错落点，两种猜测都不能接受。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RestoreTarget {
     /// 覆盖原服务器目录

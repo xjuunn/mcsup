@@ -46,7 +46,7 @@ fn create_then_list_roundtrips() {
         created.snapshot.status,
         domain::backup::SnapshotStatus::Complete
     );
-    assert_eq!(created.snapshot.content.len(), 1);
+    assert_eq!(created.snapshot.files, 1);
 
     let page = remote.list(id, Page::new(1, 20)).expect("list");
     assert_eq!(page.total, 1);

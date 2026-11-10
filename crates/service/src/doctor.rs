@@ -166,6 +166,9 @@ impl std::fmt::Display for CheckKind {
 }
 
 /// 严重程度
+///
+/// 刻意不加 `#[non_exhaustive]`：等级直接决定退出码与 `--strict` 判定，
+/// 未知等级不能静默按「警告」放过。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
     /// 需要处理；doctor 以非零退出

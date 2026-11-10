@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
-# crates/mcsup 是唯一发布单元；apps/* 是并行 bin 入口，不进 crates.io。
+# crates/* 全部发布（package 名 mcsup-*）；apps/* 是并行 bin 入口，不进
+# crates.io。发布顺序与前置条件见 .github/workflows/publish.yml。
 # 新增成员时同步 scripts/check-architecture.sh 的允许集合表。
 members = ["apps/agent","apps/bench","apps/cli","apps/dev","crates/auth","crates/backend","crates/backup","crates/domain", "crates/file","crates/java", "crates/mcsup", "crates/modkit", "crates/port", "crates/protocol", "crates/provider", "crates/runtime", "crates/service", "crates/storage", "crates/testkit", "crates/transport"]
 
@@ -11,6 +12,7 @@ edition = "2024"
 # 不再用「pid 存活 + 删文件」的存在性锁
 rust-version = "1.89"
 license = "MIT"
+repository = "https://github.com/xjuunn/mcsup"
 
 # CI 的 clippy 步骤以 `-D warnings` 运行，rustc 与 clippy 的 warn 都会让它失败。
 # 版本统一在此声明（含 features 基线），成员一律 `xxx.workspace = true`，

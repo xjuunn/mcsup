@@ -49,6 +49,13 @@ pub const TTL: Duration = Duration::from_secs(30);
 /// 刷新锁文件名（放在远端目录下，只创建不删除）
 const LOCK_FILE: &str = "refresh.lock";
 
+/// 写入锁文件名
+///
+/// 与刷新锁分开：刷新锁覆盖「一次网络往返」，持有时间长且可以放弃；写入锁
+/// 只覆盖「一次落盘」，必须串行，避免前台的写穿透与后台刷新各写一半。
+/// 与刷新锁一样只创建不删除。
+const WRITE_LOCK_FILE: &str = "write.lock";
+
 /// 一次同步的元信息
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SyncState {
@@ -164,6 +171,11 @@ impl RemoteCache {
     ///
     /// 目录建不出来或写盘失败时返回 [`RepositoryError::Storage`]
     pub fn mark_synced(&self, now: i64) -> Result<(), RepositoryError> {
+        let _guard = self.lock_write()?;
+        self.mark_synced_locked(now)
+    }
+
+    fn mark_synced_locked(&self, now: i64) -> Result<(), RepositoryError> {
         let generation = self.generation().saturating_add(1);
         self.write_state(&SyncState {
             last_sync: Some(now),
@@ -181,6 +193,7 @@ impl RemoteCache {
     ///
     /// 目录建不出来或写盘失败时返回 [`RepositoryError::Storage`]
     pub fn mark_failed(&self, message: &str) -> Result<(), RepositoryError> {
+        let _guard = self.lock_write()?;
         let mut state = self.state().unwrap_or_default();
         state.last_error = Some(message.to_owned());
         state.generation = state.generation.saturating_add(1);
@@ -261,7 +274,8 @@ impl RemoteCache {
     ///
     /// 任一份写盘失败时返回 [`RepositoryError::Storage`]
     pub fn store(&self, snapshot: &Snapshot) -> Result<(), RepositoryError> {
-        self.write_snapshot(snapshot)
+        let _guard = self.lock_write()?;
+        self.write_snapshot_locked(snapshot)
     }
 
     /// 只在缓存自 `expected` 代次以来没被写过时整体落盘
@@ -281,10 +295,13 @@ impl RemoteCache {
         snapshot: &Snapshot,
         expected: u64,
     ) -> Result<bool, RepositoryError> {
+        // 代次检查与落盘必须在同一把锁里：只检查不入锁，另一进程可以在检查
+        // 与写入之间提交一份更新的缓存，随后被这一轮整份覆盖
+        let _guard = self.lock_write()?;
         if self.generation() != expected {
             return Ok(false);
         }
-        self.write_snapshot(snapshot)?;
+        self.write_snapshot_locked(snapshot)?;
         Ok(true)
     }
 
@@ -300,8 +317,9 @@ impl RemoteCache {
     ///
     /// 写盘失败时返回 [`RepositoryError::Storage`]
     pub fn store_workspaces(&self, items: &[WireWorkspace]) -> Result<(), RepositoryError> {
+        let _guard = self.lock_write()?;
         self.write("workspaces.json", &items)?;
-        self.mark_synced(now_secs())
+        self.mark_synced_locked(now_secs())
     }
 
     /// 只换服务器列表，见 [`Self::store_workspaces`]
@@ -310,8 +328,9 @@ impl RemoteCache {
     ///
     /// 写盘失败时返回 [`RepositoryError::Storage`]
     pub fn store_servers(&self, items: &[WireServer]) -> Result<(), RepositoryError> {
+        let _guard = self.lock_write()?;
         self.write("servers.json", &items)?;
-        self.mark_synced(now_secs())
+        self.mark_synced_locked(now_secs())
     }
 
     /// 只换 Java 列表，见 [`Self::store_workspaces`]
@@ -320,16 +339,44 @@ impl RemoteCache {
     ///
     /// 写盘失败时返回 [`RepositoryError::Storage`]
     pub fn store_javas(&self, items: &[WireJava]) -> Result<(), RepositoryError> {
+        let _guard = self.lock_write()?;
         self.write("java.json", &items)?;
-        self.mark_synced(now_secs())
+        self.mark_synced_locked(now_secs())
     }
 
-    fn write_snapshot(&self, snapshot: &Snapshot) -> Result<(), RepositoryError> {
-        self.store_workspaces(&snapshot.workspaces)?;
-        self.store_servers(&snapshot.servers)?;
-        self.store_javas(&snapshot.javas)?;
+    /// 整份落盘；调用方必须已持有写入锁
+    ///
+    /// 四份列表全部写成功后才前移元信息。旧实现逐份调用 `store_*`，每份都
+    /// 前移一次代次，最后一份失败时前几份已经「标记为已同步」，读者会拿到
+    /// 半新半旧且不判过期的缓存。
+    fn write_snapshot_locked(&self, snapshot: &Snapshot) -> Result<(), RepositoryError> {
+        self.write("workspaces.json", &snapshot.workspaces)?;
+        self.write("servers.json", &snapshot.servers)?;
+        self.write("java.json", &snapshot.javas)?;
         self.write("statuses.json", &snapshot.statuses)?;
-        self.mark_synced(snapshot.at)
+        self.mark_synced_locked(snapshot.at)
+    }
+
+    /// 拿写入锁
+    ///
+    /// 阻塞等待：临界区只有几次小文件写入，不会像刷新那样等网络。锁由文件
+    /// 句柄持有，进程退出时内核自动释放。
+    ///
+    /// # Errors
+    ///
+    /// 目录建不出来或锁文件打不开时返回 [`RepositoryError::Storage`]
+    fn lock_write(&self) -> Result<WriteLock, RepositoryError> {
+        std::fs::create_dir_all(&self.root).map_err(|err| storage(&self.root, err))?;
+        let path = self.root.join(WRITE_LOCK_FILE);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|err| storage(&path, err))?;
+        file.lock().map_err(|err| storage(&path, err))?;
+        Ok(WriteLock { _file: file })
     }
 
     /// 拿刷新锁
@@ -358,11 +405,24 @@ impl RemoteCache {
         }
     }
 
+    /// 读一份列表
+    ///
+    /// 文件缺失只有在「从未同步」时才等于空列表。已经标记同步过却少了某份
+    /// 列表，说明缓存被外部删改或写入没落全——当成空列表会让用户看到一台
+    /// 服务器都没有的假象，必须如实报损坏。
     fn read_list<T: serde::de::DeserializeOwned>(
         &self,
         file: &str,
     ) -> Result<Vec<T>, RepositoryError> {
-        Ok(read_json::<Vec<T>>(&self.root.join(file))?.unwrap_or_default())
+        let path = self.root.join(file);
+        match read_json::<Vec<T>>(&path)? {
+            Some(items) => Ok(items),
+            None if self.state()?.has_synced() => Err(RepositoryError::Corrupt(format!(
+                "cache {}: list file missing although the cache is marked synced",
+                path.display()
+            ))),
+            None => Ok(Vec::new()),
+        }
     }
 
     fn write<T: serde::Serialize>(&self, file: &str, value: &T) -> Result<(), RepositoryError> {
@@ -376,6 +436,12 @@ impl RemoteCache {
 /// 刷新锁句柄：`Drop` 时随 `File` 关闭释放
 #[derive(Debug)]
 pub struct RefreshLock {
+    _file: std::fs::File,
+}
+
+/// 写入锁句柄：`Drop` 时随 `File` 关闭释放
+#[derive(Debug)]
+struct WriteLock {
     _file: std::fs::File,
 }
 
@@ -428,20 +494,20 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, R
 fn write_atomically(path: &Path, body: &[u8]) -> Result<(), RepositoryError> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir).map_err(|err| storage(dir, err))?;
-    let file_name = path
-        .file_name()
-        .map_or_else(|| "cache".to_owned(), |n| n.to_string_lossy().into_owned());
-    let tmp = dir.join(format!(".{file_name}.tmp"));
+    // 唯一临时名：固定 `.{file}.tmp` 会让并发写的两个进程互相截断、
+    // 甚至其中一个把另一个正在写的临时文件 rename 走
+    let mut staging = tempfile::Builder::new()
+        .prefix(".cache-")
+        .tempfile_in(dir)
+        .map_err(|err| storage(dir, err))?;
     let write = || -> std::io::Result<()> {
         use std::io::Write as _;
-        let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(body)?;
-        file.sync_all()?;
-        std::fs::rename(&tmp, path)
+        staging.write_all(body)?;
+        staging.as_file_mut().sync_all()?;
+        staging.persist(path).map(|_| ()).map_err(|err| err.error)
     };
     if let Err(err) = write() {
-        // 失败时别留垃圾：临时文件残留会让下一次写入命中脏数据之外的困惑
-        let _ = std::fs::remove_file(&tmp);
+        // 暂存文件随 `NamedTempFile` 丢弃自动删除；失败时目标文件保持原样
         return Err(storage(path, err));
     }
     sync_parent(dir);
@@ -652,6 +718,58 @@ mod tests {
         }
     }
 
+    /// 已同步过却少了某份列表：不能当空列表读
+    ///
+    /// 回归：`read_list` 把缺失文件一律当空，缓存被外部删掉一份后
+    /// `mcsup server ls` 会显示「一台都没有」，还把其余列表当成新鲜数据。
+    #[test]
+    fn missing_list_after_successful_sync_is_corrupt() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let cache = cache(dir.path());
+        cache
+            .store(&Snapshot {
+                workspaces: vec![workspace("w1")],
+                servers: vec![server("web")],
+                javas: Vec::new(),
+                statuses: Vec::new(),
+                at: 100,
+            })
+            .expect("store");
+        std::fs::remove_file(cache.dir().join("servers.json")).expect("remove");
+
+        match cache.servers() {
+            Err(RepositoryError::Corrupt(message)) => {
+                assert!(message.contains("servers.json"), "{message}");
+            }
+            other => panic!("期望 Corrupt，实际 {other:?}"),
+        }
+    }
+
+    /// 一份列表写失败时，元信息必须停在旧值
+    ///
+    /// 回归：`write_snapshot` 逐份调用 `store_*`，前几份已经各自
+    /// `mark_synced`；最后一份失败后缓存被标成「刚同步过」，内容却是半新的。
+    #[test]
+    fn failed_snapshot_write_does_not_advance_the_sync_marker() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let cache = cache(dir.path());
+        cache.mark_synced(100).expect("synced");
+        let before = cache.state().expect("state");
+        // 让最后一份列表写不进去：rename 的目标是个目录
+        std::fs::create_dir_all(cache.dir().join("statuses.json")).expect("dir");
+        let snapshot = Snapshot {
+            workspaces: vec![workspace("w1")],
+            servers: vec![server("web")],
+            javas: Vec::new(),
+            statuses: Vec::new(),
+            at: 500,
+        };
+        assert!(cache.store(&snapshot).is_err(), "写不进去必须报错");
+        let after = cache.state().expect("state");
+        assert_eq!(after.last_sync, Some(100), "失败不得前移同步时间");
+        assert_eq!(after.generation, before.generation, "失败不得推进代次");
+    }
+
     #[test]
     fn refresh_lock_is_exclusive_and_released_on_drop() {
         let dir = tempfile::tempdir().expect("tmp");
@@ -705,7 +823,11 @@ mod tests {
         let leftovers: Vec<_> = std::fs::read_dir(cache.dir())
             .expect("read_dir")
             .filter_map(Result::ok)
-            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.ends_with(".tmp") || name.starts_with(".cache-")
+            })
             .collect();
         assert!(leftovers.is_empty(), "临时文件必须被 rename 或清掉");
     }

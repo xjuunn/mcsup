@@ -22,6 +22,7 @@ use thiserror::Error;
 /// 个 mod 项目的额外用途，见 [`ProviderHint`]），因此这里的分类是**面向安装
 /// 落点**的口径，而不是照抄上游字段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum ContentKind {
     /// 模组（`mods/`）
     Mod,
@@ -122,6 +123,7 @@ impl fmt::Display for ContentKind {
 
 /// 按加载器过滤的口径
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LoaderScope {
     /// 不按加载器过滤（数据包、以及原版服务端的资源包 / 光影）
     Any,
@@ -356,6 +358,9 @@ pub struct ContentIdentity {
 }
 
 /// 「已装版本 vs 候选版本」的判定结果
+///
+/// 刻意不加 `#[non_exhaustive]`：`Available` 与 `UpToDate` 处置相反，未知
+/// 判定不能静默当成「已是最新」而跳过更新。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateDecision {
     /// 按当前条件已是最优版本

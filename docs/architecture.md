@@ -81,8 +81,18 @@ mcsup/
 
 注意：
 
-`crates` 中的库名称一律使用单个单词，不使用 `mcsup-` 前缀，也没有例外
-（清单见上方目录树）。禁止使用以下名称：
+`crates` 中的库名（源码里的 crate 名，即 `[lib] name`）一律使用单个单词，
+不使用 `mcsup-` 前缀（清单见上方目录树）。发布到 crates.io 的 package 名
+必须带 `mcsup-` 前缀，两者通过 manifest 分开：
+
+```toml
+[package]
+name = "mcsup-domain"
+[lib]
+name = "domain"
+```
+
+禁止使用以下名称：
 
 ```
 core     // 内置 crate，会被遮蔽

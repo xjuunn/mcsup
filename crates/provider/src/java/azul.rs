@@ -35,6 +35,9 @@ struct PackageDto {
     download_url: String,
     #[serde(default)]
     java_version: Vec<i64>,
+    /// 归档哈希；上游字段名在不同端点不一致，名字与值都按长度识别
+    #[serde(default, alias = "sha256_hash", alias = "checksum")]
+    digest: Option<String>,
 }
 
 #[async_trait]
@@ -102,6 +105,7 @@ impl JavaReleaseSource for AzulSource {
                     vendor: JavaVendor::Zulu,
                     version,
                     package_type: request.package_type,
+                    expected_checksum: pkg.digest.as_deref().and_then(super::checksum_hex),
                 })
             })
             .collect())
@@ -137,6 +141,7 @@ mod tests {
             major: JavaMajor::parse(27).expect("27"),
             version: "27.0.0".into(),
             package_type: JavaPackageType::Jre,
+            expected_checksum: None,
         }
     }
 

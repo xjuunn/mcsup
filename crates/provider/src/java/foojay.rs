@@ -51,6 +51,9 @@ struct PackageDto {
     operating_system: String,
     #[serde(default)]
     size: i64,
+    /// 归档哈希（SHA-256 / SHA-1，按长度识别）
+    #[serde(default)]
+    checksum: Option<String>,
     links: Links,
 }
 
@@ -114,6 +117,7 @@ impl JavaReleaseSource for FoojaySource {
                     vendor: JavaVendor::parse_fuzzy(&pkg.distribution),
                     version: pkg.java_version,
                     package_type: request.package_type,
+                    expected_checksum: pkg.checksum.as_deref().and_then(super::checksum_hex),
                 })
             })
             .collect())
@@ -135,6 +139,7 @@ impl JavaReleaseSource for FoojaySource {
             package: package.clone(),
             location,
             expected_size,
+            expected_checksum: package.expected_checksum.clone(),
         })
     }
 }

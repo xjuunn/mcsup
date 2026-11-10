@@ -1,5 +1,7 @@
 use crate::CancellationToken;
-use domain::backup::{BackupScope, ContentHash, RelPath, RetentionPolicy, Snapshot, SnapshotId};
+use domain::backup::{
+    BackupScope, ContentHash, RelPath, RetentionPolicy, Snapshot, SnapshotId, SnapshotSummary,
+};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -522,17 +524,20 @@ impl RemoteBackupError {
 /// 远端创建结果
 #[derive(Debug, Clone)]
 pub struct RemoteCreateOutcome {
-    /// 新建的快照
-    pub snapshot: Snapshot,
+    /// 新建的快照摘要
+    pub snapshot: SnapshotSummary,
     /// 扫描期跳过的条目数
     pub skipped: usize,
 }
 
 /// 远端快照列表一页
+///
+/// 跨机器只搬摘要：内容清单属于拥有这些文件的机器（`files` 只说明规模），
+/// 一页几十份的完整清单装不进单帧。
 #[derive(Debug, Clone)]
 pub struct RemoteSnapshotPage {
-    /// 本页快照（按时间倒序）
-    pub items: Vec<Snapshot>,
+    /// 本页快照摘要（按时间倒序）
+    pub items: Vec<SnapshotSummary>,
     /// 该服务器的快照总数
     pub total: usize,
     /// 当前页码
@@ -544,8 +549,8 @@ pub struct RemoteSnapshotPage {
 /// 远端恢复结果
 #[derive(Debug, Clone)]
 pub struct RemoteRestoreOutcome {
-    /// 被恢复的快照
-    pub snapshot: Snapshot,
+    /// 被恢复的快照摘要
+    pub snapshot: SnapshotSummary,
     /// 对端上的恢复目标目录
     pub destination: String,
     /// 写回的文件数
@@ -561,8 +566,8 @@ pub struct RemoteRestoreOutcome {
 /// 远端删除结果
 #[derive(Debug, Clone)]
 pub struct RemoteDeleteOutcome {
-    /// 被删除的快照
-    pub snapshot: Snapshot,
+    /// 被删除的快照摘要
+    pub snapshot: SnapshotSummary,
     /// 该快照释放的 CAS 引用计数缺口（待对端 prune 回收）
     pub orphaned: usize,
 }
@@ -570,8 +575,8 @@ pub struct RemoteDeleteOutcome {
 /// 远端校验结果
 #[derive(Debug, Clone)]
 pub struct RemoteVerifyOutcome {
-    /// 被校验的快照
-    pub snapshot: Snapshot,
+    /// 被校验的快照摘要
+    pub snapshot: SnapshotSummary,
     /// 被引用的对象数（去重后）
     pub objects: usize,
     /// 校验通过的字节数
@@ -583,8 +588,8 @@ pub struct RemoteVerifyOutcome {
 /// 远端清理结果
 #[derive(Debug, Clone, Default)]
 pub struct RemotePruneOutcome {
-    /// 被删除的快照
-    pub removed: Vec<Snapshot>,
+    /// 被删除的快照摘要
+    pub removed: Vec<SnapshotSummary>,
     /// 回收的 CAS 对象数
     pub objects_reclaimed: usize,
     /// 回收的字节数

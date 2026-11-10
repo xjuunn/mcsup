@@ -159,6 +159,52 @@ impl RemoteMembers {
     }
 }
 
+/// 组合仓库按单一键查一条记录，并区分「确实不存在」与「无法确认」
+///
+/// 列表视图允许跳过不可达的远端（离线不阻塞本地），但按名 / 按路径查单条
+/// 不能沿用这个语义：远端离线时把「查不到」压成 `NotFound` 会让一个真实存在
+/// 的远端资源被报成不存在。只有所有远端都成功应答、且都没命中，才返回
+/// 调用方给的 `missing`；否则按存储失败上报，说明存在性无法确认。
+fn find_across<T>(
+    local: Result<Vec<T>, RepositoryError>,
+    remotes: impl IntoIterator<Item = (String, Result<Vec<T>, RepositoryError>)>,
+    matches: impl Fn(&T) -> bool,
+    missing: impl FnOnce() -> RepositoryError,
+    what: &str,
+) -> Result<T, RepositoryError> {
+    if let Some(found) = local?.into_iter().find(|item| matches(item)) {
+        return Ok(found);
+    }
+    let mut unreachable = Vec::new();
+    for (name, items) in remotes {
+        match items {
+            Ok(items) => {
+                if let Some(found) = items.into_iter().find(|item| matches(item)) {
+                    return Ok(found);
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    remote = %name,
+                    %err,
+                    what,
+                    "remote list failed while resolving one entry; existence is unconfirmed"
+                );
+                unreachable.push(name);
+            }
+        }
+    }
+    if unreachable.is_empty() {
+        return Err(missing());
+    }
+    Err(RepositoryError::Storage(Box::new(std::io::Error::other(
+        format!(
+            "cannot confirm {what} absence: unreachable remote(s): {}",
+            unreachable.join(", ")
+        ),
+    ))))
+}
+
 /// 组合工作目录仓库：本地 + 全部远端
 pub struct CombinedWorkspaceRepository {
     local: Arc<dyn WorkspaceRepository>,
@@ -194,17 +240,29 @@ impl WorkspaceRepository for CombinedWorkspaceRepository {
     }
 
     fn get(&self, id: &WorkspaceId) -> Result<Workspace, RepositoryError> {
-        self.list()?
-            .into_iter()
-            .find(|ws| &ws.id == id)
-            .ok_or_else(|| RepositoryError::NotFound(id.as_str().to_owned()))
+        find_across(
+            self.local.list(),
+            self.remotes
+                .all()
+                .iter()
+                .map(|member| (member.name.as_str().to_owned(), member.workspaces.list())),
+            |ws| &ws.id == id,
+            || RepositoryError::NotFound(id.as_str().to_owned()),
+            "workspace",
+        )
     }
 
     fn get_by_name(&self, name: &WorkspaceName) -> Result<Workspace, RepositoryError> {
-        self.list()?
-            .into_iter()
-            .find(|ws| &ws.name == name)
-            .ok_or_else(|| RepositoryError::NotFound(name.as_str().to_owned()))
+        find_across(
+            self.local.list(),
+            self.remotes
+                .all()
+                .iter()
+                .map(|member| (member.name.as_str().to_owned(), member.workspaces.list())),
+            |ws| &ws.name == name,
+            || RepositoryError::NotFound(name.as_str().to_owned()),
+            "workspace",
+        )
     }
 
     fn list(&self) -> Result<Vec<Workspace>, RepositoryError> {
@@ -318,10 +376,16 @@ impl ServerRepository for CombinedServerRepository {
     }
 
     fn get(&self, name: &ServerName) -> Result<ServerMeta, RepositoryError> {
-        self.list()?
-            .into_iter()
-            .find(|meta| &meta.name == name)
-            .ok_or_else(|| RepositoryError::NotFound(name.as_str().to_owned()))
+        find_across(
+            self.local.list(),
+            self.remotes
+                .all()
+                .iter()
+                .map(|member| (member.name.as_str().to_owned(), member.servers.list())),
+            |meta| &meta.name == name,
+            || RepositoryError::NotFound(name.as_str().to_owned()),
+            "server",
+        )
     }
 
     fn list(&self) -> Result<Vec<ServerMeta>, RepositoryError> {
@@ -442,10 +506,16 @@ impl JavaRuntimeRepository for CombinedJavaRepository {
     }
 
     fn get_by_path(&self, path: &std::path::Path) -> Result<JavaRuntime, RepositoryError> {
-        self.list()?
-            .into_iter()
-            .find(|rt| rt.path == path)
-            .ok_or_else(|| RepositoryError::NotFound(path.display().to_string()))
+        find_across(
+            self.local.list(),
+            self.remotes
+                .all()
+                .iter()
+                .map(|member| (member.name.as_str().to_owned(), member.java.list())),
+            |rt| rt.path == path,
+            || RepositoryError::NotFound(path.display().to_string()),
+            "java runtime",
+        )
     }
 
     fn remove(&self, path: &std::path::Path) -> Result<(), RepositoryError> {
@@ -605,6 +675,51 @@ mod tests {
         );
         let all = combined.list().expect("local list survives");
         assert!(all.is_empty());
+    }
+
+    /// 远端不可达时按名查不能把「无法确认」压成「不存在」
+    #[test]
+    fn unresolved_lookup_with_unreachable_remote_is_storage_error() {
+        let down = || {
+            Err(RepositoryError::Storage(Box::new(std::io::Error::other(
+                "remote is down",
+            ))))
+        };
+        let missing = || RepositoryError::NotFound("target".to_owned());
+        let local_empty = || Ok(Vec::<u32>::new());
+
+        // 唯一远端不可达：存在性无法确认
+        let err = find_across(
+            local_empty(),
+            [("r1".to_owned(), down())],
+            |value| *value == 1,
+            missing,
+            "thing",
+        )
+        .expect_err("unreachable remote must not look absent");
+        assert!(matches!(err, RepositoryError::Storage(_)), "{err:?}");
+
+        // 所有远端都应答且未命中：这时才是真正的 NotFound
+        let err = find_across(
+            local_empty(),
+            [("r1".to_owned(), Ok(Vec::<u32>::new()))],
+            |value| *value == 1,
+            missing,
+            "thing",
+        )
+        .expect_err("reachable remote without a match is absent");
+        assert!(matches!(err, RepositoryError::NotFound(_)), "{err:?}");
+
+        // 有远端不可达，但另一台命中：照常返回命中项
+        let found = find_across(
+            local_empty(),
+            [("r1".to_owned(), down()), ("r2".to_owned(), Ok(vec![1, 2]))],
+            |value| *value == 1,
+            missing,
+            "thing",
+        )
+        .expect("a reachable remote hit wins");
+        assert_eq!(found, 1);
     }
 
     struct EmptyServers;

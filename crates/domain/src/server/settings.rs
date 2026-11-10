@@ -27,6 +27,9 @@ pub struct InvalidSettingValue {
 }
 
 /// 服务属性键
+///
+/// 刻意不加 `#[non_exhaustive]`：键集合由 [`SettingKey::ALL`] 与解析表共同
+/// 枚举，新增键必须同步补全交互提示与非交互用法，不能落进兜底分支。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SettingKey {
     /// 绑定本服务的 JVM 大版本

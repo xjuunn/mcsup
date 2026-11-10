@@ -14,7 +14,7 @@ use domain::server::version::{ServerVariant, ServerVersion, VersionId};
 use file::FileCoreInspector;
 use port::TaskObserver;
 use protocol::remote::wire::{
-    WireModBlocked, WirePropUpdate, WireServer, WireSettings, WireSnapshot, WireStatusEntry,
+    WireModBlocked, WirePropUpdate, WireServer, WireSettings, WireSnapshotSummary, WireStatusEntry,
     WireVersion,
 };
 use protocol::remote::{ErrorKind, Request, Response};
@@ -486,7 +486,9 @@ impl Agent {
             Err(response) => return response,
         };
         match self.core.lifecycle.log_tail(&name, lines) {
-            Ok(lines) => Response::LogLines { lines },
+            Ok(lines) => Response::LogLines {
+                lines: fit_log_reply(lines),
+            },
             Err(err) => lifecycle_failure(&err),
         }
     }
@@ -520,13 +522,20 @@ impl Agent {
             match watch.read_new() {
                 Ok(batch) if !batch.is_empty() => {
                     history.extend(batch);
-                    return Response::LogLines { lines: history };
+                    if history.len() > domain::limits::MAX_LOG_LINES {
+                        history.drain(..history.len() - domain::limits::MAX_LOG_LINES);
+                    }
+                    return Response::LogLines {
+                        lines: fit_log_reply(history),
+                    };
                 }
                 Ok(_) => {}
                 Err(err) => return lifecycle_failure(&err),
             }
             if std::time::Instant::now() >= deadline {
-                return Response::LogLines { lines: history };
+                return Response::LogLines {
+                    lines: fit_log_reply(history),
+                };
             }
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
@@ -896,16 +905,10 @@ impl Agent {
             .backup
             .create(&name, &options, &port::CancellationToken::new())
         {
-            Ok(outcome) => {
-                let snapshot = match WireSnapshot::try_from(&outcome.snapshot) {
-                    Ok(wire) => wire,
-                    Err(err) => return failure(ErrorKind::PROTOCOL, err),
-                };
-                Response::SnapshotCreated {
-                    snapshot,
-                    skipped: outcome.skipped,
-                }
-            }
+            Ok(outcome) => Response::SnapshotCreated {
+                snapshot: WireSnapshotSummary::from(&outcome.snapshot),
+                skipped: outcome.skipped,
+            },
             Err(err) => backup_failure(&err),
         }
     }
@@ -920,22 +923,12 @@ impl Agent {
             .backup
             .list(&name, domain::backup::Page::new(page, page_size))
         {
-            Ok(paged) => {
-                let items = paged
-                    .items
-                    .iter()
-                    .map(WireSnapshot::try_from)
-                    .collect::<Result<Vec<_>, _>>();
-                match items {
-                    Ok(items) => Response::Snapshots {
-                        items,
-                        total: paged.total,
-                        page: paged.page,
-                        page_size: paged.page_size,
-                    },
-                    Err(err) => failure(ErrorKind::PROTOCOL, err),
-                }
-            }
+            Ok(paged) => Response::Snapshots {
+                items: paged.items.iter().map(WireSnapshotSummary::from).collect(),
+                total: paged.total,
+                page: paged.page,
+                page_size: paged.page_size,
+            },
             Err(err) => backup_failure(&err),
         }
     }
@@ -960,10 +953,7 @@ impl Agent {
             .restore(&name, snapshot, &target, &port::CancellationToken::new())
         {
             Ok(outcome) => {
-                let restored = match WireSnapshot::try_from(&outcome.snapshot) {
-                    Ok(wire) => wire,
-                    Err(err) => return failure(ErrorKind::PROTOCOL, err),
-                };
+                let restored = WireSnapshotSummary::from(&outcome.snapshot);
                 Response::Restored {
                     snapshot: restored,
                     destination: outcome.destination.to_string_lossy().into_owned(),
@@ -987,10 +977,7 @@ impl Agent {
         };
         match self.core.backup.delete(&name, snapshot) {
             Ok(outcome) => {
-                let deleted = match WireSnapshot::try_from(&outcome.snapshot) {
-                    Ok(wire) => wire,
-                    Err(err) => return failure(ErrorKind::PROTOCOL, err),
-                };
+                let deleted = WireSnapshotSummary::from(&outcome.snapshot);
                 Response::SnapshotDeleted {
                     snapshot: deleted,
                     orphaned: outcome.orphaned,
@@ -1007,10 +994,7 @@ impl Agent {
         };
         match self.core.backup.verify(&name, snapshot, &mut |_, _| ()) {
             Ok(outcome) => {
-                let verified = match WireSnapshot::try_from(&outcome.snapshot) {
-                    Ok(wire) => wire,
-                    Err(err) => return failure(ErrorKind::PROTOCOL, err),
-                };
+                let verified = WireSnapshotSummary::from(&outcome.snapshot);
                 Response::SnapshotVerified {
                     snapshot: verified,
                     objects: outcome.objects,
@@ -1043,22 +1027,16 @@ impl Agent {
             older_than_secs,
         };
         match self.core.backup.prune(&name, retention, dry_run) {
-            Ok(outcome) => {
-                let removed = outcome
+            Ok(outcome) => Response::Pruned {
+                removed: outcome
                     .removed
                     .iter()
-                    .map(WireSnapshot::try_from)
-                    .collect::<Result<Vec<_>, _>>();
-                match removed {
-                    Ok(removed) => Response::Pruned {
-                        removed,
-                        objects_reclaimed: outcome.objects_reclaimed,
-                        bytes_reclaimed: outcome.bytes_reclaimed,
-                        dry_run: outcome.dry_run,
-                    },
-                    Err(err) => failure(ErrorKind::PROTOCOL, err),
-                }
-            }
+                    .map(WireSnapshotSummary::from)
+                    .collect(),
+                objects_reclaimed: outcome.objects_reclaimed,
+                bytes_reclaimed: outcome.bytes_reclaimed,
+                dry_run: outcome.dry_run,
+            },
             Err(err) => backup_failure(&err),
         }
     }
@@ -1172,9 +1150,9 @@ impl Drop for StagingGuard {
 /// 本地给 4、经 agent 给 2，客户端无法判断该不该重试。
 ///
 /// 线上词表比分类更细一档（`busy` / `already_exists` 都是冲突），需要区分时
-/// 由调用方在投影前先摘出来。反过来则必然有损：`Failure` 与 `Backend` 都投影
-/// 成 `io`，`Cancelled` 也落 `io`——线协议没有「取消」这一档，对端收到 IO 失败
-/// 时客户端按后端失败处理。本地 Ctrl-C 不经过这里（入口自己就能判 130），
+/// 由调用方在投影前先摘出来。分类与词表一一对应，未知种类只在旧对端出现：
+/// 旧客户端收到 `failure` / `cancelled` 会落 `Other`，其 `category()` 仍按
+/// 后端失败处理，方向安全。本地 Ctrl-C 不经过这里（入口自己就能判 130），
 /// 只有 agent 侧自查到取消才会走到这条路径。
 fn wire_kind(category: port::ErrorCategory) -> &'static str {
     match category {
@@ -1182,9 +1160,9 @@ fn wire_kind(category: port::ErrorCategory) -> &'static str {
         port::ErrorCategory::Conflict => ErrorKind::BUSY,
         port::ErrorCategory::Usage => ErrorKind::INVALID,
         port::ErrorCategory::Unauthorized => ErrorKind::UNAUTHORIZED,
-        port::ErrorCategory::Backend
-        | port::ErrorCategory::Failure
-        | port::ErrorCategory::Cancelled => ErrorKind::IO,
+        port::ErrorCategory::Failure => ErrorKind::FAILURE,
+        port::ErrorCategory::Cancelled => ErrorKind::CANCELLED,
+        port::ErrorCategory::Backend => ErrorKind::IO,
     }
 }
 
@@ -1254,6 +1232,68 @@ fn modpack_failure(err: &ModpackError) -> Response {
 
 fn lifecycle_failure(err: &LifecycleError) -> Response {
     failure_ref(wire_kind(err.category()), err)
+}
+
+/// 单帧日志回复的预算：给信封（版本、`op`、字段名与括号）留出余量
+const LOG_REPLY_RESERVE: usize = 1024;
+
+/// 把日志行裁到单帧装得下的规模，保留最新的行
+///
+/// 帧上限按**序列化之后**的字节数判定，不能只看原文字节：引号与反斜杠会翻倍，
+/// 控制字符按 `\u00XX` 展开到 6 倍。日志内容由服务器进程写、不受本程序控制，
+/// 而本地读取上限（[`domain::limits::MAX_LOG_TAIL_BYTES`]）与单帧上限同为
+/// 8 MiB——不裁就是「合法的 `logs --tail` 请求让出站编码失败、连接被断开」，
+/// 用户看到的是「跟随日志失败」而不是日志被截断。
+fn fit_log_reply(lines: Vec<String>) -> Vec<String> {
+    fit_log_reply_within(
+        lines,
+        protocol::remote::MAX_FRAME_BYTES.saturating_sub(LOG_REPLY_RESERVE),
+    )
+}
+
+/// [`fit_log_reply`] 的显式预算版本（测试用小预算验证裁剪）
+fn fit_log_reply_within(lines: Vec<String>, budget: usize) -> Vec<String> {
+    let mut used = 0usize;
+    let mut kept: Vec<String> = Vec::with_capacity(lines.len());
+    // 从最新的行往前收：必须丢的是旧行，否则用户看不到刚发生的事
+    for line in lines.into_iter().rev() {
+        let cost = json_len(&line).saturating_add(1); // 分隔逗号
+        if used.saturating_add(cost) <= budget {
+            used += cost;
+            kept.push(line);
+            continue;
+        }
+        // 这一行本身就超预算：截断后保留，更旧的整行丢弃（没空间了）
+        let room = budget.saturating_sub(used).saturating_sub(2); // 一对引号
+        if room > 0 {
+            kept.push(clip_json(&line, room));
+        }
+        break;
+    }
+    kept.reverse();
+    kept
+}
+
+/// 一行文本放进 JSON 字符串后占多少字节
+///
+/// 用 `serde_json` 实测而不是估算：转义规则随内容变化，估小了就退回到
+/// 「整帧超限」的老问题。序列化失败按最坏倍率兜底——宁可少留几行，也不让
+/// 一整帧编码失败。
+fn json_len(text: &str) -> usize {
+    serde_json::to_string(text).map_or(text.len().saturating_mul(6), |encoded| encoded.len())
+}
+
+/// 把一行截到编码后不超过 `room` 字节
+///
+/// 先按最坏倍率（一个字节最多展开成 6 字节）取上界，再回退到字符边界：
+/// 对超长行逐字符测量没有意义，截断的部分对排障没有价值。
+fn clip_json(line: &str, room: usize) -> String {
+    let limit = room / 6;
+    let mut end = limit.min(line.len());
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    line[..end].to_owned()
 }
 
 /// 备份失败 → 错误帧：按领域判定分类，不解析文案
@@ -1340,22 +1380,13 @@ mod tests {
             ErrorCategory::Usage,
             ErrorCategory::Unauthorized,
             ErrorCategory::Backend,
+            ErrorCategory::Failure,
+            ErrorCategory::Cancelled,
         ] {
             let wire = wire_kind(category);
             assert_eq!(
                 RemoteFailureKind::from_wire(wire).category(),
                 category,
-                "{wire}"
-            );
-        }
-
-        // 线协议没有「通用失败」与「取消」两档：都退化为后端失败，方向安全
-        // （客户端只会重试或报错，不会误当成「用户取消」而静默成功）
-        for category in [ErrorCategory::Failure, ErrorCategory::Cancelled] {
-            let wire = wire_kind(category);
-            assert_eq!(
-                RemoteFailureKind::from_wire(wire).category(),
-                ErrorCategory::Backend,
                 "{wire}"
             );
         }
@@ -1403,5 +1434,48 @@ mod tests {
 
         let err = Outer(std::io::Error::other("inner layer"));
         assert_eq!(chain_text(&err), "outer layer: inner layer");
+    }
+
+    /// 日志回复必须整帧装得下：超限的帧会让出站编码失败、连接被断开
+    ///
+    /// 回归：本地读取上限与单帧上限同为 8 MiB，而 JSON 转义会额外放大，
+    /// 于是一个合法的 `logs --tail 10000` 请求能构造出永远发不出去的响应。
+    #[test]
+    fn oversized_log_reply_is_clipped_to_fit_one_frame() {
+        // 引号与反斜杠在 JSON 里翻倍，正是最容易撑爆帧的内容
+        let line = "\\\"".repeat(2048);
+        let lines: Vec<String> = (0..10_000).map(|_| line.clone()).collect();
+        let clipped = fit_log_reply(lines);
+        assert!(!clipped.is_empty(), "至少要保留最新的几行");
+        assert!(clipped.len() < 10_000, "必须裁掉放不下的旧行");
+
+        let response = Response::LogLines { lines: clipped };
+        let mut wire = Vec::new();
+        protocol::remote::write_response(&mut wire, &response).expect("裁剪后的帧必须能编码");
+        assert!(wire.len() <= protocol::remote::MAX_FRAME_BYTES);
+    }
+
+    /// 裁剪从最新往前保留，且单行超预算时截断而不是整行丢弃
+    #[test]
+    fn log_reply_clipping_keeps_newest_lines() {
+        let lines = vec!["old".to_owned(), "middle".to_owned(), "newest".to_owned()];
+        // 预算只够最后一行（含引号与分隔符）
+        let budget = json_len("newest") + 2;
+        let kept = fit_log_reply_within(lines, budget);
+        assert_eq!(kept, vec!["newest".to_owned()]);
+
+        // 单行超预算：截断后保留，内容仍来自这一行
+        let long = "x".repeat(4096);
+        let kept = fit_log_reply_within(vec![long.clone()], 600);
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0].len() < long.len());
+        assert!(!kept[0].is_empty());
+    }
+
+    /// 空回复保持为空，不受裁剪逻辑影响
+    #[test]
+    fn log_reply_clipping_keeps_empty_reply_empty() {
+        assert!(fit_log_reply(Vec::new()).is_empty());
+        assert!(fit_log_reply_within(Vec::new(), 0).is_empty());
     }
 }

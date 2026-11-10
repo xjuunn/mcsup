@@ -457,13 +457,29 @@ impl ModpackExtractor for MrpackExtractor {
         let mut zip = open_archive(archive)?;
         let mut text = String::new();
         match zip.by_name(domain::server::modpack::INDEX_FILE) {
-            Ok(mut entry) => {
-                entry.read_to_string(&mut text).map_err(|err| {
-                    ModpackExtractError::Extract(format!(
-                        "read {}: {err}",
+            Ok(entry) => {
+                if entry.size() > INDEX_LIMIT {
+                    return Err(ModpackExtractError::Extract(format!(
+                        "{} is {} bytes, over the {INDEX_LIMIT}-byte limit",
+                        domain::server::modpack::INDEX_FILE,
+                        entry.size()
+                    )));
+                }
+                entry
+                    .take(INDEX_LIMIT + 1)
+                    .read_to_string(&mut text)
+                    .map_err(|err| {
+                        ModpackExtractError::Extract(format!(
+                            "read {}: {err}",
+                            domain::server::modpack::INDEX_FILE
+                        ))
+                    })?;
+                if text.len() as u64 > INDEX_LIMIT {
+                    return Err(ModpackExtractError::Extract(format!(
+                        "{} is over the {INDEX_LIMIT}-byte limit",
                         domain::server::modpack::INDEX_FILE
-                    ))
-                })?;
+                    )));
+                }
             }
             Err(ZipError::FileNotFound) => {
                 return Err(ModpackExtractError::MissingIndex(
@@ -520,16 +536,46 @@ impl ModpackExtractor for MrpackExtractor {
         let mut zip = open_archive(archive)?;
         let (server, plain) = override_entries(&mut zip)?;
         let has_server = !server.is_empty();
+        let mut written_total = 0u64;
         for index in server {
-            extract_entry(&mut zip, index, dest, "server-overrides/", false)?;
+            extract_entry(
+                &mut zip,
+                index,
+                dest,
+                "server-overrides/",
+                false,
+                &mut written_total,
+            )?;
         }
         for index in plain {
             // server-overrides 已经写过的文件不覆盖
-            extract_entry(&mut zip, index, dest, "overrides/", has_server)?;
+            extract_entry(
+                &mut zip,
+                index,
+                dest,
+                "overrides/",
+                has_server,
+                &mut written_total,
+            )?;
         }
         Ok(())
     }
 }
+
+/// 清单最多允许多大
+///
+/// 正规 `.mrpack` 清单是 KB 级；上限只用来兜损坏或恶意归档声明的巨大条目，
+/// 避免把整个归档的大小读进内存。
+const INDEX_LIMIT: u64 = 4 * 1024 * 1024;
+
+/// 单个 override 成员的解压上限：256 MiB
+///
+/// overrides 是配置与少量资源，不是 mod 本体（mod 走清单下载）。声明大小
+/// 先校验一次，解压时再按字节截断，防止 zip 声明的 size 与实际流不一致。
+const OVERRIDE_FILE_LIMIT: u64 = 256 * 1024 * 1024;
+
+/// 全部 override 成员的解压总量上限：1 GiB
+const OVERRIDE_TOTAL_LIMIT: u64 = 1024 * 1024 * 1024;
 
 /// 打开归档并给出统一的错误文本
 fn open_archive(archive: &Path) -> Result<ZipArchive<File>, ModpackExtractError> {
@@ -571,6 +617,7 @@ fn extract_entry(
     dest: &Path,
     prefix: &str,
     skip_existing: bool,
+    written_total: &mut u64,
 ) -> Result<(), ModpackExtractError> {
     let mut entry = zip
         .by_index(index)
@@ -592,6 +639,15 @@ fn extract_entry(
     if skip_existing && target.exists() {
         return Ok(());
     }
+
+    let remaining = OVERRIDE_TOTAL_LIMIT.saturating_sub(*written_total);
+    let allowed = OVERRIDE_FILE_LIMIT.min(remaining);
+    if allowed == 0 || entry.size() > allowed {
+        return Err(ModpackExtractError::Extract(format!(
+            "override {relative} exceeds the extraction limit"
+        )));
+    }
+
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|err| ModpackExtractError::Extract(err.to_string()))?;
@@ -599,9 +655,17 @@ fn extract_entry(
     let mut out = File::create(&target).map_err(|err| {
         ModpackExtractError::Extract(format!("create {}: {err}", target.display()))
     })?;
-    std::io::copy(&mut entry, &mut out).map_err(|err| {
+    let copied = std::io::copy(&mut (&mut entry).take(allowed + 1), &mut out).map_err(|err| {
         ModpackExtractError::Extract(format!("write {}: {err}", target.display()))
     })?;
+    if copied > allowed {
+        drop(out);
+        let _ = std::fs::remove_file(&target);
+        return Err(ModpackExtractError::Extract(format!(
+            "override {relative} exceeds the extraction limit"
+        )));
+    }
+    *written_total = (*written_total).saturating_add(copied);
     Ok(())
 }
 

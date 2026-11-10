@@ -61,8 +61,10 @@ pub(crate) async fn run(
                 level: f.severity().as_str(),
                 kind: f.check.as_str(),
                 detail: detail_json(&f.check),
-                message: crate::i18n::platform_check(&f.check, printer.lang()),
-                fix: crate::i18n::platform_fix(&f.check, printer.lang()),
+                // JSON 是机器契约：文案固定英文，不随 --lang / 平台 locale 变化。
+                // 人类可读输出已在上面的 render_human 里按语言渲染。
+                message: crate::i18n::platform_check(&f.check, crate::locale::Lang::En),
+                fix: crate::i18n::platform_fix(&f.check, crate::locale::Lang::En),
             })
             .collect(),
     };

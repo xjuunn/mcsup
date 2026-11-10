@@ -156,6 +156,7 @@ impl Upstream {
 
 /// 上游面不合法
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum InvalidUpstream {
     /// 键不符合 kebab-case
     #[error("invalid upstream key {key:?}: expected kebab-case ascii")]
@@ -238,6 +239,7 @@ impl Binding {
 
 /// 绑定不合法
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum InvalidBinding {
     /// 上游键不符合 kebab-case
     #[error("invalid upstream key {upstream:?}: expected kebab-case ascii")]
@@ -500,6 +502,7 @@ impl Catalog {
 
 /// 目录不合法
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum CatalogError {
     /// 没有任何上游面
     #[error("catalog has no upstream")]

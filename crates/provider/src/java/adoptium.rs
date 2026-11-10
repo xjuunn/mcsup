@@ -53,6 +53,9 @@ struct PackageInfo {
     /// 归档文件名（用于架构复核；缺失时回退到链接尾段）
     #[serde(default)]
     name: String,
+    /// 归档 SHA-256（Adoptium 的 package 对象自带）
+    #[serde(default)]
+    checksum: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -133,6 +136,7 @@ impl JavaReleaseSource for AdoptiumSource {
                     major: super::parse_major_or_drop(major, "adoptium", &package.link)?,
                     version,
                     package_type: request.package_type,
+                    expected_checksum: package.checksum.as_deref().and_then(super::checksum_hex),
                 })
             })
             .collect())

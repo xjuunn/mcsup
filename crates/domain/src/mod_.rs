@@ -120,6 +120,7 @@ impl fmt::Display for ModLoader {
 /// 四档而非两档：`Unknown` 是「判不出」，与 `Optional`（声明为可选）
 /// 是完全不同的两件事，不能合并。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum SideSupport {
     /// 该侧必需
     Required,
@@ -162,6 +163,7 @@ impl fmt::Display for SideSupport {
 
 /// 结论的可靠度
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[non_exhaustive]
 pub enum Confidence {
     /// 元数据显式声明
     Certain,
@@ -442,6 +444,7 @@ pub fn compare_mc_version(a: &str, b: &str) -> std::cmp::Ordering {
 /// 声明成 `side="CLIENT"`，装到服务端照常启动；不读这个字段就会把它们
 /// 报成「缺少必需依赖」，进而误判成服务端起不来。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum DepSide {
     /// 两侧都生效（缺省值：没写 `side` 的依赖就是这个）
     #[default]
@@ -583,6 +586,8 @@ fn present_has(present: &[String], id: &str) -> bool {
 ///
 /// 判定规则在本模块（[`Risk::of`]），入口只负责渲染。三档对应三种处置：
 /// `Blocking` 直接建议排除，`Review` 默认仍装但提示人工确认，`Ok` 无需关注。
+/// 刻意不加 `#[non_exhaustive]`：新增等级必须同时决定默认处置与入口退出码，
+/// 静默兜底会让「未判定的风险」看起来像已检查。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Risk {
     /// 无风险
@@ -850,6 +855,7 @@ fn is_builtin_dep(id: &str) -> bool {
 /// 与 API 迟早给出两种结论。`--force` 的含义也由这里的 `allow_blocking` 定义，
 /// 不是各命令自己解释。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum InstallVerdict {
     /// 可以直接落盘
     Allow,
@@ -933,6 +939,7 @@ impl ServerTarget {
 /// 与 [`SideSupport`] 同样不压缩成二元：`Unknown` 是「判不出」，不是
 /// 「不匹配」。把判不出当成不匹配会让工具开始骗人。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum Fit {
     /// 满足
     Match,
@@ -1015,6 +1022,9 @@ impl FitIssue {
 }
 
 /// 「这个文件能不能装到这台服务端」的总结论
+///
+/// 刻意不加 `#[non_exhaustive]`：三档分别对应「装」「判不出」「拒装」，
+/// 未知档不能静默并入任一处置。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FitVerdict {
     /// 三个维度都满足

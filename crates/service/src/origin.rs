@@ -25,6 +25,7 @@ use thiserror::Error;
 /// 缺省 [`OriginFilter::All`]：本地 + 全部已配对远端。过滤只影响「返回哪些
 /// 条目」，不改变命令语义——过滤后为空是成功，不是错误。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OriginFilter {
     /// 本地 + 全部远端
     #[default]

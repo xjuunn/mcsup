@@ -140,6 +140,9 @@ fn describe_value_error(err: &ConfigValueError) -> String {
         ConfigValueError::Entry {
             key, value, reason, ..
         } => format!("{key} 的项 {value} 不是可用的镜像前缀（{reason}）"),
+        // 库的错误枚举是对外契约，新增变体先以英文原文兜底，避免入口因
+        // 版本不一致而无法渲染；具体文案应在升级入口时补齐。
+        _ => err.to_string(),
     }
 }
 

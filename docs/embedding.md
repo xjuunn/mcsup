@@ -50,11 +50,11 @@ crates/mcsup/               门面 package mcsup（唯一入口与发布主体�
 │   ├── runtime/            Minecraft / JVM 进程运行（实现 port，依赖 protocol）
 │   ├── backup/             CAS / Snapshot / Restore（实现 port::ContentStore 等）
 │   ├── transport/          RPC 通信：TLS + 长度前缀帧（client / server / handler）
-│   └── backend/            Local 执行位置与备份数据（实现 port::Backend 与
-│                           port::BackupStore；唯一允许组合实现层的 crate）
+│   ├── backend/            Local 执行位置与备份数据（实现 port::Backend 与
+│   │                       port::BackupStore；唯一允许组合实现层的 crate）
+│   └── modkit/             Mod / Modpack 管理
 └── 待建（同样建 crate 并在门面加 feature）：
-    ├── modkit/             Mod / Modpack
-    └── api/                REST DTO / OpenAPI（apps/server 使用）
+    └── api/                REST DTO / OpenAPI（apps/server 使用；不在本仓库）
 
 apps/cli 不是门面内模块：CLI 命令语义与渲染在 `apps/cli`，通过门面
 `bootstrap` 组合根取服务，不额外建 `cli` crate。
@@ -165,7 +165,10 @@ impl Mcsup {
 - 无全局状态、无 lazy_static、无 once_cell 单例。实例由调用方持有。
 - 库不读配置文件、不读环境变量。配置由 app 层传入。
 - 库不 spawn 不可取消的后台任务。长驻进程有 handle，调用方能停能查。
-- 公开枚举加 `#[non_exhaustive]`。
+- 公开枚举默认加 `#[non_exhaustive]`。例外是「处置型」枚举（状态转移结果、
+  恢复目标、更新判定等）：每个变体都要在线上词表、入口提示或退出码各有一处
+  映射，静默兜底会把未知状态误报成已知结论，这类枚举保持封闭，新增变体由
+  编译期强制逐处审视。
 - 需要宿主实现的 trait 不加 sealed。
 - 不使用 glob 重导出（`pub use crate::runtime::*` 会把内部结构变成公共 API）。
 
@@ -230,24 +233,29 @@ CLI 既是人类工具，也是第三方（非 Rust）的编程接口。两者�
 ```
 crates.io
 ├── mcsup                  门面 lib，feature 选择能力
-└── mcsup-domain 等         内层（发布时由单词名改名，见下）
+└── mcsup-domain 等         内层 package；[lib] name 仍是单词名
 
-仓库，不发布
-├── crates/mcsup/           门面；内层现为 publish = false 的 path 依赖
+仓库
+├── crates/mcsup/           门面；依赖内层 mcsup-* 包
 └── apps/cli/ ...           bin，装出 mcsup / mcsup-agent / mcsup-server
 ```
 
-发布顺序（被依赖者先发，`.github/workflows/publish.yml` 的 matrix 即此顺序）：
+内层 package 统一命名为 `mcsup-<目录名>`，同时用 `[lib] name = "<目录名>"`
+保留源码里的单词 crate 名（`use domain::` 不变）。crates.io 只认 package 名，
+因此 `mcsup-domain` 可发布，而本地编译与依赖键仍写作 `domain`。
+
+发布顺序（被依赖者先发，`.github/workflows/publish.yml` 中的循环即此顺序）：
 
 ```
-domain → auth → port → protocol
-       → service / file / java / provider / storage / backup / transport / runtime
-       → backend → mcsup
+mcsup-domain → mcsup-auth → mcsup-port → mcsup-protocol
+             → mcsup-file / mcsup-java / mcsup-provider / mcsup-storage
+             → mcsup-backup / mcsup-modkit / mcsup-runtime / mcsup-transport
+             → mcsup-service / mcsup-backend → mcsup
 ```
 
 必须覆盖门面能 feature 拉入的**每一个**内层 crate：漏一个，门面发布时
 crates.io 找不到该依赖，整个版本发不出去。`backend` 排在实现层之后，
-因为它是唯一允许组合具体实现的 crate。
+因为它是唯一允许组合具体实现的 crate；`modkit` 曾从旧清单漏掉。
 
 `apps/` 不发布到 crates.io。它们通过 `--path` 或 `--git` 安装：
 
@@ -272,14 +280,12 @@ Cargo 禁止同一 workspace 内出现同名 package，所以发布库叫 `mcsup
 发布时接受的代价：
 
 - 单词名 `domain` / `port` / `service` / `file` / `provider` 在 crates.io
-  均被占用（实测 2026-10）；内层发布必须改名 `mcsup-*`（已验证可用）。
-- 发布顺序：`mcsup-domain → mcsup-port → mcsup-service / mcsup-file /
-  mcsup-java / mcsup-provider / mcsup-storage / mcsup-runtime → mcsup`。
+  均被占用（实测 2026-10）；内层 package 已统一改名 `mcsup-*`（已验证可用）。
+- 发布顺序：叶子契约 → 实现层 → 编排 / backend → 门面，见上一节。
 - 版本锁步：内层与门面共用 `workspace.version` 一起 bump，避免同名类型
-  跨版本不兼容。
+  跨版本不兼容；内层互依的 `version` 字面量由 `scripts/bump-version.sh`
+  与根版本一并推进。
 - 内层一经发布即成公共 API，跨层重构受 semver 约束。
-- 只开发不发布时无需改名：内层 `publish = false`，`apps/cli` 与测试方走
-  path 依赖；未改名前 `cargo publish -p mcsup` 必然失败。
 
 ### Feature 矩阵
 
@@ -299,22 +305,24 @@ backup   = ["dep:backup", "port"]
 backend  = ["dep:backend", "port"]
 file     = ["dep:file", "port"]
 java     = ["dep:java", "port"]
+modkit   = ["dep:modkit", "port"]
 provider = ["dep:provider", "port"]
 storage  = ["dep:storage", "port"]
 runtime  = ["dep:runtime", "port", "protocol"]
 transport = ["dep:transport", "protocol"]
 auth     = ["dep:auth"]
 bootstrap = ["storage", "service", "backup", "backend", "file", "java",
-             "provider", "runtime", "port", "protocol", "transport"]
+             "modkit", "provider", "runtime", "port", "protocol", "transport"]
 remote    = ["bootstrap", "transport", "runtime", "auth", "service", "protocol"]
 ```
 
 级联规则：feature 引用同级 feature，被引用者带出其可选依赖——只要
 `mcsup::port` 可命名，`mcsup::domain` 必可命名。每新增一个内层 crate，
-同步三处：根 `[workspace.dependencies]` 的互依声明（`path + version`
-唯一携带处）、门面可选依赖（`workspace = true` + `optional`）与
-feature 级联、`lib.rs` 的 `pub use`。内层 manifest 一律
-`xxx.workspace = true` 继承，禁止再写版本字面量。
+同步四处：内层 manifest 的 package 名（`mcsup-*`）与 `[lib] name`、门面
+可选依赖（依赖键保持单词名，写 `package = "mcsup-*"` + `version` + `path`）、
+feature 级联、`lib.rs` 的 `pub use`。内层互依同样使用
+`package = "mcsup-*", version, path`；`scripts/bump-version.sh` 负责同步
+根版本与这些 version 字面量。
 
 组合 feature 现有两个：`bootstrap`（默认组合根，见下）与 `remote`（被连接端）。
 两者都已加入 `facade_allow`，`check-architecture.sh` 的 feature_bundles 会一并
@@ -341,7 +349,7 @@ Cargo 不会为依赖构建 bin target。第三方写 `mcsup = { version = "0.1"
 
 ```toml
 [dependencies]
-mcsup = { version = "0.1", default-features = false, features = ["full"] }
+mcsup = { version = "0.1", default-features = false, features = ["bootstrap"] }
 ```
 
 ### 非 Rust 第三方（Prism / HMCL / ATLauncher）

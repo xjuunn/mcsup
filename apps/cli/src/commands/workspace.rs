@@ -894,7 +894,8 @@ fn doctor_cmd(
                 kind: f.kind.as_str(),
                 workspace: f.workspace.as_deref(),
                 detail: detail_json(&f.kind),
-                message: crate::i18n::check(&f.kind, printer.lang()),
+                // JSON 是机器契约：文案固定英文，不随 --lang / 平台 locale 变化。
+                message: crate::i18n::check(&f.kind, crate::locale::Lang::En),
             })
             .collect(),
     };

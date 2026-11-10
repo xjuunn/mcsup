@@ -17,6 +17,25 @@ use crate::{CAS_DIR, error::BackupIoError};
 /// 读 / 写缓冲大小：与常见文件系统块大小同量级，兼顾大文件吞吐与内存占用
 const BUFFER_SIZE: usize = 64 * 1024;
 
+/// rename 之后同步父目录，保证目录项在崩溃后仍然可见
+///
+/// 文件内容已由暂存文件的 `sync_all` 落盘；不刷目录的话，掉电后可能出现
+/// 「对象文件在、目录记录不在」，恢复时按哈希查不到刚写入的对象。
+fn sync_dir(dir: &Path) -> Result<(), CasError> {
+    #[cfg(unix)]
+    {
+        let directory = fs::File::open(dir).map_err(|err| BackupIoError::io(dir, err))?;
+        directory
+            .sync_all()
+            .map_err(|err| BackupIoError::io(dir, err))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+    Ok(())
+}
+
 /// 文件系统上的 CAS
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CasStore {
@@ -109,7 +128,17 @@ impl CasStore {
             .map_err(|err| BackupIoError::io(staging.path(), err))?;
 
         let final_path = self.object_path(&hash);
-        if final_path.is_file() {
+        if let Ok(meta) = fs::metadata(&final_path)
+            && meta.is_file()
+        {
+            // 同哈希必须是同内容。只查存在会掩盖截断 / 位翻转：文件在但
+            // 大小不符时继续复用，后续恢复读到的就是坏对象。
+            if meta.len() != size {
+                return Err(CasError::Corrupt {
+                    hash,
+                    reason: format!("existing object is {} bytes, expected {size}", meta.len()),
+                });
+            }
             // 去重命中：内容已在 CAS 中，丢弃暂存文件
             return Ok((hash, size));
         }
@@ -118,6 +147,7 @@ impl CasStore {
         staging
             .persist(&final_path)
             .map_err(|err| BackupIoError::io(&final_path, err.error))?;
+        sync_dir(parent)?;
         tracing::debug!(hash = %hash, size, hint = %hint, "cas object stored");
         Ok((hash, size))
     }
@@ -190,7 +220,11 @@ impl ContentStore for CasStore {
             .prefix(".restore-")
             .tempfile_in(parent)
             .map_err(|err| BackupIoError::io(parent, err))?;
+        // 复制的同时重算哈希：CAS 里的对象可能被位翻转或外部改写，
+        // 不校验就等于把坏数据当备份恢复回去。校验失败时不落目标文件
+        // （暂存文件随句柄丢弃自动删除）。
         let mut reader = std::io::BufReader::with_capacity(BUFFER_SIZE, source);
+        let mut hasher = Sha256::new();
         let mut size: u64 = 0;
         let mut buffer = vec![0u8; BUFFER_SIZE];
         loop {
@@ -200,11 +234,19 @@ impl ContentStore for CasStore {
             if read == 0 {
                 break;
             }
+            hasher.update(&buffer[..read]);
             staging
                 .as_file_mut()
                 .write_all(&buffer[..read])
                 .map_err(|err| BackupIoError::io(staging.path(), err))?;
             size = size.saturating_add(read as u64);
+        }
+        let actual = ContentHash::from_digest(hasher.finalize().as_ref());
+        if &actual != hash {
+            return Err(CasError::Corrupt {
+                hash: hash.clone(),
+                reason: format!("sha256 mismatch: object contains {actual}"),
+            });
         }
         staging
             .as_file_mut()
@@ -329,6 +371,21 @@ mod tests {
         assert_eq!(store.list().expect("list"), vec![first]);
     }
 
+    /// 去重命中必须校验大小：对象文件存在但被截断时不能继续复用
+    #[test]
+    fn put_rejects_truncated_existing_object() {
+        let (_dir, store) = store();
+        let payload = b"same bytes".to_vec();
+        let (hash, _) = store
+            .put(&mut Cursor::new(payload.clone()), &rel("a"))
+            .expect("put");
+        fs::write(store.object_path(&hash), b"x").expect("truncate");
+        let err = store
+            .put(&mut Cursor::new(payload), &rel("b"))
+            .expect_err("truncated object must not be reused");
+        assert!(matches!(err, CasError::Corrupt { .. }), "{err}");
+    }
+
     #[test]
     fn object_path_is_sharded() {
         let (_dir, store) = store();
@@ -383,6 +440,27 @@ mod tests {
             .expect("verify");
         assert_eq!(steps, 2);
         assert_eq!(broken.len(), 2);
+    }
+
+    /// 取出时重算哈希：坏对象必须报 `Corrupt`，且不能落出一个目标文件
+    ///
+    /// 回归：`get` 曾只复制字节不校验，位翻转或外部改写的对象会被当成
+    /// 正常备份恢复出去。
+    #[test]
+    fn get_rejects_a_corrupt_object_without_writing_dest() {
+        let (dir, store) = store();
+        let (hash, _) = store
+            .put(&mut Cursor::new(b"payload".to_vec()), &rel("a"))
+            .expect("put");
+        fs::write(store.object_path(&hash), b"tampered").expect("tamper");
+
+        let dest = dir.path().join("restored.bin");
+        let err = store.get(&hash, &dest).expect_err("must reject");
+        match err {
+            CasError::Corrupt { hash: reported, .. } => assert_eq!(reported, hash),
+            other => panic!("期望 Corrupt，实际 {other:?}"),
+        }
+        assert!(!dest.exists(), "校验失败不得落出目标文件");
     }
 
     #[test]

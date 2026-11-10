@@ -105,6 +105,7 @@ CLI 又为远端提前分流、根本不装配 `InstallSession`。本阶段把�
   `handle`，只有 agent 覆写。`dispatch` 提供一个把事件写成帧的 `SessionSink`，
   进度帧按 ≥128 KiB / ≥100 ms 节流，阶段与输出不节流。
 - 协议版本升到 2：新增帧对旧客户端是破坏性变更，必须一起升版。
+- 协议版本升到 3：备份帧载荷由完整快照清单改为摘要，字段集合变化。
 
 #### 服务（`service`）
 
@@ -318,8 +319,13 @@ Java 用 `JavaService::install/uninstall`。失败由各错误自己的 `categor
   按 Unreachable 拒绝——有远端条目却没装配连接是装配错误，静默落到本地
   会在错误的磁盘上写快照。
 - 跨线只走**元数据帧**：扫描、CAS、恢复写盘全部发生在对端，帧载荷是
-  `WireSnapshot`（快照三份清单：entries / deleted / stamps），CAS 对象
-  留在对端。这也意味着远端 `backup create` 不会把世界文件字节拉回客户端。
+  `WireSnapshotSummary`（元数据 + 清单规模 `files` / `deleted`），CAS 对象
+  与内容清单都留在对端。这也意味着远端 `backup create` 不会把世界文件字节
+  拉回客户端。
+- 帧载荷为何是摘要而不是完整清单：完整清单（entries / stamps）随文件数线性
+  增长，实测 5000 文件的快照单份 700 KB、默认 20 份/页 达 14 MB，超出
+  `MAX_FRAME_BYTES`（8 MiB）——按完整清单传会让远端 `backup ls` 在真实
+  服务器上必然失败。客户端只需要「有多少个文件」。
 - `RemoteBackupError` 变体与协议 `ErrorKind` 对齐：NotFound / Invalid /
   Unreachable / Protocol / Io；`service` 包进 `BackupError::Supervisor`，
   入口按文案提示不再二次判级。
@@ -335,9 +341,10 @@ Java 用 `JavaService::install/uninstall`。失败由各错误自己的 `categor
   safety_snapshot, deleted}` / `SnapshotDeleted{snapshot, orphaned}` /
   `SnapshotVerified{snapshot, objects, bytes, broken}` / `Pruned{removed,
   objects_reclaimed, bytes_reclaimed, dry_run}`。
-- `wire::WireSnapshot`：`SnapshotId` / `RelPath` / `ContentHash` /
-  `BackupScope` / `SnapshotStatus` 文本互转，`SnapshotContent::new +
-  with_stamps` 重建，往返一致性由测试锁定。
+- `wire::WireSnapshotSummary`：`SnapshotId` / `BackupScope` /
+  `SnapshotStatus` 文本互转，往返一致性由测试锁定；`files` / `deleted` 是
+  清单规模而不是清单本身。协议版本随之升到 3（载荷字段集合变化，旧对端
+  解不出新帧）。
 - 备份恢复写路径的领域判定（可恢复性、运行中禁恢复、目标冲突、范围空）
   仍收敛在 `service` / `domain`，agent 分发与客户端都只搬参数。
 
@@ -473,7 +480,8 @@ roundtrip 全量权限覆盖补 `BackupList` 样例（`Permission::Backup` 豁�
 
 新模块 `protocol::remote`（与本地 IPC 的 `protocol` 平级，互不共用版本号）：
 
-- 独立 `REMOTE_PROTOCOL_VERSION = 1`（阶段 14 新增中间帧后升到 2）。不复用
+- 独立 `REMOTE_PROTOCOL_VERSION = 1`（阶段 14 新增中间帧后升到 2；备份帧
+  载荷改摘要后升到 3）。不复用
   `PROTOCOL_VERSION`：远端两端
   可以分别升级，把版本绑在一起会让「本地 CLI 与 supervisor 的 IPC 协议」
   和「跨机器协议」互相拖住。

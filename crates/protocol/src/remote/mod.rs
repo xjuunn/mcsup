@@ -31,15 +31,18 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Write};
 use wire::{
-    WireClient, WireJava, WireModBlocked, WirePropUpdate, WireServer, WireSettings, WireSnapshot,
-    WireStartOutcome, WireStatusEntry, WireStop, WireVersion, WireWorkspace,
+    WireClient, WireJava, WireModBlocked, WirePropUpdate, WireServer, WireSettings,
+    WireSnapshotSummary, WireStartOutcome, WireStatusEntry, WireStop, WireVersion, WireWorkspace,
 };
 
 /// 远端协议版本；不匹配直接拒绝，禁止猜测兼容
 ///
 /// 2：新增中间帧 [`Response::Task`]（长任务的阶段 / 进度 / 输出）。旧客户端
 /// 收到不认识的 `op` 会整条报错，因此这是破坏性变更，必须随帧集一起升版。
-pub const REMOTE_PROTOCOL_VERSION: u32 = 2;
+///
+/// 3：备份帧的载荷由完整快照清单（`entries` / `stamps`）改为摘要，只带清单
+/// 规模。字段集合变了，旧对端解不出新帧、新对端也解不出旧帧——同样必须升版。
+pub const REMOTE_PROTOCOL_VERSION: u32 = 3;
 
 /// 单帧字节上限
 ///
@@ -727,15 +730,15 @@ pub enum Response {
     // ---- backup（阶段 9） ----
     /// 快照创建结果
     SnapshotCreated {
-        /// 新建的快照
-        snapshot: WireSnapshot,
+        /// 新建的快照摘要
+        snapshot: WireSnapshotSummary,
         /// 扫描期跳过的条目数
         skipped: usize,
     },
     /// 快照列表一页（顺序与请求一致）
     Snapshots {
-        /// 本页快照
-        items: Vec<WireSnapshot>,
+        /// 本页快照摘要（不带内容清单：一页几十份的清单装不进单帧）
+        items: Vec<WireSnapshotSummary>,
         /// 该服务器的快照总数
         total: usize,
         /// 当前页码
@@ -745,8 +748,8 @@ pub enum Response {
     },
     /// 恢复结果
     Restored {
-        /// 被恢复的快照
-        snapshot: WireSnapshot,
+        /// 被恢复的快照摘要
+        snapshot: WireSnapshotSummary,
         /// 对端上的恢复目标目录
         destination: String,
         /// 写回的文件数
@@ -760,15 +763,15 @@ pub enum Response {
     },
     /// 删除结果
     SnapshotDeleted {
-        /// 被删除的快照
-        snapshot: WireSnapshot,
+        /// 被删除的快照摘要
+        snapshot: WireSnapshotSummary,
         /// 该快照释放的 CAS 引用计数缺口（待 prune 回收）
         orphaned: usize,
     },
     /// 校验结果
     SnapshotVerified {
-        /// 被校验的快照
-        snapshot: WireSnapshot,
+        /// 被校验的快照摘要
+        snapshot: WireSnapshotSummary,
         /// 被引用的对象数（去重后）
         objects: usize,
         /// 校验通过的字节数
@@ -778,8 +781,8 @@ pub enum Response {
     },
     /// 清理结果
     Pruned {
-        /// 被删除的快照
-        removed: Vec<WireSnapshot>,
+        /// 被删除的快照摘要
+        removed: Vec<WireSnapshotSummary>,
         /// 回收的 CAS 对象数
         objects_reclaimed: usize,
         /// 回收的字节数
@@ -838,6 +841,10 @@ impl ErrorKind {
     pub const IO: &'static str = "io";
     /// 参数非法
     pub const INVALID: &'static str = "invalid";
+    /// 通用失败：确实出错，但没有更具体的分类
+    pub const FAILURE: &'static str = "failure";
+    /// 用户取消
+    pub const CANCELLED: &'static str = "cancelled";
 }
 
 /// 写出一帧（版本 + JSON + 换行 + flush）
@@ -881,14 +888,44 @@ fn write_remote<W: Write, T: Serialize>(w: &mut W, body: &T) -> io::Result<()> {
         v: REMOTE_PROTOCOL_VERSION,
         body,
     };
-    serde_json::to_writer(&mut *w, &frame)?;
+    // 出站同样受单帧上限约束。先序列化到有界缓冲再整帧写出，避免
+    // 「写了一半才超限」把连接留在半帧状态。
+    let mut framed = BoundedFrame::default();
+    serde_json::to_writer(&mut framed, &frame)?;
+    w.write_all(&framed.bytes)?;
     w.write_all(b"\n")?;
     w.flush()
 }
 
+/// 出站帧缓冲：超过 [`MAX_FRAME_BYTES`] 立即失败
+#[derive(Default)]
+struct BoundedFrame {
+    bytes: Vec<u8>,
+}
+
+impl Write for BoundedFrame {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        if self.bytes.len().saturating_add(data.len()) > MAX_FRAME_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("remote frame exceeds {MAX_FRAME_BYTES} bytes"),
+            ));
+        }
+        self.bytes.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 fn read_remote<R: BufRead, T: DeserializeOwned>(r: &mut R) -> io::Result<T> {
     let line = read_bounded_line(r)?;
-    let frame: Frame<T> = serde_json::from_slice(&line)
+    // 两阶段解码：先只取版本字段，再解帧体。若先解帧体，未知 `op` 的
+    // 新版本帧会在反序列化阶段失败，被误报成「JSON 非法」而不是版本不匹配，
+    // 排障方向完全错位。
+    let frame: Frame<serde_json::Value> = serde_json::from_slice(&line)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     if frame.v != REMOTE_PROTOCOL_VERSION {
         return Err(io::Error::new(
@@ -900,7 +937,8 @@ fn read_remote<R: BufRead, T: DeserializeOwned>(r: &mut R) -> io::Result<T> {
             ),
         ));
     }
-    Ok(frame.body)
+    serde_json::from_value(frame.body)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
 }
 
 /// 读一行，但先设上限
@@ -997,9 +1035,9 @@ mod tests {
         read_response(&mut cursor).expect("read")
     }
 
-    /// 一条最小合法的 `WireSnapshot`（完整内容清单，验编解码不丢字段）
-    fn snapshot_wire() -> WireSnapshot {
-        WireSnapshot {
+    /// 一条最小合法的快照摘要（验编解码不丢字段）
+    fn snapshot_wire() -> WireSnapshotSummary {
+        WireSnapshotSummary {
             id: "20260101t000000-abc123".to_owned(),
             workspace_id: "survival".to_owned(),
             server: "web".to_owned(),
@@ -1007,9 +1045,8 @@ mod tests {
             parent: None,
             scope: vec!["world".to_owned()],
             status: "complete".to_owned(),
-            entries: vec![("world/level.dat".to_owned(), "a".repeat(64))],
-            deleted: vec!["logs/old.log".to_owned()],
-            stamps: vec![("world/level.dat".to_owned(), 4096, 1_700_000_000)],
+            files: 1,
+            deleted: 1,
             added: 1,
             reused: 0,
             total_bytes: 4096,
@@ -1291,6 +1328,34 @@ mod tests {
         }
     }
 
+    /// 一页快照必须装得进单帧
+    ///
+    /// 回归：帧载荷曾经是完整内容清单（`entries` / `stamps`），5000 文件的
+    /// 服务器一份就 700 KB，默认 20 份/页 达到 14 MB，必然超出单帧上限——
+    /// 远端 `backup ls` 在真实服务器上永远失败。清单留在对端，帧里只带规模。
+    #[test]
+    fn snapshot_page_fits_one_frame() {
+        let items: Vec<WireSnapshotSummary> = (0..20)
+            .map(|index| WireSnapshotSummary {
+                id: format!("20260101t000000-{index:06x}"),
+                ..snapshot_wire()
+            })
+            .collect();
+        let response = Response::Snapshots {
+            items,
+            total: 200,
+            page: 1,
+            page_size: 20,
+        };
+        let mut buf = Vec::new();
+        write_response(&mut buf, &response).expect("encode");
+        assert!(
+            buf.len() < MAX_FRAME_BYTES / 16,
+            "一页摘要不应接近单帧上限：{} bytes",
+            buf.len()
+        );
+    }
+
     #[test]
     fn backup_responses_roundtrip() {
         let responses = [
@@ -1438,6 +1503,13 @@ mod tests {
         assert!(err.to_string().contains("version mismatch"), "{err}");
         assert!(check_protocol_version(99).is_err());
         assert!(check_protocol_version(REMOTE_PROTOCOL_VERSION).is_ok());
+
+        // 新版本帧可能带旧代码不认识的 op：必须先报版本不匹配，
+        // 而不是把「未知 op」误报成 JSON 非法。
+        let mut cursor = Cursor::new(b"{\"v\":99,\"op\":\"future_op\"}\n".to_vec());
+        let err = read_request(&mut cursor).expect_err("v99 unknown op");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("version mismatch"), "{err}");
     }
 
     #[test]
@@ -1456,6 +1528,15 @@ mod tests {
         huge.resize(MAX_FRAME_BYTES + 16, b'a');
         let mut cursor = Cursor::new(huge);
         let err = read_request(&mut cursor).expect_err("oversized");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("exceeds"), "{err}");
+
+        // 出站帧同样不能无限增长：超过上限时写入失败，而不是把内存打满
+        let mut bounded = BoundedFrame::default();
+        bounded
+            .write_all(&vec![b'a'; MAX_FRAME_BYTES])
+            .expect("at limit");
+        let err = bounded.write_all(b"x").expect_err("over limit");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("exceeds"), "{err}");
     }

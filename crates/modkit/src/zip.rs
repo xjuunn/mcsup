@@ -306,12 +306,21 @@ fn is_nested_jar(name: &str) -> bool {
 }
 
 /// 读一个条目的全部字节
+///
+/// 元数据文件（`fabric.mod.json` / `mods.toml` / `plugin.yml` …）都是 KB 级；
+/// 给一个宽裕上限，避免损坏或恶意归档用一个声明极大的条目把内存吃光。
 fn read_entry<R: Read + std::io::Seek>(zip: &mut ZipArchive<R>, name: &str) -> Option<Vec<u8>> {
-    let mut entry = zip.by_name(name).ok()?;
+    let entry = zip.by_name(name).ok()?;
+    if entry.size() > METADATA_LIMIT {
+        return None;
+    }
     let mut buf = Vec::new();
-    entry.read_to_end(&mut buf).ok()?;
+    entry.take(METADATA_LIMIT).read_to_end(&mut buf).ok()?;
     Some(buf)
 }
+
+/// 单个元数据文件最多读多少字节
+const METADATA_LIMIT: u64 = 4 * 1024 * 1024;
 
 /// 扫描所有 class：返回（最大 Java 大版本, 是否有客户端类引用）
 fn scan_classes(zip: &mut ZipArchive<std::fs::File>, names: &[String]) -> (Option<u32>, bool) {
@@ -1328,6 +1337,33 @@ mod tests {
         assert!(
             cap.missing_mandatory_deps(&[], Some(ModLoader::Forge))
                 .is_empty()
+        );
+    }
+
+    /// 超限条目按「读不到」处理，不把整个归档声明的字节数读进内存
+    ///
+    /// 损坏或恶意归档可以声明一个几 GB 的元数据条目；`read_to_end` 会照单
+    /// 全收。元数据文件实际都是 KB 级，超过上限应直接跳过。
+    #[test]
+    fn oversized_metadata_entry_is_rejected() {
+        use std::io::{Cursor, Write};
+
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        writer
+            .start_file("fabric.mod.json", options)
+            .expect("start");
+        let oversized = vec![0_u8; usize::try_from(METADATA_LIMIT).expect("limit") + 1];
+        writer.write_all(&oversized).expect("write");
+        writer.start_file("plugin.yml", options).expect("start");
+        writer.write_all(b"name: x\n").expect("write");
+        let bytes = writer.finish().expect("finish").into_inner();
+
+        let mut zip = ZipArchive::new(Cursor::new(bytes)).expect("archive");
+        assert!(read_entry(&mut zip, "fabric.mod.json").is_none());
+        assert_eq!(
+            read_entry(&mut zip, "plugin.yml").as_deref(),
+            Some(b"name: x\n".as_slice())
         );
     }
 

@@ -182,9 +182,10 @@ $ mcsup remote connect host:port --code 4821-9375
 | `mcsup remote ping <name>` | 连通性 / 版本 / 能力，供脚本使用 |
 | `mcsup remote disconnect <name>` | 删除本地配对、凭证与只读缓存目录（`{data_dir}/remotes/<name>/`），**并通知远端删掉本机那条客户端记录**；对端连不上时本地照常断开、远端记录保留（会提示如何在 serve 端清理）。当前工作区指向该远端时切回本地最后使用的工作区 |
 
-- `--name` 不合法（含 `/`）或是保留字（`all` / `local` / `remote`）时**先于任何
-  网络动作**报用法错误（退出码 2）：这类错属本地输入，先探测会把真正的错因盖成
-  「连不上」。
+- `--name` 不合法（含 `/`、形如 `.` / `..`、首尾为 `.` / `-`）或是保留字
+  （`all` / `local` / `remote`）时**先于任何网络动作**报用法错误（退出码 2）：
+  这类错属本地输入，先探测会把真正的错因盖成「连不上」。名字会原样成为
+  `{data_dir}/remotes/<name>/` 的目录名，因此不允许路径片段。
 
 `connect` 幂等：重复执行等于重新握手并刷新 token 与指纹。
 
@@ -232,7 +233,8 @@ mcsup java ls --origin all
 约定：
 
 - 缺省值可经环境变量 `MCSUP_ORIGIN` 覆盖，优先级 `flag > 环境变量 > all`。
-- `all` / `local` / `remote` 是保留字，不能用作远端名；远端名禁止包含 `/`。
+- `all` / `local` / `remote` 是保留字，不能用作远端名；远端名禁止包含 `/`，
+  也不能是 `.` / `..` 或首尾为 `.` / `-` 的名字（它会成为缓存目录名）。
 - 过滤只影响展示与返回集合，不改变命令语义；过滤后为空是成功（退出码 0）。
 - 人类可读输出增加 `ORIGIN` 列；JSON 输出每项增加 `origin` 字段，其余
   形状不变。
@@ -302,7 +304,7 @@ error: “web” 存在于多个位置
 | `server start` / `stop` / `restart` / `status` / `send` | 生命周期帧，经 `RoutingSupervisor` 按来源分派；远端条目的核心 / Java / EULA 预检在**对端**执行，客户端不得用本地路径判定（见下「预检在哪里跑」） |
 | `server remove` | `ServerRemove`（可选 `--purge` 删盘），判定与删盘在对端；未给 `--origin` 时先解析来源——远端条目不会被当成本地条目（本地有同名则仍本地优先） |
 | `server version` | 组合注册表 `get`（不新增帧） |
-| `server backup ...` | 备份帧族（快照元数据跨线，CAS 在对端） |
+| `server backup ...` | 备份帧族（快照元数据 + 清单规模跨线，内容清单与 CAS 在对端） |
 | `java scan` / `install` / `uninstall` | `JavaScan` / `JavaInstall` / `JavaUninstall`，下载与登记在对端 |
 | `java list` / `server list` / `workspace list` | 读本地缓存（零网络），过期时后台刷新 |
 | `server link --origin` | `ServerLink`：符号链接、marker 与入库全在对端 |
@@ -494,7 +496,8 @@ remotes/<name>/
 - 复用 `protocol::Frame`，首帧为 `Hello { protocol_version, agent_version,
   capabilities }`。
 - `PROTOCOL_VERSION` 不匹配直接拒绝，不猜测兼容；破坏性变更走新增字段 +
-  版本递增。当前 `REMOTE_PROTOCOL_VERSION = 2`（新增中间帧 `Response::Task`）。
+  版本递增。当前 `REMOTE_PROTOCOL_VERSION = 3`（2 新增中间帧
+  `Response::Task`；3 把备份帧载荷由完整快照清单改为摘要）。
 - 能力协商决定可选能力（backup / file / java / streaming）是否可用。
 - 日志 follow 用 `LogsFollow` 长轮询帧承载（断线即取消，无会话状态）。
 - **进度通道**：长任务（装核心 / 装 Java / 整合包布置）在终结响应之前回若干
@@ -537,8 +540,10 @@ service ──TaskObserver──▶ 本地：apps/cli/src/progress.rs
    拉起 `mcsup __supervise`。
 8. 远端备份：`RemoteBackupPort`（按服务器身份寻址、域类型出入参），
    `BackupService` 按条目来源路由——远端条目整段转发到对端执行（扫描、
-   CAS、恢复写盘都在对端），跨线只走元数据帧（`WireSnapshot`），CAS 对象
-   留在对端；agent 侧复用与本地 CLI 同一份 `BackupService`。
+   CAS、恢复写盘都在对端），跨线只走元数据帧（`WireSnapshotSummary`：
+   元数据 + 清单规模，不含 `entries` / `stamps`），CAS 对象与内容清单都留在
+   对端——完整清单随文件数线性增长，一页几十份会超出单帧上限；agent 侧复用
+   与本地 CLI 同一份 `BackupService`。
 9. CLI：`remote serve/connect/reconnect/list/status/ping/disconnect/revoke`，
    `--origin` 过滤与 `ORIGIN` 列，创建 / 删除 / 扫描的远端路由，退出码 6。
 10. 流式日志 follow 与备份进度（未做）；此时再评估 `transport` 是否切换为

@@ -996,6 +996,11 @@ pub struct JavaPackage {
     /// 完整版本串
     pub version: String,
     pub package_type: JavaPackageType,
+    /// 上游在列表阶段声明的归档校验和；`None` 表示源未提供
+    ///
+    /// 放在包里而不是只在 [`ResolvedJava`] 上：Adoptium / Azul 的下载地址就是
+    /// `id`，解析阶段不再回查，只有列表响应带哈希。丢了它就只能无校验下载。
+    pub expected_checksum: Option<Checksum>,
 }
 
 /// 解析后的可下载二进制
@@ -1005,6 +1010,8 @@ pub struct ResolvedJava {
     pub location: Url,
     /// 期望字节数；`None` 跳过校验
     pub expected_size: Option<u64>,
+    /// 期望归档校验和；`None` 跳过校验
+    pub expected_checksum: Option<Checksum>,
 }
 
 /// Java 发行包来源
@@ -1269,6 +1276,10 @@ impl StopSpec {
 }
 
 /// 停机结果
+///
+/// 刻意不加 `#[non_exhaustive]`：每个变体都在线上词表、停机等待循环与入口
+/// 退出码各有一处映射，新增变体必须让这些位置重新审视。静默兜底会把「未知
+/// 结果」报成成功或超时，用户据此判断服务器是否已停。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopOutcome {
     /// 宽限内正常退出
@@ -1311,6 +1322,10 @@ pub enum RemoteFailureKind {
     Unreachable,
     /// 对端 IO / 存储失败
     Io,
+    /// 通用失败：确实出错，但没有更具体的分类
+    Failure,
+    /// 用户取消
+    Cancelled,
     /// 未登记的种类（保留原文，只用于排障）
     Other(String),
 }
@@ -1332,6 +1347,8 @@ impl RemoteFailureKind {
             "protocol" => Self::Protocol,
             "unreachable" => Self::Unreachable,
             "io" => Self::Io,
+            "failure" => Self::Failure,
+            "cancelled" => Self::Cancelled,
             other => Self::Other(other.to_owned()),
         }
     }
@@ -1349,6 +1366,8 @@ impl RemoteFailureKind {
             Self::Protocol => "protocol",
             Self::Unreachable => "unreachable",
             Self::Io => "io",
+            Self::Failure => "failure",
+            Self::Cancelled => "cancelled",
             Self::Other(raw) => raw,
         }
     }
@@ -1364,6 +1383,8 @@ impl RemoteFailureKind {
             Self::AlreadyExists | Self::Busy => ErrorCategory::Conflict,
             Self::Invalid => ErrorCategory::Usage,
             Self::Unauthorized => ErrorCategory::Unauthorized,
+            Self::Failure => ErrorCategory::Failure,
+            Self::Cancelled => ErrorCategory::Cancelled,
             Self::NotRunning | Self::Protocol | Self::Unreachable | Self::Io | Self::Other(_) => {
                 ErrorCategory::Backend
             }

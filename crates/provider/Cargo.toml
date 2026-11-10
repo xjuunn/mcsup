@@ -1,15 +1,19 @@
 [package]
-name = "provider"
+name = "mcsup-provider"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish = false
+description = "External API, download, and third-party resource adapters for MCSUP"
+repository.workspace = true
+
+[lib]
+name = "provider"
 
 [dependencies]
 async-trait.workspace = true
-domain = { version = "0.1.0", path = "../domain" }
-port = { version = "0.1.0", path = "../port" }
+domain = { package = "mcsup-domain", version = "0.1.0", path = "../domain" }
+port = { package = "mcsup-port", version = "0.1.0", path = "../port" }
 # default-features = false 砍掉默认的 rustls(aws-lc-rs) 栈：aws-lc 要从源码
 # 编译整套 C 库（cc/cmake 构建脚本 + 数百 C 文件），拖慢构建、放大 MSVC
 # %TEMP% 依赖，对 Minecraft 服务器工具毫无必要。改用 rustls + ring：
@@ -44,5 +48,5 @@ zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2
 workspace = true
 
 [dev-dependencies]
-testkit = { version = "0.1.0", path = "../testkit" }
+testkit = { package = "mcsup-testkit", path = "../testkit" }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "io-util"] }

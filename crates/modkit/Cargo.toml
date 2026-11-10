@@ -1,15 +1,19 @@
 [package]
-name = "modkit"
+name = "mcsup-modkit"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish = false
+description = "Mod and modpack management for MCSUP"
+repository.workspace = true
+
+[lib]
+name = "modkit"
 
 [dependencies]
-domain = { version = "0.1.0", path = "../domain" }
+domain = { package = "mcsup-domain", version = "0.1.0", path = "../domain" }
 flate2 = "1.1.10"
-port = { version = "0.1.0", path = "../port" }
+port = { package = "mcsup-port", version = "0.1.0", path = "../port" }
 serde_json.workspace = true
 zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2"] }
 

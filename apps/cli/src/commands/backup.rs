@@ -14,7 +14,8 @@ use crate::prompts;
 use anyhow::{Context, Result};
 use comfy_table::{ContentArrangement, Table};
 use mcsup::domain::backup::{
-    BackupScope, ContentHash, Page, RestoreTarget, RetentionInput, Snapshot, SnapshotId, parse_age,
+    BackupScope, ContentHash, Page, RestoreTarget, RetentionInput, SnapshotId, SnapshotSummary,
+    parse_age,
 };
 use mcsup::domain::server::meta::ServerName;
 use mcsup::domain::server::settings::parse_backup_scope;
@@ -98,14 +99,14 @@ pub(crate) async fn create(
             format!(
                 "已创建备份 {}（{} 个文件，新增 {}，复用 {}）",
                 outcome.snapshot.id.as_str(),
-                outcome.snapshot.content.len(),
+                outcome.snapshot.files,
                 outcome.snapshot.added,
                 outcome.snapshot.reused
             ),
             format!(
                 "created backup {} ({} files, {} added, {} reused)",
                 outcome.snapshot.id.as_str(),
-                outcome.snapshot.content.len(),
+                outcome.snapshot.files,
                 outcome.snapshot.added,
                 outcome.snapshot.reused
             ),
@@ -179,7 +180,7 @@ pub(crate) fn list(name: &str, page: usize, page_size: usize, printer: Printer) 
                 snapshot.id.as_str(),
                 &utc_display(snapshot.created_at),
                 snapshot.status.as_str(),
-                &snapshot.content.len().to_string(),
+                &snapshot.files.to_string(),
                 &output::human_bytes(snapshot.total_bytes),
                 snapshot.label.as_deref().unwrap_or("-"),
             ]);
@@ -554,7 +555,7 @@ pub(crate) fn prune(
 // ---- 辅助 ----
 
 /// 快照 → JSON 行
-fn row_of(snapshot: &Snapshot) -> BackupRow<'_> {
+fn row_of(snapshot: &SnapshotSummary) -> BackupRow<'_> {
     BackupRow {
         id: snapshot.id.as_str(),
         server: snapshot.server.as_str(),
@@ -562,7 +563,7 @@ fn row_of(snapshot: &Snapshot) -> BackupRow<'_> {
         parent: snapshot.parent.as_ref().map(SnapshotId::as_str),
         status: snapshot.status.as_str(),
         scope: snapshot.scope.entries().to_vec(),
-        files: snapshot.content.len(),
+        files: snapshot.files,
         added: snapshot.added,
         reused: snapshot.reused,
         total_bytes: snapshot.total_bytes,

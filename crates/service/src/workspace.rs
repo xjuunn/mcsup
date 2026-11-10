@@ -188,6 +188,9 @@ struct MarkerToml {
 }
 
 /// init 结果
+///
+/// 刻意不加 `#[non_exhaustive]`：每种结局都必须给出对应的工作目录与提示，
+/// 未知结局没有可返回的 `Workspace`。
 #[derive(Debug, Clone)]
 pub enum InitOutcome {
     /// 新建并注册
@@ -226,6 +229,8 @@ impl RemoveOutcome {
 ///
 /// 远端配对断开 / 撤销时，本机 current 可能正指向该来源的工作区。留着这个指针
 /// 会让之后每条缺省落点命令都报「来源不可用」，所以必须当场撤回本地。
+/// 刻意不加 `#[non_exhaustive]`：每种结局对应不同的提示与撤回动作，未知
+/// 结局不能静默当成「未改动」。
 #[derive(Debug, Clone)]
 pub enum DetachOutcome {
     /// 当前选择不指向被移除的来源（或本来就没有选择），未改动

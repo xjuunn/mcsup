@@ -90,6 +90,9 @@ pub struct InstallOutcome {
 }
 
 /// 卸载结果
+///
+/// 刻意不加 `#[non_exhaustive]`：每个变体对应不同的用户提示（是否动了托管
+/// 目录），未知结果不能冒充其中任何一种。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UninstallOutcome {
     /// mcsup 管理的运行时：文件与记录一并删除
@@ -341,7 +344,7 @@ impl JavaService {
         let request = DownloadRequest {
             location: resolved.location,
             destination: destination.clone(),
-            expected: None,
+            expected: resolved.expected_checksum.clone(),
             expected_size: resolved.expected_size,
             mirrors: Vec::new(),
         };
@@ -830,6 +833,7 @@ mod tests {
                 major,
                 version: format!("{major}.0.5"),
                 package_type: request.package_type,
+                expected_checksum: None,
             }])
         }
 
@@ -841,6 +845,74 @@ mod tests {
                 package: package.clone(),
                 location: url::Url::parse("https://example.com/java-bin").expect("url"),
                 expected_size: None,
+                expected_checksum: None,
+            })
+        }
+    }
+
+    /// 源声明了哈希时必须传到下载请求；记录后照常失败退出，目录清理走同一路径
+    struct ChecksumRecordingDownloader {
+        seen: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ArtifactDownloader for ChecksumRecordingDownloader {
+        async fn download(
+            &self,
+            request: &DownloadRequest,
+            _progress: Option<&dyn ProgressSink>,
+            _cancel: &CancellationToken,
+        ) -> Result<DownloadedArtifact, port::DownloadError> {
+            self.seen.store(
+                request.expected.is_some(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            Err(port::DownloadError::Cancelled)
+        }
+    }
+
+    struct ChecksumRegistry;
+
+    fn sha256_checksum() -> domain::server::artifact::Checksum {
+        domain::server::artifact::Checksum::new(
+            domain::server::artifact::ChecksumAlgorithm::Sha256,
+            "a".repeat(64),
+        )
+    }
+
+    #[async_trait]
+    impl JavaSourceRegistryPort for ChecksumRegistry {
+        fn source_names(&self) -> Vec<&'static str> {
+            vec!["checksum"]
+        }
+
+        async fn ranked(&self) -> Arc<dyn JavaSourceRegistryPort> {
+            Arc::new(ChecksumRegistry)
+        }
+
+        async fn list_packages(
+            &self,
+            request: &JavaPackageRequest,
+        ) -> Result<Vec<port::JavaPackage>, SourceError> {
+            Ok(vec![port::JavaPackage {
+                id: "pkg1".into(),
+                vendor: JavaVendor::Temurin,
+                major: request.major,
+                version: format!("{}.0.5", request.major),
+                package_type: request.package_type,
+                expected_checksum: Some(sha256_checksum()),
+            }])
+        }
+
+        async fn resolve_binary(
+            &self,
+            package: &port::JavaPackage,
+        ) -> Result<port::ResolvedJava, SourceError> {
+            Ok(port::ResolvedJava {
+                package: package.clone(),
+                location: url::Url::parse("https://example.com/java-bin").expect("url"),
+                expected_size: None,
+                expected_checksum: package.expected_checksum.clone(),
             })
         }
     }
@@ -1180,6 +1252,33 @@ mod tests {
         assert_eq!(managed[0].id, "temurin-21");
     }
 
+    /// 上游声明的哈希必须进入下载请求：否则哈希只是展示，落盘仍不校验
+    #[tokio::test]
+    async fn install_passes_expected_checksum_to_downloader() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (service, _repo) = svc_parts(
+            tmp.path(),
+            Arc::new(ChecksumRecordingDownloader { seen: seen.clone() }),
+            Arc::new(ChecksumRegistry),
+        );
+        let cancel = CancellationToken::new();
+        // 下载器记录后返回失败：这里只关心请求是否带上了期望校验和
+        let _ = service
+            .install(
+                JavaMajor::parse(21).expect("21"),
+                JavaPackageType::Jdk,
+                None,
+                None,
+                &cancel,
+            )
+            .await;
+        assert!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            "expected checksum must be forwarded to the downloader"
+        );
+    }
+
     /// `java_root` 下的全部残留名（失败清理类断言用）
     fn java_root_entries(tmp: &Path) -> Vec<String> {
         crate::fs::read_dir(tmp.join("java"))
@@ -1365,6 +1464,7 @@ mod tests {
                     major: request.major,
                     version: format!("{}.0.5", request.major),
                     package_type: request.package_type,
+                    expected_checksum: None,
                 }])
             }
 
@@ -1377,6 +1477,7 @@ mod tests {
                     package: package.clone(),
                     location: url::Url::parse("https://example.com/java-bin").expect("url"),
                     expected_size: None,
+                    expected_checksum: None,
                 })
             }
         }
@@ -1502,6 +1603,7 @@ mod tests {
             major: JavaMajor::parse(27).expect("27"),
             version: "27.0.0".into(),
             package_type: JavaPackageType::Jdk,
+            expected_checksum: None,
         };
         assert_eq!(install_dir_name(&jdk), "zulu-27");
         let jre = port::JavaPackage {

@@ -1,16 +1,20 @@
 [package]
-name = "service"
+name = "mcsup-service"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish = false
+description = "Business orchestration for MCSUP"
+repository.workspace = true
+
+[lib]
+name = "service"
 
 [dependencies]
 async-trait.workspace = true
 dirs.workspace = true
-domain = { version = "0.1.0", path = "../domain" }
-port = { version = "0.1.0", path = "../port" }
+domain = { package = "mcsup-domain", version = "0.1.0", path = "../domain" }
+port = { package = "mcsup-port", version = "0.1.0", path = "../port" }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha1 = "0.11.0"
@@ -25,12 +29,12 @@ uuid.workspace = true
 workspace = true
 
 [dev-dependencies]
-backup = { version = "0.1.0", path = "../backup" }
-modkit = { version = "0.1.0", path = "../modkit" }
-service = { version = "0.1.0", path = "." }
-storage = { version = "0.1.0", path = "../storage" }
+backup = { package = "mcsup-backup", path = "../backup" }
+modkit = { package = "mcsup-modkit", path = "../modkit" }
+service = { package = "mcsup-service", path = "." }
+storage = { package = "mcsup-storage", path = "../storage" }
 tempfile.workspace = true
-testkit = { version = "0.1.0", path = "../testkit" }
+testkit = { package = "mcsup-testkit", path = "../testkit" }
 tokio = { workspace = true, features = ["macros", "rt"] }
 uuid.workspace = true
 zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2"] }

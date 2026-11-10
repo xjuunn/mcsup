@@ -211,6 +211,7 @@ mod tests {
                     major: JavaMajor::parse(21).expect("21"),
                     version: "21.0.5".into(),
                     package_type: JavaPackageType::Jdk,
+                    expected_checksum: None,
                 }])
             }
         }
@@ -223,6 +224,7 @@ mod tests {
                 package: package.clone(),
                 location: url::Url::parse("https://example.com/jdk.tar.gz").expect("url"),
                 expected_size: None,
+                expected_checksum: None,
             })
         }
     }
