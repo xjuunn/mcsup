@@ -190,7 +190,11 @@ impl ContentStore for CasStore {
             .prefix(".restore-")
             .tempfile_in(parent)
             .map_err(|err| BackupIoError::io(parent, err))?;
+        // 复制的同时重算哈希：CAS 里的对象可能被位翻转或外部改写，
+        // 不校验就等于把坏数据当备份恢复回去。校验失败时不落目标文件
+        // （暂存文件随句柄丢弃自动删除）。
         let mut reader = std::io::BufReader::with_capacity(BUFFER_SIZE, source);
+        let mut hasher = Sha256::new();
         let mut size: u64 = 0;
         let mut buffer = vec![0u8; BUFFER_SIZE];
         loop {
@@ -200,11 +204,19 @@ impl ContentStore for CasStore {
             if read == 0 {
                 break;
             }
+            hasher.update(&buffer[..read]);
             staging
                 .as_file_mut()
                 .write_all(&buffer[..read])
                 .map_err(|err| BackupIoError::io(staging.path(), err))?;
             size = size.saturating_add(read as u64);
+        }
+        let actual = ContentHash::from_digest(hasher.finalize().as_ref());
+        if &actual != hash {
+            return Err(CasError::Corrupt {
+                hash: hash.clone(),
+                reason: format!("sha256 mismatch: object contains {actual}"),
+            });
         }
         staging
             .as_file_mut()
@@ -383,6 +395,27 @@ mod tests {
             .expect("verify");
         assert_eq!(steps, 2);
         assert_eq!(broken.len(), 2);
+    }
+
+    /// 取出时重算哈希：坏对象必须报 `Corrupt`，且不能落出一个目标文件
+    ///
+    /// 回归：`get` 曾只复制字节不校验，位翻转或外部改写的对象会被当成
+    /// 正常备份恢复出去。
+    #[test]
+    fn get_rejects_a_corrupt_object_without_writing_dest() {
+        let (dir, store) = store();
+        let (hash, _) = store
+            .put(&mut Cursor::new(b"payload".to_vec()), &rel("a"))
+            .expect("put");
+        fs::write(store.object_path(&hash), b"tampered").expect("tamper");
+
+        let dest = dir.path().join("restored.bin");
+        let err = store.get(&hash, &dest).expect_err("must reject");
+        match err {
+            CasError::Corrupt { hash: reported, .. } => assert_eq!(reported, hash),
+            other => panic!("期望 Corrupt，实际 {other:?}"),
+        }
+        assert!(!dest.exists(), "校验失败不得落出目标文件");
     }
 
     #[test]

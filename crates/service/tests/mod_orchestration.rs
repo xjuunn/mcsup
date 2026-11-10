@@ -1000,6 +1000,50 @@ async fn apply_fix_from_log_moves_the_blamed_jar_to_trash() {
     );
 }
 
+/// 执行修复按计划自己的类别走：`--kind plugin` 的文件在 `plugins/`
+///
+/// 回归：`apply_fix` 曾硬编码 `ContentKind::Mod`，插件的合法移除被判成
+/// `Escapes`，补装也会落到 `mods/` 而不是 `plugins/`。
+#[tokio::test]
+async fn apply_fix_uses_the_planned_content_kind() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[("calcmod.jar", SideSupport::Required)],
+        b"jar-bytes",
+    );
+    harness.write("plugins/calcmod.jar", b"payload");
+    harness
+        .inspector
+        .declares_classes("calcmod.jar", &["net/jsa2025/calcmod/commands/CalcCommand"]);
+    harness.write("console.log", CALCMOD_CRASH_LOG.as_bytes());
+
+    let plan = harness
+        .mods
+        .plan_fix_from_log("alpha", ContentKind::Plugin, 500)
+        .await
+        .expect("plan_fix_from_log");
+    assert_eq!(plan.kind, ContentKind::Plugin);
+    let plugin_jar = harness.server_dir().join("plugins").join("calcmod.jar");
+    assert_eq!(plan.removals.len(), 1, "{plan:?}");
+    assert_eq!(plan.removals[0].file, plugin_jar);
+
+    let applied = harness
+        .mods
+        .apply_fix(
+            "alpha",
+            &plan,
+            ApplyOptions {
+                allow_blocking: false,
+                progress: None,
+                cancel: &CancellationToken::new(),
+            },
+        )
+        .await
+        .expect("apply_fix");
+    assert_eq!(applied.removed.len(), 1, "{applied:?}");
+    assert!(!plugin_jar.exists(), "插件必须从 plugins/ 移除");
+}
+
 /// 执行修复：补装落盘
 #[tokio::test]
 async fn apply_fix_installs_the_missing_dependency() {

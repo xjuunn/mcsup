@@ -398,9 +398,10 @@ fn backup_list_rejects_zero_page_and_page_size() {
     let home = temp_home();
     init_workspace(&home, "ws");
 
+    // 语言必须显式固定：断言的是中文文案，跟着机器 locale 走会在英文环境失败
     for args in [
-        ["ls", "alpha", "--page", "0"],
-        ["ls", "alpha", "--page-size", "0"],
+        ["ls", "alpha", "--page", "0", "--lang", "zh"],
+        ["ls", "alpha", "--page-size", "0", "--lang", "zh"],
     ] {
         let bad = backup(&home, &args);
         assert_eq!(

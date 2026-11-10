@@ -402,6 +402,11 @@ pub struct FixRemove {
 pub struct ModFixPlan {
     /// 服务器名
     pub server: String,
+    /// 计划针对的内容类别
+    ///
+    /// 移除校验与补装落点都由它决定（`plugins/` 与 `mods/` 不是一回事）。
+    /// 计划必须在执行时带着产出它的类别，不能假定为 `Mod`。
+    pub kind: ContentKind,
     /// 补装项
     pub installs: Vec<FixInstall>,
     /// 移除项
@@ -1251,6 +1256,7 @@ impl ModService {
 
         Ok(ModFixPlan {
             server: server.meta.name.as_str().to_owned(),
+            kind,
             installs,
             removals,
             unresolved,
@@ -1356,6 +1362,7 @@ impl ModService {
 
         Ok(ModFixPlan {
             server: server.meta.name.as_str().to_owned(),
+            kind,
             installs: Vec::new(),
             removals,
             unresolved: Vec::new(),
@@ -1512,7 +1519,12 @@ impl ModService {
     ) -> Result<ModFixApplied, ModError> {
         let server = self.local_server(name)?;
         self.ensure_stopped(&server)?;
-        let kind = ContentKind::Mod;
+        // 计划自己带着产出它的类别：插件计划的移除校验与补装落点都在
+        // `plugins/`，按 `mods/` 执行会把合法移除报成越界、补装落错目录
+        let kind = plan.kind;
+        if !kind.is_server_usable() {
+            return Err(ModError::ClientOnly { kind });
+        }
 
         let mut removed: Vec<PathBuf> = Vec::new();
         for item in &plan.removals {
