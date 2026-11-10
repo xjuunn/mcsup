@@ -46,6 +46,8 @@ const SERVER_IRRELEVANT_DIRS: [&str; 2] = ["resourcepacks/", "shaderpacks/"];
 /// 一个文件的环境标记（`required` / `optional` / `unsupported`）
 ///
 /// 反序列化在 `provider::modrinth::mrpack`（领域层不引入 serde，见模块文档）。
+/// 刻意不加 `#[non_exhaustive]`：`Unsupported` 与其余两档处置相反，未知档
+/// 不能静默归入任一侧。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnvSupport {
     /// 该侧必须安装

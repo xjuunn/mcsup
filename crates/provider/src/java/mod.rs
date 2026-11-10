@@ -18,7 +18,28 @@ pub(crate) fn resolved_from_id(
         package: package.clone(),
         location,
         expected_size: None,
+        expected_checksum: package.expected_checksum.clone(),
     })
+}
+
+/// 把上游哈希串转成校验和，只按长度识别算法
+///
+/// 三家源的字段名与类型声明不一致（`checksum` / `sha256_hash`，有的还没给
+/// `checksum_type`）。按长度识别不会把 MD5 当 SHA-256 去校验——那会让每次
+/// 安装都失败。识别不出算法时返回 `None`（退回只校验大小），不猜测。
+#[must_use]
+pub(crate) fn checksum_hex(raw: &str) -> Option<domain::server::artifact::Checksum> {
+    use domain::server::artifact::{Checksum, ChecksumAlgorithm};
+    let hex = raw.trim();
+    if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let algorithm = match hex.len() {
+        64 => ChecksumAlgorithm::Sha256,
+        40 => ChecksumAlgorithm::Sha1,
+        _ => return None,
+    };
+    Some(Checksum::new(algorithm, hex))
 }
 
 /// 归档名是否可直接解压部署（dmg / msi / pkg 等安装包一律不收）
@@ -141,7 +162,10 @@ pub(crate) fn parse_major_or_drop(
 
 #[cfg(test)]
 mod tests {
-    use super::{arch_from_filename, arch_matches, filename_arch_matches, os_matches};
+    use super::{
+        arch_from_filename, arch_matches, checksum_hex, filename_arch_matches, os_matches,
+    };
+    use domain::server::artifact::ChecksumAlgorithm;
 
     /// 回归：foojay 的架构参数名是 `architecture`，写成 `arch` 会被上游静默忽略，
     /// 于是 aarch64 机器装到 x64 的 JVM（`execve` 直接失败）。
@@ -217,5 +241,27 @@ mod tests {
         assert!(os_matches("linux", "linux"));
         assert!(!os_matches("linux", "windows"));
         assert!(!os_matches("linux", ""));
+    }
+
+    /// 只按长度识别算法：MD5 等不认识的摘要必须忽略，不能误当 SHA-256
+    /// 去校验（那会让每次安装都失败）
+    #[test]
+    fn checksum_hex_recognises_sha256_and_sha1_only() {
+        let sha256 = "a".repeat(64);
+        assert_eq!(
+            checksum_hex(&sha256).map(|c| c.algorithm()),
+            Some(ChecksumAlgorithm::Sha256)
+        );
+        let sha1 = "b".repeat(40);
+        assert_eq!(
+            checksum_hex(&sha1).map(|c| c.algorithm()),
+            Some(ChecksumAlgorithm::Sha1)
+        );
+        assert!(
+            checksum_hex(&"c".repeat(32)).is_none(),
+            "MD5 must be ignored"
+        );
+        assert!(checksum_hex("not-hex").is_none());
+        assert!(checksum_hex("").is_none());
     }
 }

@@ -578,7 +578,9 @@ fn side_text(side: SideSupport, lang: Lang) -> &'static str {
         SideSupport::Required => text(lang, "✓ 必需", "✓ required"),
         SideSupport::Optional => text(lang, "✓ 可选", "✓ optional"),
         SideSupport::Unsupported => text(lang, "✗ 不支持", "✗ unsupported"),
-        SideSupport::Unknown => text(lang, "? 判不出", "? unknown"),
+        // `Unknown` 与未来新增档位都按「判不出」展示：不会把未知状态渲染成
+        // 「必需」或「不支持」。
+        _ => text(lang, "? 判不出", "? unknown"),
     }
 }
 

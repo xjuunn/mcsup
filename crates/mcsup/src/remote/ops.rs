@@ -520,6 +520,9 @@ impl Agent {
             match watch.read_new() {
                 Ok(batch) if !batch.is_empty() => {
                     history.extend(batch);
+                    if history.len() > domain::limits::MAX_LOG_LINES {
+                        history.drain(..history.len() - domain::limits::MAX_LOG_LINES);
+                    }
                     return Response::LogLines { lines: history };
                 }
                 Ok(_) => {}
@@ -1172,9 +1175,9 @@ impl Drop for StagingGuard {
 /// 本地给 4、经 agent 给 2，客户端无法判断该不该重试。
 ///
 /// 线上词表比分类更细一档（`busy` / `already_exists` 都是冲突），需要区分时
-/// 由调用方在投影前先摘出来。反过来则必然有损：`Failure` 与 `Backend` 都投影
-/// 成 `io`，`Cancelled` 也落 `io`——线协议没有「取消」这一档，对端收到 IO 失败
-/// 时客户端按后端失败处理。本地 Ctrl-C 不经过这里（入口自己就能判 130），
+/// 由调用方在投影前先摘出来。分类与词表一一对应，未知种类只在旧对端出现：
+/// 旧客户端收到 `failure` / `cancelled` 会落 `Other`，其 `category()` 仍按
+/// 后端失败处理，方向安全。本地 Ctrl-C 不经过这里（入口自己就能判 130），
 /// 只有 agent 侧自查到取消才会走到这条路径。
 fn wire_kind(category: port::ErrorCategory) -> &'static str {
     match category {
@@ -1182,9 +1185,9 @@ fn wire_kind(category: port::ErrorCategory) -> &'static str {
         port::ErrorCategory::Conflict => ErrorKind::BUSY,
         port::ErrorCategory::Usage => ErrorKind::INVALID,
         port::ErrorCategory::Unauthorized => ErrorKind::UNAUTHORIZED,
-        port::ErrorCategory::Backend
-        | port::ErrorCategory::Failure
-        | port::ErrorCategory::Cancelled => ErrorKind::IO,
+        port::ErrorCategory::Failure => ErrorKind::FAILURE,
+        port::ErrorCategory::Cancelled => ErrorKind::CANCELLED,
+        port::ErrorCategory::Backend => ErrorKind::IO,
     }
 }
 
@@ -1340,22 +1343,13 @@ mod tests {
             ErrorCategory::Usage,
             ErrorCategory::Unauthorized,
             ErrorCategory::Backend,
+            ErrorCategory::Failure,
+            ErrorCategory::Cancelled,
         ] {
             let wire = wire_kind(category);
             assert_eq!(
                 RemoteFailureKind::from_wire(wire).category(),
                 category,
-                "{wire}"
-            );
-        }
-
-        // 线协议没有「通用失败」与「取消」两档：都退化为后端失败，方向安全
-        // （客户端只会重试或报错，不会误当成「用户取消」而静默成功）
-        for category in [ErrorCategory::Failure, ErrorCategory::Cancelled] {
-            let wire = wire_kind(category);
-            assert_eq!(
-                RemoteFailureKind::from_wire(wire).category(),
-                ErrorCategory::Backend,
                 "{wire}"
             );
         }

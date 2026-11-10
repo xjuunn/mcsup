@@ -100,6 +100,7 @@ impl TaskStage {
 /// 事件的种类只能有一处，新增种类时两端一起变，不会出现「本地有、远端没有」。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum TaskEvent {
     /// 进入新阶段
     Stage {

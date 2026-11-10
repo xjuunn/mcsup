@@ -22,7 +22,7 @@ static INSTALL: Once = Once::new();
 ///
 /// 进程内可能已有别处安装过（`provider` 的 HTTP 客户端）；这里只在没人安装时
 /// 安装，失败也不报错——已有 provider 就够用。
-pub fn install_provider() {
+pub(crate) fn install_provider() {
     INSTALL.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
@@ -41,7 +41,9 @@ fn provider() -> Arc<CryptoProvider> {
 /// # Errors
 ///
 /// 证书与私钥不匹配或密码学后端不可用时返回 [`TransportError::Tls`]
-pub fn server_config(identity: &ServerIdentity) -> Result<Arc<ServerConfig>, TransportError> {
+pub(crate) fn server_config(
+    identity: &ServerIdentity,
+) -> Result<Arc<ServerConfig>, TransportError> {
     let provider = provider();
     let config = ServerConfig::builder_with_provider(Arc::clone(&provider))
         .with_safe_default_protocol_versions()?
@@ -55,7 +57,7 @@ pub fn server_config(identity: &ServerIdentity) -> Result<Arc<ServerConfig>, Tra
 /// # Errors
 ///
 /// 密码学后端不可用时返回 [`TransportError::Tls`]
-pub fn client_config(expected: &Fingerprint) -> Result<Arc<ClientConfig>, TransportError> {
+pub(crate) fn client_config(expected: &Fingerprint) -> Result<Arc<ClientConfig>, TransportError> {
     let provider = provider();
     let verifier = Arc::new(PinnedVerifier {
         expected: expected.clone(),
@@ -77,7 +79,7 @@ pub fn client_config(expected: &Fingerprint) -> Result<Arc<ClientConfig>, Transp
 /// # Errors
 ///
 /// 密码学后端不可用时返回 [`TransportError::Tls`]
-pub fn client_config_capture(
+pub(crate) fn client_config_capture(
     captured: Arc<std::sync::Mutex<Option<Fingerprint>>>,
 ) -> Result<Arc<ClientConfig>, TransportError> {
     let provider = provider();

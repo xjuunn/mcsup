@@ -838,6 +838,10 @@ impl ErrorKind {
     pub const IO: &'static str = "io";
     /// 参数非法
     pub const INVALID: &'static str = "invalid";
+    /// 通用失败：确实出错，但没有更具体的分类
+    pub const FAILURE: &'static str = "failure";
+    /// 用户取消
+    pub const CANCELLED: &'static str = "cancelled";
 }
 
 /// 写出一帧（版本 + JSON + 换行 + flush）
@@ -881,14 +885,44 @@ fn write_remote<W: Write, T: Serialize>(w: &mut W, body: &T) -> io::Result<()> {
         v: REMOTE_PROTOCOL_VERSION,
         body,
     };
-    serde_json::to_writer(&mut *w, &frame)?;
+    // 出站同样受单帧上限约束。先序列化到有界缓冲再整帧写出，避免
+    // 「写了一半才超限」把连接留在半帧状态。
+    let mut framed = BoundedFrame::default();
+    serde_json::to_writer(&mut framed, &frame)?;
+    w.write_all(&framed.bytes)?;
     w.write_all(b"\n")?;
     w.flush()
 }
 
+/// 出站帧缓冲：超过 [`MAX_FRAME_BYTES`] 立即失败
+#[derive(Default)]
+struct BoundedFrame {
+    bytes: Vec<u8>,
+}
+
+impl Write for BoundedFrame {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        if self.bytes.len().saturating_add(data.len()) > MAX_FRAME_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("remote frame exceeds {MAX_FRAME_BYTES} bytes"),
+            ));
+        }
+        self.bytes.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 fn read_remote<R: BufRead, T: DeserializeOwned>(r: &mut R) -> io::Result<T> {
     let line = read_bounded_line(r)?;
-    let frame: Frame<T> = serde_json::from_slice(&line)
+    // 两阶段解码：先只取版本字段，再解帧体。若先解帧体，未知 `op` 的
+    // 新版本帧会在反序列化阶段失败，被误报成「JSON 非法」而不是版本不匹配，
+    // 排障方向完全错位。
+    let frame: Frame<serde_json::Value> = serde_json::from_slice(&line)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     if frame.v != REMOTE_PROTOCOL_VERSION {
         return Err(io::Error::new(
@@ -900,7 +934,8 @@ fn read_remote<R: BufRead, T: DeserializeOwned>(r: &mut R) -> io::Result<T> {
             ),
         ));
     }
-    Ok(frame.body)
+    serde_json::from_value(frame.body)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
 }
 
 /// 读一行，但先设上限
@@ -1438,6 +1473,13 @@ mod tests {
         assert!(err.to_string().contains("version mismatch"), "{err}");
         assert!(check_protocol_version(99).is_err());
         assert!(check_protocol_version(REMOTE_PROTOCOL_VERSION).is_ok());
+
+        // 新版本帧可能带旧代码不认识的 op：必须先报版本不匹配，
+        // 而不是把「未知 op」误报成 JSON 非法。
+        let mut cursor = Cursor::new(b"{\"v\":99,\"op\":\"future_op\"}\n".to_vec());
+        let err = read_request(&mut cursor).expect_err("v99 unknown op");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("version mismatch"), "{err}");
     }
 
     #[test]
@@ -1456,6 +1498,15 @@ mod tests {
         huge.resize(MAX_FRAME_BYTES + 16, b'a');
         let mut cursor = Cursor::new(huge);
         let err = read_request(&mut cursor).expect_err("oversized");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("exceeds"), "{err}");
+
+        // 出站帧同样不能无限增长：超过上限时写入失败，而不是把内存打满
+        let mut bounded = BoundedFrame::default();
+        bounded
+            .write_all(&vec![b'a'; MAX_FRAME_BYTES])
+            .expect("at limit");
+        let err = bounded.write_all(b"x").expect_err("over limit");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("exceeds"), "{err}");
     }

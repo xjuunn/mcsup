@@ -227,9 +227,9 @@ pub(crate) fn version(name: &str, printer: Printer) -> Result<()> {
             format!("server {name} does not exist"),
         )
     })?;
-    let unknown_source = crate::i18n::pick(printer.lang(), "未知", "unknown");
+    // JSON 是机器契约：无匹配来源时用稳定的 `unknown`，不随界面语言变化。
     let source = bootstrap::pick_source(&srv.meta.variant, &bootstrap::jar_sources()?)
-        .map_or(unknown_source.as_str(), |source| source.name());
+        .map_or("unknown", |source| source.name());
     let jar = srv.meta.jar.as_ref().map(|jar| JarJson {
         path: jar.path.display().to_string(),
         size: jar.size,
@@ -246,6 +246,11 @@ pub(crate) fn version(name: &str, printer: Printer) -> Result<()> {
     };
 
     if printer.is_human() {
+        let display_source = if payload.source == "unknown" {
+            crate::i18n::pick(printer.lang(), "未知", "unknown")
+        } else {
+            payload.source.to_owned()
+        };
         let mut table = Table::new();
         table.set_content_arrangement(ContentArrangement::Dynamic);
         let l = printer.lang();
@@ -256,7 +261,10 @@ pub(crate) fn version(name: &str, printer: Printer) -> Result<()> {
         table.add_row([crate::i18n::text(l, "名称", "name"), payload.name]);
         table.add_row([crate::i18n::text(l, "版本", "version"), payload.version]);
         table.add_row([crate::i18n::text(l, "变体", "variant"), payload.variant]);
-        table.add_row([crate::i18n::text(l, "来源", "source"), payload.source]);
+        table.add_row([
+            crate::i18n::text(l, "来源", "source"),
+            display_source.as_str(),
+        ]);
         match payload.jar.as_ref() {
             Some(jar) => {
                 table.add_row([crate::i18n::text(l, "核心", "core"), jar.path.as_str()]);

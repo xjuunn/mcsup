@@ -152,13 +152,13 @@ impl ServerIdentity {
 
     /// 证书（DER）
     #[must_use]
-    pub fn cert(&self) -> &CertificateDer<'static> {
+    pub(crate) fn cert(&self) -> &CertificateDer<'static> {
         &self.cert
     }
 
     /// 私钥（DER）
     #[must_use]
-    pub fn key(&self) -> &PrivateKeyDer<'static> {
+    pub(crate) fn key(&self) -> &PrivateKeyDer<'static> {
         &self.key
     }
 }

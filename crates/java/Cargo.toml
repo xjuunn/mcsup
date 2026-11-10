@@ -1,14 +1,18 @@
 [package]
-name = "java"
+name = "mcsup-java"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish = false
+description = "Java runtime discovery and selection for MCSUP"
+repository.workspace = true
+
+[lib]
+name = "java"
 
 [dependencies]
-domain = { version = "0.1.0", path = "../domain" }
-port = { version = "0.1.0", path = "../port" }
+domain = { package = "mcsup-domain", version = "0.1.0", path = "../domain" }
+port = { package = "mcsup-port", version = "0.1.0", path = "../port" }
 tracing.workspace = true
 
 [lints]

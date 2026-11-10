@@ -423,7 +423,7 @@ impl SnapshotContent {
         self
     }
 
-    /// 备份时的 `(路径, 大小, 修改时间秒)` 观察值
+    /// 备份时的 `(路径, 大小, 修改时间纳秒)` 观察值
     #[must_use]
     pub fn stamps(&self) -> &[(RelPath, u64, i64)] {
         &self.stamps
@@ -589,6 +589,9 @@ impl Snapshot {
 }
 
 /// 恢复目标：原地，或恢复为一个新服务
+///
+/// 刻意不加 `#[non_exhaustive]`：未知目标无法安全落到「原地」或「新目录」——
+/// 前者会覆盖现有服务器，后者会写错落点，两种猜测都不能接受。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RestoreTarget {
     /// 覆盖原服务器目录

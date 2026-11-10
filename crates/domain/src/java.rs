@@ -128,6 +128,9 @@ impl fmt::Display for JavaVendor {
 }
 
 /// 包类型：JDK 含编译器，JRE 仅运行时
+///
+/// 刻意不加 `#[non_exhaustive]`：托管安装目录名由类型决定，未知类型不能
+/// 冒充 JDK（会装上不该有的编译器与目录名）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum JavaPackageType {
     #[default]

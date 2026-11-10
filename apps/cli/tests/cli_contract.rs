@@ -574,6 +574,16 @@ fn workspace_doctor_missing_dir_exits_1() {
 
     let out = run(home.path(), &["workspace", "doctor", "--output", "json"]);
     assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    // JSON 是机器契约：message 不随界面语言变化
+    let zh = run(
+        home.path(),
+        &["workspace", "doctor", "--output", "json", "--lang", "zh"],
+    );
+    let en = run(
+        home.path(),
+        &["workspace", "doctor", "--output", "json", "--lang", "en"],
+    );
+    assert_eq!(zh.stdout, en.stdout, "workspace doctor JSON 不得随语言变化");
     let payload: serde_json::Value = serde_json::from_slice(&out.stdout).expect("JSON");
     assert_eq!(payload["has_errors"], true);
     let findings = payload["findings"].as_array().expect("array");
@@ -986,6 +996,42 @@ fn json_stdout_is_language_independent() {
     assert!(zh.status.success(), "stderr: {}", stderr(&zh));
     assert_eq!(zh.stdout, en.stdout, "JSON 输出不得随语言变化");
     assert!(zh.stderr.is_empty(), "stderr: {}", stderr(&zh));
+}
+
+/// `doctor` 的 JSON 文案是机器契约：message / fix 不随界面语言变化
+#[test]
+fn doctor_json_is_language_independent() {
+    let home = temp_home();
+    let config = home.path().join("config.toml");
+    std::fs::write(&config, "java-source = \"nope\"\n").expect("写入非法配置");
+    let config_path = config.to_str().expect("utf8");
+    let zh = run(
+        home.path(),
+        &[
+            "--config",
+            config_path,
+            "doctor",
+            "--output",
+            "json",
+            "--lang",
+            "zh",
+        ],
+    );
+    let en = run(
+        home.path(),
+        &[
+            "--config",
+            config_path,
+            "doctor",
+            "--output",
+            "json",
+            "--lang",
+            "en",
+        ],
+    );
+    assert_eq!(zh.status.code(), en.status.code());
+    assert_eq!(zh.status.code(), Some(1), "stderr: {}", stderr(&zh));
+    assert_eq!(zh.stdout, en.stdout, "doctor JSON 不得随语言变化");
 }
 
 /// `--version` 走中文化后的帮助通道，仍退 0 且只写 stdout

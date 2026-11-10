@@ -208,14 +208,25 @@ CLI 中任何可能超过数百毫秒的步骤（网络请求、扫描、下载�
 
 # 命名与目录结构
 
-`crates` 中的库名称一律使用单个单词，不使用 `mcsup-` 前缀：
+`crates` 中的库名（源码里的 crate 名）一律使用单个单词：
 
 ```
 domain port backend service runtime provider storage backup file java
 modkit protocol transport api auth
 ```
 
-这些是 workspace 内部的包名，不发布，因此不要求在 crates.io 上全局唯一。
+发布到 crates.io 的内层 package 名必须带 `mcsup-` 前缀，并通过 `[lib] name`
+保留单词库名：
+
+```toml
+[package]
+name = "mcsup-domain"        # package 名：crates.io 全局唯一
+[lib]
+name = "domain"              # 库名：源码仍写 use domain::
+```
+
+单词 package 名在 crates.io 已被占用，这是发布后无法更改的契约。`testkit`
+只作 dev-dependency，可保持 `publish = false`。
 
 `domain` 是领域层，包含领域模型和领域规则。禁止命名为 `core`。
 
@@ -254,18 +265,18 @@ $ mcsup-agent --listen ...    # 看到 server / agent 无法猜到和 Minecraft 
 | 标识符 | 唯一性范围 | 约束 |
 | --- | --- | --- |
 | 目录名 | 仓库内 | 单词名 |
-| package 名 | Cargo workspace 内 | 单词名 |
+| 库名（`[lib] name`） | Cargo workspace 内 | 单词名 |
+| package 名 | crates.io / workspace 内 | 内层 `mcsup-*`，apps 单词名 |
 | bin 名 | 用户 PATH | `mcsup` 或 `mcsup-*` |
 
 完整目录结构见 `docs/architecture.md`。
 
 当前与目标都是多 crate + `mcsup` 门面：`mcsup` 按 feature 级联重导出内层
-crate，是第三方依赖的唯一入口与发布主体。内层 crate 现为 `publish = false`
-的 path 依赖，单词名不发布、不占 crates.io；一旦要发布 `mcsup`，它 feature
-拉入的每个内层 crate 必须先改名 `mcsup-*`（单词名已被占用，`mcsup-*` 已验证
-可用），按 `domain → auth → port → protocol → service / file / java / provider /
-storage / backup / transport / runtime → backend → mcsup` 顺序发布，
-版本以 `workspace.version` 锁步。门面 feature、级联与发布条件见
+crate，是第三方依赖的唯一入口与发布主体。内层 package 已统一命名
+`mcsup-*` 并用 `[lib] name` 保留单词库名；按
+`mcsup-domain → mcsup-auth → mcsup-port → mcsup-protocol → 实现层 →
+mcsup-service / mcsup-backend → mcsup` 顺序发布，版本以
+`workspace.version` 锁步。门面 feature、级联与发布条件见
 `docs/embedding.md` 的分发形态一节。
 
 # 代码归属与依赖方向

@@ -12,6 +12,7 @@ use crate::config::ConfigFile;
 use crate::diagnostic::AppDiagnostic;
 use crate::locale::Lang;
 use crate::output::Printer;
+use crate::progress::TaskSpinner;
 use crate::prompts;
 use anyhow::{Context, Result};
 use comfy_table::Table;
@@ -112,6 +113,14 @@ fn connect(
         crate::commands::origin::remote_name(explicit, lang)?;
     }
     let target = normalize_target(raw);
+    let spinner = TaskSpinner::new(
+        crate::i18n::pick(
+            lang,
+            format!("正在探测 {target}"),
+            format!("probing {target}"),
+        ),
+        printer.is_human(),
+    );
     let probe = Client::probe(&target).with_context(|| {
         crate::i18n::pick(
             lang,
@@ -119,15 +128,20 @@ fn connect(
             format!("failed to connect to {target}"),
         )
     })?;
+    // 交互提示与配对码输入要独占这一行，先停回显再问
+    spinner.finish();
     let fingerprint = confirm_fingerprint(&probe, printer)?;
     let remote_name = resolve_remote_name(name, file, &target, printer)?;
     let code = resolve_pairing_code(code, &probe, printer)?;
     let client_name = client_display_name();
 
+    spinner.restart();
+    spinner.set_message(crate::i18n::pick(lang, "正在配对", "pairing"));
     let client = Client::new(&target, fingerprint.clone());
     let enrolled = client
         .enroll(&code, &client_name, read_only)
         .with_context(|| crate::i18n::pick(lang, "配对失败", "pairing failed"))?;
+    spinner.finish();
 
     let credentials = credential_store();
     credentials
@@ -184,10 +198,19 @@ fn connect_ssh(
     let lang = printer.lang();
     let (user, host) = crate::ssh::parse_user_host(target, lang)?;
     let ssh_target = format!("{user}@{host}");
+    let spinner = TaskSpinner::new(
+        crate::i18n::pick(
+            lang,
+            format!("正在建立到 {ssh_target} 的 SSH 会话"),
+            format!("opening an ssh session to {ssh_target}"),
+        ),
+        printer.is_human(),
+    );
     // 建立会话（引导 + 隧道）后，握手里的配对码直接用来配对：用户不必再从
     // 对端屏幕上抄一次。会话登记在进程内，后面 report_connected 复用同一条。
     let (local, handshake) = crate::ssh::session(&ssh_target, lang)?;
 
+    spinner.set_message(crate::i18n::pick(lang, "正在探测远端", "probing the peer"));
     let probe = Client::probe(&local).with_context(|| {
         crate::i18n::pick(
             lang,
@@ -197,13 +220,17 @@ fn connect_ssh(
     })?;
     // 指纹必须与远端自报的一致（probe 已校验），用户仍需确认——SSH 只证明
     // 「能登上去」，不证明「agent 是同一台机器上的那个」
+    spinner.finish();
     let fingerprint = confirm_fingerprint(&probe, printer)?;
     let remote_name = resolve_remote_name(name, file, &ssh_target, printer)?;
     let client_name = client_display_name();
+    spinner.restart();
+    spinner.set_message(crate::i18n::pick(lang, "正在配对", "pairing"));
     let client = Client::new(&local, fingerprint.clone());
     let enrolled = client
         .enroll(&handshake.pairing_code, &client_name, read_only)
         .with_context(|| crate::i18n::pick(lang, "SSH 配对失败", "ssh pairing failed"))?;
+    spinner.finish();
 
     let credentials = credential_store();
     credentials
@@ -283,7 +310,20 @@ fn reconnect(file: &ConfigFile, name: &str, printer: Printer) -> Result<()> {
 
     // 先解析实际可连地址（SSH 记录要先建隧道），再 probe 确认对端仍是同一张
     // 证书，最后认证：指纹变化必须显式重新配对
+    let spinner = TaskSpinner::new(
+        crate::i18n::pick(
+            lang,
+            format!("正在连接远端 {name}"),
+            format!("connecting to remote {name}"),
+        ),
+        printer.is_human(),
+    );
     let endpoint = crate::ssh::endpoint(record, lang)?;
+    spinner.set_message(crate::i18n::pick(
+        lang,
+        "正在校验证书指纹",
+        "verifying the certificate fingerprint",
+    ));
     let probe = Client::probe(&endpoint)?;
     if probe.fingerprint != fingerprint {
         return Err(AppDiagnostic::unauthorized(
@@ -303,11 +343,13 @@ fn reconnect(file: &ConfigFile, name: &str, printer: Printer) -> Result<()> {
         .into());
     }
     let client = Client::new(&endpoint, fingerprint.clone()).with_token(credential.token);
+    spinner.set_message(crate::i18n::pick(lang, "正在认证", "authenticating"));
     client.call(&Request::Ping).context(crate::i18n::pick(
         lang,
         "认证失败",
         "authentication failed",
     ))?;
+    spinner.finish();
 
     report_connected(
         &remote_name,
@@ -514,7 +556,16 @@ fn disconnect(file: &ConfigFile, name: &str, printer: Printer) -> Result<()> {
     // 先在**还持有凭证**的时候通知远端删记录：token 一旦删掉就发不出这个请求了。
     // 结果只影响提示措辞，不影响本地断开——本地这次清理是用户的明确意图，
     // 不能因为对端暂时连不上就整条命令失败，把人卡在「断不掉」的状态里。
+    let spinner = TaskSpinner::new(
+        crate::i18n::pick(
+            lang,
+            "正在通知远端删除本机记录",
+            "asking the peer to remove this client",
+        ),
+        printer.is_human(),
+    );
     let revocation = revoke_self_remote(&cfg, &remote_name, lang);
+    spinner.finish();
     let removed = cfg.remove_remote(&remote_name).is_some();
     // 先删凭证（安全优先：宁可留下一条缺凭证的配置记录，也不要留下有效 token）
     credential_store()

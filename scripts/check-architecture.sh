@@ -2,9 +2,9 @@
 # 架构规则校验。只读。
 #
 # cargo 不校验 crate 命名与依赖方向，AGENTS.md 的命名与依赖规则只能在这里断言。
-# 检查项：成员覆盖、禁用名、mcsup- 前缀（库禁止 / bin 必需）、apps 依赖、
-# [lints]、模块依赖方向、feature 与模块对应、feature 语义（拉入内层集合
-# 等于允许集合）。
+# 检查项：成员覆盖、禁用名、包名（内层 mcsup-* / bin mcsup-*）、[lib] 名、
+# apps 依赖、[lints]、模块依赖方向、feature 与模块对应、feature 语义（拉入
+# 内层集合等于允许集合）。
 #
 # 用法：sh scripts/check-architecture.sh
 
@@ -20,6 +20,30 @@ fail() {
 # package name 必须是字面量（不允许 workspace 继承），可安全按行读取。
 pkg_name() {
 	sed -n 's/^name[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$1" | head -n 1
+}
+
+# 架构语义键：内层 crate 用目录名（= [lib] name），apps 用 package 名。
+# 发布后内层 package 是 mcsup-*，但依赖方向与 feature 表仍按单词库名表达。
+pkg_key() {
+	case "$1" in
+	crates/*)
+		dir=${1#crates/}
+		printf '%s' "${dir%/Cargo.toml}"
+		;;
+	*) pkg_name "$1" ;;
+	esac
+}
+
+# [lib] name 是源码里的 crate 名；缺失时 Cargo 回退到 package 名。
+lib_name() {
+	awk '
+		/^\[/ { in_lib = ($0 == "[lib]") ; next }
+		in_lib && /^name[[:space:]]*=/ {
+			gsub(/^[^"]*"|"[^"]*$/, "")
+			print
+			exit
+		}
+	' "$1"
 }
 
 contains() {
@@ -74,16 +98,24 @@ python3 - "$metadata_json" >"$dep_edges" <<'PY'
 import json, sys
 
 meta = json.load(open(sys.argv[1], encoding="utf-8"))
-ids = {p["id"]: p["name"] for p in meta["packages"]}
+
+def key(pkg):
+    path = pkg["manifest_path"].replace("\\", "/")
+    if "/crates/" in path:
+        return path.split("/crates/")[-1].split("/")[0]
+    return pkg["name"]
+
+ids = {p["id"]: key(p) for p in meta["packages"]}
+by_name = {p["name"]: key(p) for p in meta["packages"]}
 internal = set(ids.values())
 for pkg in meta["packages"]:
-    name = pkg["name"]
+    name = key(pkg)
     for dep in pkg["dependencies"]:
         if dep.get("kind") == "dev":
             continue
         if dep.get("path") is None:
             continue
-        target = dep["name"]
+        target = by_name.get(dep["name"])
         if target in internal:
             print(f"{name}\t{target}")
 PY
@@ -103,7 +135,7 @@ pkg_deps() {
 app_names=''
 inner_pkgs=''
 for manifest in $manifests; do
-	name=$(pkg_name "$manifest")
+	name=$(pkg_key "$manifest")
 	if [ -z "$name" ]; then
 		continue
 	fi
@@ -133,8 +165,17 @@ for manifest in $manifests; do
 
 	case "$manifest" in
 	crates/*)
-		if [ "${name#mcsup-}" != "$name" ]; then
-			fail "$name: crates/ 下的库禁止使用 mcsup- 前缀"
+		key=$(pkg_key "$manifest")
+		case "$key" in
+		mcsup) expected=mcsup ;;
+		*) expected="mcsup-$key" ;;
+		esac
+		if [ "$name" != "$expected" ]; then
+			fail "$name: 发布包名应为 $expected（内层 crate 用 mcsup- 前缀，库名保持单词）"
+		fi
+		lib=$(lib_name "$manifest")
+		if [ -n "$lib" ] && [ "$lib" != "$key" ]; then
+			fail "$name: [lib] name 应为 $key，源码才能继续用 use $key::"
 		fi
 		;;
 	apps/*)
@@ -172,7 +213,7 @@ done
 # 5: 包级依赖方向。只看 normal 与 build 边，dev-dependency 允许任意方向。
 
 for manifest in $manifests; do
-	pkg=$(pkg_name "$manifest")
+	pkg=$(pkg_key "$manifest")
 	[ -n "$pkg" ] || continue
 
 	deps=$(pkg_deps "$pkg")
@@ -202,7 +243,7 @@ done
 impl_layers='runtime java storage file backup provider modkit transport'
 
 for manifest in $manifests; do
-	pkg=$(pkg_name "$manifest")
+	pkg=$(pkg_key "$manifest")
 	[ -n "$pkg" ] || continue
 	# mcsup 门面与 apps 不在本表约束内
 	case "$pkg" in
@@ -391,7 +432,7 @@ if [ -f "$pkg_manifest" ] && [ -f "$pkg_lib" ]; then
 
 	inner_names=''
 	for manifest in crates/*/Cargo.toml; do
-		name=$(pkg_name "$manifest")
+		name=$(pkg_key "$manifest")
 		if [ -n "$name" ] && [ "$name" != 'mcsup' ]; then
 			inner_names="$inner_names $name"
 		fi
@@ -428,7 +469,7 @@ if [ -f "$pkg_manifest" ] && [ -f "$pkg_lib" ]; then
 		else
 			cargo tree -p mcsup --no-default-features \
 				--edges normal,build --prefix none 2>/dev/null
-		fi | awk '{print $1}' | sort -u
+		fi | awk '{print $1}' | sed 's/^mcsup-//' | sort -u
 	}
 
 	actual=$(facade_inner_of '')

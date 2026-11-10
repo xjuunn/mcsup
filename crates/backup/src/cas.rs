@@ -17,6 +17,25 @@ use crate::{CAS_DIR, error::BackupIoError};
 /// 读 / 写缓冲大小：与常见文件系统块大小同量级，兼顾大文件吞吐与内存占用
 const BUFFER_SIZE: usize = 64 * 1024;
 
+/// rename 之后同步父目录，保证目录项在崩溃后仍然可见
+///
+/// 文件内容已由暂存文件的 `sync_all` 落盘；不刷目录的话，掉电后可能出现
+/// 「对象文件在、目录记录不在」，恢复时按哈希查不到刚写入的对象。
+fn sync_dir(dir: &Path) -> Result<(), CasError> {
+    #[cfg(unix)]
+    {
+        let directory = fs::File::open(dir).map_err(|err| BackupIoError::io(dir, err))?;
+        directory
+            .sync_all()
+            .map_err(|err| BackupIoError::io(dir, err))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+    Ok(())
+}
+
 /// 文件系统上的 CAS
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CasStore {
@@ -109,7 +128,17 @@ impl CasStore {
             .map_err(|err| BackupIoError::io(staging.path(), err))?;
 
         let final_path = self.object_path(&hash);
-        if final_path.is_file() {
+        if let Ok(meta) = fs::metadata(&final_path)
+            && meta.is_file()
+        {
+            // 同哈希必须是同内容。只查存在会掩盖截断 / 位翻转：文件在但
+            // 大小不符时继续复用，后续恢复读到的就是坏对象。
+            if meta.len() != size {
+                return Err(CasError::Corrupt {
+                    hash,
+                    reason: format!("existing object is {} bytes, expected {size}", meta.len()),
+                });
+            }
             // 去重命中：内容已在 CAS 中，丢弃暂存文件
             return Ok((hash, size));
         }
@@ -118,6 +147,7 @@ impl CasStore {
         staging
             .persist(&final_path)
             .map_err(|err| BackupIoError::io(&final_path, err.error))?;
+        sync_dir(parent)?;
         tracing::debug!(hash = %hash, size, hint = %hint, "cas object stored");
         Ok((hash, size))
     }
@@ -339,6 +369,21 @@ mod tests {
             .expect("put");
         assert_eq!(first, second);
         assert_eq!(store.list().expect("list"), vec![first]);
+    }
+
+    /// 去重命中必须校验大小：对象文件存在但被截断时不能继续复用
+    #[test]
+    fn put_rejects_truncated_existing_object() {
+        let (_dir, store) = store();
+        let payload = b"same bytes".to_vec();
+        let (hash, _) = store
+            .put(&mut Cursor::new(payload.clone()), &rel("a"))
+            .expect("put");
+        fs::write(store.object_path(&hash), b"x").expect("truncate");
+        let err = store
+            .put(&mut Cursor::new(payload), &rel("b"))
+            .expect_err("truncated object must not be reused");
+        assert!(matches!(err, CasError::Corrupt { .. }), "{err}");
     }
 
     #[test]

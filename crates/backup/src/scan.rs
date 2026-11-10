@@ -112,7 +112,7 @@ pub fn scan_tree(
             }
 
             let size = meta.len();
-            let mtime = mtime_secs(&meta);
+            let mtime = mtime_nanos(&meta);
             let reused = find_reuse(&rules.reuse, &rel_path, size, mtime);
 
             let (hash, written) = if let Some(hash) = reused {
@@ -169,12 +169,14 @@ fn is_runtime_entry(path: &RelPath) -> bool {
     RUNTIME_ENTRIES.iter().any(|entry| entry == &first)
 }
 
-/// 修改时间（Unix 秒）；取不到时为 0（此时不会命中复用，只会多重算一次）
-fn mtime_secs(meta: &fs::Metadata) -> i64 {
+/// 修改时间（Unix 纳秒）；取不到时为 0（此时不会命中复用，只会多重算一次）
+///
+/// 秒级精度会让「同一秒内同大小改写」命中复用，把旧哈希带进新快照。
+fn mtime_nanos(meta: &fs::Metadata) -> i64 {
     meta.modified()
         .ok()
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |since| i64::try_from(since.as_secs()).unwrap_or(0))
+        .map_or(0, |since| i64::try_from(since.as_nanos()).unwrap_or(0))
 }
 
 /// 基于本地文件系统的目录扫描器（实现 [`port::Scanner`]）
@@ -341,7 +343,7 @@ mod tests {
         let meta = fs::metadata(server.path().join("world/level.dat")).expect("meta");
         let rules = ScanRules {
             scope: BackupScope::all(),
-            reuse: vec![(path, hash.clone(), meta.len(), mtime_secs(&meta))],
+            reuse: vec![(path, hash.clone(), meta.len(), mtime_nanos(&meta))],
         };
         let second = scan(server.path(), &store, &rules);
         assert_eq!(second.added, 0);
@@ -363,7 +365,7 @@ mod tests {
         let rules = ScanRules {
             scope: BackupScope::all(),
             // 用旧大小 + 旧 mtime，模拟父快照记录
-            reuse: vec![(path, hash, 5, mtime_secs(&meta) - 1)],
+            reuse: vec![(path, hash, 5, mtime_nanos(&meta) - 1)],
         };
         let second = scan(server.path(), &store, &rules);
         assert_eq!(second.added, 1);

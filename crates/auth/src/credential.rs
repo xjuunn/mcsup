@@ -573,6 +573,7 @@ fn keyring_available() -> bool {
 /// 决定，换存储不动业务代码。`describe()` 给出后端描述，写进配对记录便于排查
 /// 「凭证到底存在哪」。
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum CredentialVault {
     /// 系统钥匙串
     Keyring(KeyringCredentialStore<SystemKeyring>),

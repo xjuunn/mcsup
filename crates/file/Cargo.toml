@@ -1,18 +1,22 @@
 [package]
-name = "file"
+name = "mcsup-file"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish = false
+description = "Filesystem and file transfer implementations for MCSUP"
+repository.workspace = true
+
+[lib]
+name = "file"
 
 [dependencies]
 async-trait.workspace = true
-domain = { version = "0.1.0", path = "../domain" }
+domain = { package = "mcsup-domain", version = "0.1.0", path = "../domain" }
 flate2 = "1.1.10"
 # 批量下载的有界并发组合子（`buffer_unordered`）；只用 stream 部分
 futures = { version = "0.3.31", default-features = false, features = ["std"] }
-port = { version = "0.1.0", path = "../port" }
+port = { package = "mcsup-port", version = "0.1.0", path = "../port" }
 serde_json.workspace = true
 sha1 = "0.11.0"
 sha2 = "0.11.0"

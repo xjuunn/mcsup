@@ -1,16 +1,21 @@
 [package]
-name = "testkit"
+name = "mcsup-testkit"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Test infrastructure for MCSUP (not published)"
+repository.workspace = true
 # 测试基础设施：只作 dev-dependency，不发布、不进门面
 publish = false
 
+[lib]
+name = "testkit"
+
 [dependencies]
 async-trait.workspace = true
-domain = { version = "0.1.0", path = "../domain" }
-port = { version = "0.1.0", path = "../port" }
+domain = { package = "mcsup-domain", version = "0.1.0", path = "../domain" }
+port = { package = "mcsup-port", version = "0.1.0", path = "../port" }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 url.workspace = true

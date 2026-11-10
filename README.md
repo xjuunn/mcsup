@@ -7,7 +7,7 @@
 
 ## 状态
 
-项目处于早期开发阶段（`0.1.0`，未发布到 crates.io）。API 与 CLI 契约仍在演进。
+项目处于早期开发阶段（`0.1.0`，首个 crates.io 发布准备中）。API 与 CLI 契约仍在演进。
 
 ## 组成
 
@@ -23,6 +23,8 @@
 **库**（`crates/`）
 
 - `mcsup` — 门面 crate，按 feature 级联重导出内层，是第三方依赖的唯一入口
+- 内层 package 名为 `mcsup-domain` / `mcsup-port` 等，`[lib] name` 保留单词名，
+  源码与文档继续按 `domain` / `port` 称呼
 - `domain` — 领域模型与规则（不依赖任何模块）
 - `port` — 能力 trait 定义
 - `service` — 统一业务服务层与编排

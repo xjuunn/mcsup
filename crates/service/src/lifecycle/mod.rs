@@ -809,6 +809,7 @@ impl ServerLifecycleService {
     ///
     /// 读取失败（非「不存在」）
     pub fn log_tail(&self, name: &str, lines: usize) -> Result<Vec<String>, LifecycleError> {
+        let lines = domain::limits::log_lines(lines);
         let server = self.registry.get(name)?;
         if server.is_remote() {
             return self
@@ -854,7 +855,10 @@ impl ServerLifecycleService {
         if server.is_remote() {
             return Err(LifecycleError::RemoteLogStream(name.to_owned()));
         }
-        let (watch, history) = LogWatch::open_tail(console_log_path(&server.dir), lines)?;
+        let (watch, history) = LogWatch::open_tail(
+            console_log_path(&server.dir),
+            domain::limits::log_lines(lines),
+        )?;
         Ok((history, watch))
     }
 
@@ -965,6 +969,7 @@ fn ensure_eula(server_dir: &Path, accept_eula: bool) -> Result<(), LifecycleErro
 /// 为止。控制台日志可能非 UTF-8，按 lossy 解码。快照长度用于增量读取的
 /// 起始偏移：只读 `[0, len)`，追加写入不受影响。
 fn tail_lines_upto(path: &Path, max_lines: usize) -> std::io::Result<(Vec<String>, u64)> {
+    let max_lines = domain::limits::log_lines(max_lines);
     let mut file = match crate::fs::open(path) {
         Ok(file) => file,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok((Vec::new(), 0)),
@@ -973,20 +978,26 @@ fn tail_lines_upto(path: &Path, max_lines: usize) -> std::io::Result<(Vec<String
     let len = file.metadata()?.len();
     let mut pos = len;
     let mut buf: Vec<u8> = Vec::new();
-    while pos > 0 && buf.split(|&b| b == b'\n').count().saturating_sub(1) <= max_lines {
+    let mut newlines = 0;
+    while pos > 0 && newlines <= max_lines && buf.len() < domain::limits::MAX_LOG_TAIL_BYTES {
         let take = TAIL_CHUNK.min(pos);
         pos -= take;
         file.seek(SeekFrom::Start(pos))?;
         let mut chunk = Vec::new();
         (&mut file).take(take).read_to_end(&mut chunk)?;
+        // 非空 chunk 的 `split` 段数减一即换行数；避免逐字节 filter 的
+        // 朴素计数写法（clippy 的 naive_bytecount）。
+        newlines += chunk.split(|&b| b == b'\n').count().saturating_sub(1);
         chunk.append(&mut buf);
         buf = chunk;
     }
 
     let text = String::from_utf8_lossy(&buf);
     let mut lines: Vec<&str> = text.lines().collect();
-    if pos > 0 && !lines.is_empty() {
-        lines.remove(0); // 开头是被切断的半行
+    // 从文件中间截断时第一行是半行；若整个缓冲区只有这一行（超长无换行），
+    // 保留截断后的内容，不能因为「半行」把它丢光。
+    if pos > 0 && lines.len() > 1 {
+        lines.remove(0);
     }
     if lines.len() > max_lines {
         lines.drain(..lines.len() - max_lines);
@@ -1074,19 +1085,29 @@ impl LogWatch {
             Err(err) => return Err(LifecycleError::Io(err)),
         };
         file.seek(SeekFrom::Start(self.offset))?;
+        let remaining = len.saturating_sub(self.offset);
+        let take = remaining.min(domain::limits::MAX_LOG_TAIL_BYTES as u64);
         let mut chunk = Vec::new();
-        file.read_to_end(&mut chunk)?;
+        (&mut file).take(take).read_to_end(&mut chunk)?;
         self.offset += chunk.len() as u64;
         self.partial.extend(chunk);
 
         let mut out = Vec::new();
-        while let Some(pos) = self.partial.iter().position(|&b| b == b'\n') {
+        while out.len() < domain::limits::MAX_LOG_LINES {
+            let Some(pos) = self.partial.iter().position(|&b| b == b'\n') else {
+                break;
+            };
             let mut line = self.partial.drain(..=pos).collect::<Vec<u8>>();
             line.pop(); // 去掉 '\n'
             if line.last() == Some(&b'\r') {
                 line.pop();
             }
             out.push(String::from_utf8_lossy(&line).into_owned());
+        }
+        // 无换行的超长行不能随调用次数无限增长：保留末尾一段。
+        if self.partial.len() > domain::limits::MAX_LOG_TAIL_BYTES {
+            let excess = self.partial.len() - domain::limits::MAX_LOG_TAIL_BYTES;
+            self.partial.drain(..excess);
         }
         Ok(out)
     }

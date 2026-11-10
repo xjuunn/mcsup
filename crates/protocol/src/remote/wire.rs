@@ -722,7 +722,7 @@ pub struct WireSnapshot {
     pub entries: Vec<(String, String)>,
     /// 删除墓碑（相对父快照被删掉的路径）
     pub deleted: Vec<String>,
-    /// 相对路径 → (字节数, 修改时间)
+    /// 相对路径 → (字节数, 修改时间纳秒)
     pub stamps: Vec<(String, u64, i64)>,
     /// 本次新建的 CAS 对象数
     pub added: usize,

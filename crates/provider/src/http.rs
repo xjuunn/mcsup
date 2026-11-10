@@ -46,6 +46,7 @@ pub(crate) fn build_client() -> Result<Client, SourceError> {
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
         .user_agent(USER_AGENT)
+        .redirect(redirect_policy())
         .build()
         .map_err(|e| SourceError::Init(Box::new(e)))
 }
@@ -66,8 +67,55 @@ pub(crate) fn build_stream_client() -> Result<Client, SourceError> {
         .http1_only()
         .pool_max_idle_per_host(IDLE_CONNECTIONS_PER_HOST)
         .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+        .redirect(redirect_policy())
         .build()
         .map_err(|e| SourceError::Init(Box::new(e)))
+}
+
+/// 重定向策略：只跟 HTTP(S)，禁止 HTTPS 降级到 HTTP，最多 5 跳
+///
+/// 默认策略会跟随任意跳转。上游被篡改时，一次 `https -> http` 跳转就能把
+/// 后续请求降成明文；跨协议跳转（例如 `file:`）也不该由下载器跟随。
+fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 5 {
+            return attempt.error(std::io::Error::other("too many redirects"));
+        }
+        let scheme = attempt.url().scheme().to_owned();
+        if !matches!(scheme.as_str(), "http" | "https") {
+            return attempt.error(std::io::Error::other(format!(
+                "unsupported redirect scheme: {scheme}"
+            )));
+        }
+        let downgrade = attempt
+            .previous()
+            .last()
+            .is_some_and(|previous| previous.scheme() == "https" && scheme == "http");
+        if downgrade {
+            return attempt.error(std::io::Error::other(
+                "refusing to downgrade an https redirect to http",
+            ));
+        }
+        attempt.follow()
+    })
+}
+
+/// 请求 URL 只接受 HTTP(S)
+fn ensure_http_url(url: &Url) -> Result<(), SourceError> {
+    match url.scheme() {
+        "http" | "https" => Ok(()),
+        other => Err(SourceError::Decode(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unsupported URL scheme: {other}"),
+        )))),
+    }
+}
+
+/// 字符串形式的 URL 校验后返回解析结果
+fn parse_http_url(url: &str) -> Result<Url, SourceError> {
+    let parsed = Url::parse(url).map_err(|err| SourceError::Decode(Box::new(err)))?;
+    ensure_http_url(&parsed)?;
+    Ok(parsed)
 }
 
 /// 元数据响应体的上限
@@ -178,6 +226,7 @@ impl HttpByteSource {
 #[async_trait]
 impl ByteSource for HttpByteSource {
     async fn open(&self, location: &Url) -> Result<Box<dyn ByteReader>, SourceError> {
+        ensure_http_url(location)?;
         let response = self
             .http
             .get(location.clone())
@@ -252,6 +301,7 @@ pub(crate) async fn get_json<T>(
 where
     T: DeserializeOwned,
 {
+    parse_http_url(url)?;
     let response = send_with_retry(|| client.get(url), url).await?;
     let status = response.status();
     if !status.is_success() {
@@ -284,6 +334,7 @@ pub(crate) async fn post_json<T>(client: &Client, url: &str, body: &str) -> Resu
 where
     T: DeserializeOwned,
 {
+    parse_http_url(url)?;
     let response = client
         .post(url)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -313,6 +364,7 @@ pub(crate) async fn get_text(
     url: &str,
     not_found_id: Option<VersionId>,
 ) -> Result<String, SourceError> {
+    parse_http_url(url)?;
     let response = send_with_retry(|| client.get(url), url).await?;
     let status = response.status();
     if !status.is_success() {
@@ -339,6 +391,7 @@ pub(crate) async fn get_text(
 /// 网络失败或非成功状态码时返回 [`SourceError`]；仅在「服务器不返回
 /// `Content-Length`」时返回 `Ok(None)`
 pub(crate) async fn head_size(client: &Client, url: &str) -> Result<Option<u64>, SourceError> {
+    parse_http_url(url)?;
     let response = send_with_retry(|| client.head(url), url).await?;
     let status = response.status();
     if !status.is_success() {
@@ -357,6 +410,7 @@ pub(crate) async fn head_size(client: &Client, url: &str) -> Result<Option<u64>,
 #[async_trait]
 impl RangeSource for HttpByteSource {
     async fn stat(&self, location: &Url) -> Result<RemoteStat, SourceError> {
+        ensure_http_url(location)?;
         let response = self
             .http
             .head(location.clone())
@@ -393,6 +447,7 @@ impl RangeSource for HttpByteSource {
         location: &Url,
         range: RangeInclusive<u64>,
     ) -> Result<Box<dyn ByteReader>, SourceError> {
+        ensure_http_url(location)?;
         let response = self
             .http
             .get(location.clone())

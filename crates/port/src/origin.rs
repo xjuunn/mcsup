@@ -120,6 +120,9 @@ impl fmt::Display for RemoteName {
 }
 
 /// 资源来源
+///
+/// 刻意不加 `#[non_exhaustive]`：来源决定把操作路由到本机还是某个远端，
+/// 未知来源无法安全猜测（猜错会写错主机）。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Origin {
     /// 本机

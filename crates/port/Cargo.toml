@@ -1,14 +1,18 @@
 [package]
-name = "port"
+name = "mcsup-port"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish = false
+description = "Capability traits and cross-layer contracts for MCSUP"
+repository.workspace = true
+
+[lib]
+name = "port"
 
 [dependencies]
 async-trait.workspace = true
-domain = { version = "0.1.0", path = "../domain" }
+domain = { package = "mcsup-domain", version = "0.1.0", path = "../domain" }
 # 任务事件要能装进远端帧：同一份类型在本地回调与线上传输之间共用
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
