@@ -707,8 +707,11 @@ pub(crate) async fn install_modpack(
     // 进度条画的是整包口径：总长 = 清单文件字节总和（service 层聚合，
     // 见 `ModpackService::apply`），每个文件的下载增量汇入同一个计数器，
     // 不会出现「一个文件下载完进度条就归零」的观感。
-    let file_count = prepared.index.server_files().len();
-    let label = format!("布置整合包 {name}（{file_count} 个文件）");
+    //
+    // 文案里不写文件数：清单里的仅客户端模组要等 `apply` 询问上游元数据后
+    // 才会剔除（实测一个 30 项的清单实际落盘 28 个），在这里先报一个数字就会
+    // 与结果不符。实际数量由结束后的输出给出。
+    let label = format!("布置整合包 {name}");
     let spinner = TaskSpinner::new(label.clone(), printer.is_human());
     let sink = BarSink::new(spinner.handle(), label);
     let cancel = CancellationToken::new();
