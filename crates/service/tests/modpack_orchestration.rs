@@ -1673,3 +1673,55 @@ async fn apply_downloads_all_files_via_concurrency() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// 批量下载按体积降序下发（LPT 调度）：大文件先进队占满并发，小文件补尾部，
+/// 进度条不因大文件拖尾而「越下越慢」。这不是网络优化，而是调度顺序本身。
+#[tokio::test]
+async fn apply_orders_downloads_largest_first() {
+    // 故意把体积打乱、且不按路径排序，证明排序依据是 size 而非清单顺序
+    let files = vec![
+        file("mods/small.jar", 3, EnvTag::Required),
+        file("mods/largest.jar", 40, EnvTag::Required),
+        file("mods/mid.jar", 11, EnvTag::Required),
+        file("mods/tiny.jar", 1, EnvTag::Required),
+    ];
+    let index = ModpackIndex::new(
+        1,
+        "minecraft",
+        "1.0.0",
+        "Pack",
+        deps(&[("minecraft", "1.21.1")]),
+        files,
+    )
+    .expect("index");
+    let downloader = FakeDownloader::ok();
+    let seen = downloader.requests.clone();
+    let service = service(index, Vec::new(), downloader);
+    let dir = scratch("largest-first");
+    // 预先放一份归档让 `prepare` 复用，避免 mrpack 那一次下载混进 `seen`
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let archive = dir.join("cached.mrpack");
+    std::fs::write(&archive, b"mrpack").expect("write");
+
+    let prepared = service
+        .prepare(
+            "P",
+            ModpackInstallOptions::new(&dir).archive(&archive),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("prepare");
+    service
+        .apply(&prepared, &dir, None, &CancellationToken::new())
+        .await
+        .expect("apply");
+
+    let sizes: Vec<u64> = seen
+        .lock()
+        .expect("requests")
+        .iter()
+        .map(|request| request.expected_size.expect("size"))
+        .collect();
+    assert_eq!(sizes, vec![40, 11, 3, 1], "下载应按体积降序: {sizes:?}");
+    std::fs::remove_dir_all(&dir).ok();
+}

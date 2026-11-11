@@ -599,6 +599,12 @@ impl ModpackService {
         }
         let reused = jobs.len() - to_download.len();
 
+        // 大文件优先（LPT 调度）：按体积降序，让大文件先启动、占满批量并发和
+        // 最多的墙钟时间，小文件补尾部。否则按清单原始顺序下载时，大文件若
+        // 排在末尾会拖着尾段、在途连接数一路衰减，观感就是「越下越慢」；这个
+        // 顺序同时最小化整批的完成时间（最长处理时间优先）。
+        to_download.sort_unstable_by_key(|(file, _)| std::cmp::Reverse(file.size));
+
         // 复用部分的字节先计入：进度条的起点就是「跳过的那一大半」
         let settled = ReusedProgress::new(reused_bytes, total_bytes, progress);
 
