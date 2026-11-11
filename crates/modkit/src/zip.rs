@@ -528,8 +528,8 @@ fn take_fabric_java(depends: &serde_json::Value, cap: &mut ModCapability) {
 
 /// 把版本要求字符串解析成 MC 区间
 ///
-/// 支持 fabric 的写法：`1.21.1`、`>=1.21 <1.22`、`~1.21.1`、`>=1.21`、
-/// `<1.22`、`1.21.x`。解析不出下界/上界时保留原文，区间留空。
+/// 支持 fabric 的写法：`1.21.1`、`=1.20.1`、`>=1.21 <1.22`、`~1.21.1`、
+/// `>=1.21`、`<1.22`、`1.21.x`。解析不出下界/上界时保留原文，区间留空。
 fn parse_mc_range(spec: &str) -> VersionRange {
     let mut range = VersionRange {
         raw: spec.to_owned(),
@@ -562,6 +562,13 @@ fn parse_mc_range(spec: &str) -> VersionRange {
             range.max = Some(normalize_mc(rest));
         } else if let Some(rest) = token.strip_prefix('^') {
             range.min = Some(normalize_mc(rest));
+        } else if let Some(rest) = token.strip_prefix('=') {
+            // =1.20.1：Fabric 精确匹配写法，与裸版本号同义
+            let v = normalize_mc(rest);
+            range.min = Some(v.clone());
+            if v.matches('.').count() >= 2 {
+                range.max = Some(bump_patch(&v));
+            }
         } else if is_wildcard(token) {
             // `1.21.x` / `1.21.*` / `1.21`：下界 1.21，上界 1.22。
             // 必须先于裸版本判定：`1.21.x` 不含 `*`，否则会被当成精确版本
@@ -1133,6 +1140,18 @@ mod tests {
         assert_eq!(r.min.as_deref(), Some("1.21.1"));
         assert!(r.contains("1.21.1"));
         assert!(!r.contains("1.21"));
+    }
+
+    #[test]
+    fn parses_equals_prefix_exact_version() {
+        // =1.20.1 是 Fabric 的精确匹配写法：Cobblepedia 现场就是这样声明
+        // 的，1.20.1 必须命中，1.20 / 1.20.2 都不命中
+        let r = parse_mc_range("=1.20.1");
+        assert_eq!(r.min.as_deref(), Some("1.20.1"));
+        assert_eq!(r.max.as_deref(), Some("1.20.2"));
+        assert!(r.contains("1.20.1"));
+        assert!(!r.contains("1.20"));
+        assert!(!r.contains("1.20.2"));
     }
 
     #[test]
