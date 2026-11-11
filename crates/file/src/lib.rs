@@ -40,9 +40,17 @@ const SEGMENT_CONCURRENCY: usize = 128;
 /// 留几轮富余，队列里始终有活可派，吞吐才能持平到收尾。
 const SEGMENT_WAVES: usize = 8;
 /// 单段最小字节数，低于它不值得分段建立新建连接
-const SEGMENT_MIN_BYTES: u64 = 2 * 1024 * 1024;
+///
+/// 1 MiB 而不是 2 MiB：实测跨境 CDN 单连接约 20–45 KiB/s，一段 1 MiB 也要
+/// 20–50 秒，建连开销占比不到 5%；而段越小、同时在途的连接越多，聚合吞吐
+/// 越接近线性增长。整合包里 5–8 MiB 的中等文件正是尾部最慢的一段（单流下
+/// 一个 6.5 MiB 文件要几分钟），1 MiB 分片至少给它 6 条连接。
+const SEGMENT_MIN_BYTES: u64 = 1024 * 1024;
 /// 整体小于该大小直接单流
-const MIN_SEGMENTED_SIZE: u64 = 8 * 1024 * 1024;
+///
+/// 2 MiB：再小的文件由批量并发（24 路）负责重叠等待，分段收益抵不过多一次
+/// HEAD 探测与建连。
+const MIN_SEGMENTED_SIZE: u64 = 2 * 1024 * 1024;
 /// 段最大尝试次数（含首次）
 const SEGMENT_MAX_ATTEMPTS: u32 = 3;
 /// 重发延迟
@@ -69,15 +77,20 @@ const FILE_RETRY_DELAY: Duration = Duration::from_millis(200);
 /// 每个文件独立的 `download` 回调报的是「本文件从 0 开始已传字节」，直接透传
 /// 到批量进度条就是反复归零。本结构把它换算成**整批累计值**：
 ///
-/// - `accounted` 记录本文件本轮尝试已计入的增量，用来算 delta，避免同一批字节
-///   被重复累加（透传绝对值会重复计数：并发时 A 文件完成一跳，B 文件仍按旧基数
-///   上报，总量立刻虚高）
-/// - 重试作废上一轮时，调用方按 `accounted` 精确退还，不让作废的字节留在总数里
+/// - `accounted` 记录本文件**历史最高**的已传字节。单文件进度不是单调的：
+///   分段失败会退还该段已写字节、换镜像与「分段回退单流」都会从 0 重来。
+///   只把超过高水位的部分计入，重传的字节才不会被重复累加——否则整批进度
+///   会越过 100%，速度也会虚高（实测一个 88 MiB 的整合包显示到 88.9 MiB）。
+/// - `cap` 是清单声明的大小。上游实际字节比声明大（清单过期）时，单个文件
+///   最多计入声明大小，整批进度不越过总量；多出的部分由下载链路按校验结果
+///   处置，不该由进度条表达。
 struct BatchSink<'a> {
     /// 整批已完成字节（所有文件共享）
     done: Arc<AtomicU64>,
-    /// 本文件本轮尝试已计入的字节
+    /// 本文件已计入的历史最高字节（跨重试保留）
     accounted: Arc<AtomicU64>,
+    /// 本文件最多可计入的字节（清单声明大小）
+    cap: Option<u64>,
     /// 整批声明总字节
     total: Option<u64>,
     /// 上层 sink
@@ -86,8 +99,10 @@ struct BatchSink<'a> {
 
 impl ProgressSink for BatchSink<'_> {
     fn on_progress(&self, transferred: u64, _total: Option<u64>) {
-        // 分段任务并发写同一个计数器，可能出现回退观测；饱和减法保证不为负
-        let previous = self.accounted.swap(transferred, Ordering::Relaxed);
+        let transferred = self.cap.map_or(transferred, |cap| transferred.min(cap));
+        // 分段任务并发写同一个计数器，可能回退观测；`fetch_max` 只放行
+        // 超过历史高水位的增量，退款后重传的同一段字节不会再算一遍
+        let previous = self.accounted.fetch_max(transferred, Ordering::Relaxed);
         let delta = transferred.saturating_sub(previous);
         if delta == 0 {
             return;
@@ -636,8 +651,9 @@ impl ArtifactDownloader for FileDownloader {
 impl FileDownloader {
     /// 带瞬态重试的单文件下载
     ///
-    /// 重试时把上一轮尝试已计入 `done` 的字节精确退还：作废的传输不该留在进度
-    /// 总数里，否则进度条会虚高甚至在重传后越过 100%。
+    /// 高水位账本跨尝试保留：重试、换镜像、分段回退都会让单文件进度从 0 重来，
+    /// 只按历史最高值计入才不会把同一段字节算两遍。失败尝试的字节因此不需要
+    /// 从整批总数里退还——它们本来就没被重复计入。
     async fn download_with_retry(
         &self,
         request: &DownloadRequest,
@@ -647,12 +663,12 @@ impl FileDownloader {
         cancel: &CancellationToken,
     ) -> Result<DownloadedArtifact, DownloadError> {
         let mut attempt = 1_u32;
+        let accounted = Arc::new(AtomicU64::new(0));
         loop {
-            // 每轮尝试重新计数：上一轮的增量已在失败分支退还
-            let accounted = Arc::new(AtomicU64::new(0));
             let batch = progress.map(|upstream| BatchSink {
                 done: Arc::clone(done),
                 accounted: Arc::clone(&accounted),
+                cap: request.expected_size,
                 total,
                 upstream,
             });
@@ -662,11 +678,6 @@ impl FileDownloader {
                 Err(err)
                     if err.retryable() && attempt < FILE_MAX_ATTEMPTS && !cancel.is_cancelled() =>
                 {
-                    // 退还本轮已计入的增量：这些字节随失败作废，重传时会重新计入
-                    let refund = accounted.load(Ordering::Relaxed);
-                    if refund > 0 {
-                        done.fetch_sub(refund, Ordering::Relaxed);
-                    }
                     tokio::time::sleep(FILE_RETRY_DELAY * attempt).await;
                     attempt += 1;
                 }
@@ -1489,8 +1500,8 @@ mod tests {
             assert_eq!(*pair[1].start(), *pair[0].end() + 1, "切片必须首尾相接");
         }
 
-        // 小文件保持原有粒度：没必要为几十 MiB 切出上百片
-        assert_eq!(plan_segments(8 * 1024 * 1024).len(), 4);
+        // 中等文件按 1 MiB 分片：6.5 MiB 的文件能拿到 6 条连接，而不是单流
+        assert_eq!(plan_segments(8 * 1024 * 1024).len(), 8);
         // 超大文件按上限切，不无限细分（记录文件与请求数都要有界）
         assert_eq!(
             plan_segments(8 * 1024 * 1024 * 1024).len(),
@@ -1591,7 +1602,7 @@ mod tests {
         let destination = dir.path().join("server.jar");
         let payload = big_payload();
         let range = fake_range(&payload, true);
-        // 8MiB+4096 / 2MiB = 4 段，每段首次失败一次
+        // 8MiB+4096 / 1MiB = 8 段，其中 4 段首次失败一次
         range.fail_opens.store(4, Ordering::Relaxed);
 
         let downloader =
@@ -1608,8 +1619,8 @@ mod tests {
 
         assert_eq!(done.size, payload.len() as u64);
         assert_eq!(std::fs::read(&destination)?, payload);
-        // 4 段各失败一次后重试成功：首试 4 + 重试 4
-        assert_eq!(range.open_calls.load(Ordering::Relaxed), 8);
+        // 4 段各失败一次后重试成功：首试 8 + 重试 4
+        assert_eq!(range.open_calls.load(Ordering::Relaxed), 12);
         Ok(())
     }
 
@@ -1635,8 +1646,8 @@ mod tests {
 
         assert_eq!(done.size, payload.len() as u64);
         assert_eq!(std::fs::read(&destination)?, payload);
-        // 4 段首轮各短读一次后重试成功：首试 4 + 重试 4
-        assert_eq!(range.open_calls.load(Ordering::Relaxed), 8);
+        // 4 段首轮各短读一次后重试成功：首试 8 + 重试 4
+        assert_eq!(range.open_calls.load(Ordering::Relaxed), 12);
         Ok(())
     }
 
@@ -1830,6 +1841,91 @@ mod tests {
         assert_eq!(
             samples.last().map(|(done, _)| *done),
             Some(expected_total),
+            "最终样本必须到达整批总量：{samples:?}"
+        );
+        Ok(())
+    }
+
+    /// 单文件进度回退（分段重试退款、换源从 0 重来）不得让整批重复计数
+    ///
+    /// 现场：整合包显示 `88.93 MiB/88.41 MiB`——退款后重传的同一段字节被再算
+    /// 了一遍，进度越过总量，速度也跟着虚高。
+    #[test]
+    fn batch_sink_counts_only_high_water_mark() {
+        let done = Arc::new(AtomicU64::new(0));
+        let accounted = Arc::new(AtomicU64::new(0));
+        let upstream = RecordingSink::new();
+        let sink = BatchSink {
+            done: Arc::clone(&done),
+            accounted: Arc::clone(&accounted),
+            cap: Some(100),
+            total: Some(100),
+            upstream: &upstream,
+        };
+
+        sink.on_progress(60, None);
+        // 段失败：退款 40，计数回到 20
+        sink.on_progress(20, None);
+        // 重传回到 60：这段已计入，不能再加一遍
+        sink.on_progress(60, None);
+        sink.on_progress(100, None);
+
+        assert_eq!(done.load(Ordering::Relaxed), 100, "整批不得越过声明总量");
+        assert_eq!(upstream.samples().last().map(|(done, _)| *done), Some(100));
+    }
+
+    /// 上游实际字节多于清单声明（清单过期）：单文件按声明大小封顶
+    #[test]
+    fn batch_sink_caps_file_at_declared_size() {
+        let done = Arc::new(AtomicU64::new(0));
+        let accounted = Arc::new(AtomicU64::new(0));
+        let upstream = RecordingSink::new();
+        let sink = BatchSink {
+            done: Arc::clone(&done),
+            accounted: Arc::clone(&accounted),
+            cap: Some(100),
+            total: Some(100),
+            upstream: &upstream,
+        };
+
+        sink.on_progress(150, None);
+
+        assert_eq!(done.load(Ordering::Relaxed), 100);
+    }
+
+    /// 分段重试真实发生退款时，整批进度仍收敛到总量且从不超过它
+    #[tokio::test]
+    async fn batch_progress_stays_within_total_after_segment_retries() -> Result<(), Box<dyn Error>>
+    {
+        let dir = tempdir()?;
+        let payload = big_payload();
+        let range = fake_range(&payload, true);
+        // 8 段里有 4 段首轮短读：每段都会先报字节、再退款、重传
+        range.short_reads.store(4, Ordering::Relaxed);
+        let request = batch_request(dir.path(), "big.jar", &payload);
+        let sink = RecordingSink::new();
+
+        let downloader =
+            FileDownloader::new(fake_source(&[&payload])).with_range_source(range.clone());
+        let outcomes = downloader
+            .download_many(
+                std::slice::from_ref(&request),
+                1,
+                Some(&sink),
+                &CancellationToken::new(),
+            )
+            .await;
+
+        assert!(outcomes[0].is_ok(), "分段重试后仍应成功");
+        let total = payload.len() as u64;
+        let samples = sink.samples();
+        assert!(
+            samples.iter().all(|(done, _)| *done <= total),
+            "整批进度越过总量：{samples:?}"
+        );
+        assert_eq!(
+            samples.last().map(|(done, _)| *done),
+            Some(total),
             "最终样本必须到达整批总量：{samples:?}"
         );
         Ok(())

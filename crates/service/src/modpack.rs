@@ -652,6 +652,10 @@ impl ModpackService {
 
         // 第二段：只有清单哈希过期的文件才回源确认 + 按权威哈希重下。
         // 带着批量下载已取得的 expected/actual 进入，不重复注定失败的尝试。
+        //
+        // 这一段的下载不再上报进度：这些文件的字节在批量阶段已按清单大小计入，
+        // 重下再按单文件从 0 报会把整包位置拽回去（观感是数字倒退、速度归零）。
+        // 发生概率低、单次通常只涉及一两个文件，进度条停在原处比倒退诚实。
         for (position, expected, actual) in needs_authority {
             if cancel.is_cancelled() {
                 return Err(ModpackError::Download(port::DownloadError::Cancelled));
@@ -659,9 +663,7 @@ impl ModpackService {
             let (file, target) = &to_download[position];
             let url = first_https(&file.downloads)?;
             let fetched = self
-                .accept_authoritative_hash(
-                    source, file, url, target, expected, actual, progress, cancel,
-                )
+                .accept_authoritative_hash(source, file, url, target, expected, actual, cancel)
                 .await?;
             downloaded_bytes = downloaded_bytes.saturating_add(fetched.bytes);
             if fetched.stale {
@@ -727,7 +729,6 @@ impl ModpackService {
         target: &Path,
         expected: String,
         actual: String,
-        progress: Option<&dyn ProgressSink>,
         cancel: &CancellationToken,
     ) -> Result<FetchedFile, ModpackError> {
         let Some(authoritative) =
@@ -755,7 +756,7 @@ impl ModpackService {
             expected_size: (file.size > 0).then_some(file.size),
             mirrors,
         };
-        let downloaded = self.downloader.download(&retry, progress, cancel).await?;
+        let downloaded = self.downloader.download(&retry, None, cancel).await?;
         Ok(FetchedFile {
             bytes: downloaded.size,
             stale: true,
@@ -826,8 +827,11 @@ struct OffsetSink<'a> {
 impl ProgressSink for OffsetSink<'_> {
     fn on_progress(&self, transferred: u64, _total: Option<u64>) {
         if let Some(sink) = self.upstream {
-            // 偏移量与传来的增量相加即为整包已完成字节；总长用清单字节总和
-            sink.on_progress(self.offset.saturating_add(transferred), Some(self.total));
+            // 偏移量与传来的增量相加即为整包已完成字节；总长用清单字节总和。
+            // 以总长封顶：清单里个别文件未声明大小时（不参与批量 total 的拼接），
+            // 它们的字节仍会累加进来，封顶保证进度条不显示超过总量的数字。
+            let done = self.offset.saturating_add(transferred).min(self.total);
+            sink.on_progress(done, Some(self.total));
         }
     }
 }
