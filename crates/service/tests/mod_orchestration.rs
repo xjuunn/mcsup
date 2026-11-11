@@ -876,6 +876,70 @@ async fn plan_fix_from_log_reports_unattributed_classes() {
     );
 }
 
+/// 现场日志：lilac 的 `main` 入口点被 Kotlin adapter 反射加载，肇事类
+/// `opekope2.lilac.impl.tick.TickNotifier` 从不以 `at` 帧出现，只存在于
+/// Fabric Loader 的错误消息里；而 `supermartijn642corelib` 的框架类作为
+/// 旁观者出现在 `at` 帧里。归因若只扫 `at` 帧会误删框架 jar。
+const LILAC_CRASH_LOG: &str = r"
+[10:42:30] [main/ERROR]: Encountered an exception whilst scanning fields in 'main' entrypoint for mod 'LiLaC'!
+net.fabricmc.loader.api.EntrypointException: Exception while loading entries for entrypoint 'main' provided by 'lilac'
+	at net.fabricmc.loader.impl.entrypoint.EntrypointContainerImpl.getEntrypoint(EntrypointContainerImpl.java:56)
+	at com.supermartijn642.core.registry.RegistryEntryAcceptor$Handler.gatherAnnotatedFields(RegistryEntryAcceptor.java:73)
+	at com.supermartijn642.core.CoreLib.beforeInitialize(CoreLib.java:69)
+	at net.minecraft.server.Main.main(Main.java:112)
+	at net.fabricmc.loader.impl.launch.knot.Knot.launch(Knot.java:72)
+[10:42:34] [main/ERROR]: Failed to start the minecraft server
+java.lang.RuntimeException: Could not execute entrypoint stage 'main' due to errors, provided by 'lilac' at 'opekope2.lilac.impl.tick.TickNotifier'!
+	at net.fabricmc.loader.impl.FabricLoaderImpl.invokeEntrypoints(FabricLoaderImpl.java:416)
+Caused by: net.fabricmc.loader.api.EntrypointException: Exception while loading entries for entrypoint 'main' provided by 'lilac'
+	at net.fabricmc.loader.impl.entrypoint.EntrypointContainerImpl.getEntrypoint(EntrypointContainerImpl.java:56)
+Caused by: java.lang.RuntimeException: Cannot load class net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents$EndWorldTick in environment type SERVER
+	at net.fabricmc.loader.impl.transformer.FabricTransformer.transform(FabricTransformer.java:64)
+	at net.fabricmc.loader.impl.launch.knot.KnotClassDelegate.tryLoadClass(KnotClassDelegate.java:369)
+";
+
+/// 加载器指认的肇事类优先于栈帧：只删 lilac，不误删框架 supermartijn642corelib
+#[tokio::test]
+async fn plan_fix_from_log_prefers_blamed_class_over_frames() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[
+            ("lilac.jar", SideSupport::Required),
+            ("supermartijn642corelib.jar", SideSupport::Required),
+        ],
+        b"jar-bytes",
+    );
+    harness.write("mods/lilac.jar", b"lilac");
+    harness.write("mods/supermartijn642corelib.jar", b"lib");
+    harness
+        .inspector
+        .declares_classes("lilac.jar", &["opekope2/lilac/impl/tick/TickNotifier"]);
+    harness.inspector.declares_classes(
+        "supermartijn642corelib.jar",
+        &["com/supermartijn642/core/registry/RegistryEntryAcceptor$Handler"],
+    );
+    harness.write("console.log", LILAC_CRASH_LOG.as_bytes());
+
+    let plan = harness
+        .mods
+        .plan_fix_from_log("alpha", ContentKind::Mod, 500)
+        .await
+        .expect("plan_fix_from_log");
+
+    assert_eq!(plan.removals.len(), 1, "{plan:?}");
+    assert_eq!(
+        plan.removals[0].file,
+        harness.mods_dir().join("lilac.jar"),
+        "应该删 lilac 而不是 supermartijn642corelib：{plan:?}"
+    );
+    assert!(
+        plan.removals[0].reason.contains("TickNotifier"),
+        "{:?}",
+        plan.removals[0].reason
+    );
+    assert!(plan.unattributed.is_empty(), "{plan:?}");
+}
+
 /// 日志里没有崩溃栈（没崩过、日志被清空）：空计划，不误伤任何文件
 #[tokio::test]
 async fn plan_fix_from_log_without_stack_is_empty() {

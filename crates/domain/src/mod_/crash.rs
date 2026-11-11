@@ -91,13 +91,20 @@ pub struct CrashAttribution {
     pub missing: Vec<String>,
     /// 可疑帧，按出现顺序（栈顶在前）
     pub suspects: Vec<CrashSuspect>,
+    /// 加载器在错误消息里**明确指认**的类，优先级高于 [`CrashSuspect`]。
+    ///
+    /// Fabric Loader 的入口点失败消息形如 `provided by 'lilac' at
+    /// 'opekope2.lilac.impl.tick.TickNotifier'`：肇事类是 Kotlin adapter 反射
+    /// 加载的，不会以 `at` 帧出现在栈上，只存在于这条消息里。这条消息是
+    /// 加载器自己的结论，比「栈顶落在谁身上」更权威，归因时应优先用它。
+    pub blamed: Vec<CrashSuspect>,
 }
 
 impl CrashAttribution {
     /// 没有任何可归因的线索
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.missing.is_empty() && self.suspects.is_empty()
+        self.missing.is_empty() && self.suspects.is_empty() && self.blamed.is_empty()
     }
 }
 
@@ -116,6 +123,16 @@ pub fn attribute_crash(log: &str) -> CrashAttribution {
             }
             continue;
         }
+        // 加载器指认的类优先级高于栈帧：先收集，它可能是 Kotlin 反射加载、
+        // 不出现在 `at` 帧里的「隐形肇事者」。
+        for class in blamed_classes(line) {
+            if !attribution.blamed.iter().any(|seen| seen.class == class) {
+                attribution.blamed.push(CrashSuspect {
+                    class,
+                    frame: line.to_owned(),
+                });
+            }
+        }
         let Some(class) = frame_class(line) else {
             continue;
         };
@@ -131,6 +148,30 @@ pub fn attribute_crash(log: &str) -> CrashAttribution {
         });
     }
     attribution
+}
+
+/// 从一行错误消息里读出加载器指认的肇事类（内部名），没有返回空
+///
+/// 专盯 Fabric Loader 的入口点失败消息：
+/// `provided by 'lilac' at 'opekope2.lilac.impl.tick.TickNotifier'`。
+/// 肇事类只出现在单引号里，按「引号内、点分、非平台」三条过滤，`lilac`、
+/// `main` 这类不含点分的 token 会被形状校验挡掉。
+fn blamed_classes(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = line;
+    while let Some(idx) = rest.find('\'') {
+        let after = &rest[idx + 1..];
+        let Some(end) = after.find('\'') else {
+            break;
+        };
+        let token = &after[..end];
+        let class = token.replace('.', "/");
+        if looks_like_class(token) && !is_platform(&class) && !out.contains(&class) {
+            out.push(class);
+        }
+        rest = &after[end + 1..];
+    }
+    out
 }
 
 /// 从一行里读出「缺失的类」，不是这类行返回 `None`
@@ -269,5 +310,64 @@ java.lang.RuntimeException: boom
     fn native_frame_without_line_number_is_still_read() {
         let attribution = attribute_crash("\tat app//com/example/mod/Native.baz(Native Method)");
         assert_eq!(attribution.suspects[0].class, "com/example/mod/Native");
+    }
+
+    /// Kotlin 反射加载的肇事类不出现在 `at` 帧里，但 Fabric Loader 在
+    /// 错误消息中会写出 `provided by 'lilac' at 'opekope2...'`：
+    /// 归因必须从消息里读到类名，放到 `blamed` 而不是 `suspects`。
+    const LILAC_CRASH: &str = r"
+[10:42:30] [main/ERROR]: Encountered an exception whilst scanning fields in 'main' entrypoint for mod 'LiLaC'!
+net.fabricmc.loader.api.EntrypointException: Exception while loading entries for entrypoint 'main' provided by 'lilac'
+	at net.fabricmc.loader.impl.entrypoint.EntrypointContainerImpl.getEntrypoint(EntrypointContainerImpl.java:56)
+	at com.supermartijn642.core.registry.RegistryEntryAcceptor$Handler.gatherAnnotatedFields(RegistryEntryAcceptor.java:73)
+	at com.supermartijn642.core.CoreLib.beforeInitialize(CoreLib.java:69)
+	at net.minecraft.server.Main.main(Main.java:112)
+	at net.fabricmc.loader.impl.launch.knot.Knot.launch(Knot.java:72)
+[10:42:34] [main/ERROR]: Failed to start the minecraft server
+java.lang.RuntimeException: Could not execute entrypoint stage 'main' due to errors, provided by 'lilac' at 'opekope2.lilac.impl.tick.TickNotifier'!
+	at net.fabricmc.loader.impl.FabricLoaderImpl.invokeEntrypoints(FabricLoaderImpl.java:416)
+Caused by: net.fabricmc.loader.api.EntrypointException: Exception while loading entries for entrypoint 'main' provided by 'lilac'
+	at net.fabricmc.loader.impl.entrypoint.EntrypointContainerImpl.getEntrypoint(EntrypointContainerImpl.java:56)
+Caused by: java.lang.RuntimeException: Cannot load class net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents$EndWorldTick in environment type SERVER
+	at net.fabricmc.loader.impl.transformer.FabricTransformer.transform(FabricTransformer.java:64)
+	at net.fabricmc.loader.impl.launch.knot.KnotClassDelegate.tryLoadClass(KnotClassDelegate.java:369)
+";
+
+    #[test]
+    fn lilac_blamed_class_from_error_message() {
+        let attribution = attribute_crash(LILAC_CRASH);
+        // 引号里的 non-platform 类名被收进 blamed
+        assert_eq!(
+            attribution
+                .blamed
+                .iter()
+                .map(|s| s.class.as_str())
+                .collect::<Vec<_>>(),
+            vec!["opekope2/lilac/impl/tick/TickNotifier"],
+            "Fabric Loader 在错误消息里指认的类应该进 blamed"
+        );
+        // `at` 帧里仍有 supermartijn642corelib（它是无辜框架，但这是栈帧事实）
+        assert!(
+            attribution
+                .suspects
+                .iter()
+                .any(|s| s.class
+                    == "com/supermartijn642/core/registry/RegistryEntryAcceptor$Handler"),
+            "at 帧里仍会记录框架类——归因优先级由 service 层决定"
+        );
+        // `lilac`（不含点）和 `main` 被 looks_like_class 挡掉
+        assert!(
+            !attribution
+                .blamed
+                .iter()
+                .any(|s| s.class.contains("lilac") && !s.class.contains('/'))
+        );
+        // ClientTickEvents 是 platform（net.fabricmc.），不收入
+        assert!(
+            !attribution
+                .blamed
+                .iter()
+                .any(|s| s.class.contains("ClientTickEvents"))
+        );
     }
 }
