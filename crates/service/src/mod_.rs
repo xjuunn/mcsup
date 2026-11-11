@@ -1334,20 +1334,28 @@ impl ModService {
 
         let mut removals: Vec<FixRemove> = Vec::new();
         let mut unattributed: Vec<String> = Vec::new();
-        for suspect in &crash.suspects {
+
+        // 优先用加载器指认的肇事类：它们比 at 帧更权威（Kotlin 反射
+        // 加载的类不会以 at 帧出现，但 Fabric Loader 会在错误消息里写出
+        // `provided by 'lilac' at 'opekope2.lilac.impl.tick.TickNotifier'`）。
+        // 只要指认命中了一个文件，就不再扫 at 帧——框架类（如
+        // supermartijn642corelib）会跟着出现在栈上，但它们是旁观者。
+        for blamed in &crash.blamed {
             let owner = owners
                 .iter()
-                .find(|(_, classes)| classes.contains(&suspect.class));
+                .find(|(_, classes)| classes.contains(&blamed.class));
             match owner {
                 Some((file, _)) => {
                     let reason = match &crash.missing {
-                        // 缺失类是崩溃的直接原因，写进原因里用户才能核对
                         missing if !missing.is_empty() => format!(
-                            "启动崩溃归因：{} 引用了服务端不存在的 {}",
-                            suspect.dotted_class(),
+                            "启动崩溃归因：加载器指认 {} 引用了服务端不存在的 {}",
+                            blamed.dotted_class(),
                             missing.join("、").replace('/', ".")
                         ),
-                        _ => format!("启动崩溃归因：崩在 {}", suspect.dotted_class()),
+                        _ => format!(
+                            "启动崩溃归因：加载器指认 {} 是肇事者",
+                            blamed.dotted_class()
+                        ),
                     };
                     if !removals.iter().any(|item| item.file == *file) {
                         removals.push(FixRemove {
@@ -1356,7 +1364,37 @@ impl ModService {
                         });
                     }
                 }
-                None => unattributed.push(suspect.dotted_class()),
+                None => unattributed.push(blamed.dotted_class()),
+            }
+        }
+
+        // blamed 命中时不再扫 at 帧：栈上的框架类（supermartijn642corelib 等）
+        // 只是旁观者，把它们的 jar 也删掉是误伤。
+        if removals.is_empty() {
+            for suspect in &crash.suspects {
+                let owner = owners
+                    .iter()
+                    .find(|(_, classes)| classes.contains(&suspect.class));
+                match owner {
+                    Some((file, _)) => {
+                        let reason = match &crash.missing {
+                            // 缺失类是崩溃的直接原因，写进原因里用户才能核对
+                            missing if !missing.is_empty() => format!(
+                                "启动崩溃归因：{} 引用了服务端不存在的 {}",
+                                suspect.dotted_class(),
+                                missing.join("、").replace('/', ".")
+                            ),
+                            _ => format!("启动崩溃归因：崩在 {}", suspect.dotted_class()),
+                        };
+                        if !removals.iter().any(|item| item.file == *file) {
+                            removals.push(FixRemove {
+                                file: file.clone(),
+                                reason,
+                            });
+                        }
+                    }
+                    None => unattributed.push(suspect.dotted_class()),
+                }
             }
         }
 

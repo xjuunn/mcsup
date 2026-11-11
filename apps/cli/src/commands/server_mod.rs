@@ -705,6 +705,16 @@ fn report_crash(plan: &ModFixPlan, printer: Printer) -> Result<()> {
             &(),
         )?;
     }
+    for blamed in &crash.blamed {
+        printer.print_outcome(
+            &pick(
+                lang,
+                format!("加载器指认肇事类：{}", blamed.dotted_class()),
+                format!("loader blames: {}", blamed.dotted_class()),
+            ),
+            &(),
+        )?;
+    }
     for suspect in &crash.suspects {
         printer.print_outcome(
             &pick(
@@ -795,6 +805,8 @@ struct FixPlanJson<'a> {
 struct FixCrashJson<'a> {
     missing: &'a [String],
     suspects: Vec<FixSuspectJson<'a>>,
+    /// 加载器在错误消息里明确指认的肇事类（优先级高于 suspects）
+    blamed: Vec<FixSuspectJson<'a>>,
 }
 
 #[derive(Serialize)]
@@ -847,6 +859,14 @@ fn fix_plan_json(plan: &ModFixPlan) -> FixPlanJson<'_> {
                 .map(|suspect| FixSuspectJson {
                     class: suspect.dotted_class(),
                     frame: &suspect.frame,
+                })
+                .collect(),
+            blamed: crash
+                .blamed
+                .iter()
+                .map(|s| FixSuspectJson {
+                    class: s.dotted_class(),
+                    frame: &s.frame,
                 })
                 .collect(),
         }),
