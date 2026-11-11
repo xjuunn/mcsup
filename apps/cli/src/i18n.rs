@@ -36,6 +36,63 @@ pub(crate) fn pick(lang: Lang, zh: impl Into<String>, en: impl Into<String>) -> 
     }
 }
 
+/// 整合包 overrides 解压超过体积上限的提示
+///
+/// 单文件超限与总量超限要分开说：前者是「某个大文件不该进服务端」，后者是
+/// 「整包配置 / 资源包太大」，处置方向不同。`saves/` 已由解压器跳过，因此
+/// 总量超限的提示里不再建议删存档。
+#[must_use]
+pub(crate) fn modpack_extract_limit(
+    kind: mcsup::port::modpack::ExtractLimitKind,
+    file: &str,
+    file_size: u64,
+    written: u64,
+    limit: u64,
+    lang: Lang,
+) -> String {
+    use mcsup::port::modpack::ExtractLimitKind as K;
+
+    fn mib(bytes: u64) -> String {
+        // 整数运算换算，避免 `u64 as f64` 的精度损失（clippy 默认拒绝）
+        const MIB: u64 = 1024 * 1024;
+        let whole = bytes / MIB;
+        let tenths = (bytes % MIB) * 10 / MIB;
+        format!("{whole}.{tenths} MiB")
+    }
+
+    let (scope_zh, scope_en) = match kind {
+        K::File => ("单个文件", "a single file"),
+        K::Total => ("全部 overrides 合计", "the total overrides"),
+    };
+    let (advice_zh, advice_en) = match kind {
+        K::File => (
+            "它不是整合包的 mod 本体；确认是否必要，或换用不含该文件的整合包版本",
+            "it is not a mod; confirm it is needed or use a pack version without it",
+        ),
+        K::Total => (
+            "saves/ 存档已自动跳过；若仍超限，请换用体积更小的整合包版本",
+            "saves/ is skipped automatically; use a smaller pack version if this persists",
+        ),
+    };
+
+    pick(
+        lang,
+        format!(
+            "整合包解压失败：{scope_zh}超过 {} 上限（{file} 为 {}，累计已写 {}）。{advice_zh}",
+            mib(limit),
+            mib(file_size),
+            mib(written),
+        ),
+        format!(
+            "modpack extraction failed: {scope_en} exceeds the {} limit \
+             ({file} is {}, {} written). {advice_en}",
+            mib(limit),
+            mib(file_size),
+            mib(written),
+        ),
+    )
+}
+
 /// 平台自检发现的问题描述（`doctor`）
 #[must_use]
 pub(crate) fn platform_check(check: &mcsup::service::PlatformCheck, lang: Lang) -> String {

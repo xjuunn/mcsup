@@ -112,6 +112,35 @@ fn extracts_overrides_only() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// 存档不是服务端部署目标：`saves/` 在两种前缀下都跳过，不落盘；
+/// 其余 overrides 照常铺开
+#[test]
+fn skips_client_saves_overrides() {
+    let dir = scratch("saves");
+    let archive = dir.join("pack.mrpack");
+    build_archive(
+        &archive,
+        &[
+            ("overrides/saves/GTA 5/region/r.4.4.mca", b"region"),
+            ("overrides/saves/GTA 5/level.dat", b"level"),
+            ("server-overrides/saves/GTA 5/level.dat", b"server level"),
+            ("overrides/config/x.toml", b"server = true\n"),
+        ],
+    );
+    let dest = dir.join("server");
+
+    MrpackExtractor::new()
+        .extract_overrides(&archive, &dest)
+        .expect("铺 overrides");
+
+    assert!(!dest.join("saves").exists(), "saves/ 应被跳过");
+    assert_eq!(
+        std::fs::read(dest.join("config/x.toml")).expect("config"),
+        b"server = true\n"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// 非 ASCII 文件名按 UTF-8 落盘，不产生乱码
 #[test]
 fn extracts_utf8_entry_names() {

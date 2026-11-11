@@ -132,6 +132,31 @@ pub(crate) fn structured_message(err: &anyhow::Error, lang: Lang) -> Option<Stri
             return Some(crate::i18n::settings(&kind, lang));
         }
 
+        // 整合包 overrides 超限：不再只回一句英文 `exceeds the extraction
+        // limit`，按单文件 / 总量给出体积与处置建议。`ModpackError::Extract`
+        // 是 transparent 包装，正常路径下内层在 `chain()` 里；这里同时拆一次
+        // 外层，避免包装层级变化时掉回硬编码英文。
+        let extract = cause
+            .downcast_ref::<mcsup::port::modpack::ModpackExtractError>()
+            .or_else(
+                || match cause.downcast_ref::<mcsup::service::ModpackError>() {
+                    Some(mcsup::service::ModpackError::Extract(inner)) => Some(inner),
+                    _ => None,
+                },
+            );
+        if let Some(mcsup::port::modpack::ModpackExtractError::LimitExceeded {
+            kind,
+            file,
+            file_size,
+            written,
+            limit,
+        }) = extract
+        {
+            return Some(crate::i18n::modpack_extract_limit(
+                *kind, file, *file_size, *written, *limit, lang,
+            ));
+        }
+
         // `PropsError` / `BackupError` / `SettingsError` 的 `Registry` 变体是
         // transparent 包装：
         // 既没有 `kind()`，内层 `ServerRegistryError` 也不进 `chain()`。必须
@@ -967,5 +992,39 @@ mod tests {
         let zh = structured_message(&settings, Lang::Zh).expect("应有中文");
         assert!(zh.contains("的值非法"), "{zh}");
         assert!(!zh.contains("invalid value from"), "{zh}");
+    }
+
+    /// 整合包 overrides 超限：按单文件 / 总量给出中英双语提示，不再只
+    /// 回一句英文 `exceeds the extraction limit`
+    #[test]
+    fn modpack_extract_limit_is_localized() {
+        use mcsup::port::modpack::{ExtractLimitKind, ModpackExtractError};
+        use mcsup::service::ModpackError;
+
+        let file = anyhow::Error::from(ModpackError::from(ModpackExtractError::LimitExceeded {
+            kind: ExtractLimitKind::File,
+            file: "config/huge.bin".to_owned(),
+            file_size: 300 * 1024 * 1024,
+            written: 0,
+            limit: 256 * 1024 * 1024,
+        }));
+        let zh = structured_message(&file, Lang::Zh).expect("应有中文");
+        assert!(zh.contains("整合包解压失败"), "{zh}");
+        assert!(zh.contains("单个文件"), "{zh}");
+        assert!(zh.contains("config/huge.bin"), "{zh}");
+        let en = structured_message(&file, Lang::En).expect("应有英文");
+        assert!(en.contains("modpack extraction failed"), "{en}");
+        assert!(en.contains("a single file"), "{en}");
+
+        let total = anyhow::Error::from(ModpackError::from(ModpackExtractError::LimitExceeded {
+            kind: ExtractLimitKind::Total,
+            file: "config/x.yml".to_owned(),
+            file_size: 10,
+            written: 3 * 1024 * 1024 * 1024,
+            limit: 4 * 1024 * 1024 * 1024,
+        }));
+        let zh = structured_message(&total, Lang::Zh).expect("应有中文");
+        assert!(zh.contains("全部 overrides 合计"), "{zh}");
+        assert!(zh.contains("saves/"), "{zh}");
     }
 }

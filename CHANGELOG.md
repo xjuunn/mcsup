@@ -19,6 +19,10 @@
 
 ### 变更
 
+- 整合包布置跳过 overrides 里的 `saves/` 存档：存档是客户端世界，不是服务端
+  部署目标，随包携带时常是最大单项。其余 overrides 的解压总量上限由 1 GiB
+  提到 4 GiB；超限时按单文件 / 总量给出体积与处置建议，不再只报一句
+  `exceeds the extraction limit`。
 - 发布形态：内层 crate 的 package 名统一为 `mcsup-*`，用 `[lib] name` 保留
   单词库名；发布顺序、版本锁步与 `scripts/bump-version.sh` 一并覆盖内层
   互依的 `version` 字面量。发布 workflow 改为按依赖拓扑序单 job 执行。

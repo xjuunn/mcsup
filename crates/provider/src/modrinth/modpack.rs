@@ -574,8 +574,48 @@ const INDEX_LIMIT: u64 = 4 * 1024 * 1024;
 /// 先校验一次，解压时再按字节截断，防止 zip 声明的 size 与实际流不一致。
 const OVERRIDE_FILE_LIMIT: u64 = 256 * 1024 * 1024;
 
-/// 全部 override 成员的解压总量上限：1 GiB
-const OVERRIDE_TOTAL_LIMIT: u64 = 1024 * 1024 * 1024;
+/// 全部 override 成员的解压总量上限：4 GiB
+///
+/// 曾经是 1 GiB，但真实整合包把客户端存档、资源包一并打进 `overrides/`
+/// 时很容易越过——实测一个随包携带的 GTA 5 存档就有 949 MiB，加上 72 MiB
+/// 配置后总量约 1025 MiB，直接顶到旧上限，安装中止且只报一句
+/// `exceeds the extraction limit`，用户无从判断哪一部分太大。
+/// `saves/` 已单独跳过（见 [`is_client_save`]），这条上限继续兜住其余成员
+/// 的 zip 炸弹式膨胀；4 GiB 对正经整合包的配置与资源包足够宽裕。
+const OVERRIDE_TOTAL_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
+
+/// 成员是否是客户端存档（`saves/` 下）
+///
+/// 存档是客户端世界的布置结果，不是服务端的部署目标：整份 `saves/` 铺到
+/// 服务端既无意义，又常是 overrides 里最大的单项（GTA 5 存档 949 MiB，
+/// 占一个整合包 overrides 的 93%）。跳过，不写盘也不计入总量。
+fn is_client_save(relative: &str) -> bool {
+    relative == "saves" || relative.starts_with("saves/")
+}
+
+/// 构造超限错误：按「单文件」还是「总量」给出触发的限制种类与对应上限
+fn limit_exceeded(
+    relative: &str,
+    file_size: u64,
+    written: u64,
+    allowed: u64,
+) -> ModpackExtractError {
+    use port::modpack::ExtractLimitKind;
+    // `allowed = min(file_limit, remaining)`：只有当剩余额度不小于单文件
+    // 上限时，超限才可能是单文件本身太大；否则是总量先到顶。
+    let (kind, limit) = if allowed >= OVERRIDE_FILE_LIMIT {
+        (ExtractLimitKind::File, OVERRIDE_FILE_LIMIT)
+    } else {
+        (ExtractLimitKind::Total, OVERRIDE_TOTAL_LIMIT)
+    };
+    ModpackExtractError::LimitExceeded {
+        kind,
+        file: relative.to_owned(),
+        file_size,
+        written,
+        limit,
+    }
+}
 
 /// 打开归档并给出统一的错误文本
 fn open_archive(archive: &Path) -> Result<ZipArchive<File>, ModpackExtractError> {
@@ -635,6 +675,11 @@ fn extract_entry(
     // 外部归档的成员名：与清单路径用同一套安全规则
     domain::server::modpack::validate_relative_path(relative)
         .map_err(ModpackExtractError::Index)?;
+    // 存档是客户端世界的布置结果，不是服务端的部署目标：跳过，不写盘
+    // 也不计入总量（见 [`is_client_save`]）。
+    if is_client_save(relative) {
+        return Ok(());
+    }
     let target = dest.join(relative);
     if skip_existing && target.exists() {
         return Ok(());
@@ -643,9 +688,12 @@ fn extract_entry(
     let remaining = OVERRIDE_TOTAL_LIMIT.saturating_sub(*written_total);
     let allowed = OVERRIDE_FILE_LIMIT.min(remaining);
     if allowed == 0 || entry.size() > allowed {
-        return Err(ModpackExtractError::Extract(format!(
-            "override {relative} exceeds the extraction limit"
-        )));
+        return Err(limit_exceeded(
+            relative,
+            entry.size(),
+            *written_total,
+            allowed,
+        ));
     }
 
     if let Some(parent) = target.parent() {
@@ -661,9 +709,7 @@ fn extract_entry(
     if copied > allowed {
         drop(out);
         let _ = std::fs::remove_file(&target);
-        return Err(ModpackExtractError::Extract(format!(
-            "override {relative} exceeds the extraction limit"
-        )));
+        return Err(limit_exceeded(relative, copied, *written_total, allowed));
     }
     *written_total = (*written_total).saturating_add(copied);
     Ok(())
@@ -987,5 +1033,47 @@ mod tests {
             None
         );
         assert_eq!(modrinth_version_id_from_url("not a url"), None);
+    }
+
+    /// 只有 `saves/`（含其下所有层级）算客户端存档，其它目录不受影响
+    #[test]
+    fn only_saves_subtree_is_treated_as_client_save() {
+        assert!(is_client_save("saves"));
+        assert!(is_client_save("saves/GTA 5/region/r.4.4.mca"));
+        assert!(!is_client_save("config/saves.toml"));
+        assert!(!is_client_save("saves_backup/x.mca"));
+        assert!(!is_client_save("mods/a.jar"));
+    }
+
+    /// 超限分类：剩余额度充足时归单文件，剩余不足时归总量
+    #[test]
+    fn limit_exceeded_classifies_file_vs_total() {
+        use port::modpack::{ExtractLimitKind, ModpackExtractError};
+
+        // 剩余额度 >= 单文件上限：文件本身超过 256 MiB → File
+        let file = limit_exceeded(
+            "config/big.bin",
+            OVERRIDE_FILE_LIMIT + 1,
+            0,
+            OVERRIDE_FILE_LIMIT,
+        );
+        match file {
+            ModpackExtractError::LimitExceeded { kind, limit, .. } => {
+                assert_eq!(kind, ExtractLimitKind::File);
+                assert_eq!(limit, OVERRIDE_FILE_LIMIT);
+            }
+            other => panic!("expected LimitExceeded, got {other:?}"),
+        }
+
+        // 剩余额度小于单文件上限：总量先到顶 → Total
+        let remaining = OVERRIDE_FILE_LIMIT / 2;
+        let total = limit_exceeded("config/x.yml", 10, 0, remaining);
+        match total {
+            ModpackExtractError::LimitExceeded { kind, limit, .. } => {
+                assert_eq!(kind, ExtractLimitKind::Total);
+                assert_eq!(limit, OVERRIDE_TOTAL_LIMIT);
+            }
+            other => panic!("expected LimitExceeded, got {other:?}"),
+        }
     }
 }

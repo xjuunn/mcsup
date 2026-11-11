@@ -338,6 +338,24 @@ pub struct ModpackSearch {
     pub total: u64,
 }
 
+/// overrides 解压触发的体积限制种类
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtractLimitKind {
+    /// 单个成员超过单文件上限
+    File,
+    /// overrides 累计写入超过总量上限
+    Total,
+}
+
+impl std::fmt::Display for ExtractLimitKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::File => f.write_str("per-file"),
+            Self::Total => f.write_str("total"),
+        }
+    }
+}
+
 /// 归档解压失败（整合包 `.mrpack` 解析用）
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -351,6 +369,26 @@ pub enum ModpackExtractError {
     /// 清单非法
     #[error(transparent)]
     Index(#[from] domain::server::modpack::ModpackError),
+    /// overrides 解压超过体积上限
+    ///
+    /// 携带结构化字段而不是一句文本：入口要按 [`ExtractLimitKind`] 说清
+    /// 「是单个文件太大还是总量太大」，用户才知道下一步该动哪里。
+    #[error(
+        "modpack override {file} ({file_size} bytes) exceeds the {kind} extraction limit \
+         of {limit} bytes (already wrote {written} bytes)"
+    )]
+    LimitExceeded {
+        /// 触发的限制种类
+        kind: ExtractLimitKind,
+        /// 触发时的成员相对路径
+        file: String,
+        /// 该成员声明 / 实际的大小（字节）
+        file_size: u64,
+        /// 触发前已写入 overrides 的总量（字节）
+        written: u64,
+        /// 触发的那条上限（字节）
+        limit: u64,
+    },
 }
 
 impl ModpackExtractError {
@@ -362,7 +400,9 @@ impl ModpackExtractError {
     pub fn category(&self) -> crate::ErrorCategory {
         match self {
             Self::Index(_) => crate::ErrorCategory::Usage,
-            Self::Extract(_) | Self::MissingIndex(_) => crate::ErrorCategory::Backend,
+            Self::Extract(_) | Self::MissingIndex(_) | Self::LimitExceeded { .. } => {
+                crate::ErrorCategory::Backend
+            }
         }
     }
 }
