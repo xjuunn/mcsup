@@ -1429,7 +1429,7 @@ impl ModService {
         snapshot: Option<&ModpackManifestSnapshot>,
         server: &RegisteredServer,
     ) -> Result<FixTarget, ModError> {
-        if let Some(hit) = snapshot.and_then(|snapshot| snapshot.file_providing(modid))
+        if let Some(hit) = snapshot.and_then(|snapshot| snapshot.provider_for(modid))
             && let Some(project_id) = hit.project_id.clone()
         {
             return Ok(FixTarget::Installs(vec![FixCandidate {
@@ -1688,9 +1688,17 @@ impl ModService {
                     if let Some(missing) = pending.missing.as_deref() {
                         state.candidate_rejected(missing);
                     }
+                    // 有精确版本 ID 说明候选来自整合包清单（检索命中一律为
+                    // `None`，见 `queue_missing_deps`）。这类拒绝的处置与
+                    // 「上游搜到的项目不能用」不同，措辞必须能区分。
+                    let reason = if pending.version_id.is_some() {
+                        pack_refusal_reason(risk, &evidence)
+                    } else {
+                        refusal_reason(risk, &evidence)
+                    };
                     state.refused.push(FixRefused {
                         project_id: pending.project_id.clone(),
-                        reason: refusal_reason(risk, &evidence),
+                        reason,
                     });
                 }
                 Err(err) => {
@@ -1760,7 +1768,7 @@ impl ModService {
         for missing in missing_deps {
             if let Some(hit) = snapshot
                 .as_ref()
-                .and_then(|snapshot| snapshot.file_providing(missing))
+                .and_then(|snapshot| snapshot.provider_for(missing))
                 && let Some(project_id) = hit.project_id.clone()
             {
                 if !state.visited.contains(&project_id) {
@@ -2211,6 +2219,19 @@ fn refusal_reason(risk: Risk, evidence: &[String]) -> String {
     } else {
         format!("安装检查判定为 {}：{}", risk.as_str(), evidence.join("；"))
     }
+}
+
+/// 整合包清单点名的文件被安装检查拒绝时的措辞
+///
+/// 与检索命中不同，这里的文件是作者验证过的确切版本，`project_id` 与
+/// `version_id` 都来自清单。只说「判定为 blocking」会让用户以为上游缺了
+/// 这个依赖，实际上文件就在清单里，只是服务端装载不了——处置也不一样：
+/// 要么移除依赖它的模组，要么手动把文件放进去自己确认。
+fn pack_refusal_reason(risk: Risk, evidence: &[String]) -> String {
+    format!(
+        "{}；该文件由整合包清单指定，不是上游检索命中，可移除依赖它的模组，或手动放置后自行确认",
+        refusal_reason(risk, evidence)
+    )
 }
 
 /// 记下一项补装失败
