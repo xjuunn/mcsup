@@ -224,6 +224,18 @@ fn on_disk_not_registered_is_a_warning() {
     assert_eq!(report.findings()[0].kind.as_str(), "on-disk-not-registered");
 }
 
+#[test]
+fn noise_entries_in_servers_are_ignored() {
+    let fx = Fixture::new();
+    let ws = fx.workspace("ws1");
+    for name in [".DS_Store", "Thumbs.db", "desktop.ini", ".localized"] {
+        std::fs::write(ws.path.join("servers").join(name), b"ignored").expect("write noise");
+    }
+
+    let report = fx.doctor().run().expect("doctor");
+    assert!(report.is_empty(), "{:?}", report.findings());
+}
+
 #[cfg(unix)]
 #[test]
 fn dangling_symlink_is_an_error() {

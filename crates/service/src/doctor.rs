@@ -6,7 +6,7 @@
 //! 判定收敛在这里而不是入口：诊断项枚举化，CLI / 未来 REST 只做映射，
 //! 退出码与人话描述都由各处自行派生，不复制检查清单。
 
-use crate::workspace::MarkerState;
+use crate::workspace::{MarkerState, NOISE_ENTRIES};
 use domain::server::meta::{ServerMeta, ServerName};
 use domain::workspace::Workspace;
 use port::{RepositoryError, ServerRepository, WorkspaceRepository};
@@ -423,6 +423,10 @@ impl DoctorService {
                 continue;
             }
             let fname = entry.file_name();
+            // macOS / Windows 元数据噪声文件不是服务器目录，按 workspace 判空同口径跳过
+            if NOISE_ENTRIES.contains(&fname.to_string_lossy().as_ref()) {
+                continue;
+            }
             let name = Path::new(&fname);
             if !servers
                 .iter()
