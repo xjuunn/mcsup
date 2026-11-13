@@ -225,9 +225,18 @@ impl ServerJarSource for NeoForgeSource {
         let checksum = self.fetch_checksum(&build).await?;
         // NeoForge 元数据不声明 Java 要求，按 MC 版本推算（与 Forge 同口径）
         let java_major = domain::server::version::required_java_major(&mc);
+        // NeoForge 安装器会自行联网下载同一份原版 server.jar（单连接、无重试），
+        // 网络抖动即失败。这里把原版 jar 一并解析，交给 service 跑安装器前预置。
+        let vanilla_jar = crate::mojang::vanilla_server_jar(
+            &self.http,
+            &mc,
+            crate::shared::vanilla_jar_relative_path(&mc),
+        )
+        .await?;
         Ok(Downloads::installer(location)
             .checksum(checksum)
             .java_major(java_major)
+            .vanilla_jar(vanilla_jar)
             .resolve(version, Some(build)))
     }
 }

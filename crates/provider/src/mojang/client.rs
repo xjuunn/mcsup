@@ -4,7 +4,7 @@ use domain::server::{
     artifact::{Checksum, ChecksumAlgorithm, JarArtifact},
     version::{ServerVariant, ServerVersion, VersionId},
 };
-use port::{ResolvedArtifact, ServerJarSource, SourceError};
+use port::{ResolvedArtifact, ServerJarSource, SourceError, VanillaServerJar};
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
@@ -12,8 +12,45 @@ use url::Url;
 
 use super::manifest::{VersionDetails, VersionKind, VersionManifest, VersionManifestItem};
 
+use std::path::PathBuf;
+
 /// 版本清单地址（与 [`crate::calendar::MANIFEST_URL`] 同源）
 const MANIFEST_URL: &str = crate::calendar::MANIFEST_URL;
+
+/// 解析某 MC 版本的原版 server.jar 预置信息（供安装器类来源复用）
+///
+/// `Forge` / `NeoForge` 的安装器在运行时会联网下载同一份原版 `server.jar`，但它
+/// 只有单连接、无重试，网络抖动让 TLS 握手超时后安装器会失败。于是安装器类
+/// 来源在解析自身安装器的同时，用本函数把原版 jar 的地址、sha1 与大小一并
+/// 解析出来，交给 service 用多段重试下载器在跑安装器前预置。
+///
+/// `relative_path` 是安装器查找原版 jar 的落盘约定（`libraries/net/minecraft/…`），
+/// 属于安装器平台知识，由调用方（`Forge` / `NeoForge` 来源）给出，本函数只补
+/// `Mojang` 侧的下载事实（地址 / sha1 / 大小）。
+///
+/// # Errors
+///
+/// 清单 / 版本详情不可达、该 MC 版本不存在或响应无法解析时返回 [`SourceError`]
+pub(crate) async fn vanilla_server_jar(
+    http: &Client,
+    mc: &str,
+    relative_path: PathBuf,
+) -> Result<VanillaServerJar, SourceError> {
+    let manifest: VersionManifest = get_json(http, MANIFEST_URL, None).await?;
+    let item = manifest
+        .versions
+        .into_iter()
+        .find(|item| item.id == mc)
+        .ok_or_else(|| SourceError::NotFound(VersionId::new(mc)))?;
+    let details: VersionDetails = get_json(http, &item.url, None).await?;
+    let server = details.downloads.server;
+    Ok(VanillaServerJar {
+        location: parse_https_url(&server.url)?,
+        checksum: Checksum::new(ChecksumAlgorithm::Sha1, server.sha1),
+        size: server.size,
+        relative_path,
+    })
+}
 
 /// Mojang 官方服务端来源
 #[derive(Debug)]
@@ -127,6 +164,7 @@ fn into_atrifact(
         install: port::InstallKind::Direct,
         installer_args: Vec::new(),
         installer_args_dir: None,
+        vanilla_jar: None,
     })
 }
 

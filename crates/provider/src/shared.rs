@@ -29,7 +29,8 @@
 
 use domain::server::artifact::{Checksum, JarArtifact};
 use domain::server::version::VersionId;
-use port::{InstallKind, ResolvedArtifact, SourceError};
+use port::{InstallKind, ResolvedArtifact, SourceError, VanillaServerJar};
+use std::path::PathBuf;
 use url::Url;
 
 /// URL 处理失败
@@ -110,6 +111,8 @@ pub(crate) struct Downloads {
     pub(crate) install: InstallKind,
     /// 安装器的额外位置参数（子命令式安装器需要）
     pub(crate) installer_args: Vec<String>,
+    /// 安装器运行前需要预置的原版 jar（`Forge` / `NeoForge`）
+    pub(crate) vanilla_jar: Option<VanillaServerJar>,
 }
 
 impl Downloads {
@@ -125,6 +128,7 @@ impl Downloads {
             java_major: None,
             install: InstallKind::Direct,
             installer_args: Vec::new(),
+            vanilla_jar: None,
         }
     }
 
@@ -182,6 +186,13 @@ impl Downloads {
         self
     }
 
+    /// 指定安装器运行前需预置的原版 jar（`Forge` / `NeoForge` 安装器来源）
+    #[must_use]
+    pub(crate) fn vanilla_jar(mut self, vanilla_jar: VanillaServerJar) -> Self {
+        self.vanilla_jar = Some(vanilla_jar);
+        self
+    }
+
     /// 覆盖安装形态（构造器已经区分 direct / installer，这里供特殊来源微调）
     #[must_use]
     #[allow(dead_code, reason = "形态覆盖口子：安装形态需运行时决定的来源使用")]
@@ -210,6 +221,7 @@ impl Downloads {
             install: self.install,
             installer_args: self.installer_args,
             installer_args_dir,
+            vanilla_jar: self.vanilla_jar,
         }
     }
 }
@@ -292,6 +304,18 @@ where
             .find(|candidate| is_snapshot(candidate))
             .map(str::to_owned),
     }
+}
+
+/// `Forge` / `NeoForge` 安装器查找原版 server.jar 的固定相对路径
+///
+/// 现代安装器（`Forge` 1.13+、`NeoForge`）都用同一个约定：原版 jar 落在
+/// `libraries/net/minecraft/server/{mc}/server-{mc}.jar`。安装器自身下载失败时，
+/// 来源用此路径告诉 service 在跑安装器前把原版 jar 预置到该处。
+#[must_use]
+pub(crate) fn vanilla_jar_relative_path(mc: &str) -> PathBuf {
+    PathBuf::from(format!(
+        "libraries/net/minecraft/server/{mc}/server-{mc}.jar"
+    ))
 }
 
 /// 解析 sha1 侧车：纯 40 位十六进制

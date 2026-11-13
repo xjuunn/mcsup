@@ -278,6 +278,26 @@ impl ServerInstaller {
                     destination.display()
                 ))
             })?;
+            // 安装器运行时会自行联网下载原版 server.jar（单连接、无重试），网络
+            // 抖动让 TLS 握手超时后会失败。这里先用多段重试下载器把原版 jar 预置
+            // 到安装器约定的路径，安装器发现文件已就位就不再下载。
+            if let Some(vanilla) = &resolved.vanilla_jar {
+                let target = dir.join(&vanilla.relative_path);
+                let already_matches =
+                    mod_inspect::sha1_of(&target).is_ok_and(|hex| vanilla.checksum.matches(&hex));
+                if !already_matches {
+                    let request = DownloadRequest {
+                        location: vanilla.location.clone(),
+                        destination: target,
+                        // 原版 jar 的 sha1 与大小来自 Mojang 版本详情，可强校验
+                        expected: Some(vanilla.checksum.clone()),
+                        expected_size: Some(vanilla.size),
+                        mirrors: Vec::new(),
+                    };
+                    notify(TaskStage::Downloading);
+                    self.downloader.download(&request, progress, cancel).await?;
+                }
+            }
             // 从这里到返回之间是纯阻塞执行（几分钟量级），安装器的输出会逐行
             // 透传给用户，让他们看到正在联机下载 libraries 而不是卡死
             notify(TaskStage::Installing);
@@ -326,6 +346,8 @@ mod tests {
         cancelled: bool,
         /// 记录收到的请求，供断言校验条件是否下发
         seen: Arc<Mutex<Option<DownloadRequest>>>,
+        /// 按顺序记录全部请求，供断言「安装器 + 原版 jar」这类多次下载
+        requests: Arc<Mutex<Vec<DownloadRequest>>>,
     }
 
     impl FakeDownloader {
@@ -334,6 +356,7 @@ mod tests {
                 downloaded,
                 cancelled,
                 seen: Arc::new(Mutex::new(None)),
+                requests: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -374,6 +397,9 @@ mod tests {
             if let Ok(mut seen) = self.seen.lock() {
                 *seen = Some(request.clone());
             }
+            if let Ok(mut requests) = self.requests.lock() {
+                requests.push(request.clone());
+            }
             if self.cancelled {
                 Err(DownloadError::Cancelled)
             } else {
@@ -394,6 +420,7 @@ mod tests {
             install: port::InstallKind::Direct,
             installer_args: Vec::new(),
             installer_args_dir: None,
+            vanilla_jar: None,
         })
     }
 
@@ -477,6 +504,7 @@ mod tests {
                     install: port::InstallKind::Direct,
                     installer_args: Vec::new(),
                     installer_args_dir: None,
+                    vanilla_jar: None,
                 },
             }),
             Arc::new(FakeDownloader::new(
@@ -562,6 +590,7 @@ mod tests {
                     install: port::InstallKind::Direct,
                     installer_args: Vec::new(),
                     installer_args_dir: None,
+                    vanilla_jar: None,
                 },
                 not_found: false,
             }),
@@ -650,6 +679,129 @@ mod tests {
 
         assert_eq!(*calls.lock().expect("lock"), 1);
         assert_eq!(out.build.as_deref(), Some("26.3-66.1.0"));
+        Ok(())
+    }
+
+    /// 安装器类来源声明原版 jar 时，service 会在跑安装器前用下载器预置它
+    ///
+    /// 这是修复 `Forge` / `NeoForge` 安装器自身下载原版 jar 失败的关键：安装器只有
+    /// 单连接、无重试，这里的预置走 mcsup 的多段重试下载器。
+    #[tokio::test]
+    async fn installer_predownloads_vanilla_jar_before_running() -> Result<(), Box<dyn Error>> {
+        let dir = tempfile::tempdir()?;
+        let vanilla_checksum = Checksum::new(ChecksumAlgorithm::Sha1, "a".repeat(40));
+        let mut artifact = resolved()?;
+        artifact.install = port::InstallKind::Installer;
+        artifact.installer_args_dir = Some("26.3-66.1.0".to_owned());
+        artifact.vanilla_jar = Some(port::VanillaServerJar {
+            location: "https://example.invalid/vanilla/server.jar".parse()?,
+            checksum: vanilla_checksum.clone(),
+            size: 47_791_053,
+            relative_path: PathBuf::from("libraries/net/minecraft/server/26.3/server-26.3.jar"),
+        });
+        let downloader = Arc::new(FakeDownloader::new(
+            DownloadedArtifact {
+                path: dir.path().join(".forge-installer.jar"),
+                size: 12,
+            },
+            false,
+        ));
+        let calls = Arc::new(Mutex::new(0));
+        let installer = ServerInstaller::new(
+            Arc::new(FakeSource {
+                resolved: artifact,
+                not_found: false,
+            }),
+            downloader.clone(),
+        );
+        let ctx = InstallerContext {
+            java_bin: PathBuf::from("/jdk/bin/java"),
+            runner: Arc::new(FakeRunner {
+                calls: Arc::clone(&calls),
+            }),
+        };
+
+        installer
+            .install(
+                &VersionId::new("26.3"),
+                dir.path().join(".forge-installer.jar"),
+                Some(&ctx),
+                None,
+                &CancellationToken::new(),
+            )
+            .await?;
+
+        let requests = downloader.requests.lock().expect("lock").clone();
+        // 两次下载：安装器本体 + 预置的原版 jar
+        assert_eq!(requests.len(), 2, "应各下载安装器与原版 jar 一次");
+        let vanilla_req = &requests[1];
+        assert_eq!(
+            vanilla_req.destination,
+            dir.path()
+                .join("libraries/net/minecraft/server/26.3/server-26.3.jar"),
+        );
+        assert_eq!(vanilla_req.expected.as_ref(), Some(&vanilla_checksum));
+        assert_eq!(vanilla_req.expected_size, Some(47_791_053));
+        assert_eq!(*calls.lock().expect("lock"), 1, "安装器仍被运行一次");
+        Ok(())
+    }
+
+    /// 原版 jar 已就位且 sha1 匹配时跳过预置，不产生第二次下载
+    #[tokio::test]
+    async fn installer_skips_vanilla_predownload_when_present() -> Result<(), Box<dyn Error>> {
+        let dir = tempfile::tempdir()?;
+        let content = b"fake vanilla server jar";
+        let relative = PathBuf::from("libraries/net/minecraft/server/26.3/server-26.3.jar");
+        let target = dir.path().join(&relative);
+        std::fs::create_dir_all(target.parent().expect("parent"))?;
+        std::fs::write(&target, content)?;
+        // 用文件真实 sha1 构造来源声明，命中「已就位」判定
+        let checksum = Checksum::new(ChecksumAlgorithm::Sha1, mod_inspect::sha1_of(&target)?);
+
+        let mut artifact = resolved()?;
+        artifact.install = port::InstallKind::Installer;
+        artifact.installer_args_dir = Some("26.3-66.1.0".to_owned());
+        artifact.vanilla_jar = Some(port::VanillaServerJar {
+            location: "https://example.invalid/vanilla/server.jar".parse()?,
+            checksum,
+            size: content.len() as u64,
+            relative_path: relative,
+        });
+        let downloader = Arc::new(FakeDownloader::new(
+            DownloadedArtifact {
+                path: dir.path().join(".forge-installer.jar"),
+                size: 12,
+            },
+            false,
+        ));
+        let calls = Arc::new(Mutex::new(0));
+        let installer = ServerInstaller::new(
+            Arc::new(FakeSource {
+                resolved: artifact,
+                not_found: false,
+            }),
+            downloader.clone(),
+        );
+        let ctx = InstallerContext {
+            java_bin: PathBuf::from("/jdk/bin/java"),
+            runner: Arc::new(FakeRunner {
+                calls: Arc::clone(&calls),
+            }),
+        };
+
+        installer
+            .install(
+                &VersionId::new("26.3"),
+                dir.path().join(".forge-installer.jar"),
+                Some(&ctx),
+                None,
+                &CancellationToken::new(),
+            )
+            .await?;
+
+        let requests = downloader.requests.lock().expect("lock").clone();
+        assert_eq!(requests.len(), 1, "已就位的原版 jar 不应再次下载");
+        assert_eq!(*calls.lock().expect("lock"), 1);
         Ok(())
     }
 }

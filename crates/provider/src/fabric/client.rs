@@ -156,6 +156,7 @@ impl ServerJarSource for FabricSource {
             install: port::InstallKind::Direct,
             installer_args: Vec::new(),
             installer_args_dir: None,
+            vanilla_jar: None,
         })
     }
 }

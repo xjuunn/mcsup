@@ -268,6 +268,15 @@ impl ServerJarSource for ForgeSource {
         // Forge 的元数据不声明 Java 要求，按 MC 版本推算，避免启动时挑错 JVM
         let mc = build.split_once('-').map_or(build.as_str(), |(mc, _)| mc);
         let java_major = domain::server::version::required_java_major(mc);
+        // Forge 安装器会自行联网下载同一份原版 server.jar（单连接、无重试，网络
+        // 抖动让 TLS 握手超时后安装器失败）。这里把原版 jar 的下载信息一并解析，
+        // 交给 service 用自己的多段重试下载器在跑安装器前预置。
+        let vanilla_jar = crate::mojang::vanilla_server_jar(
+            &self.http,
+            mc,
+            crate::shared::vanilla_jar_relative_path(mc),
+        )
+        .await?;
         Ok(ResolvedArtifact {
             artifact: domain::server::artifact::JarArtifact {
                 version: version.clone(),
@@ -279,6 +288,7 @@ impl ServerJarSource for ForgeSource {
             install: port::InstallKind::Installer,
             installer_args: Vec::new(),
             installer_args_dir: Some(build),
+            vanilla_jar: Some(vanilla_jar),
         })
     }
 }

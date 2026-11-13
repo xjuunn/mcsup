@@ -140,6 +140,36 @@ pub struct ResolvedArtifact {
     /// （`1.21.1-52.0.1`）。目录名怎么定是平台知识，只有来源知道，因此由来源
     /// 在解析时一并给出，service 直接用它拼路径，不重建平台的版本选择口径。
     pub installer_args_dir: Option<String>,
+    /// 安装器运行前需要预置的原版 server.jar（仅安装器类来源有意义）
+    ///
+    /// `Forge` / `NeoForge` 的安装器运行时会联网下载同一份原版 `server.jar`，而它
+    /// 自己只有单连接、无重试，网络抖动会让 TLS 握手超时，把安装器失败报告成
+    /// `invalid checksum`。来源在解析安装器时一并解析出原版 jar 的地址、sha1、
+    /// 大小与落盘相对路径，service 用自己的多段重试下载器在跑安装器前先预置，
+    /// 安装器发现文件已就位就不会再下载。直接可运行的服务端（原版 / `Fabric` /
+    /// `Paper`）将它留空。
+    pub vanilla_jar: Option<VanillaServerJar>,
+}
+
+/// 安装器运行前需要预置的原版 server.jar
+///
+/// 只有安装器类来源（`Forge` / `NeoForge`）会产出这一项：它们的安装器需要原版 jar
+/// 才能装配服务端，但安装器自带的下载路径缺乏重试，是安装失败的高发点（见
+/// [`ResolvedArtifact::vanilla_jar`]）。
+#[derive(Debug, Clone)]
+pub struct VanillaServerJar {
+    /// 原版 jar 的下载地址（`Mojang` `piston-data`）
+    pub location: Url,
+    /// 原版 jar 的 sha1（`Mojang` 版本详情提供，可强校验）
+    pub checksum: Checksum,
+    /// 原版 jar 的字节数（由下载结果覆盖时仍用于断点续传的期望值）
+    pub size: u64,
+    /// 相对服务器目录的落盘路径，如
+    /// `libraries/net/minecraft/server/1.20.1/server-1.20.1.jar`
+    ///
+    /// 该路径是安装器查找原版 jar 的固定约定，由来源在解析时给出，service 只
+    /// 负责在跑安装器前把文件放到这里。
+    pub relative_path: PathBuf,
 }
 
 /// 下载物的用途
