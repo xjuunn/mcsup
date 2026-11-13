@@ -249,8 +249,11 @@ fn detect_bridge(names: &[String]) -> Option<ModLoader> {
 
 /// 逐加载器解析元数据
 ///
-/// `neoforge.mods.toml` 优先于 `mods.toml`：同时存在时前者是 `NeoForge` 的
-/// 权威描述。两者内容通常一致，取其一避免重复记依赖。
+/// `neoforge.mods.toml` 与 `mods.toml` 各记各的：同一个 jar 可以同时带两份
+/// （Forge + `NeoForge` 双支持）。两份清单的 `minecraft` 依赖可能不同——实测
+/// `blended-compat` 的 Forge 侧无版本约束、`NeoForge` 侧写 `[1.21,)`，
+/// 只解析一份就会把装到 Forge 上的合法情况误判成版本不符。依赖按加载器打标，
+/// 缺依赖判定里由加载器过滤，两份 toml 写同一依赖不会重复报。
 fn parse_metadata<R: Read + std::io::Seek>(zip: &mut ZipArchive<R>, cap: &mut ModCapability) {
     if let Some(raw) = read_entry(zip, "fabric.mod.json") {
         parse_fabric(&raw, cap);
@@ -260,7 +263,8 @@ fn parse_metadata<R: Read + std::io::Seek>(zip: &mut ZipArchive<R>, cap: &mut Mo
     }
     if let Some(raw) = read_entry(zip, "META-INF/neoforge.mods.toml") {
         parse_toml_mods(&raw, cap, true);
-    } else if let Some(raw) = read_entry(zip, "META-INF/mods.toml") {
+    }
+    if let Some(raw) = read_entry(zip, "META-INF/mods.toml") {
         parse_toml_mods(&raw, cap, false);
     }
     if let Some(raw) = read_entry(zip, "plugin.yml") {
@@ -1400,5 +1404,42 @@ mod tests {
         assert!(!cap.mc_range_for(Some(ModLoader::Forge)).contains("1.20.1"));
         // Fabric 那份不受 Forge 覆盖
         assert!(cap.mc_range_for(Some(ModLoader::Fabric)).contains("1.20.1"));
+    }
+
+    /// 双加载器 jar 的两份 toml 各写各的 MC 区间，都要解析
+    ///
+    /// 实测 `blended-compat`：`neoforge.mods.toml` 写 `minecraft=[1.21,)`，
+    /// `mods.toml`（Forge）不写 `minecraft`。原来的 `else if` 只解析 `NeoForge`
+    /// 那份，Forge 侧「无约束」就丢了，装到 Forge 1.20.1 被误判不符。
+    #[test]
+    fn dual_loader_tomls_keep_ranges_per_loader() {
+        use std::io::{Cursor, Write};
+
+        let neo = "[[mods]]\nmodId=\"x\"\n\
+                   [[dependencies.x]]\nmodId=\"minecraft\"\nversionRange=\"[1.21,)\"\nmandatory=true\nside=\"BOTH\"\n";
+        let forge = "[[mods]]\nmodId=\"x\"\n";
+
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        writer
+            .start_file("META-INF/neoforge.mods.toml", options)
+            .expect("start neo");
+        writer.write_all(neo.as_bytes()).expect("write neo");
+        writer
+            .start_file("META-INF/mods.toml", options)
+            .expect("start forge");
+        writer.write_all(forge.as_bytes()).expect("write forge");
+        let bytes = writer.finish().expect("finish").into_inner();
+
+        let mut zip = ZipArchive::new(Cursor::new(bytes)).expect("archive");
+        let names = entry_names(&mut zip);
+        let mut cap = ModCapability::empty("x.jar");
+        cap.loaders = detect_loaders(&names);
+        parse_metadata(&mut zip, &mut cap);
+
+        // NeoForge 侧有 [1.21,)
+        assert!(cap.mc_range_for(Some(ModLoader::NeoForge)).contains("1.21"));
+        // Forge 侧没写 minecraft 约束 = 不设限
+        assert!(cap.mc_range_for(Some(ModLoader::Forge)).is_any());
     }
 }

@@ -699,6 +699,16 @@ pub struct ModCapability {
     pub bridges_to: Option<ModLoader>,
 }
 
+/// 「不施加版本限制」的共享区间
+///
+/// [`ModCapability::mc_range_for`] 在「目标加载器被本 jar 声明、却没单独记录
+/// `minecraft` 区间」时返回对它的引用。用一次性静态避免每次临时构造，也让
+/// 返回值保持 `&VersionRange` 而不是 `Cow`。
+fn no_constraint_range() -> &'static VersionRange {
+    static RANGE: std::sync::OnceLock<VersionRange> = std::sync::OnceLock::new();
+    RANGE.get_or_init(VersionRange::any)
+}
+
 impl ModCapability {
     /// 空结果：只有路径，其余待填
     #[must_use]
@@ -739,15 +749,27 @@ impl ModCapability {
 
     /// 取 `target` 加载器可用的 MC 区间
     ///
-    /// 目标加载器有自己那份就用它；没有则回落到收敛值——一份只写了
-    /// `mods.toml` 的 jar 拿去问 Fabric 服务端，本来就是加载器维度的
-    /// 不匹配，不该再叠一条假的 MC 不符。
+    /// 三种情况：
+    ///
+    /// - 目标加载器有自己那份区间 → 用它；
+    /// - 目标加载器是本 jar 声明的加载器之一、却没单独记录 `minecraft` 区间
+    ///   → 该加载器侧「没有版本依赖」= 不施加版本限制，返回「不设限」；
+    /// - 目标加载器不在本 jar 的加载器集里 → 回落到收敛值。这种 jar 拿去问
+    ///   别的加载器，本来就是加载器维度不匹配，不该再叠一条假的 MC 不符。
+    ///
+    /// 后两种不能合并：只写 `mods.toml` 的 jar 拿去问 Fabric 服务端要回落，
+    /// 但双加载器 jar（Forge + `NeoForge`）装到 Forge 上、Forge 侧没写版本
+    /// 约束时，必须返回「不设限」而不是拿 `NeoForge` 侧的区间来误判。
     #[must_use]
     pub fn mc_range_for(&self, target: Option<ModLoader>) -> &VersionRange {
-        if let Some(target) = target
-            && let Some((_, range)) = self.mc_ranges.iter().find(|(l, _)| *l == target)
-        {
+        let Some(target) = target else {
+            return &self.mc_versions;
+        };
+        if let Some((_, range)) = self.mc_ranges.iter().find(|(l, _)| *l == target) {
             return range;
+        }
+        if self.loaders.contains(&target) {
+            return no_constraint_range();
         }
         &self.mc_versions
     }
@@ -1111,10 +1133,19 @@ impl ModCapability {
                     Fit::Match
                 } else {
                     let have: Vec<&str> = self.loaders.iter().map(|l| l.as_str()).collect();
-                    issues.push(FitIssue::new(
-                        FitDimension::Loader,
-                        format!("只支持 {}，服务端是 {want}", have.join(" / ")),
-                    ));
+                    let mut detail = format!("只支持 {}，服务端是 {want}", have.join(" / "));
+                    // Fabric 专用 mod 装在 Forge / NeoForge 上只能靠 Sinytra
+                    // Connector 桥。没检测到桥时点明出路，否则用户看到的只是
+                    // 一句「加载器不匹配」，不知道还能补个桥把 mod 跑起来。
+                    if self.loaders.iter().all(|l| *l == ModLoader::Fabric)
+                        && matches!(want, ModLoader::Forge | ModLoader::NeoForge)
+                        && !target.bridged_loaders.contains(&ModLoader::Fabric)
+                    {
+                        detail.push_str(
+                            "（Forge / NeoForge 装载 Fabric mod 需 Sinytra Connector 桥）",
+                        );
+                    }
+                    issues.push(FitIssue::new(FitDimension::Loader, detail));
                     Fit::Mismatch
                 }
             }
@@ -1512,6 +1543,34 @@ mod tests {
         assert!(c.mc_range_for(None).contains("1.19.2"));
     }
 
+    /// 多加载器 jar 只给某个加载器写了版本约束：其余加载器侧不设限
+    ///
+    /// 实测 `blended-compat` / `improved-village-placement`：Forge `mods.toml`
+    /// 无 `minecraft` 约束，仅 `NeoForge` 侧写 `[1.21,)`。装到 Forge 1.20.1
+    /// 上必须是「不设限」，而不是拿 `NeoForge` 的 `[1.21,)` 误判不符。
+    #[test]
+    fn multi_loader_jar_without_range_on_target_is_unconstrained() {
+        let mut c = ModCapability::empty("/x.jar");
+        c.loaders = vec![ModLoader::Fabric, ModLoader::NeoForge, ModLoader::Forge];
+        c.set_mc_range(
+            ModLoader::NeoForge,
+            VersionRange {
+                raw: "[1.21,)".to_owned(),
+                min: Some("1.21".to_owned()),
+                max: None,
+            },
+        );
+
+        let forge = target(ModLoader::Forge, "1.20.1", None);
+        assert!(c.mc_range_for(Some(ModLoader::Forge)).is_any());
+        assert_eq!(c.fit_for(&forge).mc_version, Fit::Match);
+        assert_eq!(c.fit_for(&forge).verdict, FitVerdict::Installable);
+
+        // NeoForge 侧那份 [1.21,) 仍然生效：NeoForge 1.20.1 上判不匹配
+        let neo = target(ModLoader::NeoForge, "1.20.1", None);
+        assert_eq!(c.fit_for(&neo).mc_version, Fit::Mismatch);
+    }
+
     #[test]
     fn class_major_maps_to_java_version() {
         assert_eq!(java_version_from_class_major(52), Some(8));
@@ -1534,11 +1593,13 @@ mod tests {
     fn cap(loaders: &[ModLoader], mc: &str, java: Option<u32>) -> ModCapability {
         let mut cap = ModCapability::empty("/x.jar");
         cap.loaders = loaders.to_vec();
-        cap.mc_versions = if mc.is_empty() {
-            VersionRange::any()
-        } else {
-            exact_range(mc)
-        };
+        // 走 set_mc_range 而不直接写 mc_versions：mc_range_for 现在区分
+        // 「加载器有区间」与「没写区间 = 不设限」，直接写收敛值会绕过前者。
+        if !mc.is_empty()
+            && let Some(first) = loaders.first()
+        {
+            cap.set_mc_range(*first, exact_range(mc));
+        }
         cap.java_compiled = java;
         cap
     }
@@ -1684,6 +1745,24 @@ mod tests {
                 .fit_for(&target(ModLoader::Forge, "", None))
                 .loader,
             Fit::Mismatch
+        );
+    }
+
+    /// Fabric 专用 mod 在 Forge 上没桥时，原因点明需要 Sinytra Connector
+    ///
+    /// 光报「只支持 fabric，服务端是 forge」用户不知道还能补个桥；点明出路
+    /// 才是可行动的原因说明。
+    #[test]
+    fn fabric_only_mod_on_forge_without_bridge_names_connector() {
+        let fabric_mod = cap(&[ModLoader::Fabric], "", None);
+        let fit = fabric_mod.fit_for(&target(ModLoader::Forge, "1.20.1", None));
+        assert_eq!(fit.loader, Fit::Mismatch);
+        assert!(
+            fit.issues
+                .iter()
+                .any(|i| i.dimension == FitDimension::Loader && i.detail.contains("Sinytra")),
+            "{:?}",
+            fit.issues
         );
     }
 
