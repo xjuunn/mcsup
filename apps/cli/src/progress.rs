@@ -1,4 +1,5 @@
-use indicatif::{ProgressBar, ProgressStyle};
+use crate::output::human_bytes;
+use indicatif::{ProgressBar, ProgressState, ProgressStyle};
 use mcsup::port::{CancellationToken, InstallerOutputSink, ProgressSink, TaskObserver, TaskStage};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -10,6 +11,42 @@ const BAR: &str = "{msg}  [{bar:36.cyan/blue}] {bytes}/{total_bytes} ({bytes_per
 const TICKS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const TICK_INTERVAL: Duration = Duration::from_millis(100);
 
+/// 速度是 `f64`，[`human_bytes`] 只接收 `u64`；四舍五入到整字节。
+///
+/// 早于首个采样点时 `per_sec()` 可能为 `NaN`，浮点转整数的饱和语义会落到 0，
+/// 正好对应「还没开始传」。
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn per_sec_bytes(state: &ProgressState) -> u64 {
+    state.per_sec().round() as u64
+}
+
+/// 让进度条按 [`human_bytes`] 的 10 进制口径显示字节与速度。
+///
+/// indicatif 内建的 `{bytes}` / `{total_bytes}` / `{bytes_per_sec}` 是 1024 进制的
+/// KiB/MiB/GiB；`{decimal_*}` 又是小写 `kB`。两者都与本项目其它输出
+/// （`human_bytes` 的 `KB` / `MB` / `GB`）不一致，所以统一覆盖成同一个函数。
+fn decimal_units(style: ProgressStyle) -> ProgressStyle {
+    style
+        .with_key(
+            "bytes",
+            |state: &ProgressState, w: &mut dyn std::fmt::Write| {
+                let _ = write!(w, "{}", human_bytes(state.pos()));
+            },
+        )
+        .with_key(
+            "total_bytes",
+            |state: &ProgressState, w: &mut dyn std::fmt::Write| {
+                let _ = write!(w, "{}", human_bytes(state.len().unwrap_or(state.pos())));
+            },
+        )
+        .with_key(
+            "bytes_per_sec",
+            |state: &ProgressState, w: &mut dyn std::fmt::Write| {
+                let _ = write!(w, "{}/s", human_bytes(per_sec_bytes(state)));
+            },
+        )
+}
+
 /// 阶段 spinner：单字符 + 文案
 fn apply_spinner_style(bar: &ProgressBar) {
     if let Ok(style) = ProgressStyle::with_template(SPINNER) {
@@ -20,14 +57,14 @@ fn apply_spinner_style(bar: &ProgressBar) {
 /// 总长未知的下载回显：spinner + 已传字节
 fn apply_unknown_length_style(bar: &ProgressBar) {
     if let Ok(style) = ProgressStyle::with_template(SPINNER_BYTES) {
-        bar.set_style(style.tick_strings(TICKS));
+        bar.set_style(decimal_units(style).tick_strings(TICKS));
     }
 }
 
 /// 已知总长的单行进度条
 fn apply_bar_style(bar: &ProgressBar) {
     if let Ok(style) = ProgressStyle::with_template(BAR) {
-        bar.set_style(style);
+        bar.set_style(decimal_units(style));
     }
 }
 
@@ -521,6 +558,72 @@ fn install_ctrl_c_handler(cancel: CancellationToken, bar: ProgressBar) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 进度条的字节与速度都走 [`human_bytes`] 的 10 进制口径，不出现 MiB
+    ///
+    /// 用最小 `TermLike` 捕获渲染文本：indicatif 的 `InMemoryTerm` 要开
+    /// `in_memory` feature（会引入 `vt100`），为一个断言不值得加依赖。
+    #[test]
+    fn bar_renders_decimal_units() {
+        use indicatif::{ProgressDrawTarget, TermLike};
+        use std::io;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Debug)]
+        struct Capture(Arc<Mutex<String>>);
+
+        impl TermLike for Capture {
+            fn width(&self) -> u16 {
+                240
+            }
+            fn move_cursor_up(&self, _: usize) -> io::Result<()> {
+                Ok(())
+            }
+            fn move_cursor_down(&self, _: usize) -> io::Result<()> {
+                Ok(())
+            }
+            fn move_cursor_right(&self, _: usize) -> io::Result<()> {
+                Ok(())
+            }
+            fn move_cursor_left(&self, _: usize) -> io::Result<()> {
+                Ok(())
+            }
+            fn write_line(&self, s: &str) -> io::Result<()> {
+                self.0.lock().expect("lock").push_str(s);
+                Ok(())
+            }
+            fn write_str(&self, s: &str) -> io::Result<()> {
+                self.0.lock().expect("lock").push_str(s);
+                Ok(())
+            }
+            fn clear_line(&self) -> io::Result<()> {
+                self.0.lock().expect("lock").clear();
+                Ok(())
+            }
+            fn flush(&self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let sink = Arc::new(Mutex::new(String::new()));
+        let bar = ProgressBar::with_draw_target(
+            Some(27_137_000),
+            ProgressDrawTarget::term_like(Box::new(Capture(Arc::clone(&sink)))),
+        );
+        apply_bar_style(&bar);
+        bar.set_message("取回整合包");
+        bar.set_position(25_207_000);
+        bar.tick();
+
+        let rendered = sink.lock().expect("lock").clone();
+        assert!(rendered.contains("25.21 MB"), "{rendered}");
+        assert!(rendered.contains("27.14 MB"), "{rendered}");
+        assert!(
+            !rendered.contains("MiB"),
+            "进度条不应再出现 MiB：{rendered}"
+        );
+        assert!(rendered.contains("/s"), "速度应带 /s 后缀：{rendered}");
+    }
 
     /// `finish` 后 bar 进入终态：不再绘制、steady tick 退出。
     /// 不 `restart` 就继续 `set_message`，整段阶段回显都是空白。
