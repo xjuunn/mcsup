@@ -241,7 +241,11 @@ pub struct DownloadRequest {
     pub destination: PathBuf,
     /// 期望的校验和；为 `None` 时跳过校验
     pub expected: Option<Checksum>,
-    /// 期望的字节数; 为 `None` 时跳过大小检验
+    /// 期望的字节数；`None` 跳过大小检验
+    ///
+    /// 有可用校验和（[`Self::expected`] 为 `Some`）且匹配时，字节数只作进度与
+    /// 分片的参考，不参与正确性判定——校验和是比字节数更强的证明，清单字节数
+    /// 过期（写错）不应致命。仅在没有可用校验和时才以字节数兜底对照。
     pub expected_size: Option<u64>,
     /// 同一份字节的其它来源（镜像），按顺序在主地址失败后尝试
     ///

@@ -873,6 +873,10 @@ fn verify(
                 actual,
             });
         }
+        // 校验和匹配即字节完整，这是比 `expected_size` 更强的正确性证明。清单里
+        // `file_size` 字段过期（例如比实际小 246 字节）时不该致命失败：字节数只
+        // 在没有可用校验和时才作为与期望对照的唯一信号。
+        return Ok(());
     }
     if let Some(expected) = request.expected_size
         && expected != transferred
@@ -1311,6 +1315,32 @@ mod tests {
         ));
         assert!(!destination.exists());
         assert_eq!(std::fs::read_dir(dir.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn checksum_match_accepts_stale_size() -> Result<(), Box<dyn Error>> {
+        let dir = tempdir()?;
+        let destination = dir.path().join("server.jar");
+        let payload = b"hello minecraft";
+        let expected = Checksum::new(ChecksumAlgorithm::Sha1, sha1_hex(payload));
+
+        let downloader = FileDownloader::new(fake_source(&[b"hello ", b"minecraft"]));
+        // 清单字节数字段过期：多声明 246 字节，与真实字节数对不上
+        let request = DownloadRequest {
+            location: "https://example.com/server.jar".parse()?,
+            destination: destination.clone(),
+            expected: Some(expected),
+            expected_size: Some(payload.len() as u64 + 246),
+            mirrors: Vec::new(),
+        };
+
+        let done = downloader
+            .download(&request, None, &CancellationToken::new())
+            .await?;
+
+        assert_eq!(done.size, payload.len() as u64);
+        assert_eq!(std::fs::read(&destination)?, payload);
         Ok(())
     }
 
