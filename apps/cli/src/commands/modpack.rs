@@ -30,6 +30,8 @@ use mcsup::port::modpack::{ModpackDetail, ModpackQuery, ModpackVersion};
 use mcsup::service::ModpackInstallOptions;
 use std::path::Path;
 
+use super::mod_review::file_name;
+
 /// 已选定的整合包
 #[derive(Debug, Clone)]
 pub(crate) struct PickedModpack {
@@ -741,6 +743,7 @@ pub(crate) async fn install_modpack(
         downloaded_bytes: applied.downloaded_bytes,
         reused: applied.reused,
         skipped_client_only: applied.skipped_client_only,
+        skipped_client_only_files: &applied.skipped_client_only_files,
         skipped_bytes: applied.skipped_bytes,
         stale_hashes: applied.stale_hashes.len(),
         blocked: applied.blocked.len(),
@@ -767,6 +770,7 @@ pub(crate) async fn install_modpack(
         ),
     );
     printer.print_outcome(&human, &payload)?;
+    print_skipped_files(printer, &applied.skipped_client_only_files);
 
     // 5. 装完复核：声明说能装，不等于装完真能跑
     //
@@ -799,6 +803,7 @@ pub(crate) fn report_remote_applied(
         downloaded_bytes: result.downloaded_bytes,
         reused: result.reused,
         skipped_client_only: result.skipped_client_only,
+        skipped_client_only_files: &result.skipped_client_only_files,
         skipped_bytes: result.skipped_bytes,
         stale_hashes: result.stale_hashes,
         blocked: result.blocked.len(),
@@ -825,6 +830,7 @@ pub(crate) fn report_remote_applied(
         ),
     );
     printer.print_outcome(&human, &payload)?;
+    print_skipped_files(printer, &result.skipped_client_only_files);
     // 文件在对端，客户端没有执行权：只摆表和说清去哪儿停用，不假装已处理
     super::mod_review::report_remote(&result.blocked, origin, printer);
     Ok(())
@@ -843,6 +849,19 @@ fn skipped_note(lang: crate::locale::Lang, skipped: usize) -> String {
         format!("，跳过 {skipped} 个仅客户端模组"),
         format!(", skipped {skipped} client-only mods"),
     )
+}
+
+/// human 模式下列出被跳过的仅客户端模组；JSON 模式数据已在 payload 里
+///
+/// 数量只说「跳过了」，用户没法知道跳过的是不是非删不可的。逐行列文件名，
+/// 与 `server mod list` 的「文件」列同口径（去 `mods/` 前缀）。
+fn print_skipped_files(printer: Printer, files: &[String]) {
+    if !printer.is_human() || files.is_empty() {
+        return;
+    }
+    for path in files {
+        crate::output::print_line(&format!("  - {}", file_name(path)));
+    }
 }
 
 /// 「清单哈希已过期但按上游权威哈希接受」的提示后缀；没有时为空串
@@ -894,6 +913,8 @@ struct ModpackInstallJson<'a> {
     reused: usize,
     /// 按上游元数据判定为仅客户端、已跳过的模组数
     skipped_client_only: usize,
+    /// 被跳过文件的清单路径（与 `skipped_client_only` 数量一一对应）
+    skipped_client_only_files: &'a [String],
     /// 服务端不读取而未下载的字节数
     skipped_bytes: u64,
     /// 清单哈希过期、但按上游权威哈希接受的文件数

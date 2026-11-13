@@ -446,8 +446,9 @@ impl ModpackService {
             .index
             .server_files()
             .len()
-            .saturating_sub(skipped_client_only);
-        applied.skipped_client_only = skipped_client_only;
+            .saturating_sub(skipped_client_only.len());
+        applied.skipped_client_only = skipped_client_only.len();
+        applied.skipped_client_only_files = skipped_client_only;
 
         // 5. 把清单留一份：项目 / 版本 ID 都在下载地址里，装完就有了权威数据，
         //    后续补依赖与整合包更新按 ID 直接定位，不必拿 modid 去搜索
@@ -529,13 +530,14 @@ impl ModpackService {
     /// 把清单文件分类：要下载的、仅客户端剔除的
     ///
     /// 仅客户端文件顺手清掉旧落盘——重装时留着只会让服务端起不来。
+    /// 返回被剔除文件的清单路径，供入口回显「跳过的是哪几个」，而不是只报数量。
     async fn classify_files<'a>(
         &self,
         prepared: &'a ModpackPrepared,
         server_dir: &Path,
         verdicts: &PackMemberVerdicts,
-    ) -> Result<(Vec<(&'a ModpackFile, PathBuf)>, usize), ModpackError> {
-        let mut skipped_client_only = 0_usize;
+    ) -> Result<(Vec<(&'a ModpackFile, PathBuf)>, Vec<String>), ModpackError> {
+        let mut skipped_client_only: Vec<String> = Vec::new();
         let mut jobs: Vec<(&'a ModpackFile, PathBuf)> = Vec::new();
         for file in prepared.index.downloadable_server_files() {
             let target = safe_target(server_dir, &file.path)?;
@@ -552,7 +554,7 @@ impl ModpackService {
                         .await
                         .map_err(|err| ModpackError::io(&target, err))?;
                 }
-                skipped_client_only += 1;
+                skipped_client_only.push(file.path.clone());
                 continue;
             }
             jobs.push((file, target));
@@ -699,6 +701,7 @@ impl ModpackService {
             downloaded_bytes,
             reused,
             skipped_client_only: 0,
+            skipped_client_only_files: Vec::new(),
             skipped_bytes: 0,
             stale_hashes,
             // 下载阶段还不知道文件本身是什么，装完判定在 `apply` 里补
@@ -997,6 +1000,9 @@ pub struct ModpackApplied {
     pub reused: usize,
     /// 按上游元数据判定为仅客户端、已跳过的文件数
     pub skipped_client_only: usize,
+    /// 被跳过文件的清单路径（如 `mods/sodium.jar`），与 [`Self::skipped_client_only`]
+    /// 数量一一对应，供入口回显列出「跳过的是哪几个」
+    pub skipped_client_only_files: Vec<String>,
     /// 因服务端不读取而未下载的字节数（资源包 / 光影 / `*.disabled`）
     ///
     /// 与 `downloaded_bytes` 是两个口径：这些字节既没下也没装，省下来的就是

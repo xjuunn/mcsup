@@ -82,6 +82,13 @@ pub(crate) fn print_styled(text: &str) {
     );
 }
 
+/// 无修饰打印一行：不加粗、不变色。用于列表项这类次级信息，
+/// 与 [`print_styled`]（标题）形成对比。
+#[allow(clippy::print_stdout)]
+pub(crate) fn print_line(text: &str) {
+    println!("{text}");
+}
+
 #[allow(clippy::print_stdout)]
 pub(crate) fn print_success(text: &str) {
     println!(

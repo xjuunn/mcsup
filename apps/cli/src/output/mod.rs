@@ -14,8 +14,8 @@ mod render;
 
 pub(crate) use error::{exit_code_of, structured_message};
 pub(crate) use render::{
-    compact_table, human_bytes, print_error_line, print_json_line, print_styled, print_success,
-    print_table, render_fields,
+    compact_table, human_bytes, print_error_line, print_json_line, print_line, print_styled,
+    print_success, print_table, render_fields,
 };
 
 use crate::locale::Lang;

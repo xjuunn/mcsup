@@ -302,7 +302,7 @@ fn remote_reason_text(entry: &RemoteModBlocked, lang: Lang) -> String {
 }
 
 /// 只显示文件名：`mods/` 前缀对每一行都一样，占宽度不提供信息
-fn file_name(path: &str) -> String {
+pub(crate) fn file_name(path: &str) -> String {
     Path::new(path).file_name().map_or_else(
         || path.to_owned(),
         |name| name.to_string_lossy().into_owned(),

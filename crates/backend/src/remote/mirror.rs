@@ -62,6 +62,8 @@ pub struct RemoteModpackResult {
     pub reused: usize,
     /// 仅客户端、已跳过的文件数
     pub skipped_client_only: usize,
+    /// 被跳过文件的清单路径（与 `skipped_client_only` 数量一一对应）
+    pub skipped_client_only_files: Vec<String>,
     /// 服务端不读取而未下载的字节数
     pub skipped_bytes: u64,
     /// 清单哈希过期、按上游权威哈希接受的文件数
@@ -485,6 +487,7 @@ impl RemoteServerRepository {
                 downloaded_bytes,
                 reused,
                 skipped_client_only,
+                skipped_client_only_files,
                 skipped_bytes,
                 stale_hashes,
                 blocked,
@@ -500,6 +503,7 @@ impl RemoteServerRepository {
                     downloaded_bytes,
                     reused,
                     skipped_client_only,
+                    skipped_client_only_files,
                     skipped_bytes,
                     stale_hashes,
                     blocked: blocked

@@ -676,6 +676,11 @@ async fn keeps_client_only_file_that_pack_members_depend_on() {
         "没人依赖的仅客户端 mod 仍然跳过"
     );
     assert_eq!(applied.skipped_client_only, 1);
+    assert_eq!(
+        applied.skipped_client_only_files,
+        vec!["mods/sodium-extra.jar".to_owned()],
+        "跳过的文件要能列出，供入口回显具体是哪一个"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 

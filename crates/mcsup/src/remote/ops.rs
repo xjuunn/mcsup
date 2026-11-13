@@ -745,6 +745,7 @@ impl Agent {
                         downloaded_bytes: applied.downloaded_bytes,
                         reused: applied.reused,
                         skipped_client_only: applied.skipped_client_only,
+                        skipped_client_only_files: applied.skipped_client_only_files.clone(),
                         skipped_bytes: applied.skipped_bytes,
                         stale_hashes: applied.stale_hashes.len(),
                         blocked: applied.blocked.iter().map(wire_mod_blocked).collect(),

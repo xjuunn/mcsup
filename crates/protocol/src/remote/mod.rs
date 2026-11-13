@@ -705,6 +705,11 @@ pub enum Response {
         reused: usize,
         /// 按上游元数据判定为仅客户端、已跳过的文件数
         skipped_client_only: usize,
+        /// 被跳过文件的清单路径（与 `skipped_client_only` 数量一一对应）
+        ///
+        /// `default` 保住旧对端：字段缺失即空，与「没跳过」同义。
+        #[serde(default)]
+        skipped_client_only_files: Vec<String>,
         /// 服务端不读取而未下载的字节数（资源包 / 光影 / `*.disabled`）
         ///
         /// `default` 保住旧对端：字段缺失即 0，与「没省下任何字节」同义。
@@ -1306,6 +1311,7 @@ mod tests {
                 downloaded_bytes: 4_096,
                 reused: 30,
                 skipped_client_only: 2,
+                skipped_client_only_files: vec!["mods/client-a.jar".to_owned()],
                 skipped_bytes: 0,
                 stale_hashes: 0,
                 blocked: vec![WireModBlocked {
