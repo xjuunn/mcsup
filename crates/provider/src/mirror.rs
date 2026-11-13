@@ -91,6 +91,11 @@ fn bmclapi() -> Result<Source, CatalogError> {
 /// 实测 Modrinth 文件经 MCIM 回源到官方 CDN 后更慢（16.5 MB：官方 2.23 MB/s →
 /// MCIM 0.64 MB/s），API 却更快（0.96 s → 0.29 s）。文件绑定保留：探测按实际
 /// 往返排序，慢的源不会中选；API 侧不经过本层，见 [`upstreams`] 的说明。
+///
+/// 注意：文件 URL 上 MCIM **不缓存内容**，只是 `302` 跳回 `cdn.modrinth.com`
+/// （`location` 里甚至保留了未编码的空格与方括号）。因此它不是官方 CDN 的
+/// 备用源：官方侧握手失败时换到 MCIM 仍会走同一条链路，故障不会因此消失。
+/// 探测排序与下载回退都只是尽人事，真正决定成败的是那条链路本身是否可用。
 fn mcim() -> Result<Source, CatalogError> {
     Ok(Source::new(SourceId::new("mcim")?, "MCIM").with(Binding::new("modrinth-cdn", MCIM)?))
 }

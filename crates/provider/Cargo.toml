@@ -19,10 +19,17 @@ port = { package = "mcsup-port", version = "0.1.0", path = "../port" }
 # %TEMP% 依赖，对 Minecraft 服务器工具毫无必要。改用 rustls + ring：
 # 全 Rust 实现（仅 ring 有少量预汇编），安全面足够，provider 代码零改动
 # （reqwest API 不因 TLS 后端变化）。
+#
+# `system-proxy` 必须在砍掉默认特性后**重新显式打开**，否则会丢一个默认行为：
+# 没有它 reqwest 只认环境变量，用户按系统设置配好的代理（Clash / Surge / 企业
+# 代理，macOS 与 Windows 都由系统统一记录）对下载完全无效。实测同一份大整合包：
+# 不走系统代理时并发 TLS 握手被上游拒掉、`tls handshake eof` 整包失败；走系统
+# 代理后握手正常，同一份整合包下完。Linux 上该特性无实现，不会引入平台依赖。
 reqwest = { version = "0.13.5", default-features = false, features = [
     "json",
     "charset",
     "http2",
+    "system-proxy",
     "rustls-no-provider",
 ] }
 rustls = { version = "0.23", default-features = false, features = [

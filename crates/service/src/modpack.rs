@@ -570,6 +570,11 @@ impl ModpackService {
     /// `ChecksumMismatch` 的少数文件再走 [`Self::fetch_one_file`] 的权威哈希
     /// 回源路径。这样快车道不被慢逻辑拖累，业务语义（清单哈希过期可修正）不变。
     ///
+    /// 第三段兜的是**瞬时传输失败**：批量阶段某个文件连接被重置（跨境 CDN 在
+    /// 大量并发握手时很常见），不代表这个文件下不到，更不代表整包报废。这些
+    /// 文件在批量结束后以并发 1 逐个重下——并发正是失败的原因，降并发才是对治。
+    /// 重下仍失败才报错；绝不静默跳过，缺文件的整合包启动即崩。
+    ///
     /// 进度口径收敛为整包：清单里每个文件都带 size，总字节可知；已复用
     /// （reused）的文件按声明 size 直接计入已完成，余下的由下载器累加。
     async fn download_files(
@@ -638,6 +643,8 @@ impl ModpackService {
         let mut stale_hashes: Vec<String> = Vec::new();
         // (位置, 清单声明的哈希, 实际下载字节的哈希)
         let mut needs_authority: Vec<(usize, String, String)> = Vec::new();
+        // 批量阶段传输失败、留到第三段低并发重下的文件位置
+        let mut needs_retry: Vec<usize> = Vec::new();
         for (position, outcome) in index.iter().copied().zip(outcomes) {
             match outcome {
                 Ok(downloaded) => {
@@ -646,7 +653,16 @@ impl ModpackService {
                 Err(port::DownloadError::ChecksumMismatch { expected, actual }) => {
                     needs_authority.push((position, expected, actual));
                 }
-                Err(err) => return Err(err.into()),
+                // 取消 / 校验失败 / 本地 IO 重试也不会变好，按原错误立即返回
+                Err(err) if !err.retryable() => return Err(err.into()),
+                Err(err) => {
+                    warn!(
+                        path = %to_download[position].0.path,
+                        error = %err,
+                        "modpack file failed in the concurrent phase; queued for serial retry"
+                    );
+                    needs_retry.push(position);
+                }
             }
         }
 
@@ -656,20 +672,17 @@ impl ModpackService {
         // 这一段的下载不再上报进度：这些文件的字节在批量阶段已按清单大小计入，
         // 重下再按单文件从 0 报会把整包位置拽回去（观感是数字倒退、速度归零）。
         // 发生概率低、单次通常只涉及一两个文件，进度条停在原处比倒退诚实。
-        for (position, expected, actual) in needs_authority {
-            if cancel.is_cancelled() {
-                return Err(ModpackError::Download(port::DownloadError::Cancelled));
-            }
-            let (file, target) = &to_download[position];
-            let url = first_https(&file.downloads)?;
-            let fetched = self
-                .accept_authoritative_hash(source, file, url, target, expected, actual, cancel)
-                .await?;
-            downloaded_bytes = downloaded_bytes.saturating_add(fetched.bytes);
-            if fetched.stale {
-                stale_hashes.push(file.path.clone());
-            }
-        }
+        let (authority_bytes, stale_paths) = self
+            .retry_authority(source, &to_download, &needs_authority, cancel)
+            .await?;
+        downloaded_bytes = downloaded_bytes.saturating_add(authority_bytes);
+        stale_hashes.extend(stale_paths);
+
+        // 第三段：批量阶段的瞬时失败按并发 1 重下。
+        let retried_bytes = self
+            .retry_serially(&to_download, &needs_retry, cancel)
+            .await?;
+        downloaded_bytes = downloaded_bytes.saturating_add(retried_bytes);
 
         info!(
             project = %prepared.resolved.project_id,
@@ -678,6 +691,7 @@ impl ModpackService {
             downloaded_bytes,
             reused,
             stale_hashes = stale_hashes.len(),
+            retried = needs_retry.len(),
             "modpack files downloaded"
         );
         Ok(ModpackApplied {
@@ -761,6 +775,84 @@ impl ModpackService {
             bytes: downloaded.size,
             stale: true,
         })
+    }
+
+    /// 只有清单哈希过期的文件才回源确认 + 按权威哈希重下。
+    ///
+    /// 这一段的下载不再上报进度：这些文件的字节在批量阶段已按清单大小计入，重下
+    /// 再按单文件从 0 报会把整包位置拽回去。发生概率低、单次通常只涉及一两个
+    /// 文件，进度条停在原处比倒退诚实。返回实际写入的字节数与清单哈希过期的路径。
+    async fn retry_authority(
+        &self,
+        source: &dyn ModpackSource,
+        to_download: &[(&ModpackFile, PathBuf)],
+        needs_authority: &[(usize, String, String)],
+        cancel: &CancellationToken,
+    ) -> Result<(u64, Vec<String>), ModpackError> {
+        let mut bytes = 0_u64;
+        let mut stale_paths = Vec::new();
+        for (position, expected, actual) in needs_authority {
+            if cancel.is_cancelled() {
+                return Err(ModpackError::Download(port::DownloadError::Cancelled));
+            }
+            let (file, target) = &to_download[*position];
+            let url = first_https(&file.downloads)?;
+            let fetched = self
+                .accept_authoritative_hash(
+                    source,
+                    file,
+                    url,
+                    target,
+                    expected.clone(),
+                    actual.clone(),
+                    cancel,
+                )
+                .await?;
+            bytes = bytes.saturating_add(fetched.bytes);
+            if fetched.stale {
+                stale_paths.push(file.path.clone());
+            }
+        }
+        Ok((bytes, stale_paths))
+    }
+
+    /// 批量阶段的瞬时失败按并发 1 重下，返回实际写入的字节数。
+    ///
+    /// 这些文件已在上层的单文件重试与候选源回退中失败过，继续用同样的并发只会
+    /// 重复同一个结果；把同时在途的连接降到 1 才能避开 CDN 对握手风暴的限流。
+    /// 落到这里的只有 `retryable()` 的失败，重下仍失败就是真实故障，原样返回
+    /// ——不跳过任何一个清单文件。
+    async fn retry_serially(
+        &self,
+        to_download: &[(&ModpackFile, PathBuf)],
+        needs_retry: &[usize],
+        cancel: &CancellationToken,
+    ) -> Result<u64, ModpackError> {
+        let mut bytes = 0_u64;
+        for position in needs_retry {
+            if cancel.is_cancelled() {
+                return Err(ModpackError::Download(port::DownloadError::Cancelled));
+            }
+            let (file, target) = &to_download[*position];
+            let url = first_https(&file.downloads)?;
+            let mirrors = self.mirrors_for(&url);
+            let request = DownloadRequest {
+                location: url,
+                destination: target.clone(),
+                expected: file.hashes.sha1_checksum(),
+                expected_size: (file.size > 0).then_some(file.size),
+                mirrors,
+            };
+            // `download` 自带单文件瞬态重试与候选源回退，这里只需压低并发：
+            // 逐个调用保证同一时刻只有一个文件在途。
+            let downloaded = self.downloader.download(&request, None, cancel).await?;
+            bytes = bytes.saturating_add(downloaded.size);
+            info!(
+                path = %file.path,
+                "modpack file recovered by serial retry"
+            );
+        }
+        Ok(bytes)
     }
 }
 
