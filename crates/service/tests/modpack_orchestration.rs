@@ -315,6 +315,8 @@ impl port::mod_::ModInspector for FakeInspector {
 struct FakeDownloader {
     requests: Arc<Mutex<Vec<DownloadRequest>>>,
     fail: bool,
+    /// 批量阶段停在总量之前（模拟最后一个 chunk 的回调没发出来）
+    short_progress: bool,
     /// 「文件名 → 实际字节的 sha1」：配置后，若请求的 expected 与之不符则返回
     /// `ChecksumMismatch { expected: 清单值, actual: 实际值 }`，模拟上游重新上传
     actual_hashes: Vec<(String, String)>,
@@ -325,6 +327,7 @@ impl FakeDownloader {
         Self {
             requests: Arc::new(Mutex::new(Vec::new())),
             fail: false,
+            short_progress: false,
             actual_hashes: Vec::new(),
         }
     }
@@ -333,8 +336,15 @@ impl FakeDownloader {
         Self {
             requests: Arc::new(Mutex::new(Vec::new())),
             fail: true,
+            short_progress: false,
             actual_hashes: Vec::new(),
         }
+    }
+
+    /// 批量进度停在总量前一个字节，模拟真实下载器的尾部采样
+    fn stopping_short(mut self) -> Self {
+        self.short_progress = true;
+        self
     }
 
     /// 指定某文件的实际字节 sha1（与清单不符时首轮报 mismatch）
@@ -384,6 +394,43 @@ impl ArtifactDownloader for FakeDownloader {
             path: request.destination.clone(),
             size: len as u64,
         })
+    }
+
+    /// 批量下载：按真实下载器的口径上报整批累计进度
+    ///
+    /// `short_progress` 时只报到 `total - 1`，模拟最后一个 chunk 的回调在收尾
+    /// 之前没有发出来的情形（真实下载器按 chunk 回调，校验 / 重命名阶段不再
+    /// 产生进度事件）。
+    async fn download_many(
+        &self,
+        requests: &[DownloadRequest],
+        _concurrency: usize,
+        progress: Option<&dyn ProgressSink>,
+        cancel: &CancellationToken,
+    ) -> Vec<Result<DownloadedArtifact, DownloadError>> {
+        let total: u64 = requests.iter().filter_map(|r| r.expected_size).sum();
+        let all_known = requests.iter().all(|r| r.expected_size.is_some());
+        let total = all_known.then_some(total);
+        let mut done = 0_u64;
+        let mut results = Vec::with_capacity(requests.len());
+        for request in requests {
+            let outcome = self.download(request, None, cancel).await;
+            if let Ok(artifact) = &outcome {
+                done += artifact.size;
+                if let Some(sink) = progress
+                    && !self.short_progress
+                {
+                    sink.on_progress(done, total);
+                }
+            }
+            results.push(outcome);
+        }
+        if self.short_progress
+            && let Some(sink) = progress
+        {
+            sink.on_progress(done.saturating_sub(1), total);
+        }
+        results
     }
 }
 
@@ -1634,6 +1681,60 @@ async fn apply_reports_pack_level_monotonic_progress() {
         samples.last().map(|(done, _)| *done),
         Some(30),
         "最终样本必须到达总量：{samples:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 批量阶段停在最后一个 chunk 之前时，整批结束必须把进度补到总量
+///
+/// 真实下载器按 chunk 回调，最后一次采样可能差最后几个字节；此后的校验、
+/// 重命名与模组判定都不再产生进度事件。不补这一下，进度条会长期停在
+/// `934.90 MB/934.91 MB`，看起来像卡死。
+#[tokio::test]
+async fn apply_tops_up_progress_when_batch_stops_short() {
+    let index = ModpackIndex::new(
+        1,
+        "minecraft",
+        "1.0.0",
+        "Pack",
+        deps(&[("minecraft", "1.21.1"), ("fabric-loader", "0.16.0")]),
+        vec![
+            file("mods/a.jar", 4, EnvTag::Required),
+            file("mods/b.jar", 8, EnvTag::Required),
+            file("mods/c.jar", 16, EnvTag::Required),
+        ],
+    )
+    .expect("index");
+    let service = service(index, Vec::new(), FakeDownloader::ok().stopping_short());
+    let dir = scratch("progress-topup");
+
+    let prepared = service
+        .prepare(
+            "P",
+            ModpackInstallOptions::new(&dir),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("prepare");
+    let sink = RecordingSink {
+        samples: Mutex::new(Vec::new()),
+    };
+    service
+        .apply(&prepared, &dir, Some(&sink), &CancellationToken::new())
+        .await
+        .expect("apply");
+
+    let samples = sink.samples.lock().expect("samples").clone();
+    // 批量阶段停在 27/28，收尾补到 28/28
+    assert_eq!(
+        samples.first().map(|(done, _)| *done),
+        Some(27),
+        "批量阶段应停在总量之前：{samples:?}"
+    );
+    assert_eq!(
+        samples.last(),
+        Some(&(28, 28)),
+        "整批结束必须补满进度：{samples:?}"
     );
     std::fs::remove_dir_all(&dir).ok();
 }

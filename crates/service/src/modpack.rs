@@ -686,6 +686,15 @@ impl ModpackService {
             .await?;
         downloaded_bytes = downloaded_bytes.saturating_add(retried_bytes);
 
+        // 收尾把进度落到整包总量。批量阶段最后一次上报可能停在最后一个
+        // 文件最后一个 chunk 之前，而此后的校验 / 重命名、以及 `apply` 里的
+        // 模组判定都不再产生进度事件 —— 不补这一下，回显会长期停在
+        // `934.90 MB/934.91 MB`，与随后的阶段切换之间留下一段假死。
+        // 到这里所有清单文件都已落盘（重下失败会提前返回 Err），补满不虚报。
+        if let Some(sink) = progress {
+            sink.on_progress(total_bytes, Some(total_bytes));
+        }
+
         info!(
             project = %prepared.resolved.project_id,
             version = %prepared.resolved.version_id,

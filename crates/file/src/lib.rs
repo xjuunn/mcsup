@@ -39,18 +39,29 @@ const SEGMENT_CONCURRENCY: usize = 128;
 /// 24 → 23 → … → 1 衰减，聚合吞吐随之衰减，观感就是「越下越慢」。
 /// 留几轮富余，队列里始终有活可派，吞吐才能持平到收尾。
 const SEGMENT_WAVES: usize = 8;
-/// 单段最小字节数，低于它不值得分段建立新建连接
+/// 单个分段的目标上限
 ///
-/// 1 MiB 而不是 2 MiB：实测跨境 CDN 单连接约 20–45 KiB/s，一段 1 MiB 也要
-/// 20–50 秒，建连开销占比不到 5%；而段越小、同时在途的连接越多，聚合吞吐
-/// 越接近线性增长。整合包里 5–8 MiB 的中等文件正是尾部最慢的一段（单流下
-/// 一个 6.5 MiB 文件要几分钟），1 MiB 分片至少给它 6 条连接。
+/// 实测跨境 CDN 单连接约 20–45 KiB/s，一段 1 MiB 要 20–50 秒，建连开销占比
+/// 不到 5%；再往下切只会让建连次数成倍上涨。它是**上限**，小文件按
+/// [`SEGMENT_TARGET_SPLIT`] 切得更细，见 [`plan_segments`]。
 const SEGMENT_MIN_BYTES: u64 = 1024 * 1024;
+/// 小文件的目标分片数
+///
+/// 批量按体积降序下发（LPT），最后启动的是最小的一批文件；它们如果只能单流，
+/// 单连接约 45 KiB/s，整批收尾就会从「秒级」拖成几十秒。按 1/8 切后每个文件
+/// 至少摊到 4–8 条连接，收尾时间不再与文件大小绑定。
+const SEGMENT_TARGET_SPLIT: u64 = 8;
+/// 分片下限
+///
+/// 低于 256 KiB 的片建连开销占比过高（跨境链路一次握手约 1 秒，而 256 KiB
+/// 在 45 KiB/s 下已经要 5–6 秒），再细只会更慢。
+const SEGMENT_FLOOR_BYTES: u64 = 256 * 1024;
 /// 整体小于该大小直接单流
 ///
-/// 2 MiB：再小的文件由批量并发（24 路）负责重叠等待，分段收益抵不过多一次
-/// HEAD 探测与建连。
-const MIN_SEGMENTED_SIZE: u64 = 2 * 1024 * 1024;
+/// 512 KiB：更小的文件本来几秒就传完，分段收益抵不过多一次 HEAD 探测与建连；
+/// 而 512 KiB–2 MiB 这一档正是 LPT 排序后压在尾部的一批，单流下要 10–45 秒，
+/// 必须让它们也分段。
+const MIN_SEGMENTED_SIZE: u64 = 512 * 1024;
 /// 段最大尝试次数（含首次）
 const SEGMENT_MAX_ATTEMPTS: u32 = 3;
 /// 重发延迟
@@ -689,22 +700,25 @@ impl FileDownloader {
 
 /// 把总量切成闭区间列表
 ///
-/// 切片按 [`SEGMENT_MIN_BYTES`] 取，数量上限是并发度的 [`SEGMENT_WAVES`] 倍：
-/// 上限内的每片都够大，不值得再细分；超出上限才合并，避免超大文件切出成千上万段。
-/// 关键是**切片数多于并发度**——多出来的分片排队等着，某条连接跑完立刻补位，
-/// 在途连接数才不会一路衰减到 1。
+/// 目标片大小是 `clamp(total / 8, 256 KiB, 1 MiB)`：大文件按 1 MiB 切，中小
+/// 文件按体积的 1/8 切。这样每个文件的每条连接都只扛 1 MiB 以内，批量尾部
+/// 那批小文件不再是一条连接扛完整个文件——收尾的墙钟时间与文件大小脱钩。
+///
+/// 片数上限是并发度的 [`SEGMENT_WAVES`] 倍：超出上限才合并，避免超大文件切出
+/// 成千上万段。关键是**切片数多于并发度**——多出来的分片排队等着，某条连接
+/// 跑完立刻补位，在途连接数才不会一路衰减到 1。
 fn plan_segments(total: u64) -> Vec<RangeInclusive<u64>> {
+    if total == 0 {
+        return Vec::new();
+    }
     let cap = (SEGMENT_CONCURRENCY * SEGMENT_WAVES) as u64;
-    let count = (total / SEGMENT_MIN_BYTES).clamp(1, cap);
-    let chunk = total / count;
+    let target = (total / SEGMENT_TARGET_SPLIT).clamp(SEGMENT_FLOOR_BYTES, SEGMENT_MIN_BYTES);
+    let count = total.div_ceil(target).clamp(1, cap);
+    let chunk = total.div_ceil(count);
     (0..count)
         .map(|index| {
-            let start = index * chunk;
-            let end = if index == count - 1 {
-                total - 1
-            } else {
-                start + chunk - 1
-            };
+            let start = index.saturating_mul(chunk);
+            let end = (index + 1).saturating_mul(chunk).min(total) - 1;
             start..=end
         })
         .collect()
@@ -1485,10 +1499,10 @@ mod tests {
     /// 切片数必须多于并发度，否则跑完的连接不会被补位，吞吐一路衰减
     #[test]
     fn plan_has_spare_slices_beyond_concurrency() {
-        // 320MiB 的整合包：按最小分片切，片数远超并发度
+        // 320MiB 的整合包：按 1 MiB 上限切，片数远超并发度
         let bounds = plan_segments(320 * 1024 * 1024);
         let expected = usize::try_from(320 * 1024 * 1024 / SEGMENT_MIN_BYTES).expect("fits");
-        assert_eq!(bounds.len(), expected, "大文件按最小分片切");
+        assert_eq!(bounds.len(), expected, "大文件按上限分片");
         assert!(
             bounds.len() > SEGMENT_CONCURRENCY,
             "切片数不多于并发度就没有补位余地"
@@ -1500,16 +1514,59 @@ mod tests {
             assert_eq!(*pair[1].start(), *pair[0].end() + 1, "切片必须首尾相接");
         }
 
-        // 中等文件按 1 MiB 分片：6.5 MiB 的文件能拿到 6 条连接，而不是单流
-        assert_eq!(plan_segments(8 * 1024 * 1024).len(), 8);
+        // 中等文件每条连接不超过 1 MiB
+        let medium = plan_segments(8 * 1024 * 1024);
+        assert!(medium.len() >= 8, "8 MiB 至少要 8 条连接: {}", medium.len());
+        assert!(
+            medium
+                .iter()
+                .all(|bounds| bounds.end() - bounds.start() < SEGMENT_MIN_BYTES),
+            "单条连接不该扛超过 1 MiB"
+        );
         // 超大文件按上限切，不无限细分（记录文件与请求数都要有界）
         assert_eq!(
             plan_segments(8 * 1024 * 1024 * 1024).len(),
             SEGMENT_CONCURRENCY * SEGMENT_WAVES
         );
-        // 小于最小分片直接一片
-        assert_eq!(plan_segments(1024 * 1024).len(), 1);
+        // 小于分片下限直接一片
         assert_eq!(plan_segments(1).len(), 1);
+    }
+
+    /// 批量尾部的小文件必须摊到多条连接
+    ///
+    /// LPT 把最小的文件排在最后，它们若只能单流，单连接约 45 KiB/s 会把整批的
+    /// 收尾拖成几十秒 —— 这正是「快下完了却突然变慢」的来源。这里锁住小文件的
+    /// 分片夹具：512 KiB 以上至少 4 条连接，每条不超过 256 KiB。
+    #[test]
+    fn plan_splits_small_tail_files() {
+        for total in [
+            512 * 1024,
+            1024 * 1024,
+            1536 * 1024,
+            2 * 1024 * 1024,
+            4 * 1024 * 1024,
+        ] {
+            let bounds = plan_segments(total);
+            assert!(
+                bounds.len() >= 2,
+                "{total} 字节应分段，实际只有 {} 片",
+                bounds.len()
+            );
+            assert_eq!(*bounds.first().expect("非空").start(), 0);
+            assert_eq!(*bounds.last().expect("非空").end(), total - 1);
+            for pair in bounds.windows(2) {
+                assert_eq!(*pair[1].start(), *pair[0].end() + 1, "切片必须首尾相接");
+            }
+            let widest = bounds
+                .iter()
+                .map(|bounds| bounds.end() - bounds.start() + 1)
+                .max()
+                .expect("非空");
+            assert!(
+                widest <= SEGMENT_FLOOR_BYTES * 2,
+                "{total} 字节的最大分片 {widest} 超过尾部目标"
+            );
+        }
     }
 
     /// 残片长度与上游不符时不得续传：那是别的版本或上次写坏的
@@ -1578,7 +1635,8 @@ mod tests {
     async fn small_file_skips_probe_and_segmentation() -> Result<(), Box<dyn Error>> {
         let dir = tempdir()?;
         let destination = dir.path().join("server.jar");
-        let payload = vec![0x5A; 1024 * 1024];
+        // 必须低于分段阈值（512 KiB），否则会走 HEAD + 分段
+        let payload = vec![0x5A; 256 * 1024];
         let range = fake_range(&payload, true);
 
         let downloader =
@@ -1601,8 +1659,9 @@ mod tests {
         let dir = tempdir()?;
         let destination = dir.path().join("server.jar");
         let payload = big_payload();
+        let segments = plan_segments(payload.len() as u64).len();
         let range = fake_range(&payload, true);
-        // 8MiB+4096 / 1MiB = 8 段，其中 4 段首次失败一次
+        // 其中 4 段首次失败一次
         range.fail_opens.store(4, Ordering::Relaxed);
 
         let downloader =
@@ -1619,8 +1678,11 @@ mod tests {
 
         assert_eq!(done.size, payload.len() as u64);
         assert_eq!(std::fs::read(&destination)?, payload);
-        // 4 段各失败一次后重试成功：首试 8 + 重试 4
-        assert_eq!(range.open_calls.load(Ordering::Relaxed), 12);
+        // 4 段各失败一次后重试成功：首试 N + 重试 4
+        assert_eq!(
+            range.open_calls.load(Ordering::Relaxed),
+            u32::try_from(segments)? + 4
+        );
         Ok(())
     }
 
@@ -1629,6 +1691,7 @@ mod tests {
         let dir = tempdir()?;
         let destination = dir.path().join("server.jar");
         let payload = big_payload();
+        let segments = plan_segments(payload.len() as u64).len();
         let range = fake_range(&payload, true);
         range.short_reads.store(4, Ordering::Relaxed);
 
@@ -1646,8 +1709,11 @@ mod tests {
 
         assert_eq!(done.size, payload.len() as u64);
         assert_eq!(std::fs::read(&destination)?, payload);
-        // 4 段首轮各短读一次后重试成功：首试 8 + 重试 4
-        assert_eq!(range.open_calls.load(Ordering::Relaxed), 12);
+        // 4 段首轮各短读一次后重试成功：首试 N + 重试 4
+        assert_eq!(
+            range.open_calls.load(Ordering::Relaxed),
+            u32::try_from(segments)? + 4
+        );
         Ok(())
     }
 

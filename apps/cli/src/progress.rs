@@ -1,8 +1,9 @@
 use crate::output::human_bytes;
-use indicatif::{ProgressBar, ProgressState, ProgressStyle};
+use indicatif::{FormattedDuration, ProgressBar, ProgressState, ProgressStyle};
 use mcsup::port::{CancellationToken, InstallerOutputSink, ProgressSink, TaskObserver, TaskStage};
-use std::sync::Mutex;
-use std::time::Duration;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const SPINNER: &str = "{spinner:.cyan} {msg}";
 const SPINNER_BYTES: &str = "{spinner:.cyan} {msg} ({bytes})";
@@ -11,21 +12,95 @@ const BAR: &str = "{msg}  [{bar:36.cyan/blue}] {bytes}/{total_bytes} ({bytes_per
 const TICKS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const TICK_INTERVAL: Duration = Duration::from_millis(100);
 
-/// 速度是 `f64`，[`human_bytes`] 只接收 `u64`；四舍五入到整字节。
+/// 速度统计窗口：只取最近这么久的字节增量
 ///
-/// 早于首个采样点时 `per_sec()` 可能为 `NaN`，浮点转整数的饱和语义会落到 0，
-/// 正好对应「还没开始传」。
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn per_sec_bytes(state: &ProgressState) -> u64 {
-    state.per_sec().round() as u64
+/// indicatif 内建估计器的时间常数是 15 秒（双重平滑后约 30 秒），下载开头
+/// 要几十秒才爬到真实速度、收尾位置不动了速度还在缓慢回落，画面上的
+/// `MB/s` 与进度增长对不上。3 秒滑窗既能看清瞬时变化，又不会被单个
+/// chunk 的抖动带偏。
+const SPEED_WINDOW: Duration = Duration::from_secs(3);
+/// 采样最短跨度：不足时按零速处理，避免首个采样点把几个 chunk 估成天文数字
+const SPEED_MIN_SPAN: Duration = Duration::from_millis(400);
+/// 超过这么久没有新字节即视为停住：速度归零，而不是继续显示历史值
+const SPEED_STALL: Duration = Duration::from_millis(1500);
+
+/// 下载速度计：按最近 [`SPEED_WINDOW`] 的采样算平均速率
+///
+/// 位置可能回退（分段失败会退还该段的已写字节），回退时以新位置重新起算，
+/// 否则会算出负增量或把重传的字节重复计入。
+#[derive(Debug, Default)]
+struct SpeedMeter {
+    samples: VecDeque<(Instant, u64)>,
 }
 
-/// 让进度条按 [`human_bytes`] 的 10 进制口径显示字节与速度。
+impl SpeedMeter {
+    /// 以当前位置为新基线（开始下载、切定长、续传接上残片时调用）
+    fn reset(&mut self, transferred: u64, now: Instant) {
+        self.samples.clear();
+        self.samples.push_back((now, transferred));
+    }
+
+    fn record(&mut self, transferred: u64, now: Instant) {
+        if self
+            .samples
+            .back()
+            .is_some_and(|&(_, last)| transferred < last)
+        {
+            self.samples.clear();
+        }
+        self.samples.push_back((now, transferred));
+        while self.samples.len() > 2 && now.duration_since(self.samples[0].0) > SPEED_WINDOW {
+            self.samples.pop_front();
+        }
+    }
+
+    /// 最近窗口内的平均速率（字节/秒）
+    #[allow(clippy::cast_precision_loss)]
+    fn per_sec(&self, now: Instant) -> f64 {
+        let (Some(&(first_time, first_pos)), Some(&(last_time, last_pos))) =
+            (self.samples.front(), self.samples.back())
+        else {
+            return 0.0;
+        };
+        if now.duration_since(last_time) > SPEED_STALL {
+            return 0.0;
+        }
+        let span = now.duration_since(first_time).max(SPEED_MIN_SPAN);
+        let bytes = last_pos.saturating_sub(first_pos);
+        bytes as f64 / span.as_secs_f64()
+    }
+
+    /// 按当前速率估计剩余时间；速率未知时返回 `None`（显示 `--`）
+    #[allow(clippy::cast_precision_loss)]
+    fn eta(&self, remaining: u64, now: Instant) -> Option<Duration> {
+        if remaining == 0 {
+            return Some(Duration::ZERO);
+        }
+        let rate = self.per_sec(now);
+        (rate > 1.0).then(|| Duration::from_secs_f64(remaining as f64 / rate))
+    }
+}
+
+/// 速度是 `f64`，[`human_bytes`] 只接收 `u64`；四舍五入到整字节。
+///
+/// `NaN` / 负数一律落到 0，对应「还没开始传」。
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn rate_bytes(rate: f64) -> u64 {
+    if rate.is_finite() && rate > 0.0 {
+        rate.round() as u64
+    } else {
+        0
+    }
+}
+
+/// 让进度条按 [`human_bytes`] 的 10 进制口径显示字节与速度，并用
+/// [`SpeedMeter`] 取代 indicatif 的滞后估计器。
 ///
 /// indicatif 内建的 `{bytes}` / `{total_bytes}` / `{bytes_per_sec}` 是 1024 进制的
 /// KiB/MiB/GiB；`{decimal_*}` 又是小写 `kB`。两者都与本项目其它输出
 /// （`human_bytes` 的 `KB` / `MB` / `GB`）不一致，所以统一覆盖成同一个函数。
-fn decimal_units(style: ProgressStyle) -> ProgressStyle {
+fn decimal_units(style: ProgressStyle, speed: Arc<Mutex<SpeedMeter>>) -> ProgressStyle {
+    let rate_meter = Arc::clone(&speed);
     style
         .with_key(
             "bytes",
@@ -41,8 +116,27 @@ fn decimal_units(style: ProgressStyle) -> ProgressStyle {
         )
         .with_key(
             "bytes_per_sec",
-            |state: &ProgressState, w: &mut dyn std::fmt::Write| {
-                let _ = write!(w, "{}/s", human_bytes(per_sec_bytes(state)));
+            move |_state: &ProgressState, w: &mut dyn std::fmt::Write| {
+                let rate = rate_meter
+                    .lock()
+                    .map_or(0.0, |meter| meter.per_sec(Instant::now()));
+                let _ = write!(w, "{}/s", human_bytes(rate_bytes(rate)));
+            },
+        )
+        .with_key(
+            "eta",
+            move |state: &ProgressState, w: &mut dyn std::fmt::Write| {
+                let remaining = state
+                    .len()
+                    .unwrap_or(state.pos())
+                    .saturating_sub(state.pos());
+                let now = Instant::now();
+                let text = speed
+                    .lock()
+                    .ok()
+                    .and_then(|meter| meter.eta(remaining, now))
+                    .map_or_else(|| "--".to_owned(), |eta| FormattedDuration(eta).to_string());
+                let _ = write!(w, "{text}");
             },
         )
 }
@@ -55,16 +149,16 @@ fn apply_spinner_style(bar: &ProgressBar) {
 }
 
 /// 总长未知的下载回显：spinner + 已传字节
-fn apply_unknown_length_style(bar: &ProgressBar) {
+fn apply_unknown_length_style(bar: &ProgressBar, speed: Arc<Mutex<SpeedMeter>>) {
     if let Ok(style) = ProgressStyle::with_template(SPINNER_BYTES) {
-        bar.set_style(decimal_units(style).tick_strings(TICKS));
+        bar.set_style(decimal_units(style, speed).tick_strings(TICKS));
     }
 }
 
 /// 已知总长的单行进度条
-fn apply_bar_style(bar: &ProgressBar) {
+fn apply_bar_style(bar: &ProgressBar, speed: Arc<Mutex<SpeedMeter>>) {
     if let Ok(style) = ProgressStyle::with_template(BAR) {
-        bar.set_style(decimal_units(style));
+        bar.set_style(decimal_units(style, speed));
     }
 }
 
@@ -164,6 +258,8 @@ pub(crate) struct BarSink {
     bar: ProgressBar,
     /// 回显状态
     state: Mutex<SinkState>,
+    /// 下载速率：模板里的 `bytes_per_sec` / `eta` 都从它取
+    speed: Arc<Mutex<SpeedMeter>>,
 }
 
 #[derive(Default)]
@@ -185,6 +281,7 @@ impl BarSink {
                 message: message.into(),
                 ..SinkState::default()
             }),
+            speed: Arc::new(Mutex::new(SpeedMeter::default())),
         }
     }
 
@@ -203,8 +300,11 @@ impl BarSink {
         };
         state.started = true;
         state.determinate = false;
+        if let Ok(mut speed) = self.speed.lock() {
+            speed.reset(self.bar.position(), Instant::now());
+        }
         resume(&self.bar);
-        apply_unknown_length_style(&self.bar);
+        apply_unknown_length_style(&self.bar, Arc::clone(&self.speed));
         self.bar.set_message(state.message.clone());
     }
 
@@ -218,6 +318,14 @@ impl BarSink {
         resume(&self.bar);
         apply_spinner_style(&self.bar);
     }
+
+    /// 当前速率（测试用）
+    #[cfg(test)]
+    fn per_sec(&self) -> f64 {
+        self.speed
+            .lock()
+            .map_or(0.0, |meter| meter.per_sec(Instant::now()))
+    }
 }
 
 impl ProgressSink for BarSink {
@@ -228,26 +336,35 @@ impl ProgressSink for BarSink {
         if !state.started {
             // 没有阶段回调的调用方：首个进度在这里接手回显
             state.started = true;
+            if let Ok(mut speed) = self.speed.lock() {
+                speed.reset(transferred, Instant::now());
+            }
             resume(&self.bar);
-            apply_unknown_length_style(&self.bar);
+            apply_unknown_length_style(&self.bar, Arc::clone(&self.speed));
             self.bar.set_message(state.message.clone());
         }
         match total {
             Some(total) if !state.determinate => {
                 // 切换单行 bar，停 steady_tick，只在位置变化时刷新
                 self.bar.set_length(total);
-                apply_bar_style(&self.bar);
+                apply_bar_style(&self.bar, Arc::clone(&self.speed));
                 self.bar.disable_steady_tick();
+                // 到此为止的字节可能全是续传时磁盘上已有的部分。先以当前位置
+                // 为新基线再落位：否则首个采样会把已有字节算成本轮吞吐，
+                // 画面瞬间飙到几十 MiB/s 再回落到真实值。
+                if let Ok(mut speed) = self.speed.lock() {
+                    speed.reset(transferred, Instant::now());
+                }
                 self.bar.set_position(transferred);
-                // 到此为止的字节可能全是续传时磁盘上已有的部分。把它算进吞吐，
-                // 画面会瞬间飙到几十 MiB/s 再慢慢回落到真实值 —— 用户看到的是
-                // 「速度飞快但其实没在下」。重置估计器正好以当前位置为新基线
-                // （只清估计历史，不清位置）。
                 self.bar.reset_eta();
                 state.determinate = true;
             }
-            // 已是定长进度条，或总长未知（保持 spinner + 已传字节）
-            _ => self.bar.set_position(transferred),
+            _ => {
+                if let Ok(mut speed) = self.speed.lock() {
+                    speed.record(transferred, Instant::now());
+                }
+                self.bar.set_position(transferred);
+            }
         }
     }
 }
@@ -388,7 +505,7 @@ pub(crate) struct InstallSession {
     /// 是否处于安装器阶段：这段时间回显线收起，只透传安装器输出
     installing: std::sync::atomic::AtomicBool,
     /// 安装器输出透传：与阶段回显共用同一条线
-    installer_output: std::sync::Arc<InstallerOutput>,
+    installer_output: Arc<InstallerOutput>,
 }
 
 impl InstallSession {
@@ -399,7 +516,7 @@ impl InstallSession {
         let sink = BarSink::new(spinner.handle(), message);
         let cancel = CancellationToken::new();
         install_ctrl_c_handler(cancel.clone(), spinner.handle());
-        let installer_output = std::sync::Arc::new(InstallerOutput::new(
+        let installer_output = Arc::new(InstallerOutput::new(
             spinner.handle(),
             cancel.clone(),
             enable,
@@ -416,7 +533,7 @@ impl InstallSession {
 
     /// 安装器输出的实时透传句柄（测试与内部断言用）
     #[cfg(test)]
-    pub(crate) fn installer_output(&self) -> std::sync::Arc<InstallerOutput> {
+    pub(crate) fn installer_output(&self) -> Arc<InstallerOutput> {
         self.installer_output.clone()
     }
 
@@ -610,7 +727,7 @@ mod tests {
             Some(27_137_000),
             ProgressDrawTarget::term_like(Box::new(Capture(Arc::clone(&sink)))),
         );
-        apply_bar_style(&bar);
+        apply_bar_style(&bar, Arc::new(Mutex::new(SpeedMeter::default())));
         bar.set_message("取回整合包");
         bar.set_position(25_207_000);
         bar.tick();
@@ -623,6 +740,88 @@ mod tests {
             "进度条不应再出现 MiB：{rendered}"
         );
         assert!(rendered.contains("/s"), "速度应带 /s 后缀：{rendered}");
+        assert!(
+            rendered.contains("ETA --"),
+            "没有采样时 ETA 应显示 `--` 而不是编造数字：{rendered}"
+        );
+    }
+
+    /// 速度计只反映最近窗口：3 秒内传了多少就报多少
+    ///
+    /// indicatif 内建估计器是 15 秒半衰期的双重平滑，开头几十秒显示的速度
+    /// 与进度增长对不上；这里锁住「滑窗」这个语义。
+    #[test]
+    fn speed_meter_reports_recent_window() {
+        let start = Instant::now();
+        let mut meter = SpeedMeter::default();
+        meter.reset(0, start);
+        // 1 秒传 10 MB
+        for step in 1..=10 {
+            meter.record(step * 1_000_000, start + Duration::from_millis(100 * step));
+        }
+        let rate = meter.per_sec(start + Duration::from_secs(1));
+        assert!(
+            (9.0..11.0).contains(&(rate / 1_000_000.0)),
+            "1 秒传 10 MB 应报约 10 MB/s，实际 {rate} B/s"
+        );
+    }
+
+    /// 窗口外的旧采样必须丢弃：速度跟着当前吞吐走，而不是整个下载的平均值
+    #[test]
+    fn speed_meter_forgets_old_samples() {
+        let start = Instant::now();
+        let mut meter = SpeedMeter::default();
+        meter.reset(0, start);
+        // 每秒 1 MB，连续 10 秒
+        for step in 1..=10 {
+            meter.record(step * 1_000_000, start + Duration::from_secs(step));
+        }
+        assert!(
+            meter.samples.len() <= 5,
+            "只该留下 3 秒窗口内的采样，实际 {}",
+            meter.samples.len()
+        );
+        let rate = meter.per_sec(start + Duration::from_secs(10));
+        assert!(
+            (0.9..=1.1).contains(&(rate / 1_000_000.0)),
+            "稳定 1 MB/s 应报约 1 MB/s，实际 {rate} B/s"
+        );
+        // 停住超过阈值后速度归零，不再显示历史值
+        assert!(
+            meter.per_sec(start + Duration::from_secs(12)) < f64::EPSILON,
+            "停住超过阈值后速度必须归零"
+        );
+    }
+
+    /// 位置回退（分段退款 / 重下）时以新位置重新起算，不得出现负增量
+    #[test]
+    fn speed_meter_handles_rollback() {
+        let start = Instant::now();
+        let mut meter = SpeedMeter::default();
+        meter.reset(0, start);
+        meter.record(5_000_000, start + Duration::from_secs(1));
+        meter.record(2_000_000, start + Duration::from_secs(2));
+        let rate = meter.per_sec(start + Duration::from_secs(2));
+        assert!(rate >= 0.0, "回退后速率不得为负：{rate}");
+        assert_eq!(meter.samples.len(), 1, "回退应丢弃旧基线，只留当前点");
+    }
+
+    /// 已传满时 ETA 为 0，速率未知时不给数字（显示 `--`）
+    #[test]
+    fn speed_meter_eta() {
+        let start = Instant::now();
+        let mut meter = SpeedMeter::default();
+        assert_eq!(meter.eta(0, start), Some(Duration::ZERO));
+        assert_eq!(meter.eta(1000, start), None, "没有采样时不应编造 ETA");
+        meter.reset(0, start);
+        meter.record(10_000_000, start + Duration::from_secs(1));
+        let eta = meter
+            .eta(30_000_000, start + Duration::from_secs(1))
+            .expect("有速率就该给 ETA");
+        assert!(
+            (2..=4).contains(&eta.as_secs()),
+            "剩余 30 MB、10 MB/s 应约 3 秒：{eta:?}"
+        );
     }
 
     /// `finish` 后 bar 进入终态：不再绘制、steady tick 退出。
@@ -732,9 +931,9 @@ mod tests {
         assert_eq!(handle.length(), Some(TOTAL));
         // 但吞吐从零起算：一个字节都还没传，速度必须是 0 而不是 RESUMED/秒
         assert!(
-            handle.per_sec() < 1.0,
+            sink.per_sec() < 1.0,
             "续传的已存在字节被算进了吞吐: {} B/s",
-            handle.per_sec()
+            sink.per_sec()
         );
     }
 
@@ -756,9 +955,9 @@ mod tests {
 
         assert_eq!(handle.position(), RESUMED + STEP);
         assert!(
-            handle.per_sec() > 0.0,
+            sink.per_sec() > 0.0,
             "新传的字节没有被计入吞吐: {} B/s",
-            handle.per_sec()
+            sink.per_sec()
         );
     }
 
