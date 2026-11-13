@@ -50,18 +50,21 @@ pub(crate) fn render_fields(rows: &[(&str, String)]) -> String {
         .join("\n")
 }
 
-/// 人类可读字节数：`1.50 GiB` / `12.0 MiB` / `512 B`
+/// 人类可读字节数：`1.50 GB` / `12.0 MB` / `512 B`
+///
+/// 按国际单位制 10 进制换算（`1 KB = 1000 B`），不是 1024 进制的 KiB/MiB/GiB。
+/// 与硬盘厂商、下载工具的口径一致：`1 MiB` 的字节数在这里显示为 `1.05 MB`。
 #[allow(clippy::cast_precision_loss)]
 pub(crate) fn human_bytes(n: u64) -> String {
-    const KIB: u64 = 1 << 10;
-    const MIB: u64 = 1 << 20;
-    const GIB: u64 = 1 << 30;
-    if n >= GIB {
-        format!("{:.2} GiB", n as f64 / GIB as f64)
-    } else if n >= MIB {
-        format!("{:.2} MiB", n as f64 / MIB as f64)
-    } else if n >= KIB {
-        format!("{:.2} KiB", n as f64 / KIB as f64)
+    const KB: u64 = 1_000;
+    const MB: u64 = 1_000 * 1_000;
+    const GB: u64 = 1_000 * 1_000 * 1_000;
+    if n >= GB {
+        format!("{:.2} GB", n as f64 / GB as f64)
+    } else if n >= MB {
+        format!("{:.2} MB", n as f64 / MB as f64)
+    } else if n >= KB {
+        format!("{:.2} KB", n as f64 / KB as f64)
     } else {
         format!("{n} B")
     }
@@ -105,4 +108,31 @@ pub(crate) fn print_json_line(line: &str) {
 #[allow(clippy::print_stderr)]
 pub(crate) fn print_error_line(text: &str) {
     eprintln!("{text}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::human_bytes;
+
+    /// 按 10 进制换算，不使用 KiB/MiB/GiB 的 1024 进制
+    #[test]
+    fn human_bytes_uses_decimal_units() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(999), "999 B");
+        assert_eq!(human_bytes(1_000), "1.00 KB");
+        assert_eq!(human_bytes(1_500), "1.50 KB");
+        assert_eq!(human_bytes(1_000_000), "1.00 MB");
+        assert_eq!(human_bytes(641_250_000), "641.25 MB");
+        assert_eq!(human_bytes(1_000_000_000), "1.00 GB");
+    }
+
+    /// 旧口径下 `641.25 MiB` 的字节数，按真 SI 应显示为 `672.40 MB`
+    ///
+    /// 641.25 MiB = 641.25 × 1024² = 672,399,360 字节；换算到 10 进制即 672.40 MB。
+    #[test]
+    fn human_bytes_converts_binary_sizes_to_decimal() {
+        assert_eq!(human_bytes(672_399_360), "672.40 MB");
+        assert_eq!(human_bytes(1_048_576), "1.05 MB", "1 MiB = 1.048576 MB");
+        assert_eq!(human_bytes(1_073_741_824), "1.07 GB", "1 GiB = 1.073 GB");
+    }
 }

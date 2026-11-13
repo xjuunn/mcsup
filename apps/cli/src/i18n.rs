@@ -52,12 +52,13 @@ pub(crate) fn modpack_extract_limit(
 ) -> String {
     use mcsup::port::modpack::ExtractLimitKind as K;
 
-    fn mib(bytes: u64) -> String {
+    fn mb(bytes: u64) -> String {
         // 整数运算换算，避免 `u64 as f64` 的精度损失（clippy 默认拒绝）
-        const MIB: u64 = 1024 * 1024;
-        let whole = bytes / MIB;
-        let tenths = (bytes % MIB) * 10 / MIB;
-        format!("{whole}.{tenths} MiB")
+        // 与 `output::human_bytes` 同口径：10 进制（`1 MB = 1000² B`）
+        const MB: u64 = 1_000 * 1_000;
+        let whole = bytes / MB;
+        let tenths = (bytes % MB) * 10 / MB;
+        format!("{whole}.{tenths} MB")
     }
 
     let (scope_zh, scope_en) = match kind {
@@ -79,16 +80,16 @@ pub(crate) fn modpack_extract_limit(
         lang,
         format!(
             "整合包解压失败：{scope_zh}超过 {} 上限（{file} 为 {}，累计已写 {}）。{advice_zh}",
-            mib(limit),
-            mib(file_size),
-            mib(written),
+            mb(limit),
+            mb(file_size),
+            mb(written),
         ),
         format!(
             "modpack extraction failed: {scope_en} exceeds the {} limit \
              ({file} is {}, {} written). {advice_en}",
-            mib(limit),
-            mib(file_size),
-            mib(written),
+            mb(limit),
+            mb(file_size),
+            mb(written),
         ),
     )
 }

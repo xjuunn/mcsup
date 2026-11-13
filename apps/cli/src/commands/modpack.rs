@@ -855,10 +855,16 @@ fn skipped_note(lang: crate::locale::Lang, skipped: usize) -> String {
 ///
 /// 数量只说「跳过了」，用户没法知道跳过的是不是非删不可的。逐行列文件名，
 /// 与 `server mod list` 的「文件」列同口径（去 `mods/` 前缀）。
+/// 列表前先给一行标题：裸列文件名看不出这是被跳过的，容易被当成装好的 mod。
 fn print_skipped_files(printer: Printer, files: &[String]) {
     if !printer.is_human() || files.is_empty() {
         return;
     }
+    crate::output::print_line(&crate::i18n::pick(
+        printer.lang(),
+        "已跳过的仅客户端模组：",
+        "skipped client-only mods:",
+    ));
     for path in files {
         crate::output::print_line(&format!("  - {}", file_name(path)));
     }
