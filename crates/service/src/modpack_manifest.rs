@@ -250,6 +250,63 @@ impl ModpackManifestSnapshot {
             .find(|file| file.modids.iter().any(|id| id == modid))
     }
 
+    /// 按文件名形态找可能提供某个 modid 的文件
+    ///
+    /// [`Self::file_providing`] 只认已回填的 modid，而整合包按
+    /// `server: unsupported` 跳过的文件从未下载过，`modids` 永远是空的。
+    /// 这些文件在清单里却记着项目 ID 与版本 ID（藏在下载地址里），是补依赖
+    /// 最权威的线索。文件名与 modid 的对应关系在整合包里高度稳定：
+    ///
+    /// | 清单路径 | 缺失的 modid |
+    /// | --- | --- |
+    /// | `mods/SimplyTooltips-fabric-0.1.5-1.20.1.jar` | `simplytooltips` |
+    /// | `mods/antique-atlas-3.1.2+1.20.jar` | `antique_atlas` |
+    ///
+    /// 归一化后按非字母数字切段、逐段累加：遇到以数字开头的段（版本号）即
+    /// 停止，累加长度超过目标即放弃。这样 `antique-atlas` 会命中而
+    /// `antiqueatlastweaks` 不会，也不会被 `fabric` / `forge` 之类的加载器
+    /// 后缀带偏。
+    ///
+    /// 只作候选，不是判定：命中的文件仍要经 `expect_modid` 与安装检查，
+    /// 作者把文件命名成别的 mod 时会被 `WrongProvider` 拒下。多条命中说明
+    /// 文件名不足以区分，返回 `None` 交回上游检索，不猜。
+    #[must_use]
+    pub fn file_by_name_hint(&self, modid: &str) -> Option<&SnapshotFile> {
+        let want = normalize_modid(modid);
+        if want.is_empty() {
+            return None;
+        }
+        let mut hit: Option<&SnapshotFile> = None;
+        for file in &self.files {
+            // 已回填 modid 的条目走 [`Self::file_providing`]：那是权威结论，
+            // 不能让文件名形态反过来覆盖它
+            if !file.modids.is_empty() {
+                continue;
+            }
+            if name_hints_modid(&file.path, &want) {
+                if hit.is_some() {
+                    return None;
+                }
+                hit = Some(file);
+            }
+        }
+        hit
+    }
+
+    /// 找整合包为某个 modid 指定的文件：权威索引优先，文件名形态兜底
+    ///
+    /// 补依赖的两条路径（`plan_fix` 与补装队列的依赖展开）必须走同一个
+    /// 入口，否则一处认已回填的 modid、另一处只认文件名，判定就会分叉成
+    /// 「计划里能补、执行时补不上」。
+    ///
+    /// 顺序有意义：已回填的 modid 来自读过 jar 的结论，是权威数据；文件名
+    /// 只是形态线索，不能反过来覆盖它。
+    #[must_use]
+    pub fn provider_for(&self, modid: &str) -> Option<&SnapshotFile> {
+        self.file_providing(modid)
+            .or_else(|| self.file_by_name_hint(modid))
+    }
+
     /// 按路径找条目
     #[must_use]
     pub fn file_at(&self, path: &str) -> Option<&SnapshotFile> {
@@ -286,6 +343,74 @@ impl ModpackManifestSnapshot {
         file.mod_version = mod_version;
         true
     }
+}
+
+/// modid 的归一化形式：只留 ASCII 字母数字，小写
+fn normalize_modid(modid: &str) -> String {
+    modid
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+/// 文件名里紧跟 modid 之后、不改变 mod 身份的修饰段
+///
+/// 加载器与平台标记常被拼进文件名（`SimplyTooltips-fabric-0.1.5.jar`），
+/// 它们出现在 modid 之后不代表文件名还有另一段语义。不在表里的非数字段
+/// 则说明这是另一个 mod 的名字：`sodium-extra` 不是 `sodium`。
+const NAME_SUFFIX_NOISE: [&str; 7] = [
+    "fabric",
+    "forge",
+    "neoforge",
+    "quilt",
+    "mc",
+    "universal",
+    "common",
+];
+
+/// 清单路径的文件名主干是否以「归一化 modid」开头
+///
+/// 按非字母数字切段后逐段累加，遇到以数字开头的段（版本号）即停止：
+/// `antique-atlas-3.1.2+1.20` 累加到 `antiqueatlas` 时命中，而
+/// `antiqueatlastweaks-1.0.0` 的第一段就已经超过目标长度，不会误配。
+/// 后续段只有让累加值变长，因此超长后可以直接放弃。
+///
+/// 命中后还要求紧随的下一段是版本号或加载器修饰，否则文件名里还有另一段
+/// 有意义的词，说明它不是本体的文件名（`sodium-extra.jar` 不能被拿去补
+/// `sodium`）。
+fn name_hints_modid(path: &str, want: &str) -> bool {
+    let Some(name) = path.rsplit('/').next() else {
+        return false;
+    };
+    let stem = name.strip_suffix(".jar").unwrap_or(name);
+    let mut segments = stem
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|segment| !segment.is_empty());
+    let mut acc = String::with_capacity(want.len());
+    while let Some(segment) = segments.next() {
+        if segment.starts_with(|ch: char| ch.is_ascii_digit()) {
+            break;
+        }
+        for ch in segment.chars() {
+            if ch.is_ascii_alphanumeric() {
+                acc.push(ch.to_ascii_lowercase());
+            }
+        }
+        if acc.len() > want.len() {
+            return false;
+        }
+        if acc == want {
+            return match segments.next() {
+                None => true,
+                Some(next) => {
+                    next.starts_with(|ch: char| ch.is_ascii_digit())
+                        || NAME_SUFFIX_NOISE.contains(&next.to_ascii_lowercase().as_str())
+                }
+            };
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -411,6 +536,115 @@ mod tests {
             .expect("按文件名命中");
         assert_eq!(file.path, "mods/satin-2.0.0.jar");
         assert!(snapshot.file_named("absent.jar").is_none());
+    }
+
+    /// 现场：Rising Legends 3.1 把两个 `server: unsupported` 的库跳过了，
+    /// 它们的 `modids` 永远是空的。缺 `simplytooltips` / `antique_atlas` 时
+    /// 必须能从清单里认出作者指定的那个文件，而不是报「上游找不到提供方」。
+    #[test]
+    fn name_hint_finds_skipped_client_side_libraries() {
+        let pack = ModpackIndex::new(
+            1,
+            "minecraft",
+            "3.1",
+            "Rising Legends",
+            ModpackDependencies {
+                raw: BTreeMap::new(),
+            },
+            vec![
+                file(
+                    "mods/SimplyTooltips-fabric-0.1.5-1.20.1.jar",
+                    "https://cdn.modrinth.com/data/6avVoBVB/versions/MAwQRftH/SimplyTooltips-fabric-0.1.5-1.20.1.jar",
+                    EnvSupport::Unsupported,
+                ),
+                file(
+                    "mods/antique-atlas-3.1.2+1.20.jar",
+                    "https://cdn.modrinth.com/data/Y5Ve4Ui4/versions/yIV6zMoy/antique-atlas-3.1.2%2B1.20.jar",
+                    EnvSupport::Unsupported,
+                ),
+                // 真实整合包里同名的另一个 mod：提供 antique_atlas_item，
+                // 不能因为名字前段相同就把它当成 antique_atlas 的候选
+                file(
+                    "mods/antiqueatlastweaks-1.0.0.jar",
+                    "https://cdn.modrinth.com/data/ljpY4NNp/versions/rsNs3JVm/antiqueatlastweaks-1.0.0.jar",
+                    EnvSupport::Required,
+                ),
+            ],
+        )
+        .expect("清单合法");
+        let snapshot = ModpackManifestSnapshot::from_index(
+            "modrinth",
+            "Qx4KOI2G",
+            "i6zyHTyK",
+            "3.1",
+            &pack,
+            1_794_455_524,
+        );
+
+        let tooltips = snapshot
+            .file_by_name_hint("simplytooltips")
+            .expect("SimplyTooltips 命中");
+        assert_eq!(tooltips.project_id.as_deref(), Some("6avVoBVB"));
+        assert_eq!(tooltips.version_id.as_deref(), Some("MAwQRftH"));
+
+        let atlas = snapshot
+            .file_by_name_hint("antique_atlas")
+            .expect("antique-atlas 命中");
+        assert_eq!(atlas.project_id.as_deref(), Some("Y5Ve4Ui4"));
+        assert_eq!(atlas.version_id.as_deref(), Some("yIV6zMoy"));
+    }
+
+    /// 名字相近但不是本体的文件不能被当成提供方：`sodium-extra` 与
+    /// `environmentz` 各自是独立的 mod，不能拿去补 `sodium` / `environment`。
+    ///
+    /// 反过来，`antiqueatlastweaks` 提供的是 `antique_atlas_item`，其文件名
+    /// 形态与这个 modid 对不上（名字里还有 `tweaks` 一段），此时不猜：交给
+    /// 已回填的权威索引或上游检索。
+    #[test]
+    fn name_hint_does_not_match_longer_or_different_names() {
+        let snapshot = snapshot();
+        assert!(snapshot.file_by_name_hint("sodium").is_none());
+        assert_eq!(
+            snapshot
+                .file_by_name_hint("sodiumextra")
+                .map(|file| file.path.as_str()),
+            Some("mods/sodium-extra.jar")
+        );
+        assert!(snapshot.file_by_name_hint("environment").is_none());
+
+        let mut tweaks = snapshot.clone();
+        tweaks.files.push(SnapshotFile::from_manifest(&file(
+            "mods/antiqueatlastweaks-1.0.0.jar",
+            "https://cdn.modrinth.com/data/ljpY4NNp/versions/rsNs3JVm/antiqueatlastweaks-1.0.0.jar",
+            EnvSupport::Required,
+        )));
+        assert!(tweaks.file_by_name_hint("antique_atlas").is_none());
+        assert!(tweaks.file_by_name_hint("antique_atlas_item").is_none());
+    }
+
+    /// 多条命中说明文件名不足以区分，交回检索而不是猜一个
+    #[test]
+    fn name_hint_returns_none_when_ambiguous() {
+        let mut snapshot = snapshot();
+        snapshot.files.push(SnapshotFile::from_manifest(&file(
+            "mods/sodium-extra-1.0.jar",
+            "https://cdn.modrinth.com/data/OTHER/versions/V/sodium-extra-1.0.jar",
+            EnvSupport::Unsupported,
+        )));
+        assert!(snapshot.file_by_name_hint("sodium").is_none());
+    }
+
+    /// 已回填 modid 的条目由权威索引负责，文件名形态不能覆盖它
+    #[test]
+    fn name_hint_skips_entries_with_recorded_modids() {
+        let mut snapshot = snapshot();
+        assert!(snapshot.record_modids(
+            "mods/sodium-extra.jar",
+            vec!["unrelated".to_owned()],
+            None
+        ));
+        assert!(snapshot.file_by_name_hint("sodium").is_none());
+        assert!(snapshot.file_providing("unrelated").is_some());
     }
 
     #[test]

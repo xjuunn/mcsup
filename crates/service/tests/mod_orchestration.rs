@@ -240,6 +240,8 @@ impl ArtifactDownloader for FakeDownloader {
 struct Verdict {
     file: String,
     side: SideSupport,
+    /// 归档内声明的 modid；`None` 时按文件名主干推
+    id: Option<String>,
     /// 声明的必需依赖（modid + 生效侧，缺了就算缺失依赖）
     depends: Vec<(String, domain::mod_::DepSide)>,
 }
@@ -260,6 +262,7 @@ impl FakeInspector {
                     .map(|(name, side)| Verdict {
                         file: (*name).to_owned(),
                         side: *side,
+                        id: None,
                         depends: Vec::new(),
                     })
                     .collect(),
@@ -274,6 +277,18 @@ impl FakeInspector {
             file.to_owned(),
             classes.iter().map(|class| (*class).to_owned()).collect(),
         );
+    }
+
+    /// 指定某个文件在归档内声明的 modid
+    ///
+    /// 真实文件名常与 modid 不同（`SimplyTooltips-fabric-0.1.5-1.20.1.jar`
+    /// 里声明的是 `simplytooltips`），补装时的 `expect_modid` 校验按归档内
+    /// 声明判定，测试装置必须能表达这一点。
+    fn declare_id(&self, file: &str, id: &str) {
+        let mut verdicts = self.verdicts.lock().expect("verdicts");
+        if let Some(verdict) = verdicts.iter_mut().find(|verdict| verdict.file == file) {
+            verdict.id = Some(id.to_owned());
+        }
     }
 
     /// 给某个文件追加一条必需依赖（用于「缺依赖」判定）
@@ -304,7 +319,7 @@ impl ModInspector for FakeInspector {
         };
         let stem = name.trim_end_matches(".jar").to_owned();
         let mut capability = ModCapability::empty(path.display().to_string());
-        capability.id = Some(stem);
+        capability.id = Some(verdict.id.clone().unwrap_or(stem));
         capability.version = Some("1.0.0".to_owned());
         capability.loaders.push(ModLoader::Fabric);
         capability.side = SideVerdict::declared(SideSupport::Required, verdict.side);
@@ -529,6 +544,43 @@ fn install_spec() -> InstallSpec<'static> {
         version: None,
         source: None,
         allow_prerelease: false,
+    }
+}
+
+/// 一份整合包清单快照，文件条目由用例给出
+fn pack_snapshot(files: Vec<service::SnapshotFile>) -> service::ModpackManifestSnapshot {
+    service::ModpackManifestSnapshot {
+        format: service::MANIFEST_FORMAT,
+        source: "modrinth".to_owned(),
+        project_id: "Qx4KOI2G".to_owned(),
+        version_id: "i6zyHTyK".to_owned(),
+        version_number: "3.1".to_owned(),
+        name: "Rising Legends".to_owned(),
+        pack_version: "3.1".to_owned(),
+        minecraft: "1.20.1".to_owned(),
+        loader: None,
+        dependencies: BTreeMap::new(),
+        installed_at: 0,
+        files,
+    }
+}
+
+/// 清单里一个从未下载过的文件：`modids` 为空是现场的关键
+fn pack_file(path: &str, project: &str, version: &str, server: &str) -> service::SnapshotFile {
+    service::SnapshotFile {
+        path: path.to_owned(),
+        downloads: vec![format!(
+            "https://cdn.modrinth.com/data/{project}/versions/{version}/file.jar"
+        )],
+        size: 4,
+        sha1: None,
+        sha512: None,
+        client: Some("required".to_owned()),
+        server: Some(server.to_owned()),
+        project_id: Some(project.to_owned()),
+        version_id: Some(version.to_owned()),
+        modids: Vec::new(),
+        mod_version: None,
     }
 }
 
@@ -1293,6 +1345,221 @@ async fn apply_fix_uses_manifest_snapshot_ids_instead_of_searching() {
         .expect("apply_fix");
     assert_eq!(applied.installed.len(), 1, "{applied:?}");
     assert!(harness.mods_dir().join("satin.jar").is_file());
+}
+
+/// Rising Legends 3.1 的现场：两个被跳过的库 + 依赖它们的两个 mod
+///
+/// `SimplyTooltips` / `antique-atlas` 被标成 `server: unsupported` 跳过，
+/// jar 从未下载，清单里的 `modids` 因此永远为空。上游同样把它们标成仅
+/// 客户端，按名字检索找不到可补的候选。只有清单记得作者指定的项目与版本 ID。
+async fn rising_legends_harness() -> Harness {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[
+            ("simplyswords.jar", SideSupport::Required),
+            (
+                "SimplyTooltips-fabric-0.1.5-1.20.1.jar",
+                SideSupport::Required,
+            ),
+            ("antiqueatlastweaks.jar", SideSupport::Required),
+            ("antique-atlas-3.1.2+1.20.jar", SideSupport::Required),
+        ],
+        b"jar-bytes",
+    );
+    harness
+        .inspector
+        .declare_id("SimplyTooltips-fabric-0.1.5-1.20.1.jar", "simplytooltips");
+    harness
+        .inspector
+        .declare_id("antique-atlas-3.1.2+1.20.jar", "antique_atlas");
+    harness
+        .inspector
+        .declare_dep("simplyswords.jar", "simplytooltips");
+    harness
+        .inspector
+        .declare_dep("antiqueatlastweaks.jar", "antique_atlas");
+    harness.write("mods/simplyswords.jar", b"swords");
+    harness.write("mods/antiqueatlastweaks.jar", b"tweaks");
+
+    // 上游按名字检索不到本体：两个项目都被标成仅客户端。只有清单能回答
+    harness
+        .source
+        .configure(|config| config.search_pool = Vec::new());
+    harness.add_resolved_for(
+        "6avVoBVB",
+        &[("MAwQRftH", "SimplyTooltips-fabric-0.1.5-1.20.1.jar")],
+    );
+    harness.add_resolved_for("Y5Ve4Ui4", &[("yIV6zMoy", "antique-atlas-3.1.2+1.20.jar")]);
+
+    pack_snapshot(vec![
+        pack_file(
+            "mods/SimplyTooltips-fabric-0.1.5-1.20.1.jar",
+            "6avVoBVB",
+            "MAwQRftH",
+            "unsupported",
+        ),
+        pack_file(
+            "mods/antique-atlas-3.1.2+1.20.jar",
+            "Y5Ve4Ui4",
+            "yIV6zMoy",
+            "unsupported",
+        ),
+    ])
+    .save(&harness.server_dir())
+    .await
+    .expect("写快照");
+    harness
+}
+
+/// 从未回填过 modid 的清单条目要按文件名认出来，并按它的项目与版本 ID 直装
+#[tokio::test]
+async fn plan_fix_uses_manifest_file_name_when_modid_was_never_recorded() {
+    let harness = rising_legends_harness().await;
+    let plan = harness
+        .mods
+        .plan_fix("alpha", ContentKind::Mod)
+        .await
+        .expect("plan_fix");
+
+    assert!(plan.unresolved.is_empty(), "{plan:?}");
+    assert_eq!(plan.installs.len(), 2, "{plan:?}");
+    let mut planned: Vec<(&str, &str, Option<&str>)> = plan
+        .installs
+        .iter()
+        .map(|item| {
+            (
+                item.missing.as_str(),
+                item.project_id.as_str(),
+                item.version_id.as_deref(),
+            )
+        })
+        .collect();
+    planned.sort();
+    assert_eq!(
+        planned,
+        vec![
+            ("antique_atlas", "Y5Ve4Ui4", Some("yIV6zMoy")),
+            ("simplytooltips", "6avVoBVB", Some("MAwQRftH")),
+        ],
+        "必须按清单里的项目与版本 ID 直装"
+    );
+}
+
+/// 同上现场的执行侧：两个库都要真的落进 `mods/`
+#[tokio::test]
+async fn apply_fix_installs_libraries_resolved_from_the_pack_manifest() {
+    let harness = rising_legends_harness().await;
+    let plan = harness
+        .mods
+        .plan_fix("alpha", ContentKind::Mod)
+        .await
+        .expect("plan_fix");
+    let applied = harness
+        .mods
+        .apply_fix(
+            "alpha",
+            &plan,
+            ApplyOptions {
+                allow_blocking: false,
+                progress: None,
+                cancel: &CancellationToken::new(),
+            },
+        )
+        .await
+        .expect("apply_fix");
+
+    assert_eq!(applied.installed.len(), 2, "{applied:?}");
+    assert!(applied.refused.is_empty(), "{applied:?}");
+    assert!(
+        harness
+            .mods_dir()
+            .join("SimplyTooltips-fabric-0.1.5-1.20.1.jar")
+            .is_file()
+    );
+    assert!(
+        harness
+            .mods_dir()
+            .join("antique-atlas-3.1.2+1.20.jar")
+            .is_file()
+    );
+}
+
+/// 来自整合包清单的候选被安装检查拒绝时，措辞必须与检索命中区分开
+///
+/// 这类候选带的是作者验证过的精确版本，不是按名字搜来的。只说「判定为
+/// blocking」会让用户去上游找一个其实就在清单里的提供方；正确处置是移除
+/// 依赖它的模组，或手动放置后自行确认。
+#[tokio::test]
+async fn apply_fix_marks_refused_candidate_as_pack_specified() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[
+            ("simplyswords.jar", SideSupport::Required),
+            // 服务端不可装载：与客户端 mod 上服务端同型
+            (
+                "SimplyTooltips-fabric-0.1.5-1.20.1.jar",
+                SideSupport::Unsupported,
+            ),
+        ],
+        b"jar-bytes",
+    );
+    harness
+        .inspector
+        .declare_id("SimplyTooltips-fabric-0.1.5-1.20.1.jar", "simplytooltips");
+    harness
+        .inspector
+        .declare_dep("simplyswords.jar", "simplytooltips");
+    harness.write("mods/simplyswords.jar", b"swords");
+    harness
+        .source
+        .configure(|config| config.search_pool = Vec::new());
+    harness.add_resolved_for(
+        "6avVoBVB",
+        &[("MAwQRftH", "SimplyTooltips-fabric-0.1.5-1.20.1.jar")],
+    );
+    pack_snapshot(vec![pack_file(
+        "mods/SimplyTooltips-fabric-0.1.5-1.20.1.jar",
+        "6avVoBVB",
+        "MAwQRftH",
+        "unsupported",
+    )])
+    .save(&harness.server_dir())
+    .await
+    .expect("写快照");
+
+    let plan = harness
+        .mods
+        .plan_fix("alpha", ContentKind::Mod)
+        .await
+        .expect("plan_fix");
+    let applied = harness
+        .mods
+        .apply_fix(
+            "alpha",
+            &plan,
+            ApplyOptions {
+                allow_blocking: false,
+                progress: None,
+                cancel: &CancellationToken::new(),
+            },
+        )
+        .await
+        .expect("apply_fix");
+
+    assert!(applied.installed.is_empty(), "{applied:?}");
+    let refused = applied.refused.first().expect("refused entry");
+    assert!(
+        refused.reason.contains("整合包清单指定"),
+        "拒绝原因要说明候选来自清单：{}",
+        refused.reason
+    );
+    assert!(
+        !harness
+            .mods_dir()
+            .join("SimplyTooltips-fabric-0.1.5-1.20.1.jar")
+            .exists(),
+        "被拒的文件不能落盘"
+    );
 }
 
 /// 依赖是链不是一层：补装的 mod 自己还缺依赖时继续往下解析
