@@ -106,6 +106,91 @@ pub fn installer_maven_base(variant: &ServerVariant) -> Option<&'static str> {
     }
 }
 
+/// 旧版安装器（`Forge` 1.16 及更早）产出的可执行入口 JAR（相对服务器目录）
+///
+/// 这些版本不写 `user_jvm_args.txt` / 平台参数文件，启动方式是
+/// `java -jar <jar> nogui`；入口 JAR 通常落在服务器目录根部，个别构建同时
+/// 铺到 Maven 坐标下。按「先根部、后坐标」返回第一个确实存在的。
+#[must_use]
+pub fn installer_entry_jar<P: DirProbe + ?Sized>(
+    probe: &P,
+    variant: &ServerVariant,
+    build: &str,
+    dir: &Path,
+) -> Option<PathBuf> {
+    let artifact = installer_artifact_name(variant)?;
+    let root = format!("{artifact}-{build}.jar");
+    if probe.is_file(&dir.join(&root)) {
+        return Some(PathBuf::from(root));
+    }
+    let base = installer_maven_base(variant)?;
+    let maven = format!("{base}/{build}/{artifact}-{build}.jar");
+    probe
+        .is_file(&dir.join(&maven))
+        .then(|| PathBuf::from(maven))
+}
+
+/// 在安装目录里扫描旧版安装器入口 JAR（不需要预先知道 build）
+///
+/// 供只知道「这是安装器产物目录」的调用方（安装器完成判定）使用。
+/// 先看服务器目录根部，再看两个已知的 Maven 坐标目录。
+#[must_use]
+pub fn find_installer_entry_jar<P: DirProbe + ?Sized>(probe: &P, dir: &Path) -> Option<PathBuf> {
+    if let Some(entries) = probe.list(dir) {
+        for entry in entries {
+            if entry.is_dir {
+                continue;
+            }
+            let Some(name) = entry.path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if is_legacy_entry_name(name)
+                && let Ok(relative) = entry.path.strip_prefix(dir)
+            {
+                return Some(relative.to_path_buf());
+            }
+        }
+    }
+    for (base, artifact) in [
+        ("libraries/net/minecraftforge/forge", "forge"),
+        ("libraries/net/neoforged/neoforge", "neoforge"),
+    ] {
+        let Some(entries) = probe.list(&dir.join(base)) else {
+            continue;
+        };
+        for entry in entries.into_iter().filter(|entry| entry.is_dir) {
+            let Some(build) = entry.path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let jar = entry.path.join(format!("{artifact}-{build}.jar"));
+            if probe.is_file(&jar)
+                && let Ok(relative) = jar.strip_prefix(dir)
+            {
+                return Some(relative.to_path_buf());
+            }
+        }
+    }
+    None
+}
+
+/// 旧版入口 JAR 的文件名：`forge-<build>.jar` / `neoforge-<build>.jar`
+fn is_legacy_entry_name(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("jar"))
+        && (name.starts_with("forge-") || name.starts_with("neoforge-"))
+        && !name.starts_with('.')
+}
+
+/// 安装器产物的 artifact 前缀：`forge-{build}.jar` / `neoforge-{build}.jar`
+fn installer_artifact_name(variant: &ServerVariant) -> Option<&'static str> {
+    match variant {
+        ServerVariant::Forge => Some("forge"),
+        ServerVariant::NeoForge => Some("neoforge"),
+        _ => None,
+    }
+}
+
 /// 在 `root` 下递归找本 build 的平台参数文件，返回相对服务器目录的路径
 ///
 /// 命中条件是「文件名匹配 **且** 所在目录名等于 `build`」——宁可找不到（由上层
@@ -449,5 +534,62 @@ mod tests {
         assert!(installer_maven_base(&ServerVariant::Vanilla).is_none());
         assert!(installer_maven_base(&ServerVariant::Forge).is_some());
         assert!(installer_maven_base(&ServerVariant::NeoForge).is_some());
+    }
+
+    /// 旧版 Forge：入口 JAR 在服务器目录根部，按已知 build 直接命中
+    #[test]
+    fn legacy_entry_jar_prefers_server_dir_root() {
+        let dir = Path::new("/srv/mc");
+        let build = "1.12.2-14.23.5.2859";
+        let probe = FakeProbe::default().file(dir.join(format!("forge-{build}.jar")));
+
+        assert_eq!(
+            installer_entry_jar(&probe, &ServerVariant::Forge, build, dir),
+            Some(PathBuf::from(format!("forge-{build}.jar")))
+        );
+    }
+
+    /// 旧版 Forge：根部没有时回落到 Maven 坐标下的同名 JAR
+    #[test]
+    fn legacy_entry_jar_falls_back_to_maven_coordinate() {
+        let dir = Path::new("/srv/mc");
+        let build = "1.12.2-14.23.5.2859";
+        let maven = format!("libraries/net/minecraftforge/forge/{build}/forge-{build}.jar");
+        let probe = FakeProbe::default().file(dir.join(&maven));
+
+        assert_eq!(
+            installer_entry_jar(&probe, &ServerVariant::Forge, build, dir),
+            Some(PathBuf::from(maven))
+        );
+    }
+
+    /// 完成判定用扫描：不认识 build 也能在根部与 Maven 坐标里找到入口
+    #[test]
+    fn find_legacy_entry_jar_scan_finds_root_and_maven_layouts() {
+        let dir = Path::new("/srv/mc");
+        let root = dir.join("forge-1.12.2-14.23.5.2859.jar");
+        let probe = FakeProbe::default()
+            .dir(dir.to_path_buf())
+            .file(root.clone());
+        assert_eq!(
+            find_installer_entry_jar(&probe, dir),
+            Some(PathBuf::from("forge-1.12.2-14.23.5.2859.jar"))
+        );
+
+        let build_dir = dir.join("libraries/net/minecraftforge/forge/1.12.2-14.23.5.2859");
+        let jar = build_dir.join("forge-1.12.2-14.23.5.2859.jar");
+        let probe = FakeProbe::default()
+            .file(dir.join(USER_ARGS))
+            .dir(dir.join("libraries"))
+            .dir(dir.join("libraries/net/minecraftforge"))
+            .dir(dir.join("libraries/net/minecraftforge/forge"))
+            .dir(build_dir)
+            .file(jar);
+        assert_eq!(
+            find_installer_entry_jar(&probe, dir),
+            Some(PathBuf::from(
+                "libraries/net/minecraftforge/forge/1.12.2-14.23.5.2859/forge-1.12.2-14.23.5.2859.jar"
+            ))
+        );
     }
 }

@@ -21,6 +21,30 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+/// 安装器完成判定用的真实磁盘探测（`domain::server::launch::DirProbe`）
+#[derive(Debug, Default, Clone, Copy)]
+struct FsProbe;
+
+impl domain::server::launch::DirProbe for FsProbe {
+    fn is_file(&self, path: &Path) -> bool {
+        path.is_file()
+    }
+
+    fn list(&self, dir: &Path) -> Option<Vec<domain::server::launch::DirEntry>> {
+        let entries = std::fs::read_dir(dir).ok()?;
+        Some(
+            entries
+                .flatten()
+                .map(|entry| {
+                    let path = entry.path();
+                    let is_dir = path.is_dir();
+                    domain::server::launch::DirEntry { path, is_dir }
+                })
+                .collect(),
+        )
+    }
+}
+
 /// 失败时保留的输出尾部行数
 const TAIL_LINES: usize = 20;
 
@@ -418,7 +442,9 @@ fn has_expected_marker_for(dir: &Path, kind: port::InstallKind) -> bool {
         return entry.is_file() && has_non_empty_subdir(&dir.join("libraries"));
     }
     if !EXPECTED_MARKERS.iter().any(|name| dir.join(name).is_file()) {
-        return false;
+        // 旧版 Forge（1.16 及更早）不写参数文件：入口是服务器目录根部或
+        // Maven 坐标下的 `forge-{build}.jar`，有它才算装完
+        return domain::server::launch::find_installer_entry_jar(&FsProbe, dir).is_some();
     }
     // 参数文件存在但入口 JAR 缺失 = 安装中途失败；扫一遍 libraries 里的参数文件
     // （安装器在下载依赖前就写了它们），全部通过才算成功
@@ -530,6 +556,25 @@ mod tests {
             port::InstallKind::Installer
         ));
         std::fs::write(dir.path().join("user_jvm_args.txt"), b"# args").expect("write");
+        assert!(has_expected_marker_for(
+            dir.path(),
+            port::InstallKind::Installer
+        ));
+    }
+
+    /// 旧版 Forge 不写参数文件：根部有 `forge-{build}.jar` 即算装好
+    #[test]
+    fn legacy_forge_entry_jar_counts_as_installed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(!has_expected_marker_for(
+            dir.path(),
+            port::InstallKind::Installer
+        ));
+        std::fs::write(
+            dir.path().join("forge-1.12.2-14.23.5.2859.jar"),
+            b"universal",
+        )
+        .expect("write");
         assert!(has_expected_marker_for(
             dir.path(),
             port::InstallKind::Installer

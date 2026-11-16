@@ -1002,8 +1002,15 @@ impl ServerRegistry {
 
         let files = loader_args_files(&variant, build, dir);
         if files.is_empty() {
+            // 旧版 Forge（1.16 及更早）没有参数文件：安装器产出 `forge-{build}.jar`，
+            // 启动方式是 `java -jar <jar> nogui`
+            if let Some(installed) =
+                self.install_legacy_entry(name, version, &variant, build, dir, &out)?
+            {
+                return Ok(Some(installed));
+            }
             return Err(InstallError::Layout(format!(
-                "安装器完成后在 {} 找不到启动参数文件",
+                "安装器完成后在 {} 找不到启动参数文件或入口 JAR",
                 dir.display()
             ))
             .into());
@@ -1026,6 +1033,47 @@ impl ServerRegistry {
         )?;
         Ok(Some(InstalledServerJar {
             destination: dir.join(&files[0]),
+            server: srv,
+            jar,
+            launch,
+        }))
+    }
+
+    /// 旧版安装器产物登记：入口 JAR 可能在服务器目录根部，也可能在 Maven
+    /// 坐标下；找到就记成 `java -jar <jar> nogui`，找不到返回 `None` 由调用方报错
+    fn install_legacy_entry(
+        &self,
+        name: &str,
+        version: &VersionId,
+        variant: &ServerVariant,
+        build: &str,
+        dir: &Path,
+        out: &InstalledDownload,
+    ) -> Result<Option<InstalledServerJar>, InstallJarError> {
+        let Some(entry) = domain::server::launch::installer_entry_jar(
+            &crate::fs_probe::FsDirProbe,
+            variant,
+            build,
+            dir,
+        ) else {
+            return Ok(None);
+        };
+        let launch = LaunchSpec::jar(entry.clone());
+        let jar = InstalledJar {
+            path: entry.clone(),
+            size: crate::fs::metadata(dir.join(&entry)).map_or(0, |m| m.len()),
+            checksum: out.checksum.clone(),
+        };
+        let srv = self.update_core(
+            name,
+            version,
+            &jar,
+            Some(&launch),
+            out.java_major,
+            crate::atomic::unix_now(),
+        )?;
+        Ok(Some(InstalledServerJar {
+            destination: dir.join(&entry),
             server: srv,
             jar,
             launch,
