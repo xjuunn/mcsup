@@ -1104,6 +1104,8 @@ impl ModCapability {
     ///
     /// - **加载器**：文件声明的加载器里有目标加载器即满足。`Quilt` 运行时
     ///   保留 Fabric 兼容层，因此 `Quilt` 目标接受 Fabric mod；反向不成立。
+    ///   1.12.2 及更早的 Forge 读 `mcmod.info`（`LegacyForge`），与 1.13+ 的
+    ///   `mods.toml` 是同一加载器的两代元数据，故按目标 MC 版本放行。
     ///   其余跨加载器兼容（`NeoForge` 1.20.1 的 Forge 血统等）版本相关，
     ///   不能一概而论，宁可不判。
     /// - **MC 版本**：文件声明的区间是否含目标版本。**没声明区间算满足**：
@@ -1116,40 +1118,8 @@ impl ModCapability {
     pub fn fit_for(&self, target: &ServerTarget) -> ServerFit {
         let mut issues = Vec::new();
 
-        let loader = match target.loader {
-            None => Fit::Unknown,
-            Some(want) => {
-                if self.loaders.is_empty() {
-                    issues.push(FitIssue::new(
-                        FitDimension::Loader,
-                        format!("jar 内没有可识别的加载器元数据，判不出是否支持 {want}"),
-                    ));
-                    Fit::Unknown
-                } else if self
-                    .loaders
-                    .iter()
-                    .any(|have| loads(want, *have, &target.bridged_loaders))
-                {
-                    Fit::Match
-                } else {
-                    let have: Vec<&str> = self.loaders.iter().map(|l| l.as_str()).collect();
-                    let mut detail = format!("只支持 {}，服务端是 {want}", have.join(" / "));
-                    // Fabric 专用 mod 装在 Forge / NeoForge 上只能靠 Sinytra
-                    // Connector 桥。没检测到桥时点明出路，否则用户看到的只是
-                    // 一句「加载器不匹配」，不知道还能补个桥把 mod 跑起来。
-                    if self.loaders.iter().all(|l| *l == ModLoader::Fabric)
-                        && matches!(want, ModLoader::Forge | ModLoader::NeoForge)
-                        && !target.bridged_loaders.contains(&ModLoader::Fabric)
-                    {
-                        detail.push_str(
-                            "（Forge / NeoForge 装载 Fabric mod 需 Sinytra Connector 桥）",
-                        );
-                    }
-                    issues.push(FitIssue::new(FitDimension::Loader, detail));
-                    Fit::Mismatch
-                }
-            }
-        };
+        let (loader, loader_issues) = self.fit_loader(target);
+        issues.extend(loader_issues);
 
         let mc_version = match &target.mc_version {
             None => Fit::Unknown,
@@ -1212,14 +1182,105 @@ impl ModCapability {
             issues,
         }
     }
+
+    /// 加载器维度：目标服务端能否载入本文件声明的加载器之一
+    ///
+    /// 「能装」「缺 MC 版本待确认」「确实不匹配」三种结论必须分开：第二种若
+    /// 按不匹配处置，`mod inspect --loader forge` 不配 `--mc` 就查不了其余
+    /// 维度；第三种要附可行动的说明。独立成方法也让 [`Self::fit_for`] 的
+    /// 三个维度各自成段，而不是在一个 match 里叠三层分支。
+    fn fit_loader(&self, target: &ServerTarget) -> (Fit, Vec<FitIssue>) {
+        let Some(want) = target.loader else {
+            return (Fit::Unknown, Vec::new());
+        };
+        let mc = target.mc_version.as_deref();
+        if self.loaders.is_empty() {
+            return (
+                Fit::Unknown,
+                vec![FitIssue::new(
+                    FitDimension::Loader,
+                    format!("jar 内没有可识别的加载器元数据，判不出是否支持 {want}"),
+                )],
+            );
+        }
+        if self
+            .loaders
+            .iter()
+            .any(|have| loads(want, *have, &target.bridged_loaders, mc))
+        {
+            return (Fit::Match, Vec::new());
+        }
+        // 只支持 mcmod.info，而目标 MC 未知：判不出 1.12.2 的门槛是否满足。
+        // 报「待确认」而不是拒绝——按拒绝处置会把 `--loader forge` 不配
+        // `--mc` 的查询锁死。
+        if self
+            .loaders
+            .iter()
+            .any(|have| legacy_forge_needs_mc(want, *have, mc))
+        {
+            return (
+                Fit::Unknown,
+                vec![FitIssue::new(
+                    FitDimension::Loader,
+                    "只支持 legacy-forge（mcmod.info），未给出服务端 MC 版本，判不出是否适用"
+                        .to_owned(),
+                )],
+            );
+        }
+        (
+            Fit::Mismatch,
+            vec![FitIssue::new(
+                FitDimension::Loader,
+                self.unsupported_loader_detail(want, target),
+            )],
+        )
+    }
+
+    /// 加载器不匹配时的说明：先报双方是谁，再按可行动的出路补一句
+    fn unsupported_loader_detail(&self, want: ModLoader, target: &ServerTarget) -> String {
+        let have: Vec<&str> = self.loaders.iter().map(|l| l.as_str()).collect();
+        let mut detail = format!("只支持 {}，服务端是 {want}", have.join(" / "));
+        // mcmod.info 是 1.12.2 及更早的元数据格式，1.13+ 的 Forge 只读
+        // mods.toml。只报「只支持 legacy-forge」用户不知道是版本太旧还是
+        // 加载器装错，补一句门槛。
+        if self.loaders.iter().all(|l| *l == ModLoader::LegacyForge) && want == ModLoader::Forge {
+            detail.push_str("（mcmod.info 只在 MC 1.12.2 及更早的 Forge 上生效）");
+        }
+        // Fabric 专用 mod 装在 Forge / NeoForge 上只能靠 Sinytra Connector
+        // 桥。没检测到桥时点明出路，否则用户看到的只是一句「加载器不匹配」，
+        // 不知道还能补个桥把 mod 跑起来。
+        if self.loaders.iter().all(|l| *l == ModLoader::Fabric)
+            && matches!(want, ModLoader::Forge | ModLoader::NeoForge)
+            && !target.bridged_loaders.contains(&ModLoader::Fabric)
+        {
+            detail.push_str("（Forge / NeoForge 装载 Fabric mod 需 Sinytra Connector 桥）");
+        }
+        detail
+    }
 }
+
+/// `mcmod.info` 覆盖的最后一个 MC 版本
+///
+/// Forge 1.13 起改用 `META-INF/mods.toml`，1.12.2 及更早才读 `mcmod.info`。
+/// 同一加载器的两代元数据格式只在后者覆盖的版本上互通，因此这条放行必须
+/// 带上目标 MC 版本——不能写成「Forge 永远接受 `LegacyForge`」。
+const LEGACY_FORGE_LAST_MC: &str = "1.12.2";
 
 /// `target` 加载器能否载入 `have` 声明的 mod
 ///
 /// `bridged` 是目标服务端通过桥（Sinytra Connector）额外支持的加载器：装了
 /// 桥的 Forge 服务端能装 Fabric mod，反过来同理。桥只开通一条方向明确的
 /// 通道，不改变其它加载器之间的兼容关系。
-fn loads(target: ModLoader, have: ModLoader, bridged: &[ModLoader]) -> bool {
+///
+/// `mc_version` 只参与 `LegacyForge` 的判定：`mcmod.info` 与 `mods.toml` 是
+/// Forge 的两代元数据，前者只在 1.12.2 及更早被读取；目标 MC 未知时返回
+/// `false`，由调用方按「判不出」处置。
+fn loads(
+    target: ModLoader,
+    have: ModLoader,
+    bridged: &[ModLoader],
+    mc_version: Option<&str>,
+) -> bool {
     if target == have {
         return true;
     }
@@ -1229,7 +1290,26 @@ fn loads(target: ModLoader, have: ModLoader, bridged: &[ModLoader]) -> bool {
     if matches!((target, have), (ModLoader::Quilt, ModLoader::Fabric)) {
         return true;
     }
+    if matches!((target, have), (ModLoader::Forge, ModLoader::LegacyForge)) {
+        return mc_version.is_some_and(legacy_forge_mc);
+    }
     bridged.contains(&have)
+}
+
+/// 目标 MC 是否落在 `mcmod.info` 生效的版本段（≤ 1.12.2）
+///
+/// 空串是「没问」，不是版本号，不能按 `0` 判成更早的版本。
+fn legacy_forge_mc(mc: &str) -> bool {
+    !mc.is_empty() && compare_mc_version(mc, LEGACY_FORGE_LAST_MC) != std::cmp::Ordering::Greater
+}
+
+/// 只差目标 MC 版本就能判定是否放行 `mcmod.info` 的 mod
+///
+/// 与 [`loads`] 互补：`loads` 判「能装」，这里判「判不出」。分开是因为
+/// 调用方要把后者呈现成 `Fit::Unknown`（待确认），而不是不匹配。
+fn legacy_forge_needs_mc(target: ModLoader, have: ModLoader, mc_version: Option<&str>) -> bool {
+    matches!((target, have), (ModLoader::Forge, ModLoader::LegacyForge))
+        && mc_version.is_none_or(str::is_empty)
 }
 
 #[cfg(test)]
@@ -1764,6 +1844,65 @@ mod tests {
             "{:?}",
             fit.issues
         );
+    }
+
+    /// 1.12.2 的 Forge 读 `mcmod.info`：同一加载器的旧元数据必须放行
+    ///
+    /// 回归：`loads()` 只认 `Forge == Forge`，把 1.12.2 整合包里所有用
+    /// `mcmod.info` 的 mod 判成「只支持 legacy-forge」，启动预检全拦。
+    #[test]
+    fn legacy_forge_mod_is_installable_on_forge_1_12_2() {
+        let fit = cap(&[ModLoader::LegacyForge], "1.12.2", None).fit_for(&target(
+            ModLoader::Forge,
+            "1.12.2",
+            None,
+        ));
+        assert_eq!(fit.loader, Fit::Match);
+        assert_eq!(fit.verdict, FitVerdict::Installable);
+    }
+
+    /// 放行的门槛是 MC 版本：1.13+ 的 Forge 只读 `mods.toml`
+    #[test]
+    fn legacy_forge_mod_is_rejected_on_forge_1_13_and_names_mcmod() {
+        let fit = cap(&[ModLoader::LegacyForge], "1.12.2", None).fit_for(&target(
+            ModLoader::Forge,
+            "1.13",
+            None,
+        ));
+        assert_eq!(fit.loader, Fit::Mismatch);
+        assert_eq!(fit.verdict, FitVerdict::Rejected);
+        assert!(
+            fit.issues
+                .iter()
+                .any(|i| i.dimension == FitDimension::Loader && i.detail.contains("mcmod.info")),
+            "{:?}",
+            fit.issues
+        );
+    }
+
+    /// 目标 MC 未知时不下结论：`--loader forge` 不配 `--mc` 仍能查其余维度
+    #[test]
+    fn legacy_forge_mod_on_forge_without_mc_is_unclear() {
+        let fit = cap(&[ModLoader::LegacyForge], "1.12.2", None).fit_for(&ServerTarget {
+            loader: Some(ModLoader::Forge),
+            mc_version: None,
+            java_major: None,
+            bridged_loaders: Vec::new(),
+        });
+        assert_eq!(fit.loader, Fit::Unknown);
+        assert_eq!(fit.verdict, FitVerdict::Unclear);
+    }
+
+    /// `mcmod.info` 不影响 NeoForge：它是 1.20.2 起独立的分支
+    #[test]
+    fn legacy_forge_mod_is_rejected_on_neoforge() {
+        let fit = cap(&[ModLoader::LegacyForge], "1.12.2", None).fit_for(&target(
+            ModLoader::NeoForge,
+            "1.21.1",
+            None,
+        ));
+        assert_eq!(fit.loader, Fit::Mismatch);
+        assert_eq!(fit.verdict, FitVerdict::Rejected);
     }
 
     /// 桥接 jar 自己没有加载器元数据、字节码又疑似客户端，仍视为服务端基础设施
