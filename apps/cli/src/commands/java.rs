@@ -1,13 +1,14 @@
 use crate::diagnostic::AppDiagnostic;
 use crate::output::Printer;
 use crate::progress::{InstallSession, ScanProgress, TaskSpinner};
+use crate::prompts;
 use anyhow::{Context, Result, anyhow};
 use comfy_table::{ContentArrangement, Table};
 use inquire::Select;
 use mcsup::domain::java::{JavaMajor, JavaPackageType, JavaRuntime, JavaVendor};
 use mcsup::port::{JavaRuntimeRepository as _, TaskStage};
 use mcsup::protocol::cli::{JavaInstallJson, JavaRow, JavaScanJson, JavaUninstallJson};
-use mcsup::service::UninstallOutcome;
+use mcsup::service::{LifecycleError, UninstallOutcome};
 use std::path::{Path, PathBuf};
 use tracing::info;
 
@@ -187,6 +188,67 @@ pub(crate) fn scan_remote(origin: &mcsup::port::Origin, printer: Printer) -> Res
             skipped: 0,
         },
     )
+}
+
+/// 缺失的 Java 运行时（交互修复的判定结果）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MissingJava {
+    /// 一个运行时都没有，说不出缺哪个大版本
+    Any,
+    /// 点名的大版本缺失
+    Major(JavaMajor),
+}
+
+/// 从生命周期错误里取出缺失的 Java，其余错误返回 `None`
+#[must_use]
+pub(crate) fn missing_java_major(err: &LifecycleError) -> Option<MissingJava> {
+    match err {
+        LifecycleError::NoJava => Some(MissingJava::Any),
+        LifecycleError::UnknownJavaMajor { major, .. } => Some(MissingJava::Major(*major)),
+        _ => None,
+    }
+}
+
+/// 缺 Java 时交互确认并安装，装完由调用方重试
+///
+/// 装到「跑服务器的那台」：远端服务器装到对端，本地服务器装本机。
+/// 返回 `Ok(false)` 表示用户拒绝安装，调用方应中止并保留原错误。
+pub(crate) async fn offer_install_missing(
+    name: &str,
+    missing: MissingJava,
+    printer: Printer,
+) -> Result<bool> {
+    let remote = super::origin::remote_target(name, printer.lang())?;
+    let host = remote
+        .as_ref()
+        .map_or_else(|| "本机".to_owned(), |t| t.member.name.to_string());
+    let prompt_text = match missing {
+        MissingJava::Major(major) => format!("{host} 缺少 Java {major}，是否现在安装？"),
+        MissingJava::Any => format!("{host} 未发现任何 Java 运行时，是否现在安装？"),
+    };
+    if !prompts::confirm_or_yes(printer, &prompt_text, true)? {
+        return Ok(false);
+    }
+    // 一个运行时都没有时无从点名，装当前 LTS 21 作为起步
+    let major = match missing {
+        MissingJava::Major(major) => major.to_string(),
+        MissingJava::Any => "21".to_string(),
+    };
+    match &remote {
+        Some(target) => {
+            install_on(
+                &mcsup::port::Origin::Remote(target.member.name.clone()),
+                Some(&major),
+                false,
+                None,
+                printer,
+            )?;
+        }
+        None => {
+            install_with_outcome(Some(&major), false, None, printer).await?;
+        }
+    }
+    Ok(true)
 }
 
 /// 安装 Java 并返回结果（供 server start 调用）
@@ -757,7 +819,30 @@ fn pick_selected<'a, T>(items: &'a [T], labels: &[String], selected: &str) -> Op
 
 #[cfg(test)]
 mod tests {
-    use super::pick_selected;
+    use super::{MissingJava, missing_java_major, pick_selected};
+
+    /// 缺 Java 的两种错误被识别为「可交互修复」，其余错误不触发安装提示
+    #[test]
+    fn missing_java_major_maps_only_java_absence_errors() {
+        let major = mcsup::domain::java::JavaMajor::parse(8).expect("8");
+        assert_eq!(
+            missing_java_major(&mcsup::service::LifecycleError::NoJava),
+            Some(MissingJava::Any)
+        );
+        assert_eq!(
+            missing_java_major(&mcsup::service::LifecycleError::UnknownJavaMajor {
+                name: "test".to_owned(),
+                major,
+            }),
+            Some(MissingJava::Major(major))
+        );
+        assert_eq!(
+            missing_java_major(&mcsup::service::LifecycleError::NoJar {
+                name: "test".to_owned(),
+            }),
+            None
+        );
+    }
 
     /// 同大版本的两条运行时必须按完整标签映射，不能都落到第一条
     #[test]

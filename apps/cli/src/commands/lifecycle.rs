@@ -105,49 +105,17 @@ async fn run_start(
                 // 引导用户从已发布大版本中选一个装；
                 // UnknownJavaMajor：服务器绑定 / 版本要求的 Java 大版本缺失 →
                 // 明确点名该版本（class file 69.0 这类报错的根因是选低了）
-                let missing = err.downcast_ref::<LifecycleError>().and_then(|e| match e {
-                    LifecycleError::NoJava => Some(None),
-                    LifecycleError::UnknownJavaMajor { major, .. } => Some(Some(*major)),
-                    _ => None,
-                });
+                let missing = err
+                    .downcast_ref::<LifecycleError>()
+                    .and_then(super::java::missing_java_major);
 
                 if let Some(missing_major) = missing {
                     if !printer.is_interactive() {
                         return Err(err);
                     }
                     // 目标可能在远端：缺 Java 时要装到「跑服务器的那台」，装在本机没用
-                    let remote = super::origin::remote_target(name, printer.lang())?;
-                    let host = remote
-                        .as_ref()
-                        .map_or_else(|| "本机".to_owned(), |t| t.member.name.to_string());
-                    let prompt_text = match missing_major {
-                        Some(major) => format!("{host} 缺少 Java {major}，是否现在安装？"),
-                        None => format!("{host} 未发现任何 Java 运行时，是否现在安装？"),
-                    };
-                    if !prompts::confirm_or_yes(printer, &prompt_text, true)? {
+                    if !super::java::offer_install_missing(name, missing_major, printer).await? {
                         return Err(anyhow::anyhow!("缺少所需 Java 版本，已中止启动"));
-                    }
-                    // 安装缺的版本；NoJava 无从点名，装当前 LTS 21 作为起步
-                    let major_str = missing_major.map_or("21".to_string(), |m| m.to_string());
-                    match &remote {
-                        Some(target) => {
-                            crate::commands::java::install_on(
-                                &mcsup::port::Origin::Remote(target.member.name.clone()),
-                                Some(&major_str),
-                                false,
-                                None,
-                                printer,
-                            )?;
-                        }
-                        None => {
-                            crate::commands::java::install_with_outcome(
-                                Some(&major_str),
-                                false,
-                                None,
-                                printer,
-                            )
-                            .await?;
-                        }
                     }
                     continue;
                 }

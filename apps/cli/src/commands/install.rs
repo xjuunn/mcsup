@@ -243,17 +243,40 @@ pub(crate) async fn download_jar(
         // 先把名字取出来：闭包会在 `variant` 之后还要读它，直接捕获会与
         // `lifecycle` 的借用冲突
         let variant_name = variant.as_str().to_owned();
-        let java_bin = lifecycle
-            .installer_java_bin(name, &mut || {}, &mut |_| {})
-            .with_context(|| {
-                crate::i18n::pick(
-                    printer.lang(),
-                    format!("{variant_name} 需要先运行安装器，但找不到可用的 Java 运行时"),
-                    format!(
-                        "{variant_name} needs to run its installer first, but no usable Java runtime was found"
-                    ),
-                )
-            })?;
+        let java_bin = loop {
+            match lifecycle.installer_java_bin(name, &mut || {}, &mut |_| {}) {
+                Ok(java_bin) => break java_bin,
+                Err(err) => {
+                    // 与 `server start` 同一口径：交互下点名缺的版本并现场安装，
+                    // 装完重试；非交互或非 Java 缺失时保留原错误
+                    let missing =
+                        super::java::missing_java_major(&err).filter(|_| printer.is_interactive());
+                    let Some(missing) = missing else {
+                        return Err(anyhow::Error::from(err)).with_context(|| {
+                            crate::i18n::pick(
+                                printer.lang(),
+                                format!(
+                                    "{variant_name} 需要先运行安装器，但找不到可用的 Java 运行时"
+                                ),
+                                format!(
+                                    "{variant_name} needs to run its installer first, but no usable Java runtime was found"
+                                ),
+                            )
+                        });
+                    };
+                    session.pause_for_prompt();
+                    let accepted = super::java::offer_install_missing(name, missing, printer).await;
+                    session.resume_after_prompt();
+                    if !accepted? {
+                        return Err(anyhow::anyhow!(crate::i18n::pick(
+                            printer.lang(),
+                            "缺少所需 Java 版本，已中止安装",
+                            "the required Java version is missing; install aborted",
+                        )));
+                    }
+                }
+            }
+        };
         Some(mcsup::service::InstallerContext {
             java_bin,
             runner: Arc::new(mcsup::runtime::LocalInstallerRunner::new()),
