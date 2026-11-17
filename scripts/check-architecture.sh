@@ -456,6 +456,8 @@ if [ -f "$pkg_manifest" ] && [ -f "$pkg_lib" ]; then
 		backend) printf '%s' 'auth backend backup domain port protocol runtime transport' ;;
 		# 组合 feature：一次拉入全部内层（默认组合根）
 		bootstrap) printf '%s' 'auth backend backup domain file java modkit port protocol provider runtime service storage transport' ;;
+		# 组合 feature：默认组合根 + 任务级接口（kit），不额外拉内层
+		kit) printf '%s' 'auth backend backup domain file java modkit port protocol provider runtime service storage transport' ;;
 		# 组合 feature：agent 侧要装配整套服务 + 传输 + supervisor 入口
 		remote) printf '%s' 'auth backend backup domain file java modkit port protocol provider runtime service storage transport' ;;
 		*) printf '%s' '' ;;
