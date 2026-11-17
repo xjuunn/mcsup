@@ -3,21 +3,18 @@
 //! 这里只有「按什么顺序调 service」和「默认值从哪来」。状态判定、EULA 写入、
 //! 核心可行性、运行中拒改磁盘都在 `service` / `domain`，kit 不复制任何一条。
 
-use super::Kit;
 use super::config::KitConfig;
 use super::error::KitError;
 use super::options::RunOptions;
 use domain::java::JavaMajor;
 use domain::server::variant::ServerVariant;
 use domain::server::version::VersionId;
-use domain::workspace::Workspace;
 use port::{ScannedJava, StopOutcome, SupervisorStartOutcome, SupervisorStatus};
 use service::{
-    InitOutcome, InstalledServerJar, ModpackApplied, ModpackInstallOptions, ModpackPrepared,
-    ServerRemoveOutcome,
+    InstalledServerJar, ModpackApplied, ModpackInstallOptions, ModpackPrepared, ServerRemoveOutcome,
 };
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -533,7 +530,23 @@ impl RemoveServer {
     }
 }
 
-impl Kit<'_> {
+/// 服务器任务句柄
+///
+/// 由 [`Kit::servers`](crate::kit::Kit::servers) 取得，不单独持有资源：它借用
+/// 组合根与默认策略，因此与 `Kit` 生命周期一致。
+#[derive(Clone, Copy, Debug)]
+pub struct Servers<'a> {
+    core: &'a crate::bootstrap::Mcsup,
+    config: &'a KitConfig,
+}
+
+impl<'a> Servers<'a> {
+    pub(super) fn new(core: &'a crate::bootstrap::Mcsup, config: &'a KitConfig) -> Self {
+        Self { core, config }
+    }
+}
+
+impl Servers<'_> {
     /// 一行建服：登记目录 → 装核心 →（可选）起服
     ///
     /// 每一步都走与 CLI 相同的 service：目录与 marker 由注册表写，核心由
@@ -548,9 +561,9 @@ impl Kit<'_> {
     ///
     /// 缺名称 / 变体没有来源 / 未接受 EULA 而要求起服（用法类），以及工作目录、
     /// 注册表、下载、校验、安装器、起服失败时返回 [`KitError`]
-    pub async fn create_server(&self, options: CreateServer) -> Result<CreatedServer, KitError> {
-        let resolved = options.resolve(self.config())?;
-        let mcsup = self.core();
+    pub async fn create(&self, options: CreateServer) -> Result<CreatedServer, KitError> {
+        let resolved = options.resolve(self.config)?;
+        let mcsup = self.core;
 
         // 起服请求先解析：缺 supervisor 之类的用法错误必须在建目录之前报，
         // 否则会留下「建好了、核心也装了，但起不来」的半成品
@@ -564,7 +577,7 @@ impl Kit<'_> {
             on_found: None,
         });
         if let Some(request) = &start_request {
-            request.resolve(self.config(), mcsup.has_external_supervisor())?;
+            request.resolve(self.config, mcsup.has_external_supervisor())?;
         }
 
         // 整合包先取回清单：MC 版本与加载器要写进注册表，且取回失败时磁盘上
@@ -601,10 +614,13 @@ impl Kit<'_> {
         }
 
         // 来源先查：未知变体不该留下一个装不了核心的空目录
-        let source = self.core_source(&variant)?;
+        let core_spec = CoreSpec::new(self.core, &variant, &core_version)?;
 
         let workspace = match &resolved.workspace_dir {
-            Some(dir) => Some(self.ensure_workspace(dir, None)?.name.as_str().to_owned()),
+            Some(dir) => {
+                let workspace = super::workspace::ensure(self.core, dir, None)?;
+                Some(workspace.name.as_str().to_owned())
+            }
             None => resolved.workspace.clone(),
         };
 
@@ -616,15 +632,7 @@ impl Kit<'_> {
             resolved.java_major,
         )?;
 
-        let core = self
-            .install_core_inner(
-                &resolved.name,
-                source,
-                &core_version,
-                variant.needs_installer(),
-                &resolved.run,
-            )
-            .await?;
+        let core = core_spec.install(&resolved.name, &resolved.run).await?;
 
         // 整合包：核心就位后铺 overrides、按清单下载文件。失败时服务器与
         // 核心都保留，重试入口就是 [`Self::install_modpack`]
@@ -641,7 +649,7 @@ impl Kit<'_> {
         drop(staging);
 
         let started = match start_request {
-            Some(request) => Some(self.start_server(&resolved.name, request)?),
+            Some(request) => Some(self.start(&resolved.name, request)?),
             None => None,
         };
 
@@ -672,7 +680,7 @@ impl Kit<'_> {
         project: &str,
         options: InstallModpack,
     ) -> Result<ModpackInstallOutcome, KitError> {
-        let mcsup = self.core();
+        let mcsup = self.core;
         // 先确认目标存在：否则会先下完整包才因为「服务器不存在」失败
         let server = mcsup.registry.get(name)?;
 
@@ -699,15 +707,9 @@ impl Kit<'_> {
         // 清单决定加载器核心：先装核心（此步同时写回 MC 版本元数据），再布置
         let variant = prepared.require_loader()?;
         let core_version = VersionId::new(prepared.minecraft_version()?);
-        let source = self.core_source(&variant)?;
-        self.install_core_inner(
-            name,
-            source,
-            &core_version,
-            variant.needs_installer(),
-            &options.run,
-        )
-        .await?;
+        CoreSpec::new(self.core, &variant, &core_version)?
+            .install(name, &options.run)
+            .await?;
 
         let progress = options
             .run
@@ -730,7 +732,8 @@ impl Kit<'_> {
     ///
     /// 运行中换核心会被拒绝（Linux 上 rename 成功但 JVM 仍用旧 inode），判定在
     /// `service`。版本缺省沿用注册表记录，因此
-    /// `kit.install_core("survival", InstallCore::default())` 就是「按原样重装」。
+    /// `kit.servers().install_core("survival", InstallCore::default())` 就是
+    /// 「按原样重装」。
     /// 变体取自注册表记录（服务层不提供改注册变体），记录里的 Java 大版本由
     /// 核心元数据（来源给出的要求）回写。
     ///
@@ -743,73 +746,12 @@ impl Kit<'_> {
         name: &str,
         options: InstallCore,
     ) -> Result<InstalledServerJar, KitError> {
-        let server = self.core().registry.get(name)?;
+        let server = self.core.registry.get(name)?;
         let variant = server.meta.variant.clone();
         let resolved = options.resolve(&server);
-        let source = self.core_source(&variant)?;
-        self.install_core_inner(
-            name,
-            source,
-            &resolved.version,
-            variant.needs_installer(),
-            &resolved.run,
-        )
-        .await
-    }
-
-    /// 查来源 + 装核心的共同尾巴
-    ///
-    /// 安装器类变体（Forge / `NeoForge` / Quilt）要先运行安装器：挑 Java 的口径
-    /// 与起服一致，因此复用 lifecycle 的选法，不另写一套。
-    async fn install_core_inner(
-        &self,
-        name: &str,
-        source: Arc<dyn port::ServerJarSource>,
-        version: &VersionId,
-        needs_installer: bool,
-        run: &RunOptions,
-    ) -> Result<InstalledServerJar, KitError> {
-        let mcsup = self.core();
-        let installer_ctx = if needs_installer {
-            let java_bin = mcsup
-                .lifecycle
-                .installer_java_bin(name, &mut || {}, &mut |_| {})?;
-            Some(service::InstallerContext {
-                java_bin,
-                runner: Arc::new(runtime::LocalInstallerRunner::new()),
-            })
-        } else {
-            None
-        };
-        let installer = service::ServerInstaller::new(source, Arc::clone(&mcsup.downloader));
-        let token = run.token();
-        Ok(mcsup
-            .lifecycle
-            .install_jar_checked(
-                name,
-                version,
-                &installer,
-                &file::FileCoreInspector::new(),
-                installer_ctx.as_ref(),
-                run.observer_ref(),
-                &token,
-            )
-            .await?)
-    }
-
-    /// 按变体找核心来源；本实例没有承载该变体时给出用法错误
-    fn core_source(
-        &self,
-        variant: &ServerVariant,
-    ) -> Result<Arc<dyn port::ServerJarSource>, KitError> {
-        self.core()
-            .jar_sources
-            .iter()
-            .find(|source| source.variant() == *variant)
-            .cloned()
-            .ok_or_else(|| KitError::UnsupportedVariant {
-                variant: variant.as_str().to_owned(),
-            })
+        CoreSpec::new(self.core, &variant, &resolved.version)?
+            .install(name, &resolved.run)
+            .await
     }
 
     /// 一行起服
@@ -818,12 +760,12 @@ impl Kit<'_> {
     ///
     /// 缺 supervisor 可执行文件（默认 supervisor 且未配置），或注册表 / Java /
     /// EULA / mod 预检 / supervisor 交互失败时返回 [`KitError`]
-    pub fn start_server(
+    pub fn start(
         &self,
         name: &str,
         options: StartServer,
     ) -> Result<SupervisorStartOutcome, KitError> {
-        let start = options.resolve(self.config(), self.core().has_external_supervisor())?;
+        let start = options.resolve(self.config, self.core.has_external_supervisor())?;
         let first = options.on_first_scan;
         let found = options.on_found;
         let mut on_first = || {
@@ -837,7 +779,7 @@ impl Kit<'_> {
             }
         };
         Ok(self
-            .core()
+            .core
             .lifecycle
             .start(name, &start, &mut on_first, &mut on_found)?)
     }
@@ -848,8 +790,8 @@ impl Kit<'_> {
     ///
     /// 服务器不存在、supervisor 交互失败或宽限到期仍在运行（未加 `force`）时
     /// 返回 [`KitError`]
-    pub fn stop_server(&self, name: &str, options: StopServer) -> Result<StopOutcome, KitError> {
-        Ok(self.core().lifecycle.stop(name, options.resolve())?)
+    pub fn stop(&self, name: &str, options: StopServer) -> Result<StopOutcome, KitError> {
+        Ok(self.core.lifecycle.stop(name, options.resolve())?)
     }
 
     /// 一行重启：先停（超时中止，不再拉起），再走同一条起服路径
@@ -859,16 +801,16 @@ impl Kit<'_> {
     ///
     /// # Errors
     ///
-    /// 停服失败 / 宽限超时，或起服失败（见 [`Self::start_server`]）时返回
+    /// 停服失败 / 宽限超时，或起服失败（见 [`Self::start`]）时返回
     /// [`KitError`]
-    pub fn restart_server(
+    pub fn restart(
         &self,
         name: &str,
         start: StartServer,
         stop: StopServer,
     ) -> Result<SupervisorStartOutcome, KitError> {
-        self.stop_server(name, stop)?;
-        self.start_server(name, start)
+        self.stop(name, stop)?;
+        self.start(name, start)
     }
 
     /// 一行删服：注销登记，（可选）删磁盘目录
@@ -880,13 +822,13 @@ impl Kit<'_> {
     ///
     /// 服务器不存在、运行中、链接服务器带 `purge`、`cwd` 在目录内、目录
     /// `mcsup.json` 不属于该记录，或删除失败时返回 [`KitError`]
-    pub fn remove_server(
+    pub fn remove(
         &self,
         name: &str,
         options: RemoveServer,
     ) -> Result<ServerRemoveOutcome, KitError> {
         let (purge, cwd) = options.resolve();
-        Ok(self.core().lifecycle.remove_server(name, purge, &cwd)?)
+        Ok(self.core.lifecycle.remove_server(name, purge, &cwd)?)
     }
 
     /// 服务器实时状态；`None` = 未在运行
@@ -894,26 +836,82 @@ impl Kit<'_> {
     /// # Errors
     ///
     /// 服务器不存在或 supervisor 交互失败时返回 [`KitError`]
-    pub fn server_status(&self, name: &str) -> Result<Option<SupervisorStatus>, KitError> {
-        Ok(self.core().lifecycle.status(name)?)
+    pub fn status(&self, name: &str) -> Result<Option<SupervisorStatus>, KitError> {
+        Ok(self.core.lifecycle.status(name)?)
+    }
+}
+
+/// 「来源 + 目标版本 + 是否需要安装器」的合成体
+///
+/// 建服、装整合包、换核心三个入口都要走「按变体查来源 → 必要时准备安装器 →
+/// 交给 lifecycle 装」，差异只在参数从哪来。合成体让这条链路只有一份，
+/// 调用点既不必各自拼装 `install_jar_checked` 的六项参数，也不会漏掉
+/// 「未承载该变体」的用法错误。
+struct CoreSpec<'a> {
+    core: &'a crate::bootstrap::Mcsup,
+    source: Arc<dyn port::ServerJarSource>,
+    version: VersionId,
+    needs_installer: bool,
+}
+
+impl<'a> CoreSpec<'a> {
+    /// 按变体查来源；本实例没有承载该变体时返回用法错误
+    fn new(
+        core: &'a crate::bootstrap::Mcsup,
+        variant: &ServerVariant,
+        version: &VersionId,
+    ) -> Result<Self, KitError> {
+        let source = core
+            .jar_sources
+            .iter()
+            .find(|source| source.variant() == *variant)
+            .cloned()
+            .ok_or_else(|| KitError::UnsupportedVariant {
+                variant: variant.as_str().to_owned(),
+            })?;
+        Ok(Self {
+            core,
+            source,
+            version: version.clone(),
+            needs_installer: variant.needs_installer(),
+        })
     }
 
-    /// 确保 `dir` 是一个已登记的工作目录，返回它
+    /// 装核心
     ///
-    /// 目录已有合法 marker 或已登记时不会重复创建（`init` 自带恢复分支），
-    /// 因此可以安全地重复调用。
-    ///
-    /// # Errors
-    ///
-    /// 目录非空且未登记、名称冲突、marker / 注册表写入失败时返回 [`KitError`]
-    pub fn ensure_workspace(&self, dir: &Path, name: Option<&str>) -> Result<Workspace, KitError> {
-        let outcome = self.core().workspaces.init(dir, name)?;
-        Ok(match outcome {
-            InitOutcome::Created(workspace)
-            | InitOutcome::Recovered(workspace)
-            | InitOutcome::AlreadyRegistered(workspace)
-            | InitOutcome::MarkerRestored(workspace) => workspace,
-        })
+    /// 安装器类变体（Forge / `NeoForge` / Quilt）要先运行安装器：挑 Java 的口径
+    /// 与起服一致，因此复用 lifecycle 的选法，不另写一套。
+    async fn install(&self, name: &str, run: &RunOptions) -> Result<InstalledServerJar, KitError> {
+        let installer_ctx = if self.needs_installer {
+            let java_bin = self
+                .core
+                .lifecycle
+                .installer_java_bin(name, &mut || {}, &mut |_| {})?;
+            Some(service::InstallerContext {
+                java_bin,
+                runner: Arc::new(runtime::LocalInstallerRunner::new()),
+            })
+        } else {
+            None
+        };
+        let installer = service::ServerInstaller::new(
+            Arc::clone(&self.source),
+            Arc::clone(&self.core.downloader),
+        );
+        let token = run.token();
+        Ok(self
+            .core
+            .lifecycle
+            .install_jar_checked(
+                name,
+                &self.version,
+                &installer,
+                &file::FileCoreInspector::new(),
+                installer_ctx.as_ref(),
+                run.observer_ref(),
+                &token,
+            )
+            .await?)
     }
 }
 

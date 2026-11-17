@@ -178,6 +178,8 @@ impl Mcsup {
 它解决的是采用门槛：第三方要的是「起一台服」「备份一次」，而不是先读懂
 注册表、安装器、Java 选择、`save-off` 时序。
 
+任务按领域挂在访问器上，`Kit` 本身只有策略与逃生口：
+
 ```rust
 use std::path::Path;
 use mcsup::bootstrap::Mcsup;
@@ -187,29 +189,29 @@ use mcsup::kit::{CreateServer, InstallMod, KitConfig};
 let core = Mcsup::open(Path::new("/srv/mcsup"))?;
 let kit = core.kit(KitConfig { accept_eula: true, ram_mib: Some(4096), ..Default::default() });
 
-kit.create_server(CreateServer::new("survival").version("1.21.4")).await?; // 建目录 + 入库 + 装核心 +（可选）起服
-kit.install_mod("survival", "fabric-api", InstallMod::default()).await?;   // 计划 → 下载 → 检查 → 原子换入
+kit.servers().create(CreateServer::new("survival").version("1.21.4")).await?; // 建目录 + 入库 + 装核心 +（可选）起服
+kit.content().install("survival", "fabric-api", InstallMod::default()).await?; // 计划 → 下载 → 检查 → 原子换入
 # Ok(()) }
 ```
 
-完整可运行的调用顺序见 `crates/mcsup/examples/kit.rs`。接口按任务分组：
+完整可运行的调用顺序见 `crates/mcsup/examples/kit.rs`。接口按访问器分组：
 
-| 任务 | 方法 |
-| --- | --- |
-| 建服 / 整合包开服 | `create_server`（`CreateServer::modpack` 按清单决定 MC 版本与加载器） |
-| 整合包装已有服务器 | `install_modpack`（取回 → 装加载器核心 → 铺 overrides → 下载清单文件；建服中途失败后的重试入口） |
-| 核心 | `install_core` |
-| 生命周期 | `start_server` / `stop_server` / `restart_server` / `server_status` |
-| 删服 | `remove_server`（`purge` 才删盘，缺省只注销） |
-| 备份 | `backup_now` / `list_backups` / `verify_backup` / `restore_backup` / `delete_backup` / `prune_backups` |
-| 内容 | `install_mod` / `update_mods` / `remove_mod` |
-| Java | `install_java` / `java_runtimes` |
-| 工作目录 | `ensure_workspace` |
+| 访问器 | 方法 | 说明 |
+| --- | --- | --- |
+| `kit.servers()` | `create` | 建服；`CreateServer::modpack` 按清单决定 MC 版本与加载器 |
+| | `install_modpack` | 整合包装已有服务器（取回 → 装加载器核心 → 铺 overrides → 下载清单文件；建服中途失败后的重试入口） |
+| | `install_core` | 装 / 换核心（变体取注册表记录） |
+| | `start` / `stop` / `restart` / `status` | 生命周期与实时状态 |
+| | `remove` | 删服（`purge` 才删盘，缺省只注销） |
+| `kit.backups()` | `create` / `list` / `verify` / `restore` / `delete` / `prune` | 备份全流程与保留策略清理 |
+| `kit.content()` | `install` / `update` / `remove` | 内容安装、检查更新、移除 |
+| `kit.java()` | `install` / `runtimes` | 装托管运行时、列出本机可用运行时 |
+| `kit.workspaces()` | `ensure` | 工作目录初始化 / 复用 |
 
-`install_mod` / `update_mods` 保留两阶段语义：`dry_run` 只返回计划。整合包
-建服的显式 `variant` 必须与整合包模式一致，否则返回 `KitError::ConflictingVariant`；
-`install_java` 的大版本既不来自单次调用也不来自 `KitConfig::java_major` 时返回
-`KitError::MissingJavaMajor`——不猜版本。
+`content().install` / `content().update` 保留两阶段语义：`dry_run` 只返回计划。
+整合包建服的显式 `variant` 必须与整合包模式一致，否则返回
+`KitError::ConflictingVariant`；`java().install` 的大版本既不来自单次调用也不
+来自 `KitConfig::java_major` 时返回 `KitError::MissingJavaMajor`——不猜版本。
 
 三层配置，`Option` 表示「这次不覆盖」：
 
@@ -227,13 +229,15 @@ kit.install_mod("survival", "fabric-api", InstallMod::default()).await?;   // �
 - `Kit::core()` 回到底层组合根；没被 kit 包住的操作照旧直接调 service。
 - 长任务接受 `RunOptions`（`port::TaskObserver` + `CancellationToken`），
   进度与取消不因走 kit 而消失；`dry_run` 保留两阶段语义。
-- 同步 / 异步与 service 保持一致：`create_server` / `install_mod` 是 async
-  （要联网），`backup_now` / 起停 / 查状态是阻塞调用，异步宿主自行
+- 同步 / 异步与 service 保持一致：`servers().create` / `content().install` 是
+  async（要联网），`backups().create` / 起停 / 查状态是阻塞调用，异步宿主自行
   `spawn_blocking`。
 
-新增一条任务的做法：选项类型与 `impl Kit` 放 `crates/mcsup/src/kit/<任务>.rs`，
-在 `kit/mod.rs` 重导出；选项字段全用 `Option`，在私有 `resolve` 里与
-`KitConfig` 合并（纯计算，可单测）。新增内层 crate 时不需要改动这里。
+新增一条任务的做法：选项类型与 `impl <领域句柄>` 放
+`crates/mcsup/src/kit/<领域>.rs`，在 `kit/mod.rs` 重导出并为句柄加一个访问器；
+选项字段全用 `Option`，在私有 `resolve` 里与 `KitConfig` 合并（纯计算，可单测）。
+新领域才需要新的句柄与 `kit/` 下的新文件，现有领域里加方法不碰别的文件。
+新增内层 crate 时不需要改动这里。
 
 ## 对外契约
 

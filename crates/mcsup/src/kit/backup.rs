@@ -5,7 +5,6 @@
 //! 「原地恢复必须已停机」由领域层判定，kit 不复制这条规则，只把 `RestoreTarget`
 //! 原样递交。
 
-use super::Kit;
 use super::config::KitConfig;
 use super::error::KitError;
 use super::options::RunOptions;
@@ -208,7 +207,23 @@ impl PruneBackups {
     }
 }
 
-impl Kit<'_> {
+/// 备份任务句柄
+///
+/// 由 [`Kit::backups`](crate::kit::Kit::backups) 取得：方法名去掉领域前缀，
+/// 在调用点读作 `kit.backups().create(...)` / `kit.backups().prune(...)`。
+#[derive(Clone, Copy, Debug)]
+pub struct Backups<'a> {
+    core: &'a crate::bootstrap::Mcsup,
+    config: &'a KitConfig,
+}
+
+impl<'a> Backups<'a> {
+    pub(super) fn new(core: &'a crate::bootstrap::Mcsup, config: &'a KitConfig) -> Self {
+        Self { core, config }
+    }
+}
+
+impl Backups<'_> {
     /// 一行建快照
     ///
     /// 服务器运行中也能备份：service 先 `save-off` 再 `save-all flush`，扫描
@@ -222,10 +237,10 @@ impl Kit<'_> {
     ///
     /// 服务器不存在、范围为空、CAS / 扫描 / 记录写入失败，或注入控制台命令
     /// 失败时返回 [`KitError`]
-    pub fn backup_now(&self, name: &str, options: BackupNow) -> Result<CreateOutcome, KitError> {
-        let (resolved, run) = options.resolve(self.config());
+    pub fn create(&self, name: &str, options: BackupNow) -> Result<CreateOutcome, KitError> {
+        let (resolved, run) = options.resolve(self.config);
         let token = run.token();
-        Ok(self.core().backup.create(name, &resolved, &token)?)
+        Ok(self.core.backup.create(name, &resolved, &token)?)
     }
 
     /// 列快照（按时间倒序，最新在前）
@@ -233,8 +248,8 @@ impl Kit<'_> {
     /// # Errors
     ///
     /// 服务器不存在、索引读取失败或服务器位于不可达远端时返回 [`KitError`]
-    pub fn list_backups(&self, name: &str, options: ListBackups) -> Result<SnapshotPage, KitError> {
-        Ok(self.core().backup.list(name, options.resolve())?)
+    pub fn list(&self, name: &str, options: ListBackups) -> Result<SnapshotPage, KitError> {
+        Ok(self.core.backup.list(name, options.resolve())?)
     }
 
     /// 从快照恢复
@@ -246,7 +261,7 @@ impl Kit<'_> {
     ///
     /// 快照不存在 / 不可恢复、原地恢复且服务器在运行、目标服务名已占用、
     /// 落点越界、CAS 对象缺失或写盘失败时返回 [`KitError`]
-    pub fn restore_backup(
+    pub fn restore(
         &self,
         name: &str,
         snapshot_id: &str,
@@ -255,7 +270,7 @@ impl Kit<'_> {
         let (target, run) = options.resolve();
         let token = run.token();
         Ok(self
-            .core()
+            .core
             .backup
             .restore(name, snapshot_id, &target, &token)?)
     }
@@ -266,11 +281,8 @@ impl Kit<'_> {
     ///
     /// 快照不存在、索引 / CAS 读取失败时返回 [`KitError`]；对象缺失或损坏
     /// 不报错，而是出现在 [`VerifyOutcome::broken`] 里
-    pub fn verify_backup(&self, name: &str, snapshot_id: &str) -> Result<VerifyOutcome, KitError> {
-        Ok(self
-            .core()
-            .backup
-            .verify(name, snapshot_id, &mut |_, _| {})?)
+    pub fn verify(&self, name: &str, snapshot_id: &str) -> Result<VerifyOutcome, KitError> {
+        Ok(self.core.backup.verify(name, snapshot_id, &mut |_, _| {})?)
     }
 
     /// 删除一份快照（引用计数归零的 CAS 对象留给 prune 回收）
@@ -278,8 +290,8 @@ impl Kit<'_> {
     /// # Errors
     ///
     /// 快照不存在、索引写入失败或服务器位于不可达远端时返回 [`KitError`]
-    pub fn delete_backup(&self, name: &str, snapshot_id: &str) -> Result<DeleteOutcome, KitError> {
-        Ok(self.core().backup.delete(name, snapshot_id)?)
+    pub fn delete(&self, name: &str, snapshot_id: &str) -> Result<DeleteOutcome, KitError> {
+        Ok(self.core.backup.delete(name, snapshot_id)?)
     }
 
     /// 按保留策略清理快照并回收无引用的 CAS 对象
@@ -288,13 +300,9 @@ impl Kit<'_> {
     ///
     /// 保留策略冲突（同时给了 `keep` 与 `older_than`）、服务器不存在、索引
     /// 读写失败或对象删除失败时返回 [`KitError`]
-    pub fn prune_backups(
-        &self,
-        name: &str,
-        options: PruneBackups,
-    ) -> Result<PruneOutcome, KitError> {
+    pub fn prune(&self, name: &str, options: PruneBackups) -> Result<PruneOutcome, KitError> {
         let (retention, dry_run) = options.resolve();
-        Ok(self.core().backup.prune(name, retention, dry_run)?)
+        Ok(self.core.backup.prune(name, retention, dry_run)?)
     }
 }
 

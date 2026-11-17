@@ -1,6 +1,6 @@
 //! 任务级接口的真实装配：真注册表、真安装编排、假来源与假下载器
 //!
-//! 这里不打桩 service：`Kit::create_server` 走的是与 CLI 同一条
+//! 这里不打桩 service：`kit.servers().create` 走的是与 CLI 同一条
 //! 注册表 → 来源 → 下载 → 校验 → 登记核心链路，只把网络换成可控假件。
 //! 因此「一行建服」是否真的落盘、是否只下载一次、失败前有没有副作用，
 //! 都在这里被钉住。
@@ -595,7 +595,8 @@ async fn create_server_with(
     let workspace = dir.join("workspace");
     let created = mcsup
         .kit(KitConfig::default())
-        .create_server(
+        .servers()
+        .create(
             CreateServer::new(name)
                 .workspace_dir(&workspace)
                 .variant(variant)
@@ -620,7 +621,8 @@ async fn create_server_registers_and_installs_core() {
     let workspace_dir = dir.path().join("workspace");
     let created = mcsup
         .kit(KitConfig::default())
-        .create_server(
+        .servers()
+        .create(
             CreateServer::new("survival")
                 .workspace_dir(&workspace_dir)
                 .version("1.21.4"),
@@ -659,7 +661,8 @@ async fn create_with_start_refuses_unaccepted_eula() {
     let workspace_dir = dir.path().join("workspace");
     let err = mcsup
         .kit(KitConfig::default())
-        .create_server(
+        .servers()
+        .create(
             CreateServer::new("survival")
                 .workspace_dir(&workspace_dir)
                 .start(true),
@@ -684,7 +687,8 @@ async fn unknown_variant_leaves_nothing_behind() {
     let workspace_dir = dir.path().join("workspace");
     let err = mcsup
         .kit(KitConfig::default())
-        .create_server(
+        .servers()
+        .create(
             CreateServer::new("survival")
                 .variant(ServerVariant::Vanilla)
                 .workspace_dir(&workspace_dir),
@@ -717,7 +721,8 @@ async fn create_uses_config_defaults_for_start_and_eula() {
     });
 
     let created = kit
-        .create_server(
+        .servers()
+        .create(
             CreateServer::new("survival")
                 .workspace_dir(&workspace_dir)
                 .version("1.21.4"),
@@ -744,6 +749,7 @@ async fn install_core_replaces_the_jar_and_updates_metadata() {
 
     let installed = mcsup
         .kit(KitConfig::default())
+        .servers()
         .install_core("survival", InstallCore::default().version("1.21.5"))
         .await
         .expect("reinstall");
@@ -768,6 +774,7 @@ async fn install_core_rejects_variant_without_source() {
         .expect("bootstrap");
     let err = bare
         .kit(KitConfig::default())
+        .servers()
         .install_core("survival", InstallCore::default())
         .await
         .expect_err("没有 Fabric 来源");
@@ -786,7 +793,8 @@ fn start_requires_supervisor_exe_for_default_supervisor() {
     let (_dir, mcsup, _downloader) = build(vec![Arc::new(FixedSource::vanilla())]);
     let err = mcsup
         .kit(KitConfig::default())
-        .start_server("survival", StartServer::default())
+        .servers()
+        .start("survival", StartServer::default())
         .expect_err("缺 supervisor_exe");
     assert!(matches!(err, KitError::MissingSupervisorExe));
     assert_eq!(err.category(), ErrorCategory::Usage);
@@ -813,23 +821,27 @@ async fn start_status_restart_and_stop_share_one_supervisor() {
         ..KitConfig::default()
     });
 
-    assert!(kit.server_status("survival").expect("status").is_none());
-    kit.start_server("survival", StartServer::default())
+    assert!(kit.servers().status("survival").expect("status").is_none());
+    kit.servers()
+        .start("survival", StartServer::default())
         .expect("start");
     let running = kit
-        .server_status("survival")
+        .servers()
+        .status("survival")
         .expect("status")
         .expect("running");
     assert_eq!(running.status, ServerStatus::Running);
     assert_eq!(supervisor.starts(), 1);
 
-    kit.restart_server("survival", StartServer::default(), StopServer::default())
+    kit.servers()
+        .restart("survival", StartServer::default(), StopServer::default())
         .expect("restart");
     assert_eq!(supervisor.starts(), 2, "重启要真的再拉起一次");
     assert_eq!(supervisor.stops(), 1);
 
     let stopped = kit
-        .stop_server("survival", StopServer::default())
+        .servers()
+        .stop("survival", StopServer::default())
         .expect("stop");
     assert_eq!(
         stopped,
@@ -837,10 +849,11 @@ async fn start_status_restart_and_stop_share_one_supervisor() {
             elapsed: Duration::from_millis(1)
         }
     );
-    assert!(kit.server_status("survival").expect("status").is_none());
+    assert!(kit.servers().status("survival").expect("status").is_none());
     // 幂等：已经停了再停一次不报错
     assert_eq!(
-        kit.stop_server("survival", StopServer::default())
+        kit.servers()
+            .stop("survival", StopServer::default())
             .expect("stop again"),
         StopOutcome::AlreadyStopped
     );
@@ -862,7 +875,8 @@ async fn remove_running_server_is_rejected() {
 
     let err = mcsup
         .kit(KitConfig::default())
-        .remove_server(
+        .servers()
+        .remove(
             "survival",
             RemoveServer::default().purge(true).cwd(fixture.dir.path()),
         )
@@ -883,7 +897,8 @@ async fn remove_without_purge_keeps_the_directory() {
 
     let outcome = mcsup
         .kit(KitConfig::default())
-        .remove_server("survival", RemoveServer::default().cwd(fixture.dir.path()))
+        .servers()
+        .remove("survival", RemoveServer::default().cwd(fixture.dir.path()))
         .expect("remove");
     assert!(!outcome.disk_purged);
     assert!(server_dir.is_dir(), "不 purge 时必须保留数据");
@@ -901,7 +916,8 @@ async fn remove_with_purge_deletes_the_directory() {
 
     let outcome = mcsup
         .kit(KitConfig::default())
-        .remove_server(
+        .servers()
+        .remove(
             "survival",
             RemoveServer::default().purge(true).cwd(fixture.dir.path()),
         )
@@ -926,16 +942,19 @@ async fn backup_lifecycle_runs_through_kit() {
     let kit = mcsup.kit(KitConfig::default());
 
     let first = kit
-        .backup_now("survival", BackupNow::default().label("before-upgrade"))
+        .backups()
+        .create("survival", BackupNow::default().label("before-upgrade"))
         .expect("backup");
     assert_eq!(first.skipped, 0);
     std::fs::write(server_dir.join("world/level.dat"), b"second").expect("level");
     let second = kit
-        .backup_now("survival", BackupNow::default())
+        .backups()
+        .create("survival", BackupNow::default())
         .expect("backup");
 
     let page = kit
-        .list_backups("survival", ListBackups::default())
+        .backups()
+        .list("survival", ListBackups::default())
         .expect("list");
     assert_eq!(page.total, 2);
     assert_eq!(page.items.len(), 2);
@@ -945,13 +964,15 @@ async fn backup_lifecycle_runs_through_kit() {
     );
 
     let verified = kit
-        .verify_backup("survival", first.snapshot.id.as_str())
+        .backups()
+        .verify("survival", first.snapshot.id.as_str())
         .expect("verify");
     assert!(verified.broken.is_empty());
     assert!(verified.objects > 0);
 
     let restored = kit
-        .restore_backup(
+        .backups()
+        .restore(
             "survival",
             first.snapshot.id.as_str(),
             RestoreBackup::default(),
@@ -963,7 +984,8 @@ async fn backup_lifecycle_runs_through_kit() {
     );
     // 原地恢复前会自动留一份安全快照
     let after_restore = kit
-        .list_backups("survival", ListBackups::default())
+        .backups()
+        .list("survival", ListBackups::default())
         .expect("list");
     assert_eq!(after_restore.total, 3);
     assert_eq!(restored.snapshot.id, first.snapshot.id);
@@ -971,16 +993,19 @@ async fn backup_lifecycle_runs_through_kit() {
     assert_ne!(safety, first.snapshot.id);
 
     let deleted = kit
-        .delete_backup("survival", second.snapshot.id.as_str())
+        .backups()
+        .delete("survival", second.snapshot.id.as_str())
         .expect("delete");
     assert_eq!(deleted.snapshot.id, second.snapshot.id);
 
     let pruned = kit
-        .prune_backups("survival", PruneBackups::default().keep(1))
+        .backups()
+        .prune("survival", PruneBackups::default().keep(1))
         .expect("prune");
     assert_eq!(pruned.removed.len(), 1);
     let final_page = kit
-        .list_backups("survival", ListBackups::default())
+        .backups()
+        .list("survival", ListBackups::default())
         .expect("list");
     assert_eq!(final_page.total, 1);
 }
@@ -996,7 +1021,8 @@ async fn prune_with_conflicting_retention_is_rejected() {
 
     let err = mcsup
         .kit(KitConfig::default())
-        .prune_backups(
+        .backups()
+        .prune(
             "survival",
             PruneBackups::default()
                 .keep(1)
@@ -1016,12 +1042,14 @@ async fn list_backups_honours_page_size() {
     create_server(mcsup, fixture.dir.path(), "survival").await;
     let kit = mcsup.kit(KitConfig::default());
     for _ in 0..3 {
-        kit.backup_now("survival", BackupNow::default())
+        kit.backups()
+            .create("survival", BackupNow::default())
             .expect("backup");
     }
 
     let page = kit
-        .list_backups("survival", ListBackups::default().size(2))
+        .backups()
+        .list("survival", ListBackups::default().size(2))
         .expect("list");
     assert_eq!(page.items.len(), 2);
     assert_eq!(page.total, 3);
@@ -1043,7 +1071,8 @@ async fn install_mod_lands_in_the_mods_directory() {
     let kit = mcsup.kit(KitConfig::default());
 
     let outcome = kit
-        .install_mod("survival", "testmod", InstallMod::default())
+        .content()
+        .install("survival", "testmod", InstallMod::default())
         .await
         .expect("install");
     assert_eq!(outcome.plan.version_id, "v2", "没给版本时取最新候选");
@@ -1072,7 +1101,8 @@ async fn install_mod_dry_run_does_not_touch_disk() {
 
     let outcome = mcsup
         .kit(KitConfig::default())
-        .install_mod(
+        .content()
+        .install(
             "survival",
             "testmod",
             InstallMod::default().dry_run(true).version("v1"),
@@ -1097,13 +1127,15 @@ async fn update_mods_replaces_the_old_file() {
     let mcsup = &fixture.mcsup;
     let server_dir = create_fabric_server(mcsup, fixture.dir.path(), "survival").await;
     let kit = mcsup.kit(KitConfig::default());
-    kit.install_mod("survival", "testmod", InstallMod::default().version("v1"))
+    kit.content()
+        .install("survival", "testmod", InstallMod::default().version("v1"))
         .await
         .expect("install v1");
     assert!(server_dir.join("mods/testmod-1.0.jar").is_file());
 
     let outcome = kit
-        .update_mods("survival", UpdateMods::default())
+        .content()
+        .update("survival", UpdateMods::default())
         .await
         .expect("update");
     assert_eq!(outcome.plan.items.len(), 1, "已装的 v1 应当有更新");
@@ -1131,12 +1163,14 @@ async fn update_mods_dry_run_reports_the_plan_only() {
     let mcsup = &fixture.mcsup;
     let server_dir = create_fabric_server(mcsup, fixture.dir.path(), "survival").await;
     let kit = mcsup.kit(KitConfig::default());
-    kit.install_mod("survival", "testmod", InstallMod::default().version("v1"))
+    kit.content()
+        .install("survival", "testmod", InstallMod::default().version("v1"))
         .await
         .expect("install v1");
 
     let outcome = kit
-        .update_mods("survival", UpdateMods::default().dry_run(true))
+        .content()
+        .update("survival", UpdateMods::default().dry_run(true))
         .await
         .expect("plan update");
     assert!(outcome.applied.is_none());
@@ -1156,12 +1190,14 @@ async fn remove_mod_deletes_the_selected_file() {
     let mcsup = &fixture.mcsup;
     let server_dir = create_fabric_server(mcsup, fixture.dir.path(), "survival").await;
     let kit = mcsup.kit(KitConfig::default());
-    kit.install_mod("survival", "testmod", InstallMod::default().version("v1"))
+    kit.content()
+        .install("survival", "testmod", InstallMod::default().version("v1"))
         .await
         .expect("install");
 
     let preview = kit
-        .remove_mod(
+        .content()
+        .remove(
             "survival",
             "testmod-1.0.jar",
             RemoveMod::default().dry_run(true),
@@ -1174,7 +1210,8 @@ async fn remove_mod_deletes_the_selected_file() {
     );
 
     let removed = kit
-        .remove_mod("survival", "testmod-1.0.jar", RemoveMod::default())
+        .content()
+        .remove("survival", "testmod-1.0.jar", RemoveMod::default())
         .expect("remove");
     assert_eq!(removed.files, vec![server_dir.join("mods/testmod-1.0.jar")]);
     assert!(!removed.dry_run);
@@ -1199,7 +1236,8 @@ async fn create_server_from_modpack_uses_the_manifest() {
     let workspace_dir = fixture.dir.path().join("workspace");
     let created = mcsup
         .kit(KitConfig::default())
-        .create_server(
+        .servers()
+        .create(
             CreateServer::new("packed")
                 .workspace_dir(&workspace_dir)
                 .modpack("all-the-mods"),
@@ -1238,7 +1276,8 @@ async fn modpack_mode_rejects_a_conflicting_variant() {
     let workspace_dir = fixture.dir.path().join("workspace");
     let err = mcsup
         .kit(KitConfig::default())
-        .create_server(
+        .servers()
+        .create(
             CreateServer::new("packed")
                 .workspace_dir(&workspace_dir)
                 .modpack("all-the-mods")
@@ -1272,7 +1311,8 @@ async fn modpack_version_defaults_to_the_source_pick() {
             default_version: "latest".to_owned(),
             ..KitConfig::default()
         })
-        .create_server(
+        .servers()
+        .create(
             CreateServer::new("packed")
                 .workspace_dir(&workspace_dir)
                 .modpack("all-the-mods"),
@@ -1301,6 +1341,7 @@ async fn install_modpack_onto_existing_server_layouts_content() {
 
     let installed = mcsup
         .kit(KitConfig::default())
+        .servers()
         .install_modpack(
             "survival",
             "all-the-mods",
@@ -1360,6 +1401,7 @@ async fn install_modpack_onto_missing_server_is_rejected() {
     let err = fixture
         .mcsup
         .kit(KitConfig::default())
+        .servers()
         .install_modpack(
             "no-such-server",
             "all-the-mods",
@@ -1385,7 +1427,8 @@ async fn install_java_requires_a_major_version() {
     let err = fixture
         .mcsup
         .kit(KitConfig::default())
-        .install_java(InstallJava::default())
+        .java()
+        .install(InstallJava::default())
         .await
         .expect_err("缺大版本");
     assert!(matches!(err, KitError::MissingJavaMajor));
@@ -1405,7 +1448,8 @@ async fn install_java_registers_a_managed_runtime() {
     let kit = fixture.mcsup.kit(KitConfig::default());
 
     let outcome = kit
-        .install_java(InstallJava::default().major(JavaMajor::parse(21).expect("21")))
+        .java()
+        .install(InstallJava::default().major(JavaMajor::parse(21).expect("21")))
         .await
         .expect("install java");
     assert_eq!(outcome.runtime.major, JavaMajor::parse(21).expect("21"));
@@ -1421,7 +1465,7 @@ async fn install_java_registers_a_managed_runtime() {
         "安装目录必须是一个可用的 JVM home"
     );
 
-    let runtimes = kit.java_runtimes().expect("list");
+    let runtimes = kit.java().runtimes().expect("list");
     assert!(
         runtimes
             .iter()
@@ -1448,7 +1492,8 @@ async fn install_java_uses_config_defaults() {
     });
 
     let outcome = kit
-        .install_java(InstallJava::default())
+        .java()
+        .install(InstallJava::default())
         .await
         .expect("install");
     assert_eq!(outcome.runtime.major, JavaMajor::parse(21).expect("21"));
@@ -1464,10 +1509,12 @@ fn ensure_workspace_is_idempotent() {
     let workspace_dir = tempfile::tempdir().expect("workspace");
     let kit = mcsup.kit(KitConfig::default());
     let first = kit
-        .ensure_workspace(workspace_dir.path(), Some("main"))
+        .workspaces()
+        .ensure(workspace_dir.path(), Some("main"))
         .expect("init");
     let second = kit
-        .ensure_workspace(workspace_dir.path(), Some("main"))
+        .workspaces()
+        .ensure(workspace_dir.path(), Some("main"))
         .expect("again");
     assert_eq!(first.id, second.id);
     assert_eq!(second.name.as_str(), "main");
@@ -1479,15 +1526,17 @@ async fn creating_the_same_name_twice_is_a_conflict() {
     let (dir, mcsup, _downloader) = build(vec![Arc::new(FixedSource::vanilla())]);
     let workspace_dir: PathBuf = dir.path().join("workspace");
     let kit = mcsup.kit(KitConfig::default());
-    kit.create_server(
-        CreateServer::new("survival")
-            .workspace_dir(&workspace_dir)
-            .version("1.21.4"),
-    )
-    .await
-    .expect("first");
+    kit.servers()
+        .create(
+            CreateServer::new("survival")
+                .workspace_dir(&workspace_dir)
+                .version("1.21.4"),
+        )
+        .await
+        .expect("first");
     let err = kit
-        .create_server(
+        .servers()
+        .create(
             CreateServer::new("survival")
                 .workspace_dir(&workspace_dir)
                 .version("1.21.4"),

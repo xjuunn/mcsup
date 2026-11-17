@@ -3,7 +3,6 @@
 //! 扫描与「装哪个包」的判定都在 `service::JavaService`：来源排序、平台匹配、
 //! 解压后验 JVM home、注册都由它完成。kit 只补默认值与调用顺序。
 
-use super::Kit;
 use super::config::KitConfig;
 use super::error::KitError;
 use super::options::RunOptions;
@@ -86,7 +85,24 @@ struct ResolvedJava {
     run: RunOptions,
 }
 
-impl Kit<'_> {
+/// Java 任务句柄
+///
+/// 由 [`Kit::java`](crate::kit::Kit::java) 取得。领域模型仍以
+/// `domain::java` 的类型为准（[`JavaMajor`]、[`JavaVendor`] 等），本句柄只
+/// 负责调用顺序与默认值。
+#[derive(Clone, Copy, Debug)]
+pub struct Java<'a> {
+    core: &'a crate::bootstrap::Mcsup,
+    config: &'a KitConfig,
+}
+
+impl<'a> Java<'a> {
+    pub(super) fn new(core: &'a crate::bootstrap::Mcsup, config: &'a KitConfig) -> Self {
+        Self { core, config }
+    }
+}
+
+impl Java<'_> {
     /// 一行装 Java 运行时
     ///
     /// 下载 → 解压 → 验出 JVM home → 注册，全程走 `JavaService`；宿主用
@@ -96,10 +112,10 @@ impl Kit<'_> {
     ///
     /// 没有大版本（用法类），或来源不可达、下载 / 解压 / 注册失败时返回
     /// [`KitError`]
-    pub async fn install_java(&self, options: InstallJava) -> Result<InstallOutcome, KitError> {
-        let resolved = options.resolve(self.config())?;
+    pub async fn install(&self, options: InstallJava) -> Result<InstallOutcome, KitError> {
+        let resolved = options.resolve(self.config)?;
         Ok(self
-            .core()
+            .core
             .java
             .install(
                 resolved.major,
@@ -119,8 +135,8 @@ impl Kit<'_> {
     /// # Errors
     ///
     /// 扫描或运行时注册表读取失败时返回 [`KitError`]
-    pub fn java_runtimes(&self) -> Result<Vec<JavaRuntime>, KitError> {
-        Ok(self.core().java.list_or_scan(&mut || {}, &mut |_| {})?)
+    pub fn runtimes(&self) -> Result<Vec<JavaRuntime>, KitError> {
+        Ok(self.core.java.list_or_scan(&mut || {}, &mut |_| {})?)
     }
 }
 

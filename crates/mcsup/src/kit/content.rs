@@ -8,7 +8,6 @@
 //! 任一项失败时 `service` 返回 `UpdateAborted`（含已完成项数），kit 不吞掉
 //! 这个中间状态。
 
-use super::Kit;
 use super::config::KitConfig;
 use super::error::KitError;
 use super::options::RunOptions;
@@ -22,7 +21,7 @@ use service::{
 /// 安装内容的单次覆盖
 ///
 /// `project` 是来源（默认 Modrinth）里的项目标识或别名，由
-/// [`Kit::install_mod`] 的参数给出，不在本类型里。
+/// [`Content::install`](crate::kit::Content::install) 的参数给出，不在本类型里。
 #[derive(Clone, Debug, Default)]
 pub struct InstallMod {
     version: Option<String>,
@@ -241,7 +240,22 @@ pub struct UpdateModsOutcome {
     pub applied: Option<UpdateApplied>,
 }
 
-impl Kit<'_> {
+/// 内容任务句柄
+///
+/// 由 [`Kit::content`](crate::kit::Kit::content) 取得。
+#[derive(Clone, Copy, Debug)]
+pub struct Content<'a> {
+    core: &'a crate::bootstrap::Mcsup,
+    config: &'a KitConfig,
+}
+
+impl<'a> Content<'a> {
+    pub(super) fn new(core: &'a crate::bootstrap::Mcsup, config: &'a KitConfig) -> Self {
+        Self { core, config }
+    }
+}
+
+impl Content<'_> {
     /// 一行装一个 mod / 插件
     ///
     /// 服务端运行中会被拒绝（加载器正在读这些文件）；判定来自 `Backend` 的
@@ -251,18 +265,18 @@ impl Kit<'_> {
     ///
     /// 服务器不存在 / 不在本机 / 正在运行、没有可安装版本、下载或检查失败时
     /// 返回 [`KitError`]
-    pub async fn install_mod(
+    pub async fn install(
         &self,
         name: &str,
         project: &str,
         options: InstallMod,
     ) -> Result<InstallModOutcome, KitError> {
-        let resolved = options.resolve(self.config());
+        let resolved = options.resolve(self.config);
         let observer = options.run.observer_ref();
         let token = options.run.token();
 
         let plan = self
-            .core()
+            .core
             .mods
             .plan_install(
                 name,
@@ -283,7 +297,7 @@ impl Kit<'_> {
         }
 
         let applied = self
-            .core()
+            .core
             .mods
             .install(
                 name,
@@ -313,17 +327,17 @@ impl Kit<'_> {
     ///
     /// 服务器不存在 / 不在本机 / 正在运行、上游查询失败、下载或检查失败，
     /// 或更新中途失败时返回 [`KitError`]
-    pub async fn update_mods(
+    pub async fn update(
         &self,
         name: &str,
         options: UpdateMods,
     ) -> Result<UpdateModsOutcome, KitError> {
-        let resolved = options.resolve(self.config());
+        let resolved = options.resolve(self.config);
         let observer = options.run.observer_ref();
         let token = options.run.token();
 
         let plan = self
-            .core()
+            .core
             .mods
             .plan_update(
                 name,
@@ -345,7 +359,7 @@ impl Kit<'_> {
         }
 
         let applied = self
-            .core()
+            .core
             .mods
             .apply_update(
                 name,
@@ -367,20 +381,20 @@ impl Kit<'_> {
     ///
     /// `dry_run` 只列会删哪些文件；真正删除要求服务端已停机（模型层判定）。
     /// 移除表达「不要了」；「先留着但别加载」用 `ModService::disable`（经
-    /// [`Kit::core`]）。
+    /// [`Kit::core`](crate::kit::Kit::core)）。
     ///
     /// # Errors
     ///
     /// 服务器不存在 / 不在本机 / 正在运行、选择器未命中或命中多个、删除失败
     /// 时返回 [`KitError`]
-    pub fn remove_mod(
+    pub fn remove(
         &self,
         name: &str,
         selector: &str,
         options: RemoveMod,
     ) -> Result<ModRemoved, KitError> {
-        let (kind, dry_run) = options.resolve(self.config());
-        Ok(self.core().mods.remove(name, selector, kind, dry_run)?)
+        let (kind, dry_run) = options.resolve(self.config);
+        Ok(self.core.mods.remove(name, selector, kind, dry_run)?)
     }
 }
 
