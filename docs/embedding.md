@@ -197,6 +197,7 @@ kit.install_mod("survival", "fabric-api", InstallMod::default()).await?;   // �
 | 任务 | 方法 |
 | --- | --- |
 | 建服 / 整合包开服 | `create_server`（`CreateServer::modpack` 按清单决定 MC 版本与加载器） |
+| 整合包装已有服务器 | `install_modpack`（取回 → 装加载器核心 → 铺 overrides → 下载清单文件；建服中途失败后的重试入口） |
 | 核心 | `install_core` |
 | 生命周期 | `start_server` / `stop_server` / `restart_server` / `server_status` |
 | 删服 | `remove_server`（`purge` 才删盘，缺省只注销） |

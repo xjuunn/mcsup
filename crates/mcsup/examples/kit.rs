@@ -13,10 +13,10 @@
 
 use mcsup::bootstrap::Mcsup;
 use mcsup::domain::java::JavaMajor;
-use mcsup::domain::server::variant::ServerVariant;
 use mcsup::kit::{
-    BackupNow, CreateServer, InstallCore, InstallJava, InstallMod, KitConfig, ListBackups,
-    PruneBackups, RemoveMod, RemoveServer, RestoreBackup, StartServer, StopServer, UpdateMods,
+    BackupNow, CreateServer, InstallCore, InstallJava, InstallMod, InstallModpack, KitConfig,
+    ListBackups, PruneBackups, RemoveMod, RemoveServer, RestoreBackup, StartServer, StopServer,
+    UpdateMods,
 };
 use std::path::Path;
 
@@ -91,6 +91,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         packed.core.server.meta.variant.as_str(),
         packed.core.server.meta.version
     );
+    // 建服中途失败（记录已建、内容没装完）时，重跑这一步补装，不需要重建
+    let reinstalled = kit
+        .install_modpack("atm", "all-the-mods-10", InstallModpack::default())
+        .await?;
+    println!(
+        "modpack installed: {} {}, {} server files",
+        reinstalled.variant.as_str(),
+        reinstalled.minecraft,
+        reinstalled.applied.file_count
+    );
 
     // 6. Java：装托管运行时，再列本机可用版本
     let java = kit
@@ -109,12 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // 7. 换变体（例如从 vanilla 换到 paper）与删服
-    kit.install_core(
-        "survival",
-        InstallCore::default().variant(ServerVariant::Paper),
-    )
-    .await?;
+    // 7. 删服（缺省只注销登记，purge 才删目录）
     kit.remove_server("survival", RemoveServer::default().purge(true))?;
 
     Ok(())

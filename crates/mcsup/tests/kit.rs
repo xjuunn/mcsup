@@ -752,25 +752,25 @@ async fn install_core_replaces_the_jar_and_updates_metadata() {
     assert_eq!(fixture.downloader.calls().len(), 2, "建服 + 换核心各一次");
 }
 
-/// 换成本实例没承载的变体：用法错误，不动盘
+/// 注册表里的变体在本实例没有来源：用法错误，不动盘
 #[tokio::test]
-async fn install_core_rejects_unregistered_variant() {
-    let fixture = harness(jar_bytes(), |builder| {
-        builder.jar_sources(vec![Arc::new(FixedSource::vanilla())])
-    });
-    let mcsup = &fixture.mcsup;
-    let dir = fixture.dir.path();
-    let server_dir = create_server(mcsup, dir, "survival").await;
+async fn install_core_rejects_variant_without_source() {
+    let (dir, mcsup, _downloader) = build(vec![Arc::new(FixedSource::fabric())]);
+    let server_dir =
+        create_server_with(&mcsup, dir.path(), "survival", ServerVariant::Fabric).await;
     let before = std::fs::read(server_dir.join("server.jar")).expect("jar");
 
-    let err = mcsup
+    // 同一份数据目录、显式注入空来源集合的实例：变体查不到来源
+    // （不注入时 builder 会装真实 HTTP 来源，测试会联网）
+    let bare = McsupBuilder::new()
+        .jar_sources(Vec::new())
+        .build(dir.path())
+        .expect("bootstrap");
+    let err = bare
         .kit(KitConfig::default())
-        .install_core(
-            "survival",
-            InstallCore::default().variant(ServerVariant::Paper),
-        )
+        .install_core("survival", InstallCore::default())
         .await
-        .expect_err("没有 Paper 来源");
+        .expect_err("没有 Fabric 来源");
     assert!(matches!(err, KitError::UnsupportedVariant { .. }));
     assert_eq!(err.category(), ErrorCategory::Usage);
     assert_eq!(
@@ -1280,6 +1280,100 @@ async fn modpack_version_defaults_to_the_source_pick() {
         .await
         .expect("create");
     assert_eq!(created.core.server.meta.version.as_str(), "1.21.1");
+}
+
+/// 把整合包装到已有服务器（建服中途失败后的重试入口）：只布置，不重建
+#[tokio::test]
+async fn install_modpack_onto_existing_server_layouts_content() {
+    let fixture = harness(jar_bytes(), |builder| {
+        builder
+            .jar_sources(vec![Arc::new(FixedSource::fabric())])
+            .modpack_sources(vec![Arc::new(FakeModpackSource::new())])
+            .modpack_extractor(Arc::new(FakeModpackExtractor {
+                index: modpack_index(),
+                overrides: vec![("server.properties", b"motd=pack\n")],
+            }))
+    });
+    let mcsup = &fixture.mcsup;
+    // 先建一台普通服，再往它上面装整合包
+    let server_dir = create_fabric_server(mcsup, fixture.dir.path(), "survival").await;
+    let before = fixture.downloader.calls().len();
+
+    let installed = mcsup
+        .kit(KitConfig::default())
+        .install_modpack(
+            "survival",
+            "all-the-mods",
+            mcsup::kit::InstallModpack::default(),
+        )
+        .await
+        .expect("install modpack");
+
+    assert_eq!(
+        installed.variant,
+        ServerVariant::Fabric,
+        "清单加载器决定变体"
+    );
+    assert_eq!(installed.minecraft, "1.21.1");
+    assert!(
+        server_dir.join("config/x.toml").is_file(),
+        "清单里的服务端文件必须落盘"
+    );
+    assert_eq!(
+        std::fs::read_to_string(server_dir.join("server.properties")).expect("overrides"),
+        "motd=pack\n"
+    );
+    assert_eq!(
+        mcsup
+            .registry
+            .get("survival")
+            .expect("server")
+            .meta
+            .version
+            .as_str(),
+        "1.21.1",
+        "core 元数据必须写回清单里的 MC 版本"
+    );
+    // 重试口径：清单归档 + 加载器核心 + 清单里的一个文件，各下载一次
+    assert_eq!(
+        fixture.downloader.calls().len() - before,
+        3,
+        "整合包只下清单、核心与清单文件各一次"
+    );
+    let staging =
+        std::env::temp_dir().join(format!("mcsup-kit-modpack-{}-survival", std::process::id()));
+    assert!(!staging.exists(), "暂存目录必须清掉");
+}
+
+/// 装整合包的服务器不存在：装核心那一步如实报错，不留半成品
+#[tokio::test]
+async fn install_modpack_onto_missing_server_is_rejected() {
+    let fixture = harness(jar_bytes(), |builder| {
+        builder
+            .jar_sources(vec![Arc::new(FixedSource::fabric())])
+            .modpack_sources(vec![Arc::new(FakeModpackSource::new())])
+            .modpack_extractor(Arc::new(FakeModpackExtractor {
+                index: modpack_index(),
+                overrides: Vec::new(),
+            }))
+    });
+    let err = fixture
+        .mcsup
+        .kit(KitConfig::default())
+        .install_modpack(
+            "no-such-server",
+            "all-the-mods",
+            mcsup::kit::InstallModpack::default(),
+        )
+        .await
+        .expect_err("服务器不存在");
+    // 服务器不存在在取回之前就查出，不会先下一个整包才报错
+    assert!(matches!(err, KitError::Registry(_)));
+    assert_eq!(err.category(), ErrorCategory::NotFound);
+    assert!(
+        fixture.downloader.calls().is_empty(),
+        "拒绝必须发生在任何下载之前"
+    );
 }
 
 // ---------------------------------------------------------------- Java

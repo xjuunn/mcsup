@@ -68,7 +68,10 @@ pub use error::KitError;
 pub use java::InstallJava;
 pub use mod_::{InstallMod, InstallModOutcome, RemoveMod, UpdateMods, UpdateModsOutcome};
 pub use options::RunOptions;
-pub use server::{CreateServer, CreatedServer, InstallCore, RemoveServer, StartServer, StopServer};
+pub use server::{
+    CreateServer, CreatedServer, InstallCore, InstallModpack, ModpackInstallOutcome, RemoveServer,
+    StartServer, StopServer,
+};
 
 use crate::bootstrap::Mcsup;
 

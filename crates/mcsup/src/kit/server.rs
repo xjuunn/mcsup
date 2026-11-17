@@ -13,7 +13,8 @@ use domain::server::version::VersionId;
 use domain::workspace::Workspace;
 use port::{ScannedJava, StopOutcome, SupervisorStartOutcome, SupervisorStatus};
 use service::{
-    InitOutcome, InstalledServerJar, ModpackInstallOptions, ModpackPrepared, ServerRemoveOutcome,
+    InitOutcome, InstalledServerJar, ModpackApplied, ModpackInstallOptions, ModpackPrepared,
+    ServerRemoveOutcome,
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -263,6 +264,53 @@ pub struct CreatedServer {
     pub started: Option<SupervisorStartOutcome>,
 }
 
+/// 整合包装到**已有服务器**的单次覆盖
+///
+/// 与 [`CreateServer::modpack`] 的区别：不建注册记录，只做「取回清单 → 装加载器
+/// 核心 → 铺 overrides → 下载清单文件」。建服中途失败（记录已建、核心或文件
+/// 没装完）时，用这个入口重试，不需要重建服务器。
+#[derive(Clone, Debug, Default)]
+pub struct InstallModpack {
+    version: Option<String>,
+    source: Option<String>,
+    run: RunOptions,
+}
+
+impl InstallModpack {
+    /// 包版本 ID；缺省由来源挑最新正式版
+    #[must_use]
+    pub fn version(mut self, version: impl Into<String>) -> Self {
+        self.version = Some(version.into());
+        self
+    }
+
+    /// 整合包来源名（如 `modrinth`）；缺省用注册表默认来源
+    #[must_use]
+    pub fn source(mut self, source: impl Into<String>) -> Self {
+        self.source = Some(source.into());
+        self
+    }
+
+    /// 进度观察者与取消令牌
+    #[must_use]
+    pub fn run(mut self, run: RunOptions) -> Self {
+        self.run = run;
+        self
+    }
+}
+
+/// 整合包安装到已有服务器的结果
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct ModpackInstallOutcome {
+    /// 清单声明的加载器对应的服务端变体
+    pub variant: ServerVariant,
+    /// 清单声明的 Minecraft 版本
+    pub minecraft: String,
+    /// 布置结果（overrides / 清单文件 / 复核）
+    pub applied: ModpackApplied,
+}
+
 /// 起服任务的单次覆盖
 #[derive(Clone, Default)]
 pub struct StartServer {
@@ -273,7 +321,6 @@ pub struct StartServer {
     supervisor_args: Option<Vec<OsString>>,
     on_first_scan: Option<FirstScanListener>,
     on_found: Option<JavaFoundListener>,
-    run: RunOptions,
 }
 
 impl StartServer {
@@ -328,13 +375,6 @@ impl StartServer {
         self
     }
 
-    /// 取消令牌与观察者（起服本身不产生字节进度，观察者仅透传）
-    #[must_use]
-    pub fn run(mut self, run: RunOptions) -> Self {
-        self.run = run;
-        self
-    }
-
     /// 与默认策略合并（纯计算，不碰 IO）
     fn resolve(
         &self,
@@ -374,7 +414,6 @@ impl std::fmt::Debug for StartServer {
             .field("supervisor_args", &self.supervisor_args)
             .field("on_first_scan", &self.on_first_scan.is_some())
             .field("on_found", &self.on_found.is_some())
-            .field("run", &self.run)
             .finish()
     }
 }
@@ -415,12 +454,12 @@ impl StopServer {
 
 /// 装 / 换核心的单次覆盖
 ///
-/// 三项缺省都沿用注册表里的记录：`InstallCore::default()` 等于「按原样重装」。
+/// 版本缺省沿用注册表记录：`InstallCore::default()` 等于「按原样重装」。变体
+/// 始终取注册表记录——服务层没有「改注册变体」这一步，换变体请新建服务器
+/// （[`CreateServer::variant`]）。
 #[derive(Clone, Debug, Default)]
 pub struct InstallCore {
     version: Option<String>,
-    variant: Option<ServerVariant>,
-    java_major: Option<JavaMajor>,
     run: RunOptions,
 }
 
@@ -429,20 +468,6 @@ impl InstallCore {
     #[must_use]
     pub fn version(mut self, version: impl Into<String>) -> Self {
         self.version = Some(version.into());
-        self
-    }
-
-    /// 换一个服务端变体（如从 vanilla 换到 paper）；缺省用注册表记录
-    #[must_use]
-    pub fn variant(mut self, variant: ServerVariant) -> Self {
-        self.variant = Some(variant);
-        self
-    }
-
-    /// 回写核心元数据时记录的 Java 大版本；缺省用注册表记录
-    #[must_use]
-    pub fn java_major(mut self, major: JavaMajor) -> Self {
-        self.java_major = Some(major);
         self
     }
 
@@ -460,7 +485,6 @@ impl InstallCore {
                 self.version
                     .unwrap_or_else(|| server.meta.version.as_str().to_owned()),
             ),
-            variant: self.variant.unwrap_or_else(|| server.meta.variant.clone()),
             run: self.run,
         }
     }
@@ -469,7 +493,6 @@ impl InstallCore {
 /// 合并后的核心安装参数
 struct ResolvedCore {
     version: VersionId,
-    variant: ServerVariant,
     run: RunOptions,
 }
 
@@ -517,8 +540,9 @@ impl Kit<'_> {
     /// `ServerInstaller` 下载校验，安装器类变体按起服同一口径挑 Java，起服
     /// 判定由生命周期服务给出。kit 只决定顺序与默认值。
     ///
-    /// **部分失败**：登记成功、装核心失败时服务器记录与目录会保留（与 CLI
-    /// 一致），重试 `install` 即可，不需要重建；本函数不会替你删目录。
+    /// **部分失败**：登记成功、装核心或布置失败时服务器记录与目录都会保留
+    /// （与 CLI 一致），不需要重建：普通建法重试 [`Self::install_core`]，整合包
+    /// 建法重试 [`Self::install_modpack`]。本函数不会替你删目录。
     ///
     /// # Errors
     ///
@@ -538,7 +562,6 @@ impl Kit<'_> {
             supervisor_args: None,
             on_first_scan: None,
             on_found: None,
-            run: resolved.run.clone(),
         });
         if let Some(request) = &start_request {
             request.resolve(self.config(), mcsup.has_external_supervisor())?;
@@ -604,7 +627,7 @@ impl Kit<'_> {
             .await?;
 
         // 整合包：核心就位后铺 overrides、按清单下载文件。失败时服务器与
-        // 核心都保留（重试入口是 `install_modpack` 语义的 `server install`）
+        // 核心都保留，重试入口就是 [`Self::install_modpack`]
         if let Some(pack) = &prepared {
             let progress = resolved
                 .run
@@ -625,11 +648,91 @@ impl Kit<'_> {
         Ok(CreatedServer { core, started })
     }
 
+    /// 把整合包装到**已有服务器**：取回清单 → 装加载器核心 → 铺 overrides →
+    /// 下载清单文件
+    ///
+    /// 与 [`CreateServer::modpack`] 的「建服」不同，这里不新建注册记录，只完成
+    /// 布置。主要用途是**重试**：建服中途失败时记录已落库、核心或文件没装完，
+    /// 重跑本方法即可，不需要重建服务器。
+    ///
+    /// 清单里的 MC 版本会写回核心元数据（`install_jar_checked` 同一条链路）；
+    /// 加载器核心来源按清单声明的变体挑选，本实例没承载该变体时返回用法错误。
+    ///
+    /// 注册记录里的变体不会被改写（与 CLI 的 `server install` 同一口径，服务层
+    /// 没有改变体这一步）。因此目标服务器的变体必须与清单加载器一致——建服时
+    /// 已由清单写入，重试天然满足；要换成别的加载器请新建服务器。
+    ///
+    /// # Errors
+    ///
+    /// 服务器不存在 / 运行中、变体没有来源、下载 / 校验 / 安装器 / 布置失败时
+    /// 返回 [`KitError`]
+    pub async fn install_modpack(
+        &self,
+        name: &str,
+        project: &str,
+        options: InstallModpack,
+    ) -> Result<ModpackInstallOutcome, KitError> {
+        let mcsup = self.core();
+        // 先确认目标存在：否则会先下完整包才因为「服务器不存在」失败
+        let server = mcsup.registry.get(name)?;
+
+        let dir = staging_dir(name);
+        std::fs::create_dir_all(&dir).map_err(|source| KitError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        let staging = StagingGuard(dir.clone());
+
+        let token = options.run.token();
+        let mut pack_options = ModpackInstallOptions::new(&dir);
+        if let Some(version) = &options.version {
+            pack_options = pack_options.version(version);
+        }
+        if let Some(source) = &options.source {
+            pack_options = pack_options.source(source);
+        }
+        if let Some(observer) = options.run.observer_ref() {
+            pack_options = pack_options.progress(observer);
+        }
+        let prepared = mcsup.modpack.prepare(project, pack_options, &token).await?;
+
+        // 清单决定加载器核心：先装核心（此步同时写回 MC 版本元数据），再布置
+        let variant = prepared.require_loader()?;
+        let core_version = VersionId::new(prepared.minecraft_version()?);
+        let source = self.core_source(&variant)?;
+        self.install_core_inner(
+            name,
+            source,
+            &core_version,
+            variant.needs_installer(),
+            &options.run,
+        )
+        .await?;
+
+        let progress = options
+            .run
+            .observer_ref()
+            .map(|observer| observer as &dyn port::ProgressSink);
+        let applied = mcsup
+            .modpack
+            .apply(&prepared, &server.dir, progress, &token)
+            .await?;
+        drop(staging);
+
+        Ok(ModpackInstallOutcome {
+            variant,
+            minecraft: core_version.to_string(),
+            applied,
+        })
+    }
+
     /// 一行装 / 换核心（已有服务器）
     ///
     /// 运行中换核心会被拒绝（Linux 上 rename 成功但 JVM 仍用旧 inode），判定在
-    /// `service`。版本、变体与 Java 大版本缺省沿用注册表记录，因此
+    /// `service`。版本缺省沿用注册表记录，因此
     /// `kit.install_core("survival", InstallCore::default())` 就是「按原样重装」。
+    /// 变体取自注册表记录（服务层不提供改注册变体），记录里的 Java 大版本由
+    /// 核心元数据（来源给出的要求）回写。
     ///
     /// # Errors
     ///
@@ -641,13 +744,14 @@ impl Kit<'_> {
         options: InstallCore,
     ) -> Result<InstalledServerJar, KitError> {
         let server = self.core().registry.get(name)?;
+        let variant = server.meta.variant.clone();
         let resolved = options.resolve(&server);
-        let source = self.core_source(&resolved.variant)?;
+        let source = self.core_source(&variant)?;
         self.install_core_inner(
             name,
             source,
             &resolved.version,
-            resolved.variant.needs_installer(),
+            variant.needs_installer(),
             &resolved.run,
         )
         .await
