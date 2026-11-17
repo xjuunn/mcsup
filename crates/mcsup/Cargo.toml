@@ -74,6 +74,11 @@ remote = [
     "dep:serde",
     "dep:serde_json",
 ]
+# 任务级接口：在默认组合根之上再加一层「一行完成多步编排」的默认策略
+#
+# 只引用 `bootstrap` 已经拉入的能力，不引入新的内层 crate；开本 feature
+# 同时具备 `Mcsup` 与 `Kit`。
+kit = ["bootstrap"]
 # 默认组合根：一次装配全部默认实现（storage/service/file/java/provider/runtime）
 bootstrap = [
     "dep:storage",
@@ -97,4 +102,12 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dev-dependencies]
+async-trait.workspace = true
+# zip 的 deflate-flate2 需要具体 zlib 后端；与 file / provider 一样取 flate2 默认的
+# rust_backend（纯 Rust），不额外引入 C 依赖
+flate2 = "1.1.10"
 tempfile.workspace = true
+testkit = { package = "mcsup-testkit", path = "../testkit" }
+tokio = { workspace = true, features = ["macros", "rt"] }
+url.workspace = true
+zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2"] }

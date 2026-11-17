@@ -7,6 +7,13 @@
 
 ### 新增
 
+- 门面 `kit` feature：`crates/mcsup/src/kit` 提供任务级接口（`Mcsup::kit`）。
+  `create_server` 一次完成建目录 / 入库 / 装核心 /（可选）起服；另有
+  `start_server` / `stop_server` / `server_status` / `backup_now` /
+  `install_mod` / `ensure_workspace`。配置分三层（单次覆盖 > `KitConfig` >
+  默认值），默认不代接受 EULA、不自动起服。
+- `Mcsup::has_external_supervisor`：装配时记录宿主是否注入了 supervisor /
+  backend，任务级接口据此决定 `supervisor_exe` 是否必填。
 - `apps/bench`：CAS 读写、目录扫描、快照清单编解码的 criterion 基准。
 - `fuzz/`：`parse_rel_path`、`parse_snapshot_id`、`parse_content_hash` 三个
   fuzz 目标，以及 CI 的 `fuzz`（G7）与 `coverage`（G5）job。

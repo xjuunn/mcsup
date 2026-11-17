@@ -1837,6 +1837,8 @@ dependencies = [
 name = "mcsup"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "flate2",
  "mcsup-auth",
  "mcsup-backend",
  "mcsup-backup",
@@ -1850,6 +1852,7 @@ dependencies = [
  "mcsup-runtime",
  "mcsup-service",
  "mcsup-storage",
+ "mcsup-testkit",
  "mcsup-transport",
  "serde",
  "serde_json",
@@ -1857,6 +1860,8 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "url",
+ "zip",
 ]
 
 [[package]]

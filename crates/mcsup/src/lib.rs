@@ -21,6 +21,11 @@
 #[cfg_attr(docsrs, doc(cfg(feature = "bootstrap")))]
 pub mod bootstrap;
 
+/// 任务级接口：一行完成「建服 + 装核心 + 起服」「备份」「装 mod」等多步编排
+#[cfg(feature = "kit")]
+#[cfg_attr(docsrs, doc(cfg(feature = "kit")))]
+pub mod kit;
+
 /// 被连接端：`transport::Handler` 的完整实现（`mcsup remote serve` 与 `mcsup-agent` 共用）
 #[cfg(feature = "remote")]
 #[cfg_attr(docsrs, doc(cfg(feature = "remote")))]

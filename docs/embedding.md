@@ -172,6 +172,49 @@ impl Mcsup {
 - 需要宿主实现的 trait 不加 sealed。
 - 不使用 glob 重导出（`pub use crate::runtime::*` 会把内部结构变成公共 API）。
 
+## 任务级接口（kit）
+
+门面除了「装配」（`Mcsup`），还提供「一次调用完成一条任务」（`Kit`）。
+它解决的是采用门槛：第三方要的是「起一台服」「备份一次」，而不是先读懂
+注册表、安装器、Java 选择、`save-off` 时序。
+
+```rust
+use std::path::Path;
+use mcsup::bootstrap::Mcsup;
+use mcsup::kit::{BackupNow, CreateServer, InstallMod, KitConfig};
+
+let core = Mcsup::open(Path::new("/srv/mcsup"))?;
+let kit = core.kit(KitConfig { accept_eula: true, ram_mib: Some(4096), ..Default::default() });
+
+kit.create_server(CreateServer::new("survival").version("1.21.4")).await?; // 建目录 + 入库 + 装核心 + 起服
+kit.backup_now("survival", BackupNow::default())?;                         // save-off → flush → 快照 → save-on
+kit.install_mod("survival", "fabric-api", InstallMod::default()).await?;   // 计划 → 下载 → 检查 → 原子换入
+```
+
+三层配置，`Option` 表示「这次不覆盖」：
+
+```
+单次调用显式设置 > KitConfig（实例级默认）> KitConfig::default()
+```
+
+`KitConfig` 的默认值是保守的：不代接受 EULA、不自动起服、不跳过 mod 预检。
+需要「建完起服」时显式打开 `accept_eula` / `start_after_create`，库不替调用方
+做法律与安全决定。
+
+边界：
+
+- 判定仍在 `domain` / `service`。kit 只决定调用顺序与默认值，不写第二套规则。
+- `Kit::core()` 回到底层组合根；没被 kit 包住的操作照旧直接调 service。
+- 长任务接受 `RunOptions`（`port::TaskObserver` + `CancellationToken`），
+  进度与取消不因走 kit 而消失；`dry_run` 保留两阶段语义。
+- 同步 / 异步与 service 保持一致：`create_server` / `install_mod` 是 async
+  （要联网），`backup_now` / 起停 / 查状态是阻塞调用，异步宿主自行
+  `spawn_blocking`。
+
+新增一条任务的做法：选项类型与 `impl Kit` 放 `crates/mcsup/src/kit/<任务>.rs`，
+在 `kit/mod.rs` 重导出；选项字段全用 `Option`，在私有 `resolve` 里与
+`KitConfig` 合并（纯计算，可单测）。新增内层 crate 时不需要改动这里。
+
 ## 对外契约
 
 机器接口（CLI JSON、API 的 REST 与 WebSocket、MCP）共享同一套类型，来自
@@ -313,6 +356,7 @@ transport = ["dep:transport", "protocol"]
 auth     = ["dep:auth"]
 bootstrap = ["storage", "service", "backup", "backend", "file", "java",
              "modkit", "provider", "runtime", "port", "protocol", "transport"]
+kit      = ["bootstrap"]        # 任务级接口：只加编排，不加内层 crate
 remote    = ["bootstrap", "transport", "runtime", "auth", "service", "protocol"]
 ```
 
@@ -324,9 +368,9 @@ feature 级联、`lib.rs` 的 `pub use`。内层互依同样使用
 `package = "mcsup-*", version, path`；`scripts/bump-version.sh` 负责同步
 根版本与这些 version 字面量。
 
-组合 feature 现有两个：`bootstrap`（默认组合根，见下）与 `remote`（被连接端）。
-两者都已加入 `facade_allow`，`check-architecture.sh` 的 feature_bundles 会一并
-校验。`minimal` / `full` 尚未声明，新增时同样要入表。
+组合 feature 现有三个：`bootstrap`（默认组合根，见下）、`kit`（任务级接口）、
+`remote`（被连接端）。三者都已加入 `facade_allow`，`check-architecture.sh` 的
+feature_bundles 会一并校验。`minimal` / `full` 尚未声明，新增时同样要入表。
 
 feature 语义必须机器校验。如果 `file` 硬依赖 `provider`，那
 `features = ["file"]` 会把 `reqwest` 拉进来，这个 feature 就是假的。
@@ -384,7 +428,8 @@ service、file、java、provider、storage、runtime（内层 crate + 门面 fea
 start·stop·restart·status·console·send·logs 已接通，`workspace doctor` 体检已接通，
 其余命令为桩）、
 门面 `bootstrap` 组合根（`McsupBuilder`，CLI 已改走）、CLI JSON 行类型
-收敛（`protocol::cli`，apps/cli 全部命令已切换）。
+收敛（`protocol::cli`，apps/cli 全部命令已切换）、门面 `kit` 任务级接口
+（建服 + 装核心 + 起服、起停查状态、建快照、装内容；默认策略见上一节）。
 后续按序：
 
 ```

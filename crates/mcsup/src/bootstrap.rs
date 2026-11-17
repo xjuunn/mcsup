@@ -105,6 +105,12 @@ pub struct Mcsup {
     /// 具体存储类型是实现细节，对外只经 [`McsupBuilder::server_repository`]
     /// / [`McsupBuilder::workspace_repository`] 的 trait 注入口替换。
     store: Arc<JsonStore>,
+    /// 宿主是否注入了自己的 supervisor / backend
+    ///
+    /// 默认 supervisor 靠拉起 `supervisor_exe` 子进程工作；注入过的一方自己
+    /// 解释这个路径，任务级接口（[`crate::kit`]）据此区分「必须配 exe」与
+    /// 「不用配」。
+    external_supervisor: bool,
 }
 
 impl std::fmt::Debug for Mcsup {
@@ -143,6 +149,15 @@ impl Mcsup {
             source,
         })?;
         Ok(root)
+    }
+
+    /// 宿主是否接管了 supervisor / backend
+    ///
+    /// 返回 `true` 时，启动服务器的 `supervisor_exe` 不再是必填项——路径由
+    /// 宿主实现解释，默认 `LocalSupervisor` 的 `__supervise` 约定不适用。
+    #[must_use]
+    pub fn has_external_supervisor(&self) -> bool {
+        self.external_supervisor
     }
 }
 
@@ -483,6 +498,9 @@ impl McsupBuilder {
             Arc::clone(&servers_repo),
             Arc::clone(&workspaces_repo),
         ));
+        // 注入过 supervisor 或整个 backend 都算「宿主接管进程生命周期」，
+        // 任务级接口据此不再要求 supervisor_exe
+        let external_supervisor = self.supervisor.is_some() || self.backend.is_some();
         let supervisor: Arc<dyn port::SupervisorPort> = self
             .supervisor
             .unwrap_or_else(|| Arc::new(runtime::LocalSupervisor));
@@ -574,6 +592,7 @@ impl McsupBuilder {
             mods,
             downloader,
             store,
+            external_supervisor,
         })
     }
 
