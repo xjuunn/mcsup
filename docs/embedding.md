@@ -181,15 +181,34 @@ impl Mcsup {
 ```rust
 use std::path::Path;
 use mcsup::bootstrap::Mcsup;
-use mcsup::kit::{BackupNow, CreateServer, InstallMod, KitConfig};
+use mcsup::kit::{CreateServer, InstallMod, KitConfig};
 
+# async fn demo() -> Result<(), Box<dyn std::error::Error>> {
 let core = Mcsup::open(Path::new("/srv/mcsup"))?;
 let kit = core.kit(KitConfig { accept_eula: true, ram_mib: Some(4096), ..Default::default() });
 
-kit.create_server(CreateServer::new("survival").version("1.21.4")).await?; // 建目录 + 入库 + 装核心 + 起服
-kit.backup_now("survival", BackupNow::default())?;                         // save-off → flush → 快照 → save-on
+kit.create_server(CreateServer::new("survival").version("1.21.4")).await?; // 建目录 + 入库 + 装核心 +（可选）起服
 kit.install_mod("survival", "fabric-api", InstallMod::default()).await?;   // 计划 → 下载 → 检查 → 原子换入
+# Ok(()) }
 ```
+
+完整可运行的调用顺序见 `crates/mcsup/examples/kit.rs`。接口按任务分组：
+
+| 任务 | 方法 |
+| --- | --- |
+| 建服 / 整合包开服 | `create_server`（`CreateServer::modpack` 按清单决定 MC 版本与加载器） |
+| 核心 | `install_core` |
+| 生命周期 | `start_server` / `stop_server` / `restart_server` / `server_status` |
+| 删服 | `remove_server`（`purge` 才删盘，缺省只注销） |
+| 备份 | `backup_now` / `list_backups` / `verify_backup` / `restore_backup` / `delete_backup` / `prune_backups` |
+| 内容 | `install_mod` / `update_mods` / `remove_mod` |
+| Java | `install_java` / `java_runtimes` |
+| 工作目录 | `ensure_workspace` |
+
+`install_mod` / `update_mods` 保留两阶段语义：`dry_run` 只返回计划。整合包
+建服的显式 `variant` 必须与整合包模式一致，否则返回 `KitError::ConflictingVariant`；
+`install_java` 的大版本既不来自单次调用也不来自 `KitConfig::java_major` 时返回
+`KitError::MissingJavaMajor`——不猜版本。
 
 三层配置，`Option` 表示「这次不覆盖」：
 
@@ -197,9 +216,9 @@ kit.install_mod("survival", "fabric-api", InstallMod::default()).await?;   // �
 单次调用显式设置 > KitConfig（实例级默认）> KitConfig::default()
 ```
 
-`KitConfig` 的默认值是保守的：不代接受 EULA、不自动起服、不跳过 mod 预检。
-需要「建完起服」时显式打开 `accept_eula` / `start_after_create`，库不替调用方
-做法律与安全决定。
+`KitConfig` 的默认值是保守的：不代接受 EULA、不自动起服、不跳过 mod 预检、
+不默认安装 Java 大版本。需要「建完起服」时显式打开 `accept_eula` /
+`start_after_create`，库不替调用方做法律与安全决定。
 
 边界：
 

@@ -1,4 +1,4 @@
-//! 服务器任务：建服 + 装核心、起服、停服、状态
+//! 服务器任务：建服（含整合包）、装 / 换核心、起停查状态、删服
 //!
 //! 这里只有「按什么顺序调 service」和「默认值从哪来」。状态判定、EULA 写入、
 //! 核心可行性、运行中拒改磁盘都在 `service` / `domain`，kit 不复制任何一条。
@@ -12,7 +12,9 @@ use domain::server::variant::ServerVariant;
 use domain::server::version::VersionId;
 use domain::workspace::Workspace;
 use port::{ScannedJava, StopOutcome, SupervisorStartOutcome, SupervisorStatus};
-use service::{InitOutcome, InstalledServerJar};
+use service::{
+    InitOutcome, InstalledServerJar, ModpackInstallOptions, ModpackPrepared, ServerRemoveOutcome,
+};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,7 +31,14 @@ type JavaFoundListener = Arc<dyn Fn(&ScannedJava) + Send + Sync>;
 /// [`CreateServer::default`] 不提供名字，直接调用会得到
 /// [`KitError::MissingName`]。
 ///
+/// 两种建法共用同一个入口：
+///
+/// - 普通核心：`variant` 决定加载器，`version` 是 MC 版本
+/// - 整合包：给 [`Self::modpack`]，此时 `version` 是**整合包版本 ID**，
+///   MC 版本与加载器由包内清单决定
+///
 /// ```no_run
+/// use mcsup::domain::server::variant::ServerVariant;
 /// use mcsup::kit::CreateServer;
 ///
 /// // 名字必填，其余取默认
@@ -38,7 +47,9 @@ type JavaFoundListener = Arc<dyn Fn(&ScannedJava) + Send + Sync>;
 /// let tuned = CreateServer::default()
 ///     .name("creative")
 ///     .version("1.21.4")
-///     .variant(mcsup::domain::server::variant::ServerVariant::Paper);
+///     .variant(ServerVariant::Paper);
+/// // 按整合包建服：加载器与 MC 版本取自清单
+/// let packed = CreateServer::new("atm").modpack("all-the-mods-10");
 /// ```
 #[derive(Clone, Debug, Default)]
 pub struct CreateServer {
@@ -51,6 +62,8 @@ pub struct CreateServer {
     start: Option<bool>,
     accept_eula: Option<bool>,
     ram_mib: Option<u32>,
+    modpack: Option<String>,
+    modpack_source: Option<String>,
     run: RunOptions,
 }
 
@@ -72,9 +85,29 @@ impl CreateServer {
     }
 
     /// 版本；缺省用 [`KitConfig::default_version`]（默认 `latest`）
+    ///
+    /// 整合包模式下这里给的是**整合包版本 ID**，不是 MC 版本。
     #[must_use]
     pub fn version(mut self, version: impl Into<String>) -> Self {
         self.version = Some(version.into());
+        self
+    }
+
+    /// 按整合包建服：`project` 是来源里的项目 ID / slug
+    ///
+    /// 给本项后流程变为「取回清单 → 按清单落库 → 装加载器核心 → 铺 overrides
+    /// → 下载清单文件」。显式 `variant` 必须与整合包模式一致，否则拒绝——
+    /// 静默忽略调用方的变体只会让人以为装的是自己指定的加载器。
+    #[must_use]
+    pub fn modpack(mut self, project: impl Into<String>) -> Self {
+        self.modpack = Some(project.into());
+        self
+    }
+
+    /// 整合包来源名（如 `modrinth`）；缺省用注册表默认来源
+    #[must_use]
+    pub fn modpack_source(mut self, source: impl Into<String>) -> Self {
+        self.modpack_source = Some(source.into());
         self
     }
 
@@ -149,12 +182,26 @@ impl CreateServer {
         if start && !accept_eula {
             return Err(KitError::EulaNotAccepted);
         }
+        // 整合包模式下加载器由清单决定；显式给了别的变体是调用方搞错了对象
+        if let Some(variant) = &self.variant
+            && self.modpack.is_some()
+            && !service::is_modpack_variant(variant)
+        {
+            return Err(KitError::ConflictingVariant {
+                variant: variant.as_str().to_owned(),
+            });
+        }
+        let explicit_version = self.version;
+        let modpack = self.modpack.map(|project| ModpackRequest {
+            project,
+            // 没给版本时交给来源挑最新正式版；不能拿配置里的 `latest`
+            // 当包版本 ID，那是一个不存在的版本
+            version: explicit_version.clone(),
+            source: self.modpack_source,
+        });
         Ok(ResolvedCreate {
             name,
-            version: VersionId::new(
-                self.version
-                    .unwrap_or_else(|| config.default_version.clone()),
-            ),
+            version: explicit_version.unwrap_or_else(|| config.default_version.clone()),
             variant: self.variant.unwrap_or_else(|| config.variant.clone()),
             workspace: self.workspace.or_else(|| config.workspace.clone()),
             workspace_dir: self.workspace_dir,
@@ -162,16 +209,27 @@ impl CreateServer {
             accept_eula,
             start,
             ram_mib: self.ram_mib.or(config.ram_mib),
+            modpack,
             run: self.run,
         })
     }
+}
+
+/// 整合包建服的输入
+#[derive(Debug, Clone)]
+struct ModpackRequest {
+    project: String,
+    /// 包版本 ID；`None` 由来源挑最新正式版
+    version: Option<String>,
+    source: Option<String>,
 }
 
 /// 合并后的建服参数
 #[derive(Debug)]
 struct ResolvedCreate {
     name: String,
-    version: VersionId,
+    /// 普通建法的 MC 版本（整合包模式不使用，见 `modpack`）
+    version: String,
     variant: ServerVariant,
     workspace: Option<String>,
     workspace_dir: Option<PathBuf>,
@@ -179,7 +237,20 @@ struct ResolvedCreate {
     accept_eula: bool,
     start: bool,
     ram_mib: Option<u32>,
+    modpack: Option<ModpackRequest>,
     run: RunOptions,
+}
+
+/// 建服前取回的整合包暂存目录：离开作用域即删除
+///
+/// 只删自己建的目录。归档可能由调用方从别处传入，按 `archive.parent()` 推断
+/// 会连带删掉用户文件——这条与 CLI 的处置一致。
+struct StagingGuard(PathBuf);
+
+impl Drop for StagingGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// 建服结果
@@ -342,6 +413,103 @@ impl StopServer {
     }
 }
 
+/// 装 / 换核心的单次覆盖
+///
+/// 三项缺省都沿用注册表里的记录：`InstallCore::default()` 等于「按原样重装」。
+#[derive(Clone, Debug, Default)]
+pub struct InstallCore {
+    version: Option<String>,
+    variant: Option<ServerVariant>,
+    java_major: Option<JavaMajor>,
+    run: RunOptions,
+}
+
+impl InstallCore {
+    /// 目标 MC 版本（也是来源解析的版本参数）；缺省用注册表记录
+    #[must_use]
+    pub fn version(mut self, version: impl Into<String>) -> Self {
+        self.version = Some(version.into());
+        self
+    }
+
+    /// 换一个服务端变体（如从 vanilla 换到 paper）；缺省用注册表记录
+    #[must_use]
+    pub fn variant(mut self, variant: ServerVariant) -> Self {
+        self.variant = Some(variant);
+        self
+    }
+
+    /// 回写核心元数据时记录的 Java 大版本；缺省用注册表记录
+    #[must_use]
+    pub fn java_major(mut self, major: JavaMajor) -> Self {
+        self.java_major = Some(major);
+        self
+    }
+
+    /// 进度观察者与取消令牌
+    #[must_use]
+    pub fn run(mut self, run: RunOptions) -> Self {
+        self.run = run;
+        self
+    }
+
+    /// 与注册表记录合并（纯计算）
+    fn resolve(self, server: &service::RegisteredServer) -> ResolvedCore {
+        ResolvedCore {
+            version: VersionId::new(
+                self.version
+                    .unwrap_or_else(|| server.meta.version.as_str().to_owned()),
+            ),
+            variant: self.variant.unwrap_or_else(|| server.meta.variant.clone()),
+            run: self.run,
+        }
+    }
+}
+
+/// 合并后的核心安装参数
+struct ResolvedCore {
+    version: VersionId,
+    variant: ServerVariant,
+    run: RunOptions,
+}
+
+/// 删除服务器的单次覆盖
+///
+/// 删除只注销登记；`purge` 才删目录。运行中一律拒绝（由 `service` 判定）。
+#[derive(Clone, Debug, Default)]
+pub struct RemoveServer {
+    purge: Option<bool>,
+    cwd: Option<PathBuf>,
+}
+
+impl RemoveServer {
+    /// 同时删除服务器目录；缺省只注销登记
+    ///
+    /// 链接服务器不能带 `purge`（目标在工作区外），由 `service` 拒绝。
+    #[must_use]
+    pub fn purge(mut self, purge: bool) -> Self {
+        self.purge = Some(purge);
+        self
+    }
+
+    /// 调用方进程的工作目录，用于「cwd 在待删目录内」的拒绝判定
+    ///
+    /// 缺省 `"."`，由 `service` 解析成真实工作目录；嵌在别的进程里的宿主
+    /// 应当传入自己的目录。
+    #[must_use]
+    pub fn cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
+    }
+
+    fn resolve(self) -> (bool, PathBuf) {
+        (
+            self.purge.unwrap_or(false),
+            self.cwd.unwrap_or_else(|| PathBuf::from(".")),
+        )
+    }
+}
+
 impl Kit<'_> {
     /// 一行建服：登记目录 → 装核心 →（可选）起服
     ///
@@ -360,17 +528,7 @@ impl Kit<'_> {
         let resolved = options.resolve(self.config())?;
         let mcsup = self.core();
 
-        // 来源先查：未知变体不该留下一个装不了核心的空目录
-        let source = mcsup
-            .jar_sources
-            .iter()
-            .find(|source| source.variant() == resolved.variant)
-            .cloned()
-            .ok_or_else(|| KitError::UnsupportedVariant {
-                variant: resolved.variant.as_str().to_owned(),
-            })?;
-
-        // 起服请求也先解析：缺 supervisor 之类的用法错误必须在建目录之前报，
+        // 起服请求先解析：缺 supervisor 之类的用法错误必须在建目录之前报，
         // 否则会留下「建好了、核心也装了，但起不来」的半成品
         let start_request = resolved.start.then(|| StartServer {
             accept_eula: Some(resolved.accept_eula),
@@ -386,48 +544,78 @@ impl Kit<'_> {
             request.resolve(self.config(), mcsup.has_external_supervisor())?;
         }
 
+        // 整合包先取回清单：MC 版本与加载器要写进注册表，且取回失败时磁盘上
+        // 不应该留下任何东西。暂存目录用 guard 保证任何退出路径都被清掉。
+        let mut staging = None;
+        let mut prepared: Option<ModpackPrepared> = None;
+        let mut variant = resolved.variant.clone();
+        let mut core_version = VersionId::new(resolved.version.as_str());
+        let token = resolved.run.token();
+        if let Some(request) = &resolved.modpack {
+            let dir = staging_dir(&resolved.name);
+            std::fs::create_dir_all(&dir).map_err(|source| KitError::Io {
+                path: dir.clone(),
+                source,
+            })?;
+            staging = Some(StagingGuard(dir.clone()));
+            let mut pack_options = ModpackInstallOptions::new(&dir);
+            if let Some(version) = &request.version {
+                pack_options = pack_options.version(version);
+            }
+            if let Some(source) = &request.source {
+                pack_options = pack_options.source(source);
+            }
+            if let Some(observer) = resolved.run.observer_ref() {
+                pack_options = pack_options.progress(observer);
+            }
+            let pack = mcsup
+                .modpack
+                .prepare(&request.project, pack_options, &token)
+                .await?;
+            variant = pack.require_loader()?;
+            core_version = VersionId::new(pack.minecraft_version()?);
+            prepared = Some(pack);
+        }
+
+        // 来源先查：未知变体不该留下一个装不了核心的空目录
+        let source = self.core_source(&variant)?;
+
         let workspace = match &resolved.workspace_dir {
             Some(dir) => Some(self.ensure_workspace(dir, None)?.name.as_str().to_owned()),
             None => resolved.workspace.clone(),
         };
 
-        mcsup.registry.create(
+        let server = mcsup.registry.create(
             workspace.as_deref(),
             &resolved.name,
-            &resolved.version,
-            resolved.variant.clone(),
+            &core_version,
+            variant.clone(),
             resolved.java_major,
         )?;
 
-        // 安装器类变体（Forge / NeoForge / Quilt）要先运行安装器：挑 Java 的
-        // 口径与起服一致，因此复用 lifecycle 的选法，不另写一套
-        let installer_ctx = if resolved.variant.needs_installer() {
-            let java_bin =
-                mcsup
-                    .lifecycle
-                    .installer_java_bin(&resolved.name, &mut || {}, &mut |_| {})?;
-            Some(service::InstallerContext {
-                java_bin,
-                runner: Arc::new(runtime::LocalInstallerRunner::new()),
-            })
-        } else {
-            None
-        };
-
-        let installer = service::ServerInstaller::new(source, Arc::clone(&mcsup.downloader));
-        let token = resolved.run.token();
-        let core = mcsup
-            .lifecycle
-            .install_jar_checked(
+        let core = self
+            .install_core_inner(
                 &resolved.name,
-                &resolved.version,
-                &installer,
-                &file::FileCoreInspector::new(),
-                installer_ctx.as_ref(),
-                resolved.run.observer_ref(),
-                &token,
+                source,
+                &core_version,
+                variant.needs_installer(),
+                &resolved.run,
             )
             .await?;
+
+        // 整合包：核心就位后铺 overrides、按清单下载文件。失败时服务器与
+        // 核心都保留（重试入口是 `install_modpack` 语义的 `server install`）
+        if let Some(pack) = &prepared {
+            let progress = resolved
+                .run
+                .observer_ref()
+                .map(|observer| observer as &dyn port::ProgressSink);
+            mcsup
+                .modpack
+                .apply(pack, &server.dir, progress, &token)
+                .await?;
+        }
+        drop(staging);
 
         let started = match start_request {
             Some(request) => Some(self.start_server(&resolved.name, request)?),
@@ -435,6 +623,89 @@ impl Kit<'_> {
         };
 
         Ok(CreatedServer { core, started })
+    }
+
+    /// 一行装 / 换核心（已有服务器）
+    ///
+    /// 运行中换核心会被拒绝（Linux 上 rename 成功但 JVM 仍用旧 inode），判定在
+    /// `service`。版本、变体与 Java 大版本缺省沿用注册表记录，因此
+    /// `kit.install_core("survival", InstallCore::default())` 就是「按原样重装」。
+    ///
+    /// # Errors
+    ///
+    /// 服务器不存在、变体没有来源、运行中、下载 / 校验 / 安装器失败时返回
+    /// [`KitError`]
+    pub async fn install_core(
+        &self,
+        name: &str,
+        options: InstallCore,
+    ) -> Result<InstalledServerJar, KitError> {
+        let server = self.core().registry.get(name)?;
+        let resolved = options.resolve(&server);
+        let source = self.core_source(&resolved.variant)?;
+        self.install_core_inner(
+            name,
+            source,
+            &resolved.version,
+            resolved.variant.needs_installer(),
+            &resolved.run,
+        )
+        .await
+    }
+
+    /// 查来源 + 装核心的共同尾巴
+    ///
+    /// 安装器类变体（Forge / `NeoForge` / Quilt）要先运行安装器：挑 Java 的口径
+    /// 与起服一致，因此复用 lifecycle 的选法，不另写一套。
+    async fn install_core_inner(
+        &self,
+        name: &str,
+        source: Arc<dyn port::ServerJarSource>,
+        version: &VersionId,
+        needs_installer: bool,
+        run: &RunOptions,
+    ) -> Result<InstalledServerJar, KitError> {
+        let mcsup = self.core();
+        let installer_ctx = if needs_installer {
+            let java_bin = mcsup
+                .lifecycle
+                .installer_java_bin(name, &mut || {}, &mut |_| {})?;
+            Some(service::InstallerContext {
+                java_bin,
+                runner: Arc::new(runtime::LocalInstallerRunner::new()),
+            })
+        } else {
+            None
+        };
+        let installer = service::ServerInstaller::new(source, Arc::clone(&mcsup.downloader));
+        let token = run.token();
+        Ok(mcsup
+            .lifecycle
+            .install_jar_checked(
+                name,
+                version,
+                &installer,
+                &file::FileCoreInspector::new(),
+                installer_ctx.as_ref(),
+                run.observer_ref(),
+                &token,
+            )
+            .await?)
+    }
+
+    /// 按变体找核心来源；本实例没有承载该变体时给出用法错误
+    fn core_source(
+        &self,
+        variant: &ServerVariant,
+    ) -> Result<Arc<dyn port::ServerJarSource>, KitError> {
+        self.core()
+            .jar_sources
+            .iter()
+            .find(|source| source.variant() == *variant)
+            .cloned()
+            .ok_or_else(|| KitError::UnsupportedVariant {
+                variant: variant.as_str().to_owned(),
+            })
     }
 
     /// 一行起服
@@ -477,6 +748,43 @@ impl Kit<'_> {
         Ok(self.core().lifecycle.stop(name, options.resolve())?)
     }
 
+    /// 一行重启：先停（超时中止，不再拉起），再走同一条起服路径
+    ///
+    /// 停服失败时不继续拉起：在「不知道停没停」的状态上再起一台，只会得到
+    /// 两个进程抢同一份世界文件。
+    ///
+    /// # Errors
+    ///
+    /// 停服失败 / 宽限超时，或起服失败（见 [`Self::start_server`]）时返回
+    /// [`KitError`]
+    pub fn restart_server(
+        &self,
+        name: &str,
+        start: StartServer,
+        stop: StopServer,
+    ) -> Result<SupervisorStartOutcome, KitError> {
+        self.stop_server(name, stop)?;
+        self.start_server(name, start)
+    }
+
+    /// 一行删服：注销登记，（可选）删磁盘目录
+    ///
+    /// 运行中拒绝；`cwd` 在待删目录内也拒绝（否则删掉的正是进程脚下的目录）。
+    /// 两条判定都在 `service`，kit 只合并默认值。
+    ///
+    /// # Errors
+    ///
+    /// 服务器不存在、运行中、链接服务器带 `purge`、`cwd` 在目录内、目录
+    /// `mcsup.json` 不属于该记录，或删除失败时返回 [`KitError`]
+    pub fn remove_server(
+        &self,
+        name: &str,
+        options: RemoveServer,
+    ) -> Result<ServerRemoveOutcome, KitError> {
+        let (purge, cwd) = options.resolve();
+        Ok(self.core().lifecycle.remove_server(name, purge, &cwd)?)
+    }
+
     /// 服务器实时状态；`None` = 未在运行
     ///
     /// # Errors
@@ -505,10 +813,26 @@ impl Kit<'_> {
     }
 }
 
+/// 整合包暂存目录：进程 + 服务器名隔离，避免并发建服互相覆盖
+///
+/// 只放取回的 `.mrpack` 与解出的临时文件；建成后由 [`StagingGuard`] 删除。
+fn staging_dir(name: &str) -> PathBuf {
+    let safe: String = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    std::env::temp_dir().join(format!("mcsup-kit-modpack-{}-{safe}", std::process::id()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use domain::server::content::ContentKind;
 
     fn config() -> KitConfig {
         KitConfig {
@@ -600,6 +924,9 @@ mod tests {
     /// 内容类别默认值与配置默认值一致（防止两处各写一份）
     #[test]
     fn config_content_kind_default_is_mod() {
-        assert_eq!(KitConfig::default().content_kind, ContentKind::Mod);
+        assert_eq!(
+            KitConfig::default().content_kind,
+            domain::server::content::ContentKind::Mod
+        );
     }
 }

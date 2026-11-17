@@ -57,16 +57,18 @@
 mod backup;
 mod config;
 mod error;
+mod java;
 mod mod_;
 mod options;
 mod server;
 
-pub use backup::BackupNow;
+pub use backup::{BackupNow, ListBackups, PruneBackups, RestoreBackup};
 pub use config::KitConfig;
 pub use error::KitError;
-pub use mod_::{InstallMod, InstallModOutcome};
+pub use java::InstallJava;
+pub use mod_::{InstallMod, InstallModOutcome, RemoveMod, UpdateMods, UpdateModsOutcome};
 pub use options::RunOptions;
-pub use server::{CreateServer, CreatedServer, StartServer, StopServer};
+pub use server::{CreateServer, CreatedServer, InstallCore, RemoveServer, StartServer, StopServer};
 
 use crate::bootstrap::Mcsup;
 

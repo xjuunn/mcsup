@@ -14,6 +14,7 @@
 //! `..Default::default()` 是同一种语义，区别只是补齐发生在运行时而不是结构体
 //! 字面量里，因此同一份默认策略可以被多次调用复用。
 
+use domain::java::{JavaMajor, JavaPackageType, JavaVendor};
 use domain::server::content::ContentKind;
 use domain::server::variant::ServerVariant;
 use service::DEFAULT_FLUSH_WAIT_MS;
@@ -65,6 +66,15 @@ pub struct KitConfig {
     pub no_reuse: bool,
     /// 默认内容类别（`mod` / `plugin` 等）
     pub content_kind: ContentKind,
+    /// 默认安装的 Java 大版本；`None` = 必须由单次调用指定
+    ///
+    /// 不给默认值是刻意的：装哪个大版本取决于要跑的服务端，猜错会白下一个
+    /// 几百 MB 的运行时。
+    pub java_major: Option<JavaMajor>,
+    /// 默认 Java 包类型（完整 JDK 或精简 JRE）
+    pub java_package_type: JavaPackageType,
+    /// 默认 Java 发行商；`None` = 来源按自身优先级挑选
+    pub java_vendor: Option<JavaVendor>,
     /// 拉起 supervisor 的可执行文件
     ///
     /// 只有默认 supervisor（`LocalSupervisor`）需要它：它靠拉起
@@ -90,6 +100,9 @@ impl Default for KitConfig {
             flush_wait_ms: DEFAULT_FLUSH_WAIT_MS,
             no_reuse: false,
             content_kind: ContentKind::Mod,
+            java_major: None,
+            java_package_type: JavaPackageType::Jdk,
+            java_vendor: None,
             supervisor_exe: None,
             supervisor_args: Vec::new(),
             start_after_create: false,
@@ -111,6 +124,8 @@ mod tests {
         assert_eq!(config.default_version, "latest");
         assert_eq!(config.variant, ServerVariant::Vanilla);
         assert_eq!(config.flush_wait_ms, DEFAULT_FLUSH_WAIT_MS);
+        assert!(config.java_major.is_none(), "装 Java 必须显式给大版本");
+        assert_eq!(config.java_package_type, JavaPackageType::Jdk);
     }
 
     /// `..Default::default()` 只改指定字段，其余保持默认

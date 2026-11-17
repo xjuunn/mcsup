@@ -111,3 +111,7 @@ testkit = { package = "mcsup-testkit", path = "../testkit" }
 tokio = { workspace = true, features = ["macros", "rt"] }
 url.workspace = true
 zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2"] }
+
+[[example]]
+name = "kit"
+required-features = ["kit"]

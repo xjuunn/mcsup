@@ -5,7 +5,11 @@
 //! 必填项」与「这个实例没有承载该变体的来源」，两者都是用法问题。
 
 use port::ErrorCategory;
-use service::{BackupError, LifecycleError, ModError, ServerRegistryError, WorkspaceError};
+use service::{
+    BackupError, JavaError, LifecycleError, ModError, ModpackError, ServerRegistryError,
+    WorkspaceError,
+};
+use std::path::PathBuf;
 use thiserror::Error;
 
 /// 任务级接口失败
@@ -27,6 +31,21 @@ pub enum KitError {
     /// mod 编排失败
     #[error(transparent)]
     Mod(#[from] ModError),
+    /// 整合包取回 / 布置失败
+    #[error(transparent)]
+    Modpack(#[from] ModpackError),
+    /// Java 检测 / 安装失败
+    #[error(transparent)]
+    Java(#[from] JavaError),
+    /// 整合包暂存目录无法准备
+    #[error("failed to prepare staging directory `{}`: {source}", path.display())]
+    Io {
+        /// 目标路径
+        path: PathBuf,
+        /// 底层错误
+        #[source]
+        source: std::io::Error,
+    },
     /// 没有给服务器名称
     #[error("a server name is required: call CreateServer::new(name)")]
     MissingName,
@@ -51,6 +70,19 @@ pub enum KitError {
          set accept_eula on the call or in KitConfig (the library never accepts it for you)"
     )]
     EulaNotAccepted,
+    /// 整合包模式给了与之矛盾的显式变体
+    #[error(
+        "variant `{variant}` conflicts with modpack mode; the pack manifest decides the loader"
+    )]
+    ConflictingVariant {
+        /// 被拒绝的变体机器名
+        variant: String,
+    },
+    /// 装 Java 没给大版本
+    #[error(
+        "installing Java needs a major version; set InstallJava::major or KitConfig::java_major"
+    )]
+    MissingJavaMajor,
 }
 
 impl KitError {
@@ -65,12 +97,17 @@ impl KitError {
             Self::Lifecycle(err) => err.category(),
             Self::Backup(err) => err.category(),
             Self::Mod(err) => err.category(),
-            // 三项都是「调用方给的输入不成立」，改参数即可成功
-            Self::MissingName | Self::UnsupportedVariant { .. } | Self::EulaNotAccepted => {
-                ErrorCategory::Usage
-            }
-            // 缺 supervisor 是可配置项错误，与「后端不可用」不同：补配置即可
-            Self::MissingSupervisorExe => ErrorCategory::Usage,
+            Self::Modpack(err) => err.category(),
+            Self::Java(err) => err.category(),
+            // 都是「调用方给的输入不成立」，改参数 / 补配置即可成功
+            Self::MissingName
+            | Self::UnsupportedVariant { .. }
+            | Self::EulaNotAccepted
+            | Self::MissingJavaMajor
+            | Self::ConflictingVariant { .. }
+            | Self::MissingSupervisorExe => ErrorCategory::Usage,
+            // 临时目录都建不出来：本机环境问题
+            Self::Io { .. } => ErrorCategory::Backend,
         }
     }
 }

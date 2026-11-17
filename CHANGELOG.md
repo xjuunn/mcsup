@@ -8,10 +8,13 @@
 ### 新增
 
 - 门面 `kit` feature：`crates/mcsup/src/kit` 提供任务级接口（`Mcsup::kit`）。
-  `create_server` 一次完成建目录 / 入库 / 装核心 /（可选）起服；另有
-  `start_server` / `stop_server` / `server_status` / `backup_now` /
-  `install_mod` / `ensure_workspace`。配置分三层（单次覆盖 > `KitConfig` >
-  默认值），默认不代接受 EULA、不自动起服。
+  覆盖建服（含按整合包开服）/ 换核心 / 起停重启查状态 / 删服 / 备份全流程
+  （建、列、校验、恢复、删除、保留策略清理）/ 内容安装更新移除 / Java 安装
+  与运行时候选 / 工作目录初始化。`create_server` 一次完成取回清单（整合包）、
+  建目录、入库、装核心与（可选）起服；`install_mod` / `update_mods` 的
+  `dry_run` 只出计划。配置分三层（单次覆盖 > `KitConfig` > 默认值），默认
+  不代接受 EULA、不自动起服、不默认安装 Java 大版本。
+- `crates/mcsup/examples/kit.rs`：kit 全流程使用示例（随 `kit` feature 编译）。
 - `Mcsup::has_external_supervisor`：装配时记录宿主是否注入了 supervisor /
   backend，任务级接口据此决定 `supervisor_exe` 是否必填。
 - `apps/bench`：CAS 读写、目录扫描、快照清单编解码的 criterion 基准。
