@@ -1545,3 +1545,70 @@ async fn creating_the_same_name_twice_is_a_conflict() {
         .expect_err("second");
     assert_eq!(err.category(), ErrorCategory::Conflict);
 }
+
+// ---------------------------------------------------------------- 句柄
+
+/// 访问器派生出的句柄共用同一份默认策略
+///
+/// 这是拆分句柄后必须钉住的性质：`KitConfig` 只有一份，句柄只是视图。
+/// 若某个访问器拷贝配置或丢掉它，`servers()` 的 EULA / RAM 默认值就会静默失效。
+#[tokio::test]
+async fn accessors_share_the_same_config() {
+    let supervisor = Arc::new(SwitchableSupervisor::default());
+    let home = PathBuf::from("/nonexistent/jdk-21");
+    let fixture = harness(jar_bytes(), |builder| {
+        builder
+            .jar_sources(vec![Arc::new(FixedSource::vanilla())])
+            .supervisor(supervisor.clone())
+            .scanner(Arc::new(OneJavaScanner { home }))
+    });
+    let kit = fixture.mcsup.kit(KitConfig {
+        accept_eula: true,
+        start_after_create: true,
+        ram_mib: Some(2048),
+        ..KitConfig::default()
+    });
+
+    // 配置里的 EULA / 自动起服经 servers() 生效
+    let created = kit
+        .servers()
+        .create(
+            CreateServer::new("survival")
+                .workspace_dir(fixture.dir.path().join("workspace"))
+                .version("1.21.4"),
+        )
+        .await
+        .expect("create");
+    assert!(
+        created.started.is_some(),
+        "配置里的 start_after_create 必须生效"
+    );
+    assert_eq!(
+        std::fs::read_to_string(created.core.server.dir.join("eula.txt")).expect("eula"),
+        "eula=true\n",
+        "配置里的 accept_eula 必须生效"
+    );
+    assert_eq!(supervisor.starts(), 1);
+}
+
+/// `with_config` 派生的句柄与 `Kit` 同源：改配置不改底层装配
+#[test]
+fn with_config_derives_a_handle_with_new_defaults() {
+    let (_dir, mcsup, _downloader) = build(Vec::new());
+    let base = mcsup.kit(KitConfig::default());
+    assert!(base.config().java_major.is_none());
+
+    let tuned = base.with_config(KitConfig {
+        java_major: Some(JavaMajor::parse(21).expect("21")),
+        ..KitConfig::default()
+    });
+    assert_eq!(
+        tuned.config().java_major,
+        Some(JavaMajor::parse(21).expect("21"))
+    );
+    assert!(base.config().java_major.is_none(), "派生不能改原句柄的策略");
+    assert!(
+        std::ptr::eq(base.core(), tuned.core()),
+        "派生句柄必须共用同一个组合根"
+    );
+}

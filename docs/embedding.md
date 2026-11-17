@@ -453,7 +453,8 @@ start·stop·restart·status·console·send·logs 已接通，`workspace doctor`
 其余命令为桩）、
 门面 `bootstrap` 组合根（`McsupBuilder`，CLI 已改走）、CLI JSON 行类型
 收敛（`protocol::cli`，apps/cli 全部命令已切换）、门面 `kit` 任务级接口
-（建服 + 装核心 + 起服、起停查状态、建快照、装内容；默认策略见上一节）。
+（`servers` / `backups` / `content` / `java` / `workspaces` 五个领域句柄；默认
+策略与边界见上一节）。
 后续按序：
 
 ```

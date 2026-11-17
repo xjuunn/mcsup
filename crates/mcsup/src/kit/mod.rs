@@ -17,7 +17,7 @@
 //! | `kit.java()` | [`Java`](crate::kit::Java) | 装运行时 / 列出本机运行时 |
 //! | `kit.workspaces()` | [`Workspaces`](crate::kit::Workspaces) | 工作目录初始化 |
 //!
-//! 子句柄只借用 `Kit`，可以连写：
+//! 子句柄只借用组合根与默认策略（不借用 `Kit` 自身），可以连写：
 //!
 //! ```no_run
 //! use std::path::Path;
