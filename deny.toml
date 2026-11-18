@@ -20,10 +20,15 @@ yanked = "deny"
 # unmaintained：上游已把它们并入 zbus 6，但 keyring 4 的 v1 兼容层尚未跟进，
 # 且没有可安全升级的版本。这些 crate 只在 Linux 上编译（macOS / Windows 走
 # Keychain / Credential Manager，不构建它们）；等 keyring 跟进 zbus 6 后移除。
+#
+# chrono 被标记为 unmaintained（RUSTSEC-2026-0543）：只经 apps/dev 的
+# rmcp → schemars → chrono 进入依赖树，该包 publish = false，不进任何发布
+# 产物；advisory 明确没有安全升级版本。等 rmcp 换掉 chrono 后移除。
 ignore = [
     "RUSTSEC-2026-0370",
     "RUSTSEC-2026-0371",
     "RUSTSEC-2026-0372",
+    "RUSTSEC-2026-0543",
 ]
 
 [licenses]

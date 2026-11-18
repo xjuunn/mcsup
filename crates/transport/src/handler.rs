@@ -48,11 +48,11 @@ pub struct SessionInfo {
 
 impl SessionInfo {
     /// 该角色能否执行某个请求
+    ///
+    /// 判定来自动作目录（[`protocol::action`]），这里只把会话角色交给它。
     #[must_use]
     pub fn permits(&self, request: &Request) -> bool {
-        request
-            .required_permission()
-            .is_none_or(|permission| self.role.permits(permission))
+        request.spec().permits(self.role)
     }
 }
 

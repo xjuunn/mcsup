@@ -12,6 +12,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::io::{self, BufRead, Write};
 
+/// 动作目录：操作标识、所需权限与风险等级（唯一真相来源）
+pub mod action;
+
 /// CLI `--output json` 的行类型（唯一真相来源，禁止各入口自行定义 DTO）
 pub mod cli;
 

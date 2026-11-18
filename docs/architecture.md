@@ -584,6 +584,30 @@ Protocol 定义传输什么（`StartServerRequest` / `StartServerResponse` /
 契约来源」放在 `protocol` 是**有意**的，不属于入口逻辑泄漏。渲染（表格、
 着色、进度）不在此层，仍在入口。
 
+## 动作目录（Action Catalog）
+
+`protocol::action` 是「有哪些操作、要什么权限、最坏影响多大」的唯一真相来源。
+每个可执行操作登记一次，得到稳定标识（如 `server.start`）、所需权限、风险等级
+与断线重试安全性。
+
+为什么集中：远端帧、CLI、TUI、将来的 REST 与 MCP 都要在派发前回答同样三个问题
+——「要什么权限」「失败后能不能自动重发」「审批时要提示多大风险」。放在各入口
+就是四份表，改一处漏三处。`protocol` 是既有契约 crate（`protocol::cli` 同理），
+不是新层。
+
+边界：
+
+- 只描述，不执行。准入判定仍在 `service`（运行中拒绝改盘等），业务规则仍在
+  `domain`；动作目录回答的是「入口该不该把请求发下去」。
+- 远端帧的 `required_permission` / `is_retry_safe` / `operation` 都从目录取，
+  `Request::spec` 的 `match` 没有兜底分支：新增帧漏登记编译不过。
+- 本地独有的操作同样登记。带 plan / apply 的操作只登记执行侧，计划是执行前的
+  预览，不是独立动作。
+- 风险取该动作可能达到的最高影响。带 `purge` / `dry_run` 参数的动作按最坏情况
+  登记，参数级细化留给审批层。
+- 标识一经发布禁止改名：审计记录、脚本与工具名都按它归类。新增流程见
+  `crates/protocol/src/action.rs` 的模块文档。
+
 # Agent
 
 Agent 是远程执行节点：`mcsup-server / CLI → RemoteBackend → RPC → Agent →

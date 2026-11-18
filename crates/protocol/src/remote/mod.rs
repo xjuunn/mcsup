@@ -25,6 +25,7 @@
 pub mod wire;
 
 use crate::Frame;
+use crate::action::{self, ActionSpec};
 use auth::{ClientId, Permission, Role};
 pub use port::task::{TaskEvent, TaskObserver, TaskStage};
 use serde::de::DeserializeOwned;
@@ -435,128 +436,77 @@ pub enum Request {
 }
 
 impl Request {
+    /// 该帧对应的动作目录条目
+    ///
+    /// 权限、风险与重试安全都从 [`crate::action`] 取，不在帧定义上维护
+    /// 第二份表：两份表必然分叉。
+    #[must_use]
+    pub fn spec(&self) -> ActionSpec {
+        match self {
+            Self::Hello { .. } => action::HELLO,
+            Self::Enroll { .. } => action::ENROLL,
+            Self::Authenticate { .. } => action::AUTHENTICATE,
+            Self::Ping => action::PING,
+            Self::Shutdown => action::SHUTDOWN,
+            Self::WorkspaceList => action::WORKSPACE_LIST,
+            Self::WorkspaceInit { .. } => action::WORKSPACE_INIT,
+            Self::WorkspaceUse { .. } => action::WORKSPACE_USE,
+            Self::WorkspaceRemove { .. } => action::WORKSPACE_REMOVE,
+            Self::ServerList => action::SERVER_LIST,
+            Self::ServerCreate { .. } => action::SERVER_CREATE,
+            Self::ServerCreateModpack { .. } => action::SERVER_CREATE_MODPACK,
+            Self::ServerRemove { .. } => action::SERVER_REMOVE,
+            Self::ServerInstall { .. } => action::SERVER_INSTALL,
+            Self::ServerLink { .. } => action::SERVER_LINK,
+            Self::ServerVariants => action::SERVER_VARIANTS,
+            Self::ServerVersions { .. } => action::SERVER_VERSIONS,
+            Self::PropsGet { .. } => action::SERVER_PROPS_GET,
+            Self::PropsSet { .. } => action::SERVER_PROPS_SET,
+            Self::SettingsSet { .. } => action::SERVER_SET,
+            Self::JavaList => action::JAVA_LIST,
+            Self::JavaScan => action::JAVA_SCAN,
+            Self::JavaInstall { .. } => action::JAVA_INSTALL,
+            Self::JavaUninstall { .. } => action::JAVA_UNINSTALL,
+            Self::ClientList => action::CLIENT_LIST,
+            Self::ClientRevoke { .. } => action::CLIENT_REVOKE,
+            Self::ClientSelfRevoke => action::CLIENT_SELF_REVOKE,
+            Self::StatusMany { .. } => action::STATUS_MANY,
+            Self::Start { .. } => action::SERVER_START,
+            Self::Stop { .. } => action::SERVER_STOP,
+            Self::SendLine { .. } => action::SERVER_SEND,
+            Self::LogsTail { .. } | Self::LogsFollow { .. } => action::SERVER_LOGS,
+            Self::BackupCreate { .. } => action::BACKUP_CREATE,
+            Self::BackupList { .. } => action::BACKUP_LIST,
+            Self::BackupRestore { .. } => action::BACKUP_RESTORE,
+            Self::BackupDelete { .. } => action::BACKUP_DELETE,
+            Self::BackupVerify { .. } => action::BACKUP_VERIFY,
+            Self::BackupPrune { .. } => action::BACKUP_PRUNE,
+        }
+    }
+
     /// 该操作要求的权限；`None` = 无需认证
     ///
-    /// 映射放这里而不是 agent：它是协议的一部分，客户端可以据此在发请求前
-    /// 就给出「当前角色无权执行」的提示，而不是让对端拒绝一次。
+    /// 客户端可以据此在发请求前提示「当前角色无权执行」，而不是让对端
+    /// 拒绝一次。
     #[must_use]
     pub fn required_permission(&self) -> Option<Permission> {
-        match self {
-            // `ClientSelfRevoke` 同属此列：删掉自己不改变他人的可达性，不构成
-            // 提权。要求 Manage 会让默认的 `operator` 无法自己退出名册。
-            Self::Hello { .. }
-            | Self::Enroll { .. }
-            | Self::Authenticate { .. }
-            | Self::ClientSelfRevoke => None,
-            Self::Ping
-            | Self::WorkspaceList
-            | Self::ServerList
-            | Self::JavaList
-            | Self::PropsGet { .. }
-            | Self::ServerVariants
-            | Self::ServerVersions { .. }
-            | Self::StatusMany { .. } => Some(Permission::Read),
-            // 控制台输出可能含玩家名、IP、管理员敲下的命令，比元数据更敏感，
-            // 单列 `Logs` 而不是并进 `Read`
-            Self::LogsTail { .. } | Self::LogsFollow { .. } => Some(Permission::Logs),
-            Self::WorkspaceInit { .. }
-            | Self::WorkspaceUse { .. }
-            | Self::WorkspaceRemove { .. }
-            | Self::ServerCreate { .. }
-            | Self::ServerCreateModpack { .. }
-            | Self::ServerRemove { .. }
-            | Self::ServerInstall { .. }
-            | Self::ServerLink { .. }
-            | Self::PropsSet { .. }
-            | Self::SettingsSet { .. }
-            | Self::JavaScan
-            | Self::JavaInstall { .. }
-            | Self::JavaUninstall { .. } => Some(Permission::Write),
-            Self::Start { .. } | Self::Stop { .. } | Self::SendLine { .. } => {
-                Some(Permission::Control)
-            }
-            // 备份写对端磁盘并可能覆盖服务器目录，比 Write 更重，单列 Backup
-            Self::BackupCreate { .. }
-            | Self::BackupList { .. }
-            | Self::BackupRestore { .. }
-            | Self::BackupDelete { .. }
-            | Self::BackupVerify { .. }
-            | Self::BackupPrune { .. } => Some(Permission::Backup),
-            // 客户端名册是访问控制数据：能看就能做社会工程，按 Manage 处理
-            Self::Shutdown | Self::ClientList | Self::ClientRevoke { .. } => {
-                Some(Permission::Manage)
-            }
-        }
+        self.spec().permission
     }
 
     /// 该帧在「连接断开后重发」是否安全
     ///
     /// 传输层在复用连接断掉时会重连一次；只有**只读 / 幂等**的帧允许重发。
-    /// 写帧被对端执行后若响应丢失，重发会造成重复副作用（重复快照、重复下载、
-    /// 二次登记），因此一律不重试——宁可让用户看到一次失败后自己重试。
+    /// 写帧被对端执行后若响应丢失，重发会造成重复副作用（重复快照、重复
+    /// 下载、二次登记），因此一律不重试——宁可让用户看到一次失败后自己重试。
     #[must_use]
-    pub const fn is_retry_safe(&self) -> bool {
-        matches!(
-            self,
-            Self::Ping
-                | Self::WorkspaceList
-                | Self::ServerList
-                | Self::ServerVariants
-                | Self::ServerVersions { .. }
-                | Self::PropsGet { .. }
-                | Self::JavaList
-                | Self::ClientList
-                | Self::StatusMany { .. }
-                | Self::LogsTail { .. }
-                | Self::LogsFollow { .. }
-                | Self::BackupList { .. }
-                | Self::BackupVerify { .. }
-        )
+    pub fn is_retry_safe(&self) -> bool {
+        self.spec().retry_safe
     }
 
     /// 操作名（审计日志、错误提示共用）
     #[must_use]
-    pub const fn operation(&self) -> &'static str {
-        match self {
-            Self::Hello { .. } => "hello",
-            Self::Enroll { .. } => "enroll",
-            Self::Authenticate { .. } => "authenticate",
-            Self::Ping => "ping",
-            Self::Shutdown => "shutdown",
-            Self::WorkspaceList => "workspace.list",
-            Self::WorkspaceInit { .. } => "workspace.init",
-            Self::WorkspaceUse { .. } => "workspace.use",
-            Self::WorkspaceRemove { .. } => "workspace.remove",
-            Self::ServerList => "server.list",
-            Self::ServerCreate { .. } => "server.create",
-            Self::ServerCreateModpack { .. } => "server.create_modpack",
-            Self::ServerRemove { .. } => "server.remove",
-            Self::ServerInstall { .. } => "server.install",
-            Self::ServerLink { .. } => "server.link",
-            Self::ServerVariants => "server.variants",
-            Self::ServerVersions { .. } => "server.versions",
-            Self::PropsGet { .. } => "server.props.get",
-            Self::PropsSet { .. } => "server.props.set",
-            Self::SettingsSet { .. } => "server.set",
-            Self::JavaList => "java.list",
-            Self::JavaScan => "java.scan",
-            Self::JavaInstall { .. } => "java.install",
-            Self::JavaUninstall { .. } => "java.uninstall",
-            Self::ClientList => "client.list",
-            Self::ClientRevoke { .. } => "client.revoke",
-            Self::ClientSelfRevoke => "client.self.revoke",
-            Self::StatusMany { .. } => "status.many",
-            Self::Start { .. } => "server.start",
-            Self::Stop { .. } => "server.stop",
-            Self::SendLine { .. } => "server.send",
-            Self::LogsTail { .. } | Self::LogsFollow { .. } => "server.logs",
-            Self::BackupCreate { .. } => "backup.create",
-            Self::BackupList { .. } => "backup.list",
-            Self::BackupRestore { .. } => "backup.restore",
-            Self::BackupDelete { .. } => "backup.delete",
-            Self::BackupVerify { .. } => "backup.verify",
-            Self::BackupPrune { .. } => "backup.prune",
-        }
+    pub fn operation(&self) -> &'static str {
+        self.spec().id.as_str()
     }
 }
 
@@ -1084,10 +1034,12 @@ mod tests {
         }
     }
 
-    #[test]
+    /// 全部远端帧的样本：往返与动作目录登记共用
+    ///
+    /// 新增变体时补一条，往返与登记测试同时覆盖。
     #[allow(clippy::too_many_lines)] // 帧样本清单本身就是长列表，拆分反而难对账
-    fn every_request_roundtrips_with_version() {
-        let requests = [
+    fn sample_requests() -> Vec<Request> {
+        vec![
             Request::Hello {
                 protocol_version: REMOTE_PROTOCOL_VERSION,
                 client_version: "0.1.0".to_owned(),
@@ -1192,6 +1144,11 @@ mod tests {
                 server_id: "550e8400-e29b-41d4-a716-446655440000".to_owned(),
                 lines: 30,
             },
+            Request::LogsFollow {
+                server_id: "550e8400-e29b-41d4-a716-446655440000".to_owned(),
+                lines: 10,
+                timeout_ms: 5000,
+            },
             Request::BackupCreate {
                 server_id: "550e8400-e29b-41d4-a716-446655440000".to_owned(),
                 label: Some("before-upgrade".to_owned()),
@@ -1223,14 +1180,36 @@ mod tests {
                 older_than_secs: None,
                 dry_run: true,
             },
-        ];
-        for request in requests {
+        ]
+    }
+
+    #[test]
+    fn every_request_roundtrips_with_version() {
+        for request in sample_requests() {
             let back = roundtrip(&request);
             assert_eq!(
                 serde_json::to_value(&back).expect("json"),
                 serde_json::to_value(&request).expect("json"),
                 "{} 往返不一致",
                 request.operation()
+            );
+        }
+    }
+
+    /// 每个远端帧指向的动作都已登记在目录里
+    ///
+    /// `spec()` 用无兜底的 `match` 指向常量，漏了变体编译不过；这条测试补另一
+    /// 半：指向的常量必须真的进了 [`crate::action::ACTIONS`]。漏登记会让入口
+    /// 枚举动作时少一项，权限与风险也就跟着丢。
+    #[test]
+    fn every_request_is_registered_in_the_action_catalog() {
+        for request in sample_requests() {
+            let spec = request.spec();
+            assert_eq!(
+                action::get(spec.id.as_str()),
+                Some(spec),
+                "{} 未登记到动作目录",
+                spec.id
             );
         }
     }
