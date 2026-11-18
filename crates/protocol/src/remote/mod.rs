@@ -441,7 +441,7 @@ impl Request {
     /// 权限、风险与重试安全都从 [`crate::action`] 取，不在帧定义上维护
     /// 第二份表：两份表必然分叉。
     #[must_use]
-    pub fn spec(&self) -> ActionSpec {
+    pub const fn spec(&self) -> ActionSpec {
         match self {
             Self::Hello { .. } => action::HELLO,
             Self::Enroll { .. } => action::ENROLL,
@@ -489,7 +489,7 @@ impl Request {
     /// 客户端可以据此在发请求前提示「当前角色无权执行」，而不是让对端
     /// 拒绝一次。
     #[must_use]
-    pub fn required_permission(&self) -> Option<Permission> {
+    pub const fn required_permission(&self) -> Option<Permission> {
         self.spec().permission
     }
 
@@ -499,13 +499,13 @@ impl Request {
     /// 写帧被对端执行后若响应丢失，重发会造成重复副作用（重复快照、重复
     /// 下载、二次登记），因此一律不重试——宁可让用户看到一次失败后自己重试。
     #[must_use]
-    pub fn is_retry_safe(&self) -> bool {
+    pub const fn is_retry_safe(&self) -> bool {
         self.spec().retry_safe
     }
 
     /// 操作名（审计日志、错误提示共用）
     #[must_use]
-    pub fn operation(&self) -> &'static str {
+    pub const fn operation(&self) -> &'static str {
         self.spec().id.as_str()
     }
 }
@@ -1036,7 +1036,8 @@ mod tests {
 
     /// 全部远端帧的样本：往返与动作目录登记共用
     ///
-    /// 新增变体时补一条，往返与登记测试同时覆盖。
+    /// 必须覆盖 [`Request`] 的**每一个**变体：往返与「已登记到目录」两条测试都
+    /// 只跑这份清单，漏一条就等于那个帧没人测。新增变体时同时补一条。
     #[allow(clippy::too_many_lines)] // 帧样本清单本身就是长列表，拆分反而难对账
     fn sample_requests() -> Vec<Request> {
         vec![
@@ -1073,6 +1074,10 @@ mod tests {
                 version: "1.21.1".to_owned(),
                 variant: "paper".to_owned(),
                 java_major: Some(21),
+            },
+            Request::ServerInstall {
+                name: "web".to_owned(),
+                version: "latest".to_owned(),
             },
             Request::ServerRemove {
                 name: "web".to_owned(),

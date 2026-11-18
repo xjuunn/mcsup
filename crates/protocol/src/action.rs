@@ -1,13 +1,26 @@
 //! 动作目录：可执行操作的稳定标识、所需权限与风险等级
 //!
-//! 每个能读敏感数据或改变状态的操作在这里登记一次。远端帧
-//! （[`crate::remote::Request`]）的权限、重试安全与操作名都从这份表取，
-//! 禁止再维护第二份「哪个操作要什么权限」的映射——两份表必然分叉。
+//! 每个要回答「谁能做、断线能不能重发、审批时该提示多大风险」的操作在这里
+//! 登记一次。远端帧（[`crate::remote::Request`]）的权限、重试安全与操作名都从
+//! 这份表取，禁止再维护第二份「哪个操作要什么权限」的映射——两份表必然分叉。
 //!
 //! 这里只描述，不执行。谁执行、能不能执行仍由 `domain` / `service` 判定：
 //! [`crate::action::ActionSpec::permits`] 给入口在派发前判断「当前角色有没有这项权限」，
 //! 不是第二套业务规则。运行态（如运行中拒绝改盘）由 `service` 判定，
 //! 权限由调用方（`transport` 的会话、将来的 API / MCP 入口）判定。
+//!
+//! # 覆盖范围
+//!
+//! - **全部远端帧**：一个都不能漏。[`crate::remote::Request::spec`] 的 `match`
+//!   没有兜底分支，新增变体不指向目录就编译不过。
+//! - **本地写操作**：建 / 删 / 装核心 / 链接、起停重启、注入控制台、改
+//!   `server.properties` 与服务属性，以及 `server mod` 的安装、更新、停用、
+//!   移除与修复。
+//!
+//! 只读的本地查询（`server version`、`server mod list` / `outdated`、
+//! `mod inspect`）与产品级命令（`update`、`doctor`、`config`）暂未登记：前者
+//! 不改变状态，后者作用于本机安装而不是服务器资源。将来的入口（REST / MCP
+//! 工具）要按动作授权时补登记，禁止在入口里另写一张权限表。
 //!
 //! # 新增一个操作
 //!
@@ -65,7 +78,11 @@ pub enum Risk {
 pub struct ActionSpec {
     /// 稳定标识
     pub id: ActionId,
-    /// 所需权限；`None` = 无需认证（握手与认证帧）
+    /// 所需权限
+    ///
+    /// `None` 有两种情形，都表示「不额外要求权限」而不是「已通过认证」：
+    /// 握手帧（此时会话尚未认证），以及任意已认证角色都能做的动作
+    /// （`client.self.revoke`）。认证本身由 `transport` 的连接状态判定。
     pub permission: Option<Permission>,
     /// 对持久数据可能造成的最高影响
     pub risk: Risk,
@@ -394,6 +411,20 @@ catalog! {
         risk: Reversible,
         retry_safe: false,
     },
+    /// 停用 mod / 插件（改名加 `.disabled` 后缀）
+    CONTENT_DISABLE: "content.disable" {
+        permission: Some(Permission::Write),
+        risk: Reversible,
+        retry_safe: false,
+    },
+    /// 按修复计划重装 / 移除不兼容的 mod（`server mod fix --yes`）
+    ///
+    /// plan 与 apply 是同一个动作的两段：计划只预览，不单独登记。
+    CONTENT_FIX: "content.fix" {
+        permission: Some(Permission::Write),
+        risk: Reversible,
+        retry_safe: false,
+    },
     /// 移除 mod / 插件（移进回收站）
     CONTENT_REMOVE: "content.remove" {
         permission: Some(Permission::Write),
@@ -484,6 +515,43 @@ mod tests {
         assert_eq!(id.to_string(), "server.start");
     }
 
+    /// 只有只读动作允许自动重发
+    ///
+    /// 写动作在对端执行后若响应丢失，重发会造成第二次副作用（重复快照、
+    /// 重复下载、二次登记）。这条约束挡住「顺手把某个写动作标成
+    /// `retry_safe`」。
+    #[test]
+    fn retry_safe_actions_are_read_only() {
+        for spec in ACTIONS {
+            if spec.retry_safe {
+                assert_eq!(
+                    spec.risk,
+                    Risk::ReadOnly,
+                    "{} 不是只读动作，不能自动重发",
+                    spec.id.as_str()
+                );
+            }
+        }
+    }
+
+    /// 不要求权限的动作只能是握手帧与自助撤销
+    ///
+    /// 集合写死：新增一个 `permission: None` 的动作会让这条测试失败，提醒作者
+    /// 确认它真的对任意已认证角色开放，而不是漏填权限。
+    #[test]
+    fn permission_free_actions_are_the_documented_set() {
+        let mut free: Vec<&str> = ACTIONS
+            .iter()
+            .filter(|spec| spec.permission.is_none())
+            .map(|spec| spec.id.as_str())
+            .collect();
+        free.sort_unstable();
+        assert_eq!(
+            free,
+            ["authenticate", "client.self.revoke", "enroll", "hello"]
+        );
+    }
+
     /// 查找往返，未知标识返回 `None`
     #[test]
     fn lookup_round_trips_and_rejects_unknown() {
@@ -534,6 +602,8 @@ mod tests {
             "client.list",
             "client.revoke",
             "client.self.revoke",
+            "content.disable",
+            "content.fix",
             "content.install",
             "content.remove",
             "content.update",

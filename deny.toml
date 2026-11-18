@@ -22,8 +22,8 @@ yanked = "deny"
 # Keychain / Credential Manager，不构建它们）；等 keyring 跟进 zbus 6 后移除。
 #
 # chrono 被标记为 unmaintained（RUSTSEC-2026-0543）：只经 apps/dev 的
-# rmcp → schemars → chrono 进入依赖树，该包 publish = false，不进任何发布
-# 产物；advisory 明确没有安全升级版本。等 rmcp 换掉 chrono 后移除。
+# rmcp / schemars → chrono 进入依赖树（apps/dev 的 publish = false，不进任何
+# 发布产物）；advisory 明确没有安全升级版本。等上游换掉 chrono 后移除。
 ignore = [
     "RUSTSEC-2026-0370",
     "RUSTSEC-2026-0371",

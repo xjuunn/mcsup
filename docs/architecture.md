@@ -601,8 +601,13 @@ Protocol 定义传输什么（`StartServerRequest` / `StartServerResponse` /
   `domain`；动作目录回答的是「入口该不该把请求发下去」。
 - 远端帧的 `required_permission` / `is_retry_safe` / `operation` 都从目录取，
   `Request::spec` 的 `match` 没有兜底分支：新增帧漏登记编译不过。
-- 本地独有的操作同样登记。带 plan / apply 的操作只登记执行侧，计划是执行前的
-  预览，不是独立动作。
+- 本地写操作同样登记：建服 / 删服 / 装核心 / 链接、起停重启、注入控制台、
+  改配置，以及 `server mod` 的安装、更新、停用、移除与修复。带 plan / apply 的
+  操作只登记执行侧，计划是执行前的预览，不是独立动作。
+- 只读的本地查询（`server version`、`server mod list` / `outdated`、`mod
+  inspect`）与产品级命令（`update`、`doctor`、`config`）暂未登记：前者不改变
+  状态，后者作用于本机安装。将来的入口要按动作授权时补登记，不要另写一张
+  权限表。
 - 风险取该动作可能达到的最高影响。带 `purge` / `dry_run` 参数的动作按最坏情况
   登记，参数级细化留给审批层。
 - 标识一经发布禁止改名：审计记录、脚本与工具名都按它归类。新增流程见
