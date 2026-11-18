@@ -7,6 +7,11 @@
 
 ### 新增
 
+- `protocol::action`：动作目录。每个可执行操作登记稳定标识、所需权限、风险等级
+  与断线重试安全性；远端帧的 `required_permission` / `is_retry_safe` /
+  `operation` 改为从目录取，`Request::spec` 的 `match` 无兜底分支，新增帧漏
+  登记即编译失败。目录覆盖全部远端帧与本地写操作（起停重启、改配置、`server
+  mod` 的安装 / 更新 / 停用 / 移除 / 修复），标识一经发布禁止改名。
 - 门面 `kit` feature：`crates/mcsup/src/kit` 提供任务级接口（`Mcsup::kit`）。
   任务按领域分挂在访问器上——`kit.servers()`（建服、整合包开服、整合包装已有
   服务器、装核心、起停重启查状态、删服）、`kit.backups()`（建、列、校验、恢复、
