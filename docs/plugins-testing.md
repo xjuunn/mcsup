@@ -1253,8 +1253,22 @@ panic，只能返回错误。
 | `SDK-TS-013` | `createMockHost` | 无 socket |
 | `SDK-TS-014` | 流 | async iterator |
 | `SDK-TS-015` | 打包 | 无 devDependency 进入产物 |
-| `SDK-PY-001..008` | 同 Rust 语义 | pydantic 归一化、`$defs`、Optional |
-| `SDK-JAVA-001..008` | 同 Rust 语义 | record 注解、TCP 回退 |
+| `SDK-PY-001` | `--dump-descriptor` | 与 Rust 逐字节一致 |
+| `SDK-PY-002` | pydantic 配置 | 类型、默认值、`$defs` 内联 |
+| `SDK-PY-003` | op 路由 | 按 id 分发 |
+| `SDK-PY-004` | 事件 | 反序列化为强类型 |
+| `SDK-PY-005` | 宿主调用 | 异步且可取消 |
+| `SDK-PY-006` | 取消 | 传播到 handler |
+| `SDK-PY-007` | 错误映射 | `PluginError` → 帧 |
+| `SDK-PY-008` | Optional 折叠 | 不出现 `null` 字段 |
+| `SDK-JAVA-001` | `--dump-descriptor` | 与 Rust 逐字节一致 |
+| `SDK-JAVA-002` | record 配置 | 类型、默认值、`$defs` 内联 |
+| `SDK-JAVA-003` | op 路由 | 按 id 分发 |
+| `SDK-JAVA-004` | 事件 | 反序列化为强类型 |
+| `SDK-JAVA-005` | 宿主调用 | 可取消 |
+| `SDK-JAVA-006` | 取消 | 传播到 handler |
+| `SDK-JAVA-007` | 错误映射 | `PluginError` → 帧 |
+| `SDK-JAVA-008` | TCP 回退 | 端点解析与重连 |
 | `SDK-GEN-001` | schema 子集 | 只生成允许构造 |
 | `SDK-GEN-002` | 构建时生成 | 运行时无生成入口 |
 | `SDK-GEN-003` | dump 不连接 | 无端点也成功 |
