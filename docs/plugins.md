@@ -1036,6 +1036,18 @@ pub trait FileOps: Send + Sync {
 `conflict`。`mcsup.json` 与运行中的启动文件（JAR / 参数文件）禁止改写与删除：
 前者返回 `denied`，后者返回 `conflict`。
 
+Java 能力的帧方法：
+
+| 能力 | `method` | 输入 | 输出 |
+| --- | --- | --- | --- |
+| `java` | `list` | `{}` | `{runtimes:[{id, path, major, version, vendor, managed, created_at, updated_at}]}` |
+| `java` | `install` | `{major}`；十进制整数或字符串 | `{runtime}` |
+| `java` | `remove` | `{path}`；绝对路径，需与已登记项一致 | `{removed}` |
+
+安装固定 `jdk` 包类型，厂商交给来源排序挑最优，与 CLI `java install` 的默认
+路径一致；未登记的路径返回 `not_found`，上游 / 下载 / 磁盘失败返回
+`unavailable`。大版本不在 8–99 区间返回 `invalid_input`。
+
 ## 9.2 限额
 
 | 接口 | 限额 |

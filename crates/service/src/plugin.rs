@@ -10,11 +10,13 @@
 
 use crate::backup::{BackupError, BackupService, CreateOptions};
 use crate::fs_error::FsError;
+use crate::java::{JavaError, JavaService};
 use crate::lifecycle::{LifecycleError, ServerLifecycleService, StartOptions};
 use crate::mod_::{ApplyOptions, InstallSpec, ListOptions, ModError, ModService};
 use crate::props::ServerPropsService;
 use crate::registry::{ServerRegistry, ServerRegistryError};
 use domain::backup::{Page, RestoreTarget, RetentionInput};
+use domain::java::{JavaMajor, JavaPackageType, JavaRuntime};
 use domain::path::RelPath;
 use domain::plugin::capability::{self, Capability};
 use domain::plugin::descriptor::Descriptor;
@@ -1111,6 +1113,7 @@ pub struct HostApiImpl {
     lifecycle: Arc<ServerLifecycleService>,
     backup: BackupService,
     mods: ModService,
+    java: JavaService,
     supervisor_exe: PathBuf,
     props: ServerPropsService,
     kv: Arc<dyn KvStore>,
@@ -1137,6 +1140,8 @@ pub struct HostApiDeps {
     pub backup: BackupService,
     /// mod / 内容编排
     pub mods: ModService,
+    /// Java 运行时编排
+    pub java: JavaService,
     /// 拉起 supervisor 用的可执行文件（宿主 `current_exe()`）
     pub supervisor_exe: PathBuf,
     /// 插件键值空间
@@ -1164,6 +1169,7 @@ impl HostApiImpl {
             lifecycle,
             backup,
             mods,
+            java,
             supervisor_exe,
             kv,
             secrets,
@@ -1175,6 +1181,7 @@ impl HostApiImpl {
             lifecycle,
             backup,
             mods,
+            java,
             supervisor_exe,
             kv,
             secrets,
@@ -1996,6 +2003,50 @@ fn content_host_error(err: &ModError) -> HostError {
     }
 }
 
+impl JavaOps for HostApiImpl {
+    fn list(&self) -> Result<Vec<JavaRuntime>, HostError> {
+        self.java.list().map_err(|err| java_host_error(&err))
+    }
+
+    fn install(&self, major: JavaMajor) -> Result<JavaRuntime, HostError> {
+        // 插件协议只给大版本：包类型固定 JDK（托管目录名与内容由它决定），
+        // 厂商交给来源排序挑最优，与 CLI `java install` 的默认路径一致。
+        let cancel = port::CancellationToken::new();
+        with_content_runtime(|runtime| {
+            runtime.block_on(
+                self.java
+                    .install(major, JavaPackageType::Jdk, None, None, &cancel),
+            )
+        })?
+        .map(|outcome| outcome.runtime)
+        .map_err(|err| java_host_error(&err))
+    }
+
+    fn remove(&self, path: &Path) -> Result<bool, HostError> {
+        self.java
+            .uninstall(path)
+            .map(|_| true)
+            .map_err(|err| java_host_error(&err))
+    }
+}
+
+/// Java 编排错误 → 宿主错误
+///
+/// 分类由 [`JavaError::category`] 决定：未登记 → `not_found`，上游 / 下载 /
+/// 磁盘 → `unavailable`（可重试），参数问题 → `invalid_input`。
+fn java_host_error(err: &JavaError) -> HostError {
+    let message = err.to_string();
+    match err.category() {
+        ErrorCategory::NotFound => HostError::not_found(message),
+        ErrorCategory::Conflict => HostError::conflict(message),
+        ErrorCategory::Cancelled => HostError::new(PluginErrorCode::Cancelled, message),
+        ErrorCategory::Usage => HostError::invalid_input(message),
+        ErrorCategory::Backend => HostError::new(PluginErrorCode::Unavailable, message),
+        ErrorCategory::Unauthorized => HostError::denied(message),
+        ErrorCategory::Failure => HostError::internal(message),
+    }
+}
+
 /// 后续阶段的能力实现占位：装配到的能力若阶段未开放，宿主返回 `unsupported`
 ///
 /// 用空实现而不是 `None` 是为了让装配方一眼看出「已显式关闭」，不是漏配。
@@ -2676,6 +2727,18 @@ mod tests {
         assert_eq!(
             backup_host_error(&BackupError::EmptyScope).code,
             port::plugin::ErrorCode::InvalidInput
+        );
+    }
+
+    #[test]
+    fn api_java_errors_map_to_host_codes() {
+        assert_eq!(
+            java_host_error(&JavaError::NotFound("/opt/java/17".to_owned())).code,
+            port::plugin::ErrorCode::NotFound
+        );
+        assert_eq!(
+            java_host_error(&JavaError::Scan("permission denied".to_owned())).code,
+            port::plugin::ErrorCode::Unavailable
         );
     }
 

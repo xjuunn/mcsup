@@ -896,19 +896,20 @@ panic，只能返回错误。
 | `API-JAVA-003` | 未授予 | `denied` |
 | `API-JAVA-004` | 平台不支持 | `unsupported` |
 
-落位：`server:lifecycle` / `backup` / `content` 由 `service::plugin::HostApiImpl`
-实现，`crates/plugin/src/api.rs` 只做帧分发。生命周期错误按「服务器状态」收敛：
+落位：`server:lifecycle` / `backup` / `content` / `java` 由
+`service::plugin::HostApiImpl` 实现，`crates/plugin/src/api.rs` 只做帧分发。生命周期错误按「服务器状态」收敛：
 已在运行 / 未在运行 / EULA 未确认 / 缺核心均为 `conflict`，停机超时为
 `timeout`。备份错误按 `BackupError::category()` 映射（不存在 → `not_found`，
 运行中恢复 → `conflict`，磁盘 / 远端不可用 → `unavailable`）。内容错误按
 `ModError::category()` 映射（运行中 → `conflict`，选择器未命中 → `not_found`，
 纯客户端内容 → `invalid_input`，上游 / 磁盘失败 → `unavailable`），远端服务器
-返回 `unsupported`。
+返回 `unsupported`。Java 错误按 `JavaError::category()` 映射（未登记 →
+`not_found`，扫描 / 上游 / 下载 → `unavailable`）。
 
 审计在会话层统一记录：`action` 为 `capability:<能力>:<方法>`，成功结果只摘
 `snapshot` / `file` 字段（备份与内容审计的检索键），失败记录错误码与消息。
-对应单测可用 `cargo test -p mcsup-service --lib api_life` / `api_bak` / `api_cnt`
-与 `cargo test -p mcsup-plugin --lib api::tests` 过滤。
+对应单测可用 `cargo test -p mcsup-service --lib api_life` / `api_bak` / `api_cnt` /
+`api_java` 与 `cargo test -p mcsup-plugin --lib api::tests` 过滤。
 
 ## 9.9 展示类型投影（`DESC-DISPLAY`）
 

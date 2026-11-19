@@ -11,6 +11,7 @@
 //! 入口与插件都不重复这套顺序。
 
 use crate::base64;
+use domain::java::{JavaMajor, JavaRuntime};
 use domain::plugin::PluginId;
 use domain::plugin::capability::Capability;
 use domain::server::content::{ContentIdentity, ContentKind};
@@ -182,7 +183,8 @@ fn host_call(
         Capability::ServerLifecycle => lifecycle(services, method, input, bound),
         Capability::Backup => backup(services, method, input, bound),
         Capability::Content => content(services, method, input, bound),
-        Capability::Java | Capability::Events | Capability::ProcessSpawn | Capability::McClient => {
+        Capability::Java => java(services, method, input),
+        Capability::Events | Capability::ProcessSpawn | Capability::McClient => {
             Err(HostError::unsupported(format!(
                 "{capability} host methods are not available in this host build"
             )))
@@ -698,6 +700,61 @@ fn content(
     }
 }
 
+fn java(services: &HostServices, method: &str, input: &Value) -> Result<Value, HostError> {
+    let service = services
+        .java
+        .as_ref()
+        .ok_or_else(|| HostError::unsupported("java is not available"))?;
+    match method {
+        "list" => {
+            let runtimes = service
+                .list()?
+                .iter()
+                .map(java_runtime_json)
+                .collect::<Vec<_>>();
+            Ok(json!({ "runtimes": runtimes }))
+        }
+        "install" => {
+            let major = java_major_arg(input)?;
+            let runtime = service.install(major)?;
+            Ok(json!({ "runtime": java_runtime_json(&runtime) }))
+        }
+        "remove" => {
+            let path = path_arg(input, "path")?;
+            Ok(json!({ "removed": service.remove(&path)? }))
+        }
+        other => Err(unknown_method("java", other)),
+    }
+}
+
+fn java_major_arg(input: &Value) -> Result<JavaMajor, HostError> {
+    match input.get("major") {
+        Some(Value::Number(value)) => value
+            .as_i64()
+            .ok_or_else(|| HostError::invalid_input("major must be an integer"))
+            .and_then(|raw| {
+                JavaMajor::parse(raw)
+                    .map_err(|err| HostError::invalid_input(format!("invalid java major: {err}")))
+            }),
+        Some(Value::String(raw)) => JavaMajor::parse_str(raw)
+            .map_err(|err| HostError::invalid_input(format!("invalid java major: {err}"))),
+        _ => Err(HostError::invalid_input("missing integer field major")),
+    }
+}
+
+fn java_runtime_json(runtime: &JavaRuntime) -> Value {
+    json!({
+        "id": runtime.id,
+        "path": runtime.path.to_string_lossy(),
+        "major": runtime.major.as_i16(),
+        "version": runtime.version,
+        "vendor": runtime.vendor.as_str(),
+        "managed": runtime.managed,
+        "created_at": runtime.created_at,
+        "updated_at": runtime.updated_at,
+    })
+}
+
 fn content_kind_arg(input: &Value) -> Result<ContentKind, HostError> {
     match optional_string_arg(input, "kind")? {
         None => Ok(ContentKind::Mod),
@@ -781,6 +838,7 @@ fn unknown_method(capability: &str, method: &str) -> HostError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use domain::java::{JavaMajor, JavaVendor};
     use domain::plugin::PluginId;
     use port::plugin::{
         BackupEntry, ConsoleLine, ConsolePage, ContentEntry, ContentInstallRequest, FileEntry,
@@ -1473,6 +1531,136 @@ mod tests {
                 .code,
             port::plugin::ErrorCode::Denied
         );
+    }
+
+    /// 记录 Java 调用参数的替身
+    #[derive(Default)]
+    struct Java {
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl Java {
+        fn record(&self, call: String) {
+            self.calls.lock().expect("lock").push(call);
+        }
+    }
+
+    fn fake_runtime(major: JavaMajor) -> JavaRuntime {
+        JavaRuntime {
+            id: "runtime-1".to_owned(),
+            path: PathBuf::from("/opt/java/17"),
+            major,
+            version: "17.0.9+9".to_owned(),
+            vendor: JavaVendor::Temurin,
+            managed: true,
+            created_at: 1,
+            updated_at: 2,
+        }
+    }
+
+    impl JavaOps for Java {
+        fn list(&self) -> Result<Vec<JavaRuntime>, HostError> {
+            self.record("list".to_owned());
+            Ok(vec![fake_runtime(JavaMajor::parse(17).expect("major"))])
+        }
+
+        fn install(&self, major: JavaMajor) -> Result<JavaRuntime, HostError> {
+            self.record(format!("install:{major}"));
+            Ok(fake_runtime(major))
+        }
+
+        fn remove(&self, path: &Path) -> Result<bool, HostError> {
+            self.record(format!("remove:{}", path.display()));
+            Ok(true)
+        }
+    }
+
+    // ---- Java（API-JAVA） ----
+
+    #[test]
+    fn java_frames_forward_major_and_path() {
+        let java = Arc::new(Java::default());
+        let services = HostServices {
+            java: Some(Arc::clone(&java) as Arc<dyn JavaOps>),
+            ..HostServices::default()
+        };
+        let caps = granted(&[Capability::Java]);
+        let ctx = ctx(&caps);
+
+        let value =
+            dispatch(&services, &Call::host(1, "java", "list", json!({})), ctx).expect("list");
+        assert_eq!(value["runtimes"][0]["id"], "runtime-1");
+        assert_eq!(value["runtimes"][0]["major"], 17);
+        assert_eq!(value["runtimes"][0]["vendor"], "temurin");
+        assert_eq!(value["runtimes"][0]["managed"], true);
+
+        let value = dispatch(
+            &services,
+            &Call::host(2, "java", "install", json!({ "major": 21 })),
+            ctx,
+        )
+        .expect("install");
+        assert_eq!(value["runtime"]["major"], 21);
+
+        let value = dispatch(
+            &services,
+            &Call::host(3, "java", "remove", json!({ "path": "/opt/java/17" })),
+            ctx,
+        )
+        .expect("remove");
+        assert_eq!(value["removed"], true);
+
+        let calls = java.calls.lock().expect("lock").clone();
+        assert_eq!(
+            calls,
+            [
+                "list".to_owned(),
+                "install:21".to_owned(),
+                "remove:/opt/java/17".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn java_requires_grant_and_service() {
+        let call = Call::host(1, "java", "list", json!({}));
+        assert_eq!(
+            dispatch(&services(), &call, ctx(&granted(&[])))
+                .expect_err("ungranted")
+                .code,
+            port::plugin::ErrorCode::Denied
+        );
+
+        let caps = granted(&[Capability::Java]);
+        assert_eq!(
+            dispatch(&HostServices::default(), &call, ctx(&caps))
+                .expect_err("unsupported")
+                .code,
+            port::plugin::ErrorCode::Unsupported
+        );
+    }
+
+    #[test]
+    fn java_rejects_invalid_major() {
+        let java = Arc::new(Java::default());
+        let services = HostServices {
+            java: Some(Arc::clone(&java) as Arc<dyn JavaOps>),
+            ..HostServices::default()
+        };
+        let caps = granted(&[Capability::Java]);
+        for input in [json!({ "major": 7 }), json!({ "major": "x" }), json!({})] {
+            assert_eq!(
+                dispatch(
+                    &services,
+                    &Call::host(1, "java", "install", input),
+                    ctx(&caps)
+                )
+                .expect_err("invalid major")
+                .code,
+                port::plugin::ErrorCode::InvalidInput
+            );
+        }
+        assert!(java.calls.lock().expect("lock").is_empty());
     }
 
     // ---- 内容（API-CNT） ----
