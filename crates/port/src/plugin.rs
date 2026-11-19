@@ -1,0 +1,1075 @@
+//! 插件宿主的能力端口
+//!
+//! `crates/plugin` 需要「列服务器、发控制台、建备份」，但不能依赖 `service`
+//! 或其它实现层。方向在这里反转：宿主只依赖这些窄 trait，由 `service` /
+//! `storage` / `provider` 实现，门面 `bootstrap` 负责装配。
+//!
+//! # 为什么按能力拆开
+//!
+//! 一个 `HostApi` God Trait 会让任何实现方都被迫实现全部方法，测试也无法
+//! 逐能力替换。拆开后：
+//!
+//! - 每个 trait 对应一项 [`domain::plugin::capability::Capability`]；
+//! - 未实现的阶段用默认方法返回 `unsupported`，而不是静默成功；
+//! - mock 只需要实现被调用的那一小块。
+//!
+//! # 错误
+//!
+//! 全部方法返回 [`HostError`]：它已经带上稳定错误码与 [`ErrorCategory`]，
+//! 入口只做映射。`[禁止]` 在实现里把「能力未授予」降级成成功。
+//!
+//! # 限额
+//!
+//! 限额在 `docs/plugins.md` 第 9.2 节定义，常量集中在本模块。实现必须
+//! **拒绝**越界请求（`limit_exceeded`），不得截断后返回成功。
+
+use crate::StopOutcome;
+use crate::error::ErrorCategory;
+use domain::java::{JavaMajor, JavaRuntime};
+use domain::plugin::capability::Capability;
+use domain::plugin::error::PluginErrorCode;
+use domain::plugin::manifest::Manifest;
+use domain::plugin::state::PluginState;
+use domain::plugin::{PluginId, PluginScope};
+use domain::server::artifact::Checksum;
+use domain::server::content::{ContentCandidate, ContentIdentity};
+use domain::server::meta::ServerName;
+use domain::server::status::ServerStatus;
+use domain::server::version::VersionId;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+pub use domain::plugin::error::PluginErrorCode as ErrorCode;
+
+// ---- 限额（docs/plugins.md 9.2 / 5.4） ----
+
+/// `kv` 键最大字节数
+pub const MAX_KV_KEY_BYTES: usize = 256;
+
+/// `kv` 单值最大字节数
+pub const MAX_KV_VALUE_BYTES: usize = 256 * 1024;
+
+/// 单插件 `kv` 总量最大字节数
+pub const MAX_KV_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+
+/// `kv` 单次列举最大键数
+pub const MAX_KV_LIST: usize = 1000;
+
+/// 密钥键最大字节数
+pub const MAX_SECRET_KEY_BYTES: usize = 128;
+
+/// 密钥值最大字节数
+pub const MAX_SECRET_VALUE_BYTES: usize = 8 * 1024;
+
+/// 控制台单次读取行数上限
+pub const MAX_CONSOLE_LINES: usize = 500;
+
+/// 控制台注入单行最大字节数
+pub const MAX_CONSOLE_LINE_BYTES: usize = 4096;
+
+/// 文件单次读 / 写最大字节数
+pub const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
+
+/// 出站响应最大字节数
+pub const MAX_NET_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+/// 出站重定向上限
+pub const MAX_NET_REDIRECTS: u8 = 3;
+
+/// 流式总字节上限
+pub const MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
+
+/// 宿主错误：稳定码 + 分类 + 消息 + 可重试
+///
+/// 分类与可重试由构造时按 [`PluginErrorCode`] 推导；调用方可以覆盖可重试
+/// （例如同样的 `conflict`，在状态修正后可重试），但不该改分类。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostError {
+    /// 稳定错误码
+    pub code: PluginErrorCode,
+    /// 失败分类
+    pub category: ErrorCategory,
+    /// 可重试
+    pub retryable: bool,
+    /// 人类可读消息；不得包含密钥
+    pub message: String,
+}
+
+impl HostError {
+    /// 按错误码构造
+    #[must_use]
+    pub fn new(code: PluginErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            category: category_of(code),
+            retryable: code.retryable(),
+            message: message.into(),
+        }
+    }
+
+    /// 用法错误
+    #[must_use]
+    pub fn invalid_input(message: impl Into<String>) -> Self {
+        Self::new(PluginErrorCode::InvalidInput, message)
+    }
+
+    /// 资源不存在
+    #[must_use]
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self::new(PluginErrorCode::NotFound, message)
+    }
+
+    /// 能力未授予
+    #[must_use]
+    pub fn denied(message: impl Into<String>) -> Self {
+        Self::new(PluginErrorCode::Denied, message)
+    }
+
+    /// 状态冲突
+    #[must_use]
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::new(PluginErrorCode::Conflict, message)
+    }
+
+    /// 当前阶段不支持
+    #[must_use]
+    pub fn unsupported(message: impl Into<String>) -> Self {
+        Self::new(PluginErrorCode::Unsupported, message)
+    }
+
+    /// 超过限额
+    #[must_use]
+    pub fn limit_exceeded(message: impl Into<String>) -> Self {
+        Self::new(PluginErrorCode::LimitExceeded, message)
+    }
+
+    /// 内部错误
+    #[must_use]
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::new(PluginErrorCode::Internal, message)
+    }
+}
+
+impl fmt::Display for HostError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for HostError {}
+
+/// 错误码 → 分类
+///
+/// 与 `protocol::plugin::category_of` 的取值一致。`port` 不能依赖 `protocol`
+/// （方向是 `protocol -> port`），因此两边各写一次映射；测试断言两者一致。
+#[must_use]
+pub const fn category_of(code: PluginErrorCode) -> ErrorCategory {
+    use PluginErrorCode as C;
+    match code {
+        C::InvalidInput | C::LimitExceeded | C::Unsupported => ErrorCategory::Usage,
+        C::NotFound => ErrorCategory::NotFound,
+        C::Denied => ErrorCategory::Unauthorized,
+        C::Conflict => ErrorCategory::Conflict,
+        C::Cancelled => ErrorCategory::Cancelled,
+        C::Timeout | C::Unavailable | C::Crashed => ErrorCategory::Backend,
+        _ => ErrorCategory::Failure,
+    }
+}
+
+// ---- 只读查询 ----
+
+/// 列表项：服务器名、实时状态与版本
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerSummary {
+    /// 服务器名
+    pub name: ServerName,
+    /// 实时状态
+    pub status: ServerStatus,
+    /// 已安装核心版本；未安装为 `None`
+    pub version: Option<VersionId>,
+}
+
+/// 单台服务器的详细视图
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerStatusView {
+    /// 实时状态
+    pub status: ServerStatus,
+    /// 已安装核心版本
+    pub version: Option<VersionId>,
+    /// 在线玩家数；不可得时为 `None`
+    pub players: Option<u32>,
+    /// 已运行时长；不可得时为 `None`
+    pub uptime: Option<Duration>,
+}
+
+/// `server:read`：列服务器、状态、版本、属性
+pub trait ServerRead: Send + Sync {
+    /// 列出全部服务器（`server` 作用域实现只返回自身）
+    ///
+    /// # Errors
+    ///
+    /// 记录读取失败时返回 [`HostError`]
+    fn list(&self) -> Result<Vec<ServerSummary>, HostError>;
+
+    /// 单台状态
+    ///
+    /// # Errors
+    ///
+    /// 不存在返回 `not_found`
+    fn status(&self, server: &ServerName) -> Result<ServerStatusView, HostError>;
+
+    /// 已安装核心版本
+    ///
+    /// # Errors
+    ///
+    /// 不存在返回 `not_found`
+    fn version(&self, server: &ServerName) -> Result<Option<VersionId>, HostError>;
+
+    /// 服务端属性
+    ///
+    /// # Errors
+    ///
+    /// 不存在返回 `not_found`
+    fn properties(&self, server: &ServerName) -> Result<BTreeMap<String, String>, HostError>;
+}
+
+/// 一行控制台输出
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsoleLine {
+    /// 游标：单调递增，用于去重
+    pub cursor: u64,
+    /// 行文本（不含换行）
+    pub text: String,
+}
+
+/// 控制台分页
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsolePage {
+    /// 本页行
+    pub lines: Vec<ConsoleLine>,
+    /// 下一页游标；无新行时与请求游标相同
+    pub next: u64,
+}
+
+/// `console:read` / `console:write`：控制台游标读取与注入
+pub trait ConsoleIo: Send + Sync {
+    /// 读取 `cursor` 之后的至多 `max_lines` 行；`cursor=None` 从当前尾部开始
+    ///
+    /// # Errors
+    ///
+    /// `max_lines` 越界或服务器不存在时返回 [`HostError`]
+    fn tail(
+        &self,
+        server: &ServerName,
+        cursor: Option<u64>,
+        max_lines: usize,
+    ) -> Result<ConsolePage, HostError>;
+
+    /// 注入一行命令
+    ///
+    /// # Errors
+    ///
+    /// 服务器未运行返回 `conflict`；行超限返回 `limit_exceeded`
+    fn send_line(&self, server: &ServerName, line: &str) -> Result<(), HostError>;
+}
+
+// ---- 生命周期 ----
+
+/// `server:lifecycle`：启停重启
+pub trait ServerLifecycle: Send + Sync {
+    /// 启动
+    ///
+    /// # Errors
+    ///
+    /// 已在运行返回 `conflict`；实现未开放返回 `unsupported`
+    fn start(&self, _server: &ServerName) -> Result<(), HostError> {
+        Err(HostError::unsupported("server:lifecycle is not available"))
+    }
+
+    /// 停机
+    ///
+    /// # Errors
+    ///
+    /// 同 [`Self::start`]
+    fn stop(&self, _server: &ServerName, _grace: Duration) -> Result<StopOutcome, HostError> {
+        Err(HostError::unsupported("server:lifecycle is not available"))
+    }
+
+    /// 重启
+    ///
+    /// # Errors
+    ///
+    /// 同 [`Self::start`]
+    fn restart(&self, _server: &ServerName, _grace: Duration) -> Result<(), HostError> {
+        Err(HostError::unsupported("server:lifecycle is not available"))
+    }
+}
+
+// ---- 备份 ----
+
+/// 快照摘要
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupEntry {
+    /// 快照 id
+    pub id: String,
+    /// 创建时间（Unix 秒）
+    pub created_at: i64,
+    /// 新增对象字节数
+    pub added_bytes: u64,
+}
+
+/// `backup`：创建 / 列表 / 恢复 / 校验 / 清理
+pub trait BackupOps: Send + Sync {
+    /// 创建备份，返回快照 id
+    ///
+    /// # Errors
+    ///
+    /// 未开放返回 `unsupported`；服务器未运行且实现要求在线时返回 `conflict`
+    fn create(&self, _server: &ServerName, _label: Option<&str>) -> Result<String, HostError> {
+        Err(HostError::unsupported("backup is not available"))
+    }
+
+    /// 列出快照，按创建时间降序
+    ///
+    /// # Errors
+    ///
+    /// 未开放返回 `unsupported`
+    fn list(&self, _server: &ServerName) -> Result<Vec<BackupEntry>, HostError> {
+        Err(HostError::unsupported("backup is not available"))
+    }
+
+    /// 恢复快照
+    ///
+    /// # Errors
+    ///
+    /// 未开放返回 `unsupported`
+    fn restore(&self, _server: &ServerName, _snapshot: &str) -> Result<(), HostError> {
+        Err(HostError::unsupported("backup is not available"))
+    }
+
+    /// 校验快照完整性
+    ///
+    /// # Errors
+    ///
+    /// 未开放返回 `unsupported`
+    fn verify(&self, _server: &ServerName, _snapshot: &str) -> Result<bool, HostError> {
+        Err(HostError::unsupported("backup is not available"))
+    }
+
+    /// 只保留最近 `keep` 个快照，返回删除数
+    ///
+    /// # Errors
+    ///
+    /// 未开放返回 `unsupported`
+    fn prune(&self, _server: &ServerName, _keep: usize) -> Result<usize, HostError> {
+        Err(HostError::unsupported("backup is not available"))
+    }
+
+    /// 删除单个快照
+    ///
+    /// # Errors
+    ///
+    /// 未开放返回 `unsupported`
+    fn delete(&self, _server: &ServerName, _snapshot: &str) -> Result<bool, HostError> {
+        Err(HostError::unsupported("backup is not available"))
+    }
+}
+
+// ---- 内容 ----
+
+/// 已安装内容条目
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentEntry {
+    /// 内容身份
+    pub identity: ContentIdentity,
+    /// 文件名
+    pub file_name: String,
+    /// 字节数
+    pub size: u64,
+}
+
+/// `content`：查询 / 安装 / 移除服务端内容
+pub trait ContentOps: Send + Sync {
+    /// 列出已安装内容
+    ///
+    /// # Errors
+    ///
+    /// 未开放返回 `unsupported`
+    fn list(&self, _server: &ServerName) -> Result<Vec<ContentEntry>, HostError> {
+        Err(HostError::unsupported("content is not available"))
+    }
+
+    /// 安装候选内容
+    ///
+    /// # Errors
+    ///
+    /// 未开放返回 `unsupported`
+    fn install(
+        &self,
+        _server: &ServerName,
+        _candidate: &ContentCandidate,
+    ) -> Result<ContentEntry, HostError> {
+        Err(HostError::unsupported("content is not available"))
+    }
+
+    /// 移除内容
+    ///
+    /// # Errors
+    ///
+    /// 未开放返回 `unsupported`
+    fn remove(&self, _server: &ServerName, _identity: &ContentIdentity) -> Result<bool, HostError> {
+        Err(HostError::unsupported("content is not available"))
+    }
+}
+
+// ---- Java ----
+
+/// `java`：托管 JDK 列表 / 安装 / 卸载
+pub trait JavaOps: Send + Sync {
+    /// 列出已登记运行时
+    ///
+    /// # Errors
+    ///
+    /// 未开放返回 `unsupported`
+    fn list(&self) -> Result<Vec<JavaRuntime>, HostError> {
+        Err(HostError::unsupported("java is not available"))
+    }
+
+    /// 安装指定大版本
+    ///
+    /// # Errors
+    ///
+    /// 未开放返回 `unsupported`
+    fn install(&self, _major: JavaMajor) -> Result<JavaRuntime, HostError> {
+        Err(HostError::unsupported("java is not available"))
+    }
+
+    /// 卸载托管运行时
+    ///
+    /// # Errors
+    ///
+    /// 未开放返回 `unsupported`
+    fn remove(&self, _path: &Path) -> Result<bool, HostError> {
+        Err(HostError::unsupported("java is not available"))
+    }
+}
+
+// ---- 文件 ----
+
+/// 目录项
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileEntry {
+    /// 相对服务端目录的路径
+    pub path: PathBuf,
+    /// 是否目录
+    pub is_dir: bool,
+    /// 文件字节数（目录为 0）
+    pub size: u64,
+}
+
+/// `files:read` / `files:write`：服务端目录内的受限读写
+///
+/// 路径参数一律相对；实现必须完成规范化与前缀比较，拒绝 `..`、绝对路径、
+/// 盘符、UNC 与符号链接逃逸。`[禁止]` 把校验交给调用方。
+pub trait FileOps: Send + Sync {
+    /// 读文件
+    ///
+    /// # Errors
+    ///
+    /// 越界路径返回 `denied`；超过 [`MAX_FILE_BYTES`] 返回 `limit_exceeded`
+    fn read(&self, _server: &ServerName, _rel: &Path) -> Result<Vec<u8>, HostError> {
+        Err(HostError::unsupported("files are not available"))
+    }
+
+    /// 写文件；`overwrite=false` 时目标已存在返回 `conflict`
+    ///
+    /// # Errors
+    ///
+    /// 同 [`Self::read`]；实现未开放返回 `unsupported`
+    fn write(
+        &self,
+        _server: &ServerName,
+        _rel: &Path,
+        _bytes: &[u8],
+        _overwrite: bool,
+    ) -> Result<(), HostError> {
+        Err(HostError::unsupported("files are not available"))
+    }
+
+    /// 列目录
+    ///
+    /// # Errors
+    ///
+    /// 同 [`Self::read`]
+    fn list(&self, _server: &ServerName, _rel_dir: &Path) -> Result<Vec<FileEntry>, HostError> {
+        Err(HostError::unsupported("files are not available"))
+    }
+
+    /// 删除文件或空目录
+    ///
+    /// # Errors
+    ///
+    /// 同 [`Self::read`]
+    fn remove(&self, _server: &ServerName, _rel: &Path) -> Result<bool, HostError> {
+        Err(HostError::unsupported("files are not available"))
+    }
+}
+
+// ---- 键值与密钥 ----
+
+/// `storage:kv`：插件自己的键值空间
+pub trait KvStore: Send + Sync {
+    /// 读取；不存在返回 `Ok(None)`
+    ///
+    /// # Errors
+    ///
+    /// 键非法返回 `invalid_input`
+    fn get(&self, plugin: &PluginId, key: &str) -> Result<Option<Vec<u8>>, HostError>;
+
+    /// 写入（覆盖）
+    ///
+    /// # Errors
+    ///
+    /// 键 / 值越界或总量超限返回 `limit_exceeded`
+    fn set(&self, plugin: &PluginId, key: &str, value: &[u8]) -> Result<(), HostError>;
+
+    /// 删除；返回是否曾存在
+    ///
+    /// # Errors
+    ///
+    /// 键非法返回 `invalid_input`
+    fn delete(&self, plugin: &PluginId, key: &str) -> Result<bool, HostError>;
+
+    /// 按前缀列举，按键升序，最多 [`MAX_KV_LIST`] 个
+    ///
+    /// # Errors
+    ///
+    /// 前缀非法返回 `invalid_input`
+    fn list(&self, plugin: &PluginId, prefix: &str) -> Result<Vec<String>, HostError>;
+}
+
+/// 密钥值
+///
+/// `Debug` 固定输出 `***`，防止日志与审计意外泄露明文；要取出内容必须显式
+/// 调用 [`SecretValue::expose`]。
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretValue(Vec<u8>);
+
+impl SecretValue {
+    /// 从字节构造
+    #[must_use]
+    pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> Self {
+        Self(bytes.into())
+    }
+
+    /// 从文本构造
+    #[must_use]
+    pub fn from_text(text: impl Into<String>) -> Self {
+        Self(text.into().into_bytes())
+    }
+
+    /// 显式取出内容
+    #[must_use]
+    pub fn expose(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// 字节数
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// 是否为空
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl fmt::Debug for SecretValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SecretValue(***)")
+    }
+}
+
+/// `secret:rw`：插件命名空间的凭据
+///
+/// 写接口接收明文；读接口同样返回 [`SecretValue`]，由调用方决定用途。
+/// `[禁止]` 把明文写进审计、日志或 `plugin status` 输出。
+pub trait SecretStore: Send + Sync {
+    /// 读取
+    ///
+    /// # Errors
+    ///
+    /// 未开放返回 `unsupported`
+    fn get(&self, _plugin: &PluginId, _key: &str) -> Result<Option<SecretValue>, HostError> {
+        Err(HostError::unsupported("secret:rw is not available"))
+    }
+
+    /// 写入
+    ///
+    /// # Errors
+    ///
+    /// 未开放返回 `unsupported`
+    fn set(&self, _plugin: &PluginId, _key: &str, _value: &SecretValue) -> Result<(), HostError> {
+        Err(HostError::unsupported("secret:rw is not available"))
+    }
+
+    /// 删除
+    ///
+    /// # Errors
+    ///
+    /// 未开放返回 `unsupported`
+    fn delete(&self, _plugin: &PluginId, _key: &str) -> Result<bool, HostError> {
+        Err(HostError::unsupported("secret:rw is not available"))
+    }
+}
+
+// ---- 出站网络 ----
+
+/// 宿主代发的出站请求
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetRequest {
+    /// HTTP 方法，大写
+    pub method: String,
+    /// 绝对 URL，仅 http / https
+    pub url: String,
+    /// 请求头
+    pub headers: BTreeMap<String, String>,
+    /// 请求体
+    pub body: Option<Vec<u8>>,
+    /// 超时
+    pub timeout: Duration,
+}
+
+/// 出站响应
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetResponse {
+    /// 状态码
+    pub status: u16,
+    /// 响应头
+    pub headers: BTreeMap<String, String>,
+    /// 响应体
+    pub body: Vec<u8>,
+}
+
+/// `net:outbound`：宿主代发的出站请求
+///
+/// 实现必须按 `manifest.net.allow` 做主机名后缀精确匹配，默认拒绝回环、
+/// 私网、链路本地与云元数据地址。白名单为空时拒绝所有请求。
+pub trait NetProxy: Send + Sync {
+    /// 发起一次请求
+    ///
+    /// # Errors
+    ///
+    /// 目标不在白名单返回 `denied`；非 http/https 或无白名单返回 `unsupported`
+    fn request(&self, _plugin: &PluginId, _request: NetRequest) -> Result<NetResponse, HostError> {
+        Err(HostError::unsupported("net:outbound is not available"))
+    }
+}
+
+// ---- 安装记录 ----
+
+/// 安装记录：期望状态与静态声明
+///
+/// 实时状态不在这里：`enabled` 是用户期望，进程跑没跑由 [`PluginSupervisor`]
+/// 回答。记录里的 [`Self::last_state`] 只用于宿主不在时的离线展示。
+#[derive(Debug, Clone)]
+pub struct PluginRecord {
+    /// 插件 id
+    pub id: PluginId,
+    /// 当前活动版本（SemVer）
+    pub version: String,
+    /// 插件 API 主版本
+    pub api: u32,
+    /// 作用域
+    pub scope: PluginScope,
+    /// `server` 作用域下的服务器
+    pub server: Option<ServerName>,
+    /// 用户期望：是否允许运行
+    pub enabled: bool,
+    /// 用户确认过的能力
+    pub approved: BTreeSet<Capability>,
+    /// 原始 manifest
+    pub manifest: Manifest,
+    /// 产物根目录
+    pub artifact_dir: PathBuf,
+    /// 安装时间（Unix 秒）
+    pub installed_at: i64,
+    /// 最后更新时间（Unix 秒）
+    pub updated_at: i64,
+    /// 离线展示用的最后状态
+    pub last_state: PluginState,
+    /// 最近一次失败原因
+    pub last_error: Option<String>,
+    /// 已安装但未激活的版本（回滚用）
+    pub previous_version: Option<String>,
+    /// 安装来源摘要
+    pub source: Option<String>,
+    /// 产物摘要
+    pub sha256: Option<String>,
+    /// 是否通过签名校验
+    pub signed: bool,
+}
+
+impl PluginRecord {
+    /// 是否存在待确认能力（安装 / 升级后）
+    #[must_use]
+    pub fn needs_approval(&self) -> bool {
+        self.manifest
+            .capabilities
+            .iter()
+            .filter_map(|raw| Capability::parse(raw).ok())
+            .any(|cap| cap.risk().needs_approval() && !self.approved.contains(&cap))
+    }
+
+    /// manifest 声明的能力集合（闭集内）
+    #[must_use]
+    pub fn declared_capabilities(&self) -> BTreeSet<Capability> {
+        self.manifest
+            .capabilities
+            .iter()
+            .filter_map(|raw| Capability::parse(raw).ok())
+            .collect()
+    }
+}
+
+/// 安装记录存储
+pub trait PluginStore: Send + Sync {
+    /// 全部记录，按 id 升序
+    ///
+    /// # Errors
+    ///
+    /// 底层失败返回 [`crate::RepositoryError`]
+    fn list(&self) -> Result<Vec<PluginRecord>, crate::RepositoryError>;
+
+    /// 按 id 读取
+    ///
+    /// # Errors
+    ///
+    /// 不存在返回 [`crate::RepositoryError::NotFound`]
+    fn get(&self, id: &PluginId) -> Result<PluginRecord, crate::RepositoryError>;
+
+    /// 写入或覆盖
+    ///
+    /// # Errors
+    ///
+    /// 底层失败返回 [`crate::RepositoryError::Storage`]
+    fn put(&self, record: &PluginRecord) -> Result<(), crate::RepositoryError>;
+
+    /// 删除记录（不删产物与数据）
+    ///
+    /// # Errors
+    ///
+    /// 不存在返回 [`crate::RepositoryError::NotFound`]
+    fn remove(&self, id: &PluginId) -> Result<(), crate::RepositoryError>;
+}
+
+// ---- 安装来源与校验 ----
+
+/// 安装来源
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtifactOrigin {
+    /// 本地目录或压缩包
+    Local(PathBuf),
+    /// 远程压缩包
+    Url(String),
+    /// git 仓库，可固定 revision
+    Git {
+        /// 仓库地址
+        url: String,
+        /// 分支 / tag / commit
+        rev: Option<String>,
+    },
+}
+
+/// 校验通过的插件产物
+#[derive(Debug, Clone)]
+pub struct PluginArtifact {
+    /// 解包后的根目录
+    pub root: PathBuf,
+    /// 校验过的 manifest
+    pub manifest: Manifest,
+    /// descriptor 原始字节（校验由调用方完成，保证错误顺序可控）
+    pub descriptor: Vec<u8>,
+    /// 产物摘要（小写 hex）
+    pub sha256: String,
+    /// 是否带签名
+    pub signed: bool,
+    /// 是否被信任（签名有效，或用户显式 `--allow-unsigned`）
+    pub trusted: bool,
+}
+
+/// `ArtifactSource`：把来源解析成解包后的产物
+pub trait ArtifactSource: Send + Sync {
+    /// 拉取并解包到 `dest_root`
+    ///
+    /// 实现负责压缩包上限（128 MiB / 解包 512 MiB）与路径逃逸检查；manifest
+    /// 与 descriptor 的语义校验由 `service` 调用 `domain` 完成。
+    ///
+    /// # Errors
+    ///
+    /// 下载、解包、摘要失败返回 [`HostError`]
+    fn fetch(&self, origin: &ArtifactOrigin, dest_root: &Path)
+    -> Result<PluginArtifact, HostError>;
+}
+
+/// `ArtifactVerifier`：摘要 + 签名校验
+pub trait ArtifactVerifier: Send + Sync {
+    /// 校验产物
+    ///
+    /// # Errors
+    ///
+    /// 摘要不匹配返回 `invalid_input`；无签名且未允许时返回 `denied`
+    fn verify(
+        &self,
+        root: &Path,
+        expected_sha256: Option<&Checksum>,
+        allow_unsigned: bool,
+    ) -> Result<PluginArtifact, HostError>;
+}
+
+// ---- 审计 ----
+
+/// 审计结论
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditResult {
+    /// 允许并完成
+    Allowed,
+    /// 被能力门拒绝
+    Denied,
+    /// 已授权但执行失败
+    Failed,
+}
+
+/// 一条审计记录
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditEvent {
+    /// Unix 秒
+    pub at: i64,
+    /// 插件
+    pub plugin: String,
+    /// 动作（op id / `capability:<name>` / `lifecycle:<verb>`）
+    pub action: String,
+    /// 涉及能力
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<Capability>,
+    /// 结论
+    pub result: AuditResult,
+    /// 细节；不得包含密钥
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// 审计出口
+///
+/// 与 [`crate::EventSink`] 同一条纪律：`record` 必须不阻塞业务、不把失败
+/// 传播给调用方。实现自行记录写入失败。
+pub trait AuditSink: Send + Sync {
+    /// 记录一条审计
+    fn record(&self, _event: &AuditEvent) {}
+}
+
+/// 丢弃全部审计的默认出口
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopAuditSink;
+
+impl AuditSink for NoopAuditSink {}
+
+// ---- 宿主运行时 ----
+
+/// 会话摘要
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInfo {
+    /// 会话 id
+    pub session_id: String,
+    /// 实际授予的能力
+    pub granted: BTreeSet<Capability>,
+    /// 插件进程 PID
+    pub pid: u32,
+    /// 会话开始时间（Unix 秒）
+    pub started_at: i64,
+}
+
+/// 宿主视角的实时状态
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginRuntimeStatus {
+    /// 插件
+    pub id: PluginId,
+    /// 实际状态
+    pub state: PluginState,
+    /// 活动会话
+    pub session: Option<SessionInfo>,
+    /// 最近一次错误
+    pub last_error: Option<String>,
+}
+
+/// 流式分块的接收方
+pub trait StreamSink: Send {
+    /// 收到一块；`done=true` 表示流正常结束
+    ///
+    /// # Errors
+    ///
+    /// 接收方决定放弃（客户端断开、写失败）时返回错误，宿主据此发 `cancel`
+    fn on_chunk(&mut self, chunk: &Value, done: bool) -> Result<(), HostError>;
+}
+
+/// 插件宿主运行时：启停、状态、调用、控制通道
+///
+/// 由 `crates/plugin` 实现，`service` 只编排。`[禁止]` 让入口直接持有进程
+/// 句柄或自行拼帧。
+pub trait PluginSupervisor: Send + Sync {
+    /// 拉起插件并等待握手完成
+    ///
+    /// # Errors
+    ///
+    /// 未启用返回 `conflict`；握手失败返回 `crashed`
+    fn start(&self, id: &PluginId) -> Result<SessionInfo, HostError>;
+
+    /// 请求停机
+    ///
+    /// # Errors
+    ///
+    /// 未运行返回 `conflict`
+    fn stop(&self, id: &PluginId, grace: Duration) -> Result<(), HostError>;
+
+    /// 实时状态
+    ///
+    /// # Errors
+    ///
+    /// 记录不存在返回 `not_found`
+    fn status(&self, id: &PluginId) -> Result<PluginRuntimeStatus, HostError>;
+
+    /// 调用插件 op（惰性启动）
+    ///
+    /// # Errors
+    ///
+    /// 能力未授予返回 `denied`；超时返回 `timeout`
+    fn call(&self, id: &PluginId, op: &str, input: Value) -> Result<Value, HostError>;
+
+    /// 订阅插件 stream（惰性启动）
+    ///
+    /// # Errors
+    ///
+    /// 同 [`Self::call`]；超过总字节上限返回 `limit_exceeded`
+    fn stream(
+        &self,
+        id: &PluginId,
+        op: &str,
+        input: Value,
+        sink: &mut dyn StreamSink,
+    ) -> Result<(), HostError>;
+
+    /// 让宿主重新读取安装记录（install / remove 后）
+    ///
+    /// # Errors
+    ///
+    /// 记录读取失败返回 `internal`
+    fn reload(&self) -> Result<(), HostError>;
+
+    /// 撤销一项已授予能力；立即生效，不重启会话
+    ///
+    /// 宿主不在时默认成功：下次握手会按记录重新计算授予集合。
+    ///
+    /// # Errors
+    ///
+    /// 会话状态损坏时返回 `internal`
+    fn revoke(&self, _id: &PluginId, _capability: Capability) -> Result<(), HostError> {
+        Ok(())
+    }
+
+    /// 游标读取插件日志（控制通道）
+    ///
+    /// # Errors
+    ///
+    /// 宿主未运行时返回 `unavailable`
+    fn logs(&self, _id: &PluginId, _offset: Option<u64>, _max: usize) -> Result<Value, HostError> {
+        Err(HostError::unsupported("plugin logs are not available"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn category_mapping_covers_every_code() {
+        for code in PluginErrorCode::ALL {
+            let category = category_of(code);
+            assert_eq!(category, HostError::new(code, "").category, "{code}");
+        }
+        assert_eq!(
+            category_of(PluginErrorCode::Denied),
+            ErrorCategory::Unauthorized
+        );
+        assert_eq!(
+            category_of(PluginErrorCode::Timeout),
+            ErrorCategory::Backend
+        );
+        assert_eq!(
+            category_of(PluginErrorCode::InvalidInput),
+            ErrorCategory::Usage
+        );
+    }
+
+    #[test]
+    fn retryability_follows_code() {
+        assert!(HostError::new(PluginErrorCode::Timeout, "").retryable);
+        assert!(!HostError::new(PluginErrorCode::Denied, "").retryable);
+    }
+
+    #[test]
+    fn secret_debug_is_redacted() {
+        let secret = SecretValue::from_text("hunter2");
+        assert_eq!(format!("{secret:?}"), "SecretValue(***)");
+        assert_eq!(secret.expose(), b"hunter2");
+        assert_eq!(secret.len(), 7);
+    }
+
+    #[test]
+    fn advanced_capabilities_default_to_unsupported() {
+        struct Empty;
+        impl ServerLifecycle for Empty {}
+        impl BackupOps for Empty {}
+        impl ContentOps for Empty {}
+        impl JavaOps for Empty {}
+        impl FileOps for Empty {}
+        impl SecretStore for Empty {}
+        impl NetProxy for Empty {}
+
+        let server = ServerName::parse("survival").expect("name");
+        assert!(matches!(
+            Empty.start(&server).map_err(|err| err.code),
+            Err(PluginErrorCode::Unsupported)
+        ));
+        let plugin = PluginId::parse("demo").expect("id");
+        assert!(matches!(
+            Empty
+                .request(
+                    &plugin,
+                    NetRequest {
+                        method: "GET".to_owned(),
+                        url: "https://example.com".to_owned(),
+                        headers: BTreeMap::new(),
+                        body: None,
+                        timeout: Duration::from_secs(1),
+                    }
+                )
+                .map_err(|err| err.code),
+            Err(PluginErrorCode::Unsupported)
+        ));
+    }
+
+    #[test]
+    fn display_includes_code() {
+        let err = HostError::denied("console:write 未授予");
+        assert_eq!(err.to_string(), "denied: console:write 未授予");
+        assert_eq!(err.category, ErrorCategory::Unauthorized);
+    }
+}

@@ -68,4 +68,32 @@ pub enum DomainEvent {
         /// 失败原因
         reason: String,
     },
+    /// 游戏内聊天（由控制台行解析，插件订阅 `chat:message`）
+    ///
+    /// 字段名按 `docs/plugins.md` 第 4.6 节固定为 `server` / `from`：同时携带
+    /// 说话者与文本时，`name` 会产生歧义；线格式同样使用这两个名字。
+    ChatMessage {
+        /// 来源服务器
+        server: String,
+        /// 玩家名
+        from: String,
+        /// 原始文本（保留 `§` 颜色码，渲染层处理）
+        text: String,
+        /// RFC3339 UTC 时间
+        at: String,
+    },
+    /// 玩家加入（`player:joined`）
+    PlayerJoined {
+        /// 来源服务器
+        server: String,
+        /// 玩家名
+        player: String,
+    },
+    /// 玩家离开（`player:left`）
+    PlayerLeft {
+        /// 来源服务器
+        server: String,
+        /// 玩家名
+        player: String,
+    },
 }

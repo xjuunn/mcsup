@@ -9,6 +9,7 @@ pub mod modrinth;
 pub mod mojang;
 pub mod neoforge;
 pub mod papermc;
+pub mod plugin;
 pub mod purpur;
 pub mod quilt;
 mod shared;

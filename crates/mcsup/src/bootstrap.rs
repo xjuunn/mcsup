@@ -34,6 +34,7 @@ use service::{
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use storage::JsonStore;
+use storage::plugin::{JsonlAuditSink, KvFileStore, PluginFileStore, SecretFileStore};
 use thiserror::Error;
 
 /// 组合根装配失败
@@ -94,6 +95,16 @@ pub struct Mcsup {
     pub modpack: ModpackService,
     /// 服务端 mod 编排（列表 / 安装 / 卸载 / 检查更新 / 更新）
     pub mods: service::ModService,
+    /// 插件编排（安装记录、授权、启停、调用）
+    pub plugins: service::PluginService,
+    /// 宿主能力实现（`server:read` / `console:*` / 键值 / 密钥）
+    pub plugin_api: Arc<service::HostApiImpl>,
+    /// 插件事件总线（宿主订阅者与领域事件共用）
+    pub plugin_events: plugin::EventBus,
+    /// 插件安装记录存储（`__plugin-host` 与安装编排共用）
+    pub plugin_store: Arc<dyn port::plugin::PluginStore>,
+    /// 插件审计出口
+    pub plugin_audit: Arc<dyn port::plugin::AuditSink>,
     /// 下载器（HTTP 传输 + 断点续传）：远端安装核心时由 agent 侧复用
     ///
     /// 与各 service 内部持有的是同一个实例；单独暴露是因为远端安装（
@@ -158,6 +169,43 @@ impl Mcsup {
     #[must_use]
     pub fn has_external_supervisor(&self) -> bool {
         self.external_supervisor
+    }
+
+    /// 构造插件宿主运行时
+    ///
+    /// 只有 `__plugin-host` 进程调用它：其他入口经 [`service::PluginService`]
+    /// 的 [`port::plugin::PluginSupervisor`] 与控制通道访问宿主。宿主不在
+    /// 构造时启动任何后台线程或绑定端点，由调用方决定何时 `serve`。
+    #[must_use]
+    pub fn plugin_host(self: &Arc<Self>, data_dir: &Path) -> Arc<plugin::PluginHost> {
+        let services = Arc::new(plugin::HostServices {
+            server_read: Some(self.plugin_api.clone()),
+            console: Some(self.plugin_api.clone()),
+            kv: Some(self.plugin_api.kv()),
+            secrets: Some(self.plugin_api.secrets()),
+            ..plugin::HostServices::default()
+        });
+        plugin::PluginHost::new(
+            data_dir.to_path_buf(),
+            Arc::clone(&self.plugin_store),
+            services,
+            self.plugin_events.clone(),
+            Arc::clone(&self.plugin_audit),
+            env!("CARGO_PKG_VERSION"),
+        )
+    }
+}
+
+/// 领域事件同时送到调用方注入的出口与插件总线
+struct TeeEventSink {
+    primary: Arc<dyn port::EventSink>,
+    bus: plugin::EventBus,
+}
+
+impl port::EventSink for TeeEventSink {
+    fn publish(&self, event: domain::server::event::DomainEvent) {
+        self.bus.publish(event.clone());
+        self.primary.publish(event);
     }
 }
 
@@ -518,8 +566,11 @@ impl McsupBuilder {
         };
         let workspaces =
             WorkspaceService::new(Arc::clone(&workspaces_repo), Arc::clone(&servers_repo));
-        let events: Arc<dyn port::EventSink> =
-            self.events.unwrap_or_else(|| Arc::new(port::NoopEventSink));
+        let plugin_events = plugin::EventBus::default();
+        let events: Arc<dyn port::EventSink> = Arc::new(TeeEventSink {
+            primary: self.events.unwrap_or_else(|| Arc::new(port::NoopEventSink)),
+            bus: plugin_events.clone(),
+        });
         let lifecycle = ServerLifecycleService::with_events(
             Arc::clone(&registry),
             java.clone(),
@@ -580,7 +631,40 @@ impl McsupBuilder {
             inspector,
         );
 
-        Ok(Mcsup {
+        // 插件：记录 / 键值 / 密钥 / 审计全部落 `{data_dir}` 下的固定布局。
+        let plugin_db = db_root.join("plugins");
+        let plugin_store: Arc<dyn port::plugin::PluginStore> =
+            Arc::new(PluginFileStore::open(&plugin_db).map_err(|source| {
+                BootstrapError::Store {
+                    path: plugin_db.clone(),
+                    source,
+                }
+            })?);
+        let plugin_data = data_dir.join("plugin-data");
+        let plugin_logs = data_dir.join("logs").join("plugins");
+        let plugin_audit: Arc<dyn port::plugin::AuditSink> =
+            Arc::new(JsonlAuditSink::new(db_root.join("audit").join("plugins")));
+        let kv: Arc<dyn port::plugin::KvStore> = Arc::new(KvFileStore::new(plugin_data.clone()));
+        let secrets: Arc<dyn port::plugin::SecretStore> =
+            Arc::new(SecretFileStore::new(plugin_data.clone()));
+        let plugin_api = Arc::new(service::HostApiImpl::new(
+            Arc::clone(&registry),
+            Arc::new(lifecycle.clone()),
+            kv,
+            secrets,
+        ));
+        let plugins = service::PluginService::new(
+            Arc::clone(&plugin_store),
+            Some(Arc::new(plugin::ControlClient::new(data_dir))),
+            Some(Arc::new(provider::plugin::PluginArtifactSource::new())),
+            Some(Arc::new(provider::plugin::PluginArtifactVerifier::new())),
+            Arc::clone(&plugin_audit),
+            data_dir.join("plugins"),
+            plugin_data,
+            plugin_logs,
+        );
+
+        let mcsup = Mcsup {
             workspaces,
             registry,
             java,
@@ -590,10 +674,16 @@ impl McsupBuilder {
             content,
             modpack,
             mods,
+            plugins,
+            plugin_api,
+            plugin_events,
+            plugin_store,
+            plugin_audit,
             downloader,
             store,
             external_supervisor,
-        })
+        };
+        Ok(mcsup)
     }
 
     /// 组装选源组件；没有可用镜像时返回 `None`

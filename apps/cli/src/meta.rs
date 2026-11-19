@@ -1046,6 +1046,289 @@ pub(crate) fn config_edit() -> &'static str {
     t("打开编辑器", "open the editor")
 }
 
+// ---- plugin ----
+
+#[must_use]
+pub(crate) fn plugin() -> &'static str {
+    t(
+        "平台插件：安装、启停、调用、授权与日志",
+        "platform plugins: install, lifecycle, calls, grants and logs",
+    )
+}
+
+#[must_use]
+pub(crate) fn plugin_host() -> &'static str {
+    t("运行插件宿主", "run the plugin host")
+}
+
+#[must_use]
+pub(crate) fn plugin_list() -> &'static str {
+    t("列出已安装插件", "list installed plugins")
+}
+
+#[must_use]
+pub(crate) fn plugin_install() -> &'static str {
+    t(
+        "安装插件（本地目录 / zip / URL / git）",
+        "install a plugin (local directory / zip / URL / git)",
+    )
+}
+
+#[must_use]
+pub(crate) fn plugin_update() -> &'static str {
+    t(
+        "升级到新版本（沿用记录的来源）",
+        "upgrade to a new version using the recorded source",
+    )
+}
+
+#[must_use]
+pub(crate) fn plugin_remove() -> &'static str {
+    t("卸载插件", "uninstall a plugin")
+}
+
+#[must_use]
+pub(crate) fn plugin_enable() -> &'static str {
+    t("允许插件运行", "allow a plugin to run")
+}
+
+#[must_use]
+pub(crate) fn plugin_disable() -> &'static str {
+    t(
+        "停止并禁止插件运行",
+        "stop a plugin and forbid it from running",
+    )
+}
+
+#[must_use]
+pub(crate) fn plugin_start() -> &'static str {
+    t("拉起插件进程", "start the plugin process")
+}
+
+#[must_use]
+pub(crate) fn plugin_stop() -> &'static str {
+    t("停止插件进程", "stop the plugin process")
+}
+
+#[must_use]
+pub(crate) fn plugin_restart() -> &'static str {
+    t("重启插件进程", "restart the plugin process")
+}
+
+#[must_use]
+pub(crate) fn plugin_status() -> &'static str {
+    t("单插件状态", "status of one plugin")
+}
+
+#[must_use]
+pub(crate) fn plugin_ops() -> &'static str {
+    t("列出插件声明的 op", "list the ops declared by a plugin")
+}
+
+#[must_use]
+pub(crate) fn plugin_call() -> &'static str {
+    t("调用插件 op", "call a plugin op")
+}
+
+#[must_use]
+pub(crate) fn plugin_config() -> &'static str {
+    t("配置读取 / 写入", "read or write plugin config")
+}
+
+#[must_use]
+pub(crate) fn plugin_grant() -> &'static str {
+    t("追加能力授权", "grant a capability")
+}
+
+#[must_use]
+pub(crate) fn plugin_revoke() -> &'static str {
+    t(
+        "撤销能力授权（立即生效）",
+        "revoke a capability (takes effect immediately)",
+    )
+}
+
+#[must_use]
+pub(crate) fn plugin_block() -> &'static str {
+    t(
+        "本机拉黑：立即停用且不再自动启动",
+        "block locally: stop now and never auto-start",
+    )
+}
+
+#[must_use]
+pub(crate) fn plugin_unblock() -> &'static str {
+    t("解除拉黑", "lift a local block")
+}
+
+#[must_use]
+pub(crate) fn plugin_quarantine() -> &'static str {
+    t(
+        "隔离：保留产物但禁止运行",
+        "quarantine: keep the artifact but forbid running",
+    )
+}
+
+#[must_use]
+pub(crate) fn plugin_release() -> &'static str {
+    t("解除隔离", "release from quarantine")
+}
+
+#[must_use]
+pub(crate) fn plugin_logs() -> &'static str {
+    t("读取插件日志", "read plugin logs")
+}
+
+#[must_use]
+pub(crate) fn plugin_verify() -> &'static str {
+    t("校验产物摘要与签名", "verify artifact digest and signature")
+}
+
+#[must_use]
+pub(crate) fn plugin_rollback() -> &'static str {
+    t("回滚到上一版本", "roll back to the previous version")
+}
+
+#[must_use]
+pub(crate) fn plugin_doctor() -> &'static str {
+    t(
+        "体检：记录、产物、宿主连通性",
+        "doctor: records, artifacts and host connectivity",
+    )
+}
+
+#[must_use]
+pub(crate) fn plugin_config_get() -> &'static str {
+    t("读取配置（密钥打码）", "read config (secrets masked)")
+}
+
+#[must_use]
+pub(crate) fn plugin_config_set() -> &'static str {
+    t("写入配置", "write config")
+}
+
+#[must_use]
+pub(crate) fn plugin_json_arg() -> &'static str {
+    t("输出 JSON", "output JSON")
+}
+
+#[must_use]
+pub(crate) fn plugin_source_arg() -> &'static str {
+    t(
+        "本地路径或 URL（省略时由 --from / --url / --git 指定）",
+        "local path or URL (omit when using --from / --url / --git)",
+    )
+}
+
+#[must_use]
+pub(crate) fn plugin_from_arg() -> &'static str {
+    t("从本地目录安装", "install from a local directory")
+}
+
+#[must_use]
+pub(crate) fn plugin_url_arg() -> &'static str {
+    t("从 URL 下载安装", "install from a URL")
+}
+
+#[must_use]
+pub(crate) fn plugin_git_arg() -> &'static str {
+    t("从 git 仓库安装", "install from a git repository")
+}
+
+#[must_use]
+pub(crate) fn plugin_ref_arg() -> &'static str {
+    t("git 版本 / 分支", "git revision / branch")
+}
+
+#[must_use]
+pub(crate) fn plugin_sha256_arg() -> &'static str {
+    t("期望的 SHA-256", "expected SHA-256")
+}
+
+#[must_use]
+pub(crate) fn plugin_allow_unsigned_arg() -> &'static str {
+    t("允许未签名产物", "allow unsigned artifacts")
+}
+
+#[must_use]
+pub(crate) fn plugin_dev_arg() -> &'static str {
+    t(
+        "开发模式（等同 --allow-unsigned）",
+        "development mode (same as --allow-unsigned)",
+    )
+}
+
+#[must_use]
+pub(crate) fn plugin_to_arg() -> &'static str {
+    t("目标版本", "target version")
+}
+
+#[must_use]
+pub(crate) fn plugin_prune_arg() -> &'static str {
+    t("删除旧版本产物", "delete old version artifacts")
+}
+
+#[must_use]
+pub(crate) fn plugin_purge_arg() -> &'static str {
+    t("同时删除插件数据", "also delete plugin data")
+}
+
+#[must_use]
+pub(crate) fn plugin_grace_arg() -> &'static str {
+    t("优雅退出等待秒数", "graceful shutdown timeout in seconds")
+}
+
+#[must_use]
+pub(crate) fn plugin_input_arg() -> &'static str {
+    t(
+        "调用参数 JSON / @文件 / -",
+        "call input as JSON / @file / -",
+    )
+}
+
+#[must_use]
+pub(crate) fn plugin_stream_arg() -> &'static str {
+    t("按流式输出", "stream the output")
+}
+
+#[must_use]
+pub(crate) fn plugin_follow_arg() -> &'static str {
+    t("持续跟随新日志", "keep following new log lines")
+}
+
+#[must_use]
+pub(crate) fn plugin_tail_arg() -> &'static str {
+    t("读取的行数", "number of lines to read")
+}
+
+#[must_use]
+pub(crate) fn plugin_target_arg() -> &'static str {
+    t("插件 id 或产物目录", "plugin id or artifact directory")
+}
+
+#[must_use]
+pub(crate) fn plugin_key_arg() -> &'static str {
+    t("配置键", "config key")
+}
+
+#[must_use]
+pub(crate) fn plugin_value_arg() -> &'static str {
+    t("配置值", "config value")
+}
+
+#[must_use]
+pub(crate) fn plugin_secret_arg() -> &'static str {
+    t("按密钥处理（输入不回显）", "treat as a secret (no echo)")
+}
+
+#[must_use]
+pub(crate) fn plugin_data_dir_arg() -> &'static str {
+    t(
+        "平台数据目录；缺省用当前配置",
+        "platform data directory; defaults to current config",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -15,6 +15,7 @@ domain = { package = "mcsup-domain", version = "0.1.0", path = "../domain" }
 port = { package = "mcsup-port", version = "0.1.0", path = "../port" }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+sha2 = "0.11.0"
 tempfile.workspace = true
 
 [lints]

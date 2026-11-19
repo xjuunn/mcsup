@@ -816,13 +816,16 @@ fn no_args_help_is_chinese_on_stderr() {
 fn help_output_follows_lang_flag() {
     let home = temp_home();
     // 覆盖各层：顶层 / 一级子命令 / 二级子命令 / 带参数说明的命令
-    let cases: [&[&str]; 6] = [
+    let cases: [&[&str]; 9] = [
         &["--help", "--lang", "en"],
         &["workspace", "-h", "--lang", "en"],
         &["server", "--help", "--lang", "en"],
         &["server", "create", "--help", "--lang", "en"],
         &["java", "install", "--help", "--lang", "en"],
         &["workspace", "doctor", "--help", "--lang", "en"],
+        &["plugin", "--help", "--lang", "en"],
+        &["plugin", "install", "--help", "--lang", "en"],
+        &["plugin", "call", "--help", "--lang", "en"],
     ];
     for args in cases {
         let out = run(home.path(), args);
@@ -1397,5 +1400,110 @@ fn single_letter_shorthand_is_rejected() {
             "{args:?}: {}",
             stderr(&out)
         );
+    }
+}
+
+// ---- plugin ----
+
+/// 空数据目录：`plugin list --json` 输出空数组，不因宿主不在而失败
+#[test]
+fn plugin_list_json_is_empty_without_plugins() {
+    let home = temp_home();
+    let out = run(home.path(), &["plugin", "list", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let rows: serde_json::Value = serde_json::from_slice(&out.stdout).expect("list 输出数组");
+    assert_eq!(rows, serde_json::json!([]));
+}
+
+/// 未知插件是「不存在」而不是「用法错误」
+#[test]
+fn plugin_status_unknown_exits_3() {
+    let home = temp_home();
+    let out = run(home.path(), &["plugin", "status", "ghost"]);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    assert!(out.stdout.is_empty(), "失败不得输出数据");
+}
+
+#[test]
+fn plugin_invalid_id_exits_2() {
+    let home = temp_home();
+    let out = run(home.path(), &["plugin", "status", "Not A Plugin"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+}
+
+/// 本地目录安装 → 列表 → ops → 校验摘要。全程不联网、不拉起宿主。
+#[test]
+fn plugin_install_local_artifact_then_list_ops_and_verify() {
+    let home = temp_home();
+    let artifact = home.path().join("demo-plugin");
+    write_plugin_artifact(&artifact);
+
+    let out = run(
+        home.path(),
+        &[
+            "--output",
+            "json",
+            "plugin",
+            "install",
+            "--from",
+            artifact.to_str().expect("utf-8 path"),
+            "--allow-unsigned",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let installed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("install 输出对象");
+    assert_eq!(installed["id"], "demo");
+    assert_eq!(installed["version"], "0.1.0");
+    assert_eq!(installed["signed"], false);
+
+    let out = run(home.path(), &["plugin", "list", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let rows: serde_json::Value = serde_json::from_slice(&out.stdout).expect("list 输出数组");
+    assert_eq!(rows[0]["id"], "demo");
+    // 安装后还没有 enable，离线状态是 disabled
+    assert_eq!(rows[0]["state"], "disabled");
+
+    let out = run(home.path(), &["plugin", "ops", "demo", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let ops: serde_json::Value = serde_json::from_slice(&out.stdout).expect("ops 输出数组");
+    assert_eq!(ops[0]["id"], "ping");
+
+    let out = run(
+        home.path(),
+        &["--output", "json", "plugin", "verify", "demo"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let verified: serde_json::Value = serde_json::from_slice(&out.stdout).expect("verify 输出对象");
+    assert_eq!(verified["id"], "demo");
+    assert_eq!(verified["signed"], false);
+    assert_eq!(verified["trusted"], true);
+}
+
+fn write_plugin_artifact(root: &Path) {
+    std::fs::create_dir_all(root.join("bin")).expect("create bin");
+    std::fs::write(
+        root.join("manifest.json"),
+        r#"{"schema":1,"id":"demo","name":"Demo","version":"0.1.0","api":1,
+            "entry":{"type":"process","cmd":"bin/demo"},
+            "capabilities":["events"],"license":"MIT"}"#,
+    )
+    .expect("write manifest");
+    std::fs::write(
+        root.join("descriptor.json"),
+        r#"{"schema":1,"plugin_id":"demo","api":1,
+            "ops":[{"id":"ping","kind":"query","title":"Ping","risk":"read",
+                    "input":{"type":"object"},"output":{"type":"object"}}]}"#,
+    )
+    .expect("write descriptor");
+    std::fs::write(root.join("bin/demo"), "#!/bin/sh\nexit 0\n").expect("write entry");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            root.join("bin/demo"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod entry");
     }
 }

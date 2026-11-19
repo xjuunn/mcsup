@@ -1846,6 +1846,7 @@ dependencies = [
  "mcsup-file",
  "mcsup-java",
  "mcsup-modkit",
+ "mcsup-plugin",
  "mcsup-port",
  "mcsup-protocol",
  "mcsup-provider",
@@ -1917,6 +1918,8 @@ name = "mcsup-domain"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -1960,6 +1963,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcsup-plugin"
+version = "0.1.0"
+dependencies = [
+ "mcsup-domain",
+ "mcsup-port",
+ "mcsup-protocol",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "mcsup-port"
 version = "0.1.0"
 dependencies = [
@@ -1980,6 +1998,7 @@ dependencies = [
  "mcsup-port",
  "serde",
  "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -1995,6 +2014,8 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",
@@ -2050,6 +2071,7 @@ dependencies = [
  "mcsup-port",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 
@@ -2610,7 +2632,9 @@ dependencies = [
  "base64",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
+ "futures-util",
  "h2",
  "http",
  "http-body",

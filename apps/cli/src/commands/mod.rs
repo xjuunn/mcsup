@@ -8,6 +8,7 @@ mod mod_inspect;
 mod mod_review;
 mod modpack;
 mod origin;
+mod plugin;
 mod props;
 mod remote;
 mod server_mod;
@@ -36,6 +37,11 @@ pub(crate) async fn run(cli: Cli, cfg: &ConfigFile, lang: Lang) -> Result<()> {
         Command::Mod { action } => mod_inspect::run(action, printer).await,
         Command::Remote { action } => remote::run(action, printer),
         Command::Doctor { only, strict } => doctor::run(cfg, &only, strict, printer).await,
+        Command::Plugin { action } => plugin::run(action, printer),
+        Command::PluginHost {
+            data_dir,
+            idle_timeout,
+        } => plugin::run_host(data_dir, idle_timeout),
         Command::Config { action } => config::run(action, printer),
         Command::Update => err("update"),
         // 隐藏入口：读命令在后台拉起的缓存刷新进程，输出一律丢弃

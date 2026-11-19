@@ -6,6 +6,7 @@ pub mod mirror;
 pub mod mod_;
 pub mod modpack;
 pub mod origin;
+pub mod plugin;
 pub mod task;
 
 pub use backend::Backend;

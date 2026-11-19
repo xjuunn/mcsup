@@ -1,0 +1,870 @@
+//! `plugin` 子命令与隐藏的 `__plugin-host`
+//!
+//! 入口只做参数解析、进度回显、结果渲染与错误映射。安装记录与授权在
+//! [`mcsup::service::PluginService`]；进程、帧与会话在宿主进程；两者经控制
+//! 通道相连。管理命令在本进程完成文件与记录操作后通知宿主 `reload`。
+
+use crate::bootstrap;
+use crate::cli::{PluginAction, PluginConfigAction};
+use crate::config;
+use crate::diagnostic::AppDiagnostic;
+use crate::output::{OutputFormat, Printer};
+use crate::progress::TaskSpinner;
+use anyhow::{Context, Result, anyhow};
+use comfy_table::Table;
+use mcsup::domain::plugin::PluginId;
+use mcsup::domain::plugin::capability::Capability;
+use mcsup::domain::plugin::descriptor::Descriptor;
+use mcsup::domain::plugin::manifest::Manifest;
+use mcsup::domain::server::artifact::{Checksum, ChecksumAlgorithm};
+use mcsup::port::plugin::ArtifactVerifier as _;
+use mcsup::port::plugin::{ArtifactOrigin, StreamSink};
+use mcsup::service::PluginService;
+use serde_json::{Value, json};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+pub(crate) fn run(action: PluginAction, printer: Printer) -> Result<()> {
+    match action {
+        PluginAction::List { json } => list(printer, json),
+        PluginAction::Install {
+            source,
+            from,
+            url,
+            git,
+            reference,
+            sha256,
+            allow_unsigned,
+            dev,
+        } => install(
+            source,
+            from,
+            url,
+            git,
+            reference,
+            sha256,
+            allow_unsigned || dev,
+            printer,
+        ),
+        PluginAction::Update { id, to, prune } => update(&id, to, prune, printer),
+        PluginAction::Remove { id, purge } => remove(&id, purge, printer),
+        PluginAction::Enable { id } => set_enabled(&id, true, printer),
+        PluginAction::Disable { id } => set_enabled(&id, false, printer),
+        PluginAction::Start { id } => start(&id, printer),
+        PluginAction::Stop { id, grace } => stop(&id, grace, printer),
+        PluginAction::Restart { id } => restart(&id, printer),
+        PluginAction::Status { id, json } => status(&id, printer, json),
+        PluginAction::Ops { id, json } => ops(&id, printer, json),
+        PluginAction::Call {
+            id,
+            op,
+            input,
+            json,
+            stream,
+        } => call(&id, &op, input.as_deref(), stream, printer, json),
+        PluginAction::Config { action } => config_cmd(&action, printer),
+        PluginAction::Grant { id, capability } => grant(&id, &capability, printer),
+        PluginAction::Revoke { id, capability } => revoke(&id, &capability, printer),
+        PluginAction::Block { id } | PluginAction::Quarantine { id } => {
+            let _ = id;
+            Err(AppDiagnostic::not_implemented("plugin block / quarantine").into())
+        }
+        PluginAction::Unblock { id } | PluginAction::Release { id } => {
+            let _ = id;
+            Err(AppDiagnostic::not_implemented("plugin unblock / release").into())
+        }
+        PluginAction::Logs { id, follow, tail } => logs(&id, follow, tail, printer),
+        PluginAction::Verify { target } => verify(&target, printer),
+        PluginAction::Rollback { id } => rollback(&id, printer),
+        PluginAction::Doctor { json } => doctor(printer, json),
+    }
+}
+
+/// 隐藏入口：运行宿主直到收到 `shutdown`
+pub(crate) fn run_host(data_dir: Option<PathBuf>, idle_timeout: u64) -> Result<()> {
+    let data_dir = data_dir.unwrap_or_else(config::platform_data_dir);
+    let mcsup = Arc::new(bootstrap::open_mcsup().context("装配插件宿主")?);
+    let host = mcsup
+        .plugin_host(&data_dir)
+        .with_idle_after(Duration::from_secs(idle_timeout.max(10)));
+    let server = mcsup::plugin::ControlServer::bind(&data_dir).map_err(|err| match err {
+        mcsup::plugin::control::ControlError::AlreadyRunning => {
+            AppDiagnostic::conflict("另一个插件宿主已在运行", None)
+        }
+        other => AppDiagnostic::failure(other.to_string(), None),
+    })?;
+    host.spawn_idle_reaper();
+    let control = Arc::new(mcsup::plugin::HostControl::new(
+        Arc::clone(&host) as Arc<dyn mcsup::port::plugin::PluginSupervisor>,
+        Arc::clone(&mcsup.plugin_store),
+        data_dir.join("logs").join("plugins"),
+        Arc::clone(&mcsup.plugin_audit),
+    ));
+    server.serve(control).context("运行插件宿主控制端点")?;
+    host.shutdown_all(Duration::from_secs(5));
+    Ok(())
+}
+
+fn open() -> Result<PluginService> {
+    Ok(bootstrap::open_mcsup()?.plugins)
+}
+
+fn parse_id(raw: &str) -> Result<PluginId> {
+    PluginId::parse(raw).map_err(|err| {
+        AppDiagnostic::usage(format!("插件 id 非法: {raw}"), Some(err.to_string())).into()
+    })
+}
+
+fn parse_capability(raw: &str) -> Result<Capability> {
+    Capability::parse(raw).map_err(|err| {
+        AppDiagnostic::usage(format!("能力名非法: {raw}"), Some(err.to_string())).into()
+    })
+}
+
+fn json_printer(printer: Printer, json: bool) -> Printer {
+    if json {
+        printer.with_format(OutputFormat::Json)
+    } else {
+        printer
+    }
+}
+
+/// 宿主不在时拉起 `__plugin-host` 并等待可连接
+fn ensure_host() -> Result<()> {
+    let data_dir = config::platform_data_dir();
+    let client = mcsup::plugin::ControlClient::new(&data_dir);
+    if client.is_available() {
+        return Ok(());
+    }
+    let exe = std::env::current_exe().context("定位 mcsup 可执行文件")?;
+    std::process::Command::new(exe)
+        .arg("__plugin-host")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("拉起插件宿主")?;
+    for _ in 0..100 {
+        if client.is_available() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err(AppDiagnostic::failure(
+        "插件宿主未能在 10 秒内就绪",
+        Some("查看 `mcsup plugin doctor` 或宿主日志".to_owned()),
+    )
+    .into())
+}
+
+fn list(printer: Printer, json: bool) -> Result<()> {
+    let printer = json_printer(printer, json);
+    let service = open()?;
+    let records = service.list()?;
+    if printer.is_human() {
+        if records.is_empty() {
+            printer.print_section(&crate::i18n::pick(
+                printer.lang(),
+                "还没有安装插件",
+                "no plugins installed",
+            ));
+            return Ok(());
+        }
+        let mut table = Table::new();
+        table.set_header(["ID", "版本", "状态", "启用", "待确认"]);
+        for record in &records {
+            let state = service.status(&record.id).map_or_else(
+                |_| record.last_state.as_str().to_owned(),
+                |status| status.state.as_str().to_owned(),
+            );
+            table.add_row([
+                record.id.to_string(),
+                record.version.clone(),
+                state,
+                record.enabled.to_string(),
+                record.needs_approval().to_string(),
+            ]);
+        }
+        printer.print_table(&table);
+        return Ok(());
+    }
+    let mut items = Vec::with_capacity(records.len());
+    for record in records {
+        let state = service.status(&record.id).map_or_else(
+            |_| record.last_state.as_str().to_owned(),
+            |status| status.state.as_str().to_owned(),
+        );
+        items.push(json!({
+            "id": record.id.to_string(),
+            "version": record.version,
+            "enabled": record.enabled,
+            "state": state,
+            "needs_approval": record.needs_approval(),
+            "signed": record.signed,
+        }));
+    }
+    printer.print_outcome("", &items)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn install(
+    source: Option<String>,
+    from: Option<PathBuf>,
+    url: Option<String>,
+    git: Option<String>,
+    reference: Option<String>,
+    sha256: Option<String>,
+    allow_unsigned: bool,
+    printer: Printer,
+) -> Result<()> {
+    let origin = resolve_origin(source, from, url, git, reference)?;
+    let expected = sha256.map(|hex| Checksum::new(ChecksumAlgorithm::Sha256, hex));
+    let service = open()?;
+    let spinner = TaskSpinner::new(
+        crate::i18n::pick(printer.lang(), "正在安装插件…", "installing plugin…"),
+        printer.is_human(),
+    );
+    let outcome = service
+        .install(&origin, expected.as_ref(), allow_unsigned)
+        .map_err(anyhow::Error::from);
+    spinner.finish();
+    let outcome = outcome?;
+    let record = outcome.record;
+    if printer.is_human() && !outcome.pending.is_empty() {
+        printer.print_section(&crate::i18n::pick(
+            printer.lang(),
+            format!(
+                "安装完成，仍待确认: {}；运行 `mcsup plugin grant {} <capability>`",
+                outcome
+                    .pending
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                record.id
+            ),
+            format!(
+                "installed; pending approval: {}; run `mcsup plugin grant {} <capability>`",
+                outcome
+                    .pending
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                record.id
+            ),
+        ));
+    }
+    printer.print_outcome(
+        &crate::i18n::pick(
+            printer.lang(),
+            format!("已安装 {} {}", record.id, record.version),
+            format!("installed {} {}", record.id, record.version),
+        ),
+        &json!({
+            "id": record.id.to_string(),
+            "version": record.version,
+            "pending": outcome.pending.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "signed": record.signed,
+        }),
+    )
+}
+
+fn resolve_origin(
+    source: Option<String>,
+    from: Option<PathBuf>,
+    url: Option<String>,
+    git: Option<String>,
+    reference: Option<String>,
+) -> Result<ArtifactOrigin> {
+    let supplied = [
+        source.is_some(),
+        from.is_some(),
+        url.is_some(),
+        git.is_some(),
+    ]
+    .into_iter()
+    .filter(|given| *given)
+    .count();
+    if supplied != 1 {
+        return Err(AppDiagnostic::usage(
+            "必须且只能给出一个来源：<source> / --from / --url / --git",
+            None,
+        )
+        .into());
+    }
+    if let Some(git) = git {
+        return Ok(ArtifactOrigin::Git {
+            url: git,
+            rev: reference,
+        });
+    }
+    if reference.is_some() {
+        return Err(AppDiagnostic::usage("--ref 只能与 --git 一起使用", None).into());
+    }
+    if let Some(url) = url {
+        return Ok(ArtifactOrigin::Url(url));
+    }
+    if let Some(path) = from {
+        return Ok(ArtifactOrigin::Local(path));
+    }
+    let Some(raw) = source else {
+        return Err(AppDiagnostic::usage("缺少插件来源", None).into());
+    };
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        Ok(ArtifactOrigin::Url(raw))
+    } else {
+        Ok(ArtifactOrigin::Local(PathBuf::from(raw)))
+    }
+}
+
+fn update(id: &str, to: Option<String>, _prune: bool, printer: Printer) -> Result<()> {
+    let id = parse_id(id)?;
+    let service = open()?;
+    let record = service.record(&id)?;
+    if let Some(to) = to
+        && to != record.version
+    {
+        return Err(AppDiagnostic::usage(
+            format!(
+                "当前实现按来源中的最新产物安装，不能单独指定 --to {to}；请安装包含该版本的来源"
+            ),
+            None,
+        )
+        .into());
+    }
+    let origin = origin_from_source(record.source.as_deref()).ok_or_else(|| {
+        AppDiagnostic::usage(
+            format!("插件 {id} 没有可复用的安装来源；用 `mcsup plugin install <source>` 升级"),
+            None,
+        )
+    })?;
+    let spinner = TaskSpinner::new(
+        crate::i18n::pick(printer.lang(), "正在升级插件…", "updating plugin…"),
+        printer.is_human(),
+    );
+    let result = service
+        .install(&origin, None, true)
+        .map_err(anyhow::Error::from);
+    spinner.finish();
+    let outcome = result?;
+    printer.print_outcome(
+        &crate::i18n::pick(
+            printer.lang(),
+            format!("已升级 {} 到 {}", outcome.record.id, outcome.record.version),
+            format!(
+                "updated {} to {}",
+                outcome.record.id, outcome.record.version
+            ),
+        ),
+        &json!({
+            "id": outcome.record.id.to_string(),
+            "version": outcome.record.version,
+        }),
+    )
+}
+
+fn origin_from_source(source: Option<&str>) -> Option<ArtifactOrigin> {
+    let source = source?;
+    if let Some(path) = source.strip_prefix("local:") {
+        return Some(ArtifactOrigin::Local(PathBuf::from(path)));
+    }
+    if let Some(url) = source.strip_prefix("url:") {
+        return Some(ArtifactOrigin::Url(url.to_owned()));
+    }
+    if let Some(rest) = source.strip_prefix("git:") {
+        let (url, rev) = match rest.split_once('@') {
+            Some((url, rev)) => (url.to_owned(), Some(rev.to_owned())),
+            None => (rest.to_owned(), None),
+        };
+        return Some(ArtifactOrigin::Git { url, rev });
+    }
+    None
+}
+
+fn remove(id: &str, purge: bool, printer: Printer) -> Result<()> {
+    let id = parse_id(id)?;
+    let service = open()?;
+    service.remove(&id, purge)?;
+    printer.print_outcome(
+        &crate::i18n::pick(
+            printer.lang(),
+            format!("已卸载 {id}{}", if purge { "（含数据）" } else { "" }),
+            format!("removed {id}{}", if purge { " (with data)" } else { "" }),
+        ),
+        &json!({ "id": id.to_string(), "purge": purge }),
+    )
+}
+
+fn set_enabled(id: &str, enable: bool, printer: Printer) -> Result<()> {
+    let id = parse_id(id)?;
+    let service = open()?;
+    let record = if enable {
+        service.enable(&id)?
+    } else {
+        service.disable(&id)?
+    };
+    printer.print_outcome(
+        &crate::i18n::pick(
+            printer.lang(),
+            format!("{} {}", if enable { "已启用" } else { "已停用" }, record.id),
+            format!(
+                "{} {}",
+                if enable { "enabled" } else { "disabled" },
+                record.id
+            ),
+        ),
+        &json!({ "id": record.id.to_string(), "enabled": record.enabled }),
+    )
+}
+
+fn start(id: &str, printer: Printer) -> Result<()> {
+    let id = parse_id(id)?;
+    ensure_host()?;
+    let service = open()?;
+    let info = service.start(&id)?;
+    printer.print_outcome(
+        &crate::i18n::pick(
+            printer.lang(),
+            format!("已启动 {}（pid {}）", id, info.pid),
+            format!("started {} (pid {})", id, info.pid),
+        ),
+        &json!({
+            "id": id.to_string(),
+            "session": {
+                "session_id": info.session_id,
+                "pid": info.pid,
+                "granted": info.granted.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            }
+        }),
+    )
+}
+
+fn stop(id: &str, grace: u64, printer: Printer) -> Result<()> {
+    let id = parse_id(id)?;
+    let service = open()?;
+    service.stop(&id, Duration::from_secs(grace.min(300)))?;
+    printer.print_outcome(
+        &crate::i18n::pick(
+            printer.lang(),
+            format!("已停止 {id}"),
+            format!("stopped {id}"),
+        ),
+        &json!({ "id": id.to_string(), "stopped": true }),
+    )
+}
+
+fn restart(id: &str, printer: Printer) -> Result<()> {
+    let id = parse_id(id)?;
+    ensure_host()?;
+    let service = open()?;
+    let info = service.restart(&id, Duration::from_secs(10))?;
+    printer.print_outcome(
+        &crate::i18n::pick(
+            printer.lang(),
+            format!("已重启 {}（pid {}）", id, info.pid),
+            format!("restarted {} (pid {})", id, info.pid),
+        ),
+        &json!({ "id": id.to_string(), "pid": info.pid }),
+    )
+}
+
+fn status(id: &str, printer: Printer, json: bool) -> Result<()> {
+    let printer = json_printer(printer, json);
+    let id = parse_id(id)?;
+    let service = open()?;
+    let record = service.record(&id)?;
+    let status = service.status(&id)?;
+    if printer.is_human() {
+        let mut table = Table::new();
+        table.set_header(["项", "值"]);
+        let mut row = |name: &str, value: String| {
+            table.add_row([comfy_table::Cell::new(name), comfy_table::Cell::new(value)]);
+        };
+        row("ID", record.id.to_string());
+        row("版本", record.version.clone());
+        row("作用域", record.scope.as_str().to_owned());
+        row("启用", record.enabled.to_string());
+        row("状态", status.state.as_str().to_owned());
+        row("待确认", record.needs_approval().to_string());
+        row(
+            "能力",
+            record
+                .approved
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        if let Some(session) = &status.session {
+            row("会话", session.session_id.clone());
+            row("PID", session.pid.to_string());
+        }
+        if let Some(error) = &status.last_error {
+            row("最近错误", error.clone());
+        }
+        printer.print_table(&table);
+        return Ok(());
+    }
+    printer.print_outcome(
+        "",
+        &json!({
+            "id": record.id.to_string(),
+            "version": record.version,
+            "scope": record.scope.as_str(),
+            "enabled": record.enabled,
+            "state": status.state.as_str(),
+            "needs_approval": record.needs_approval(),
+            "approved": record.approved.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "capabilities": record.declared_capabilities().iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "session": status.session.as_ref().map(|session| json!({
+                "session_id": session.session_id,
+                "pid": session.pid,
+                "granted": session.granted.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            })),
+            "last_error": status.last_error,
+        }),
+    )
+}
+
+fn ops(id: &str, printer: Printer, json: bool) -> Result<()> {
+    let printer = json_printer(printer, json);
+    let id = parse_id(id)?;
+    let service = open()?;
+    let descriptor = service.descriptor(&id)?;
+    if printer.is_human() {
+        if descriptor.ops.is_empty() {
+            printer.print_section(&crate::i18n::pick(
+                printer.lang(),
+                "该插件没有声明 op",
+                "this plugin declares no ops",
+            ));
+            return Ok(());
+        }
+        let mut table = Table::new();
+        table.set_header(["op", "类型", "风险", "标题"]);
+        for resolved in &descriptor.ops {
+            table.add_row([
+                resolved.op.id.clone(),
+                resolved.op.kind.as_str().to_owned(),
+                resolved.op.risk.as_str().to_owned(),
+                resolved.op.title.clone(),
+            ]);
+        }
+        printer.print_table(&table);
+        return Ok(());
+    }
+    let items: Vec<Value> = descriptor
+        .ops
+        .iter()
+        .map(|resolved| {
+            json!({
+                "id": resolved.op.id,
+                "kind": resolved.op.kind.as_str(),
+                "risk": resolved.op.risk.as_str(),
+                "title": resolved.op.title,
+                "display": resolved.display.type_name(),
+                "timeout_ms": resolved.op.timeout_ms,
+            })
+        })
+        .collect();
+    printer.print_outcome("", &items)
+}
+
+fn read_input(raw: Option<&str>) -> Result<Value> {
+    let text = match raw {
+        None => return Ok(json!({})),
+        Some("-") => {
+            let mut buffer = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buffer)
+                .context("读取 stdin")?;
+            buffer
+        }
+        Some(value) if value.starts_with('@') => {
+            let path = &value[1..];
+            std::fs::read_to_string(path).with_context(|| format!("读取 {path}"))?
+        }
+        Some(value) => value.to_owned(),
+    };
+    serde_json::from_str(&text)
+        .map_err(|err| AppDiagnostic::usage("--input 不是合法 JSON", Some(err.to_string())).into())
+}
+
+fn call(
+    id: &str,
+    op: &str,
+    input: Option<&str>,
+    stream: bool,
+    printer: Printer,
+    json: bool,
+) -> Result<()> {
+    let printer = json_printer(printer, json);
+    let id = parse_id(id)?;
+    let input = read_input(input)?;
+    ensure_host()?;
+    let service = open()?;
+    if stream {
+        let mut sink = PrintSink::new(printer);
+        service.stream(&id, op, input, &mut sink)?;
+        return Ok(());
+    }
+    let output = service.call(&id, op, input)?;
+    printer.print_outcome(&serde_json::to_string_pretty(&output)?, &output)
+}
+
+/// 把 stream 分块输出；`done` 只作为 JSON 载荷的一部分，不额外造行
+struct PrintSink {
+    printer: Printer,
+}
+
+impl PrintSink {
+    fn new(printer: Printer) -> Self {
+        Self { printer }
+    }
+}
+
+impl StreamSink for PrintSink {
+    fn on_chunk(
+        &mut self,
+        chunk: &Value,
+        done: bool,
+    ) -> Result<(), mcsup::port::plugin::HostError> {
+        if self.printer.is_human() {
+            match chunk {
+                Value::String(text) => crate::output::print_line(text),
+                other => crate::output::print_line(&other.to_string()),
+            }
+        } else {
+            crate::output::print_json_line(
+                &serde_json::to_string(&json!({ "chunk": chunk, "done": done }))
+                    .unwrap_or_else(|_| "{}".to_owned()),
+            );
+        }
+        Ok(())
+    }
+}
+
+fn config_cmd(action: &PluginConfigAction, _printer: Printer) -> Result<()> {
+    match action {
+        PluginConfigAction::Get { .. } => {
+            Err(AppDiagnostic::not_implemented("plugin config get").into())
+        }
+        PluginConfigAction::Set { .. } => {
+            Err(AppDiagnostic::not_implemented("plugin config set").into())
+        }
+    }
+}
+
+fn grant(id: &str, capability: &str, printer: Printer) -> Result<()> {
+    let id = parse_id(id)?;
+    let capability = parse_capability(capability)?;
+    let service = open()?;
+    let record = service.grant(&id, capability)?;
+    printer.print_outcome(
+        &crate::i18n::pick(
+            printer.lang(),
+            format!("已授予 {} {capability}", record.id),
+            format!("granted {capability} to {}", record.id),
+        ),
+        &json!({
+            "id": record.id.to_string(),
+            "capability": capability.to_string(),
+            "approved": record.approved.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        }),
+    )
+}
+
+fn revoke(id: &str, capability: &str, printer: Printer) -> Result<()> {
+    let id = parse_id(id)?;
+    let capability = parse_capability(capability)?;
+    let service = open()?;
+    let record = service.revoke(&id, capability)?;
+    printer.print_outcome(
+        &crate::i18n::pick(
+            printer.lang(),
+            format!("已撤销 {} {capability}", record.id),
+            format!("revoked {capability} from {}", record.id),
+        ),
+        &json!({
+            "id": record.id.to_string(),
+            "capability": capability.to_string(),
+            "approved": record.approved.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        }),
+    )
+}
+
+fn logs(id: &str, follow: bool, tail: usize, printer: Printer) -> Result<()> {
+    let id = parse_id(id)?;
+    ensure_host()?;
+    let service = open()?;
+    let mut offset: Option<u64> = None;
+    loop {
+        let payload = service.logs(&id, offset, tail.clamp(1, 5000))?;
+        if let Some(lines) = payload.get("lines").and_then(Value::as_array) {
+            for line in lines {
+                match line {
+                    Value::String(text) => crate::output::print_line(text),
+                    other => crate::output::print_line(&other.to_string()),
+                }
+            }
+        }
+        let next = payload.get("next").and_then(Value::as_u64).or(offset);
+        offset = next;
+        if !follow {
+            return Ok(());
+        }
+        let _ = printer;
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+fn verify(target: &str, printer: Printer) -> Result<()> {
+    let service = open()?;
+    let (root, expected, id) = if let Ok(id) = PluginId::parse(target) {
+        let record = service.record(&id)?;
+        let expected = record
+            .sha256
+            .as_deref()
+            .map(|hex| Checksum::new(ChecksumAlgorithm::Sha256, hex));
+        (record.artifact_dir, expected, Some(record.id))
+    } else {
+        let path = PathBuf::from(target);
+        if !path.exists() {
+            return Err(
+                AppDiagnostic::not_found(format!("找不到插件 id 或目录: {target}"), None).into(),
+            );
+        }
+        (path, None, None)
+    };
+    let verifier = mcsup::provider::plugin::PluginArtifactVerifier::new();
+    let artifact = verifier
+        .verify(&root, expected.as_ref(), true)
+        .map_err(anyhow::Error::from)?;
+    let manifest = Manifest::from_json(
+        &serde_json::to_vec(&artifact.manifest).map_err(|err| anyhow!("{err}"))?,
+    )
+    .map_err(|err| AppDiagnostic::failure(format!("manifest 非法: {err}"), None))?;
+    printer.print_outcome(
+        &crate::i18n::pick(
+            printer.lang(),
+            format!("校验通过：{} {}", manifest.id, manifest.raw.version),
+            format!("verified {} {}", manifest.id, manifest.raw.version),
+        ),
+        &json!({
+            "id": id.map_or_else(|| manifest.id.to_string(), |id| id.to_string()),
+            "sha256": artifact.sha256,
+            "signed": artifact.signed,
+            "trusted": artifact.trusted,
+        }),
+    )
+}
+
+fn rollback(id: &str, printer: Printer) -> Result<()> {
+    let id = parse_id(id)?;
+    let service = open()?;
+    let record = service.rollback(&id)?;
+    printer.print_outcome(
+        &crate::i18n::pick(
+            printer.lang(),
+            format!("已回滚 {} 到 {}", record.id, record.version),
+            format!("rolled {} back to {}", record.id, record.version),
+        ),
+        &json!({ "id": record.id.to_string(), "version": record.version }),
+    )
+}
+
+fn doctor(printer: Printer, json: bool) -> Result<()> {
+    let printer = json_printer(printer, json);
+    let service = open()?;
+    let records = service.list()?;
+    let mut findings: Vec<Value> = Vec::new();
+    for record in &records {
+        let artifact = record.artifact_dir.clone();
+        if !artifact.is_dir() {
+            findings.push(json!({
+                "level": "error",
+                "id": record.id.to_string(),
+                "message": format!("产物目录缺失: {}", artifact.display()),
+            }));
+            continue;
+        }
+        let manifest_path = artifact.join("manifest.json");
+        if let Err(err) = std::fs::read(&manifest_path)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| Manifest::from_json(&bytes).map_err(|err| anyhow!("{err}")))
+        {
+            findings.push(json!({
+                "level": "error",
+                "id": record.id.to_string(),
+                "message": format!("manifest 非法: {err}"),
+            }));
+        }
+        let descriptor_path = artifact.join("descriptor.json");
+        if let Err(err) = std::fs::read(&descriptor_path)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| {
+                Descriptor::from_json(&bytes, &record.id).map_err(|err| anyhow!("{err}"))
+            })
+        {
+            findings.push(json!({
+                "level": "error",
+                "id": record.id.to_string(),
+                "message": format!("descriptor 非法: {err}"),
+            }));
+        }
+        if record.needs_approval() {
+            findings.push(json!({
+                "level": "warning",
+                "id": record.id.to_string(),
+                "message": "存在待确认能力，插件不会启动",
+            }));
+        }
+    }
+    let host = mcsup::plugin::ControlClient::new(&config::platform_data_dir()).is_available();
+    if !host {
+        findings.push(json!({
+            "level": "info",
+            "id": Value::Null,
+            "message": "插件宿主未运行；start / call 会自动拉起",
+        }));
+    }
+    let errors = findings
+        .iter()
+        .filter(|finding| finding["level"] == "error")
+        .count();
+    if printer.is_human() {
+        if findings.is_empty() {
+            printer.print_section(&crate::i18n::pick(
+                printer.lang(),
+                "插件检查通过",
+                "plugin check passed",
+            ));
+        } else {
+            let mut table = Table::new();
+            table.set_header(["级别", "插件", "说明"]);
+            for finding in &findings {
+                table.add_row([
+                    finding["level"].as_str().unwrap_or("info").to_owned(),
+                    finding["id"].as_str().unwrap_or("-").to_owned(),
+                    finding["message"].as_str().unwrap_or_default().to_owned(),
+                ]);
+            }
+            printer.print_table(&table);
+        }
+    } else {
+        printer.print_outcome("", &findings)?;
+    }
+    if errors > 0 {
+        return Err(AppDiagnostic::findings(errors).into());
+    }
+    Ok(())
+}
+
+/// 测试与诊断用：产物根
+#[allow(dead_code)]
+fn artifact_root(record: &mcsup::port::plugin::PluginRecord) -> &Path {
+    &record.artifact_dir
+}
