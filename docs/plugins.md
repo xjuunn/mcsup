@@ -983,6 +983,46 @@ pub trait FileOps: Send + Sync {
 `BackupOps` / `ContentOps` / `JavaOps` / `FileOps` 按同样风格定义，方法集合与
 现有 `service` 的公开方法一一对应，不新增业务语义。
 
+生命周期能力的帧方法：
+
+| 能力 | `method` | 输入 | 输出 |
+| --- | --- | --- | --- |
+| `server:lifecycle` | `start` | `{server}` | `{ok: true}` |
+| `server:lifecycle` | `stop` | `{server, grace_secs?}`；默认 30 秒 | `{outcome: "stopped", elapsed_ms}` / `{outcome: "already_stopped"}` |
+| `server:lifecycle` | `restart` | `{server, grace_secs?}` | `{ok: true}` |
+
+插件触发的启动不接受 EULA 条款：`eula.txt` 未同意时返回 `conflict`，必须由
+管理员在 CLI 显式确认。停机宽限到期仍未退出返回 `timeout`，服务器保持运行。
+
+备份能力的帧方法：
+
+| 能力 | `method` | 输入 | 输出 |
+| --- | --- | --- | --- |
+| `backup` | `create` | `{server, label?}` | `{snapshot}` |
+| `backup` | `list` | `{server}` | `{snapshots:[{id, created_at, added_bytes}]}` |
+| `backup` | `restore` | `{server, snapshot}` | `{ok: true}` |
+| `backup` | `verify` | `{server, snapshot}` | `{healthy}` |
+| `backup` | `prune` | `{server, keep}` | `{removed}` |
+| `backup` | `delete` | `{server, snapshot}` | `{deleted}` |
+
+`restore` 只执行原地恢复；服务器运行中返回 `conflict`。快照不存在统一返回
+`not_found`，磁盘 / 远端不可用返回 `unavailable`（可重试）。
+
+内容能力的帧方法：
+
+| 能力 | `method` | 输入 | 输出 |
+| --- | --- | --- | --- |
+| `content` | `list` | `{server, kind?, identify?}`；`kind` 默认 `mod` | `{items:[{file, size, identity?}]}` |
+| `content` | `install` | `{server, project, version?, kind?}` | `{file, size, project, version}` |
+| `content` | `remove` | `{server, selector, kind?}` | `{removed}` |
+
+`kind` 只接受 `mod` / `plugin` / `resourcepack` / `datapack` / `shader` / `modpack`。
+`identify=true` 需要联网反查来源与版本，失败项按「身份未知」返回而不让整次
+列表失败。安装沿用服务端条件挑版本，服务器运行中返回 `conflict`，上游不可用
+返回 `unavailable`（可重试），该类内容为纯客户端时返回 `invalid_input`。移除的
+`selector` 可以是文件名或 modid，未命中返回 `not_found`，命中多个返回
+`invalid_input` 并列候选。
+
 文件能力的帧方法：
 
 | 能力 | `method` | 输入 | 输出 |
@@ -1031,7 +1071,7 @@ pub trait FileOps: Send + Sync {
 | 实现 | 位置 | 说明 |
 | --- | --- | --- |
 | `ServerRead` / `ConsoleIo` / `ServerLifecycle` / `BackupOps` / `ContentOps` / `JavaOps` | `service::plugin::HostApiImpl` | 复用现有 service，不复制业务逻辑 |
-| `FileOps` | `service::plugin::HostApiImpl` + `file` 的路径校验 | service 内部经 `crate::fs` 入口 |
+| `FileOps` | `service::plugin::HostApiImpl` + `domain::path` 的路径校验 | service 内部经 `crate::fs` 入口 |
 | `KvStore` / `SecretStore` / `PluginStore` / `AuditSink` | `storage` | 一条记录一个 JSON；审计用追加 JSONL |
 | `ArtifactSource` | `provider` | git / url 解析与下载 |
 | `ArtifactVerifier` / `PluginSupervisor` | `plugin` | 摘要、签名、进程、端点、帧 |

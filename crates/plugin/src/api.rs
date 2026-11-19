@@ -13,10 +13,13 @@
 use crate::base64;
 use domain::plugin::PluginId;
 use domain::plugin::capability::Capability;
+use domain::server::content::{ContentIdentity, ContentKind};
 use domain::server::meta::ServerName;
+use port::StopOutcome;
 use port::plugin::{
-    BackupOps, ConsoleIo, ContentOps, ContractInvoker, FileOps, HostError, JavaOps, KvStore,
-    NetProxy, NetRequest, SecretStore, SecretValue, ServerLifecycle, ServerRead, ServerStatusView,
+    BackupOps, ConsoleIo, ContentInstallRequest, ContentOps, ContractInvoker, FileOps, HostError,
+    JavaOps, KvStore, NetProxy, NetRequest, SecretStore, SecretValue, ServerLifecycle, ServerRead,
+    ServerStatusView,
 };
 use protocol::plugin::{Call, CallRoute};
 use serde_json::{Value, json};
@@ -176,15 +179,14 @@ fn host_call(
         Capability::NetOutbound => net(services, method, input, ctx.plugin),
         Capability::FilesRead => files_read(services, method, input, bound),
         Capability::FilesWrite => files_write(services, method, input, bound),
-        Capability::ServerLifecycle
-        | Capability::Backup
-        | Capability::Content
-        | Capability::Java
-        | Capability::Events
-        | Capability::ProcessSpawn
-        | Capability::McClient => Err(HostError::unsupported(format!(
-            "{capability} host methods are not available in this host build"
-        ))),
+        Capability::ServerLifecycle => lifecycle(services, method, input, bound),
+        Capability::Backup => backup(services, method, input, bound),
+        Capability::Content => content(services, method, input, bound),
+        Capability::Java | Capability::Events | Capability::ProcessSpawn | Capability::McClient => {
+            Err(HostError::unsupported(format!(
+                "{capability} host methods are not available in this host build"
+            )))
+        }
         // 非穷尽枚举：宿主版本比能力目录新时，未知能力拒绝而不是放行。
         _ => Err(HostError::unsupported(format!(
             "{capability} is not supported by this host"
@@ -507,6 +509,217 @@ fn files_write(
     }
 }
 
+fn lifecycle(
+    services: &HostServices,
+    method: &str,
+    input: &Value,
+    bound: Option<&ServerName>,
+) -> Result<Value, HostError> {
+    let service = services
+        .lifecycle
+        .as_ref()
+        .ok_or_else(|| HostError::unsupported("server:lifecycle is not available"))?;
+    match method {
+        "start" => {
+            let server = server_arg(input, bound)?;
+            service.start(&server)?;
+            Ok(json!({ "ok": true }))
+        }
+        "stop" => {
+            let server = server_arg(input, bound)?;
+            let grace = Duration::from_secs(grace_secs_arg(input)?);
+            let outcome = service.stop(&server, grace)?;
+            Ok(match outcome {
+                StopOutcome::Stopped { elapsed } => json!({
+                    "outcome": "stopped",
+                    "elapsed_ms": u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                }),
+                StopOutcome::AlreadyStopped => json!({ "outcome": "already_stopped" }),
+                StopOutcome::TimedOut { waited } => json!({
+                    "outcome": "timed_out",
+                    "waited_ms": u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+                }),
+            })
+        }
+        "restart" => {
+            let server = server_arg(input, bound)?;
+            let grace = Duration::from_secs(grace_secs_arg(input)?);
+            service.restart(&server, grace)?;
+            Ok(json!({ "ok": true }))
+        }
+        other => Err(unknown_method("server:lifecycle", other)),
+    }
+}
+
+fn grace_secs_arg(input: &Value) -> Result<u64, HostError> {
+    match input.get("grace_secs") {
+        None | Some(Value::Null) => Ok(30),
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| HostError::invalid_input("grace_secs must be a non-negative integer")),
+    }
+}
+
+fn backup(
+    services: &HostServices,
+    method: &str,
+    input: &Value,
+    bound: Option<&ServerName>,
+) -> Result<Value, HostError> {
+    let service = services
+        .backup
+        .as_ref()
+        .ok_or_else(|| HostError::unsupported("backup is not available"))?;
+    match method {
+        "create" => {
+            let server = server_arg(input, bound)?;
+            let label = optional_string_arg(input, "label")?;
+            let snapshot = service.create(&server, label.as_deref())?;
+            Ok(json!({ "snapshot": snapshot }))
+        }
+        "list" => {
+            let server = server_arg(input, bound)?;
+            let snapshots = service
+                .list(&server)?
+                .into_iter()
+                .map(|entry| {
+                    json!({
+                        "id": entry.id,
+                        "created_at": entry.created_at,
+                        "added_bytes": entry.added_bytes,
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(json!({ "snapshots": snapshots }))
+        }
+        "restore" => {
+            let server = server_arg(input, bound)?;
+            let snapshot = string_arg(input, "snapshot")?;
+            service.restore(&server, snapshot)?;
+            Ok(json!({ "ok": true }))
+        }
+        "verify" => {
+            let server = server_arg(input, bound)?;
+            let snapshot = string_arg(input, "snapshot")?;
+            Ok(json!({ "healthy": service.verify(&server, snapshot)? }))
+        }
+        "prune" => {
+            let server = server_arg(input, bound)?;
+            let keep = usize_arg(input, "keep")?;
+            Ok(json!({ "removed": service.prune(&server, keep)? }))
+        }
+        "delete" => {
+            let server = server_arg(input, bound)?;
+            let snapshot = string_arg(input, "snapshot")?;
+            Ok(json!({ "deleted": service.delete(&server, snapshot)? }))
+        }
+        other => Err(unknown_method("backup", other)),
+    }
+}
+
+fn optional_string_arg(input: &Value, key: &str) -> Result<Option<String>, HostError> {
+    match input.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(raw)) => Ok(Some(raw.clone())),
+        Some(_) => Err(HostError::invalid_input(format!("{key} must be a string"))),
+    }
+}
+
+fn usize_arg(input: &Value, key: &str) -> Result<usize, HostError> {
+    input
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| HostError::invalid_input(format!("{key} must be a non-negative integer")))
+}
+
+fn content(
+    services: &HostServices,
+    method: &str,
+    input: &Value,
+    bound: Option<&ServerName>,
+) -> Result<Value, HostError> {
+    let service = services
+        .content
+        .as_ref()
+        .ok_or_else(|| HostError::unsupported("content is not available"))?;
+    match method {
+        "list" => {
+            let server = server_arg(input, bound)?;
+            let kind = content_kind_arg(input)?;
+            let identify = match input.get("identify") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(value)) => *value,
+                Some(_) => return Err(HostError::invalid_input("identify must be a boolean")),
+            };
+            let items = service
+                .list(&server, kind, identify)?
+                .into_iter()
+                .map(|entry| {
+                    let mut item = json!({
+                        "file": entry.file_name,
+                        "size": entry.size,
+                    });
+                    if let Some(identity) = entry.identity {
+                        item["identity"] = content_identity_json(&identity);
+                    }
+                    item
+                })
+                .collect::<Vec<_>>();
+            Ok(json!({ "items": items }))
+        }
+        "install" => {
+            let server = server_arg(input, bound)?;
+            let project = string_arg(input, "project")?;
+            let version = optional_string_arg(input, "version")?;
+            let kind = content_kind_arg(input)?;
+            let entry = service.install(
+                &server,
+                &ContentInstallRequest {
+                    project: project.to_owned(),
+                    version: version.clone(),
+                    kind,
+                },
+            )?;
+            Ok(json!({
+                "file": entry.file_name,
+                "size": entry.size,
+                "project": project,
+                "version": version,
+            }))
+        }
+        "remove" => {
+            let server = server_arg(input, bound)?;
+            let selector = string_arg(input, "selector")?;
+            let kind = content_kind_arg(input)?;
+            Ok(json!({ "removed": service.remove(&server, selector, kind)? }))
+        }
+        other => Err(unknown_method("content", other)),
+    }
+}
+
+fn content_kind_arg(input: &Value) -> Result<ContentKind, HostError> {
+    match optional_string_arg(input, "kind")? {
+        None => Ok(ContentKind::Mod),
+        Some(raw) => ContentKind::parse(&raw)
+            .map_err(|err| HostError::invalid_input(format!("invalid content kind: {err}"))),
+    }
+}
+
+fn content_identity_json(identity: &ContentIdentity) -> Value {
+    json!({
+        "hash": identity.hash,
+        "project_id": identity.project_id,
+        "slug": identity.slug,
+        "title": identity.title,
+        "version_id": identity.version_id,
+        "version_number": identity.version_number,
+        "channel": identity.channel,
+        "date_published": identity.date_published,
+        "kind": identity.kind.map(ContentKind::as_str),
+    })
+}
+
 fn path_arg(input: &Value, key: &str) -> Result<PathBuf, HostError> {
     Ok(PathBuf::from(string_arg(input, key)?))
 }
@@ -569,7 +782,10 @@ fn unknown_method(capability: &str, method: &str) -> HostError {
 mod tests {
     use super::*;
     use domain::plugin::PluginId;
-    use port::plugin::{ConsoleLine, ConsolePage, FileEntry, ServerSummary};
+    use port::plugin::{
+        BackupEntry, ConsoleLine, ConsolePage, ContentEntry, ContentInstallRequest, FileEntry,
+        ServerSummary,
+    };
     use std::collections::BTreeMap;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -625,6 +841,180 @@ mod tests {
         }
         fn send_line(&self, _server: &ServerName, _line: &str) -> Result<(), HostError> {
             Ok(())
+        }
+    }
+
+    /// 记录生命周期调用的替身
+    #[derive(Default)]
+    struct Lifecycle {
+        calls: Mutex<Vec<(&'static str, String, Option<Duration>)>>,
+    }
+
+    impl Lifecycle {
+        fn record(&self, action: &'static str, server: &ServerName, grace: Option<Duration>) {
+            self.calls
+                .lock()
+                .expect("lock")
+                .push((action, server.as_str().to_owned(), grace));
+        }
+    }
+
+    impl ServerLifecycle for Lifecycle {
+        fn start(&self, server: &ServerName) -> Result<(), HostError> {
+            self.record("start", server, None);
+            Ok(())
+        }
+
+        fn stop(&self, server: &ServerName, grace: Duration) -> Result<StopOutcome, HostError> {
+            self.record("stop", server, Some(grace));
+            Ok(StopOutcome::Stopped {
+                elapsed: Duration::from_millis(5),
+            })
+        }
+
+        fn restart(&self, server: &ServerName, grace: Duration) -> Result<(), HostError> {
+            self.record("restart", server, Some(grace));
+            Ok(())
+        }
+    }
+
+    fn lifecycle_services(lifecycle: &Arc<Lifecycle>) -> HostServices {
+        HostServices {
+            lifecycle: Some(Arc::clone(lifecycle) as Arc<dyn ServerLifecycle>),
+            ..HostServices::default()
+        }
+    }
+
+    /// 记录备份调用的替身
+    #[derive(Default)]
+    struct Backup {
+        calls: Mutex<Vec<(String, String, Option<String>)>>,
+    }
+
+    impl Backup {
+        fn record(&self, action: &str, server: &ServerName, extra: Option<&str>) {
+            self.calls.lock().expect("lock").push((
+                action.to_owned(),
+                server.as_str().to_owned(),
+                extra.map(str::to_owned),
+            ));
+        }
+    }
+
+    impl BackupOps for Backup {
+        fn create(&self, server: &ServerName, label: Option<&str>) -> Result<String, HostError> {
+            self.record("create", server, label);
+            Ok("snap-1".to_owned())
+        }
+
+        fn list(&self, server: &ServerName) -> Result<Vec<BackupEntry>, HostError> {
+            self.record("list", server, None);
+            Ok(vec![BackupEntry {
+                id: "snap-1".to_owned(),
+                created_at: 1_700_000_000,
+                added_bytes: 4096,
+            }])
+        }
+
+        fn restore(&self, server: &ServerName, snapshot: &str) -> Result<(), HostError> {
+            self.record("restore", server, Some(snapshot));
+            Ok(())
+        }
+
+        fn verify(&self, server: &ServerName, snapshot: &str) -> Result<bool, HostError> {
+            self.record("verify", server, Some(snapshot));
+            Ok(true)
+        }
+
+        fn prune(&self, server: &ServerName, keep: usize) -> Result<usize, HostError> {
+            self.record("prune", server, Some(&keep.to_string()));
+            Ok(2)
+        }
+
+        fn delete(&self, server: &ServerName, snapshot: &str) -> Result<bool, HostError> {
+            self.record("delete", server, Some(snapshot));
+            Ok(true)
+        }
+    }
+
+    fn backup_services(backup: &Arc<Backup>) -> HostServices {
+        HostServices {
+            backup: Some(Arc::clone(backup) as Arc<dyn BackupOps>),
+            ..HostServices::default()
+        }
+    }
+
+    /// 记录内容调用参数的替身
+    #[derive(Default)]
+    struct Content {
+        calls: Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl Content {
+        fn record(&self, action: &str, server: &ServerName, extra: String) {
+            self.calls.lock().expect("lock").push((
+                action.to_owned(),
+                server.as_str().to_owned(),
+                extra,
+            ));
+        }
+    }
+
+    impl ContentOps for Content {
+        fn list(
+            &self,
+            server: &ServerName,
+            kind: ContentKind,
+            identify: bool,
+        ) -> Result<Vec<ContentEntry>, HostError> {
+            self.record("list", server, format!("{kind}:{identify}"));
+            Ok(vec![ContentEntry {
+                identity: Some(ContentIdentity {
+                    hash: "sha1".to_owned(),
+                    project_id: "jei".to_owned(),
+                    slug: Some("jei".to_owned()),
+                    title: Some("JEI".to_owned()),
+                    version_id: "v1".to_owned(),
+                    version_number: "1.0".to_owned(),
+                    channel: "release".to_owned(),
+                    date_published: "2026-01-01T00:00:00Z".to_owned(),
+                    kind: Some(ContentKind::Mod),
+                }),
+                file_name: "jei.jar".to_owned(),
+                size: 1234,
+            }])
+        }
+
+        fn install(
+            &self,
+            server: &ServerName,
+            request: &ContentInstallRequest,
+        ) -> Result<ContentEntry, HostError> {
+            self.record(
+                "install",
+                server,
+                format!(
+                    "{}@{}:{}",
+                    request.project,
+                    request.version.as_deref().unwrap_or("-"),
+                    request.kind
+                ),
+            );
+            Ok(ContentEntry {
+                identity: None,
+                file_name: "jei.jar".to_owned(),
+                size: 1234,
+            })
+        }
+
+        fn remove(
+            &self,
+            server: &ServerName,
+            selector: &str,
+            kind: ContentKind,
+        ) -> Result<usize, HostError> {
+            self.record("remove", server, format!("{selector}:{kind}"));
+            Ok(1)
         }
     }
 
@@ -887,6 +1277,334 @@ mod tests {
             json!({ "server": "survival", "path": "a" }),
         );
         let caps = granted(&[Capability::FilesRead]);
+        assert_eq!(
+            dispatch(&HostServices::default(), &call, ctx(&caps))
+                .expect_err("unsupported")
+                .code,
+            port::plugin::ErrorCode::Unsupported
+        );
+    }
+
+    // ---- 生命周期与备份（API-LIFE / API-BAK） ----
+
+    #[test]
+    fn lifecycle_start_stop_restart_forward_bound_server_and_grace() {
+        let lifecycle = Arc::new(Lifecycle::default());
+        let bound = ServerName::parse("survival").expect("name");
+        let caps = granted(&[Capability::ServerLifecycle]);
+        let scope = DispatchContext {
+            plugin: plugin(),
+            granted: &caps,
+            scope_server: Some(&bound),
+            contracts: None,
+        };
+        let services = lifecycle_services(&lifecycle);
+
+        let call = Call::host(
+            1,
+            "server:lifecycle",
+            "start",
+            json!({ "server": "survival" }),
+        );
+        assert_eq!(
+            dispatch(&services, &call, scope).expect("start")["ok"],
+            true
+        );
+
+        let call = Call::host(
+            2,
+            "server:lifecycle",
+            "stop",
+            json!({ "server": "survival", "grace_secs": 7 }),
+        );
+        let value = dispatch(&services, &call, scope).expect("stop");
+        assert_eq!(value["outcome"], "stopped");
+        assert_eq!(value["elapsed_ms"], 5);
+
+        let call = Call::host(
+            3,
+            "server:lifecycle",
+            "restart",
+            json!({ "server": "survival" }),
+        );
+        dispatch(&services, &call, scope).expect("restart");
+
+        let calls = lifecycle.calls.lock().expect("lock").clone();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0], ("start", "survival".to_owned(), None));
+        assert_eq!(
+            calls[1],
+            ("stop", "survival".to_owned(), Some(Duration::from_secs(7)))
+        );
+        assert_eq!(
+            calls[2],
+            (
+                "restart",
+                "survival".to_owned(),
+                Some(Duration::from_secs(30))
+            )
+        );
+    }
+
+    #[test]
+    fn lifecycle_scoped_plugin_cannot_target_another_server() {
+        let lifecycle = Arc::new(Lifecycle::default());
+        let bound = ServerName::parse("survival").expect("name");
+        let caps = granted(&[Capability::ServerLifecycle]);
+        let call = Call::host(
+            1,
+            "server:lifecycle",
+            "start",
+            json!({ "server": "creative" }),
+        );
+        let err = dispatch(
+            &lifecycle_services(&lifecycle),
+            &call,
+            DispatchContext {
+                plugin: plugin(),
+                granted: &caps,
+                scope_server: Some(&bound),
+                contracts: None,
+            },
+        )
+        .expect_err("scope");
+        assert_eq!(err.code, port::plugin::ErrorCode::Denied);
+    }
+
+    #[test]
+    fn backup_frames_round_trip_all_methods() {
+        let backup = Arc::new(Backup::default());
+        let services = backup_services(&backup);
+        let caps = granted(&[Capability::Backup]);
+        let ctx = ctx(&caps);
+
+        let call = Call::host(
+            1,
+            "backup",
+            "create",
+            json!({ "server": "survival", "label": "before-upgrade" }),
+        );
+        assert_eq!(
+            dispatch(&services, &call, ctx).expect("create")["snapshot"],
+            "snap-1"
+        );
+
+        let call = Call::host(2, "backup", "list", json!({ "server": "survival" }));
+        let value = dispatch(&services, &call, ctx).expect("list");
+        assert_eq!(value["snapshots"][0]["id"], "snap-1");
+        assert_eq!(value["snapshots"][0]["created_at"], 1_700_000_000);
+        assert_eq!(value["snapshots"][0]["added_bytes"], 4096);
+
+        let call = Call::host(
+            3,
+            "backup",
+            "restore",
+            json!({ "server": "survival", "snapshot": "snap-1" }),
+        );
+        assert_eq!(
+            dispatch(&services, &call, ctx).expect("restore")["ok"],
+            true
+        );
+
+        let call = Call::host(
+            4,
+            "backup",
+            "verify",
+            json!({ "server": "survival", "snapshot": "snap-1" }),
+        );
+        assert_eq!(
+            dispatch(&services, &call, ctx).expect("verify")["healthy"],
+            true
+        );
+
+        let call = Call::host(
+            5,
+            "backup",
+            "prune",
+            json!({ "server": "survival", "keep": 3 }),
+        );
+        assert_eq!(
+            dispatch(&services, &call, ctx).expect("prune")["removed"],
+            2
+        );
+
+        let call = Call::host(
+            6,
+            "backup",
+            "delete",
+            json!({ "server": "survival", "snapshot": "snap-1" }),
+        );
+        assert_eq!(
+            dispatch(&services, &call, ctx).expect("delete")["deleted"],
+            true
+        );
+
+        let calls = backup.calls.lock().expect("lock").clone();
+        assert_eq!(calls[0].0, "create");
+        assert_eq!(calls[0].2.as_deref(), Some("before-upgrade"));
+        assert_eq!(calls[4].2.as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn backup_rejects_missing_arguments_and_methods() {
+        let backup = Arc::new(Backup::default());
+        let caps = granted(&[Capability::Backup]);
+        let call = Call::host(1, "backup", "list", json!({ "server": "survival" }));
+        let value = dispatch(&backup_services(&backup), &call, ctx(&caps)).expect("list");
+        assert_eq!(value["snapshots"][0]["added_bytes"], 4096);
+
+        let call = Call::host(1, "backup", "prune", json!({ "server": "survival" }));
+        assert_eq!(
+            dispatch(&backup_services(&backup), &call, ctx(&caps))
+                .expect_err("missing keep")
+                .code,
+            port::plugin::ErrorCode::InvalidInput
+        );
+
+        let call = Call::host(
+            1,
+            "backup",
+            "restore",
+            json!({ "server": "survival", "snapshot": "snap-1" }),
+        );
+        assert_eq!(
+            dispatch(&backup_services(&backup), &call, ctx(&granted(&[])))
+                .expect_err("ungranted")
+                .code,
+            port::plugin::ErrorCode::Denied
+        );
+    }
+
+    // ---- 内容（API-CNT） ----
+
+    #[test]
+    fn content_frames_forward_kind_identify_and_arguments() {
+        let content = Arc::new(Content::default());
+        let services = HostServices {
+            content: Some(Arc::clone(&content) as Arc<dyn ContentOps>),
+            ..HostServices::default()
+        };
+        let caps = granted(&[Capability::Content]);
+        let ctx = ctx(&caps);
+
+        let call = Call::host(
+            1,
+            "content",
+            "list",
+            json!({ "server": "survival", "kind": "plugin", "identify": true }),
+        );
+        let value = dispatch(&services, &call, ctx).expect("list");
+        assert_eq!(value["items"][0]["file"], "jei.jar");
+        assert_eq!(value["items"][0]["size"], 1234);
+        assert_eq!(value["items"][0]["identity"]["project_id"], "jei");
+
+        let call = Call::host(
+            2,
+            "content",
+            "install",
+            json!({ "server": "survival", "project": "jei", "version": "v1", "kind": "plugin" }),
+        );
+        let value = dispatch(&services, &call, ctx).expect("install");
+        assert_eq!(value["file"], "jei.jar");
+        assert_eq!(value["project"], "jei");
+        assert_eq!(value["version"], "v1");
+
+        let call = Call::host(
+            3,
+            "content",
+            "remove",
+            json!({ "server": "survival", "selector": "jei.jar", "kind": "plugin" }),
+        );
+        assert_eq!(
+            dispatch(&services, &call, ctx).expect("remove")["removed"],
+            1
+        );
+
+        let calls = content.calls.lock().expect("lock").clone();
+        assert_eq!(
+            calls[0],
+            (
+                "list".to_owned(),
+                "survival".to_owned(),
+                "plugin:true".to_owned()
+            )
+        );
+        assert_eq!(
+            calls[1],
+            (
+                "install".to_owned(),
+                "survival".to_owned(),
+                "jei@v1:plugin".to_owned()
+            )
+        );
+        assert_eq!(
+            calls[2],
+            (
+                "remove".to_owned(),
+                "survival".to_owned(),
+                "jei.jar:plugin".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn content_defaults_to_mod_and_rejects_unknown_kind() {
+        let content = Arc::new(Content::default());
+        let services = HostServices {
+            content: Some(Arc::clone(&content) as Arc<dyn ContentOps>),
+            ..HostServices::default()
+        };
+        let caps = granted(&[Capability::Content]);
+
+        let call = Call::host(1, "content", "list", json!({ "server": "survival" }));
+        dispatch(&services, &call, ctx(&caps)).expect("list");
+
+        let call = Call::host(
+            1,
+            "content",
+            "list",
+            json!({ "server": "survival", "kind": "shaderpack" }),
+        );
+        assert_eq!(
+            dispatch(&services, &call, ctx(&caps))
+                .expect_err("unknown kind")
+                .code,
+            port::plugin::ErrorCode::InvalidInput
+        );
+
+        let calls = content.calls.lock().expect("lock").clone();
+        assert_eq!(
+            calls[0],
+            (
+                "list".to_owned(),
+                "survival".to_owned(),
+                "mod:false".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn content_requires_grant_and_service() {
+        let content = Arc::new(Content::default());
+        let services = HostServices {
+            content: Some(Arc::clone(&content) as Arc<dyn ContentOps>),
+            ..HostServices::default()
+        };
+        let call = Call::host(
+            1,
+            "content",
+            "remove",
+            json!({ "server": "survival", "selector": "jei.jar" }),
+        );
+        assert_eq!(
+            dispatch(&services, &call, ctx(&granted(&[])))
+                .expect_err("ungranted")
+                .code,
+            port::plugin::ErrorCode::Denied
+        );
+
+        let call = Call::host(1, "content", "list", json!({ "server": "survival" }));
+        let caps = granted(&[Capability::Content]);
         assert_eq!(
             dispatch(&HostServices::default(), &call, ctx(&caps))
                 .expect_err("unsupported")

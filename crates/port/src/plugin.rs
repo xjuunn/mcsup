@@ -32,7 +32,7 @@ use domain::plugin::manifest::Manifest;
 use domain::plugin::state::PluginState;
 use domain::plugin::{PluginId, PluginScope};
 use domain::server::artifact::Checksum;
-use domain::server::content::{ContentCandidate, ContentIdentity};
+use domain::server::content::{ContentIdentity, ContentKind};
 use domain::server::meta::ServerName;
 use domain::server::status::ServerStatus;
 use domain::server::version::VersionId;
@@ -384,44 +384,71 @@ pub trait BackupOps: Send + Sync {
 /// 已安装内容条目
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContentEntry {
-    /// 内容身份
-    pub identity: ContentIdentity,
+    /// 内容身份；未联网识别时为 `None`
+    pub identity: Option<ContentIdentity>,
     /// 文件名
     pub file_name: String,
     /// 字节数
     pub size: u64,
 }
 
+/// 内容安装请求：项目 + 可选精确版本 + 类别
+///
+/// 框架不凭「候选」猜项目：候选来自某次检索，可能属于另一个项目；
+/// 安装必须由调用方明确给出项目标识与类别。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentInstallRequest {
+    /// 上游项目 ID 或 slug
+    pub project: String,
+    /// 精确版本 ID；`None` 按服务端条件挑最优候选
+    pub version: Option<String>,
+    /// 内容类别
+    pub kind: ContentKind,
+}
+
 /// `content`：查询 / 安装 / 移除服务端内容
 pub trait ContentOps: Send + Sync {
     /// 列出已安装内容
     ///
+    /// `identify=true` 时会计算哈希并访问上游反查来源与版本；失败项按
+    /// 「身份未知」返回，不让整次列表失败。
+    ///
     /// # Errors
     ///
     /// 未开放返回 `unsupported`
-    fn list(&self, _server: &ServerName) -> Result<Vec<ContentEntry>, HostError> {
+    fn list(
+        &self,
+        _server: &ServerName,
+        _kind: ContentKind,
+        _identify: bool,
+    ) -> Result<Vec<ContentEntry>, HostError> {
         Err(HostError::unsupported("content is not available"))
     }
 
-    /// 安装候选内容
+    /// 安装内容
     ///
     /// # Errors
     ///
-    /// 未开放返回 `unsupported`
+    /// 未开放返回 `unsupported`；服务器运行中返回 `conflict`
     fn install(
         &self,
         _server: &ServerName,
-        _candidate: &ContentCandidate,
+        _request: &ContentInstallRequest,
     ) -> Result<ContentEntry, HostError> {
         Err(HostError::unsupported("content is not available"))
     }
 
-    /// 移除内容
+    /// 移除内容；选择器为文件名或 modid
     ///
     /// # Errors
     ///
-    /// 未开放返回 `unsupported`
-    fn remove(&self, _server: &ServerName, _identity: &ContentIdentity) -> Result<bool, HostError> {
+    /// 未开放返回 `unsupported`；未命中返回 `not_found`
+    fn remove(
+        &self,
+        _server: &ServerName,
+        _selector: &str,
+        _kind: ContentKind,
+    ) -> Result<usize, HostError> {
         Err(HostError::unsupported("content is not available"))
     }
 }

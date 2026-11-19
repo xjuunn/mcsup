@@ -67,6 +67,9 @@ pub enum BootstrapError {
         #[source]
         source: std::io::Error,
     },
+    /// 定位当前可执行文件失败（插件 `server:lifecycle` 需要它拉起 supervisor）
+    #[error("locate current executable: {0}")]
+    Exe(#[source] std::io::Error),
 }
 
 /// 默认组合根：一次装配全部服务
@@ -185,6 +188,9 @@ impl Mcsup {
         let services = Arc::new(plugin::HostServices {
             server_read: Some(self.plugin_api.clone()),
             console: Some(self.plugin_api.clone()),
+            lifecycle: Some(self.plugin_api.clone()),
+            backup: Some(self.plugin_api.clone()),
+            content: Some(self.plugin_api.clone()),
             files: Some(self.plugin_api.clone()),
             kv: Some(self.plugin_api.kv()),
             secrets: Some(self.plugin_api.secrets()),
@@ -658,13 +664,16 @@ impl McsupBuilder {
             Arc::new(SecretFileStore::new(plugin_data.clone()));
         let plugin_config_store: Arc<dyn port::plugin::PluginConfigStore> =
             Arc::new(PluginConfigFileStore::new(plugin_data.clone()));
-        let plugin_api = Arc::new(service::HostApiImpl::new(
-            Arc::clone(&registry),
-            Arc::new(lifecycle.clone()),
+        let plugin_api = Arc::new(service::HostApiImpl::new(service::HostApiDeps {
+            registry: Arc::clone(&registry),
+            lifecycle: Arc::new(lifecycle.clone()),
+            backup: backup.clone(),
+            mods: mods.clone(),
+            supervisor_exe: std::env::current_exe().map_err(BootstrapError::Exe)?,
             kv,
             secrets,
-            Arc::clone(&plugin_store),
-        ));
+            store: Arc::clone(&plugin_store),
+        }));
         let plugins = service::PluginService::new(
             Arc::clone(&plugin_store),
             Arc::clone(&plugin_config_store),

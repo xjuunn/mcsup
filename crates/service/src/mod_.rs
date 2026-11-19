@@ -603,6 +603,10 @@ impl std::fmt::Debug for ApplyOptions<'_> {
 }
 
 /// mod 管理编排
+///
+/// 可克隆：字段都是 `Arc` 或轻量句柄，插件宿主的 `content` 能力与 CLI 共用
+/// 同一份注册表 / backend，不另起一套运行态判定。
+#[derive(Clone)]
 pub struct ModService {
     registry: Arc<ServerRegistry>,
     backend: Arc<dyn Backend>,

@@ -688,10 +688,13 @@ impl SessionInner {
             inner.audit.record(&AuditEvent {
                 at: now_secs(),
                 plugin: inner.record.id.to_string(),
-                action: format!(
-                    "capability:{}",
-                    call.capability.as_deref().unwrap_or("unknown")
-                ),
+                action: match (call.capability.as_deref(), call.method.as_deref()) {
+                    (Some(capability), Some(method)) => {
+                        format!("capability:{capability}:{method}")
+                    }
+                    (Some(capability), None) => format!("capability:{capability}"),
+                    _ => "capability:unknown".to_owned(),
+                },
                 capability: call
                     .capability
                     .as_deref()
@@ -701,14 +704,33 @@ impl SessionInner {
                     Err(err) if err.code == port::plugin::ErrorCode::Denied => AuditResult::Denied,
                     Err(_) => AuditResult::Failed,
                 },
-                detail: result
-                    .as_ref()
-                    .err()
-                    .map(|err| format!("{}: {}", err.code, err.message)),
+                detail: match &result {
+                    // 快照 id 与落盘文件名是备份 / 内容审计的检索键；只摘
+                    // 这两个非敏感字段，不能把整个输出写进审计
+                    //（`storage:kv` 的读取含明文值）。
+                    Ok(value) => Self::audit_detail(value),
+                    Err(err) => Some(format!("{}: {}", err.code, err.message)),
+                },
             });
             inner.write_result(&call, result);
             inner.inflight.fetch_sub(1, Ordering::SeqCst);
         });
+    }
+
+    /// 审计摘要：只摘可检索的非敏感字段
+    fn audit_detail(value: &Value) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(id) = value.get("snapshot").and_then(Value::as_str) {
+            parts.push(format!("snapshot={id}"));
+        }
+        if let Some(file) = value.get("file").and_then(Value::as_str) {
+            parts.push(format!("file={file}"));
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" "))
+        }
     }
 
     fn write_result(&self, call: &Call, result: Result<Value, HostError>) {

@@ -8,29 +8,34 @@
 //! [`HostApiImpl`] 把宿主需要的业务能力实现成 [`port::plugin`] 的窄 trait。
 //! 依赖全部是 `Arc<dyn ...>` 或同层 service，不反向依赖宿主运行时。
 
+use crate::backup::{BackupError, BackupService, CreateOptions};
 use crate::fs_error::FsError;
-use crate::lifecycle::ServerLifecycleService;
+use crate::lifecycle::{LifecycleError, ServerLifecycleService, StartOptions};
+use crate::mod_::{ApplyOptions, InstallSpec, ListOptions, ModError, ModService};
 use crate::props::ServerPropsService;
-use crate::registry::ServerRegistry;
+use crate::registry::{ServerRegistry, ServerRegistryError};
+use domain::backup::{Page, RestoreTarget, RetentionInput};
 use domain::path::RelPath;
 use domain::plugin::capability::{self, Capability};
 use domain::plugin::descriptor::Descriptor;
+use domain::plugin::error::PluginErrorCode;
 use domain::plugin::manifest::Manifest;
 use domain::plugin::state::{PluginEvent, PluginState};
 use domain::plugin::{PluginId, PluginScope};
 use domain::server::artifact::Checksum;
+use domain::server::content::ContentKind;
 use domain::server::layout::console_log_path;
 use domain::server::meta::ServerName;
 use domain::server::status::ServerStatus;
 use port::plugin::{
     ArtifactOrigin, ArtifactSource, ArtifactVerifier, AuditEvent, AuditResult, AuditSink,
-    BackupOps, ConfigOps, ConsoleIo, ConsoleLine, ConsolePage, ContentOps, FileEntry, FileOps,
-    HostError, JavaOps, KvStore, MAX_CONSOLE_LINE_BYTES, MAX_CONSOLE_LINES, MAX_FILE_BYTES,
-    NetPolicy, PluginConfigStore, PluginRecord, PluginRuntimeStatus, PluginStore, PluginSupervisor,
-    SecretStore, ServerLifecycle, ServerRead, ServerStatusView, ServerSummary, SessionInfo,
-    StoredConfig,
+    BackupEntry, BackupOps, ConfigOps, ConsoleIo, ConsoleLine, ConsolePage, ContentEntry,
+    ContentInstallRequest, ContentOps, FileEntry, FileOps, HostError, JavaOps, KvStore,
+    MAX_CONSOLE_LINE_BYTES, MAX_CONSOLE_LINES, MAX_FILE_BYTES, NetPolicy, PluginConfigStore,
+    PluginRecord, PluginRuntimeStatus, PluginStore, PluginSupervisor, SecretStore, ServerLifecycle,
+    ServerRead, ServerStatusView, ServerSummary, SessionInfo, StoredConfig,
 };
-use port::{ErrorCategory, RepositoryError};
+use port::{ErrorCategory, RepositoryError, StopOutcome, StopSpec};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::io::Read as _;
@@ -1104,6 +1109,9 @@ fn now_secs() -> i64 {
 pub struct HostApiImpl {
     registry: Arc<ServerRegistry>,
     lifecycle: Arc<ServerLifecycleService>,
+    backup: BackupService,
+    mods: ModService,
+    supervisor_exe: PathBuf,
     props: ServerPropsService,
     kv: Arc<dyn KvStore>,
     secrets: Arc<dyn SecretStore>,
@@ -1116,20 +1124,58 @@ impl std::fmt::Debug for HostApiImpl {
     }
 }
 
+/// 宿主能力实现的装配依赖
+///
+/// 单独成结构而不是一长串参数：每加一项能力都会再加一个入参，位置参数
+/// 迟早会接错（全部是 `Arc`，编译器帮不上忙）。
+pub struct HostApiDeps {
+    /// 服务器注册表
+    pub registry: Arc<ServerRegistry>,
+    /// 生命周期编排
+    pub lifecycle: Arc<ServerLifecycleService>,
+    /// 备份编排
+    pub backup: BackupService,
+    /// mod / 内容编排
+    pub mods: ModService,
+    /// 拉起 supervisor 用的可执行文件（宿主 `current_exe()`）
+    pub supervisor_exe: PathBuf,
+    /// 插件键值空间
+    pub kv: Arc<dyn KvStore>,
+    /// 插件密钥空间
+    pub secrets: Arc<dyn SecretStore>,
+    /// 插件记录
+    pub store: Arc<dyn PluginStore>,
+}
+
+impl std::fmt::Debug for HostApiDeps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostApiDeps")
+            .field("supervisor_exe", &self.supervisor_exe)
+            .finish_non_exhaustive()
+    }
+}
+
 impl HostApiImpl {
     /// 构造宿主能力实现
     #[must_use]
-    pub fn new(
-        registry: Arc<ServerRegistry>,
-        lifecycle: Arc<ServerLifecycleService>,
-        kv: Arc<dyn KvStore>,
-        secrets: Arc<dyn SecretStore>,
-        store: Arc<dyn PluginStore>,
-    ) -> Self {
+    pub fn new(deps: HostApiDeps) -> Self {
+        let HostApiDeps {
+            registry,
+            lifecycle,
+            backup,
+            mods,
+            supervisor_exe,
+            kv,
+            secrets,
+            store,
+        } = deps;
         Self {
             props: ServerPropsService::new(Arc::clone(&registry)),
             registry,
             lifecycle,
+            backup,
+            mods,
+            supervisor_exe,
             kv,
             secrets,
             store,
@@ -1198,7 +1244,7 @@ impl ServerRead for HostApiImpl {
             .registry
             .get(server.as_str())
             .map_err(|err| match err {
-                crate::registry::ServerRegistryError::NotFound(_) => {
+                ServerRegistryError::NotFound(_) => {
                     HostError::not_found(format!("server {server} not found"))
                 }
                 other => HostError::internal(format!("read server {server}: {other}")),
@@ -1224,7 +1270,7 @@ impl ServerRead for HostApiImpl {
             .registry
             .get(server.as_str())
             .map_err(|err| match err {
-                crate::registry::ServerRegistryError::NotFound(_) => {
+                ServerRegistryError::NotFound(_) => {
                     HostError::not_found(format!("server {server} not found"))
                 }
                 other => HostError::internal(format!("read server {server}: {other}")),
@@ -1264,7 +1310,7 @@ impl ConsoleIo for HostApiImpl {
             .registry
             .get(server.as_str())
             .map_err(|err| match err {
-                crate::registry::ServerRegistryError::NotFound(_) => {
+                ServerRegistryError::NotFound(_) => {
                     HostError::not_found(format!("server {server} not found"))
                 }
                 other => HostError::internal(format!("read server {server}: {other}")),
@@ -1628,7 +1674,7 @@ impl HostApiImpl {
             .registry
             .get(server.as_str())
             .map_err(|err| match err {
-                crate::registry::ServerRegistryError::NotFound(_) => {
+                ServerRegistryError::NotFound(_) => {
                     HostError::not_found(format!("server {server} not found"))
                 }
                 other => HostError::internal(format!("read server {server}: {other}")),
@@ -1657,6 +1703,296 @@ impl HostApiImpl {
             ),
         };
         ServerFiles::new(&registered.dir, running, launch)
+    }
+}
+
+impl ServerLifecycle for HostApiImpl {
+    fn start(&self, server: &ServerName) -> Result<(), HostError> {
+        let options = plugin_start_options(&self.supervisor_exe);
+        self.lifecycle
+            .start(server.as_str(), &options, &mut || {}, &mut |_| {})
+            .map(|_| ())
+            .map_err(|err| lifecycle_host_error(&err))
+    }
+
+    fn stop(&self, server: &ServerName, grace: Duration) -> Result<StopOutcome, HostError> {
+        let spec = StopSpec {
+            grace,
+            force: false,
+        };
+        self.lifecycle
+            .stop(server.as_str(), spec)
+            .map_err(|err| lifecycle_host_error(&err))
+    }
+
+    fn restart(&self, server: &ServerName, grace: Duration) -> Result<(), HostError> {
+        let options = plugin_start_options(&self.supervisor_exe);
+        let spec = StopSpec {
+            grace,
+            force: false,
+        };
+        self.lifecycle
+            .restart(server.as_str(), &options, spec, &mut || {}, &mut |_| {})
+            .map(|_| ())
+            .map_err(|err| lifecycle_host_error(&err))
+    }
+}
+
+/// 插件触发的启动不接受 EULA 条款：那必须由管理员显式确认
+fn plugin_start_options(supervisor_exe: &Path) -> StartOptions {
+    StartOptions {
+        accept_eula: false,
+        skip_mod_check: false,
+        ram_mib: None,
+        supervisor_exe: supervisor_exe.to_path_buf(),
+        supervisor_args: vec![std::ffi::OsString::from("__supervise")],
+    }
+}
+
+/// 生命周期错误 → 宿主错误
+///
+/// 插件无法修复的服务器状态（缺核心、EULA 未确认、已在运行）一律是
+/// `conflict`：调用方要改的是服务器状态，不是重试或改参数。
+fn lifecycle_host_error(err: &LifecycleError) -> HostError {
+    use LifecycleError as E;
+    let message = err.to_string();
+    match err {
+        E::Registry(ServerRegistryError::NotFound(_)) => HostError::not_found(message),
+        E::NoJar { .. }
+        | E::EulaRequired
+        | E::AlreadyRunning
+        | E::NotRunning
+        | E::Busy { .. }
+        | E::ModsBlocked { .. } => HostError::conflict(message),
+        E::NoJava | E::UnknownJavaMajor { .. } => {
+            HostError::new(PluginErrorCode::Unavailable, message)
+        }
+        E::StopTimedOut { .. } => HostError::new(PluginErrorCode::Timeout, message),
+        E::RemoteLogStream(_) => HostError::unsupported(message),
+        E::Registry(_)
+        | E::Java(_)
+        | E::Supervisor(_)
+        | E::InstallJar(_)
+        | E::Io(_)
+        | E::StatusCountMismatch { .. } => HostError::internal(message),
+    }
+}
+
+impl BackupOps for HostApiImpl {
+    fn create(&self, server: &ServerName, label: Option<&str>) -> Result<String, HostError> {
+        let options = CreateOptions {
+            label: label.map(str::to_owned),
+            ..CreateOptions::default()
+        };
+        let cancel = port::CancellationToken::new();
+        let outcome = self
+            .backup
+            .create(server.as_str(), &options, &cancel)
+            .map_err(|err| backup_host_error(&err))?;
+        Ok(outcome.snapshot.id.to_string())
+    }
+
+    fn list(&self, server: &ServerName) -> Result<Vec<BackupEntry>, HostError> {
+        let page = self
+            .backup
+            .list(server.as_str(), Page::new(1, usize::MAX))
+            .map_err(|err| backup_host_error(&err))?;
+        Ok(page
+            .items
+            .into_iter()
+            .map(|snapshot| BackupEntry {
+                id: snapshot.id.to_string(),
+                created_at: snapshot.created_at,
+                added_bytes: snapshot.added_bytes,
+            })
+            .collect())
+    }
+
+    fn restore(&self, server: &ServerName, snapshot: &str) -> Result<(), HostError> {
+        let cancel = port::CancellationToken::new();
+        self.backup
+            .restore(server.as_str(), snapshot, &RestoreTarget::InPlace, &cancel)
+            .map(|_| ())
+            .map_err(|err| backup_host_error(&err))
+    }
+
+    fn verify(&self, server: &ServerName, snapshot: &str) -> Result<bool, HostError> {
+        self.backup
+            .verify(server.as_str(), snapshot, &mut |_, _| {})
+            .map(|outcome| outcome.is_healthy())
+            .map_err(|err| backup_host_error(&err))
+    }
+
+    fn prune(&self, server: &ServerName, keep: usize) -> Result<usize, HostError> {
+        self.backup
+            .prune(
+                server.as_str(),
+                RetentionInput {
+                    keep: Some(keep),
+                    older_than_secs: None,
+                },
+                false,
+            )
+            .map(|outcome| outcome.removed.len())
+            .map_err(|err| backup_host_error(&err))
+    }
+
+    fn delete(&self, server: &ServerName, snapshot: &str) -> Result<bool, HostError> {
+        self.backup
+            .delete(server.as_str(), snapshot)
+            .map(|_| true)
+            .map_err(|err| backup_host_error(&err))
+    }
+}
+
+/// 备份错误 → 宿主错误：分类由 service 决定，这里只翻译成稳定码
+fn backup_host_error(err: &BackupError) -> HostError {
+    let message = err.to_string();
+    match err.category() {
+        ErrorCategory::NotFound => HostError::not_found(message),
+        ErrorCategory::Conflict => HostError::conflict(message),
+        ErrorCategory::Cancelled => HostError::new(PluginErrorCode::Cancelled, message),
+        ErrorCategory::Usage => HostError::invalid_input(message),
+        ErrorCategory::Backend => HostError::new(PluginErrorCode::Unavailable, message),
+        ErrorCategory::Unauthorized => HostError::denied(message),
+        ErrorCategory::Failure => HostError::internal(message),
+    }
+}
+
+impl ContentOps for HostApiImpl {
+    fn list(
+        &self,
+        server: &ServerName,
+        kind: ContentKind,
+        identify: bool,
+    ) -> Result<Vec<ContentEntry>, HostError> {
+        let list = with_content_runtime(|runtime| {
+            runtime.block_on(self.mods.list(
+                server.as_str(),
+                ListOptions {
+                    kind,
+                    identify,
+                    source: None,
+                    updates: false,
+                },
+            ))
+        })?
+        .map_err(|err| content_host_error(&err))?;
+        let dir = list.dir;
+        Ok(list
+            .mods
+            .into_iter()
+            .map(|entry| {
+                // 大小只用于展示；读不到时留 0，不因单个文件阻断整次列表
+                //（读不出来的文件已在 `unreadable` 里单独报告）。
+                let size = std::fs::metadata(dir.join(&entry.file)).map_or(0, |meta| meta.len());
+                ContentEntry {
+                    identity: entry.identity,
+                    file_name: entry.file,
+                    size,
+                }
+            })
+            .collect())
+    }
+
+    fn install(
+        &self,
+        server: &ServerName,
+        request: &ContentInstallRequest,
+    ) -> Result<ContentEntry, HostError> {
+        // 计划与执行都走 `ModService`：运行态判定、依赖检查与落点规则不在
+        // 插件层重写，插件拿到的结果与 CLI 完全一致。
+        let plan = with_content_runtime(|runtime| {
+            runtime.block_on(self.mods.plan_install(
+                server.as_str(),
+                &request.project,
+                request.kind,
+                InstallSpec {
+                    version: request.version.as_deref(),
+                    source: None,
+                    allow_prerelease: false,
+                },
+            ))
+        })?
+        .map_err(|err| content_host_error(&err))?;
+        let cancel = port::CancellationToken::new();
+        let installed = with_content_runtime(|runtime| {
+            runtime.block_on(self.mods.install(
+                server.as_str(),
+                &plan,
+                ApplyOptions {
+                    allow_blocking: false,
+                    progress: None,
+                    cancel: &cancel,
+                },
+            ))
+        })?
+        .map_err(|err| content_host_error(&err))?;
+        Ok(ContentEntry {
+            // 安装结果只承诺落盘事实，不额外访问上游反查身份：那属于
+            // `list(identify=true)` 的职责。
+            identity: None,
+            file_name: installed.file,
+            size: installed.size,
+        })
+    }
+
+    fn remove(
+        &self,
+        server: &ServerName,
+        selector: &str,
+        kind: ContentKind,
+    ) -> Result<usize, HostError> {
+        self.mods
+            .remove(server.as_str(), selector, kind, false)
+            .map(|removed| removed.files.len())
+            .map_err(|err| content_host_error(&err))
+    }
+}
+
+/// 同步宿主线程上跑 `ModService` 的异步方法
+///
+/// 插件会话的每次宿主调用都在自己的线程上执行，这里按线程复用 runtime：
+/// 它不是业务状态，只是 IO / 定时器驱动。`enable_all` 必须带上 tokio 的
+/// `net` feature，否则下载用的 IO driver 不会被启用。
+fn with_content_runtime<T>(
+    work: impl FnOnce(&tokio::runtime::Runtime) -> T,
+) -> Result<T, HostError> {
+    thread_local! {
+        static CONTENT_RUNTIME: std::cell::OnceCell<tokio::runtime::Runtime> =
+            const { std::cell::OnceCell::new() };
+    }
+    CONTENT_RUNTIME.with(|cell| {
+        if cell.get().is_none() {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|err| HostError::internal(format!("init content runtime: {err}")))?;
+            let _ = cell.set(runtime);
+        }
+        cell.get()
+            .map(work)
+            .ok_or_else(|| HostError::internal("content runtime was not initialized"))
+    })
+}
+
+/// mod 编排错误 → 宿主错误
+///
+/// 分类仍由 `ModError::category()` 决定；只有「服务器在远端」需要单独翻成
+/// `unsupported`：插件连不上另一台主机，重试或改参数都没用。
+fn content_host_error(err: &ModError) -> HostError {
+    let message = err.to_string();
+    if matches!(err, ModError::Remote { .. }) {
+        return HostError::unsupported(message);
+    }
+    match err.category() {
+        ErrorCategory::NotFound => HostError::not_found(message),
+        ErrorCategory::Conflict => HostError::conflict(message),
+        ErrorCategory::Cancelled => HostError::new(PluginErrorCode::Cancelled, message),
+        ErrorCategory::Usage => HostError::invalid_input(message),
+        ErrorCategory::Backend => HostError::new(PluginErrorCode::Unavailable, message),
+        ErrorCategory::Unauthorized => HostError::denied(message),
+        ErrorCategory::Failure => HostError::internal(message),
     }
 }
 
@@ -2297,6 +2633,83 @@ mod tests {
         );
         assert!(files.remove(Path::new("empty")).expect("empty dir"));
         assert!(!dir.path().join("empty").exists());
+    }
+
+    // ---- 生命周期与备份错误映射（API-LIFE / API-BAK） ----
+
+    #[test]
+    fn api_life_errors_map_to_host_codes() {
+        let conflict = |err: LifecycleError| {
+            assert_eq!(
+                lifecycle_host_error(&err).code,
+                port::plugin::ErrorCode::Conflict
+            );
+        };
+        conflict(LifecycleError::AlreadyRunning);
+        conflict(LifecycleError::NotRunning);
+        conflict(LifecycleError::EulaRequired);
+        conflict(LifecycleError::NoJar {
+            name: "survival".to_owned(),
+        });
+        assert_eq!(
+            lifecycle_host_error(&LifecycleError::StopTimedOut {
+                waited: Duration::from_secs(30),
+            })
+            .code,
+            port::plugin::ErrorCode::Timeout
+        );
+    }
+
+    #[test]
+    fn api_bak_errors_map_to_host_codes() {
+        assert_eq!(
+            backup_host_error(&BackupError::SnapshotNotFound("missing".to_owned())).code,
+            port::plugin::ErrorCode::NotFound
+        );
+        assert_eq!(
+            backup_host_error(&BackupError::RestoreWhileRunning {
+                name: "survival".to_owned(),
+            })
+            .code,
+            port::plugin::ErrorCode::Conflict
+        );
+        assert_eq!(
+            backup_host_error(&BackupError::EmptyScope).code,
+            port::plugin::ErrorCode::InvalidInput
+        );
+    }
+
+    #[test]
+    fn api_cnt_errors_map_to_host_codes() {
+        assert_eq!(
+            content_host_error(&ModError::Running {
+                name: "survival".to_owned(),
+            })
+            .code,
+            port::plugin::ErrorCode::Conflict
+        );
+        assert_eq!(
+            content_host_error(&ModError::NotFound {
+                selector: "jei".to_owned(),
+                dir: PathBuf::from("/srv/mods"),
+            })
+            .code,
+            port::plugin::ErrorCode::NotFound
+        );
+        assert_eq!(
+            content_host_error(&ModError::Remote {
+                name: "survival".to_owned(),
+            })
+            .code,
+            port::plugin::ErrorCode::Unsupported
+        );
+        assert_eq!(
+            content_host_error(&ModError::ClientOnly {
+                kind: ContentKind::Shader,
+            })
+            .code,
+            port::plugin::ErrorCode::InvalidInput
+        );
     }
 
     fn all_capabilities() -> [Capability; 4] {
