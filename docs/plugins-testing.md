@@ -865,6 +865,10 @@ panic，只能返回错误。
 | `API-FS-007` | 运行中 jar | `conflict` |
 | `API-FS-008` | Windows 大小写 / UNC | 归一化后校验 |
 
+落位：`service::plugin` 的 `ServerFiles` 负责路径、限额与保留名判定，
+`crates/plugin/src/api.rs` 只做帧分发。单测名以 `api_fs_` 开头，可用
+`cargo test -p mcsup-service --lib api_fs` 过滤；符号链接用例在 unix 上执行。
+
 ## 9.8 生命周期 / 备份 / 内容 / Java（`API-LIFE` / `API-BAK` / `API-CNT` / `API-JAVA`）
 
 | ID | 场景 | 期望 |

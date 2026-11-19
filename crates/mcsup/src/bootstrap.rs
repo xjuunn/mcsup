@@ -185,6 +185,7 @@ impl Mcsup {
         let services = Arc::new(plugin::HostServices {
             server_read: Some(self.plugin_api.clone()),
             console: Some(self.plugin_api.clone()),
+            files: Some(self.plugin_api.clone()),
             kv: Some(self.plugin_api.kv()),
             secrets: Some(self.plugin_api.secrets()),
             net: Some(Arc::new(provider::plugin_net::HttpNetProxy::new(

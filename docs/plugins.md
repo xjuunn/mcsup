@@ -970,10 +970,31 @@ pub trait SecretStore: Send + Sync {
 pub trait NetProxy: Send + Sync {
     fn request(&self, plugin: &PluginId, req: NetRequest) -> Result<NetResponse, HostError>;
 }
+
+pub trait FileOps: Send + Sync {
+    fn read(&self, server: &ServerName, rel: &Path) -> Result<Vec<u8>, HostError>;
+    fn write(&self, server: &ServerName, rel: &Path, bytes: &[u8], overwrite: bool)
+        -> Result<(), HostError>;
+    fn list(&self, server: &ServerName, rel_dir: &Path) -> Result<Vec<FileEntry>, HostError>;
+    fn remove(&self, server: &ServerName, rel: &Path) -> Result<bool, HostError>;
+}
 ```
 
 `BackupOps` / `ContentOps` / `JavaOps` / `FileOps` 按同样风格定义，方法集合与
 现有 `service` 的公开方法一一对应，不新增业务语义。
+
+文件能力的帧方法：
+
+| 能力 | `method` | 输入 | 输出 |
+| --- | --- | --- | --- |
+| `files:read` | `read` | `{server, path}` | `{path, size, data}`（`data` 为 base64） |
+| `files:read` | `list` | `{server, path?}`；省略 / `""` / `"."` 表示根 | `{entries:[{path, is_dir, size}]}` |
+| `files:write` | `write` | `{server, path, data, overwrite?}`；`overwrite` 默认 `false` | `{ok, size}` |
+| `files:write` | `remove` | `{server, path}` | `{removed}` |
+
+`write` 覆盖已存在文件时必须显式 `overwrite:true`；目标存在且未允许覆盖返回
+`conflict`。`mcsup.json` 与运行中的启动文件（JAR / 参数文件）禁止改写与删除：
+前者返回 `denied`，后者返回 `conflict`。
 
 ## 9.2 限额
 
@@ -997,6 +1018,10 @@ pub trait NetProxy: Send + Sync {
 
 - 路径必须是相对路径；拒绝 `..`、绝对路径、盘符、UNC、符号链接逃逸。
 - 解析后必须仍在服务端目录内（`canonicalize` 后前缀比较，注意 Windows 大小写）。
+- 文件能力在创建父目录前先校验最深的已存在祖先，避免先写后查；符号链接
+  指向目录内部允许，指向目录外一律 `denied`。
+- `mcsup.json` 与运行中的启动文件是保留名：写 / 删分别返回 `denied` /
+  `conflict`；判定对大小写不敏感，覆盖 Windows 的大小写不敏感文件系统。
 - `NetProxy` 默认拒绝回环、私网、链路本地地址与云元数据地址；`manifest.net.allow`
   为空时拒绝所有请求并返回 `denied`。
 - `[禁止]` 用字符串包含判断域名；必须解析后按主机名后缀精确匹配。

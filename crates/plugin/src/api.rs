@@ -21,6 +21,7 @@ use port::plugin::{
 use protocol::plugin::{Call, CallRoute};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -173,12 +174,12 @@ fn host_call(
         Capability::StorageKv => kv(services, method, input, ctx.plugin),
         Capability::SecretRw => secrets(services, method, input, ctx.plugin),
         Capability::NetOutbound => net(services, method, input, ctx.plugin),
+        Capability::FilesRead => files_read(services, method, input, bound),
+        Capability::FilesWrite => files_write(services, method, input, bound),
         Capability::ServerLifecycle
         | Capability::Backup
         | Capability::Content
         | Capability::Java
-        | Capability::FilesRead
-        | Capability::FilesWrite
         | Capability::Events
         | Capability::ProcessSpawn
         | Capability::McClient => Err(HostError::unsupported(format!(
@@ -431,6 +432,107 @@ fn net(
     }
 }
 
+fn files_read(
+    services: &HostServices,
+    method: &str,
+    input: &Value,
+    bound: Option<&ServerName>,
+) -> Result<Value, HostError> {
+    let service = services
+        .files
+        .as_ref()
+        .ok_or_else(|| HostError::unsupported("files:read is not available"))?;
+    match method {
+        "read" => {
+            let server = server_arg(input, bound)?;
+            let path = path_arg(input, "path")?;
+            let bytes = service.read(&server, &path)?;
+            Ok(json!({
+                "path": path_text(&path),
+                "size": bytes.len(),
+                "data": base64::encode(&bytes),
+            }))
+        }
+        "list" => {
+            let server = server_arg(input, bound)?;
+            let path = optional_path_arg(input)?;
+            let entries = service
+                .list(&server, &path)?
+                .into_iter()
+                .map(|entry| {
+                    json!({
+                        "path": path_text(&entry.path),
+                        "is_dir": entry.is_dir,
+                        "size": entry.size,
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(json!({ "entries": entries }))
+        }
+        other => Err(unknown_method("files:read", other)),
+    }
+}
+
+fn files_write(
+    services: &HostServices,
+    method: &str,
+    input: &Value,
+    bound: Option<&ServerName>,
+) -> Result<Value, HostError> {
+    let service = services
+        .files
+        .as_ref()
+        .ok_or_else(|| HostError::unsupported("files:write is not available"))?;
+    match method {
+        "write" => {
+            let server = server_arg(input, bound)?;
+            let path = path_arg(input, "path")?;
+            let bytes = base64_arg(input, "data")?;
+            let overwrite = match input.get("overwrite") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(value)) => *value,
+                Some(_) => {
+                    return Err(HostError::invalid_input("overwrite must be a boolean"));
+                }
+            };
+            service.write(&server, &path, &bytes, overwrite)?;
+            Ok(json!({ "ok": true, "size": bytes.len() }))
+        }
+        "remove" => {
+            let server = server_arg(input, bound)?;
+            let path = path_arg(input, "path")?;
+            Ok(json!({ "removed": service.remove(&server, &path)? }))
+        }
+        other => Err(unknown_method("files:write", other)),
+    }
+}
+
+fn path_arg(input: &Value, key: &str) -> Result<PathBuf, HostError> {
+    Ok(PathBuf::from(string_arg(input, key)?))
+}
+
+fn optional_path_arg(input: &Value) -> Result<PathBuf, HostError> {
+    match input.get("path") {
+        None | Some(Value::Null) => Ok(PathBuf::new()),
+        Some(Value::String(raw)) => Ok(PathBuf::from(raw)),
+        Some(_) => Err(HostError::invalid_input("path must be a string")),
+    }
+}
+
+/// 协议里的路径一律 POSIX 文本；内部 `PathBuf` 在 Windows 上带 `\`
+fn path_text(path: &Path) -> String {
+    let mut text = String::new();
+    for component in path.components() {
+        if let std::path::Component::Normal(part) = component {
+            if !text.is_empty() {
+                text.push('/');
+            }
+            text.push_str(&part.to_string_lossy());
+        }
+    }
+    text
+}
+
 fn server_arg(input: &Value, bound: Option<&ServerName>) -> Result<ServerName, HostError> {
     let raw = string_arg(input, "server")?;
     let server = ServerName::parse(raw)
@@ -467,7 +569,7 @@ fn unknown_method(capability: &str, method: &str) -> HostError {
 mod tests {
     use super::*;
     use domain::plugin::PluginId;
-    use port::plugin::{ConsoleLine, ConsolePage, ServerSummary};
+    use port::plugin::{ConsoleLine, ConsolePage, FileEntry, ServerSummary};
     use std::collections::BTreeMap;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -627,6 +729,170 @@ mod tests {
         .expect("tail");
         assert_eq!(value["next"], 5);
         assert_eq!(value["lines"][0]["text"], "hello");
+    }
+
+    struct Files {
+        seen: Mutex<Option<(String, PathBuf, Option<bool>)>>,
+    }
+
+    impl Files {
+        fn new() -> Self {
+            Self {
+                seen: Mutex::new(None),
+            }
+        }
+    }
+
+    impl FileOps for Files {
+        fn read(&self, server: &ServerName, rel: &Path) -> Result<Vec<u8>, HostError> {
+            *self.seen.lock().expect("lock") =
+                Some((server.as_str().to_owned(), rel.to_path_buf(), None));
+            Ok(b"hello".to_vec())
+        }
+
+        fn write(
+            &self,
+            server: &ServerName,
+            rel: &Path,
+            bytes: &[u8],
+            overwrite: bool,
+        ) -> Result<(), HostError> {
+            assert_eq!(bytes, b"payload");
+            *self.seen.lock().expect("lock") = Some((
+                server.as_str().to_owned(),
+                rel.to_path_buf(),
+                Some(overwrite),
+            ));
+            Ok(())
+        }
+
+        fn list(&self, server: &ServerName, rel_dir: &Path) -> Result<Vec<FileEntry>, HostError> {
+            *self.seen.lock().expect("lock") =
+                Some((server.as_str().to_owned(), rel_dir.to_path_buf(), None));
+            Ok(vec![FileEntry {
+                path: Path::new("world").join("level.dat"),
+                is_dir: false,
+                size: 42,
+            }])
+        }
+
+        fn remove(&self, server: &ServerName, rel: &Path) -> Result<bool, HostError> {
+            *self.seen.lock().expect("lock") =
+                Some((server.as_str().to_owned(), rel.to_path_buf(), None));
+            Ok(true)
+        }
+    }
+
+    fn files_services(files: &Arc<Files>) -> HostServices {
+        HostServices {
+            files: Some(Arc::clone(files) as Arc<dyn FileOps>),
+            ..HostServices::default()
+        }
+    }
+
+    #[test]
+    fn files_read_returns_base64_and_uses_bound_server() {
+        let files = Arc::new(Files::new());
+        let bound = ServerName::parse("survival").expect("name");
+        let call = Call::host(
+            1,
+            "files:read",
+            "read",
+            json!({ "server": "survival", "path": "world/level.dat" }),
+        );
+        let caps = granted(&[Capability::FilesRead]);
+        let value = dispatch(
+            &files_services(&files),
+            &call,
+            DispatchContext {
+                plugin: plugin(),
+                granted: &caps,
+                scope_server: Some(&bound),
+                contracts: None,
+            },
+        )
+        .expect("read");
+        assert_eq!(value["path"], "world/level.dat");
+        assert_eq!(value["size"], 5);
+        assert_eq!(value["data"], base64::encode(b"hello"));
+        let seen = files.seen.lock().expect("lock").take().expect("called");
+        assert_eq!(seen.0, "survival");
+        assert_eq!(seen.1, PathBuf::from("world/level.dat"));
+    }
+
+    #[test]
+    fn files_write_decodes_base64_and_forwards_overwrite() {
+        let files = Arc::new(Files::new());
+        let call = Call::host(
+            1,
+            "files:write",
+            "write",
+            json!({
+                "server": "survival",
+                "path": "plugins/demo.jar",
+                "data": base64::encode(b"payload"),
+                "overwrite": true,
+            }),
+        );
+        let caps = granted(&[Capability::FilesWrite]);
+        let value = dispatch(&files_services(&files), &call, ctx(&caps)).expect("write");
+        assert_eq!(value["ok"], true);
+        let seen = files.seen.lock().expect("lock").take().expect("called");
+        assert_eq!(seen.2, Some(true));
+    }
+
+    #[test]
+    fn files_list_projects_posix_paths_and_remove_reports_result() {
+        let files = Arc::new(Files::new());
+        let caps = granted(&[Capability::FilesRead, Capability::FilesWrite]);
+        let call = Call::host(1, "files:read", "list", json!({ "server": "survival" }));
+        let value = dispatch(&files_services(&files), &call, ctx(&caps)).expect("list");
+        assert_eq!(value["entries"][0]["path"], "world/level.dat");
+        assert_eq!(value["entries"][0]["size"], 42);
+
+        let call = Call::host(
+            2,
+            "files:write",
+            "remove",
+            json!({ "server": "survival", "path": "plugins/old.jar" }),
+        );
+        let value = dispatch(&files_services(&files), &call, ctx(&caps)).expect("remove");
+        assert_eq!(value["removed"], true);
+    }
+
+    #[test]
+    fn files_methods_stay_inside_their_capability() {
+        let files = Arc::new(Files::new());
+        let call = Call::host(
+            1,
+            "files:read",
+            "write",
+            json!({ "server": "survival", "path": "a", "data": "" }),
+        );
+        let caps = granted(&[Capability::FilesRead]);
+        assert_eq!(
+            dispatch(&files_services(&files), &call, ctx(&caps))
+                .expect_err("read cannot write")
+                .code,
+            port::plugin::ErrorCode::InvalidInput
+        );
+    }
+
+    #[test]
+    fn files_without_service_is_unsupported() {
+        let call = Call::host(
+            1,
+            "files:read",
+            "read",
+            json!({ "server": "survival", "path": "a" }),
+        );
+        let caps = granted(&[Capability::FilesRead]);
+        assert_eq!(
+            dispatch(&HostServices::default(), &call, ctx(&caps))
+                .expect_err("unsupported")
+                .code,
+            port::plugin::ErrorCode::Unsupported
+        );
     }
 
     #[test]

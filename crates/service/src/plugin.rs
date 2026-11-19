@@ -12,6 +12,7 @@ use crate::fs_error::FsError;
 use crate::lifecycle::ServerLifecycleService;
 use crate::props::ServerPropsService;
 use crate::registry::ServerRegistry;
+use domain::path::RelPath;
 use domain::plugin::capability::{self, Capability};
 use domain::plugin::descriptor::Descriptor;
 use domain::plugin::manifest::Manifest;
@@ -23,14 +24,16 @@ use domain::server::meta::ServerName;
 use domain::server::status::ServerStatus;
 use port::plugin::{
     ArtifactOrigin, ArtifactSource, ArtifactVerifier, AuditEvent, AuditResult, AuditSink,
-    BackupOps, ConfigOps, ConsoleIo, ConsoleLine, ConsolePage, ContentOps, FileOps, HostError,
-    JavaOps, KvStore, MAX_CONSOLE_LINE_BYTES, MAX_CONSOLE_LINES, NetPolicy, PluginConfigStore,
-    PluginRecord, PluginRuntimeStatus, PluginStore, PluginSupervisor, SecretStore, ServerLifecycle,
-    ServerRead, ServerStatusView, ServerSummary, SessionInfo, StoredConfig,
+    BackupOps, ConfigOps, ConsoleIo, ConsoleLine, ConsolePage, ContentOps, FileEntry, FileOps,
+    HostError, JavaOps, KvStore, MAX_CONSOLE_LINE_BYTES, MAX_CONSOLE_LINES, MAX_FILE_BYTES,
+    NetPolicy, PluginConfigStore, PluginRecord, PluginRuntimeStatus, PluginStore, PluginSupervisor,
+    SecretStore, ServerLifecycle, ServerRead, ServerStatusView, ServerSummary, SessionInfo,
+    StoredConfig,
 };
 use port::{ErrorCategory, RepositoryError};
 use serde_json::Value;
 use std::collections::BTreeSet;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1315,6 +1318,348 @@ impl ConsoleIo for HostApiImpl {
     }
 }
 
+/// 文件能力的服务器根：canonical 根 + 运行期保护信息
+///
+/// 所有落点都先解析符号链接再与根比较；比较用 canonical 路径，Windows 的
+/// 大小写与实际目录名由系统解析，字符串前缀判断不承担归一化职责。
+struct ServerFiles {
+    root: PathBuf,
+    /// 进程是否仍持有启动文件（`Starting` / `Running` / `Stopping`）
+    running: bool,
+    /// 运行期不可覆盖的启动文件，相对服务器目录
+    launch: Option<PathBuf>,
+}
+
+impl ServerFiles {
+    fn new(dir: &Path, running: bool, launch: Option<PathBuf>) -> Result<Self, HostError> {
+        let root = crate::fs::canonicalize(dir).map_err(|err| io_error(dir, &err))?;
+        Ok(Self {
+            root,
+            running,
+            launch,
+        })
+    }
+
+    fn relative(rel: &Path) -> Result<RelPath, HostError> {
+        RelPath::from_path(rel).map_err(|err| HostError::denied(err.to_string()))
+    }
+
+    /// 已存在路径：解析符号链接后必须仍在根内
+    fn checked_existing(&self, rel: &RelPath) -> Result<PathBuf, HostError> {
+        let target = self.root.join(rel.to_platform_path());
+        let resolved = crate::fs::canonicalize(&target).map_err(|err| io_error(&target, &err))?;
+        self.ensure_inside(&resolved, rel)?;
+        Ok(target)
+    }
+
+    fn ensure_inside(&self, resolved: &Path, rel: &RelPath) -> Result<(), HostError> {
+        if resolved.starts_with(&self.root) {
+            Ok(())
+        } else {
+            Err(HostError::denied(format!(
+                "path escapes the server directory: {rel}"
+            )))
+        }
+    }
+
+    /// 写入落点：缺的父目录逐级建出来
+    ///
+    /// 先找到最深的已存在祖先并确认它在根内，再创建缺失目录——顺序反过来
+    /// 会在检测到逃逸之前就把目录建到根外。
+    fn writable(&self, rel: &RelPath) -> Result<PathBuf, HostError> {
+        let target = self.root.join(rel.to_platform_path());
+        let parent = target
+            .parent()
+            .ok_or_else(|| HostError::denied(format!("path has no parent: {rel}")))?;
+        let mut ancestor = parent;
+        let mut missing = Vec::new();
+        loop {
+            match crate::fs::symlink_metadata(ancestor) {
+                Ok(_) => break,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    let name = ancestor.file_name().ok_or_else(|| {
+                        HostError::denied(format!("path escapes the root: {rel}"))
+                    })?;
+                    missing.push(name.to_owned());
+                    ancestor = ancestor.parent().ok_or_else(|| {
+                        HostError::denied(format!("path escapes the root: {rel}"))
+                    })?;
+                }
+                Err(err) => return Err(io_error(ancestor, &err)),
+            }
+        }
+        let resolved = crate::fs::canonicalize(ancestor).map_err(|err| io_error(ancestor, &err))?;
+        self.ensure_inside(&resolved, rel)?;
+        let mut dir = resolved;
+        for name in missing.iter().rev() {
+            dir.push(name);
+            crate::fs::create_dir_all(&dir).map_err(|err| io_error(&dir, &err))?;
+        }
+        // 目标本身可能是符号链接：写入会跟随它，落点同样要校验。
+        match crate::fs::symlink_metadata(&target) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let resolved = crate::fs::canonicalize(&target).map_err(|err| {
+                    if err.kind() == std::io::ErrorKind::NotFound {
+                        HostError::denied(format!(
+                            "refusing to write through a dangling symbolic link: {rel}"
+                        ))
+                    } else {
+                        io_error(&target, &err)
+                    }
+                })?;
+                self.ensure_inside(&resolved, rel)?;
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(io_error(&target, &err)),
+        }
+        Ok(target)
+    }
+
+    /// 写 / 删前的保留名与运行期检查
+    fn check_mutation(&self, rel: &RelPath) -> Result<(), HostError> {
+        if rel.as_str().eq_ignore_ascii_case(MARKER_FILE) {
+            return Err(HostError::denied(format!(
+                "{MARKER_FILE} is reserved for server metadata"
+            )));
+        }
+        if self.running
+            && self
+                .launch
+                .as_deref()
+                .is_some_and(|launch| same_path(rel, launch))
+        {
+            return Err(HostError::conflict(format!(
+                "cannot modify the running server file: {rel}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn read(&self, rel: &Path) -> Result<Vec<u8>, HostError> {
+        let rel = Self::relative(rel)?;
+        let target = self.checked_existing(&rel)?;
+        let meta = crate::fs::metadata(&target).map_err(|err| io_error(&target, &err))?;
+        if !meta.is_file() {
+            return Err(HostError::conflict(format!("not a regular file: {rel}")));
+        }
+        if meta.len() > MAX_FILE_BYTES as u64 {
+            return Err(limit_error(rel.as_str(), meta.len(), MAX_FILE_BYTES));
+        }
+        let file = crate::fs::open(&target).map_err(|err| io_error(&target, &err))?;
+        let mut bytes = Vec::new();
+        file.take(MAX_FILE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|err| io_error(&target, &err))?;
+        if bytes.len() > MAX_FILE_BYTES {
+            return Err(limit_error(
+                rel.as_str(),
+                bytes.len() as u64,
+                MAX_FILE_BYTES,
+            ));
+        }
+        Ok(bytes)
+    }
+
+    fn write(&self, rel: &Path, bytes: &[u8], overwrite: bool) -> Result<(), HostError> {
+        if bytes.len() > MAX_FILE_BYTES {
+            return Err(limit_error("write", bytes.len() as u64, MAX_FILE_BYTES));
+        }
+        let rel = Self::relative(rel)?;
+        self.check_mutation(&rel)?;
+        let target = self.writable(&rel)?;
+        if !overwrite && crate::fs::symlink_metadata(&target).is_ok() {
+            return Err(HostError::conflict(format!("file already exists: {rel}")));
+        }
+        crate::fs::write(&target, bytes).map_err(|err| io_error(&target, &err))
+    }
+
+    fn list(&self, rel_dir: &Path) -> Result<Vec<FileEntry>, HostError> {
+        let (dir, prefix) = if rel_dir.as_os_str().is_empty() || rel_dir == Path::new(".") {
+            (self.root.clone(), String::new())
+        } else {
+            let rel = Self::relative(rel_dir)?;
+            (self.checked_existing(&rel)?, rel.as_str().to_owned())
+        };
+        let meta = crate::fs::metadata(&dir).map_err(|err| io_error(&dir, &err))?;
+        if !meta.is_dir() {
+            return Err(HostError::conflict(format!(
+                "not a directory: {}",
+                dir.display()
+            )));
+        }
+        let entries = crate::fs::read_dir(&dir).map_err(|err| io_error(&dir, &err))?;
+        let mut out = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|err| io_error(&dir, &err))?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let text = if prefix.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            // 跨平台不可表示的条目直接跳过：返回给插件的路径必须能再传回来。
+            let Ok(path) = RelPath::parse(&text) else {
+                continue;
+            };
+            let path_on_disk = entry.path();
+            let meta = crate::fs::symlink_metadata(&path_on_disk)
+                .map_err(|err| io_error(&path_on_disk, &err))?;
+            let is_dir = meta.file_type().is_dir();
+            let size = if meta.file_type().is_file() {
+                meta.len()
+            } else {
+                0
+            };
+            out.push(FileEntry {
+                path: path.to_platform_path(),
+                is_dir,
+                size,
+            });
+        }
+        out.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(out)
+    }
+
+    fn remove(&self, rel: &Path) -> Result<bool, HostError> {
+        let rel = Self::relative(rel)?;
+        self.check_mutation(&rel)?;
+        let target = self.root.join(rel.to_platform_path());
+        let meta = match crate::fs::symlink_metadata(&target) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(io_error(&target, &err)),
+        };
+        // 父目录仍要校验：符号链接目录能把条目指到根外。
+        let parent = target
+            .parent()
+            .ok_or_else(|| HostError::denied(format!("path has no parent: {rel}")))?;
+        let resolved = crate::fs::canonicalize(parent).map_err(|err| io_error(parent, &err))?;
+        self.ensure_inside(&resolved, &rel)?;
+        if meta.file_type().is_symlink() {
+            remove_link(&target).map_err(|err| io_error(&target, &err))?;
+        } else if meta.is_dir() {
+            crate::fs::remove_dir(&target).map_err(|err| io_error(&target, &err))?;
+        } else {
+            crate::fs::remove_file(&target).map_err(|err| io_error(&target, &err))?;
+        }
+        Ok(true)
+    }
+}
+
+/// 服务端身份文件：插件不得覆盖或删除
+const MARKER_FILE: &str = "mcsup.json";
+
+fn same_path(rel: &RelPath, raw: &Path) -> bool {
+    RelPath::from_path(raw).is_ok_and(|path| path.as_str().eq_ignore_ascii_case(rel.as_str()))
+}
+
+fn limit_error(what: &str, actual: u64, limit: usize) -> HostError {
+    HostError::limit_exceeded(format!("{what} is {actual} bytes; limit is {limit}"))
+}
+
+fn io_error(path: &Path, err: &std::io::Error) -> HostError {
+    use std::io::ErrorKind;
+    let message = format!("{}: {err}", path.display());
+    match err.kind() {
+        ErrorKind::NotFound => HostError::not_found(message),
+        ErrorKind::PermissionDenied => HostError::denied(message),
+        ErrorKind::AlreadyExists
+        | ErrorKind::IsADirectory
+        | ErrorKind::NotADirectory
+        | ErrorKind::DirectoryNotEmpty => HostError::conflict(message),
+        _ => HostError::internal(message),
+    }
+}
+
+/// 删除符号链接本身；Windows 的目录链接必须走 `remove_dir`
+fn remove_link(path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    if crate::fs::metadata(path).is_ok_and(|meta| meta.is_dir()) {
+        return crate::fs::remove_dir(path);
+    }
+    crate::fs::remove_file(path)
+}
+
+impl FileOps for HostApiImpl {
+    fn read(&self, server: &ServerName, rel: &Path) -> Result<Vec<u8>, HostError> {
+        self.files(server)?.read(rel)
+    }
+
+    fn write(
+        &self,
+        server: &ServerName,
+        rel: &Path,
+        bytes: &[u8],
+        overwrite: bool,
+    ) -> Result<(), HostError> {
+        self.mutable_files(server)?.write(rel, bytes, overwrite)
+    }
+
+    fn list(&self, server: &ServerName, rel_dir: &Path) -> Result<Vec<FileEntry>, HostError> {
+        self.files(server)?.list(rel_dir)
+    }
+
+    fn remove(&self, server: &ServerName, rel: &Path) -> Result<bool, HostError> {
+        self.mutable_files(server)?.remove(rel)
+    }
+}
+
+impl HostApiImpl {
+    /// 只读文件视图；不探测进程状态，读文件不该依赖 supervisor 可达
+    fn files(&self, server: &ServerName) -> Result<ServerFiles, HostError> {
+        self.build_files(server, false)
+    }
+
+    /// 写 / 删文件视图；需要进程状态来判断启动文件是否被占用
+    fn mutable_files(&self, server: &ServerName) -> Result<ServerFiles, HostError> {
+        self.build_files(server, true)
+    }
+
+    fn build_files(
+        &self,
+        server: &ServerName,
+        protect_running: bool,
+    ) -> Result<ServerFiles, HostError> {
+        let registered = self
+            .registry
+            .get(server.as_str())
+            .map_err(|err| match err {
+                crate::registry::ServerRegistryError::NotFound(_) => {
+                    HostError::not_found(format!("server {server} not found"))
+                }
+                other => HostError::internal(format!("read server {server}: {other}")),
+            })?;
+        let running = if protect_running {
+            let status = self
+                .lifecycle
+                .status(server.as_str())
+                .map_err(|err| HostError::internal(format!("server {server} status: {err}")))?
+                .map(|status| status.status);
+            matches!(
+                status,
+                Some(ServerStatus::Starting | ServerStatus::Running | ServerStatus::Stopping)
+            )
+        } else {
+            false
+        };
+        let launch = match registered.meta.launch.as_ref() {
+            Some(spec) => Some(spec.primary_file().to_path_buf()),
+            None => Some(
+                registered
+                    .meta
+                    .jar
+                    .as_ref()
+                    .map_or_else(|| PathBuf::from("server.jar"), |jar| jar.path.clone()),
+            ),
+        };
+        ServerFiles::new(&registered.dir, running, launch)
+    }
+}
+
 /// 后续阶段的能力实现占位：装配到的能力若阶段未开放，宿主返回 `unsupported`
 ///
 /// 用空实现而不是 `None` 是为了让装配方一眼看出「已显式关闭」，不是漏配。
@@ -1656,6 +2001,302 @@ mod tests {
         );
         service.release(&id).expect("release");
         service.enable(&id).expect("enable after release");
+    }
+
+    // ---- 文件能力（API-FS） ----
+
+    fn files(root: &Path) -> ServerFiles {
+        ServerFiles::new(root, false, None).expect("files")
+    }
+
+    fn write_file(root: &Path, rel: &str, bytes: &[u8]) {
+        let path = root.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("parent");
+        }
+        std::fs::write(path, bytes).expect("write");
+    }
+
+    #[test]
+    fn api_fs_001_relative_read_and_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let files = files(dir.path());
+        files
+            .write(Path::new("world/level.dat"), b"level", false)
+            .expect("write");
+        assert_eq!(
+            files.read(Path::new("./world/level.dat")).expect("read"),
+            b"level"
+        );
+        assert_eq!(
+            files
+                .write(Path::new("world/level.dat"), b"next", false)
+                .expect_err("exists")
+                .code,
+            port::plugin::ErrorCode::Conflict
+        );
+        files
+            .write(Path::new("world/level.dat"), b"next", true)
+            .expect("overwrite");
+        assert_eq!(
+            files.read(Path::new("world/level.dat")).expect("read"),
+            b"next"
+        );
+        let root = files.list(Path::new("")).expect("list root");
+        assert!(
+            root.iter()
+                .any(|entry| entry.path == Path::new("world") && entry.is_dir)
+        );
+        let world = files.list(Path::new("world")).expect("list world");
+        assert_eq!(world.len(), 1);
+        assert_eq!(world[0].path, Path::new("world").join("level.dat"));
+        assert_eq!(world[0].size, 4);
+    }
+
+    #[test]
+    fn api_fs_002_traversal_is_denied() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let files = files(dir.path());
+        for path in ["../escape", "world/../../escape"] {
+            assert_eq!(
+                files
+                    .read(Path::new(path))
+                    .expect_err("read traversal")
+                    .code,
+                port::plugin::ErrorCode::Denied
+            );
+            assert_eq!(
+                files
+                    .write(Path::new(path), b"x", true)
+                    .expect_err("write traversal")
+                    .code,
+                port::plugin::ErrorCode::Denied
+            );
+        }
+        assert!(!dir.path().parent().expect("parent").join("escape").exists());
+    }
+
+    #[test]
+    fn api_fs_003_absolute_path_is_denied() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside");
+        let target = outside.path().join("secret.txt");
+        std::fs::write(&target, b"secret").expect("secret");
+        let files = files(dir.path());
+        assert_eq!(
+            files.read(&target).expect_err("absolute read").code,
+            port::plugin::ErrorCode::Denied
+        );
+        assert_eq!(
+            files
+                .write(&target, b"changed", true)
+                .expect_err("absolute write")
+                .code,
+            port::plugin::ErrorCode::Denied
+        );
+        assert_eq!(std::fs::read(&target).expect("unchanged"), b"secret");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn api_fs_004_symlink_escape_is_denied() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("secret.txt"), b"secret").expect("secret");
+        symlink(outside.path(), dir.path().join("link")).expect("symlink");
+        let files = files(dir.path());
+        assert_eq!(
+            files
+                .read(Path::new("link/secret.txt"))
+                .expect_err("read escape")
+                .code,
+            port::plugin::ErrorCode::Denied
+        );
+        assert_eq!(
+            files
+                .write(Path::new("link/new/deeper.txt"), b"x", true)
+                .expect_err("write escape")
+                .code,
+            port::plugin::ErrorCode::Denied
+        );
+        assert!(
+            !outside.path().join("new").exists(),
+            "must not create outside"
+        );
+        assert_eq!(
+            files
+                .remove(Path::new("link/secret.txt"))
+                .expect_err("remove escape")
+                .code,
+            port::plugin::ErrorCode::Denied
+        );
+        assert!(outside.path().join("secret.txt").exists());
+
+        std::fs::write(dir.path().join("real.txt"), b"inside").expect("real");
+        symlink(dir.path().join("real.txt"), dir.path().join("alias.txt")).expect("alias");
+        assert_eq!(
+            files.read(Path::new("alias.txt")).expect("inside link"),
+            b"inside"
+        );
+    }
+
+    #[test]
+    fn api_fs_005_file_size_limit_boundary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let files = files(dir.path());
+        let exact = vec![7_u8; MAX_FILE_BYTES];
+        files
+            .write(Path::new("exact.bin"), &exact, false)
+            .expect("exact");
+        assert_eq!(
+            files.read(Path::new("exact.bin")).expect("read").len(),
+            exact.len()
+        );
+        assert_eq!(
+            files
+                .write(
+                    Path::new("over.bin"),
+                    &vec![0_u8; MAX_FILE_BYTES + 1],
+                    false
+                )
+                .expect_err("write over limit")
+                .code,
+            port::plugin::ErrorCode::LimitExceeded
+        );
+        std::fs::write(dir.path().join("over.bin"), vec![0_u8; MAX_FILE_BYTES + 1])
+            .expect("write over");
+        assert_eq!(
+            files
+                .read(Path::new("over.bin"))
+                .expect_err("read over limit")
+                .code,
+            port::plugin::ErrorCode::LimitExceeded
+        );
+    }
+
+    #[test]
+    fn api_fs_006_marker_is_reserved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("mcsup.json"), b"{}").expect("marker");
+        let files = files(dir.path());
+        assert_eq!(
+            files
+                .write(Path::new("mcsup.json"), b"{}", true)
+                .expect_err("marker write")
+                .code,
+            port::plugin::ErrorCode::Denied
+        );
+        assert_eq!(
+            files
+                .write(Path::new("MCSup.json"), b"{}", true)
+                .expect_err("marker case")
+                .code,
+            port::plugin::ErrorCode::Denied
+        );
+        assert_eq!(
+            files
+                .remove(Path::new("mcsup.json"))
+                .expect_err("marker remove")
+                .code,
+            port::plugin::ErrorCode::Denied
+        );
+        assert_eq!(files.read(Path::new("mcsup.json")).expect("read"), b"{}");
+        files
+            .write(Path::new("world/mcsup.json"), b"{}", true)
+            .expect("nested marker name is not reserved");
+    }
+
+    #[test]
+    fn api_fs_007_running_launch_file_conflicts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("server.jar"), b"jar").expect("jar");
+        let stopped = files(dir.path());
+        stopped
+            .write(Path::new("server.jar"), b"new", true)
+            .expect("stopped jar is writable");
+
+        let running =
+            ServerFiles::new(dir.path(), true, Some(PathBuf::from("server.jar"))).expect("running");
+        assert_eq!(
+            running
+                .write(Path::new("server.jar"), b"new", true)
+                .expect_err("running jar write")
+                .code,
+            port::plugin::ErrorCode::Conflict
+        );
+        assert_eq!(
+            running
+                .write(Path::new("SERVER.JAR"), b"new", true)
+                .expect_err("running jar case")
+                .code,
+            port::plugin::ErrorCode::Conflict
+        );
+        assert_eq!(
+            running
+                .remove(Path::new("server.jar"))
+                .expect_err("running jar remove")
+                .code,
+            port::plugin::ErrorCode::Conflict
+        );
+        assert_eq!(
+            running.read(Path::new("server.jar")).expect("read jar"),
+            b"new"
+        );
+    }
+
+    #[test]
+    fn api_fs_008_windows_forms_are_denied_everywhere() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let files = files(dir.path());
+        for path in [
+            r"\\server\share\file",
+            "//server/share/file",
+            r"C:\evil",
+            "C:/evil",
+            "C:evil",
+            r"world\level.dat",
+            "CON",
+            "world/trail.",
+        ] {
+            assert_eq!(
+                files
+                    .write(Path::new(path), b"x", true)
+                    .expect_err("windows form")
+                    .code,
+                port::plugin::ErrorCode::Denied,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn api_fs_list_and_remove() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_file(dir.path(), "a.txt", b"a");
+        std::fs::create_dir(dir.path().join("empty")).expect("empty dir");
+        std::fs::create_dir(dir.path().join("full")).expect("full dir");
+        std::fs::write(dir.path().join("full/b.txt"), b"b").expect("b");
+        let files = files(dir.path());
+        let root = files.list(Path::new(".")).expect("list");
+        assert_eq!(root.len(), 3);
+        assert!(
+            root.iter()
+                .any(|entry| entry.path == Path::new("full") && entry.is_dir)
+        );
+        assert_eq!(
+            files.list(Path::new("a.txt")).expect_err("file list").code,
+            port::plugin::ErrorCode::Conflict
+        );
+        assert!(files.remove(Path::new("a.txt")).expect("remove file"));
+        assert!(!files.remove(Path::new("a.txt")).expect("missing"));
+        assert_eq!(
+            files.remove(Path::new("full")).expect_err("non-empty").code,
+            port::plugin::ErrorCode::Conflict
+        );
+        assert!(files.remove(Path::new("empty")).expect("empty dir"));
+        assert!(!dir.path().join("empty").exists());
     }
 
     fn all_capabilities() -> [Capability; 4] {
