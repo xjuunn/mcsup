@@ -682,6 +682,7 @@ impl SessionInner {
                     plugin: &inner.record.id,
                     granted: &granted,
                     scope_server: inner.record.server.as_ref(),
+                    contracts: inner.services.contracts.as_deref(),
                 },
             );
             inner.audit.record(&AuditEvent {

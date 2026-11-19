@@ -26,7 +26,8 @@ use port::plugin::{
 use protocol::plugin::{ConfigValues, WelcomeLimits};
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::path::PathBuf;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
@@ -108,13 +109,20 @@ impl PluginHost {
         data_dir: PathBuf,
         store: Arc<dyn PluginStore>,
         config_store: Arc<dyn PluginConfigStore>,
-        services: Arc<HostServices>,
+        services: &Arc<HostServices>,
         bus: EventBus,
         audit: Arc<dyn AuditSink>,
         host_version: impl Into<String>,
     ) -> Arc<Self> {
         let run_dir = data_dir.join("run");
         let log_dir = data_dir.join("logs").join("plugins");
+        // 契约路由依赖会话表，构造顺序是「先建宿主、再回填弱指针」。
+        // 会话拿到的是补齐了 `contracts` 的副本，调用方持有的 Arc 不受影响。
+        let router = Arc::new(crate::contract::ContractRouter::new());
+        let services = Arc::new(HostServices {
+            contracts: Some(Arc::clone(&router) as Arc<dyn port::plugin::ContractInvoker>),
+            ..(**services).clone()
+        });
         let host = Arc::new(Self {
             data_dir,
             run_dir,
@@ -132,6 +140,7 @@ impl PluginHost {
             idle_after: IDLE_STOP_AFTER,
             self_ref: OnceLock::new(),
         });
+        router.attach(&host);
         let _ = host.self_ref.set(Arc::downgrade(&host));
         host
     }
@@ -233,8 +242,37 @@ impl PluginHost {
 
     /// 数据目录
     #[must_use]
-    pub fn data_dir(&self) -> &std::path::Path {
+    pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    /// 读取安装记录（契约路由用）
+    pub(crate) fn record_of(&self, id: &PluginId) -> Result<PluginRecord, HostError> {
+        self.record(id)
+    }
+
+    /// 全部安装记录（契约路由选提供方用）
+    pub(crate) fn records(&self) -> Result<Vec<PluginRecord>, HostError> {
+        self.store
+            .list()
+            .map_err(|err| HostError::internal(format!("list plugin records: {err}")))
+    }
+
+    /// 调用提供方 op，使用契约自己的超时
+    pub(crate) fn call_plugin(
+        &self,
+        id: &PluginId,
+        op: &str,
+        input: Value,
+        timeout: Duration,
+    ) -> Result<Value, HostError> {
+        let session = self.ensure_session(id)?;
+        session.call(op, input, timeout)
+    }
+
+    /// 审计出口（契约路由记录 `plugin.contract`）
+    pub(crate) fn audit(&self) -> &Arc<dyn AuditSink> {
+        &self.audit
     }
 
     fn forget_session(&self, id: &PluginId) {
@@ -334,8 +372,27 @@ impl PluginHost {
         let conn = match endpoint.accept(HANDSHAKE_TIMEOUT) {
             Ok(conn) => conn,
             Err(err) => {
-                process.kill();
-                let reason = format!("handshake_timeout: {err}");
+                // 先看进程是否已经自己退出。握手超时的根因经常是插件启动即
+                // 死亡（缺文件、签名被拒、启动 panic），而 kill() 会把真实
+                // 退出状态覆盖成我们自己发的 SIGKILL。
+                let before = process.try_wait().ok().flatten();
+                let exit = if let Some(status) = before {
+                    format!("exited on its own ({status})")
+                } else {
+                    process.kill();
+                    match process.try_wait().ok().flatten() {
+                        Some(status) => format!("was still running, killed ({status})"),
+                        None => "was still running, killed".to_owned(),
+                    }
+                };
+                // 插件没连上时，stderr 往往已经说明了原因（路径不存在、
+                // 权限不足、启动即 panic）。只报超时会把真正的错误埋掉。
+                let log_tail = plugin_log_tail(&self.log_dir, id);
+                let mut reason = format!("handshake_timeout: {err}; process {exit}");
+                if !log_tail.is_empty() {
+                    reason.push_str("; plugin log: ");
+                    reason.push_str(&log_tail);
+                }
                 record_state(self.store.as_ref(), id, PluginState::Failed, Some(&reason));
                 return Err(HostError::new(port::plugin::ErrorCode::Crashed, reason));
             }
@@ -698,7 +755,41 @@ fn record_state(store: &dyn PluginStore, id: &PluginId, state: PluginState, reas
     let _ = store.put(&record);
 }
 
-fn now_secs() -> i64 {
+/// 插件日志末尾，用于握手失败的诊断
+///
+/// 只取最后 2 KiB 的最后 8 行。任何一步失败都退化成空串：诊断信息不能盖过
+/// 原始错误，日志缺失也不该把「启动失败」变成另一种失败。
+fn plugin_log_tail(log_dir: &Path, id: &PluginId) -> String {
+    const TAIL_BYTES: u64 = 2048;
+    const TAIL_LINES: usize = 8;
+    const MAX_REPORTED_CHARS: usize = 1024;
+
+    let path = log_dir.join(format!("{id}.log"));
+    let Ok(mut file) = std::fs::File::open(&path) else {
+        return String::new();
+    };
+    let len = file.metadata().map_or(0, |meta| meta.len());
+    if len == 0
+        || file
+            .seek(SeekFrom::Start(len.saturating_sub(TAIL_BYTES)))
+            .is_err()
+    {
+        return String::new();
+    }
+    let mut buf = Vec::with_capacity(usize::try_from(TAIL_BYTES).unwrap_or(2048));
+    if file.read_to_end(&mut buf).is_err() {
+        return String::new();
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let tail = lines[lines.len().saturating_sub(TAIL_LINES)..].join(" | ");
+    tail.chars().take(MAX_REPORTED_CHARS).collect()
+}
+
+pub(crate) fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| {
@@ -745,6 +836,25 @@ mod tests {
         assert_eq!(offline_state(&record), PluginState::Disabled);
         record.last_state = PluginState::PendingApproval;
         assert_eq!(offline_state(&record), PluginState::PendingApproval);
+    }
+
+    #[test]
+    fn plugin_log_tail_keeps_only_the_last_lines() {
+        use std::fmt::Write as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut text = String::new();
+        for index in 0..20 {
+            let _ = writeln!(text, "line {index}");
+        }
+        std::fs::write(dir.path().join("demo.log"), text).expect("write log");
+        let id = PluginId::parse("demo").expect("id");
+        let tail = plugin_log_tail(dir.path(), &id);
+        assert_eq!(tail.split(" | ").count(), 8);
+        assert!(tail.contains("line 19"));
+        assert!(!tail.contains("line 11"));
+        let missing = PluginId::parse("missing").expect("id");
+        assert!(plugin_log_tail(dir.path(), &missing).is_empty());
     }
 
     fn sample_record() -> PluginRecord {

@@ -15,13 +15,14 @@ use domain::plugin::PluginId;
 use domain::plugin::capability::Capability;
 use domain::server::meta::ServerName;
 use port::plugin::{
-    BackupOps, ConsoleIo, ContentOps, FileOps, HostError, JavaOps, KvStore, NetProxy, SecretStore,
-    SecretValue, ServerLifecycle, ServerRead, ServerStatusView,
+    BackupOps, ConsoleIo, ContentOps, ContractInvoker, FileOps, HostError, JavaOps, KvStore,
+    NetProxy, NetRequest, SecretStore, SecretValue, ServerLifecycle, ServerRead, ServerStatusView,
 };
 use protocol::plugin::{Call, CallRoute};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// 宿主能力集合
 ///
@@ -49,6 +50,8 @@ pub struct HostServices {
     pub secrets: Option<Arc<dyn SecretStore>>,
     /// `net:outbound`
     pub net: Option<Arc<dyn NetProxy>>,
+    /// 插件间契约路由；由宿主构造时注入
+    pub contracts: Option<Arc<dyn ContractInvoker>>,
 }
 
 impl std::fmt::Debug for HostServices {
@@ -65,6 +68,7 @@ impl std::fmt::Debug for HostServices {
             ("storage:kv", self.kv.is_some()),
             ("secret:rw", self.secrets.is_some()),
             ("net:outbound", self.net.is_some()),
+            ("contracts", self.contracts.is_some()),
         ] {
             if present {
                 set.entry(&name);
@@ -75,7 +79,7 @@ impl std::fmt::Debug for HostServices {
 }
 
 /// 一次分发的上下文
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct DispatchContext<'a> {
     /// 本次会话的插件身份；键值与密钥命名空间由宿主决定，不采信输入
     pub plugin: &'a PluginId,
@@ -83,6 +87,19 @@ pub struct DispatchContext<'a> {
     pub granted: &'a BTreeSet<Capability>,
     /// `server` 作用域绑定的服务器；`machine` 作用域为 `None`
     pub scope_server: Option<&'a ServerName>,
+    /// 契约路由；宿主尚未装配时为 `None`，契约调用返回 `unsupported`
+    pub contracts: Option<&'a dyn ContractInvoker>,
+}
+
+impl std::fmt::Debug for DispatchContext<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DispatchContext")
+            .field("plugin", &self.plugin)
+            .field("granted", &self.granted)
+            .field("scope_server", &self.scope_server)
+            .field("contracts", &self.contracts.is_some())
+            .finish()
+    }
 }
 
 /// 分发一次插件 → 宿主调用
@@ -95,11 +112,42 @@ pub fn dispatch(
     call: &Call,
     ctx: DispatchContext<'_>,
 ) -> Result<Value, HostError> {
-    if !matches!(call.route(), Ok(CallRoute::Host { .. })) {
-        return Err(HostError::invalid_input(
-            "host call must use capability + method (no op)",
-        ));
+    match call
+        .route()
+        .map_err(|err| HostError::invalid_input(err.to_string()))?
+    {
+        CallRoute::Contract {
+            contract,
+            target,
+            trace,
+        } => {
+            let invoker = ctx.contracts.ok_or_else(|| {
+                HostError::unsupported("contract routing is not available in this host build")
+            })?;
+            let target = target
+                .map(PluginId::parse)
+                .transpose()
+                .map_err(|err| HostError::invalid_input(format!("invalid target: {err}")))?;
+            invoker.invoke(port::plugin::ContractCall {
+                caller: ctx.plugin.clone(),
+                contract: contract.to_owned(),
+                target,
+                input: call.input.clone(),
+                trace: trace.map(str::to_owned),
+            })
+        }
+        CallRoute::Host { .. } => host_call(services, call, ctx),
+        _ => Err(HostError::invalid_input(
+            "host call must use capability + method, or contract",
+        )),
     }
+}
+
+fn host_call(
+    services: &HostServices,
+    call: &Call,
+    ctx: DispatchContext<'_>,
+) -> Result<Value, HostError> {
     let capability_name = call
         .capability
         .as_deref()
@@ -124,13 +172,13 @@ pub fn dispatch(
         Capability::ConsoleWrite => console_write(services, method, input, bound),
         Capability::StorageKv => kv(services, method, input, ctx.plugin),
         Capability::SecretRw => secrets(services, method, input, ctx.plugin),
+        Capability::NetOutbound => net(services, method, input, ctx.plugin),
         Capability::ServerLifecycle
         | Capability::Backup
         | Capability::Content
         | Capability::Java
         | Capability::FilesRead
         | Capability::FilesWrite
-        | Capability::NetOutbound
         | Capability::Events
         | Capability::ProcessSpawn
         | Capability::McClient => Err(HostError::unsupported(format!(
@@ -326,6 +374,63 @@ fn secrets(
     }
 }
 
+fn net(
+    services: &HostServices,
+    method: &str,
+    input: &Value,
+    plugin: &PluginId,
+) -> Result<Value, HostError> {
+    let service = services
+        .net
+        .as_ref()
+        .ok_or_else(|| HostError::unsupported("net:outbound is not available"))?;
+    match method {
+        "request" => {
+            let url = string_arg(input, "url")?;
+            let http_method = input
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or("GET")
+                .to_ascii_uppercase();
+            let mut headers = BTreeMap::new();
+            if let Some(map) = input.get("headers") {
+                let map = map
+                    .as_object()
+                    .ok_or_else(|| HostError::invalid_input("headers must be an object"))?;
+                for (name, value) in map {
+                    let value = value.as_str().ok_or_else(|| {
+                        HostError::invalid_input(format!("header {name:?} must be a string"))
+                    })?;
+                    headers.insert(name.clone(), value.to_owned());
+                }
+            }
+            let body = match input.get("body") {
+                Some(Value::Null) | None => None,
+                Some(_) => Some(base64_arg(input, "body")?),
+            };
+            let timeout_ms = input.get("timeout_ms").and_then(Value::as_u64);
+            let timeout = timeout_ms.map_or(Duration::ZERO, Duration::from_millis);
+            let response = service.request(
+                plugin,
+                NetRequest {
+                    method: http_method,
+                    url: url.to_owned(),
+                    headers,
+                    body,
+                    timeout,
+                },
+            )?;
+            Ok(json!({
+                "status": response.status,
+                "headers": response.headers,
+                "body": base64::encode(&response.body),
+                "body_len": response.body.len(),
+            }))
+        }
+        other => Err(unknown_method("net:outbound", other)),
+    }
+}
+
 fn server_arg(input: &Value, bound: Option<&ServerName>) -> Result<ServerName, HostError> {
     let raw = string_arg(input, "server")?;
     let server = ServerName::parse(raw)
@@ -440,6 +545,7 @@ mod tests {
             plugin: plugin(),
             granted: granted_caps,
             scope_server: None,
+            contracts: None,
         }
     }
 
@@ -498,6 +604,7 @@ mod tests {
                 plugin: plugin(),
                 granted: &caps,
                 scope_server: Some(&bound),
+                contracts: None,
             },
         )
         .expect_err("scoped");
@@ -578,9 +685,182 @@ mod tests {
                 plugin: plugin(),
                 granted: &caps,
                 scope_server: None,
+                contracts: None,
             },
         )
         .expect("kv get");
         assert_eq!(value["value"], base64::encode(b"demo"));
+    }
+
+    struct RecordingNet {
+        seen: Mutex<Option<(PluginId, NetRequest)>>,
+    }
+
+    impl NetProxy for RecordingNet {
+        fn request(
+            &self,
+            plugin: &PluginId,
+            request: NetRequest,
+        ) -> Result<port::plugin::NetResponse, HostError> {
+            *self.seen.lock().expect("lock") = Some((plugin.clone(), request));
+            Ok(port::plugin::NetResponse {
+                status: 201,
+                headers: BTreeMap::from([("x-test".to_owned(), "yes".to_owned())]),
+                body: b"ok".to_vec(),
+            })
+        }
+    }
+
+    fn net_services(net: &Arc<RecordingNet>) -> HostServices {
+        HostServices {
+            net: Some(Arc::clone(net) as Arc<dyn NetProxy>),
+            ..HostServices::default()
+        }
+    }
+
+    #[test]
+    fn net_request_decodes_base64_and_uses_host_identity() {
+        let net = Arc::new(RecordingNet {
+            seen: Mutex::new(None),
+        });
+        let call = Call::host(
+            1,
+            "net:outbound",
+            "request",
+            json!({
+                "method": "post",
+                "url": "https://api.example.com/hook",
+                "headers": { "content-type": "text/plain" },
+                "body": base64::encode(b"hello"),
+                "timeout_ms": 1500,
+            }),
+        );
+        let caps = granted(&[Capability::NetOutbound]);
+        let value = dispatch(&net_services(&net), &call, ctx(&caps)).expect("net");
+        assert_eq!(value["status"], 201);
+        assert_eq!(value["headers"]["x-test"], "yes");
+        assert_eq!(value["body"], base64::encode(b"ok"));
+        assert_eq!(value["body_len"], 2);
+        let (seen_plugin, seen) = net.seen.lock().expect("lock").take().expect("called");
+        assert_eq!(&seen_plugin, plugin());
+        assert_eq!(seen.method, "POST");
+        assert_eq!(seen.url, "https://api.example.com/hook");
+        assert_eq!(
+            seen.headers.get("content-type").map(String::as_str),
+            Some("text/plain")
+        );
+        assert_eq!(seen.body.as_deref(), Some(&b"hello"[..]));
+        assert_eq!(seen.timeout, Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn net_null_body_is_absent_and_bad_headers_are_invalid() {
+        let net = Arc::new(RecordingNet {
+            seen: Mutex::new(None),
+        });
+        let services = net_services(&net);
+        let caps = granted(&[Capability::NetOutbound]);
+        let call = Call::host(
+            1,
+            "net:outbound",
+            "request",
+            json!({ "url": "https://api.example.com", "body": null }),
+        );
+        dispatch(&services, &call, ctx(&caps)).expect("net");
+        assert!(
+            net.seen
+                .lock()
+                .expect("lock")
+                .as_ref()
+                .expect("called")
+                .1
+                .body
+                .is_none()
+        );
+
+        let call = Call::host(
+            2,
+            "net:outbound",
+            "request",
+            json!({ "url": "https://api.example.com", "headers": { "x": 1 } }),
+        );
+        assert_eq!(
+            dispatch(&services, &call, ctx(&caps))
+                .expect_err("header")
+                .code,
+            port::plugin::ErrorCode::InvalidInput
+        );
+    }
+
+    #[test]
+    fn net_without_proxy_is_unsupported() {
+        let call = Call::host(1, "net:outbound", "request", json!({ "url": "https://x" }));
+        let caps = granted(&[Capability::NetOutbound]);
+        assert_eq!(
+            dispatch(&HostServices::default(), &call, ctx(&caps))
+                .expect_err("no proxy")
+                .code,
+            port::plugin::ErrorCode::Unsupported
+        );
+    }
+
+    struct RecordingInvoker {
+        seen: Mutex<Option<port::plugin::ContractCall>>,
+    }
+
+    impl ContractInvoker for RecordingInvoker {
+        fn invoke(&self, call: port::plugin::ContractCall) -> Result<Value, HostError> {
+            *self.seen.lock().expect("lock") = Some(call);
+            Ok(json!({ "delivered": true }))
+        }
+    }
+
+    #[test]
+    fn contract_call_carries_host_identity_and_trace() {
+        let invoker = Arc::new(RecordingInvoker {
+            seen: Mutex::new(None),
+        });
+        let services = HostServices {
+            contracts: Some(Arc::clone(&invoker) as Arc<dyn ContractInvoker>),
+            ..HostServices::default()
+        };
+        let caps = BTreeSet::new();
+        let call = Call::contract(
+            1,
+            "chat.publish@1",
+            Some("other".to_owned()),
+            Some("t-1".to_owned()),
+            json!({ "text": "hi" }),
+        );
+        let value = dispatch(
+            &services,
+            &call,
+            DispatchContext {
+                plugin: plugin(),
+                granted: &caps,
+                scope_server: None,
+                contracts: services.contracts.as_deref(),
+            },
+        )
+        .expect("contract");
+        assert_eq!(value["delivered"], true);
+        let seen = invoker.seen.lock().expect("lock").take().expect("called");
+        assert_eq!(&seen.caller, plugin());
+        assert_eq!(seen.contract, "chat.publish@1");
+        assert_eq!(seen.target.as_ref().map(PluginId::as_str), Some("other"));
+        assert_eq!(seen.trace.as_deref(), Some("t-1"));
+        assert_eq!(seen.input["text"], "hi");
+    }
+
+    #[test]
+    fn contract_without_router_is_unsupported() {
+        let caps = BTreeSet::new();
+        let call = Call::contract(1, "chat.publish@1", None, None, json!({}));
+        assert_eq!(
+            dispatch(&HostServices::default(), &call, ctx(&caps))
+                .expect_err("no router")
+                .code,
+            port::plugin::ErrorCode::Unsupported
+        );
     }
 }

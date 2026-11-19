@@ -10,6 +10,7 @@
 
 use domain::plugin::PluginId;
 use domain::plugin::PluginScope;
+use domain::plugin::capability::Capability;
 use domain::plugin::error::PluginErrorCode;
 use domain::plugin::manifest::Manifest;
 use domain::plugin::state::PluginState;
@@ -23,7 +24,7 @@ use port::plugin::{
     PluginSupervisor, StoredConfig, StreamSink,
 };
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -115,6 +116,17 @@ impl StreamSink for CollectSink {
     }
 }
 
+#[derive(Default)]
+struct MemoryAudit {
+    events: Mutex<Vec<port::plugin::AuditEvent>>,
+}
+
+impl port::plugin::AuditSink for MemoryAudit {
+    fn record(&self, event: &port::plugin::AuditEvent) {
+        self.events.lock().expect("lock").push(event.clone());
+    }
+}
+
 fn fixture_id() -> PluginId {
     PluginId::parse("fixture").expect("id")
 }
@@ -126,17 +138,57 @@ fn install_fixture(data_dir: &Path, id: &PluginId) -> PathBuf {
     std::fs::create_dir_all(&bin_dir).expect("create bin dir");
     let source = PathBuf::from(env!("CARGO_BIN_EXE_plugin-fixture"));
     let target = bin_dir.join("plugin-fixture");
-    std::fs::copy(&source, &target).expect("copy fixture");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod fixture");
+    // 优先硬链接：同一 inode 的首次执行只会被系统校验一次，整轮测试不必
+    // 为每份拷贝重复付这笔开销。跨文件系统（或 Windows 权限不足）时回退到
+    // 拷贝，行为不变。
+    if std::fs::hard_link(&source, &target).is_err() {
+        std::fs::copy(&source, &target).expect("copy fixture");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fixture");
+        }
     }
+    warm_up_fixture(&target, &artifact_dir.join("warmup-missing.sock"));
     artifact_dir
 }
 
+/// 预热 fixture，把首次执行的开销挪到握手计时之外
+///
+/// macOS 要校验刚写入的 Mach-O；`check.sh` 刚链接完几十个测试二进制时，
+/// 校验与它们的启动挤在一起，拷贝出来的 fixture 可能在 `execve` 里停十几秒。
+/// 这段是操作系统的启动成本，不是插件握手行为，不该占用宿主的 10 s 期限。
+/// 先执行一次（端点不存在，必然立刻失败退出），之后的拉起复用已校验的
+/// inode，握手计时才只覆盖插件自己的行为。
+fn warm_up_fixture(target: &Path, missing_endpoint: &Path) {
+    let output = std::process::Command::new(target)
+        .arg("--endpoint")
+        .arg(missing_endpoint)
+        .env("MCSUP_PLUGIN_TOKEN", "warmup")
+        .env("MCSUP_PLUGIN_ID", "warmup")
+        .env("MCSUP_PLUGIN_SCOPE", "machine")
+        .output()
+        .expect("run fixture warm-up");
+    assert!(
+        !output.status.success(),
+        "warm-up must fail: the endpoint does not exist"
+    );
+}
+
 fn record(id: &PluginId, artifact_dir: PathBuf, version: &str) -> PluginRecord {
+    record_with(id, artifact_dir, version, &[], &[], &[])
+}
+
+/// 带能力、契约声明与确认记录的安装记录
+fn record_with(
+    id: &PluginId,
+    artifact_dir: PathBuf,
+    version: &str,
+    capabilities: &[&str],
+    provides: &[&str],
+    consumes: &[&str],
+) -> PluginRecord {
     let manifest = json!({
         "schema": 1,
         "id": id.as_str(),
@@ -144,12 +196,18 @@ fn record(id: &PluginId, artifact_dir: PathBuf, version: &str) -> PluginRecord {
         "version": version,
         "api": domain::plugin::PLUGIN_API_VERSION,
         "entry": { "type": "process", "cmd": "bin/plugin-fixture" },
-        "capabilities": [],
+        "capabilities": capabilities,
+        "provides": provides,
+        "consumes": consumes,
         "license": "MIT",
     });
     let raw = Manifest::from_json(&serde_json::to_vec(&manifest).expect("manifest json"))
         .expect("valid manifest")
         .raw;
+    let approved = capabilities
+        .iter()
+        .filter_map(|raw| Capability::parse(raw).ok())
+        .collect();
     PluginRecord {
         id: id.clone(),
         version: version.to_owned(),
@@ -157,7 +215,7 @@ fn record(id: &PluginId, artifact_dir: PathBuf, version: &str) -> PluginRecord {
         scope: PluginScope::Machine,
         server: None,
         enabled: true,
-        approved: BTreeSet::default(),
+        approved,
         manifest: raw,
         artifact_dir,
         installed_at: 0,
@@ -182,13 +240,22 @@ fn host_with_config(
     store: &Arc<MemoryStore>,
     configs: Arc<MemoryConfigStore>,
 ) -> Arc<PluginHost> {
+    host_with_audit(data_dir, store, configs, Arc::new(NoopAuditSink))
+}
+
+fn host_with_audit(
+    data_dir: &Path,
+    store: &Arc<MemoryStore>,
+    configs: Arc<MemoryConfigStore>,
+    audit: Arc<dyn port::plugin::AuditSink>,
+) -> Arc<PluginHost> {
     PluginHost::new(
         data_dir.to_path_buf(),
         Arc::clone(store) as Arc<dyn PluginStore>,
         configs,
-        Arc::new(HostServices::default()),
+        &Arc::new(HostServices::default()),
         EventBus::new(),
-        Arc::new(NoopAuditSink),
+        audit,
         "test-host",
     )
 }
@@ -400,4 +467,348 @@ fn control_channel_lists_calls_and_shuts_down() {
     client.shutdown().expect("control shutdown");
     serve.join().expect("join serve").expect("serve result");
     host.shutdown_all(Duration::from_secs(1));
+}
+
+// ---- 契约路由 ----
+
+/// 安装一个 fixture 记录并复制产物
+fn install(
+    data_dir: &Path,
+    store: &MemoryStore,
+    id: &PluginId,
+    capabilities: &[&str],
+    provides: &[&str],
+    consumes: &[&str],
+) {
+    let artifact = install_fixture(data_dir, id);
+    store
+        .put(&record_with(
+            id,
+            artifact,
+            env!("CARGO_PKG_VERSION"),
+            capabilities,
+            provides,
+            consumes,
+        ))
+        .expect("put record");
+}
+
+fn plugin_id(raw: &str) -> PluginId {
+    PluginId::parse(raw).expect("id")
+}
+
+#[test]
+fn contract_broadcast_aggregates_responses_and_failures() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data_dir = dir.path().to_path_buf();
+    let store = Arc::new(MemoryStore::default());
+    let caller = plugin_id("caller");
+    let provider_a = plugin_id("provider-a");
+    let provider_b = plugin_id("provider-b");
+    install(&data_dir, &store, &caller, &[], &[], &["incident.report@1"]);
+    install(
+        &data_dir,
+        &store,
+        &provider_a,
+        &[],
+        &["incident.report@1"],
+        &[],
+    );
+    install(
+        &data_dir,
+        &store,
+        &provider_b,
+        &[],
+        &["incident.report@1"],
+        &[],
+    );
+    let audit = Arc::new(MemoryAudit::default());
+    let host = host_with_audit(
+        &data_dir,
+        &store,
+        Arc::new(MemoryConfigStore::default()),
+        audit.clone(),
+    );
+
+    let output = host
+        .call(
+            &caller,
+            "call_contract",
+            json!({
+                "contract": "incident.report@1",
+                "input": { "title": "boom", "fail_for": ["provider-b"] },
+            }),
+        )
+        .expect("broadcast");
+
+    let responses = output["responses"].as_array().expect("responses");
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0]["plugin_id"], "provider-a");
+    assert_eq!(responses[0]["output"]["provider"], "provider-a");
+    let failures = output["failures"].as_array().expect("failures");
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0]["plugin_id"], "provider-b");
+    assert_eq!(failures[0]["error"]["code"], "denied");
+    assert_eq!(failures[0]["error"]["category"], "unauthorized");
+
+    let events = audit.events.lock().expect("lock");
+    let contract_events: Vec<_> = events
+        .iter()
+        .filter(|event| event.action == "plugin.contract")
+        .collect();
+    assert_eq!(contract_events.len(), 2, "each provider must be audited");
+    let details: Vec<Value> = contract_events
+        .iter()
+        .map(|event| serde_json::from_str(event.detail.as_deref().expect("detail")).expect("json"))
+        .collect();
+    for detail in &details {
+        assert_eq!(detail["caller"], "caller");
+        assert_eq!(detail["contract"], "incident.report@1");
+    }
+    assert!(
+        details
+            .iter()
+            .any(|detail| detail["provider"] == "provider-a" && detail["result"] == "ok")
+    );
+    assert!(
+        details
+            .iter()
+            .any(|detail| detail["provider"] == "provider-b" && detail["result"] == "denied")
+    );
+
+    host.shutdown_all(Duration::from_secs(2));
+}
+
+#[test]
+fn contract_unicast_requires_target_when_multiple_providers() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data_dir = dir.path().to_path_buf();
+    let store = Arc::new(MemoryStore::default());
+    let caller = plugin_id("caller");
+    let provider_a = plugin_id("provider-a");
+    let provider_b = plugin_id("provider-b");
+    install(&data_dir, &store, &caller, &[], &[], &["agent.converse@1"]);
+    for provider in [&provider_a, &provider_b] {
+        install(
+            &data_dir,
+            &store,
+            provider,
+            &["net:outbound"],
+            &["agent.converse@1"],
+            &[],
+        );
+    }
+    let host = host(&data_dir, &store);
+
+    let err = host
+        .call(
+            &caller,
+            "call_contract",
+            json!({
+                "contract": "agent.converse@1",
+                "input": { "message": "hi" },
+            }),
+        )
+        .expect_err("ambiguity must require target");
+    assert_eq!(err.code, PluginErrorCode::Conflict);
+
+    let output = host
+        .call(
+            &caller,
+            "call_contract",
+            json!({
+                "contract": "agent.converse@1",
+                "target": "provider-b",
+                "input": { "message": "hi" },
+            }),
+        )
+        .expect("targeted unicast");
+    assert_eq!(output["provider"], "provider-b");
+    assert_eq!(output["echo"]["message"], "hi");
+
+    let err = host
+        .call(
+            &caller,
+            "call_contract",
+            json!({
+                "contract": "agent.converse@1",
+                "target": "provider-c",
+                "input": { "message": "hi" },
+            }),
+        )
+        .expect_err("provider-c is not installed here");
+    assert_eq!(err.code, PluginErrorCode::NotFound);
+
+    host.shutdown_all(Duration::from_secs(2));
+}
+
+#[test]
+fn contract_cycle_is_rejected_as_conflict() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data_dir = dir.path().to_path_buf();
+    let store = Arc::new(MemoryStore::default());
+    let caller = plugin_id("caller");
+    let provider = plugin_id("provider-a");
+    install(&data_dir, &store, &caller, &[], &[], &["agent.converse@1"]);
+    install(
+        &data_dir,
+        &store,
+        &provider,
+        &["net:outbound"],
+        &["agent.converse@1"],
+        &["agent.converse@1"],
+    );
+    let host = host(&data_dir, &store);
+
+    let err = host
+        .call(
+            &caller,
+            "call_contract",
+            json!({
+                "contract": "agent.converse@1",
+                "target": "provider-a",
+                "input": {
+                    "chain": [
+                        { "contract": "agent.converse@1", "target": "provider-a" },
+                        { "contract": "agent.converse@1", "target": "provider-a" }
+                    ]
+                },
+            }),
+        )
+        .expect_err("cycle must be rejected");
+    assert_eq!(err.code, PluginErrorCode::Conflict);
+    assert!(err.message.contains("cycle"), "{}", err.message);
+    assert!(
+        host.session_count() <= 2,
+        "nested calls must not spawn extra sessions"
+    );
+
+    host.shutdown_all(Duration::from_secs(2));
+}
+
+#[test]
+fn contract_depth_is_bounded() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data_dir = dir.path().to_path_buf();
+    let store = Arc::new(MemoryStore::default());
+    let caller = plugin_id("caller");
+    let provider = plugin_id("provider-a");
+    install(&data_dir, &store, &caller, &[], &[], &["agent.converse@1"]);
+    install(
+        &data_dir,
+        &store,
+        &provider,
+        &[
+            "net:outbound",
+            "console:read",
+            "console:write",
+            "server:lifecycle",
+        ],
+        &[
+            "agent.converse@1",
+            "chat.ask@1",
+            "lifecycle.act@1",
+            "incident.report@1",
+            "chat.publish@1",
+        ],
+        &[
+            "agent.converse@1",
+            "chat.ask@1",
+            "lifecycle.act@1",
+            "incident.report@1",
+            "chat.publish@1",
+        ],
+    );
+    let host = host(&data_dir, &store);
+
+    let err = host
+        .call(
+            &caller,
+            "call_contract",
+            json!({
+                "contract": "agent.converse@1",
+                "target": "provider-a",
+                "input": {
+                    "chain": [
+                        { "contract": "chat.ask@1", "target": "provider-a" },
+                        { "contract": "lifecycle.act@1", "target": "provider-a" },
+                        { "contract": "incident.report@1" },
+                        { "contract": "chat.publish@1" }
+                    ]
+                },
+            }),
+        )
+        .expect_err("depth must be bounded");
+    assert_eq!(err.code, PluginErrorCode::LimitExceeded);
+    assert!(err.message.contains("depth"), "{}", err.message);
+
+    host.shutdown_all(Duration::from_secs(2));
+}
+
+#[test]
+fn contract_caller_must_declare_consumes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data_dir = dir.path().to_path_buf();
+    let store = Arc::new(MemoryStore::default());
+    let caller = plugin_id("caller");
+    let provider = plugin_id("provider-a");
+    install(&data_dir, &store, &caller, &[], &[], &[]);
+    install(
+        &data_dir,
+        &store,
+        &provider,
+        &[],
+        &["incident.report@1"],
+        &[],
+    );
+    let host = host(&data_dir, &store);
+
+    let err = host
+        .call(
+            &caller,
+            "call_contract",
+            json!({
+                "contract": "incident.report@1",
+                "input": { "title": "boom" },
+            }),
+        )
+        .expect_err("undeclared consume must be denied");
+    assert_eq!(err.code, PluginErrorCode::Denied);
+
+    host.shutdown_all(Duration::from_secs(2));
+}
+
+#[test]
+fn contract_unknown_trace_is_rejected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data_dir = dir.path().to_path_buf();
+    let store = Arc::new(MemoryStore::default());
+    let caller = plugin_id("caller");
+    let provider = plugin_id("provider-a");
+    install(&data_dir, &store, &caller, &[], &[], &["agent.converse@1"]);
+    install(
+        &data_dir,
+        &store,
+        &provider,
+        &["net:outbound"],
+        &["agent.converse@1"],
+        &[],
+    );
+    let host = host(&data_dir, &store);
+
+    let err = host
+        .call(
+            &caller,
+            "call_contract",
+            json!({
+                "contract": "agent.converse@1",
+                "target": "provider-a",
+                "trace": "not-a-live-trace",
+                "input": { "message": "hi" },
+            }),
+        )
+        .expect_err("unknown trace must be rejected");
+    assert_eq!(err.code, PluginErrorCode::Conflict);
+
+    host.shutdown_all(Duration::from_secs(2));
 }

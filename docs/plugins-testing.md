@@ -912,6 +912,8 @@ panic，只能返回错误。
 | `CON-RTE-010` | `@1` / `@2` 并存 | 按请求版本路由 |
 | `CON-RTE-011` | 审计 | caller / provider / contract / result |
 | `CON-RTE-012` | 单请求 32 次 | 第 33 次 `limit_exceeded` |
+| `CON-RTE-013` | 调用方未声明 `consumes` | `denied` |
+| `CON-RTE-014` | 未知或过期 `trace` | `conflict` |
 
 ## 10.2 各契约（`CON-CHAT` / `CON-AGENT` / `CON-MET` / `CON-INC` / `CON-LIFE`）
 

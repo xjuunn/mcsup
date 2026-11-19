@@ -4,6 +4,7 @@
 //! 调用（1:1 或 1:N，有超时）。这里登记 v1 允许的全部契约；未知名字必须让
 //! 安装失败，`[禁止]` 插件自定义契约或动态方法名。
 
+use crate::plugin::PluginId;
 use crate::plugin::capability::Capability;
 use std::collections::BTreeSet;
 use std::fmt;
@@ -17,6 +18,105 @@ pub const MAX_CONTRACT_DEPTH: usize = 4;
 
 /// 单次请求内契约调用总数上限
 pub const MAX_CONTRACT_FANOUT: u32 = 32;
+
+/// 调用链中的一层：哪个插件调用了哪个契约
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallStep {
+    /// 调用方插件
+    pub plugin: PluginId,
+    /// 被调用的契约（不含版本）
+    pub contract: Contract,
+}
+
+/// 契约调用链判定失败
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CallChainError {
+    /// 同一 `(plugin, contract)` 在链上出现第二次
+    #[error("contract call cycle: {plugin} already called {contract}")]
+    Cycle {
+        /// 插件
+        plugin: PluginId,
+        /// 契约
+        contract: Contract,
+    },
+    /// 超过最大深度
+    #[error("contract call depth exceeds {MAX_CONTRACT_DEPTH}")]
+    TooDeep,
+    /// 超过单次请求的调用总数
+    #[error("contract call fanout exceeds {MAX_CONTRACT_FANOUT}")]
+    TooBroad,
+}
+
+/// 一次请求的调用链
+///
+/// 只保存判定所需的最小信息：调用方身份与契约。宿主在进入提供方之前把本层
+/// 压入链，提供方再次发起契约调用时带回来，循环与深度因此不依赖调用栈猜测。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CallChain {
+    steps: Vec<CallStep>,
+}
+
+impl CallChain {
+    /// 空链（根调用）
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { steps: Vec::new() }
+    }
+
+    /// 已记录的层
+    #[must_use]
+    pub fn steps(&self) -> &[CallStep] {
+        &self.steps
+    }
+
+    /// 层数
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.steps.len()
+    }
+
+    /// 是否为空
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+
+    /// 压入一层；重复 `(plugin, contract)` 视为循环
+    ///
+    /// # Errors
+    ///
+    /// 循环、超过 [`MAX_CONTRACT_DEPTH`] 时返回 [`CallChainError`]
+    pub fn push(&mut self, plugin: PluginId, contract: Contract) -> Result<(), CallChainError> {
+        if self
+            .steps
+            .iter()
+            .any(|step| step.plugin == plugin && step.contract == contract)
+        {
+            return Err(CallChainError::Cycle { plugin, contract });
+        }
+        if self.steps.len() >= MAX_CONTRACT_DEPTH {
+            return Err(CallChainError::TooDeep);
+        }
+        self.steps.push(CallStep { plugin, contract });
+        Ok(())
+    }
+}
+
+/// 记入本次请求的调用数并检查扇出
+///
+/// # Errors
+///
+/// 总数超过 [`MAX_CONTRACT_FANOUT`] 或溢出时返回
+/// [`CallChainError::TooBroad`]
+pub fn ensure_fanout(current: u32, additional: u32) -> Result<u32, CallChainError> {
+    let total = current
+        .checked_add(additional)
+        .ok_or(CallChainError::TooBroad)?;
+    if total > MAX_CONTRACT_FANOUT {
+        return Err(CallChainError::TooBroad);
+    }
+    Ok(total)
+}
 
 /// 闭集中的一个契约
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -375,5 +475,42 @@ mod tests {
         assert_eq!(Contract::ChatPublish.timeout(), Duration::from_secs(10));
         assert_eq!(Contract::AgentConverse.timeout(), Duration::from_secs(120));
         assert_eq!(Contract::LifecycleAct.timeout(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn call_chain_rejects_cycles_and_depth() {
+        let alpha = PluginId::parse("alpha").expect("id");
+        let beta = PluginId::parse("beta").expect("id");
+        let mut chain = CallChain::new();
+        chain
+            .push(alpha.clone(), Contract::IncidentReport)
+            .expect("first");
+        assert_eq!(chain.len(), 1);
+        assert_eq!(
+            chain.push(alpha.clone(), Contract::IncidentReport),
+            Err(CallChainError::Cycle {
+                plugin: alpha.clone(),
+                contract: Contract::IncidentReport,
+            })
+        );
+        chain.push(beta, Contract::MetricsSample).expect("second");
+        chain
+            .push(alpha.clone(), Contract::ChatPublish)
+            .expect("third");
+        chain.push(alpha, Contract::ChatAsk).expect("fourth");
+        assert_eq!(
+            chain.push(
+                PluginId::parse("gamma").expect("id"),
+                Contract::LifecycleAct
+            ),
+            Err(CallChainError::TooDeep)
+        );
+    }
+
+    #[test]
+    fn fanout_is_capped() {
+        assert_eq!(ensure_fanout(0, 32), Ok(32));
+        assert_eq!(ensure_fanout(32, 1), Err(CallChainError::TooBroad));
+        assert_eq!(ensure_fanout(u32::MAX, 1), Err(CallChainError::TooBroad));
     }
 }

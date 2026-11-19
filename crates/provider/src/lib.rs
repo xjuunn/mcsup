@@ -10,6 +10,7 @@ pub mod mojang;
 pub mod neoforge;
 pub mod papermc;
 pub mod plugin;
+pub mod plugin_net;
 pub mod purpur;
 pub mod quilt;
 mod shared;

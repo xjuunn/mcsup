@@ -667,10 +667,54 @@ pub trait NetProxy: Send + Sync {
     ///
     /// # Errors
     ///
-    /// 目标不在白名单返回 `denied`；非 http/https 或无白名单返回 `unsupported`
+    /// 目标不在白名单（含 `manifest.net.allow` 为空）返回 `denied`；
+    /// 非 http/https 返回 `unsupported`
     fn request(&self, _plugin: &PluginId, _request: NetRequest) -> Result<NetResponse, HostError> {
         Err(HostError::unsupported("net:outbound is not available"))
     }
+}
+
+/// 出站域名策略
+///
+/// `NetProxy` 只拿到 [`PluginId`]，不允许采信请求里自报的身份；白名单必须
+/// 从安装记录读取。实现放在 `service`（有 `PluginStore`），由门面注入
+/// `provider` 的 HTTP 代理。
+pub trait NetPolicy: Send + Sync {
+    /// 该插件 `manifest.net.allow` 声明的允许主机 / 后缀
+    ///
+    /// # Errors
+    ///
+    /// 记录不存在或读取失败返回对应 [`HostError`]
+    fn allowed_hosts(&self, plugin: &PluginId) -> Result<Vec<String>, HostError>;
+}
+
+/// 一次契约调用
+#[derive(Debug, Clone)]
+pub struct ContractCall {
+    /// 调用方；由宿主会话身份决定，不采信插件输入
+    pub caller: PluginId,
+    /// 契约标识（含 `@1` 版本后缀）
+    pub contract: String,
+    /// 单播目标；广播契约必须为 `None`
+    pub target: Option<PluginId>,
+    /// 调用输入
+    pub input: Value,
+    /// 宿主在根调用分配的调用链令牌；提供方嵌套调用时原样带回
+    pub trace: Option<String>,
+}
+
+/// 宿主内契约路由
+///
+/// 实现在 `crates/plugin`：它拥有会话表，能拉起提供方并把调用送过去。
+/// 循环、深度、扇出与目标选择的判定在 `domain::plugin::contract`。
+pub trait ContractInvoker: Send + Sync {
+    /// 路由一次契约调用
+    ///
+    /// # Errors
+    ///
+    /// 契约未声明、没有提供方、循环、超深、超扇出或全部提供方失败时返回
+    /// 对应 [`HostError`]
+    fn invoke(&self, call: ContractCall) -> Result<Value, HostError>;
 }
 
 // ---- 安装记录 ----

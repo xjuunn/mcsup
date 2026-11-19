@@ -180,10 +180,15 @@ pub struct EventFrame {
 
 /// 调用帧
 ///
-/// 三种用法共用 `type:"call"`：
+/// 四种用法共用 `type:"call"`：
 /// - `op`：宿主调用插件的 op；
 /// - `capability` + `method`：插件调用宿主能力；
-/// - `method`：CLI / server / agent 经控制通道调用宿主方法。
+/// - `method`：CLI / server / agent 经控制通道调用宿主方法；
+/// - `contract`：插件经宿主调用另一个插件提供的契约。
+///
+/// 契约调用可以带 `target`（仅单播契约允许）与 `trace`（宿主在根调用时
+/// 分配，提供方再次发起契约调用必须原样带回，宿主据此做循环、深度与扇出
+/// 判定）。`trace` 对插件是不透明令牌，解析规则只在宿主。
 ///
 /// 解码后必须调用 [`Call::route`] 校验字段组合，不能只看 `op` 是否为空。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,6 +204,15 @@ pub struct Call {
     /// 方法
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
+    /// 契约标识（如 `chat.publish@1`）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract: Option<String>,
+    /// 单播契约的目标插件
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// 宿主分配的调用链令牌
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace: Option<String>,
     /// 输入
     #[serde(default)]
     pub input: serde_json::Value,
@@ -218,6 +232,15 @@ pub enum CallRoute<'a> {
     },
     /// 控制通道方法
     Control(&'a str),
+    /// 插件 → 宿主的契约调用
+    Contract {
+        /// 契约标识（含版本）
+        contract: &'a str,
+        /// 单播目标
+        target: Option<&'a str>,
+        /// 调用链令牌
+        trace: Option<&'a str>,
+    },
 }
 
 impl Call {
@@ -229,6 +252,9 @@ impl Call {
             op: Some(op.into()),
             capability: None,
             method: None,
+            contract: None,
+            target: None,
+            trace: None,
             input,
         }
     }
@@ -246,6 +272,9 @@ impl Call {
             op: None,
             capability: Some(capability.into()),
             method: Some(method.into()),
+            contract: None,
+            target: None,
+            trace: None,
             input,
         }
     }
@@ -258,6 +287,30 @@ impl Call {
             op: None,
             capability: None,
             method: Some(method.into()),
+            contract: None,
+            target: None,
+            trace: None,
+            input,
+        }
+    }
+
+    /// 构造契约调用
+    #[must_use]
+    pub fn contract(
+        id: u64,
+        contract: impl Into<String>,
+        target: Option<String>,
+        trace: Option<String>,
+        input: serde_json::Value,
+    ) -> Self {
+        Self {
+            id,
+            op: None,
+            capability: None,
+            method: None,
+            contract: Some(contract.into()),
+            target,
+            trace,
             input,
         }
     }
@@ -266,9 +319,33 @@ impl Call {
     ///
     /// # Errors
     ///
-    /// 同时出现 `op` 与 `capability`、缺少 `method`、全部为空等组合返回
-    /// [`FrameError::InvalidCall`]
+    /// 同时出现 `op` 与 `capability`、缺少 `method`、全部为空、`target` /
+    /// `trace` 脱离契约调用等组合返回 [`FrameError::InvalidCall`]
     pub fn route(&self) -> Result<CallRoute<'_>, FrameError> {
+        if let Some(contract) = &self.contract {
+            if contract.is_empty()
+                || self.op.is_some()
+                || self.capability.is_some()
+                || self.method.is_some()
+                || self.target.as_deref() == Some("")
+                || self.trace.as_deref() == Some("")
+            {
+                return Err(FrameError::InvalidCall {
+                    reason: "contract call must use contract only, with optional target/trace"
+                        .to_owned(),
+                });
+            }
+            return Ok(CallRoute::Contract {
+                contract,
+                target: self.target.as_deref(),
+                trace: self.trace.as_deref(),
+            });
+        }
+        if self.target.is_some() || self.trace.is_some() {
+            return Err(FrameError::InvalidCall {
+                reason: "target/trace are only valid on contract calls".to_owned(),
+            });
+        }
         match (&self.op, &self.capability, &self.method) {
             (Some(op), None, None) if !op.is_empty() => Ok(CallRoute::Op(op)),
             (None, Some(capability), Some(method))
@@ -278,7 +355,8 @@ impl Call {
             }
             (None, None, Some(method)) if !method.is_empty() => Ok(CallRoute::Control(method)),
             _ => Err(FrameError::InvalidCall {
-                reason: "call must be exactly one of op, capability+method, or method".to_owned(),
+                reason: "call must be exactly one of op, capability+method, method, or contract"
+                    .to_owned(),
             }),
         }
     }
@@ -825,14 +903,35 @@ mod tests {
         ));
         let control = Call::control(3, "status", serde_json::json!({}));
         assert!(matches!(control.route(), Ok(CallRoute::Control("status"))));
+        let contract = Call::contract(
+            4,
+            "chat.publish@1",
+            None,
+            Some("t-1".to_owned()),
+            serde_json::json!({ "text": "hi" }),
+        );
+        assert!(matches!(
+            contract.route(),
+            Ok(CallRoute::Contract {
+                contract: "chat.publish@1",
+                target: None,
+                trace: Some("t-1"),
+            })
+        ));
         let invalid = Call {
-            id: 4,
+            id: 5,
             op: Some("echo".to_owned()),
             capability: Some("events".to_owned()),
             method: None,
+            contract: None,
+            target: None,
+            trace: None,
             input: serde_json::json!({}),
         };
         assert!(invalid.route().is_err());
+        let mut stray_target = Call::op(6, "echo", serde_json::json!({}));
+        stray_target.target = Some("other".to_owned());
+        assert!(stray_target.route().is_err());
     }
 
     #[test]

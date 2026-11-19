@@ -187,13 +187,16 @@ impl Mcsup {
             console: Some(self.plugin_api.clone()),
             kv: Some(self.plugin_api.kv()),
             secrets: Some(self.plugin_api.secrets()),
+            net: Some(Arc::new(provider::plugin_net::HttpNetProxy::new(
+                Arc::clone(&self.plugin_api) as Arc<dyn port::plugin::NetPolicy>,
+            ))),
             ..plugin::HostServices::default()
         });
         plugin::PluginHost::new(
             data_dir.to_path_buf(),
             Arc::clone(&self.plugin_store),
             Arc::clone(&self.plugin_config_store),
-            services,
+            &services,
             self.plugin_events.clone(),
             Arc::clone(&self.plugin_audit),
             env!("CARGO_PKG_VERSION"),
@@ -659,6 +662,7 @@ impl McsupBuilder {
             Arc::new(lifecycle.clone()),
             kv,
             secrets,
+            Arc::clone(&plugin_store),
         ));
         let plugins = service::PluginService::new(
             Arc::clone(&plugin_store),

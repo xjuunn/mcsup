@@ -17,6 +17,7 @@
 pub mod api;
 pub mod base64;
 pub mod conn;
+pub mod contract;
 pub mod control;
 pub mod event;
 pub mod host;

@@ -24,9 +24,9 @@ use domain::server::status::ServerStatus;
 use port::plugin::{
     ArtifactOrigin, ArtifactSource, ArtifactVerifier, AuditEvent, AuditResult, AuditSink,
     BackupOps, ConfigOps, ConsoleIo, ConsoleLine, ConsolePage, ContentOps, FileOps, HostError,
-    JavaOps, KvStore, MAX_CONSOLE_LINE_BYTES, MAX_CONSOLE_LINES, PluginConfigStore, PluginRecord,
-    PluginRuntimeStatus, PluginStore, PluginSupervisor, SecretStore, ServerLifecycle, ServerRead,
-    ServerStatusView, ServerSummary, SessionInfo, StoredConfig,
+    JavaOps, KvStore, MAX_CONSOLE_LINE_BYTES, MAX_CONSOLE_LINES, NetPolicy, PluginConfigStore,
+    PluginRecord, PluginRuntimeStatus, PluginStore, PluginSupervisor, SecretStore, ServerLifecycle,
+    ServerRead, ServerStatusView, ServerSummary, SessionInfo, StoredConfig,
 };
 use port::{ErrorCategory, RepositoryError};
 use serde_json::Value;
@@ -1104,6 +1104,7 @@ pub struct HostApiImpl {
     props: ServerPropsService,
     kv: Arc<dyn KvStore>,
     secrets: Arc<dyn SecretStore>,
+    store: Arc<dyn PluginStore>,
 }
 
 impl std::fmt::Debug for HostApiImpl {
@@ -1120,6 +1121,7 @@ impl HostApiImpl {
         lifecycle: Arc<ServerLifecycleService>,
         kv: Arc<dyn KvStore>,
         secrets: Arc<dyn SecretStore>,
+        store: Arc<dyn PluginStore>,
     ) -> Self {
         Self {
             props: ServerPropsService::new(Arc::clone(&registry)),
@@ -1127,6 +1129,7 @@ impl HostApiImpl {
             lifecycle,
             kv,
             secrets,
+            store,
         }
     }
 
@@ -1140,6 +1143,23 @@ impl HostApiImpl {
     #[must_use]
     pub fn secrets(&self) -> Arc<dyn SecretStore> {
         Arc::clone(&self.secrets)
+    }
+}
+
+impl NetPolicy for HostApiImpl {
+    fn allowed_hosts(&self, plugin: &PluginId) -> Result<Vec<String>, HostError> {
+        let record = self.store.get(plugin).map_err(|err| match err {
+            RepositoryError::NotFound(message) => {
+                HostError::not_found(format!("plugin {plugin} not found: {message}"))
+            }
+            other => HostError::internal(format!("read plugin {plugin}: {other}")),
+        })?;
+        Ok(record
+            .manifest
+            .net
+            .as_ref()
+            .map(|net| net.allow.clone())
+            .unwrap_or_default())
     }
 }
 

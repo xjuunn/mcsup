@@ -594,6 +594,36 @@ Unix socket 权限 `0600`；Windows 管道使用当前用户 DACL。`[禁止]` �
  "input":{"server":"survival","line":"say hi"}}
 ```
 
+插件调用另一个插件提供的契约（`target` 仅单播可用，`trace` 由宿主分配）：
+
+```json
+{"v":1,"type":"call","id":8,"contract":"chat.publish@1",
+ "input":{"server":"survival","text":"hi"}}
+```
+
+根调用不带 `trace`。宿主在接受根调用时分配一个不透明令牌并随调用链登记；
+提供方再次发起契约调用时必须把收到的 `trace` 原样带回，宿主据此做循环、
+深度与扇出判定。提供方无法伪造链路：未知或过期的 `trace` 返回 `conflict`。
+
+宿主向提供方投递契约时使用 op `contract.call`，调用链令牌在 `input.trace`：
+
+```json
+{"v":1,"type":"call","id":9,"op":"contract.call",
+ "input":{"contract":"chat.publish@1","caller":"monitor","trace":"<64 hex>",
+          "input":{"server":"survival","text":"hi"}}}
+```
+
+`net:outbound` 的宿主方法为 `request`：
+
+```json
+{"v":1,"type":"call","id":10,"capability":"net:outbound","method":"request",
+ "input":{"method":"GET","url":"https://api.example.com/status",
+          "headers":{"accept":"application/json"},"body":null,"timeout_ms":5000}}
+```
+
+请求体与响应体都用 base64；响应为
+`{"status":200,"headers":{...},"body":"<base64>","body_len":123}`。
+
 `id` 由发起方分配，在**同一方向**内唯一。两个方向各自维护 id 空间，`result`
 按方向归属，不会混淆。
 
@@ -1400,10 +1430,14 @@ RE2 子集，禁止回溯引用与环视。
 | 目标 | `target` 是 `plugin_id`，只允许在单播契约中使用 |
 | 深度 | 调用链 ≤ 4 层 |
 | 循环 | 同一 `(plugin_id, contract)` 在调用栈中出现两次即拒绝，返回 `conflict` |
-| 扇出 | 单次请求内契约调用总数 ≤ 32 |
+| 扇出 | 单次请求内契约调用总数 ≤ 32；按实际投递的提供方次数计数 |
 | 超时 | 每个契约有独立超时；父调用超时同时取消子调用 |
 | 审计 | 每次调用记录 caller、provider、契约、结果、耗时 |
 | 版本 | 调用方声明版本；提供方不支持即 `not_found`，不做降级猜测 |
+
+根调用由宿主分配 `trace`，提供方嵌套调用原样带回；每层压入
+`(caller, contract)`，循环判定与深度判定都基于这条显式调用链，不依赖宿主
+线程栈。广播没有提供方时返回空 `responses` 与空 `failures`，不算失败。
 
 广播的聚合结果：
 
