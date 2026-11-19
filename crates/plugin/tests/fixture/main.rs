@@ -112,6 +112,7 @@ fn main() -> io::Result<()> {
     );
 
     let mut stream_seq = 0_u64;
+    let mut config_revision = 0_u64;
     loop {
         let frame = match read_frame(&mut reader) {
             Ok(frame) => frame,
@@ -119,10 +120,14 @@ fn main() -> io::Result<()> {
             Err(err) => return Err(frame_io(err)),
         };
         match frame {
-            Frame::Call(call) => stream_seq = handle_call(&mut writer, &call, stream_seq)?,
+            Frame::Call(call) => {
+                stream_seq = handle_call(&mut writer, &call, stream_seq, config_revision)?;
+            }
             Frame::Ping(seq) => write_frame(&mut writer, &Frame::Pong(seq)).map_err(frame_io)?,
             Frame::Shutdown { .. } | Frame::Reject(_) => return Ok(()),
+            Frame::Welcome(welcome) => config_revision = welcome.config.revision,
             Frame::Config(config) => {
+                config_revision = config.revision;
                 let result = ResultFrame::ok(
                     config.id,
                     serde_json::json!({ "revision": config.revision }),
@@ -131,7 +136,6 @@ fn main() -> io::Result<()> {
             }
             Frame::Unknown { .. }
             | Frame::Hello(_)
-            | Frame::Welcome(_)
             | Frame::Event(_)
             | Frame::Result(_)
             | Frame::Stream(_)
@@ -141,7 +145,12 @@ fn main() -> io::Result<()> {
     }
 }
 
-fn handle_call(writer: &mut Stream, call: &Call, stream_seq: u64) -> io::Result<u64> {
+fn handle_call(
+    writer: &mut Stream,
+    call: &Call,
+    stream_seq: u64,
+    config_revision: u64,
+) -> io::Result<u64> {
     let op = call.op.as_deref().unwrap_or_default();
     match op {
         "fail" => {
@@ -172,6 +181,7 @@ fn handle_call(writer: &mut Stream, call: &Call, stream_seq: u64) -> io::Result<
                     "op": op,
                     "input": call.input,
                     "pid": std::process::id(),
+                    "config_revision": config_revision,
                 }),
             );
             write_frame(writer, &Frame::Result(result)).map_err(frame_io)?;

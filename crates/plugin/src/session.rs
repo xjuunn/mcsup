@@ -21,8 +21,8 @@ use port::plugin::{
 };
 use port::plugin::{MAX_STREAM_BYTES, category_of};
 use protocol::plugin::{
-    Call, Cancel, ConfigValues, Frame, Hello, Reject, RejectCode, ResultFrame, StreamFrame,
-    Welcome, WelcomeLimits, WelcomeScope, WireError, read_frame, write_frame,
+    Call, Cancel, ConfigFrame, ConfigValues, Frame, Hello, Reject, RejectCode, ResultFrame,
+    StreamFrame, Welcome, WelcomeLimits, WelcomeScope, WireError, read_frame, write_frame,
 };
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
@@ -33,6 +33,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::conn::Connection;
+
+/// 配置变更等待插件确认的上限
+const CONFIG_APPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 握手配置
 pub(crate) struct SessionConfig {
@@ -510,6 +513,54 @@ impl SessionInner {
                     ));
                 }
             }
+        }
+    }
+
+    /// 下发配置变更并等待插件确认
+    ///
+    /// 插件应用失败时返回它给出的错误；调用方负责回滚落盘值。
+    ///
+    /// # Errors
+    ///
+    /// 插件回 `ok:false`、连接断开或 10 s 内未确认时返回对应错误
+    pub(crate) fn apply_config(
+        self: &Arc<Self>,
+        revision: u64,
+        values: &Value,
+    ) -> Result<(), HostError> {
+        self.touch();
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = mpsc::channel();
+        self.register(id, Pending::Result(tx))?;
+        let frame = Frame::Config(ConfigFrame {
+            id,
+            revision,
+            values: values.clone(),
+        });
+        if let Err(err) = self.send(&frame) {
+            self.remove_pending(id);
+            return Err(err);
+        }
+        match rx.recv_timeout(CONFIG_APPLY_TIMEOUT) {
+            Ok(result) if result.ok => Ok(()),
+            Ok(result) => Err(wire_to_host(
+                result.error,
+                "plugin rejected the config change",
+            )),
+            Err(RecvTimeoutError::Timeout) => {
+                self.remove_pending(id);
+                Err(HostError::new(
+                    port::plugin::ErrorCode::Timeout,
+                    format!(
+                        "plugin did not acknowledge config revision {revision} within {} s",
+                        CONFIG_APPLY_TIMEOUT.as_secs()
+                    ),
+                ))
+            }
+            Err(RecvTimeoutError::Disconnected) => Err(HostError::new(
+                port::plugin::ErrorCode::Unavailable,
+                "plugin session ended before acknowledging the config change",
+            )),
         }
     }
 

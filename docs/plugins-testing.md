@@ -518,6 +518,21 @@ java -jar conformance.jar --cases ../conformance/cases.json
 | `DOM-EVT-007` | 颜色码 `§` 保留在原始文本，渲染层处理 |
 | `DOM-EVT-008` | 玩家进出行解析 |
 
+## 6.6 配置实例（`DOM-CFG`）
+
+| ID | 输入 | 期望 |
+| --- | --- | --- |
+| `DOM-CFG-001` | 合法对象 | 通过 |
+| `DOM-CFG-002` | 缺必填 | 错误路径指向字段 |
+| `DOM-CFG-003` | `additionalProperties:false` 下多字段 | 拒绝 |
+| `DOM-CFG-004` | 整数 / 数值 / 布尔类型不符 | 拒绝 |
+| `DOM-CFG-005` | `minimum` / `maximum` / exclusive 边界 | 边界值按声明接受或拒绝 |
+| `DOM-CFG-006` | `minLength` / `maxLength` / `pattern` | 越界或模式不符拒绝 |
+| `DOM-CFG-007` | `minItems` / `maxItems` / `items` | 逐项校验 |
+| `DOM-CFG-008` | 默认值 | 递归收集，不臆造类型默认 |
+| `DOM-CFG-009` | `x-mcsup-secret` | 读取打码为 `***` |
+| `DOM-CFG-010` | 未知关键字 | 按注解忽略，不拒绝旧插件 |
+
 # 7. 协议测试矩阵
 
 ## 7.1 帧编解码（`PROTO-FRM`）
@@ -607,6 +622,7 @@ panic，只能返回错误。
 | `PROTO-CFG-004` | 乱序 revision | 丢弃过期帧 |
 | `PROTO-CFG-005` | 含密钥 | `config get` 返回 `***` |
 | `PROTO-CFG-006` | `starting` 期间变更 | 排队到 `welcome` 后 |
+| `PROTO-CFG-007` | `config.json` 落盘 | `0600`，`--purge` 时删除 |
 
 ## 7.6 控制通道（`PROTO-CTL`）
 
@@ -622,6 +638,7 @@ panic，只能返回错误。
 | `PROTO-CTL-008` | `grant/revoke` | 授权即时生效 |
 | `PROTO-CTL-009` | `reload` | 安装后宿主读到新记录 |
 | `PROTO-CTL-010` | TCP 回退认证 | 缺令牌拒绝，错误的拒绝 |
+| `PROTO-CTL-011` | `config_apply` | 只下发已落盘配置，revision 不双增 |
 
 ## 7.7 版本（`PROTO-VER`）
 
@@ -1120,6 +1137,9 @@ panic，只能返回错误。
 | `CLI-CMD-018` | `rollback` | 切回上一版本 |
 | `CLI-CMD-019` | `verify` | 摘要与签名结果 |
 | `CLI-CMD-020` | `doctor` | 汇总检查项 |
+| `CLI-CMD-021` | `block` / `unblock` | 立即停止并禁用；解除后不自动启用 |
+| `CLI-CMD-022` | `quarantine` / `release` | 产物保留，启动被拒绝 |
+| `CLI-CMD-023` | `config set --secret` | 值从 stdin 读取，回显与输出均不含明文 |
 
 ## 12.2 输出（`CLI-OUT`）
 

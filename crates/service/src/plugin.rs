@@ -23,10 +23,10 @@ use domain::server::meta::ServerName;
 use domain::server::status::ServerStatus;
 use port::plugin::{
     ArtifactOrigin, ArtifactSource, ArtifactVerifier, AuditEvent, AuditResult, AuditSink,
-    BackupOps, ConsoleIo, ConsoleLine, ConsolePage, ContentOps, FileOps, HostError, JavaOps,
-    KvStore, MAX_CONSOLE_LINE_BYTES, MAX_CONSOLE_LINES, PluginRecord, PluginRuntimeStatus,
-    PluginStore, PluginSupervisor, SecretStore, ServerLifecycle, ServerRead, ServerStatusView,
-    ServerSummary, SessionInfo,
+    BackupOps, ConfigOps, ConsoleIo, ConsoleLine, ConsolePage, ContentOps, FileOps, HostError,
+    JavaOps, KvStore, MAX_CONSOLE_LINE_BYTES, MAX_CONSOLE_LINES, PluginConfigStore, PluginRecord,
+    PluginRuntimeStatus, PluginStore, PluginSupervisor, SecretStore, ServerLifecycle, ServerRead,
+    ServerStatusView, ServerSummary, SessionInfo, StoredConfig,
 };
 use port::{ErrorCategory, RepositoryError};
 use serde_json::Value;
@@ -84,7 +84,8 @@ impl PluginError {
             Self::AlreadyExists(_) | Self::Conflict(_) => ErrorCategory::Conflict,
             Self::Usage(_) => ErrorCategory::Usage,
             Self::Denied(_) => ErrorCategory::Unauthorized,
-            Self::Host(_) | Self::HostError(_) | Self::Io(_) => ErrorCategory::Backend,
+            Self::Host(_) | Self::Io(_) => ErrorCategory::Backend,
+            Self::HostError(err) => err.category,
             Self::Repo(err) => err.category(),
             Self::Fs(err) => err.category(),
         }
@@ -123,6 +124,8 @@ pub struct PluginService {
     source: Option<Arc<dyn ArtifactSource>>,
     verifier: Option<Arc<dyn ArtifactVerifier>>,
     audit: Arc<dyn AuditSink>,
+    /// 配置读写（与宿主控制通道共用同一份实现）
+    config: Arc<PluginConfig>,
     /// `{data_dir}/mcsup/plugins`：不可变产物根
     plugins_root: PathBuf,
     /// `{data_dir}/mcsup/plugin-data`：插件可写目录
@@ -149,6 +152,7 @@ impl PluginService {
     #[must_use]
     pub fn new(
         store: Arc<dyn PluginStore>,
+        config_store: Arc<dyn PluginConfigStore>,
         supervisor: Option<Arc<dyn PluginSupervisor>>,
         source: Option<Arc<dyn ArtifactSource>>,
         verifier: Option<Arc<dyn ArtifactVerifier>>,
@@ -157,16 +161,30 @@ impl PluginService {
         plugin_data: PathBuf,
         log_root: PathBuf,
     ) -> Self {
+        let config = Arc::new(PluginConfig::new(
+            Arc::clone(&store),
+            config_store,
+            plugins_root.clone(),
+            supervisor.clone(),
+            Arc::clone(&audit),
+        ));
         Self {
             store,
             supervisor,
             source,
             verifier,
             audit,
+            config,
             plugins_root,
             plugin_data,
             log_root,
         }
+    }
+
+    /// 配置读写句柄（宿主控制通道与 CLI 共用）
+    #[must_use]
+    pub fn config(&self) -> Arc<dyn ConfigOps> {
+        self.config.clone()
     }
 
     /// 宿主是否可达
@@ -260,13 +278,123 @@ impl PluginService {
         })
     }
 
+    /// 读取配置（密钥字段打码）
+    ///
+    /// # Errors
+    ///
+    /// 记录不存在或 descriptor 非法时返回 [`PluginError`]
+    pub fn config_get(&self, id: &PluginId) -> Result<Value, PluginError> {
+        Ok(self.config.get(id)?)
+    }
+
+    /// 写入配置：顶层合并、整体校验、落盘并下发
+    ///
+    /// # Errors
+    ///
+    /// schema 校验失败返回 [`PluginError::Usage`]；插件应用失败时保留上一版本
+    pub fn config_set(&self, id: &PluginId, values: &Value) -> Result<Value, PluginError> {
+        Ok(self.config.set(id, values)?)
+    }
+
+    /// 本机拉黑：立即停用且不再自动启动
+    ///
+    /// # Errors
+    ///
+    /// 记录不存在时返回 [`PluginError::NotFound`]
+    pub fn block(&self, id: &PluginId) -> Result<PluginRecord, PluginError> {
+        self.set_flag(id, Flag::Blocked, true)
+    }
+
+    /// 解除拉黑；不自动启用
+    ///
+    /// # Errors
+    ///
+    /// 记录不存在时返回 [`PluginError::NotFound`]
+    pub fn unblock(&self, id: &PluginId) -> Result<PluginRecord, PluginError> {
+        self.set_flag(id, Flag::Blocked, false)
+    }
+
+    /// 隔离：保留产物但禁止运行
+    ///
+    /// # Errors
+    ///
+    /// 记录不存在时返回 [`PluginError::NotFound`]
+    pub fn quarantine(&self, id: &PluginId) -> Result<PluginRecord, PluginError> {
+        self.set_flag(id, Flag::Quarantined, true)
+    }
+
+    /// 解除隔离；不自动启用
+    ///
+    /// # Errors
+    ///
+    /// 记录不存在时返回 [`PluginError::NotFound`]
+    pub fn release(&self, id: &PluginId) -> Result<PluginRecord, PluginError> {
+        self.set_flag(id, Flag::Quarantined, false)
+    }
+
+    fn set_flag(&self, id: &PluginId, flag: Flag, on: bool) -> Result<PluginRecord, PluginError> {
+        let mut record = self.record(id)?;
+        let already = match flag {
+            Flag::Blocked => record.blocked,
+            Flag::Quarantined => record.quarantined,
+        };
+        if already != on {
+            if on {
+                // 拉黑 / 隔离立即生效：先停进程，再改记录。
+                if let Some(supervisor) = &self.supervisor {
+                    match supervisor.status(id) {
+                        Ok(status) if status.session.is_some() => {
+                            supervisor.stop(id, Duration::from_secs(10))?;
+                        }
+                        Ok(_) => {}
+                        Err(err) if err.code == port::plugin::ErrorCode::Unavailable => {}
+                        Err(err) => return Err(err.into()),
+                    }
+                }
+                record.enabled = false;
+                record.last_state = PluginState::Disabled;
+            }
+            match flag {
+                Flag::Blocked => record.blocked = on,
+                Flag::Quarantined => record.quarantined = on,
+            }
+            record.updated_at = now_secs();
+            self.store.put(&record)?;
+            self.audit.record(&AuditEvent {
+                at: now_secs(),
+                plugin: id.to_string(),
+                action: match (flag, on) {
+                    (Flag::Blocked, true) => "security:block",
+                    (Flag::Blocked, false) => "security:unblock",
+                    (Flag::Quarantined, true) => "security:quarantine",
+                    (Flag::Quarantined, false) => "security:release",
+                }
+                .to_owned(),
+                capability: None,
+                result: AuditResult::Allowed,
+                detail: None,
+            });
+        }
+        Ok(record)
+    }
+
     /// 启用：只改期望状态，不拉起进程
     ///
     /// # Errors
     ///
-    /// 已启用、仍有待确认能力时返回 [`PluginError::Conflict`]
+    /// 已启用、仍有待确认能力、被拉黑或隔离时返回 [`PluginError::Conflict`]
     pub fn enable(&self, id: &PluginId) -> Result<PluginRecord, PluginError> {
         let mut record = self.record(id)?;
+        if record.blocked {
+            return Err(PluginError::Conflict(format!(
+                "plugin {id} is blocked; run `mcsup plugin unblock {id}` first"
+            )));
+        }
+        if record.quarantined {
+            return Err(PluginError::Conflict(format!(
+                "plugin {id} is quarantined; run `mcsup plugin release {id}` first"
+            )));
+        }
         if record.enabled {
             return Err(PluginError::Conflict(format!(
                 "plugin {id} is already enabled"
@@ -428,6 +556,16 @@ impl PluginService {
     /// 未启用、握手失败时返回 [`PluginError`]
     pub fn start(&self, id: &PluginId) -> Result<SessionInfo, PluginError> {
         let record = self.record(id)?;
+        if record.blocked {
+            return Err(PluginError::Conflict(format!(
+                "plugin {id} is blocked; run `mcsup plugin unblock {id}` first"
+            )));
+        }
+        if record.quarantined {
+            return Err(PluginError::Conflict(format!(
+                "plugin {id} is quarantined; run `mcsup plugin release {id}` first"
+            )));
+        }
         if !record.enabled {
             return Err(PluginError::Conflict(format!(
                 "plugin {id} is not enabled; run `mcsup plugin enable {id}`"
@@ -613,6 +751,8 @@ impl PluginService {
             source: Some(origin_text(origin)),
             sha256: Some(artifact.sha256),
             signed: artifact.signed,
+            blocked: false,
+            quarantined: false,
         };
         self.store.put(&record)?;
         self.audit.record(&AuditEvent {
@@ -728,6 +868,181 @@ impl PluginService {
                     .to_owned(),
             )
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flag {
+    Blocked,
+    Quarantined,
+}
+
+/// 配置读写：校验、合并、落盘、下发
+///
+/// 入口（CLI）与宿主控制通道共用这一份实现，避免「CLI 校验一遍、宿主再
+/// 校验一遍」后两边规则分叉。
+pub(crate) struct PluginConfig {
+    store: Arc<dyn PluginStore>,
+    config_store: Arc<dyn PluginConfigStore>,
+    plugins_root: PathBuf,
+    supervisor: Option<Arc<dyn PluginSupervisor>>,
+    audit: Arc<dyn AuditSink>,
+}
+
+impl std::fmt::Debug for PluginConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PluginConfig")
+            .field("plugins_root", &self.plugins_root)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PluginConfig {
+    /// 构造
+    #[must_use]
+    pub(crate) fn new(
+        store: Arc<dyn PluginStore>,
+        config_store: Arc<dyn PluginConfigStore>,
+        plugins_root: PathBuf,
+        supervisor: Option<Arc<dyn PluginSupervisor>>,
+        audit: Arc<dyn AuditSink>,
+    ) -> Self {
+        Self {
+            store,
+            config_store,
+            plugins_root,
+            supervisor,
+            audit,
+        }
+    }
+
+    fn record(&self, id: &PluginId) -> Result<PluginRecord, HostError> {
+        self.store.get(id).map_err(|err| match err {
+            RepositoryError::NotFound(_) => HostError::not_found(format!("plugin {id} not found")),
+            other => HostError::internal(format!("read plugin {id}: {other}")),
+        })
+    }
+
+    /// 已安装版本的配置 schema
+    fn schema(record: &PluginRecord) -> Result<Option<Value>, HostError> {
+        let path = record.artifact_dir.join("descriptor.json");
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            // artifact 被手工删掉时按「无配置」处理；调用方会在写配置时拒绝。
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(HostError::internal(format!(
+                    "read descriptor {}: {err}",
+                    path.display()
+                )));
+            }
+        };
+        Descriptor::from_json(&bytes, &record.id)
+            .map(|descriptor| descriptor.config)
+            .map_err(|err| HostError::internal(format!("invalid descriptor: {err}")))
+    }
+
+    /// 当前值：schema 默认值打底，叠加已保存的值
+    fn current(&self, id: &PluginId, schema: &Value) -> Result<StoredConfig, HostError> {
+        let stored = self
+            .config_store
+            .get(id)
+            .map_err(|err| HostError::internal(format!("read plugin config: {err}")))?
+            .unwrap_or_default();
+        let mut values = domain::plugin::schema::defaults(schema);
+        if let (Some(base), Some(saved)) = (values.as_object_mut(), stored.values.as_object()) {
+            for (key, value) in saved {
+                base.insert(key.clone(), value.clone());
+            }
+        }
+        Ok(StoredConfig {
+            revision: stored.revision,
+            values,
+        })
+    }
+}
+
+impl ConfigOps for PluginConfig {
+    fn get(&self, id: &PluginId) -> Result<Value, HostError> {
+        let record = self.record(id)?;
+        let Some(schema) = Self::schema(&record)? else {
+            return Ok(serde_json::json!({ "revision": 0, "values": {} }));
+        };
+        let current = self.current(id, &schema)?;
+        Ok(serde_json::json!({
+            "revision": current.revision,
+            "values": domain::plugin::schema::mask_secrets(&schema, &current.values),
+        }))
+    }
+
+    fn set(&self, id: &PluginId, values: &Value) -> Result<Value, HostError> {
+        let record = self.record(id)?;
+        let schema = Self::schema(&record)?.ok_or_else(|| {
+            HostError::unsupported(format!("plugin {id} does not declare a config schema"))
+        })?;
+        let patch = values
+            .as_object()
+            .ok_or_else(|| HostError::invalid_input("config values must be an object"))?;
+        let previous = self.current(id, &schema)?;
+        let mut merged = previous.values.clone();
+        let Some(object) = merged.as_object_mut() else {
+            return Err(HostError::internal("stored config is not an object"));
+        };
+        for (key, value) in patch {
+            object.insert(key.clone(), value.clone());
+        }
+        domain::plugin::schema::validate_instance(&schema, &merged, "config")
+            .map_err(|err| HostError::invalid_input(err.to_string()))?;
+        let next = StoredConfig {
+            revision: previous.revision + 1,
+            values: merged.clone(),
+        };
+        self.config_store
+            .put(id, &next)
+            .map_err(|err| HostError::internal(format!("write plugin config: {err}")))?;
+        if let Some(supervisor) = &self.supervisor {
+            match supervisor.apply_config(id, next.revision, &merged) {
+                Ok(()) => {}
+                // 宿主不在：配置已落盘，下次握手经 `welcome.config` 下发。
+                Err(err) if err.code == port::plugin::ErrorCode::Unavailable => {}
+                Err(err) => {
+                    self.rollback(id, &previous);
+                    self.mark_degraded(id, &err);
+                    return Err(err);
+                }
+            }
+        }
+        let changed = patch.keys().cloned().collect::<Vec<_>>().join(", ");
+        self.audit.record(&AuditEvent {
+            at: now_secs(),
+            plugin: id.to_string(),
+            action: "config:set".to_owned(),
+            capability: None,
+            result: AuditResult::Allowed,
+            // 审计只记键名，绝不记值。
+            detail: Some(format!("revision {}, keys: {changed}", next.revision)),
+        });
+        Ok(serde_json::json!({
+            "revision": next.revision,
+            "values": domain::plugin::schema::mask_secrets(&schema, &next.values),
+        }))
+    }
+}
+
+impl PluginConfig {
+    fn rollback(&self, id: &PluginId, previous: &StoredConfig) {
+        // 写回失败只影响「保留上一版本」的强度，不能再把原始错误覆盖掉。
+        let _ = self.config_store.put(id, previous);
+    }
+
+    fn mark_degraded(&self, id: &PluginId, err: &HostError) {
+        let Ok(mut record) = self.store.get(id) else {
+            return;
+        };
+        record.last_state = PluginState::Degraded;
+        record.last_error = Some(format!("config apply failed: {}", err.message));
+        record.updated_at = now_secs();
+        let _ = self.store.put(&record);
     }
 }
 
@@ -1016,12 +1331,33 @@ impl FileOps for UnavailableFiles {}
 mod tests {
     use super::*;
     use domain::plugin::PluginScope;
+    use serde_json::json;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
 
     #[derive(Default)]
     struct MemoryStore {
         records: Mutex<BTreeMap<String, PluginRecord>>,
+    }
+
+    /// 测试用配置存储：内存
+    #[derive(Default)]
+    struct MemoryConfigStore {
+        configs: Mutex<BTreeMap<String, StoredConfig>>,
+    }
+
+    impl PluginConfigStore for MemoryConfigStore {
+        fn get(&self, id: &PluginId) -> Result<Option<StoredConfig>, RepositoryError> {
+            Ok(self.configs.lock().expect("lock").get(id.as_str()).cloned())
+        }
+
+        fn put(&self, id: &PluginId, config: &StoredConfig) -> Result<(), RepositoryError> {
+            self.configs
+                .lock()
+                .expect("lock")
+                .insert(id.to_string(), config.clone());
+            Ok(())
+        }
     }
 
     impl PluginStore for MemoryStore {
@@ -1091,12 +1427,15 @@ mod tests {
             source: None,
             sha256: None,
             signed: false,
+            blocked: false,
+            quarantined: false,
         }
     }
 
     fn service(store: Arc<MemoryStore>) -> PluginService {
         PluginService::new(
             store,
+            Arc::new(MemoryConfigStore::default()),
             None,
             None,
             None,
@@ -1177,5 +1516,134 @@ mod tests {
             service.remove(&id, false).expect_err("enabled").category(),
             ErrorCategory::Conflict
         );
+    }
+
+    fn config_service(dir: &Path) -> (PluginService, PluginId) {
+        let id = PluginId::parse("demo").expect("id");
+        std::fs::write(
+            dir.join("descriptor.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": 1,
+                "plugin_id": "demo",
+                "api": 1,
+                "config": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "interval_secs": { "type": "integer", "minimum": 5, "default": 60 },
+                        "token": { "type": "string", "x-mcsup-secret": true }
+                    }
+                }
+            }))
+            .expect("descriptor json"),
+        )
+        .expect("write descriptor");
+        let store: Arc<dyn PluginStore> = Arc::new(MemoryStore::default());
+        let mut stored = record("demo", false, &[]);
+        stored.artifact_dir = dir.to_path_buf();
+        store.put(&stored).expect("put");
+        let service = PluginService::new(
+            Arc::clone(&store),
+            Arc::new(MemoryConfigStore::default()),
+            None,
+            None,
+            None,
+            Arc::new(port::plugin::NoopAuditSink),
+            dir.join("plugins"),
+            dir.join("plugin-data"),
+            dir.join("logs"),
+        );
+        (service, id)
+    }
+
+    #[test]
+    fn config_get_starts_from_schema_defaults() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (service, id) = config_service(dir.path());
+        let config = service.config_get(&id).expect("config");
+        assert_eq!(config["revision"], 0);
+        assert_eq!(config["values"]["interval_secs"], 60);
+    }
+
+    #[test]
+    fn config_set_merges_validates_and_bumps_revision() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (service, id) = config_service(dir.path());
+        let config = service
+            .config_set(&id, &json!({ "interval_secs": 30 }))
+            .expect("set");
+        assert_eq!(config["revision"], 1);
+        assert_eq!(config["values"]["interval_secs"], 30);
+        assert_eq!(
+            service.config_get(&id).expect("get")["values"]["interval_secs"],
+            30
+        );
+    }
+
+    #[test]
+    fn invalid_config_is_rejected_without_writing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (service, id) = config_service(dir.path());
+        let err = service
+            .config_set(&id, &json!({ "interval_secs": 1 }))
+            .expect_err("below minimum");
+        assert_eq!(err.category(), ErrorCategory::Usage);
+        assert_eq!(service.config_get(&id).expect("get")["revision"], 0);
+    }
+
+    #[test]
+    fn secret_config_values_are_masked_on_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (service, id) = config_service(dir.path());
+        service
+            .config_set(&id, &json!({ "token": "s3cret" }))
+            .expect("set secret");
+        let config = service.config_get(&id).expect("get");
+        assert_eq!(config["values"]["token"], "***");
+    }
+
+    #[test]
+    fn blocked_plugin_cannot_be_enabled() {
+        let store = Arc::new(MemoryStore::default());
+        store
+            .put(&record("demo", false, &all_capabilities()))
+            .expect("put");
+        let service = service(store);
+        let id = PluginId::parse("demo").expect("id");
+        let blocked = service.block(&id).expect("block");
+        assert!(blocked.blocked);
+        assert_eq!(
+            service.enable(&id).expect_err("blocked").category(),
+            ErrorCategory::Conflict
+        );
+        let released = service.unblock(&id).expect("unblock");
+        assert!(!released.blocked);
+        service.enable(&id).expect("enable after unblock");
+    }
+
+    #[test]
+    fn quarantined_plugin_cannot_be_enabled() {
+        let store = Arc::new(MemoryStore::default());
+        store
+            .put(&record("demo", false, &all_capabilities()))
+            .expect("put");
+        let service = service(store);
+        let id = PluginId::parse("demo").expect("id");
+        service.quarantine(&id).expect("quarantine");
+        assert_eq!(
+            service.enable(&id).expect_err("quarantined").category(),
+            ErrorCategory::Conflict
+        );
+        service.release(&id).expect("release");
+        service.enable(&id).expect("enable after release");
+    }
+
+    fn all_capabilities() -> [Capability; 4] {
+        [
+            Capability::Events,
+            Capability::StorageKv,
+            Capability::ServerRead,
+            Capability::ConsoleRead,
+        ]
     }
 }

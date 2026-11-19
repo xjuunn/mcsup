@@ -18,6 +18,7 @@ pub mod descriptor;
 pub mod error;
 pub mod event;
 pub mod manifest;
+pub mod schema;
 pub mod state;
 
 use std::fmt;

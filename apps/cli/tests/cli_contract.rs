@@ -1480,6 +1480,112 @@ fn plugin_install_local_artifact_then_list_ops_and_verify() {
     assert_eq!(verified["trusted"], true);
 }
 
+/// 配置读写与拉黑：全程不联网、不拉起宿主，CLI 与宿主共用的校验必须生效
+#[test]
+fn plugin_config_and_block_flags_are_visible_and_enforced() {
+    let home = temp_home();
+    let artifact = home.path().join("config-plugin");
+    write_plugin_artifact(&artifact);
+    let out = run(
+        home.path(),
+        &[
+            "--output",
+            "json",
+            "plugin",
+            "install",
+            "--from",
+            artifact.to_str().expect("utf-8 path"),
+            "--allow-unsigned",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    // 默认值来自 schema；写入后 revision 增加
+    let out = run(
+        home.path(),
+        &["--output", "json", "plugin", "config", "get", "demo"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let config: serde_json::Value = serde_json::from_slice(&out.stdout).expect("config 输出对象");
+    assert_eq!(config["revision"], 0);
+    assert_eq!(config["values"]["interval"], 60);
+
+    let out = run(
+        home.path(),
+        &[
+            "--output", "json", "plugin", "config", "set", "demo", "interval", "30",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let set: serde_json::Value = serde_json::from_slice(&out.stdout).expect("set 输出对象");
+    assert_eq!(set["revision"], 1);
+
+    let out = run(
+        home.path(),
+        &[
+            "--output", "json", "plugin", "config", "get", "demo", "interval",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let single: serde_json::Value = serde_json::from_slice(&out.stdout).expect("key 输出对象");
+    assert_eq!(single["value"], 30);
+
+    // 越界值走用法错误，且不写入
+    let out = run(
+        home.path(),
+        &["plugin", "config", "set", "demo", "interval", "1"],
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+
+    // 密钥不回显：写入与读取都不出现明文
+    let out = run(
+        home.path(),
+        &[
+            "--output", "json", "plugin", "config", "set", "demo", "token", "s3cret", "--secret",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("s3cret"));
+    assert!(!stderr(&out).contains("s3cret"));
+    let out = run(
+        home.path(),
+        &[
+            "--output", "json", "plugin", "config", "get", "demo", "token",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let single: serde_json::Value = serde_json::from_slice(&out.stdout).expect("key 输出对象");
+    assert_eq!(single["value"], "***");
+
+    // 拉黑立即禁用，解除后不自动启用
+    let out = run(
+        home.path(),
+        &["--output", "json", "plugin", "block", "demo"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let blocked: serde_json::Value = serde_json::from_slice(&out.stdout).expect("block 输出对象");
+    assert_eq!(blocked["blocked"], true);
+    assert_eq!(blocked["enabled"], false);
+
+    let out = run(home.path(), &["plugin", "enable", "demo"]);
+    assert_eq!(out.status.code(), Some(4), "{}", stderr(&out));
+
+    let out = run(
+        home.path(),
+        &["--output", "json", "plugin", "unblock", "demo"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let released: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("unblock 输出对象");
+    assert_eq!(released["blocked"], false);
+
+    let out = run(home.path(), &["--output", "json", "plugin", "list"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let rows: serde_json::Value = serde_json::from_slice(&out.stdout).expect("list 输出数组");
+    assert_eq!(rows[0]["blocked"], false);
+    assert_eq!(rows[0]["quarantined"], false);
+}
+
 fn write_plugin_artifact(root: &Path) {
     std::fs::create_dir_all(root.join("bin")).expect("create bin");
     std::fs::write(
@@ -1492,6 +1598,10 @@ fn write_plugin_artifact(root: &Path) {
     std::fs::write(
         root.join("descriptor.json"),
         r#"{"schema":1,"plugin_id":"demo","api":1,
+            "config":{"type":"object","additionalProperties":false,
+                      "properties":{
+                        "interval":{"type":"integer","minimum":5,"default":60},
+                        "token":{"type":"string","x-mcsup-secret":true}}},
             "ops":[{"id":"ping","kind":"query","title":"Ping","risk":"read",
                     "input":{"type":"object"},"output":{"type":"object"}}]}"#,
     )

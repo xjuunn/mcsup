@@ -20,8 +20,8 @@ use domain::plugin::capability::Capability;
 use domain::plugin::event::Subscription;
 use domain::plugin::state::{PluginEvent, PluginState};
 use port::plugin::{
-    AuditEvent, AuditResult, AuditSink, HostError, PluginRecord, PluginRuntimeStatus, PluginStore,
-    PluginSupervisor, SessionInfo, StreamSink,
+    AuditEvent, AuditResult, AuditSink, HostError, PluginConfigStore, PluginRecord,
+    PluginRuntimeStatus, PluginStore, PluginSupervisor, SessionInfo, StreamSink,
 };
 use protocol::plugin::{ConfigValues, WelcomeLimits};
 use serde_json::Value;
@@ -72,6 +72,7 @@ pub struct PluginHost {
     run_dir: PathBuf,
     log_dir: PathBuf,
     store: Arc<dyn PluginStore>,
+    config_store: Arc<dyn PluginConfigStore>,
     services: Arc<HostServices>,
     bus: EventBus,
     audit: Arc<dyn AuditSink>,
@@ -106,6 +107,7 @@ impl PluginHost {
     pub fn new(
         data_dir: PathBuf,
         store: Arc<dyn PluginStore>,
+        config_store: Arc<dyn PluginConfigStore>,
         services: Arc<HostServices>,
         bus: EventBus,
         audit: Arc<dyn AuditSink>,
@@ -118,6 +120,7 @@ impl PluginHost {
             run_dir,
             log_dir,
             store,
+            config_store,
             services,
             bus,
             audit,
@@ -282,6 +285,16 @@ impl PluginHost {
             id: id.clone(),
         };
         let record = self.record(id)?;
+        if record.blocked {
+            return Err(HostError::denied(format!(
+                "plugin {id} is blocked; run `mcsup plugin unblock {id}` first"
+            )));
+        }
+        if record.quarantined {
+            return Err(HostError::denied(format!(
+                "plugin {id} is quarantined; run `mcsup plugin release {id}` first"
+            )));
+        }
         if !record.enabled {
             return Err(HostError::conflict(format!(
                 "plugin {id} is not enabled; run `mcsup plugin enable {id}`"
@@ -332,7 +345,7 @@ impl PluginHost {
             token,
             host_version: self.host_version.clone(),
             limits: WelcomeLimits::default(),
-            config: ConfigValues::default(),
+            config: self.welcome_config(id),
             services: Arc::clone(&self.services),
             audit: Arc::clone(&self.audit),
             handshake_timeout: HANDSHAKE_TIMEOUT,
@@ -517,6 +530,29 @@ impl PluginHost {
             other => HostError::internal(format!("read plugin {id}: {other}")),
         })
     }
+
+    /// 握手时下发的配置：明文，插件需要用它工作
+    fn welcome_config(&self, id: &PluginId) -> ConfigValues {
+        match self.config_store.get(id) {
+            Ok(Some(stored)) => ConfigValues {
+                revision: stored.revision,
+                values: stored.values,
+            },
+            Ok(None) => ConfigValues::default(),
+            Err(err) => {
+                // 读不出来不能阻止启动：插件收到空配置，记录里留下线索。
+                self.audit.record(&AuditEvent {
+                    at: now_secs(),
+                    plugin: id.to_string(),
+                    action: "config:read".to_owned(),
+                    capability: None,
+                    result: AuditResult::Failed,
+                    detail: Some(format!("{err}")),
+                });
+                ConfigValues::default()
+            }
+        }
+    }
 }
 
 struct StartingGuard<'a> {
@@ -622,6 +658,14 @@ impl PluginSupervisor for PluginHost {
         if let Some(session) = self.session_of(id) {
             session.revoke_grant(capability);
         }
+        Ok(())
+    }
+
+    fn apply_config(&self, id: &PluginId, revision: u64, values: &Value) -> Result<(), HostError> {
+        if let Some(session) = self.session_of(id) {
+            return session.apply_config(revision, values);
+        }
+        // 会话不在：配置已落盘，下次握手经 `welcome.config` 下发。
         Ok(())
     }
 }
@@ -731,6 +775,8 @@ mod tests {
             source: None,
             sha256: None,
             signed: false,
+            blocked: false,
+            quarantined: false,
         }
     }
 }

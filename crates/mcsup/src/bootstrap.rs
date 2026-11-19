@@ -34,7 +34,9 @@ use service::{
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use storage::JsonStore;
-use storage::plugin::{JsonlAuditSink, KvFileStore, PluginFileStore, SecretFileStore};
+use storage::plugin::{
+    JsonlAuditSink, KvFileStore, PluginConfigFileStore, PluginFileStore, SecretFileStore,
+};
 use thiserror::Error;
 
 /// 组合根装配失败
@@ -103,6 +105,8 @@ pub struct Mcsup {
     pub plugin_events: plugin::EventBus,
     /// 插件安装记录存储（`__plugin-host` 与安装编排共用）
     pub plugin_store: Arc<dyn port::plugin::PluginStore>,
+    /// 插件配置存储（CLI 与宿主共用同一份落盘）
+    pub plugin_config_store: Arc<dyn port::plugin::PluginConfigStore>,
     /// 插件审计出口
     pub plugin_audit: Arc<dyn port::plugin::AuditSink>,
     /// 下载器（HTTP 传输 + 断点续传）：远端安装核心时由 agent 侧复用
@@ -188,6 +192,7 @@ impl Mcsup {
         plugin::PluginHost::new(
             data_dir.to_path_buf(),
             Arc::clone(&self.plugin_store),
+            Arc::clone(&self.plugin_config_store),
             services,
             self.plugin_events.clone(),
             Arc::clone(&self.plugin_audit),
@@ -647,6 +652,8 @@ impl McsupBuilder {
         let kv: Arc<dyn port::plugin::KvStore> = Arc::new(KvFileStore::new(plugin_data.clone()));
         let secrets: Arc<dyn port::plugin::SecretStore> =
             Arc::new(SecretFileStore::new(plugin_data.clone()));
+        let plugin_config_store: Arc<dyn port::plugin::PluginConfigStore> =
+            Arc::new(PluginConfigFileStore::new(plugin_data.clone()));
         let plugin_api = Arc::new(service::HostApiImpl::new(
             Arc::clone(&registry),
             Arc::new(lifecycle.clone()),
@@ -655,6 +662,7 @@ impl McsupBuilder {
         ));
         let plugins = service::PluginService::new(
             Arc::clone(&plugin_store),
+            Arc::clone(&plugin_config_store),
             Some(Arc::new(plugin::ControlClient::new(data_dir))),
             Some(Arc::new(provider::plugin::PluginArtifactSource::new())),
             Some(Arc::new(provider::plugin::PluginArtifactVerifier::new())),
@@ -678,6 +686,7 @@ impl McsupBuilder {
             plugin_api,
             plugin_events,
             plugin_store,
+            plugin_config_store,
             plugin_audit,
             downloader,
             store,

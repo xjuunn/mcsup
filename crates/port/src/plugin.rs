@@ -679,6 +679,12 @@ pub trait NetProxy: Send + Sync {
 ///
 /// 实时状态不在这里：`enabled` 是用户期望，进程跑没跑由 [`PluginSupervisor`]
 /// 回答。记录里的 [`Self::last_state`] 只用于宿主不在时的离线展示。
+///
+/// 四个布尔字段互相独立，组合都有意义：`enabled`（期望状态）、`signed`
+/// （来源可信度）、`blocked`（本机拉黑）、`quarantined`（取证隔离）。刻意
+/// 不合并成状态机：拉黑后仍保留原 `last_state`，解除后能回到用户上一份
+/// 期望状态。
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct PluginRecord {
     /// 插件 id
@@ -715,6 +721,10 @@ pub struct PluginRecord {
     pub sha256: Option<String>,
     /// 是否通过签名校验
     pub signed: bool,
+    /// 本机拉黑：立即停用且不再自动启动
+    pub blocked: bool,
+    /// 隔离：保留产物但禁止运行，用于取证
+    pub quarantined: bool,
 }
 
 impl PluginRecord {
@@ -768,6 +778,35 @@ pub trait PluginStore: Send + Sync {
     ///
     /// 不存在返回 [`crate::RepositoryError::NotFound`]
     fn remove(&self, id: &PluginId) -> Result<(), crate::RepositoryError>;
+}
+
+/// 一份已落盘的配置
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StoredConfig {
+    /// 单调递增的修订号
+    pub revision: u64,
+    /// 明文配置值
+    pub values: Value,
+}
+
+/// 配置存储
+///
+/// 与安装记录分开：记录是声明与期望状态，配置是用户数据，二者写入频率与
+/// 权限要求不同（配置可能含密钥，落盘为 `0600`）。
+pub trait PluginConfigStore: Send + Sync {
+    /// 读取；不存在返回 `Ok(None)`
+    ///
+    /// # Errors
+    ///
+    /// 底层失败或文件损坏返回 [`crate::RepositoryError`]
+    fn get(&self, id: &PluginId) -> Result<Option<StoredConfig>, crate::RepositoryError>;
+
+    /// 写入
+    ///
+    /// # Errors
+    ///
+    /// 底层失败返回 [`crate::RepositoryError::Storage`]
+    fn put(&self, id: &PluginId, config: &StoredConfig) -> Result<(), crate::RepositoryError>;
 }
 
 // ---- 安装来源与校验 ----
@@ -992,6 +1031,46 @@ pub trait PluginSupervisor: Send + Sync {
     fn logs(&self, _id: &PluginId, _offset: Option<u64>, _max: usize) -> Result<Value, HostError> {
         Err(HostError::unsupported("plugin logs are not available"))
     }
+
+    /// 把一组已校验的配置下发给运行中的插件
+    ///
+    /// 会话不在时返回成功：配置已落盘，下次握手会经 `welcome.config` 下发。
+    /// `values` 是明文；入口读取必须走 [`ConfigOps`] 的打码接口。
+    ///
+    /// # Errors
+    ///
+    /// 插件回 `ok:false` 或超时返回对应错误
+    fn apply_config(
+        &self,
+        _id: &PluginId,
+        _revision: u64,
+        _values: &Value,
+    ) -> Result<(), HostError> {
+        Err(HostError::unsupported(
+            "config changes are not supported by this host",
+        ))
+    }
+}
+
+/// 插件配置的读取与写入
+///
+/// 由 `service` 实现：校验 schema、合并、递增版本、落盘、下发。入口与宿主
+/// 控制通道共用同一份实现，`[禁止]` 在 CLI 或端点里重写「怎么校验配置」。
+pub trait ConfigOps: Send + Sync {
+    /// 读取配置（密钥字段已打码）
+    ///
+    /// # Errors
+    ///
+    /// 记录不存在返回 `not_found`；descriptor 非法返回 `internal`
+    fn get(&self, id: &PluginId) -> Result<Value, HostError>;
+
+    /// 写入配置：`values` 与当前值做顶层合并后整体校验
+    ///
+    /// # Errors
+    ///
+    /// schema 校验失败返回 `invalid_input`；插件应用失败返回对应错误，
+    /// 且上一版本保持不变
+    fn set(&self, id: &PluginId, values: &Value) -> Result<Value, HostError>;
 }
 
 #[cfg(test)]

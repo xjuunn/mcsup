@@ -15,8 +15,8 @@ use domain::plugin::PluginId;
 use domain::plugin::capability::Capability;
 use domain::plugin::state::PluginState;
 use port::plugin::{
-    AuditEvent, AuditResult, AuditSink, HostError, PluginRecord, PluginRuntimeStatus, PluginStore,
-    PluginSupervisor, SessionInfo, StreamSink,
+    AuditEvent, AuditResult, AuditSink, ConfigOps, HostError, PluginRecord, PluginRuntimeStatus,
+    PluginStore, PluginSupervisor, SessionInfo, StreamSink,
 };
 use protocol::plugin::{Call, Frame, ResultFrame, StreamFrame, WireError, read_frame, write_frame};
 use serde_json::{Value, json};
@@ -479,6 +479,17 @@ fn dispatch(handler: &dyn ControlHandler, method: &str, input: &Value) -> Result
         }
         "config_get" => handler.config_get(&id_of(input)?),
         "config_set" => handler.config_set(&id_of(input)?, input.get("values")),
+        "config_apply" => {
+            let id = id_of(input)?;
+            let revision = input
+                .get("revision")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| HostError::invalid_input("missing `revision`"))?;
+            let values = input
+                .get("values")
+                .ok_or_else(|| HostError::invalid_input("missing `values`"))?;
+            handler.config_apply(&id, revision, values)
+        }
         "grant" => {
             let id = id_of(input)?;
             let capability = capability_of(input)?;
@@ -583,22 +594,25 @@ pub trait ControlHandler: Send + Sync {
     ///
     /// # Errors
     ///
-    /// 配置不可用时返回 `unsupported`
-    fn config_get(&self, _id: &PluginId) -> Result<Value, HostError> {
-        Err(HostError::unsupported(
-            "plugin config is not implemented yet",
-        ))
-    }
+    /// 记录不存在或配置无效时返回错误
+    fn config_get(&self, id: &PluginId) -> Result<Value, HostError>;
     /// 写入配置
     ///
     /// # Errors
     ///
-    /// 配置不可用时返回 `unsupported`
-    fn config_set(&self, _id: &PluginId, _values: Option<&Value>) -> Result<Value, HostError> {
-        Err(HostError::unsupported(
-            "plugin config is not implemented yet",
-        ))
-    }
+    /// schema 校验失败或插件拒绝应用时返回错误
+    fn config_set(&self, id: &PluginId, values: Option<&Value>) -> Result<Value, HostError>;
+    /// 只下发已校验的配置（管理命令已落盘）
+    ///
+    /// # Errors
+    ///
+    /// 插件拒绝或超时
+    fn config_apply(
+        &self,
+        id: &PluginId,
+        revision: u64,
+        values: &Value,
+    ) -> Result<Value, HostError>;
     /// 追加授权
     ///
     /// # Errors
@@ -629,6 +643,7 @@ pub trait ControlHandler: Send + Sync {
 pub struct HostControl {
     supervisor: Arc<dyn PluginSupervisor>,
     store: Arc<dyn PluginStore>,
+    config: Arc<dyn ConfigOps>,
     log_dir: PathBuf,
     audit: Arc<dyn AuditSink>,
 }
@@ -647,12 +662,14 @@ impl HostControl {
     pub fn new(
         supervisor: Arc<dyn PluginSupervisor>,
         store: Arc<dyn PluginStore>,
+        config: Arc<dyn ConfigOps>,
         log_dir: PathBuf,
         audit: Arc<dyn AuditSink>,
     ) -> Self {
         Self {
             supervisor,
             store,
+            config,
             log_dir,
             audit,
         }
@@ -697,6 +714,8 @@ fn record_json(record: &PluginRecord, status: &PluginRuntimeStatus) -> Value {
         "approved": record.approved.iter().map(ToString::to_string).collect::<Vec<_>>(),
         "capabilities": record.declared_capabilities().iter().map(ToString::to_string).collect::<Vec<_>>(),
         "last_error": status.last_error,
+        "blocked": record.blocked,
+        "quarantined": record.quarantined,
         "signed": record.signed,
         "sha256": record.sha256,
         "source": record.source,
@@ -804,6 +823,25 @@ impl ControlHandler for HostControl {
             "next": next,
             "size": bytes.len(),
         }))
+    }
+
+    fn config_get(&self, id: &PluginId) -> Result<Value, HostError> {
+        self.config.get(id)
+    }
+
+    fn config_set(&self, id: &PluginId, values: Option<&Value>) -> Result<Value, HostError> {
+        let values = values.ok_or_else(|| HostError::invalid_input("missing `values`"))?;
+        self.config.set(id, values)
+    }
+
+    fn config_apply(
+        &self,
+        id: &PluginId,
+        revision: u64,
+        values: &Value,
+    ) -> Result<Value, HostError> {
+        self.supervisor.apply_config(id, revision, values)?;
+        Ok(json!({ "applied": true, "revision": revision }))
     }
 
     fn grant(&self, id: &PluginId, capability: Capability) -> Result<Value, HostError> {
@@ -1210,6 +1248,18 @@ impl PluginSupervisor for ControlClient {
     fn logs(&self, id: &PluginId, offset: Option<u64>, max: usize) -> Result<Value, HostError> {
         ControlClient::logs(self, id, offset, max)
     }
+
+    fn apply_config(&self, id: &PluginId, revision: u64, values: &Value) -> Result<(), HostError> {
+        self.request(
+            "config_apply",
+            json!({
+                "id": id.to_string(),
+                "revision": revision,
+                "values": values,
+            }),
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1261,6 +1311,17 @@ mod tests {
     }
 
     struct FakeSupervisor;
+
+    struct StubConfig;
+
+    impl ConfigOps for StubConfig {
+        fn get(&self, _id: &PluginId) -> Result<Value, HostError> {
+            Err(HostError::unsupported("config is not wired in this test"))
+        }
+        fn set(&self, _id: &PluginId, _values: &Value) -> Result<Value, HostError> {
+            Err(HostError::unsupported("config is not wired in this test"))
+        }
+    }
 
     impl PluginSupervisor for FakeSupervisor {
         fn start(&self, _id: &PluginId) -> Result<SessionInfo, HostError> {
@@ -1316,6 +1377,7 @@ mod tests {
         HostControl::new(
             Arc::new(FakeSupervisor),
             Arc::new(MemoryStore::default()),
+            Arc::new(StubConfig),
             std::env::temp_dir(),
             Arc::new(port::plugin::NoopAuditSink),
         )

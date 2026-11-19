@@ -67,14 +67,10 @@ pub(crate) fn run(action: PluginAction, printer: Printer) -> Result<()> {
         PluginAction::Config { action } => config_cmd(&action, printer),
         PluginAction::Grant { id, capability } => grant(&id, &capability, printer),
         PluginAction::Revoke { id, capability } => revoke(&id, &capability, printer),
-        PluginAction::Block { id } | PluginAction::Quarantine { id } => {
-            let _ = id;
-            Err(AppDiagnostic::not_implemented("plugin block / quarantine").into())
-        }
-        PluginAction::Unblock { id } | PluginAction::Release { id } => {
-            let _ = id;
-            Err(AppDiagnostic::not_implemented("plugin unblock / release").into())
-        }
+        PluginAction::Block { id } => set_flag(&id, FlagAction::Block, printer),
+        PluginAction::Unblock { id } => set_flag(&id, FlagAction::Unblock, printer),
+        PluginAction::Quarantine { id } => set_flag(&id, FlagAction::Quarantine, printer),
+        PluginAction::Release { id } => set_flag(&id, FlagAction::Release, printer),
         PluginAction::Logs { id, follow, tail } => logs(&id, follow, tail, printer),
         PluginAction::Verify { target } => verify(&target, printer),
         PluginAction::Rollback { id } => rollback(&id, printer),
@@ -99,6 +95,7 @@ pub(crate) fn run_host(data_dir: Option<PathBuf>, idle_timeout: u64) -> Result<(
     let control = Arc::new(mcsup::plugin::HostControl::new(
         Arc::clone(&host) as Arc<dyn mcsup::port::plugin::PluginSupervisor>,
         Arc::clone(&mcsup.plugin_store),
+        mcsup.plugins.config(),
         data_dir.join("logs").join("plugins"),
         Arc::clone(&mcsup.plugin_audit),
     ));
@@ -173,7 +170,7 @@ fn list(printer: Printer, json: bool) -> Result<()> {
             return Ok(());
         }
         let mut table = Table::new();
-        table.set_header(["ID", "版本", "状态", "启用", "待确认"]);
+        table.set_header(["ID", "版本", "状态", "启用", "待确认", "安全"]);
         for record in &records {
             let state = service.status(&record.id).map_or_else(
                 |_| record.last_state.as_str().to_owned(),
@@ -185,6 +182,7 @@ fn list(printer: Printer, json: bool) -> Result<()> {
                 state,
                 record.enabled.to_string(),
                 record.needs_approval().to_string(),
+                flag_text(record).to_owned(),
             ]);
         }
         printer.print_table(&table);
@@ -202,6 +200,8 @@ fn list(printer: Printer, json: bool) -> Result<()> {
             "enabled": record.enabled,
             "state": state,
             "needs_approval": record.needs_approval(),
+            "blocked": record.blocked,
+            "quarantined": record.quarantined,
             "signed": record.signed,
         }));
     }
@@ -489,6 +489,12 @@ fn status(id: &str, printer: Printer, json: bool) -> Result<()> {
         row("启用", record.enabled.to_string());
         row("状态", status.state.as_str().to_owned());
         row("待确认", record.needs_approval().to_string());
+        if record.blocked {
+            row("拉黑", "是".to_owned());
+        }
+        if record.quarantined {
+            row("隔离", "是".to_owned());
+        }
         row(
             "能力",
             record
@@ -517,6 +523,8 @@ fn status(id: &str, printer: Printer, json: bool) -> Result<()> {
             "enabled": record.enabled,
             "state": status.state.as_str(),
             "needs_approval": record.needs_approval(),
+            "blocked": record.blocked,
+            "quarantined": record.quarantined,
             "approved": record.approved.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "capabilities": record.declared_capabilities().iter().map(ToString::to_string).collect::<Vec<_>>(),
             "session": status.session.as_ref().map(|session| json!({
@@ -647,14 +655,156 @@ impl StreamSink for PrintSink {
     }
 }
 
-fn config_cmd(action: &PluginConfigAction, _printer: Printer) -> Result<()> {
+fn config_cmd(action: &PluginConfigAction, printer: Printer) -> Result<()> {
     match action {
-        PluginConfigAction::Get { .. } => {
-            Err(AppDiagnostic::not_implemented("plugin config get").into())
+        PluginConfigAction::Get { id, key, json } => {
+            let printer = json_printer(printer, *json);
+            let id = parse_id(id)?;
+            let service = open()?;
+            let config = service.config_get(&id)?;
+            let revision = config.get("revision").and_then(Value::as_u64).unwrap_or(0);
+            let values = config.get("values").cloned().unwrap_or_else(|| json!({}));
+            if let Some(key) = key {
+                let value = values.get(key).cloned().ok_or_else(|| {
+                    AppDiagnostic::not_found(
+                        format!("插件 {id} 的配置里没有键 {key}"),
+                        Some(format!("运行 `mcsup plugin config get {id}` 查看已有键")),
+                    )
+                })?;
+                if printer.is_human() {
+                    match &value {
+                        Value::String(text) => printer.print_section(text),
+                        other => printer.print_section(&serde_json::to_string_pretty(other)?),
+                    }
+                    return Ok(());
+                }
+                return printer.print_outcome(
+                    "",
+                    &json!({ "id": id.to_string(), "key": key, "value": value, "revision": revision }),
+                );
+            }
+            if printer.is_human() {
+                let Some(object) = values.as_object() else {
+                    printer.print_section(&values.to_string());
+                    return Ok(());
+                };
+                if object.is_empty() {
+                    printer.print_section(&crate::i18n::pick(
+                        printer.lang(),
+                        "该插件没有配置项",
+                        "this plugin has no configuration",
+                    ));
+                    return Ok(());
+                }
+                let mut table = Table::new();
+                table.set_header(["键", "值"]);
+                for (name, value) in object {
+                    let rendered = match value {
+                        Value::String(text) => text.clone(),
+                        other => other.to_string(),
+                    };
+                    table.add_row([name.clone(), rendered]);
+                }
+                printer.print_table(&table);
+                return Ok(());
+            }
+            printer.print_outcome(
+                "",
+                &json!({ "id": id.to_string(), "revision": revision, "values": values }),
+            )
         }
-        PluginConfigAction::Set { .. } => {
-            Err(AppDiagnostic::not_implemented("plugin config set").into())
+        PluginConfigAction::Set {
+            id,
+            key,
+            value,
+            secret,
+        } => {
+            let id = parse_id(id)?;
+            let value = config_value(value.as_deref(), *secret)?;
+            let service = open()?;
+            let config = service.config_set(&id, &json!({ key.clone(): value }))?;
+            let revision = config.get("revision").and_then(Value::as_u64).unwrap_or(0);
+            printer.print_outcome(
+                &crate::i18n::pick(
+                    printer.lang(),
+                    format!("已更新 {id} 的配置（revision {revision}）"),
+                    format!("updated config for {id} (revision {revision})"),
+                ),
+                &json!({ "id": id.to_string(), "key": key, "revision": revision }),
+            )
         }
+    }
+}
+
+/// 解析 `config set` 的值
+///
+/// `--secret` 时一律按字符串处理（从 stdin 读时只去掉行尾换行），避免把密钥
+/// 当作 JSON 解析失败后打出一段无意义提示。普通值先按 JSON 解析，失败才按
+/// 字符串，保证整数 / 布尔 / 数组可以直接写。
+fn config_value(raw: Option<&str>, secret: bool) -> Result<Value> {
+    if secret {
+        let text = if let Some(text) = raw {
+            text.to_owned()
+        } else {
+            let mut buffer = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buffer)
+                .context("从 stdin 读取密钥")?;
+            buffer
+        };
+        return Ok(Value::String(
+            text.trim_end_matches(['\r', '\n']).to_owned(),
+        ));
+    }
+    let Some(raw) = raw else {
+        return Err(AppDiagnostic::usage("缺少配置值；或用 --secret 从 stdin 读取", None).into());
+    };
+    Ok(serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_owned())))
+}
+
+#[derive(Clone, Copy)]
+enum FlagAction {
+    Block,
+    Unblock,
+    Quarantine,
+    Release,
+}
+
+fn set_flag(raw: &str, action: FlagAction, printer: Printer) -> Result<()> {
+    let id = parse_id(raw)?;
+    let service = open()?;
+    let record = match action {
+        FlagAction::Block => service.block(&id)?,
+        FlagAction::Unblock => service.unblock(&id)?,
+        FlagAction::Quarantine => service.quarantine(&id)?,
+        FlagAction::Release => service.release(&id)?,
+    };
+    let (human, verb) = match action {
+        FlagAction::Block => (format!("已拉黑 {id}，已停止并禁用"), "blocked".to_owned()),
+        FlagAction::Unblock => (format!("已解除拉黑 {id}"), "unblocked".to_owned()),
+        FlagAction::Quarantine => (
+            format!("已隔离 {id}，产物保留但禁止运行"),
+            "quarantined".to_owned(),
+        ),
+        FlagAction::Release => (format!("已解除隔离 {id}"), "released".to_owned()),
+    };
+    printer.print_outcome(
+        &crate::i18n::pick(printer.lang(), human, format!("{verb} {id}")),
+        &json!({
+            "id": record.id.to_string(),
+            "blocked": record.blocked,
+            "quarantined": record.quarantined,
+            "enabled": record.enabled,
+        }),
+    )
+}
+
+fn flag_text(record: &mcsup::port::plugin::PluginRecord) -> &'static str {
+    match (record.blocked, record.quarantined) {
+        (true, true) => "blocked+quarantined",
+        (true, false) => "blocked",
+        (false, true) => "quarantined",
+        (false, false) => "",
     }
 }
 

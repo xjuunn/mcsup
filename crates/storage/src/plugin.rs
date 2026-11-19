@@ -27,8 +27,8 @@ use domain::plugin::{PluginId, PluginScope};
 use port::RepositoryError;
 use port::plugin::{
     AuditEvent, AuditSink, HostError, KvStore, MAX_KV_KEY_BYTES, MAX_KV_LIST, MAX_KV_TOTAL_BYTES,
-    MAX_KV_VALUE_BYTES, MAX_SECRET_KEY_BYTES, MAX_SECRET_VALUE_BYTES, PluginRecord, PluginStore,
-    SecretStore, SecretValue,
+    MAX_KV_VALUE_BYTES, MAX_SECRET_KEY_BYTES, MAX_SECRET_VALUE_BYTES, PluginConfigStore,
+    PluginRecord, PluginStore, SecretStore, SecretValue, StoredConfig,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -50,6 +50,7 @@ static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 /// 校验——磁盘上的东西不可信，宁可报损坏也不把未知能力带进运行时。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)] // 与 PluginRecord 一致：独立开关，不是状态机
 struct FileRecord {
     schema: u32,
     id: String,
@@ -75,6 +76,10 @@ struct FileRecord {
     sha256: Option<String>,
     #[serde(default)]
     signed: bool,
+    #[serde(default)]
+    blocked: bool,
+    #[serde(default)]
+    quarantined: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     artifact_dir: Option<String>,
 }
@@ -103,6 +108,8 @@ impl FileRecord {
             source: record.source.clone(),
             sha256: record.sha256.clone(),
             signed: record.signed,
+            blocked: record.blocked,
+            quarantined: record.quarantined,
             artifact_dir: Some(record.artifact_dir.to_string_lossy().into_owned()),
         }
     }
@@ -167,6 +174,8 @@ impl FileRecord {
             source: self.source,
             sha256: self.sha256,
             signed: self.signed,
+            blocked: self.blocked,
+            quarantined: self.quarantined,
         })
     }
 }
@@ -305,6 +314,74 @@ impl PluginFileStore {
             )));
         }
         file.into_record(&self.root)
+    }
+}
+
+/// 配置存储：`{plugin-data}/<id>/config.json`（0600）
+///
+/// 配置可能包含 `x-mcsup-secret` 字段，因此与密钥文件同等对待：创建即
+/// `0600`，读取前校验权限。普通字段与密钥字段放在同一个文件里，避免
+/// 「哪些键算密钥」在读写两侧各判一次。
+pub struct PluginConfigFileStore {
+    root: PathBuf,
+}
+
+impl std::fmt::Debug for PluginConfigFileStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PluginConfigFileStore")
+            .field("root", &self.root)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PluginConfigFileStore {
+    /// `root` 是 `plugin-data` 目录
+    #[must_use]
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    fn path(&self, plugin: &PluginId) -> PathBuf {
+        self.root.join(plugin.as_str()).join("config.json")
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigFile {
+    revision: u64,
+    values: serde_json::Value,
+}
+
+impl PluginConfigStore for PluginConfigFileStore {
+    fn get(&self, plugin: &PluginId) -> Result<Option<StoredConfig>, RepositoryError> {
+        let path = self.path(plugin);
+        check_secret_permissions(&path)
+            .map_err(|err| RepositoryError::Corrupt(err.message.clone()))?;
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(super::storage_err(err)),
+        };
+        let file: ConfigFile = serde_json::from_slice(&bytes)
+            .map_err(|err| RepositoryError::Corrupt(format!("{}: {err}", path.display())))?;
+        Ok(Some(StoredConfig {
+            revision: file.revision,
+            values: file.values,
+        }))
+    }
+
+    fn put(&self, plugin: &PluginId, config: &StoredConfig) -> Result<(), RepositoryError> {
+        let path = self.path(plugin);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(super::storage_err)?;
+        }
+        let bytes = serde_json::to_vec_pretty(&ConfigFile {
+            revision: config.revision,
+            values: config.values.clone(),
+        })
+        .map_err(|err| RepositoryError::Corrupt(format!("serialize plugin config: {err}")))?;
+        write_atomic_bytes(&path, &bytes, 0o600).map_err(super::storage_err)
     }
 }
 
@@ -869,6 +946,8 @@ mod tests {
             source: None,
             sha256: None,
             signed: false,
+            blocked: false,
+            quarantined: false,
         }
     }
 
@@ -955,6 +1034,32 @@ mod tests {
             assert_eq!(mode, 0o600);
         }
         assert!(store.delete(&plugin, "token").expect("delete"));
+    }
+
+    #[test]
+    fn plugin_config_roundtrip_is_private() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = PluginConfigFileStore::new(dir.path().to_path_buf());
+        let plugin = PluginId::parse("demo").expect("id");
+        assert!(store.get(&plugin).expect("get").is_none());
+        let config = StoredConfig {
+            revision: 3,
+            values: serde_json::json!({ "interval_secs": 60, "token": "s3cret" }),
+        };
+        store.put(&plugin, &config).expect("put");
+        let stored = store.get(&plugin).expect("get").expect("stored");
+        assert_eq!(stored.revision, 3);
+        assert_eq!(stored.values, config.values);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join("demo/config.json"))
+                .expect("stat")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 
     #[test]

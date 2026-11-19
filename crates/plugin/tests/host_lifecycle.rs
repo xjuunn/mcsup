@@ -19,7 +19,8 @@ use plugin::event::EventBus;
 use plugin::host::PluginHost;
 use port::RepositoryError;
 use port::plugin::{
-    HostError, NoopAuditSink, PluginRecord, PluginStore, PluginSupervisor, StreamSink,
+    ConfigOps, HostError, NoopAuditSink, PluginConfigStore, PluginRecord, PluginStore,
+    PluginSupervisor, StoredConfig, StreamSink,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -67,6 +68,38 @@ impl PluginStore for MemoryStore {
             .remove(id.as_str())
             .map(|_| ())
             .ok_or_else(|| RepositoryError::NotFound(id.to_string()))
+    }
+}
+
+#[derive(Default)]
+struct MemoryConfigStore {
+    configs: Mutex<BTreeMap<String, StoredConfig>>,
+}
+
+impl PluginConfigStore for MemoryConfigStore {
+    fn get(&self, id: &PluginId) -> Result<Option<StoredConfig>, RepositoryError> {
+        Ok(self.configs.lock().expect("lock").get(id.as_str()).cloned())
+    }
+
+    fn put(&self, id: &PluginId, config: &StoredConfig) -> Result<(), RepositoryError> {
+        self.configs
+            .lock()
+            .expect("lock")
+            .insert(id.to_string(), config.clone());
+        Ok(())
+    }
+}
+
+/// 控制端点测试不覆盖配置读写；显式返回 `unsupported` 而不是静默成功。
+struct StubConfig;
+
+impl ConfigOps for StubConfig {
+    fn get(&self, _id: &PluginId) -> Result<Value, HostError> {
+        Err(HostError::unsupported("config is not wired in this test"))
+    }
+
+    fn set(&self, _id: &PluginId, _values: &Value) -> Result<Value, HostError> {
+        Err(HostError::unsupported("config is not wired in this test"))
     }
 }
 
@@ -135,13 +168,24 @@ fn record(id: &PluginId, artifact_dir: PathBuf, version: &str) -> PluginRecord {
         source: None,
         sha256: None,
         signed: true,
+        blocked: false,
+        quarantined: false,
     }
 }
 
 fn host(data_dir: &Path, store: &Arc<MemoryStore>) -> Arc<PluginHost> {
+    host_with_config(data_dir, store, Arc::new(MemoryConfigStore::default()))
+}
+
+fn host_with_config(
+    data_dir: &Path,
+    store: &Arc<MemoryStore>,
+    configs: Arc<MemoryConfigStore>,
+) -> Arc<PluginHost> {
     PluginHost::new(
         data_dir.to_path_buf(),
         Arc::clone(store) as Arc<dyn PluginStore>,
+        configs,
         Arc::new(HostServices::default()),
         EventBus::new(),
         Arc::new(NoopAuditSink),
@@ -233,6 +277,66 @@ fn handshake_identity_mismatch_is_reported_as_crashed() {
 }
 
 #[test]
+fn welcome_and_live_config_reach_the_plugin() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data_dir = dir.path().to_path_buf();
+    let id = fixture_id();
+    let artifact = install_fixture(&data_dir, &id);
+    let store = Arc::new(MemoryStore::default());
+    store
+        .put(&record(&id, artifact, env!("CARGO_PKG_VERSION")))
+        .expect("put record");
+    let configs = Arc::new(MemoryConfigStore::default());
+    configs
+        .put(
+            &id,
+            &StoredConfig {
+                revision: 4,
+                values: json!({ "interval_secs": 60 }),
+            },
+        )
+        .expect("put config");
+    let host = host_with_config(&data_dir, &store, configs);
+
+    host.start(&id).expect("start fixture");
+    let output = host.call(&id, "echo", json!({})).expect("call");
+    assert_eq!(output["config_revision"], 4, "welcome must carry config");
+
+    host.apply_config(&id, 5, &json!({ "interval_secs": 30 }))
+        .expect("apply config");
+    let output = host.call(&id, "echo", json!({})).expect("call");
+    assert_eq!(
+        output["config_revision"], 5,
+        "live update must reach plugin"
+    );
+    host.shutdown_all(Duration::from_secs(2));
+}
+
+#[test]
+fn blocked_and_quarantined_plugins_are_rejected_before_spawn() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data_dir = dir.path().to_path_buf();
+    let id = fixture_id();
+    let artifact = install_fixture(&data_dir, &id);
+    let store = Arc::new(MemoryStore::default());
+    let mut fixture = record(&id, artifact, env!("CARGO_PKG_VERSION"));
+    fixture.blocked = true;
+    store.put(&fixture).expect("put record");
+    let host = host(&data_dir, &store);
+
+    let err = host.start(&id).expect_err("blocked");
+    assert_eq!(err.code, PluginErrorCode::Denied);
+    assert_eq!(host.session_count(), 0, "no process may be spawned");
+
+    fixture.blocked = false;
+    fixture.quarantined = true;
+    store.put(&fixture).expect("put record");
+    let err = host.start(&id).expect_err("quarantined");
+    assert_eq!(err.code, PluginErrorCode::Denied);
+    assert_eq!(host.session_count(), 0);
+}
+
+#[test]
 fn control_channel_lists_calls_and_shuts_down() {
     let dir = tempfile::tempdir().expect("tempdir");
     let data_dir = dir.path().to_path_buf();
@@ -248,6 +352,7 @@ fn control_channel_lists_calls_and_shuts_down() {
     let control = Arc::new(HostControl::new(
         Arc::clone(&host) as Arc<dyn PluginSupervisor>,
         Arc::clone(&store) as Arc<dyn PluginStore>,
+        Arc::new(StubConfig),
         data_dir.join("logs").join("plugins"),
         Arc::new(NoopAuditSink),
     ));

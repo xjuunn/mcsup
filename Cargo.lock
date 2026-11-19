@@ -1918,6 +1918,7 @@ name = "mcsup-domain"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "regex",
  "serde",
  "serde_json",
  "thiserror",

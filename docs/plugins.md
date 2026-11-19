@@ -705,6 +705,7 @@ CLI / `apps/server` / `apps/agent` 与宿主之间的连接使用独立的控制
 | `stream` | 订阅插件 stream，返回 `stream` 帧 |
 | `logs` | 游标读取插件日志 |
 | `config_get` / `config_set` | 配置读取（密钥打码）/ 写入 |
+| `config_apply` | 只下发已由管理端校验并落盘的配置，不重复写盘 |
 | `grant` / `revoke` | 授权变更 |
 | `reload` | 安装 / 卸载后让宿主重读记录 |
 | `shutdown` | 宿主退出 |
@@ -1868,6 +1869,7 @@ Windows 还需拒绝保留名（`CON`、`NUL` 等）与尾随点 / 空格。
 ├── plugin-data/
 │   └── <id>/
 │       ├── kv/                        # 键值，一键一文件
+│       ├── config.json                # 配置（0600，可能含密钥字段）
 │       └── secrets.json               # 加密凭据
 ├── logs/
 │   ├── plugin-host.log
@@ -1883,6 +1885,8 @@ Windows 还需拒绝保留名（`CON`、`NUL` 等）与尾随点 / 空格。
 - 当前版本记录在 `db/plugins/<id>.json` 的 `active_version`，不另设指针文件，
   避免双真相源。
 - `plugin-data/<id>/` 是插件唯一可写目录；宿主不清理，除非 `--purge`。
+- `plugin-data/<id>/config.json` 与 `secrets.json` 同为 `0600`：配置可能含
+  `x-mcsup-secret` 字段，读取接口必须打码，`--purge` 时随目录删除。
 - 审计用 JSONL 而不是「一条记录一个 JSON」：记录不可变、写入高频、按时间
   追加；这是对既有存储约定的有意例外，必须在实现中注释原因。
 - 所有写入先写临时文件再原子重命名；跨进程写用 `db/.lock`。
@@ -1895,6 +1899,8 @@ Windows 还需拒绝保留名（`CON`、`NUL` 等）与尾随点 / 空格。
   "id": "chat-bridge",
   "active_version": "0.3.1",
   "enabled": true,
+  "blocked": false,
+  "quarantined": false,
   "approved": ["events", "storage:kv", "server:read", "console:read"],
   "last_state": "running",
   "installed_at": "2026-11-18T09:00:00Z",
@@ -1914,6 +1920,9 @@ Windows 还需拒绝保留名（`CON`、`NUL` 等）与尾随点 / 空格。
 
 `last_state` 是最近一次已知实际状态；进程实时状态以宿主会话表为准，读取时合并。
 `last_error` 记录最近一次失败的结构化原因（code + message + at）。
+
+`blocked` / `quarantined` 是只对本机生效的安全标记：写入时立即停止进程并禁用，
+读取时优先于 `enabled`；解除后不自动启用，由用户显式 `enable`。
 
 ## 17.3 锁
 
