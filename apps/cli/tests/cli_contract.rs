@@ -1468,6 +1468,8 @@ fn plugin_install_local_artifact_then_list_ops_and_verify() {
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     let ops: serde_json::Value = serde_json::from_slice(&out.stdout).expect("ops 输出数组");
     assert_eq!(ops[0]["id"], "ping");
+    // 展示类型由 descriptor 推断：object 输出的 query 默认 `detail`
+    assert_eq!(ops[0]["display"], "detail");
 
     let out = run(
         home.path(),

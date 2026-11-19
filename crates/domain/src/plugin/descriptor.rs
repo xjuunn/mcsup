@@ -1271,6 +1271,71 @@ mod tests {
     }
 
     #[test]
+    fn all_six_display_types_resolve() {
+        let mut value = base();
+        value["ops"] = json!([
+            { "id": "submit", "kind": "action", "title": "提交", "risk": "mutating",
+              "display": { "type": "form" },
+              "input": object_schema(json!({ "text": { "type": "string" } })),
+              "output": object_schema(json!({})) },
+            { "id": "rows", "kind": "query", "title": "列表", "risk": "read",
+              "display": { "type": "table", "columns": ["name"] },
+              "input": object_schema(json!({})),
+              "output": object_schema(json!({
+                  "items": { "type": "array", "items": { "type": "object" } }
+              })) },
+            { "id": "one", "kind": "query", "title": "详情", "risk": "read",
+              "display": { "type": "detail", "fields": ["name"] },
+              "input": object_schema(json!({})),
+              "output": object_schema(json!({ "name": { "type": "string" } })) },
+            { "id": "history", "kind": "query", "title": "会话", "risk": "read",
+              "display": { "type": "chat", "send": "submit", "stream": "messages" },
+              "input": object_schema(json!({})),
+              "output": object_schema(json!({
+                  "items": { "type": "array", "items": { "type": "object" } }
+              })) },
+            { "id": "lines", "kind": "stream", "title": "日志", "risk": "read",
+              "display": { "type": "log" },
+              "input": object_schema(json!({})),
+              "output": object_schema(json!({
+                  "at": { "type": "string" }, "text": { "type": "string" }
+              })) },
+            { "id": "points", "kind": "stream", "title": "指标", "risk": "read",
+              "display": { "type": "metrics", "unit": "ms" },
+              "input": object_schema(json!({})),
+              "output": object_schema(json!({
+                  "at": { "type": "string" }, "value": { "type": "number" }
+              })) },
+            { "id": "messages", "kind": "stream", "title": "消息", "risk": "read",
+              "input": object_schema(json!({})),
+              "output": object_schema(json!({
+                  "at": { "type": "string" }, "from": { "type": "string" },
+                  "text": { "type": "string" }
+              })) }
+        ]);
+        let descriptor = parse(value).expect("six display types validate");
+        let names: Vec<&str> = descriptor
+            .ops
+            .iter()
+            .map(|op| op.display.type_name())
+            .collect();
+        assert_eq!(
+            names,
+            ["form", "table", "detail", "chat", "log", "metrics", "log"]
+        );
+        assert_eq!(
+            descriptor.ops[3].display,
+            Display::Chat {
+                send: "submit".to_owned(),
+                stream: "messages".to_owned(),
+                text_field: None,
+                from_field: None,
+                at_field: None,
+            }
+        );
+    }
+
+    #[test]
     fn display_shape_is_checked() {
         let mut value = base();
         value["ops"][0]["display"] = json!({ "type": "table" });

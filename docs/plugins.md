@@ -1302,6 +1302,11 @@ descriptor 由 SDK 在构建时生成，与二进制一起打包。宿主只读�
 渲染器只按字段名取值，不做语义猜测。字段不存在时显示空值并记录一次 schema
 不匹配告警，不 panic、不白屏。
 
+实现落位：形状与引用校验在 `domain::plugin::descriptor`
+（`validate_display_shape` / `validate_display_refs`），CLI / Web / MCP 只投影
+`ResolvedOp::display`，不各判一套。CLI 的 `plugin ops` 在人类表格列出「展示」
+列、在 JSON 里给出 `display` 字段，取值即 [`Display::type_name`]。
+
 ## 11.4 默认推断
 
 - `kind=action` 且无 `display` → `form`。

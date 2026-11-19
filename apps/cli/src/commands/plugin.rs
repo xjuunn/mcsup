@@ -552,11 +552,12 @@ fn ops(id: &str, printer: Printer, json: bool) -> Result<()> {
             return Ok(());
         }
         let mut table = Table::new();
-        table.set_header(["op", "类型", "风险", "标题"]);
+        table.set_header(["op", "类型", "展示", "风险", "标题"]);
         for resolved in &descriptor.ops {
             table.add_row([
                 resolved.op.id.clone(),
                 resolved.op.kind.as_str().to_owned(),
+                resolved.display.type_name().to_owned(),
                 resolved.op.risk.as_str().to_owned(),
                 resolved.op.title.clone(),
             ]);

@@ -910,6 +910,20 @@ panic，只能返回错误。
 对应单测可用 `cargo test -p mcsup-service --lib api_life` / `api_bak` / `api_cnt`
 与 `cargo test -p mcsup-plugin --lib api::tests` 过滤。
 
+## 9.9 展示类型投影（`DESC-DISPLAY`）
+
+| ID | 场景 | 期望 |
+| --- | --- | --- |
+| `DESC-DISPLAY-001` | 六种 display 的合法形状 | descriptor 校验通过，类型不被改写 |
+| `DESC-DISPLAY-002` | 输出形状不匹配 | `DisplayShapeMismatch`，安装失败 |
+| `DESC-DISPLAY-003` | `chat` 引用未声明的 `send` / `stream` | `InvalidDisplayRef` |
+| `DESC-DISPLAY-004` | CLI `plugin ops` | 人类表格含「展示」列，JSON 含 `display` |
+
+落位：判定在 `domain::plugin::descriptor`（`validate_display_shape` /
+`validate_display_refs`），CLI 只投影 `ResolvedOp::display`，不重复判断。
+六种类型的正例见单测 `all_six_display_types_resolve`，可用
+`cargo test -p mcsup-domain --lib descriptor` 过滤。
+
 ---
 
 # 10. 契约测试矩阵
