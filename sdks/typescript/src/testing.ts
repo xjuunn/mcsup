@@ -130,6 +130,11 @@ export class MockHost<C extends readonly Capability[]> {
     this.deliver({ type: "cancel", id, reason });
   }
 
+  /** 注入一帧原始宿主帧（帧一致性用例用；绕过高层封装） */
+  public inject(frame: InboundFrame): void {
+    this.deliver(frame);
+  }
+
   /** 发送 shutdown 并等进程退出码 */
   public async shutdown(graceMs = 5000): Promise<number> {
     this.deliver({ type: "shutdown", grace_ms: graceMs });

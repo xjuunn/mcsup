@@ -47,6 +47,8 @@ run_ts() {
 		npm run build
 		printf '\n==> sdk typescript test\n'
 		npm test
+		printf '\n==> sdk typescript conformance\n'
+		npm run conformance
 	)
 }
 

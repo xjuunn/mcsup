@@ -1,0 +1,5 @@
+{
+  "id": "forbidden-recursion",
+  "description": "禁止：递归 → 构建失败",
+  "failure": { "reason": "recursion", "message-contains": "recursive" }
+}

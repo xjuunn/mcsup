@@ -1,0 +1,8 @@
+{
+  "id": "call.result",
+  "kind": "call",
+  "description": "调用 → result（ok:true，output 与 descriptor 一致）",
+  "op": "counter",
+  "input": { "channel": "global" },
+  "expect": { "ok": true, "output": { "count": 0, "channel": "global" } }
+}

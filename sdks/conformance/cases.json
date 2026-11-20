@@ -31,13 +31,36 @@
       "expect": { "ok": false, "error": { "code": "internal" } }
     },
     {
+      "id": "call.reentrant",
+      "op": "reentrant",
+      "kind": "action",
+      "input": {},
+      "expect": { "ok": true, "output": { "ok": true } }
+    },
+    {
+      "id": "call.capability-denied",
+      "op": "reentrant",
+      "kind": "action",
+      "granted": ["console:read", "console:write", "events"],
+      "input": {},
+      "expect": { "ok": false, "error": { "code": "denied" } }
+    },
+    {
+      "id": "frame.unknown-type-ignored",
+      "kind": "unknown-frame",
+      "inject": { "type": "future.frame", "payload": {} },
+      "op": "counter",
+      "input": { "channel": "global" },
+      "expect": { "ok": true }
+    },
+    {
       "id": "stream.sequence",
       "op": "messages",
       "kind": "stream",
       "input": { "prefix": "#" },
       "expect": {
         "ok": true,
-        "chunks": [{ "delta": "#你" }, { "delta": "#好" }, { "delta": "#" }],
+        "chunks": [{ "at": "2026-11-18T09:31:00Z", "text": "#你" }, { "at": "2026-11-18T09:31:00Z", "text": "#好" }, { "at": "2026-11-18T09:31:00Z", "text": "#" }],
         "done": true,
         "seq_from": 0
       }

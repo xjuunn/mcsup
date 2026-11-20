@@ -31,6 +31,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "test": "vitest run",
+    "conformance": "vitest run test/conformance.test.ts test/schema-conformance.test.ts test/frames-conformance.test.ts",
     "prepublishOnly": "npm run build"
   },
   "peerDependencies": {

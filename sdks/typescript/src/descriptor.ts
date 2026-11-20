@@ -10,6 +10,22 @@ import { z } from "zod";
 
 import { PLUGIN_API_VERSION, PROTOCOL_VERSION } from "./protocol.js";
 import { subscriptionKinds, type Capability, type PluginDefinition } from "./define.js";
+import {
+  DEFAULT_OP_TIMEOUT_MS,
+  DescriptorError,
+  MAX_DESCRIPTOR_BYTES,
+  OP_ID_PATTERN,
+  inferDisplay,
+  schemaShape,
+  shapeHint,
+  validateDescriptorSize,
+  validateDisplayObject,
+  validateDisplayRefs,
+  validateDisplayShape,
+  validateOpFields,
+  validateSchemaSubset,
+  validateZodSchema,
+} from "./validate.js";
 
 // ---------------------------------------------------------------------------
 // manifest
@@ -146,16 +162,16 @@ function sortKeys(value: JsonValue): JsonValue {
 }
 
 /** 折叠 `anyOf: [X, null]` 为单个 schema（非必填语义由 required 表达） */
-function foldNullable(value: JsonValue): JsonValue {
+function foldNullable(value: JsonValue, path: string): JsonValue {
   if (Array.isArray(value)) {
-    return value.map(foldNullable);
+    return value.map((item) => foldNullable(item, path));
   }
   if (!isJsonObject(value)) {
     return value;
   }
   const out: { [key: string]: JsonValue } = {};
   for (const [key, item] of Object.entries(value)) {
-    out[key] = foldNullable(item);
+    out[key] = foldNullable(item, key === "properties" ? path : `${path}.${key}`);
   }
   const anyOf = out["anyOf"];
   const typeList = out["type"];
@@ -164,11 +180,17 @@ function foldNullable(value: JsonValue): JsonValue {
     const { type: _drop, ...rest } = out;
     return { ...rest, type: typeList.find((t) => t !== "null") as JsonValue };
   }
+  if (Array.isArray(typeList) && typeList.length > 1) {
+    throw new DescriptorError(`${path}.type`, `union of ${typeList.map(String).join(" | ")} is not allowed; use a flat object with optional fields`);
+  }
   if (Array.isArray(anyOf) && anyOf.length === 2 && anyOf.some((x) => x === null || x === ("null" as JsonValue) || (isJsonObject(x) && x["type"] === "null"))) {
     const inner = anyOf.find((x) => !(x === null || (isJsonObject(x) && x["type"] === "null")));
     if (inner !== undefined && isJsonObject(inner)) {
       return { ...inner, ...stripNullOnly(out) };
     }
+  }
+  if (anyOf !== undefined) {
+    throw new DescriptorError(`${path}.anyOf`, "union is not allowed; use a flat object with optional fields");
   }
   return out;
 }
@@ -178,36 +200,70 @@ function stripNullOnly(value: { [key: string]: JsonValue }): { [key: string]: Js
   return rest;
 }
 
-/** `.meta()` 便捷键 → `x-mcsup-*`；校验 format 枚举与输出方向禁止 secret */
-function applyMetaKeys(value: JsonValue, onOutput: boolean): JsonValue {
+/** 对象 schema 一律闭合（§11.5 要求 `additionalProperties:false`） */
+function closeObjects(value: JsonValue): JsonValue {
   if (Array.isArray(value)) {
-    return value.map((item) => applyMetaKeys(item, onOutput));
+    return value.map(closeObjects);
   }
   if (!isJsonObject(value)) {
     return value;
   }
   const out: { [key: string]: JsonValue } = {};
   for (const [key, item] of Object.entries(value)) {
-    if (key === "properties" || key === "items" || key.match(/^(prefix|suffix|contains)/) !== null) {
-      out[key] = applyMetaKeys(item, onOutput);
+    out[key] = closeObjects(item);
+  }
+  // zod v4 对整数给出 ±MAX_SAFE_INTEGER 的实现边界；这不是作者的数值约束，
+  // 各语言统一剥掉，避免产物漂移
+  if (out["minimum"] === -Number.MAX_SAFE_INTEGER) {
+    delete out["minimum"];
+  }
+  if (out["maximum"] === Number.MAX_SAFE_INTEGER) {
+    delete out["maximum"];
+  }
+  if (out["type"] === "object" && !Array.isArray(out["properties"]) && out["additionalProperties"] === undefined) {
+    out["additionalProperties"] = false;
+  }
+  return out;
+}
+
+/** `.meta()` 便捷键 → `x-mcsup-*`；校验 format 枚举与输出方向禁止 secret */
+function applyMetaKeys(value: JsonValue, onOutput: boolean, path: string): JsonValue {
+  if (Array.isArray(value)) {
+    return value.map((item) => applyMetaKeys(item, onOutput, path));
+  }
+  if (!isJsonObject(value)) {
+    return value;
+  }
+  const out: { [key: string]: JsonValue } = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (key === "properties" && isJsonObject(item)) {
+      const properties: { [key: string]: JsonValue } = {};
+      for (const [name, child] of Object.entries(item)) {
+        properties[name] = applyMetaKeys(child, onOutput, `${path}.properties.${name}`);
+      }
+      out[key] = properties;
+      continue;
+    }
+    if (key === "items" || key === "additionalProperties") {
+      out[key] = applyMetaKeys(item, onOutput, `${path}.${key}`);
       continue;
     }
     const mapped = META_KEY_MAP[key];
     if (mapped === undefined) {
-      out[key] = applyMetaKeys(item, onOutput);
+      out[key] = applyMetaKeys(item, onOutput, `${path}.${key}`);
       continue;
     }
     if (mapped === "x-mcsup-secret") {
       // 输出方向出现 secret 属于安装期拒绝项（§11.6）；生成阶段直接报错
       if (onOutput) {
-        throw new Error("x-mcsup-secret is not allowed on output schemas");
+        throw new DescriptorError(path, "x-mcsup-secret is not allowed on output schemas");
       }
       out[mapped] = item;
       continue;
     }
     if (mapped === "x-mcsup-format") {
       if (typeof item !== "string" || !FORMATS.has(item)) {
-        throw new Error(`x-mcsup-format must be one of ${[...FORMATS].join(", ")}`);
+        throw new DescriptorError(`${path}.x-mcsup-format`, `must be one of ${[...FORMATS].join(", ")}`);
       }
     }
     out[mapped] = item;
@@ -216,25 +272,29 @@ function applyMetaKeys(value: JsonValue, onOutput: boolean): JsonValue {
 }
 
 /** 递归内联 `$defs` / `$ref`（zod v4 顶层 `.meta({id})` 会产生 `$ref`） */
-function inlineRefs(value: JsonValue, defs: Record<string, JsonValue> | undefined): JsonValue {
+function inlineRefs(value: JsonValue, defs: Record<string, JsonValue> | undefined, path: string): JsonValue {
   if (Array.isArray(value)) {
-    return value.map((item) => inlineRefs(item, defs));
+    return value.map((item) => inlineRefs(item, defs, path));
   }
   if (!isJsonObject(value)) {
     return value;
   }
   const ref = value["$ref"];
-  if (typeof ref === "string" && ref.startsWith("#/$defs/") && defs !== undefined) {
+  if (typeof ref === "string") {
+    if (!ref.startsWith("#/$defs/") || defs === undefined) {
+      // 外部 $ref 无法解析，§11.5 明确禁止
+      throw new DescriptorError(`${path}.$ref`, `${ref} is not allowed; only inline $defs references can be resolved`);
+    }
     const target = defs[ref.slice("#/$defs/".length)];
     if (target === undefined) {
-      throw new Error(`unresolvable $ref: ${ref}`);
+      throw new DescriptorError(`${path}.$ref`, `unresolvable reference ${ref}`);
     }
     const { $ref: _drop, ...rest } = value;
-    const inlined = inlineRefs(target, defs);
+    const inlined = inlineRefs(target, defs, path);
     if (Object.keys(rest).length === 0) {
       return inlined;
     }
-    const extra = inlineRefs(rest, defs);
+    const extra = inlineRefs(rest, defs, path);
     return { ...(isJsonObject(inlined) ? inlined : {}), ...(isJsonObject(extra) ? extra : {}) };
   }
   const out: { [key: string]: JsonValue } = {};
@@ -242,7 +302,7 @@ function inlineRefs(value: JsonValue, defs: Record<string, JsonValue> | undefine
     if (key === "$defs" || key === "definitions" || key === "$schema" || key === "$id") {
       continue;
     }
-    out[key] = inlineRefs(item, defs);
+    out[key] = inlineRefs(item, defs, `${path}.${key}`);
   }
   return out;
 }
@@ -267,13 +327,24 @@ function dropEmptyMetadata(value: JsonValue): JsonValue {
 /**
  * zod schema → 归一化 JSON Schema
  *
+ * 生成前先在 zod 层拒绝 transform / refine / union / 递归（§11.5 禁止表），
+ * 生成后再校验子集与限值。
+ *
  * @param schema zod schema
  * @param onOutput 输出方向（禁止 secret）
+ * @param path 字段路径，用于报错定位
  */
-export function jsonSchemaOf(schema: z.ZodType, onOutput: boolean): JsonValue {
+export function jsonSchemaOf(schema: z.ZodType, onOutput: boolean, path = "schema"): JsonValue {
+  validateZodSchema(path, schema);
   const raw = z.toJSONSchema(schema, { io: "input" }) as JsonValue;
   const defs = isJsonObject(raw) ? (raw["$defs"] as Record<string, JsonValue> | undefined) : undefined;
-  return sortKeys(dropEmptyMetadata(applyMetaKeys(foldNullable(inlineRefs(raw, defs)), onOutput)));
+  const normalized = sortKeys(
+    dropEmptyMetadata(
+      applyMetaKeys(closeObjects(foldNullable(inlineRefs(raw, defs, path), path)), onOutput, path),
+    ),
+  );
+  validateSchemaSubset(path, normalized);
+  return normalized;
 }
 
 // ---------------------------------------------------------------------------
@@ -299,48 +370,73 @@ export interface DescriptorOp {
   readonly display: JsonValue;
   readonly input: JsonValue;
   readonly output: JsonValue;
-  readonly timeout_ms?: number;
+  readonly timeout_ms: number;
   readonly pagination?: JsonValue;
 }
-
-const OP_ID_PATTERN = /^[a-z][a-z0-9_-]{0,63}$/;
 
 function schemaName(opId: string, direction: "in" | "out"): string {
   return `${opId}_${direction}`;
 }
 
+/** 已声明 op 的 id → kind（display 引用校验用） */
+function opKinds(resolved: readonly ResolvedOp[]): Map<string, string> {
+  const kinds = new Map<string, string>();
+  for (const op of resolved) {
+    kinds.set(op.id, op.kind);
+  }
+  return kinds;
+}
+
 /**
  * 从定义生成 descriptor。
  *
- * @throws {Error} op id / risk 不合法，或输出方向出现 secret
+ * 逐条执行 §11.2 字段约束、§11.4 默认推断、§11.3 形状与引用校验、
+ * §11.5 子集与限值、§11.7 归一化，任一失败抛 {@link DescriptorError}。
+ *
+ * @throws {DescriptorError} 超出自集 / 超限 / 引用不存在 / 输出方向出现 secret
  */
 export function buildDescriptor<C extends readonly Capability[]>(def: PluginDefinition<C>): Descriptor {
+  const resolved = collectOps(def);
+  const kinds = opKinds(resolved);
   const ops: DescriptorOp[] = [];
   const schemas: Record<string, JsonValue> = {
-    config: jsonSchemaOf(def.config, false),
+    config: jsonSchemaOf(def.config, false, "config"),
   };
-  for (const op of collectOps(def)) {
-    if (!OP_ID_PATTERN.test(op.id)) {
-      throw new Error(`op id ${op.id} must match ${OP_ID_PATTERN.source}`);
+  const seen = new Set<string>();
+  for (const op of resolved) {
+    const path = `ops.${op.id}`;
+    validateOpFields(path, op);
+    if (seen.has(op.id)) {
+      throw new DescriptorError(`${path}.id`, `${op.id} is declared more than once`);
     }
+    seen.add(op.id);
     const inputName = schemaName(op.id, "in");
     const outputName = schemaName(op.id, "out");
-    schemas[inputName] = jsonSchemaOf(op.input, false);
-    schemas[outputName] = jsonSchemaOf(op.output, true);
+    schemas[inputName] = jsonSchemaOf(op.input, false, `${path}.input`);
+    const output = jsonSchemaOf(op.output, true, `${path}.output`);
+    schemas[outputName] = output;
+    const shape = schemaShape(output);
+    const declaredType = validateDisplayObject(`${path}.display`, op.display);
+    const displayType = declaredType ?? inferDisplay(path, op.kind, shapeHint(shape));
+    validateDisplayShape(`${path}.output`, displayType, shape, op.kind === "stream");
+    if (op.kind === "query" && shape.hasItemsArray && op.pagination === undefined) {
+      throw new DescriptorError(`${path}.pagination`, "is required for list queries");
+    }
+    const extra = isJsonObject((op.display ?? null) as JsonValue) ? ((op.display as JsonValue) as { [key: string]: JsonValue }) : {};
+    const display = sortKeys({ ...extra, type: displayType });
+    validateDisplayRefs(`${path}.display`, display, kinds);
     const entry: DescriptorOp = {
       id: op.id,
       kind: op.kind,
       title: op.title,
       risk: op.risk,
-      display: sortKeys((op.display ?? { type: op.kind === "stream" ? "log" : "detail" }) as JsonValue),
+      display,
       input: { $ref: `#/schemas/${inputName}` },
       output: { $ref: `#/schemas/${outputName}` },
+      timeout_ms: op.timeoutMs ?? DEFAULT_OP_TIMEOUT_MS,
     };
     if (op.description !== undefined) {
       (entry as { description?: string }).description = op.description;
-    }
-    if (op.timeoutMs !== undefined) {
-      (entry as { timeout_ms?: number }).timeout_ms = op.timeoutMs;
     }
     if (op.pagination !== undefined) {
       (entry as { pagination?: JsonValue }).pagination = sortKeys(op.pagination as JsonValue);
@@ -348,9 +444,9 @@ export function buildDescriptor<C extends readonly Capability[]>(def: PluginDefi
     ops.push(entry);
   }
   if (ops.length > 64) {
-    throw new Error("descriptor.ops must contain at most 64 ops");
+    throw new DescriptorError("ops", `${ops.length} ops declared, limit is 64`);
   }
-  return {
+  const descriptor: Descriptor = {
     schema: 1,
     plugin_id: def.id,
     api: PLUGIN_API_VERSION,
@@ -358,6 +454,8 @@ export function buildDescriptor<C extends readonly Capability[]>(def: PluginDefi
     ops,
     schemas,
   };
+  validateDescriptorSize("descriptor", serializeNormalized(descriptor));
+  return descriptor;
 }
 
 /** 归一化产物：紧凑 JSON + 末尾换行（§11.7 第 6 条） */

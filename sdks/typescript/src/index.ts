@@ -29,6 +29,20 @@ export type { PluginErrorCategory, PluginErrorCode } from "./errors.js";
 export { run, ExitCode, Session } from "./runtime.js";
 export type { ExitCode as ExitCodeValue, FrameChannel, RunOptions } from "./runtime.js";
 
+// descriptor 校验（plugins.md §11.2–§11.5）：作者构建期遇到错误时定位用
+export { DescriptorError } from "./validate.js";
+export {
+  DEFAULT_OP_TIMEOUT_MS,
+  MAX_DESCRIPTOR_BYTES,
+  MAX_ENUM_VALUES,
+  MAX_OBJECT_PROPERTIES,
+  MAX_SCHEMA_BYTES,
+  MAX_SCHEMA_DEPTH,
+  MAX_SCHEMA_NODES,
+  MAX_STRING_LENGTH,
+  OP_ID_PATTERN,
+} from "./validate.js";
+
 export { z } from "./zod.js";
 
 export type {

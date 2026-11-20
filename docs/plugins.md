@@ -1759,8 +1759,8 @@ SDK 主版本 == plugin API 主版本
 
 ## 14.6 门禁
 
-`scripts/check-sdk.sh`（`[待实现]`）由 CI 调用，不进入 `scripts/check.sh`，
-避免本地提交等待 Node / Python 安装。
+`scripts/check-sdk.sh` 由 `scripts/check.sh` 的 `sdk` 步骤调用（§4.2），CI 上
+再单独执行一次，避免本地未装 Node / Python 时漏检。
 
 | 步骤 | 命令 | 失败含义 |
 | --- | --- | --- |
@@ -1769,7 +1769,7 @@ SDK 主版本 == plugin API 主版本
 | TS 类型 | `tsc --noEmit` | 类型错误 |
 | TS 单测 | `vitest run` | 行为错误 |
 | conformance | `npm run conformance` | 与其它 SDK 偏离 |
-| 生成一致 | `npm run gen && git diff --exit-code` | 契约漂移 |
+| 生成一致 | `npm run gen && git diff --exit-code` | 契约漂移（契约生成管线落地后启用，见 `plugins-progress.md` 偏差表） |
 | 打包 | `npm run build` | 产物不可发布 |
 
 ## 14.7 语言优先级

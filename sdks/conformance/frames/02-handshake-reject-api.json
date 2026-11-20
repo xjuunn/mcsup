@@ -1,0 +1,7 @@
+{
+  "id": "handshake.reject-api-mismatch",
+  "kind": "handshake",
+  "description": "宿主拒绝 api_mismatch → 退出码 4",
+  "reject": { "code": "api_mismatch", "message": "api mismatch" },
+  "expect": { "exit_code": 4 }
+}

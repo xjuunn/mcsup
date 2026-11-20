@@ -30,6 +30,7 @@ import {
 } from "./define.js";
 import { EventBus, createCtx, type CtxEnvironment, type CtxFor } from "./ctx.js";
 import { PluginError, toPluginError } from "./errors.js";
+import { DEFAULT_OP_TIMEOUT_MS } from "./validate.js";
 import {
   MAX_FRAME_BYTES,
   PLUGIN_API_VERSION,
@@ -578,10 +579,8 @@ export class Session<C extends readonly Capability[]> {
   private async runOnce(op: ResolvedOp, input: unknown, signal: AbortSignal): Promise<unknown> {
     const run = op.run as (input: unknown, ctx: unknown) => unknown;
     const result = Promise.resolve(run(input, this.ctx));
-    if (op.timeoutMs === undefined) {
-      return await raceAbort(result, signal);
-    }
-    return await raceAbort(withTimeout(result, op.timeoutMs), signal);
+    // descriptor 生成时已写入缺省 30 s（§11.2）；op 缺失 timeout_ms 时兜底
+    return await raceAbort(withTimeout(result, op.timeoutMs ?? DEFAULT_OP_TIMEOUT_MS), signal);
   }
 
   private async runStream(op: ResolvedOp, input: unknown, callId: number, signal: AbortSignal): Promise<void> {

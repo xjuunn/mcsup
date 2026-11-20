@@ -1,0 +1,6 @@
+{
+  "id": "default-value",
+  "description": "默认值保留",
+  "field": { "name": "limit", "type": "integer", "required": false, "default": 50 },
+  "expect": { "type": "integer", "default": 50 }
+}

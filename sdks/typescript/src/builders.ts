@@ -168,7 +168,6 @@ export class StreamBuilder<I extends z.ZodType = z.ZodType, O extends z.ZodType 
   private constructor(id: string) {
     super(id, "stream");
     this.draft.risk = "read";
-    this.draft.output = z.object({}).passthrough();
   }
 
   public static of(id: string): StreamBuilder {

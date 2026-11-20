@@ -95,6 +95,7 @@
 | `sdks/` 四语言 SDK | 仅 TypeScript（`sdks/typescript`，npm 包 `mcsup-plugin`）落地；Rust / Python / Go 待立项 |
 | `scripts/check-plugin-tests.sh` 汇总用例 ID | 已决定不做；Rust 用例由 `scripts/check.sh` 的 `test` 步骤覆盖，SDK 用例由 `scripts/check-sdk.sh` 覆盖 |
 | M1 交付 Rust / TS SDK | TypeScript 已完成，见「TS SDK」一节；Rust SDK 仍未提供 |
+| §14.4 契约生成管线 `protocol::plugin::contracts` → `sdks/typescript/contracts/v1.ts` | 未实现：`crates/protocol` 尚无 contracts 导出，`contracts/` 目录为空；`npm run gen` 与门禁的「生成一致」步骤在管线落地后启用 |
 | 市场来源必须 Sigstore 签名 | 已移除该要求；当前不校验签名 |
 
 ## 待办
@@ -136,8 +137,8 @@
 | 类型安全 | 能力驱动 `ctx`（未声明即编译期不存在）、zod v4 唯一 schema 层、输出 schema 双向校验、`PluginError` 统一错误 |
 | 协议 | 帧编解码、深度与 1 MiB 限制、握手、调用、流（seq / done / cancel）、config、ping/pong、shutdown、退出码 0/1/2/3/4 |
 | 构建 | `mcsup-plugin build`：tsc → `--mcsup-dump-descriptor` → 打包 + 平台启动器 |
-| 测试 | 63+ 用例：协议、descriptor 归一化、Builder 类型、Hooks、MockHost、真实进程、`sdks/conformance/cases.json` |
-| 门禁 | `scripts/check-sdk.sh`（已接入 `scripts/check.sh` 的 `sdk` 步骤） |
+| 测试 | 101 用例：协议、descriptor 归一化与校验、Builder 类型、Hooks、MockHost、真实进程、`sdks/conformance`（schema 12 条 + frames 6 条 + cases 13 条） |
+| 门禁 | `scripts/check-sdk.sh`（已接入 `scripts/check.sh` 的 `sdk` 步骤；含 `npm run conformance`） |
 
 行为差异（相对宿主侧文档，已在此记录）：
 
@@ -146,6 +147,11 @@
 - Builder 的 `.capabilities([...])` 决定 op 处理函数里 `ctx` 的类型；省略时
   `ctx` 为完整能力集合。
 - `contract.call` 在 v1 返回 `unsupported`，SDK 不内置契约路由。
+- descriptor 生成期执行 §11.2–§11.5 全量校验（子集、限值、display 形状与
+  引用、默认推断、op 字段约束），错误带字段路径；宿主安装期可复用同一套
+  判定（落位见 `plugins.md` §11.3 实现落位）。
+- zod v4 对 `z.number().int()` 会给出 ±`MAX_SAFE_INTEGER` 的实现边界；归一化
+  把这组边界剥掉，避免四语言产物漂移。
 
 # 性能
 

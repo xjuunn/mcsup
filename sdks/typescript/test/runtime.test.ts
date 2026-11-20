@@ -139,8 +139,8 @@ describe("流式 op", () => {
     expect(result.ok).toBe(true);
     const streams = bridge.frames.filter((f) => f.type === "stream");
     expect(streams.length).toBeGreaterThan(0);
-    const deltas = streams.map((f) => (f as { chunk: { delta?: string } }).chunk.delta).filter((d) => d !== undefined);
-    expect(deltas).toEqual(["#你", "#好", "#"]);
+    const texts = streams.map((f) => (f as { chunk: { text?: string } }).chunk.text).filter((t) => t !== undefined);
+    expect(texts).toEqual(["#你", "#好", "#"]);
     const last = streams[streams.length - 1];
     expect(last).toMatchObject({ done: true });
     await bridge.shutdown();
