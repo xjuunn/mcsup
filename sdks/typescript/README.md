@@ -50,6 +50,42 @@ Builder（`query` / `action` / `stream` / `op` / `lineFilter`）、Hooks
 （`useConsoleTail` / `useRetry` / `useKvCache` / `useEvents`）与预设属次版本
 可选 API，用法见 `docs/sdk-design.md` §4。
 
+## 工具集
+
+常用函数已由 SDK 提供，插件不要再各自实现一份。全部是纯函数或显式接能力
+client 的工厂，不依赖模块级状态：
+
+```ts
+import {
+  sanitizeChat, stripColorCodes, buildCommand, isPlayerName,  // Minecraft
+  withRetry, pLimit, mapLimit, buildUrl,                     // 网络与重试
+  chunk, clamp, truncate, unique, sleep, randomId, nowIso,    // 通用
+  kvJson, kvCounter, kvCursor, kvTtlCache,                    // 状态存储
+} from "mcsup-plugin";
+```
+
+| 分组 | 提供 |
+| --- | --- |
+| 通用 | `sleep` `clamp` `chunk` `unique` `truncate`（按码点）`randomId` `nowIso` |
+| 网络与重试 | `withRetry`（指数退避 + 抖动，只重试 retryable 错误）`pLimit` `mapLimit` `buildUrl` |
+| Minecraft | `stripColorCodes` `legacyColorCodes` `sanitizeChat`（去控制字符、折叠换行、限长）`isPlayerName` `buildCommand`（参数转义） |
+| 状态存储 | `kvJson` `kvCounter` `kvCursor`（只前进）`kvTtlCache`（TTL + 读穿） |
+
+示例：
+
+```ts
+const counter = kvCounter(ctx["storage:kv"], "stats:");
+await counter.incr("chat:forwarded");
+
+const text = sanitizeChat(event.message);
+await ctx["console:write"].sendLine("survival", buildCommand("say", [text]));
+
+await withRetry(() => ctx["net:outbound"].request({ url }), { attempts: 3 });
+```
+
+`utils` 属于次版本可选 API；纯函数不接 `ctx`，状态工具显式传入
+`ctx["storage:kv"]`，能力未授予时会在取 client 处直接 `denied`。
+
 ## 能力驱动的 Ctx
 
 `ctx` 只包含已声明能力对应的字段（原生对象写法与 Builder 写法一致）：

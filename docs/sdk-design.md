@@ -200,6 +200,17 @@ export default chatBridgePreset({
 - 预设必须声明它固定了哪些能力与 op，作者跳出的部分回落到内核写法
 - 预设属于 SDK 的次版本可选 API（§9 版本规则），不进入最小公开面
 
+## 4.5 工具集层（次版本可选）
+
+通用函数集中放在 `utils`，插件不要再各自实现一份：
+
+- 纯函数：文本 / 时间 / 切片 / 截断、重试与并发、Minecraft 颜色码与命令转义
+- 需要状态的封装（KV 计数、游标、TTL 缓存）**显式接能力 client**
+  （`kvCounter(ctx["storage:kv"])`），不接 `ctx`、不做隐式注册，能力未授予时
+  在取 client 处直接 `denied`
+- 命名不用 `useX`（Hooks 专用，§7）；工具不得包含第三方平台客户端或业务判定，
+  边界同 `plugins.md` §14.2 的禁止项
+
 # 5. 三条边界规约（硬性）
 
 1. **Builder 只造片段，不造插件**：`.build()` 的产物必须是内核可接受的片段；
@@ -248,6 +259,7 @@ op 输出类型从 `run` 的返回值与 output schema 双向校验；能用推�
 | 内核入口 | `definePlugin`，参数键与附录 D 一致（`config` / `queries` / `actions` / `streams` / `onStart` / `onStop`） | `definePlugin({...})` |
 | Builder 工厂 | 小写动词或名词工厂函数，返回链式 builder，以 `.build()` 收尾 | `op("status")`、`lineFilter()` |
 | Hook | `useX` 前缀，第一参数恒为 `ctx` | `useConsoleTail(ctx, opts)` |
+| 工具 | 普通动词 / 名词函数，不用 `useX`；状态类工厂显式接能力 client | `sanitizeChat`、`kvCounter(kv)` |
 | 预设 | `xPreset` 后缀 | `chatBridgePreset({...})` |
 | 错误 | `PluginError` | — |
 | 测试 | `testing.createMockHost()`（对齐 `plugins.md` §14.2） | — |

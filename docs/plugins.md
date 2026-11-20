@@ -1696,6 +1696,7 @@ TypeScript：
 | `PluginContext` | 能力客户端 |
 | `PluginError` | 带 `code` / `retryable` 的错误 |
 | `testing.createMockHost()` | 内存双工 |
+| `utils` | 纯函数工具（文本 / 时间 / 重试 / Minecraft 命令转义 / KV 包装），不含第三方平台客户端 |
 
 `[禁止]` 在 SDK 里实现业务能力（内置 Telegram 客户端、内置 AI 客户端等）。
 SDK 只做协议、类型、生命周期。

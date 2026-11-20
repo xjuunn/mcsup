@@ -101,5 +101,30 @@ export type {
   RetryOptions,
 } from "./hooks.js";
 
+// 工具集（次版本可选 API）：纯函数 + 显式接能力 client 的状态工具
+export {
+  buildCommand,
+  buildUrl,
+  chunk,
+  clamp,
+  isPlayerName,
+  kvCounter,
+  kvCursor,
+  kvJson,
+  kvTtlCache,
+  legacyColorCodes,
+  mapLimit,
+  nowIso,
+  pLimit,
+  randomId,
+  sanitizeChat,
+  sleep,
+  stripColorCodes,
+  truncate,
+  unique,
+  withRetry,
+} from "./utils/index.js";
+export type { KvCounter, KvCursor, KvTtlCache, WithRetryOptions } from "./utils/index.js";
+
 // 协议常量（作者偶尔需要，如手写集成测试）
 export { MAX_FRAME_BYTES, MAX_JSON_DEPTH, PLUGIN_API_VERSION, PROTOCOL_VERSION } from "./protocol.js";
