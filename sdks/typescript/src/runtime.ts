@@ -32,9 +32,11 @@ import { EventBus, createCtx, type CtxEnvironment, type CtxFor } from "./ctx.js"
 import { PluginError, toPluginError } from "./errors.js";
 import { DEFAULT_OP_TIMEOUT_MS } from "./validate.js";
 import {
+  ExitCode,
   MAX_FRAME_BYTES,
   PLUGIN_API_VERSION,
   type CallFrame,
+  type ExitCodeValue,
   type InboundFrame,
   type OutboundFrame,
 } from "./protocol.js";
@@ -46,16 +48,11 @@ function frameBytes(chunk: unknown): number {
   return Buffer.byteLength(JSON.stringify(chunk) ?? "", "utf8");
 }
 
-/** 退出码（§6.7） */
-export const ExitCode = {
-  Ok: 0,
-  Failure: 1,
-  Protocol: 2,
-  Config: 3,
-  ApiMismatch: 4,
-} as const;
-
-export type ExitCode = (typeof ExitCode)[keyof typeof ExitCode];
+/**
+ * 退出码（§6.7）：来自生成契约，禁止手写
+ */
+export { ExitCode };
+export type ExitCode = ExitCodeValue;
 
 /** 运行参数 */
 export interface RunOptions {

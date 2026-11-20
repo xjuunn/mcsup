@@ -23,7 +23,7 @@ use std::io::{self, BufReader, Read, Write};
 use std::net::TcpStream;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 #[cfg(unix)]
 enum Stream {
@@ -93,6 +93,8 @@ impl Write for Stream {
 
 /// 本进程 → 宿主方向的调用 id
 static NEXT_CALL_ID: AtomicU64 = AtomicU64::new(1);
+/// 故障注入：置位后不再回应 `ping`，让宿主在 `miss_limit` 后判定失联
+static MUTE_PONG: AtomicBool = AtomicBool::new(false);
 
 type Outcome = Result<Value, WireError>;
 
@@ -138,7 +140,12 @@ fn main() -> io::Result<()> {
                 stream_seq =
                     handle_call(&mut reader, &mut writer, &call, stream_seq, config_revision)?;
             }
-            Frame::Ping(seq) => write_frame(&mut writer, &Frame::Pong(seq)).map_err(frame_io)?,
+            Frame::Ping(seq) => {
+                // 故障注入：心跳丢失用例。置位后不回应，让宿主判定失联。
+                if !MUTE_PONG.load(Ordering::SeqCst) {
+                    write_frame(&mut writer, &Frame::Pong(seq)).map_err(frame_io)?;
+                }
+            }
             Frame::Shutdown { .. } | Frame::Reject(_) => return Ok(()),
             Frame::Welcome(welcome) => config_revision = welcome.config.revision,
             Frame::Config(config) => {
@@ -189,6 +196,26 @@ fn handle_call(
                 seq += 1;
             }
             Ok(seq)
+        }
+        // 故障注入：心跳丢失用例。置位后不再回应 ping。
+        "mute_pong" => {
+            MUTE_PONG.store(true, Ordering::SeqCst);
+            let result = ResultFrame::ok(call.id, serde_json::json!({ "muted": true }));
+            write_frame(writer, &Frame::Result(result)).map_err(frame_io)?;
+            Ok(stream_seq)
+        }
+        // 故障注入：seq 缺口用例。发 0、2，跳过 1，无 done。
+        "stream_gap" => {
+            for seq in [0_u64, 2] {
+                let frame = StreamFrame {
+                    id: call.id,
+                    seq,
+                    chunk: serde_json::json!({ "index": seq }),
+                    done: false,
+                };
+                write_frame(writer, &Frame::Stream(frame)).map_err(frame_io)?;
+            }
+            Ok(stream_seq)
         }
         // 测试发起：本进程作为调用方，向宿主发一次契约调用。
         "call_contract" => {

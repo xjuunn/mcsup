@@ -5,7 +5,13 @@
  */
 
 import type { Capability, DefinedPlugin, PluginDefinition } from "./define.js";
-import { PROTOCOL_VERSION, type CallFrame, type InboundFrame, type OutboundFrame } from "./protocol.js";
+import {
+  PROTOCOL_VERSION,
+  type CallFrame,
+  type InboundFrame,
+  type OutboundFrame,
+  type RejectCode,
+} from "./protocol.js";
 import { type FrameChannel, Session } from "./runtime.js";
 
 /** 宿主默认限额（§5.4） */
@@ -20,7 +26,7 @@ export interface MockHostOptions {
   readonly sessionId?: string;
   readonly scope?: { readonly kind: string; readonly server?: string };
   /** 握手直接拒绝 */
-  readonly reject?: { readonly code: string; readonly message: string };
+  readonly reject?: { readonly code: RejectCode; readonly message: string };
   /** 宿主对能力调用的处理 */
   readonly handle?: (call: { readonly capability: string; readonly method: string; readonly input: unknown }) => unknown;
 }

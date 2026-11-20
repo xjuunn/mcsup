@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { createMockHost } from "../src/testing.js";
+import type { RejectCode } from "../src/protocol.js";
 import { chatBridge } from "./fixtures.js";
 
 interface ConformanceCase {
@@ -80,7 +81,7 @@ describe("conformance cases", () => {
         const input = testCase.input as Record<string, unknown>;
         const host = createMockHost(chatBridge, {
           config: input["config"] ?? { token: "t" },
-          reject: input["reject"] as { code: string; message: string } | undefined,
+          reject: input["reject"] as { code: RejectCode; message: string } | undefined,
         });
         await host.start();
         expect(await host.waitExit()).toBe(testCase.expect["exit_code"]);

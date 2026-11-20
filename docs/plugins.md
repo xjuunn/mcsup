@@ -1664,10 +1664,14 @@ sdks/
 └── typescript/
     ├── package.json          name = "mcsup-plugin"
     ├── src/                  definePlugin / transport / dispatch / schema
-    ├── contracts/            由 Rust 契约生成，带生成头
+    │   └── contracts/        由 Rust 契约生成，带生成头
     ├── bin/build.ts          descriptor 生成与打包
     └── test/                 vitest + conformance
 ```
+
+生成物放在 `src/contracts/` 而不是包根的 `contracts/`：`tsc` 的 `rootDir`
+限定在 `src`，并且 `dist/*.js` 里的相对导入必须与源码树一致；放到包根会让
+`rootDir` 与运行期解析路径同时失配。
 
 ## 14.2 公开面
 
@@ -1719,7 +1723,7 @@ SDK 主版本 == plugin API 主版本
 
 消费方向（插件作者）：契约 → 类型
    protocol::plugin::contracts
-        └─ 生成 → sdks/typescript/contracts/v1.ts
+        └─ 生成 → sdks/typescript/src/contracts/v1.ts
                   sdks/python/mcsup_contracts/
                   sdks/java/.../contracts/
 ```
@@ -1728,8 +1732,14 @@ SDK 主版本 == plugin API 主版本
 
 - 生成物提交进版本库，带
   `// GENERATED FROM protocol::plugin. DO NOT EDIT.` 头。
-- CI 重新生成后 `git diff --exit-code`，漂移即失败。
+- CI 重新生成后与生成器输出逐字节比较（`diff`），漂移即失败。
 - `[禁止]` 手写契约类型。
+- 生成命令：`npm run gen`（在 `sdks/typescript` 下），内部调用
+  `cargo run -q -p mcsup-protocol --example gen-contracts -- typescript src/contracts/v1.ts`。
+- 字段名、可选性与标量类型都取自真实 `serde` 序列化结果：`call` 的四条路由与
+  `result` 的成败两种形态各取一次采样，字段集合取并集，只出现一次的字段记为
+  可省略。`crates/protocol/src/plugin/contracts.rs` 的漂移测试对同一份采样做
+  断言，字段改名或增删会先让 `cargo test` 失败。
 - 插件二进制的 `--mcsup-dump-descriptor` 是 descriptor 的唯一来源：
   `mcsup-plugin build` 先构建，再运行该标志取 JSON，最后打包。
 - `--mcsup-dump-descriptor` 与 `--mcsup-dump-manifest` 是保留标志，宿主永不传入。
@@ -1766,10 +1776,10 @@ SDK 主版本 == plugin API 主版本
 | --- | --- | --- |
 | Rust | `cargo test --workspace`（`sdks/rust`） | 契约或帧循环错误 |
 | TS 安装 | `npm ci` | 锁文件与 package.json 不一致 |
+| 生成一致 | `npm run gen` 后与生成器输出逐字节比较（`diff`） | 契约漂移：生成物未随 `protocol::plugin::contracts` 更新 |
 | TS 类型 | `tsc --noEmit` | 类型错误 |
 | TS 单测 | `vitest run` | 行为错误 |
 | conformance | `npm run conformance` | 与其它 SDK 偏离 |
-| 生成一致 | `npm run gen && git diff --exit-code` | 契约漂移（契约生成管线落地后启用，见 `plugins-progress.md` 偏差表） |
 | 打包 | `npm run build` | 产物不可发布 |
 
 ## 14.7 语言优先级

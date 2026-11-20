@@ -30,6 +30,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "gen": "cargo run -q -p mcsup-protocol --manifest-path ../../Cargo.toml --example gen-contracts -- typescript src/contracts/v1.ts",
     "test": "vitest run",
     "conformance": "vitest run test/conformance.test.ts test/schema-conformance.test.ts test/frames-conformance.test.ts",
     "prepublishOnly": "npm run build"

@@ -58,7 +58,7 @@ describe("MockHost 握手", () => {
   });
 
   it("reject 其他原因 → 退出码 2", async () => {
-    const host = createMockHost(minimal, { reject: { code: "denied", message: "no" } });
+    const host = createMockHost(minimal, { reject: { code: "rejected", message: "no" } });
     await host.start();
     expect(await host.waitExit()).toBe(ExitCode.Protocol);
   });

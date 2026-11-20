@@ -310,6 +310,81 @@ fn host_starts_calls_streams_and_stops_fixture() {
     host.shutdown_all(Duration::from_secs(2));
 }
 
+/// 心跳丢失：插件不回 pong 时，宿主在 `miss_limit` 个窗口后终止会话
+///
+/// 宿主侧职责（plugins.md §6.7：心跳超时 → 关闭端点 + 强杀）。fixture 用
+/// `mute_pong` 置位后静默，这里确认会话被摘除且不再应答调用。
+#[test]
+fn muted_plugin_is_closed_by_heartbeat_timeout() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data_dir = dir.path().to_path_buf();
+    let id = fixture_id();
+    let artifact = install_fixture(&data_dir, &id);
+    let store = Arc::new(MemoryStore::default());
+    let fixture = record(&id, artifact, env!("CARGO_PKG_VERSION"));
+    store.put(&fixture).expect("put record");
+    let host = host(&data_dir, &store).with_heartbeat(Heartbeat {
+        interval: Duration::from_millis(100),
+        miss_limit: 2,
+    });
+
+    let info = host.start(&id).expect("start fixture");
+    host.call(&id, "mute_pong", json!({}))
+        .expect("mute the fixture");
+
+    // 2 个 100 ms 窗口 + 监管线程 250 ms 轮询；给足余量
+    let mut torn_down = false;
+    let mut exit = None;
+    for _ in 0..60 {
+        std::thread::sleep(Duration::from_millis(50));
+        let status = host.status(&id).expect("status");
+        if status.session.as_ref().map(|s| s.session_id.as_str()) != Some(info.session_id.as_str())
+        {
+            torn_down = true;
+            // 摘除会话与写状态是两步，等 `last_error` 落地
+            if status.last_error.is_some() {
+                exit = status.last_error;
+                break;
+            }
+        }
+    }
+    assert!(
+        torn_down,
+        "muted plugin must be torn down after miss_limit windows"
+    );
+    let exit = exit.expect("torn-down session must record why it was closed");
+    assert!(
+        exit.contains("heartbeat timeout"),
+        "close reason must be the heartbeat timeout, got: {exit}"
+    );
+    host.shutdown_all(Duration::from_secs(2));
+}
+
+/// 流式缺口：seq 不连续时宿主终止流，不把残缺序列当作成功
+#[test]
+fn stream_seq_gap_terminates_the_stream() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data_dir = dir.path().to_path_buf();
+    let id = fixture_id();
+    let artifact = install_fixture(&data_dir, &id);
+    let store = Arc::new(MemoryStore::default());
+    let fixture = record(&id, artifact, env!("CARGO_PKG_VERSION"));
+    store.put(&fixture).expect("put record");
+    let host = host(&data_dir, &store);
+
+    host.start(&id).expect("start fixture");
+    let mut sink = CollectSink::default();
+    let err = host
+        .stream(&id, "stream_gap", json!({}), &mut sink)
+        .expect_err("seq gap must fail the stream");
+    assert!(
+        err.message.contains("seq"),
+        "error must mention the seq gap, got: {}",
+        err.message
+    );
+    host.stop(&id, Duration::from_secs(2)).expect("stop");
+}
+
 /// 回归：`stop` 之后不得被监管线程当作崩溃自动重启
 ///
 /// 监管线程每 250 ms 轮询一次存活状态，崩溃退避从 1 s 起。停机后 1.6 s 仍
@@ -855,6 +930,16 @@ fn live_session_survives_heartbeat_windows() {
         interval: Duration::from_millis(150),
         miss_limit: 3,
     });
+    // 覆盖值必须真的生效：`Arc::get_mut` 静默失败曾让这里退回 15 s 默认值，
+    // 用例随之变成必然通过的空断言
+    assert_eq!(
+        host.heartbeat_for_test(),
+        Heartbeat {
+            interval: Duration::from_millis(150),
+            miss_limit: 3,
+        },
+        "with_heartbeat must take effect"
+    );
 
     let info = host.start(&id).expect("start fixture");
     std::thread::sleep(Duration::from_millis(1_200));

@@ -9,13 +9,14 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { createMockHost, type InboundFrame } from "../src/testing.js";
+import type { RejectCode } from "../src/protocol.js";
 import { chatBridge } from "./fixtures.js";
 
 interface FrameCase {
   readonly id: string;
   readonly kind: "handshake" | "call" | "cancel" | "unknown-frame";
   readonly description?: string;
-  readonly reject?: { readonly code: string; readonly message: string };
+  readonly reject?: { readonly code: RejectCode; readonly message: string };
   readonly inject?: Record<string, unknown>;
   readonly op?: string;
   readonly input?: unknown;

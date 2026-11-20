@@ -248,6 +248,7 @@ pub(crate) fn handshake(
         next_id: AtomicU64::new(1),
         seq,
         alive: AtomicBool::new(true),
+        close_reason: Mutex::new(None),
         last_pong: AtomicU64::new(0),
         ping_seq: AtomicU64::new(0),
         stopping: AtomicBool::new(false),
@@ -309,6 +310,8 @@ pub(crate) struct SessionInner {
     next_id: AtomicU64,
     seq: AtomicU64,
     alive: AtomicBool,
+    /// 关闭原因：`close` 记录，宿主据此写出可诊断的 `last_error`
+    close_reason: Mutex<Option<String>>,
     last_pong: AtomicU64,
     ping_seq: AtomicU64,
     stopping: AtomicBool,
@@ -375,6 +378,11 @@ impl SessionInner {
     /// 是否存活
     pub(crate) fn is_alive(&self) -> bool {
         self.alive.load(Ordering::SeqCst)
+    }
+
+    /// 关闭原因（`close` 第一次调用时写入）
+    pub(crate) fn close_reason(&self) -> Option<String> {
+        self.close_reason.lock().ok().and_then(|slot| slot.clone())
     }
 
     /// 是否正在优雅停机
@@ -495,6 +503,8 @@ impl SessionInner {
         }
         let deadline = Instant::now() + timeout;
         let mut total = 0_usize;
+        // seq 从 0 连续递增（plugins.md §6.5）；缺口即终止流
+        let mut expected_seq = 0_u64;
         loop {
             let now = Instant::now();
             if now >= deadline {
@@ -507,6 +517,17 @@ impl SessionInner {
             let wait = (deadline - now).min(Duration::from_secs(60));
             match rx.recv_timeout(wait) {
                 Ok(frame) => {
+                    if frame.seq != expected_seq {
+                        self.cancel(id, "protocol");
+                        return Err(HostError::new(
+                            port::plugin::ErrorCode::Internal,
+                            format!(
+                                "stream {op} broke the seq sequence: got {}, expected {expected_seq}",
+                                frame.seq
+                            ),
+                        ));
+                    }
+                    expected_seq += 1;
                     total = total.saturating_add(
                         serde_json::to_vec(&frame.chunk).map_or(0, |bytes| bytes.len()),
                     );
@@ -835,6 +856,13 @@ impl SessionInner {
     }
 
     fn close(&self, reason: &str) {
+        // 只记录第一次关闭原因：后续调用（如监管线程的 `killed`）不该覆盖
+        // 真正触发关闭的事件
+        if let Ok(mut slot) = self.close_reason.lock()
+            && slot.is_none()
+        {
+            *slot = Some(reason.to_owned());
+        }
         if self.alive.swap(false, Ordering::SeqCst) {
             if let Ok(writer) = self.writer.lock() {
                 writer.shutdown();

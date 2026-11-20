@@ -7,24 +7,12 @@
 
 import { z } from "zod";
 
+import type { OpenCapabilityName } from "./contracts/v1.js";
 import type { OpSpecLike, ResolvedOp } from "./descriptor.js";
 import type { CtxFor } from "./ctx.js";
 
-/** 能力名（plugins.md §8.2），未开放项不在列表内 */
-export type Capability =
-  | "events"
-  | "storage:kv"
-  | "server:read"
-  | "console:read"
-  | "console:write"
-  | "net:outbound"
-  | "secret:rw"
-  | "backup"
-  | "files:read"
-  | "files:write"
-  | "server:lifecycle"
-  | "content"
-  | "java";
+/** 能力名（plugins.md §8.2）：来自生成契约，未开放项不在列表内 */
+export type Capability = OpenCapabilityName;
 
 /**
  * 能力驱动的插件上下文：`ctx` 上只出现已声明能力对应的方法组。

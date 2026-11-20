@@ -1,22 +1,32 @@
 /**
  * 帧协议（plugins.md §6）
  *
+ * 契约类型（帧、错误码、能力名、限额、退出码）全部来自
+ * `./contracts/v1.js`——该文件由 `protocol::plugin::contracts` 生成，
+ * 禁止手写（§14.4）。本文件只保留编解码与协议错误。
+ *
  * 一行一帧 JSON + `\n`，字段 snake_case。已知类型缺关键字段视为协议错误
  * （终止会话）；未知 `type` 忽略并保持连接。单行 ≤ 1 MiB、嵌套深度 ≤ 32
  * 在读取层检查。
  */
 
-/** 插件协议版本；与宿主 `PLUGIN_PROTOCOL_VERSION` 一致 */
-export const PROTOCOL_VERSION = 1;
+import {
+  ERROR_CATEGORY,
+  MAX_FRAME_BYTES,
+  MAX_JSON_DEPTH,
+  PROTOCOL_VERSION,
+  RETRYABLE_ERRORS,
+  type CallFrame,
+  type CancelFrame,
+  type ErrorCode,
+  type InboundFrame,
+  type OutboundFrame,
+  type ResultFrame,
+  type WelcomeLimits,
+  type WireError,
+} from "./contracts/v1.js";
 
-/** 插件 API 主版本；与宿主 `PLUGIN_API_VERSION` 一致 */
-export const PLUGIN_API_VERSION = 1;
-
-/** 单帧字节上限 */
-export const MAX_FRAME_BYTES = 1024 * 1024;
-
-/** JSON 嵌套深度上限 */
-export const MAX_JSON_DEPTH = 32;
+export * from "./contracts/v1.js";
 
 /** 协议错误：必须终止会话 */
 export class ProtocolError extends Error {
@@ -25,155 +35,6 @@ export class ProtocolError extends Error {
     this.name = "ProtocolError";
   }
 }
-
-// ---------------------------------------------------------------------------
-// 帧类型
-// ---------------------------------------------------------------------------
-
-/** 插件 → 宿主：握手 */
-export interface HelloFrame {
-  readonly type: "hello";
-  readonly token: string;
-  readonly api: number;
-  readonly plugin_id: string;
-  readonly plugin_version: string;
-  readonly platform: string;
-  readonly pid: number;
-  readonly requested: readonly string[];
-  readonly subscriptions: readonly string[];
-}
-
-export interface WelcomeLimits {
-  readonly inflight: number;
-  readonly frame_bytes: number;
-  readonly event_queue: number;
-  readonly log_lines_per_sec: number;
-}
-
-/** 宿主 → 插件：授予 */
-export interface WelcomeFrame {
-  readonly type: "welcome";
-  readonly session_id: string;
-  readonly host_version: string;
-  readonly granted: readonly string[];
-  readonly limits: WelcomeLimits;
-  readonly config: { readonly revision: number; readonly values: unknown };
-  readonly scope: { readonly kind: string; readonly server?: string };
-}
-
-/** 宿主 → 插件：拒绝握手 */
-export interface RejectFrame {
-  readonly type: "reject";
-  readonly code: string;
-  readonly message: string;
-  readonly details?: unknown;
-}
-
-/** 宿主 → 插件：事件投递 */
-export interface EventFrame {
-  readonly type: "event";
-  readonly seq: number;
-  readonly kind: string;
-  readonly at: string;
-  readonly server?: string;
-  readonly data: unknown;
-}
-
-/** 双向：调用 */
-export interface CallFrame {
-  readonly type: "call";
-  readonly id: number;
-  readonly op?: string;
-  readonly capability?: string;
-  readonly method?: string;
-  readonly contract?: string;
-  readonly input: unknown;
-}
-
-export interface WireError {
-  readonly code: string;
-  readonly category: string;
-  readonly retryable: boolean;
-  readonly message: string;
-}
-
-/** 双向：调用结果 */
-export interface ResultFrame {
-  readonly type: "result";
-  readonly id: number;
-  readonly ok: boolean;
-  readonly output?: unknown;
-  readonly error?: WireError;
-}
-
-/** 插件 → 宿主：流式分块 */
-export interface StreamFrame {
-  readonly type: "stream";
-  readonly id: number;
-  readonly seq: number;
-  readonly chunk: unknown;
-  readonly done: boolean;
-}
-
-/** 双向：取消 */
-export interface CancelFrame {
-  readonly type: "cancel";
-  readonly id: number;
-  readonly reason?: string;
-}
-
-/** 宿主 → 插件：配置变更（需回 result） */
-export interface ConfigFrame {
-  readonly type: "config";
-  readonly id: number;
-  readonly revision: number;
-  readonly values: unknown;
-}
-
-/** 宿主 → 插件：心跳 */
-export interface PingFrame {
-  readonly type: "ping";
-  readonly n: number;
-}
-
-/** 插件 → 宿主：心跳回应 */
-export interface PongFrame {
-  readonly type: "pong";
-  readonly n: number;
-}
-
-/** 宿主 → 插件：优雅退出 */
-export interface ShutdownFrame {
-  readonly type: "shutdown";
-  readonly grace_ms: number;
-}
-
-/** 未知 `type`：忽略并记日志 */
-export interface UnknownFrame {
-  readonly type: "unknown";
-  readonly kind: string;
-}
-
-/** 宿主 → 插件方向的帧 */
-export type InboundFrame =
-  | WelcomeFrame
-  | RejectFrame
-  | EventFrame
-  | CallFrame
-  | ResultFrame
-  | CancelFrame
-  | ConfigFrame
-  | PingFrame
-  | ShutdownFrame
-  | UnknownFrame;
-
-/** 插件 → 宿主方向的帧 */
-export type OutboundFrame =
-  | HelloFrame
-  | ResultFrame
-  | StreamFrame
-  | CallFrame
-  | PongFrame;
 
 // ---------------------------------------------------------------------------
 // 编解码
@@ -292,7 +153,7 @@ export function parseFrame(text: string): InboundFrame {
     case "reject":
       return {
         type: "reject",
-        code: requireString(frame, "code"),
+        code: requireString(frame, "code") as RejectCodeText,
         message: requireString(frame, "message"),
         details: frame["details"],
       };
@@ -313,8 +174,10 @@ export function parseFrame(text: string): InboundFrame {
         capability: optionalString(frame, "capability"),
         method: optionalString(frame, "method"),
         contract: optionalString(frame, "contract"),
+        target: optionalString(frame, "target"),
+        trace: optionalString(frame, "trace"),
         input: frame["input"],
-      };
+      } as CallFrame;
     case "result": {
       const ok = frame["ok"];
       if (typeof ok !== "boolean") {
@@ -363,35 +226,18 @@ export function encodeFrame(frame: OutboundFrame): string {
   return `${JSON.stringify({ v: PROTOCOL_VERSION, ...frame })}\n`;
 }
 
-/** 构造线上错误对象 */
+/** 构造线上错误对象；分类与可重试性来自生成的契约表 */
 export function wireError(code: string, message: string): WireError {
+  const known = (ERROR_CATEGORY as Record<string, string | undefined>)[code];
   return {
-    code,
-    category: categoryOfText(code),
-    retryable: code === "timeout" || code === "unavailable" || code === "crashed",
+    code: code as ErrorCode,
+    category: (known ?? "failure") as WireError["category"],
+    retryable: (RETRYABLE_ERRORS as readonly string[]).includes(code),
     message,
   };
 }
 
-function categoryOfText(code: string): string {
-  switch (code) {
-    case "invalid_input":
-    case "limit_exceeded":
-    case "unsupported":
-      return "usage";
-    case "not_found":
-      return "not_found";
-    case "denied":
-      return "unauthorized";
-    case "conflict":
-      return "conflict";
-    case "cancelled":
-      return "cancelled";
-    case "timeout":
-    case "unavailable":
-    case "crashed":
-      return "backend";
-    default:
-      return "failure";
-  }
-}
+/** `reject.code` 的线上文本；未知码由宿主日志记录，插件按 `rejected` 处理 */
+type RejectCodeText = InboundRejectCode;
+
+type InboundRejectCode = Extract<InboundFrame, { type: "reject" }>["code"];
