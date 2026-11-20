@@ -1190,6 +1190,32 @@ pub(crate) fn plugin_rollback() -> &'static str {
 }
 
 #[must_use]
+pub(crate) fn plugin_revocations() -> &'static str {
+    t(
+        "撤销列表：查看命中的记录，或从文件 / URL 更新",
+        "revocation list: show entries or update from a file / URL",
+    )
+}
+
+#[must_use]
+pub(crate) fn plugin_revocation_file_arg() -> &'static str {
+    t("撤销列表 JSON 文件", "revocation list JSON file")
+}
+
+#[must_use]
+pub(crate) fn plugin_revocation_url_arg() -> &'static str {
+    t(
+        "撤销列表 URL（仅 HTTPS）",
+        "revocation list URL (HTTPS only)",
+    )
+}
+
+#[must_use]
+pub(crate) fn plugin_revocation_sha256_arg() -> &'static str {
+    t("期望的 sha256", "expected sha256")
+}
+
+#[must_use]
 pub(crate) fn plugin_doctor() -> &'static str {
     t(
         "体检：记录、产物、宿主连通性",

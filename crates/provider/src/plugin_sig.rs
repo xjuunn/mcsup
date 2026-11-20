@@ -333,7 +333,7 @@ fn decode(raw: &str) -> Result<Vec<u8>, String> {
 }
 
 #[cfg(unix)]
-fn check_permissions(
+pub(crate) fn check_permissions(
     path: &Path,
     metadata: &std::fs::Metadata,
     is_dir: bool,
@@ -357,7 +357,7 @@ fn check_permissions(
 }
 
 #[cfg(not(unix))]
-fn check_permissions(
+pub(crate) fn check_permissions(
     _path: &Path,
     _metadata: &std::fs::Metadata,
     _is_dir: bool,

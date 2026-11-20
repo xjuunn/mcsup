@@ -29,6 +29,7 @@ use domain::java::{JavaMajor, JavaRuntime};
 use domain::plugin::capability::Capability;
 use domain::plugin::error::PluginErrorCode;
 use domain::plugin::manifest::Manifest;
+use domain::plugin::revocation::RevocationList;
 use domain::plugin::state::PluginState;
 use domain::plugin::{PluginId, PluginScope};
 use domain::server::artifact::Checksum;
@@ -818,6 +819,29 @@ impl PluginRecord {
             .filter_map(|raw| Capability::parse(raw).ok())
             .collect()
     }
+}
+
+/// 撤销列表的缓存读写
+///
+/// 判定（命中哪个版本、是否为空表）在 `domain::plugin::revocation`；这里只
+/// 负责把列表落盘与读回，实现层决定权限与原子性。
+///
+/// `load` 在缓存不存在时返回空列表；缓存存在但读不懂时必须报错——撤销列表
+/// 是安全设施，读不懂不能当放行。
+pub trait PluginRevocations: Send + Sync {
+    /// 读取列表；缓存不存在时返回空列表
+    ///
+    /// # Errors
+    ///
+    /// 缓存非法、权限异常或读取失败时返回 [`HostError`]
+    fn load(&self) -> Result<RevocationList, HostError>;
+
+    /// 覆盖写入列表
+    ///
+    /// # Errors
+    ///
+    /// 写盘失败时返回 [`HostError`]
+    fn store(&self, list: &RevocationList) -> Result<(), HostError>;
 }
 
 /// 安装记录存储

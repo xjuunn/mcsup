@@ -22,6 +22,7 @@ use domain::plugin::capability::{self, Capability};
 use domain::plugin::descriptor::Descriptor;
 use domain::plugin::error::PluginErrorCode;
 use domain::plugin::manifest::Manifest;
+use domain::plugin::revocation::{RevocationList, revoked_message};
 use domain::plugin::state::{PluginEvent, PluginState};
 use domain::plugin::{PluginId, PluginScope};
 use domain::server::artifact::{Checksum, ChecksumAlgorithm};
@@ -34,9 +35,9 @@ use port::plugin::{
     BackupEntry, BackupOps, ConfigOps, ConsoleIo, ConsoleLine, ConsolePage, ContentEntry,
     ContentInstallRequest, ContentOps, FileEntry, FileOps, HostError, JavaOps, KvStore,
     MAX_CONSOLE_LINE_BYTES, MAX_CONSOLE_LINES, MAX_FILE_BYTES, NetPolicy, PluginArtifact,
-    PluginConfigStore, PluginRecord, PluginRuntimeStatus, PluginStore, PluginSupervisor,
-    SecretStore, ServerLifecycle, ServerRead, ServerStatusView, ServerSummary, SessionInfo,
-    StoredConfig,
+    PluginConfigStore, PluginRecord, PluginRevocations, PluginRuntimeStatus, PluginStore,
+    PluginSupervisor, SecretStore, ServerLifecycle, ServerRead, ServerStatusView, ServerSummary,
+    SessionInfo, StoredConfig,
 };
 use port::{ErrorCategory, RepositoryError, StopOutcome, StopSpec};
 use serde_json::Value;
@@ -143,6 +144,8 @@ pub struct PluginService {
     plugin_data: PathBuf,
     /// `{data_dir}/mcsup/logs/plugins`
     log_root: PathBuf,
+    /// 撤销检查；`None` 表示不检查撤销状态
+    revocations: Option<Arc<dyn PluginRevocations>>,
 }
 
 impl std::fmt::Debug for PluginService {
@@ -189,7 +192,19 @@ impl PluginService {
             plugins_root,
             plugin_data,
             log_root,
+            revocations: None,
         }
+    }
+
+    /// 启用撤销检查
+    ///
+    /// 构建器缺省不检查：撤销列表是外部设施的产物，没有它时插件照常运行，
+    /// 见 `docs/plugins.md` §16.4 的「不可用时不得阻断」。缓存格式与权限在
+    /// 实现层（`provider`），判定只在这里。
+    #[must_use]
+    pub fn with_revocations(mut self, revocations: Arc<dyn PluginRevocations>) -> Self {
+        self.revocations = Some(revocations);
+        self
     }
 
     /// 配置读写句柄（宿主控制通道与 CLI 共用）
@@ -202,6 +217,89 @@ impl PluginService {
     #[must_use]
     pub fn host_available(&self) -> bool {
         self.supervisor.is_some()
+    }
+
+    /// 写入撤销列表
+    ///
+    /// 新列表整体替换旧列表，不合并：撤销可以撤回，合并会让已解除的记录永远
+    /// 留在本地。
+    ///
+    /// # Errors
+    ///
+    /// 未启用撤销检查时返回 [`PluginError::Usage`]；写入失败返回宿主错误
+    pub fn store_revocations(&self, list: &RevocationList) -> Result<(), PluginError> {
+        let store = self.revocation_store()?;
+        store.store(list)?;
+        self.audit.record(&AuditEvent {
+            at: now_secs(),
+            plugin: "*".to_owned(),
+            action: "security:revocations:update".to_owned(),
+            capability: None,
+            result: AuditResult::Allowed,
+            detail: Some(format!("{} entries", list.entries.len())),
+        });
+        Ok(())
+    }
+
+    /// 读取撤销列表（未启用检查时返回空表）
+    ///
+    /// # Errors
+    ///
+    /// 缓存存在但读不懂时返回错误
+    pub fn list_revocations(&self) -> Result<RevocationList, PluginError> {
+        match &self.revocations {
+            Some(store) => Ok(store.load()?),
+            None => Ok(RevocationList::default()),
+        }
+    }
+
+    /// 撤销列表能否被读取（`doctor` 用）
+    ///
+    /// # Errors
+    ///
+    /// 缓存存在但读不懂时返回错误；未启用检查视为可读。
+    pub fn revocation_list_check(&self) -> Result<(), PluginError> {
+        self.list_revocations().map(|_| ())
+    }
+
+    /// 记录的版本是否被撤销
+    ///
+    /// 返回弹给用户的说明文本，未命中返回 `None`。
+    ///
+    /// # Errors
+    ///
+    /// 撤销列表存在但读不懂时返回错误；未启用检查返回 `Ok(None)`
+    pub fn revocation(&self, record: &PluginRecord) -> Result<Option<String>, PluginError> {
+        let Some(list) = self.revocations.as_ref().map(|store| store.load()) else {
+            return Ok(None);
+        };
+        Ok(Some(list?).and_then(|list| {
+            list.hit(record.id.as_str(), &record.version)
+                .map(|entry| revoked_message(entry, &record.version))
+        }))
+    }
+
+    /// 拒绝启动时统一套用的撤销判定
+    fn ensure_not_revoked(&self, record: &PluginRecord) -> Result<(), PluginError> {
+        match self.revocation(record) {
+            Ok(None) => Ok(()),
+            Ok(Some(message)) => Err(PluginError::Denied(message)),
+            // 列表读不懂只记录，不阻断：安全设施不可用不等于插件有问题。
+            Err(err) => {
+                tracing::warn!(
+                    plugin = %record.id,
+                    error = %err,
+                    "revocation list unavailable; skipping revocation check"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn revocation_store(&self) -> Result<&Arc<dyn PluginRevocations>, PluginError> {
+        self.revocations.as_ref().ok_or_else(|| {
+            PluginError::Usage("plugin revocation checking is not configured".to_owned())
+        })
     }
 
     /// 已安装版本的 descriptor（`ops` 命令与调用的参数校验共用）
@@ -417,6 +515,7 @@ impl PluginService {
                 "plugin {id} still needs approval: {pending}; run `mcsup plugin grant {id} <capability>`"
             )));
         }
+        self.ensure_not_revoked(&record)?;
         // 待确认状态先走 `Approved`，其余从离线状态直接 `Enabled`。
         let from = record.last_state;
         let next = if from == PluginState::PendingApproval {
@@ -582,6 +681,7 @@ impl PluginService {
                 "plugin {id} is not enabled; run `mcsup plugin enable {id}`"
             )));
         }
+        self.ensure_not_revoked(&record)?;
         let supervisor = self.supervisor()?;
         Ok(supervisor.start(id)?)
     }

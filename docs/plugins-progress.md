@@ -13,7 +13,7 @@
 | M2 | 写能力、出站代发、契约路由、配置回滚与隔离 | 完成 |
 | M3 | 生命周期、备份、文件、内容能力；六类展示投影 | 完成（REST / WS、MCP 入口不在本仓库） |
 | M4 | `java` 能力 | 完成 |
-| M4 | 签名 / provenance / 撤销列表、Python / Java SDK、市场审核 | 未开始 |
+| M4 | 签名 / provenance / 撤销列表、Python / Java SDK、市场审核 | 部分完成（minisign 与撤销列表已完成；provenance / Sigstore / SDK / 市场审核未开始） |
 | M4 | 性能实测与回归基线 | 部分完成（descriptor / 帧 / 分发 / 扇出已测，见「性能」） |
 
 ## 已完成
@@ -63,7 +63,7 @@
 - 六类展示：`form` / `table` / `detail` / `chat` / `log` / `metrics` 的形状与
   引用校验在 `domain::plugin::descriptor`，CLI `plugin ops` 只做投影。
 
-### M4：Java 能力与 minisign 签名
+### M4：Java 能力、minisign 签名与撤销列表
 
 - `java`：`list` / `install` / `remove` 三个帧，实现落
   `service::plugin::HostApiImpl`，安装固定 `jdk` 包类型、厂商交给来源排序，
@@ -77,6 +77,11 @@
 - 未签名策略收敛在 `service`：本地来源可 `--allow-unsigned`（记录
   `signed = false` / `untrusted`），远端来源无签名一律拒绝；`plugin update`
   沿用原产物的信任姿态。`plugin verify` 对未安装的压缩包重跑来源校验。
+- 撤销列表：判定（id 精确匹配、空版本 = 全部、非法条目整体拒绝）在
+  `domain::plugin::revocation`，缓存读写与权限（`0600`、原子替换、拒绝符号
+  链接）在 `provider::plugin_revoke`，经 `port::plugin::PluginRevocations` 注入
+  `service`。`enable` / `start` 在状态变更前拒绝命中版本；列表不可用时只记
+  `warning`，`plugin doctor` 报出。CLI 为 `plugin revocations [import|fetch]`。
 
 ## 与设计文档的偏差
 
@@ -93,10 +98,11 @@
 
 按依赖顺序：
 
-1. 签名链路剩余部分：Sigstore（cosign）证书链与身份绑定、provenance、撤销
-   列表。minisign / ed25519 与「未签名默认拒绝、`--allow-unsigned` 仅本地」
+1. 签名链路剩余部分：Sigstore（cosign）证书链与身份绑定、provenance。
+   minisign / ed25519、撤销列表与「未签名默认拒绝、`--allow-unsigned` 仅本地」
    已完成。
-2. 撤销列表命中时拒绝启动，并与 `quarantine` / `block` 共用状态迁移。
+2. 撤销列表的自动拉取：当前只能 `plugin revocations fetch` 手工更新，尚无内置
+   定时任务与上游地址配置（需市场侧先确定地址与格式）。
 3. 补齐 `BENCH-001` / `002` / `005` / `006`：握手冷 / 热启动、宿主空闲内存、
    100 个非 resident 插件的安装与列表。需要让基准能拉起 fixture 子进程
    （当前 fixture 是 `mcsup-plugin` 的测试 bin，依赖包不会为基准构建它）。

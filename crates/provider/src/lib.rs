@@ -11,6 +11,8 @@ pub mod neoforge;
 pub mod papermc;
 pub mod plugin;
 pub mod plugin_net;
+pub mod plugin_revoke;
+pub mod plugin_revoke_file;
 pub mod plugin_sig;
 pub mod purpur;
 pub mod quilt;

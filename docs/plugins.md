@@ -1855,8 +1855,13 @@ Windows 还需拒绝保留名（`CON`、`NUL` 等）与尾随点 / 空格。
 - 未签名策略在 `service`：只有本地来源可以 `--allow-unsigned`，放行后
   `signed` / `trusted` 仍为 `false`，安装记录如实标记。
 
-Sigstore、provenance、撤销列表尚未实现：仓库没有证书链解析与信任根，
-接上之前的签名只认 minisign 信任库。
+Sigstore 与 provenance 尚未实现：仓库没有证书链解析与信任根，接上之前的签名
+只认 minisign 信任库。
+
+撤销列表已实现（§16.4）：`plugins/revoked.json` 由
+`mcsup plugin revocations import|fetch` 写入，权限 `0600`、原子替换；命中
+「插件 id + 版本」时 `enable` / `start` 一律 `denied`，`versions: []` 表示整个
+插件下架。列表读不懂或不可用时只记 `warning`、不阻断已安装插件。
 
 ## 15.4 安装流水线
 
@@ -1968,7 +1973,7 @@ Sigstore、provenance、撤销列表尚未实现：仓库没有证书链解析�
 
 | 机制 | 行为 |
 | --- | --- |
-| 撤销列表 | 宿主定期拉取；命中的版本拒绝启动并提示升级 |
+| 撤销列表 | 宿主定期拉取；命中的版本拒绝启动并提示升级。当前实现由 `mcsup plugin revocations import` / `fetch` 写入 `plugins/revoked.json`，尚无内置定时拉取 |
 | 本地拉黑 | `plugin block <id>` 立即停用且不再自动启动 |
 | 举报 | CLI / Web 生成带诊断包的举报；不包含密钥与聊天内容 |
 | 隔离 | `plugin quarantine <id>` 保留产物但禁止运行，用于取证 |
@@ -2098,6 +2103,7 @@ mcsup plugin release <id>
 mcsup plugin logs <id> [--follow] [--tail <n>]
 mcsup plugin verify <path|id>
 mcsup plugin rollback <id>
+mcsup plugin revocations [import <file>|fetch <url> [--sha256 <hex>]]
 mcsup plugin doctor [--json]
 mcsup __plugin-host --data-dir <path> [--idle-timeout <secs>]   # 隐藏
 ```

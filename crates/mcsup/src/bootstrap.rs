@@ -693,10 +693,15 @@ impl McsupBuilder {
             )),
             Some(Arc::new(provider::plugin::PluginArtifactVerifier::new())),
             Arc::clone(&plugin_audit),
-            plugins_root,
+            plugins_root.clone(),
             plugin_data,
             plugin_logs,
-        );
+        )
+        .with_revocations(Arc::new(
+            provider::plugin_revoke_file::FileRevocations::new(
+                plugins_root.join(provider::plugin_revoke::REVOCATION_FILE),
+            ),
+        ));
 
         let mcsup = Mcsup {
             workspaces,

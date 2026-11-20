@@ -1021,6 +1021,15 @@ panic，只能返回错误。
 | `INST-VER-011` | 签名缺失 | 按 H22 处理 |
 | `INST-VER-012` | 撤销列表命中 | 拒绝启动 |
 
+撤销相关的落位（`provider::plugin_revoke` 的缓存用例 + `crates/service/tests/plugin_revocation.rs`）：
+
+- `INST-VER-012`：命中版本 `enable` 被拒（`Unauthorized` / 退出码 6）；
+  `versions: []` 视为全部版本；其他版本不受影响。
+- 列表读不懂时不阻断已安装插件，`plugin doctor` 报 `warning`；
+  未装配撤销检查时不读文件也不阻断。
+- CLI 契约：`plugin revocations import` / 查看 / 命中后 `enable` 退出码 6、
+  非法列表整体拒绝（退出码 2）、`fetch` 只接受 https。
+
 ## 11.3 打包（`INST-PKG`）
 
 | ID | 场景 | 期望 |
@@ -1079,8 +1088,10 @@ panic，只能返回错误。
   单测（内容篡改、trusted comment 篡改、错 key、未知 key id、权限）。
 - `INST-SIG-009` / `010`：`crates/service/tests/plugin_signing.rs`（本地放行与
   远端拒绝）；`plugin update` 的信任姿态沿用同处在 CLI 契约测试覆盖。
-- `INST-SIG-001` / `003` / `004` / `005` / `006` / `011` 依赖 Sigstore 证书链、
-  身份绑定、provenance 与撤销列表，尚未实现，不写「通过」。
+- `INST-SIG-006`（撤销）：按「插件 id + 版本」命中即拒绝启动，与签名无关，
+  见 `crates/service/tests/plugin_revocation.rs`。
+- `INST-SIG-001` / `003` / `004` / `005` / `011` 依赖 Sigstore 证书链、身份绑定与
+  provenance，尚未实现，不写「通过」。
 
 ## 11.6 安全（`SEC-*`）
 

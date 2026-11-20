@@ -1183,12 +1183,34 @@ pub(crate) enum PluginAction {
     /// 回滚到上一版本
     #[command(about = crate::meta::plugin_rollback())]
     Rollback { id: String },
+    /// 撤销列表：查看生效的，或从文件 / URL 更新
+    #[command(about = crate::meta::plugin_revocations())]
+    Revocations {
+        #[command(subcommand)]
+        action: Option<PluginRevocationAction>,
+    },
     /// 体检：记录、产物、宿主连通性
     #[command(about = crate::meta::plugin_doctor())]
     #[command(visible_alias = "doc")]
     Doctor {
         #[arg(long, help = crate::meta::plugin_json_arg())]
         json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum PluginRevocationAction {
+    /// 从本地文件导入撤销列表
+    Import {
+        #[arg(help = crate::meta::plugin_revocation_file_arg())]
+        file: String,
+    },
+    /// 从 URL 拉取撤销列表
+    Fetch {
+        #[arg(help = crate::meta::plugin_revocation_url_arg())]
+        url: String,
+        #[arg(long, help = crate::meta::plugin_revocation_sha256_arg())]
+        sha256: Option<String>,
     },
 }
 

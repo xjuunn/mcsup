@@ -5,7 +5,7 @@
 //! 通道相连。管理命令在本进程完成文件与记录操作后通知宿主 `reload`。
 
 use crate::bootstrap;
-use crate::cli::{PluginAction, PluginConfigAction};
+use crate::cli::{PluginAction, PluginConfigAction, PluginRevocationAction};
 use crate::config;
 use crate::diagnostic::AppDiagnostic;
 use crate::output::{OutputFormat, Printer};
@@ -16,6 +16,7 @@ use mcsup::domain::plugin::PluginId;
 use mcsup::domain::plugin::capability::Capability;
 use mcsup::domain::plugin::descriptor::Descriptor;
 use mcsup::domain::plugin::manifest::Manifest;
+use mcsup::domain::plugin::revocation::RevocationList;
 use mcsup::domain::server::artifact::{Checksum, ChecksumAlgorithm};
 use mcsup::port::plugin::ArtifactVerifier as _;
 use mcsup::port::plugin::{ArtifactOrigin, StreamSink};
@@ -74,6 +75,7 @@ pub(crate) fn run(action: PluginAction, printer: Printer) -> Result<()> {
         PluginAction::Logs { id, follow, tail } => logs(&id, follow, tail, printer),
         PluginAction::Verify { target } => verify(&target, printer),
         PluginAction::Rollback { id } => rollback(&id, printer),
+        PluginAction::Revocations { action } => revocations(action, printer),
         PluginAction::Doctor { json } => doctor(printer, json),
     }
 }
@@ -802,6 +804,139 @@ fn set_flag(raw: &str, action: FlagAction, printer: Printer) -> Result<()> {
     )
 }
 
+fn revocations(action: Option<PluginRevocationAction>, printer: Printer) -> Result<()> {
+    let service = open()?;
+    let Some(action) = action else {
+        return print_revocations(&service.list_revocations()?, printer);
+    };
+    let max = mcsup::domain::plugin::revocation::MAX_REVOCATION_BYTES;
+    let bytes = match action {
+        PluginRevocationAction::Import { file } => {
+            let path = PathBuf::from(&file);
+            let metadata =
+                std::fs::metadata(&path).with_context(|| format!("read revocation list {file}"))?;
+            if metadata.len() > max {
+                return Err(
+                    AppDiagnostic::usage(format!("撤销列表超过 {max} 字节"), Some(file)).into(),
+                );
+            }
+            std::fs::read(&path).with_context(|| format!("read revocation list {file}"))?
+        }
+        PluginRevocationAction::Fetch { url, sha256 } => {
+            let spinner = TaskSpinner::new(
+                crate::i18n::pick(
+                    printer.lang(),
+                    "正在拉取撤销列表…",
+                    "fetching revocation list…",
+                ),
+                printer.is_human(),
+            );
+            let result = fetch_revocation_list(&url, sha256.as_deref(), max);
+            spinner.finish();
+            result?
+        }
+    };
+    let list = RevocationList::from_json(&bytes)
+        .map_err(|err| AppDiagnostic::usage(format!("撤销列表非法: {err}"), None))?;
+    service.store_revocations(&list)?;
+    print_revocations(&list, printer)
+}
+
+/// 十六进制 sha256
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+}
+
+/// 拉取撤销列表：只接受 HTTPS，响应带上限
+fn fetch_revocation_list(url: &str, sha256: Option<&str>, max: u64) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|err| AppDiagnostic::usage(format!("URL 非法: {url}"), Some(err.to_string())))?;
+    if parsed.scheme() != "https" {
+        return Err(AppDiagnostic::usage(format!("撤销列表只接受 https URL: {url}"), None).into());
+    }
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|err| anyhow!("build http client: {err}"))?;
+    let response = client
+        .get(parsed)
+        .send()
+        .map_err(|err| anyhow!("fetch revocation list: {err}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(anyhow!("fetch revocation list: HTTP {}", status.as_u16()));
+    }
+    if response.content_length().is_some_and(|len| len > max) {
+        return Err(anyhow!("revocation list exceeds {max} bytes"));
+    }
+    let mut bytes = Vec::new();
+    response
+        .take(max + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|err| anyhow!("read revocation list: {err}"))?;
+    if bytes.len() as u64 > max {
+        return Err(anyhow!("revocation list exceeds {max} bytes"));
+    }
+    if let Some(expected) = sha256 {
+        let actual = sha256_hex(&bytes);
+        if !actual.eq_ignore_ascii_case(expected.trim()) {
+            return Err(AppDiagnostic::conflict(
+                format!("撤销列表摘要不匹配: 期望 {expected}，实际 {actual}"),
+                None,
+            )
+            .into());
+        }
+    }
+    Ok(bytes)
+}
+
+fn print_revocations(list: &RevocationList, printer: Printer) -> Result<()> {
+    if printer.is_human() {
+        if list.entries.is_empty() {
+            printer.print_section(&crate::i18n::pick(
+                printer.lang(),
+                "当前没有撤销记录",
+                "no revoked plugins",
+            ));
+        } else {
+            let mut table = Table::new();
+            table.set_header(["插件", "版本", "原因"]);
+            for entry in &list.entries {
+                table.add_row([
+                    entry.id.clone(),
+                    if entry.versions.is_empty() {
+                        "*".to_owned()
+                    } else {
+                        entry.versions.join(", ")
+                    },
+                    entry.reason.clone().unwrap_or_default(),
+                ]);
+            }
+            printer.print_table(&table);
+        }
+    }
+    printer.print_outcome(
+        "",
+        &json!({
+            "updated_at": list.updated_at,
+            "entries": list.entries.iter().map(|entry| json!({
+                "id": entry.id,
+                "versions": entry.versions,
+                "reason": entry.reason,
+            })).collect::<Vec<_>>(),
+        }),
+    )
+}
+
 fn flag_text(record: &mcsup::port::plugin::PluginRecord) -> &'static str {
     match (record.blocked, record.quarantined) {
         (true, true) => "blocked+quarantined",
@@ -872,6 +1007,23 @@ fn logs(id: &str, follow: bool, tail: usize, printer: Printer) -> Result<()> {
         let _ = printer;
         std::thread::sleep(Duration::from_millis(500));
     }
+}
+
+/// 撤销命中时给出拒绝启动的诊断；列表不可用时跳过
+fn revoked_finding(
+    service: &PluginService,
+    record: &mcsup::port::plugin::PluginRecord,
+    skip: bool,
+) -> Option<Value> {
+    if skip {
+        return None;
+    }
+    let message = service.revocation(record).ok().flatten()?;
+    Some(json!({
+        "level": "error",
+        "id": record.id.to_string(),
+        "message": format!("{message}（拒绝启动；升级或卸载后重试）"),
+    }))
 }
 
 fn verify(target: &str, printer: Printer) -> Result<()> {
@@ -964,7 +1116,19 @@ fn doctor(printer: Printer, json: bool) -> Result<()> {
     let printer = json_printer(printer, json);
     let service = open()?;
     let records = service.list()?;
+    // 撤销列表读不懂只报一次，不逐插件重复：它是全局设施。
+    let revocation_error = match service.revocation_list_check() {
+        Ok(()) => None,
+        Err(err) => Some(err.to_string()),
+    };
     let mut findings: Vec<Value> = Vec::new();
+    if let Some(message) = &revocation_error {
+        findings.push(json!({
+            "level": "warning",
+            "id": Value::Null,
+            "message": format!("撤销列表不可用，已跳过撤销检查: {message}"),
+        }));
+    }
     for record in &records {
         let artifact = record.artifact_dir.clone();
         if !artifact.is_dir() {
@@ -973,6 +1137,10 @@ fn doctor(printer: Printer, json: bool) -> Result<()> {
                 "id": record.id.to_string(),
                 "message": format!("产物目录缺失: {}", artifact.display()),
             }));
+            continue;
+        }
+        if let Some(message) = revoked_finding(&service, record, revocation_error.is_some()) {
+            findings.push(message);
             continue;
         }
         let manifest_path = artifact.join("manifest.json");

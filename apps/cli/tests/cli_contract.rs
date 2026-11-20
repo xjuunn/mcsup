@@ -1610,6 +1610,88 @@ fn plugin_config_and_block_flags_are_visible_and_enforced() {
     assert_eq!(rows[0]["quarantined"], false);
 }
 
+/// `plugin revocations`：导入 → 查看 → 撤销命中阻止启用
+#[test]
+fn plugin_revocations_import_and_block_enable() {
+    let home = temp_home();
+    let artifact = home.path().join("revoked-plugin");
+    write_plugin_artifact(&artifact);
+    let out = run(
+        home.path(),
+        &[
+            "--output",
+            "json",
+            "plugin",
+            "install",
+            "--from",
+            artifact.to_str().expect("utf-8 path"),
+            "--allow-unsigned",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    let list_path = home.path().join("revoked.json");
+    std::fs::write(
+        &list_path,
+        r#"{"schema":1,"entries":[{"id":"demo","versions":[],"reason":"malware"}]}"#,
+    )
+    .expect("write revocation list");
+    let out = run(
+        home.path(),
+        &[
+            "--output",
+            "json",
+            "plugin",
+            "revocations",
+            "import",
+            list_path.to_str().expect("utf-8 path"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let list: serde_json::Value = serde_json::from_slice(&out.stdout).expect("列表输出对象");
+    assert_eq!(list["entries"][0]["id"], "demo");
+    assert_eq!(list["entries"][0]["reason"], "malware");
+
+    // 不带子命令 = 查看当前生效的列表
+    let out = run(home.path(), &["--output", "json", "plugin", "revocations"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let current: serde_json::Value = serde_json::from_slice(&out.stdout).expect("查看输出对象");
+    assert_eq!(current["entries"].as_array().expect("entries").len(), 1);
+
+    // 撤销命中：拒绝启用，退出码 6（Unauthorized）
+    let out = run(home.path(), &["plugin", "enable", "demo"]);
+    assert_eq!(out.status.code(), Some(6), "{}", stderr(&out));
+
+    // 非法列表整体拒绝，不落盘
+    std::fs::write(&list_path, b"not json").expect("write garbage");
+    let out = run(
+        home.path(),
+        &[
+            "plugin",
+            "revocations",
+            "import",
+            list_path.to_str().expect("utf-8 path"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+}
+
+/// 撤销列表只接受 https
+#[test]
+fn plugin_revocations_reject_plain_http() {
+    let home = temp_home();
+    let out = run(
+        home.path(),
+        &[
+            "plugin",
+            "revocations",
+            "fetch",
+            "http://127.0.0.1:1/revoked.json",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+}
+
 fn write_plugin_artifact(root: &Path) {
     std::fs::create_dir_all(root.join("bin")).expect("create bin");
     std::fs::write(
