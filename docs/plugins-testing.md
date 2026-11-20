@@ -223,7 +223,7 @@ TypeScript 侧用 `test("PROTO-FRM-004 ...")`，由报告器解析前缀。
 | 16.2 审核清单 | `INST-SIG-008` `SEC-SIG-006` | 自动审核项逐条 |
 | 18.3 退出码 | `CLI-EXIT-001..010` | 七类错误 + 插件特有场景 |
 | 19.1 审计 | `HOST-EVT-007` `CON-RTE-011` | 字段完整、无明文 |
-| 20.5 性能 | `BENCH-001..004` | 握手、调用、扇出、内存 |
+| 20.5 性能 | `BENCH-001..006` | 握手、调用、扇出、内存、列表 |
 | 20.0 条款追踪 | `PLAT-011` | 报告 ID 集合等于 `cases.json`，缺项多项均失败 |
 
 # 5. Conformance 规范
@@ -1395,10 +1395,21 @@ panic，只能返回错误。
 基准不进入 `check.sh`；M1 起每个里程碑跑一次，结果写入
 `docs/plugins-progress.md`。回归超过 20% 必须解释或修复。
 
-落位：`apps/bench/benches/plugin.rs` 覆盖 `BENCH-003`（`server:read` 分发
-开销）与 `BENCH-004`（事件扇出），跑法 `cargo bench -p bench --bench plugin`。
-`BENCH-001` / `002` / `005` / `006` 需要基准拉起 fixture 子进程与独立的宿主
-进程采样，尚未落位。
+落位（三个独立目标，均不进入 `check.sh`）：
+
+| 目标 | 覆盖 | 跑法 |
+| --- | --- | --- |
+| `apps/bench/benches/plugin.rs` | `BENCH-003`、`BENCH-004`、`BENCH-006` | `cargo bench -p bench --bench plugin` |
+| `apps/bench/benches/plugin_handshake.rs` | `BENCH-001`、`BENCH-002` | `cargo bench -p bench --bench plugin_handshake` |
+| `apps/bench/benches/plugin_memory.rs` | `BENCH-005` | `cargo bench -p bench --bench plugin_memory` |
+
+- `BENCH-001` / `002`：真实 `PluginHost` 拉起真实子进程。冷启动每次使用新拷贝
+  的 fixture（新 inode 的首次执行，含可执行校验），热启动复用同一产物目录。
+  自采样 30 次取 p95，超预算退出码非 0。fixture 是 `apps/bench` 自带的
+  `mcsup-plugin-bench-fixture`，只依赖门面，靠 `CARGO_BIN_EXE_*` 定位。
+- `BENCH-005`：基准把自身当宿主进程再拉一次，构造 `PluginHost` 后空闲，
+  父进程用 `ps` 采样 RSS（空宿主与 100 条记录各一次）。
+- `BENCH-006`：真实文件后端下 `PluginService::list` 100 条非 resident 记录。
 
 ---
 

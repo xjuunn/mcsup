@@ -1,7 +1,7 @@
-//! 插件热路径基准：descriptor 校验、帧编解码、宿主分发、事件扇出
+//! 插件热路径基准：descriptor 校验、帧编解码、宿主分发、事件扇出、列表
 //!
-//! 对应 `docs/plugins.md` §20.5 的可测部分。握手（冷 / 热启动）、空闲内存与
-//! 「100 个非 resident 插件」需要夹具二进制与真实子进程，不在本文件内。
+//! 对应 `docs/plugins.md` §20.5 中不需要真实子进程的部分。握手（冷 / 热
+//! 启动）在 `plugin_handshake.rs`，宿主空闲内存在 `plugin_memory.rs`。
 //! 跑法：`cargo bench -p bench --bench plugin`。
 
 // 基准夹具构造失败必须立刻可见（同 `hot_paths.rs` 的豁免说明）。
@@ -174,11 +174,99 @@ fn bench_event_fanout(c: &mut Criterion) {
     group.finish();
 }
 
+/// `BENCH-006`：100 个非 resident 插件的列表
+///
+/// 非 resident 意味着没有会话、没有进程，列表就是读 100 份安装记录并解析
+/// manifest。这里走真实文件后端（`PluginFileStore`），不用内存桩：落盘与
+/// 反序列化正是列表的主要开销。
+fn bench_list(c: &mut Criterion) {
+    use mcsup::domain::plugin::manifest::Manifest;
+    use mcsup::domain::plugin::state::PluginState;
+    use mcsup::domain::plugin::{PLUGIN_API_VERSION, PluginScope};
+    use mcsup::port::RepositoryError;
+    use mcsup::port::plugin::{
+        NoopAuditSink, PluginConfigStore, PluginRecord, PluginStore, StoredConfig,
+    };
+
+    struct NoConfig;
+
+    impl PluginConfigStore for NoConfig {
+        fn get(&self, _id: &PluginId) -> Result<Option<StoredConfig>, RepositoryError> {
+            Ok(None)
+        }
+
+        fn put(&self, _id: &PluginId, _config: &StoredConfig) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = mcsup::storage::plugin::PluginFileStore::open(&dir.path().join("db/plugins"))
+        .expect("open store");
+    for index in 0..100 {
+        let id = PluginId::parse(&format!("idle{index}")).expect("id");
+        let manifest = json!({
+            "schema": 1,
+            "id": id.as_str(),
+            "name": "Idle metadata",
+            "version": "1.0.0",
+            "api": PLUGIN_API_VERSION,
+            "entry": { "type": "process", "cmd": "bin/plugin" },
+            "capabilities": [],
+            "license": "MIT",
+        });
+        let raw = Manifest::from_json(&serde_json::to_vec(&manifest).expect("manifest json"))
+            .expect("valid manifest")
+            .raw;
+        let record = PluginRecord {
+            id: id.clone(),
+            version: "1.0.0".to_owned(),
+            api: PLUGIN_API_VERSION,
+            scope: PluginScope::Machine,
+            server: None,
+            enabled: false,
+            approved: BTreeSet::new(),
+            manifest: raw,
+            artifact_dir: dir.path().join("artifacts").join(id.as_str()),
+            installed_at: 0,
+            updated_at: 0,
+            last_state: PluginState::Disabled,
+            last_error: None,
+            previous_version: None,
+            source: None,
+            sha256: None,
+            signed: false,
+            blocked: false,
+            quarantined: false,
+        };
+        PluginStore::put(&store, &record).expect("put record");
+    }
+
+    // 宿主不可达时的 `PluginService::list`：只读记录，不触碰任何进程。
+    let service = mcsup::service::PluginService::new(
+        Arc::new(store) as Arc<dyn PluginStore>,
+        Arc::new(NoConfig),
+        None,
+        None,
+        None,
+        Arc::new(NoopAuditSink),
+        dir.path().join("plugins"),
+        dir.path().join("plugin-data"),
+        dir.path().join("logs"),
+    );
+    assert_eq!(service.list().expect("list").len(), 100);
+
+    c.bench_function("plugin_list/100_non_resident", |b| {
+        b.iter(|| service.list().expect("list"));
+    });
+}
+
 criterion_group!(
     benches,
     bench_descriptor,
     bench_frames,
     bench_dispatch,
-    bench_event_fanout
+    bench_event_fanout,
+    bench_list
 );
 criterion_main!(benches);

@@ -41,6 +41,9 @@ pub const REJECT_GRACE: Duration = Duration::from_secs(5);
 /// 非 resident 插件空闲多久后停止进程
 pub const IDLE_STOP_AFTER: Duration = Duration::from_secs(120);
 
+/// 旧会话退出后等待监管线程收尾的上限
+const SPAWN_SETTLE: Duration = Duration::from_secs(2);
+
 /// 退避序列（秒）
 const BACKOFF_SECS: [u64; 5] = [1, 2, 4, 8, 16];
 
@@ -292,6 +295,21 @@ impl PluginHost {
             .filter(|session| session.is_alive())
     }
 
+    /// 等监管线程把已退出的会话收走
+    ///
+    /// `stop` 依赖监管线程做崩溃/停机的分流，退出后要给它一点时间从会话表
+    /// 摘除；否则紧接着的 `start` 会撞上仍在表里的旧会话。
+    fn await_exit(&self, id: &PluginId, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let present = self.sessions.lock().is_ok_and(|map| map.contains_key(id));
+            if !present {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn ensure_session(&self, id: &PluginId) -> Result<Arc<SessionInner>, HostError> {
         if let Some(session) = self.session_of(id) {
             return Ok(session);
@@ -313,9 +331,19 @@ impl PluginHost {
                 .lock()
                 .map_err(|_| HostError::internal("starting set poisoned"))?;
             if !starting.insert(id.clone()) {
-                return Err(HostError::conflict(format!(
-                    "plugin {id} is already starting"
-                )));
+                // 上一个会话刚退出、监管线程尚未收走时也会走到这里。等它收尾
+                // 再判一次，避免把「重启刚完成」误报成并发启动。
+                drop(starting);
+                self.await_exit(id, SPAWN_SETTLE);
+                let mut starting = self
+                    .starting
+                    .lock()
+                    .map_err(|_| HostError::internal("starting set poisoned"))?;
+                if !starting.insert(id.clone()) {
+                    return Err(HostError::conflict(format!(
+                        "plugin {id} is already starting"
+                    )));
+                }
             }
         }
         let guard = StartingGuard {
@@ -635,8 +663,10 @@ impl PluginSupervisor for PluginHost {
         let Some(session) = self.session_of(id) else {
             return Err(HostError::conflict(format!("plugin {id} is not running")));
         };
+        // 不在这里摘除会话：监管线程按 `stopping` 标记判定这是用户停机，
+        // 先摘掉会让它看到「表里没有」而当作崩溃自动重启。
         session.shutdown(grace);
-        self.forget_session(id);
+        self.await_exit(id, Duration::from_secs(2));
         record_state(self.store.as_ref(), id, PluginState::Stopped, None);
         self.audit.record(&AuditEvent {
             at: now_secs(),

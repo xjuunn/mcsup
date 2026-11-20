@@ -310,6 +310,33 @@ fn host_starts_calls_streams_and_stops_fixture() {
     host.shutdown_all(Duration::from_secs(2));
 }
 
+/// 回归：`stop` 之后不得被监管线程当作崩溃自动重启
+///
+/// 监管线程每 250 ms 轮询一次存活状态，崩溃退避从 1 s 起。停机后 1.6 s 仍
+/// 没有会话，才算「停止」真的停住了；`stop` 先摘会话时这里会重新拉起。
+#[test]
+fn stopped_plugin_is_not_auto_restarted() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data_dir = dir.path().to_path_buf();
+    let id = fixture_id();
+    let artifact = install_fixture(&data_dir, &id);
+    let store = Arc::new(MemoryStore::default());
+    store
+        .put(&record(&id, artifact, env!("CARGO_PKG_VERSION")))
+        .expect("put record");
+    let host = host(&data_dir, &store);
+
+    host.start(&id).expect("start fixture");
+    host.stop(&id, Duration::from_secs(1))
+        .expect("stop fixture");
+
+    std::thread::sleep(Duration::from_millis(1600));
+    let status = host.status(&id).expect("status after stop");
+    assert_eq!(status.state, PluginState::Stopped);
+    assert_eq!(host.session_count(), 0, "stopped plugin must stay stopped");
+    host.shutdown_all(Duration::from_secs(1));
+}
+
 #[test]
 fn disabled_plugin_is_rejected_before_spawn() {
     let dir = tempfile::tempdir().expect("tempdir");

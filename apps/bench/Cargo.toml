@@ -7,7 +7,14 @@ license.workspace = true
 publish = false
 description = "MCSUP 高成本路径的基准测试（CAS / 扫描 / 序列化 / Provider 解析）"
 
-# 只有 benchmark 目标：没有用户可见的命令行入口。
+# 插件基准要拉起真实子进程：握手（`BENCH-001` / `002`）与空闲内存
+# （`BENCH-005`）都必须在独立进程里量。`CARGO_BIN_EXE_*` 只对同一个包的 bin
+# 生效，所以 fixture 由本包自带，且只依赖门面（apps 只允许依赖 `mcsup`）。
+[[bin]]
+name = "mcsup-plugin-bench-fixture"
+path = "src/bin/mcsup-plugin-bench-fixture.rs"
+doc = false
+
 # lib 只放样本构造，不给它套 harness（否则 `cargo bench` 会拿 criterion 的
 # 参数去跑普通 test 目标，报 "Unrecognized option"）。
 [lib]
@@ -25,12 +32,31 @@ name = "plugin"
 harness = false
 doc = false
 
+# 握手基准不是 criterion 统计：阈值按 p95 定义，自己采样并算分位。
+[[bench]]
+name = "plugin_handshake"
+harness = false
+doc = false
+
+# 空闲内存是进程级采样，同样不套 criterion。
+[[bench]]
+name = "plugin_memory"
+harness = false
+doc = false
+
 [dependencies]
-mcsup = { version = "0.1.0", path = "../../crates/mcsup", features = ["bootstrap", "backup"] }
+mcsup = { version = "0.1.0", path = "../../crates/mcsup", features = [
+    "bootstrap",
+    "backup",
+    "plugin",
+    "service",
+    "storage",
+] }
+# bin 目标不能使用 dev-dependencies，fixture 的 `json!` 与基准的构造都靠它。
+serde_json.workspace = true
 
 [dev-dependencies]
 criterion = { version = "0.8.0", default-features = false, features = ["cargo_bench_support"] }
-serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 

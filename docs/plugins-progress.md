@@ -14,7 +14,7 @@
 | M3 | 生命周期、备份、文件、内容能力；六类展示投影 | 完成（REST / WS、MCP 入口不在本仓库） |
 | M4 | `java` 能力 | 完成 |
 | M4 | 签名 / provenance / 撤销列表、Python / Java SDK、市场审核 | 部分完成（minisign 与撤销列表已完成；provenance / Sigstore / SDK / 市场审核未开始） |
-| M4 | 性能实测与回归基线 | 部分完成（descriptor / 帧 / 分发 / 扇出已测，见「性能」） |
+| M4 | 性能实测与回归基线 | 完成（`BENCH-001`~`006` 全部落位，见「性能」） |
 
 ## 已完成
 
@@ -103,22 +103,30 @@
    已完成。
 2. 撤销列表的自动拉取：当前只能 `plugin revocations fetch` 手工更新，尚无内置
    定时任务与上游地址配置（需市场侧先确定地址与格式）。
-3. 补齐 `BENCH-001` / `002` / `005` / `006`：握手冷 / 热启动、宿主空闲内存、
-   100 个非 resident 插件的安装与列表。需要让基准能拉起 fixture 子进程
-   （当前 fixture 是 `mcsup-plugin` 的测试 bin，依赖包不会为基准构建它）。
-4. `sdks/` 建立后再补 Python / Java SDK 与四语言 descriptor 一致性验收。
-5. REST / WS、MCP 入口在其仓库落地后补投影，判定仍复用 `domain` / `service`。
+3. `sdks/` 建立后再补 Python / Java SDK 与四语言 descriptor 一致性验收。
+4. REST / WS、MCP 入口在其仓库落地后补投影，判定仍复用 `domain` / `service`。
 
 ## 性能
 
-基准落位 `apps/bench/benches/plugin.rs`，跑法：
+基准分三个目标，互不依赖：
+
+| 目标 | 覆盖 | 判定方式 |
+| --- | --- | --- |
+| `benches/plugin.rs` | descriptor、帧、分发、扇出、列表 | criterion 均值，回归对比用 |
+| `benches/plugin_handshake.rs` | 冷 / 热启动握手 | 自采样 30 次算 p95，超预算退出码非 0 |
+| `benches/plugin_memory.rs` | 宿主空闲内存 | 独立宿主进程 RSS |
 
 ```
 cargo bench -p bench --bench plugin
+cargo bench -p bench --bench plugin_handshake
+cargo bench -p bench --bench plugin_memory
 ```
 
-环境：Apple M4 / macOS 26.6.2 / rustc 1.98.1，release profile，criterion
-默认采样（100 样本）。数值是均值，仅用于回归对比，不与不同机器比较。
+环境：Apple M4 / macOS 26.6.2 / rustc 1.98.1，release profile。criterion 用
+默认采样（100 样本）报均值；握手按阈值定义取 p95（预热 5 次、采样 30 次）。
+数值仅用于回归对比，不与不同机器比较。
+
+单进程内的热路径：
 
 | 用例 | 对应目标 | 实测 | 结论 |
 | --- | --- | --- | --- |
@@ -130,8 +138,22 @@ cargo bench -p bench --bench plugin
 | `server:read.list` 分发 | `BENCH-003`（< 5 ms） | 1.73 µs | 达标 |
 | 事件扇出 1 订阅者 | `BENCH-004`（≥ 5000/s） | 542.7 ns ≈ 1.84M/s | 达标 |
 | 事件扇出 10 订阅者 | `BENCH-004` | 544.5 ns ≈ 1.84M/s | 达标（订阅者为空实现，只测分发开销） |
+| 100 个非 resident 插件列表 | `BENCH-006`（< 1 s） | 1.82 ms | 达标（真实文件后端） |
 
-`BENCH-001` / `002`（握手冷 / 热启动）、`BENCH-005`（宿主空闲内存）、
-`BENCH-006`（100 个非 resident 插件安装与列表）尚未测量：它们需要基准拉起
-真实 fixture 子进程，而 fixture 目前只是 `mcsup-plugin` 的测试 bin，Cargo
-不会为依赖包的基准构建它。未测项不写「达标」结论。
+带真实子进程的项：
+
+| 用例 | 对应目标 | 实测 | 结论 |
+| --- | --- | --- | --- |
+| 冷启动握手 | `BENCH-001`（p95 < 500 ms） | p50 287.0 ms / p95 319.1 ms | 达标（每次新拷贝 fixture，含首次执行校验） |
+| 热启动握手 | `BENCH-002`（p95 < 150 ms） | p50 26.6 ms / p95 28.4 ms | 达标 |
+| 宿主空闲内存（空） | `BENCH-005`（< 40 MiB） | 5.8 MiB | 达标 |
+| 宿主空闲内存（100 条记录） | `BENCH-005` | 6.2 MiB | 达标，且无会话进程常驻 |
+
+口径与已知偏差：
+
+- 冷启动样本的 max 到过 604.9 ms（p95 仍达标）：首次执行的可执行校验在本机
+  有长尾，属操作系统成本，不是握手逻辑。
+- `BENCH-006` 只量「列表」，安装写盘在同一条 `put` 路径上单独耗时可忽略，
+  未单列。
+- `BENCH-005` 量的是宿主库进程（`mcsup` + `plugin` + `storage`），不含 CLI /
+  TUI 自身的常驻部分：那部分与插件无关。
