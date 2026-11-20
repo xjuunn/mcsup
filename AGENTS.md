@@ -365,6 +365,7 @@ Backend 只回答「在哪里执行」，不回答「能不能执行」——后
 | `docs/workspace.md` | 平台与工作目录布局、命名、身份与移动、init 判空与恢复、统一注册表语义 | 设计存储布局、实现 workspace / init、改动 create 落点、处理路径身份时 |
 | `docs/plugins.md` | 平台插件：分层落位、运行模型、帧协议、能力模型、manifest / descriptor、契约组合、Web 投影、SDK、安装与市场审核、阶段与验收 | 设计或实现插件、宿主、SDK、插件界面时 |
 | `docs/plugins-testing.md` | 插件测试规范：测试分层与所有权、用例 ID、需求追踪矩阵、conformance 格式、fixture 行为、覆盖率门禁、里程碑验收 | 实现或验收插件、宿主、SDK、Web 投影，或补测试用例时 |
+| `docs/sdk-design.md` | 插件 SDK 风格规约：单一内核与三层架构、Builder / Hooks 边界、类型安全支点、多语言策略、禁止项 | 设计或实现任何语言的插件 SDK、新增 Builder / Hook / 预设时 |
 
 新增代码时的判断顺序：
 
