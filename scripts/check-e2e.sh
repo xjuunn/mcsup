@@ -14,9 +14,9 @@ set -eu
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 
-# 与其他构建共用一份缓存；本脚本也能单独运行，所以要自己接入。
+# 与门禁其余步骤共用本 worktree 的构建缓存；本脚本也能单独运行，所以要自己接入。
 . ./scripts/dev-tools-env.sh
-mcsup_use_shared_target
+mcsup_use_local_target
 
 printf '\n==> e2e（CLI 端到端）\n'
 # 与 `test` 步同一套并行执行器，只是目标限定为 cli_e2e；单独跑时也只编这一个

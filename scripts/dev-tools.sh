@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 # dev-tools MCP 启动器（POSIX）。
 #
-# 与 dev-tools.cmd 同职责，见那边的注释：所有 worktree 共用一份构建产物，产物
+# 与 dev-tools.cmd 同职责，见那边的注释：所有 worktree 共用一份 dev-tools 产物，产物
 # 位置由 `git rev-parse --git-common-dir` 决定，而配置里没法执行 git 命令。
 set -eu
 
@@ -10,7 +10,7 @@ common=$(git rev-parse --git-common-dir 2>/dev/null) || {
 	exit 1
 }
 
-exe="$common/mcsup-build/debug/mcsup-dev-tools"
+exe="$common/mcsup-build/dev-tools/mcsup-dev-tools"
 if [ ! -x "$exe" ]; then
 	printf '[dev-tools] 找不到 %s\n' "$exe" >&2
 	printf '[dev-tools] 先构建一次：cargo build -p dev --bin mcsup-dev-tools\n' >&2

@@ -13,10 +13,13 @@ set -eu
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 
-# 所有 worktree 共用一份构建缓存：冷缓存下整棵依赖树要编数分钟，而每个 worktree
-# 各编一遍纯属重复。目录定位见脚本内注释。已显式设置 CARGO_TARGET_DIR 时不动。
+# feature powerset 的本地范围。默认空：跑全部组合，与 CI 一致。开发期连续跑
+# 门禁时可以 `MCSUP_HACK_SCOPE='--exclude-no-default-features'` 之类收窄。
+#
+# 构建缓存按 worktree 分开：共享目录会让不同分支的同名包交替重编，见
+# scripts/dev-tools-env.sh 的说明。已显式设置 CARGO_TARGET_DIR 时不动。
 . ./scripts/dev-tools-env.sh
-mcsup_use_shared_target
+mcsup_use_local_target
 
 # 选定要跑的步骤：无参数即全部。
 #
@@ -97,7 +100,16 @@ if want 'feature powerset'; then
 		exit 1
 	fi
 	status=0
-	cargo hack check --workspace --feature-powerset --depth 1 --all-targets || status=$?
+	# 本地只排除「一个可选 feature 都不开」的空组合：它等价于默认依赖集，
+	# 已由上面的 `check` 步骤（默认 + `--all-features`）覆盖，跑两遍没有新增
+	# 结论。允许排除后，本地会把组合清单写进缓存，`cargo hack` 的跳过清单
+	# 会忽略 `--features` 的显式值（据此判定「可跳过」的是 `--exclude-*`，
+	# 不是 `--no-default-features`），所以不能用它代替。
+	#
+	# 这只是本地提速：`[禁止]` 拿它当「feature 组合已通过」的依据。CI 的
+	# feature powerset 是深度检查、跑全部组合，那里的结论才算数。
+	cargo hack check --workspace --feature-powerset --depth 1 --all-targets \
+		${MCSUP_HACK_SCOPE:-} || status=$?
 	if [ "$status" -ne 0 ]; then
 		printf '失败于：feature powerset（%s）\n' "$status" >&2
 		printf '失败组合的 --features 即触发它的 feature。\n' >&2

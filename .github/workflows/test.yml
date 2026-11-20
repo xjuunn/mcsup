@@ -252,6 +252,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: install cargo-hack
         run: cargo install cargo-hack --locked
+      # 跑全部组合，不加 scripts/check.sh 里可选的 `MCSUP_HACK_SCOPE` 收窄：
+      # 这里是深度检查，结论必须完整。
       - name: cargo hack check
         run: cargo hack check --workspace --feature-powerset --depth 1 --all-targets
 

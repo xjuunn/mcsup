@@ -110,12 +110,15 @@ CI 是唯一能跑满 os × locale 矩阵的地方（见「代码质量门禁」
 
 # worktree 回收
 
-worktree 各自带一份 `target`，单个 1–4 GB，只有删掉 worktree 才回收得回来。
+worktree 各自带一份 `target`（`scripts/dev-tools-env.sh` 为每个 worktree 导出
+独立的 `CARGO_TARGET_DIR`，落在 `$(git rev-parse --git-common-dir)/mcsup-build/<目录名>`），
+单个 1–4 GB，只有删掉 worktree 才回收得回来。
 
-不建议把所有 worktree 指到同一个 `CARGO_TARGET_DIR`：多个 agent 同时跑
-`check.sh` 时会争用同一份 target 目录里的锁与构建产物，并行退化成本地排队，
-而且不同分支对同一 `target` 的交替写入会互相触发重编译。体积问题是「没回收」
-而不是「没共享」，所以这里的做法是及时删 worktree：
+不把所有 worktree 指到同一个 `CARGO_TARGET_DIR`：多个 agent 同时跑 `check.sh`
+时会争用同一份 target 目录里的锁与构建产物，并行退化成本地排队，而且不同分支
+对同一 `target` 的交替写入会互相触发重编译。实测共享目录下预提交门禁曾被这类
+重编拖到小时级，各自独立后同一次门禁在热缓存下是分钟内的量级。代价是磁盘，
+所以要及时删 worktree：
 
 ```
 sh scripts/worktree-status.sh        # 每个 worktree 的状态、落后数、target 体积
@@ -127,8 +130,9 @@ sh scripts/clean-worktrees.sh --yes  # 真正删除（拒绝删有未跟踪文�
 交付流程的第 6 步已要求合入后立即删除，这里的脚本用于兜底清理历史遗留的
 worktree，不能代替合入后的即时删除。
 
-需要跨 worktree 复用依赖编译结果时，用 `sccache`（`RUSTC_WRAPPER=sccache`）
-而不是共享 target 目录：它只共享编译结果，不共享构建状态与锁。
+需要跨 worktree 复用编译结果时，用 `sccache`（`RUSTC_WRAPPER=sccache`）而不是
+共享 target 目录：它只共享编译结果，不共享构建状态与锁。装好 sccache 后按
+`RUSTC_WRAPPER=sccache scripts/check.sh` 运行即可，脚本本身不强制。
 
 ---
 
@@ -144,6 +148,12 @@ scripts/check.sh
 powerset / deny。fmt 只检查不修改（`cargo fmt --all -- --check`）；
 deny 缺 cargo-deny 时静默跳过（本地绿灯 ≠ CI 绿灯，建议安装）；其余
 任一失败即中止并报出步骤名。
+
+各步骤都走本次 worktree 的构建缓存（见「worktree 回收」）。热缓存下整道门禁
+是分钟以内的量级：多数时间花在 `test` 与 `e2e` 的真实子进程与超时上，编译类
+步骤只要没有改动就是秒级。门禁变慢时先看是不是缓存被清理过低、或与别的
+worktree 共用了 target 目录，而不是去削减测试。持续复用编译结果可装 `sccache`
+并以 `RUSTC_WRAPPER=sccache scripts/check.sh` 运行。
 
 MSRV 声明在三处：`[workspace.package] rust-version`、`clippy.toml` 的
 `msrv`、`test.yml` 的 `msrv` job（其 `env.MSRV`，工具链与

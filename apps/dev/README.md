@@ -75,27 +75,30 @@ Windows 事件日志经 `wevtutil`（系统自带，参数为固定字面量）�
 cargo build -p dev
 ```
 
-### 所有 worktree 共用一份构建产物
+### 构建产物放在仓库外
 
 `opencode.jsonc` 指向 `scripts/dev-tools.cmd`（Windows）而不是直接指向 exe。
 原因有两个：
 
-1. **产物位置不在 worktree 内**。所有 worktree 共用
-   `$(git rev-parse --git-common-dir)/mcsup-build/`，该路径由启动器在运行时
-   算出；配置里没法执行 git 命令。
+1. **产物位置不在 worktree 内**。exe 统一放在
+   `$(git rev-parse --git-common-dir)/mcsup-build/dev-tools/`，与各 worktree 的
+   构建缓存（`mcsup-build/<目录名>/`）分开，该路径由启动器在运行时算出；配置里
+   没法执行 git 命令。
 2. **工程根不靠 exe 位置判断**。客户端把 cwd 设为当前 worktree，`workspace_root()`
    从 cwd 上溯，因此同一个 exe 能被每个 worktree 正确识别——`get_diff`
    报的是该 worktree 的分支与改动，`run_check` 跑的是该 worktree 的脚本。
 
-构建缓存的共享由 `scripts/dev-tools-env.sh` 提供，`scripts/check.sh` 与
-`scripts/check-e2e.sh` 都会 source 它并导出 `CARGO_TARGET_DIR`。冷缓存下整棵
-依赖树只需编一次，之后每个 worktree 直接复用。
+构建缓存不共享：`scripts/dev-tools-env.sh` 为每个 worktree 导出独立的
+`CARGO_TARGET_DIR`（`mcsup-build/<目录名>`），`scripts/check.sh`、
+`scripts/check-e2e.sh`、`scripts/test-parallel.sh` 都会 source 它。多个 worktree
+共用一份 target 会因同名包在不同分支上交替重编而互相拖慢，见
+`docs/development-workflow.md` 的 worktree 回收一节。
 
-第一次使用前在当前 worktree 里构建一次即可（只要共享目录里已有产物，后续
-worktree 无需重复）：
+第一次使用前构建一次（一次即可，exe 被所有 worktree 共用）：
 
 ```
 cargo build -p dev --bin mcsup-dev-tools
+sh scripts/install-dev-tools.sh
 ```
 
 `scripts/dev-tools.cmd` 必须保持纯 ASCII：`cmd.exe` 按 OEM 代码页解析 `.cmd`，
