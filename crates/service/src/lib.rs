@@ -74,9 +74,9 @@ pub use platform_config::{
 };
 pub use platform_doctor::{PlatformCheck, PlatformDoctor, PlatformFinding, PlatformReport};
 pub use plugin::{
-    HostApiDeps, HostApiImpl, InstallOutcome as PluginInstallOutcome, PluginError, PluginService,
-    StartOutcome, UnavailableBackup, UnavailableContent, UnavailableFiles, UnavailableJava,
-    UnavailableLifecycle,
+    FetchedPluginArtifact, HostApiDeps, HostApiImpl, InstallOutcome as PluginInstallOutcome,
+    PluginError, PluginService, StartOutcome, UnavailableBackup, UnavailableContent,
+    UnavailableFiles, UnavailableJava, UnavailableLifecycle,
 };
 /// Java 源聚合端口（定义在 `port`，此处转出便于既有调用方）
 pub use port::JavaSourceRegistryPort;

@@ -1073,6 +1073,15 @@ panic，只能返回错误。
 | `INST-SIG-011` | provenance 仓库不符 | 拒绝 |
 | `INST-SIG-012` | 信任库权限 | `0600` / 目录 `0700` |
 
+落位：
+
+- `INST-SIG-002` / `007` / `008` / `012`：`crates/provider/src/plugin_sig.rs`
+  单测（内容篡改、trusted comment 篡改、错 key、未知 key id、权限）。
+- `INST-SIG-009` / `010`：`crates/service/tests/plugin_signing.rs`（本地放行与
+  远端拒绝）；`plugin update` 的信任姿态沿用同处在 CLI 契约测试覆盖。
+- `INST-SIG-001` / `003` / `004` / `005` / `006` / `011` 依赖 Sigstore 证书链、
+  身份绑定、provenance 与撤销列表，尚未实现，不写「通过」。
+
 ## 11.6 安全（`SEC-*`）
 
 | ID | 场景 | 期望 |

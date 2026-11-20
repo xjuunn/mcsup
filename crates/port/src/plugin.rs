@@ -909,9 +909,10 @@ pub struct PluginArtifact {
     pub descriptor: Vec<u8>,
     /// 产物摘要（小写 hex）
     pub sha256: String,
-    /// 是否带签名
+    /// 是否带有效签名
     pub signed: bool,
-    /// 是否被信任（签名有效，或用户显式 `--allow-unsigned`）
+    /// 是否被信任（签名有效；未签名产物即使经 `--allow-unsigned` 放行也保持
+    /// `false`，由安装记录标记为 `untrusted`）
     pub trusted: bool,
 }
 
@@ -929,18 +930,20 @@ pub trait ArtifactSource: Send + Sync {
     -> Result<PluginArtifact, HostError>;
 }
 
-/// `ArtifactVerifier`：摘要 + 签名校验
+/// `ArtifactVerifier`：摘要与元数据复查
+///
+/// 签名在来源拉取阶段完成（签名对象是压缩包，解包后已不可恢复）；本 trait
+/// 只复核来源摘要与解包目录，并原样保留 `signed` / `trusted`。
 pub trait ArtifactVerifier: Send + Sync {
-    /// 校验产物
+    /// 复查已拉取产物
     ///
     /// # Errors
     ///
-    /// 摘要不匹配返回 `invalid_input`；无签名且未允许时返回 `denied`
+    /// 来源摘要不匹配或元数据不可读时返回 `invalid_input`
     fn verify(
         &self,
-        root: &Path,
+        artifact: &PluginArtifact,
         expected_sha256: Option<&Checksum>,
-        allow_unsigned: bool,
     ) -> Result<PluginArtifact, HostError>;
 }
 

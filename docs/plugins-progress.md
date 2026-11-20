@@ -63,13 +63,20 @@
 - 六类展示：`form` / `table` / `detail` / `chat` / `log` / `metrics` 的形状与
   引用校验在 `domain::plugin::descriptor`，CLI `plugin ops` 只做投影。
 
-### M4：Java 能力
+### M4：Java 能力与 minisign 签名
 
 - `java`：`list` / `install` / `remove` 三个帧，实现落
   `service::plugin::HostApiImpl`，安装固定 `jdk` 包类型、厂商交给来源排序，
   与 CLI `java install` 默认路径一致。
 - 错误映射：未登记 → `not_found`，扫描 / 上游 / 下载 → `unavailable`，
   大版本越界 → `invalid_input`。
+- `provider::plugin_sig`：minisign 公钥 / 签名解析、ed25519 验签（含全局
+  签名与 trusted comment）、信任库加载与 Unix 权限检查（目录 `0700`、
+  公钥 `0600`）。签名对象是压缩包本体：本地读 `<file>.minisig`，URL 取
+  `<url>.minisig`（404 视为未签名）。
+- 未签名策略收敛在 `service`：本地来源可 `--allow-unsigned`（记录
+  `signed = false` / `untrusted`），远端来源无签名一律拒绝；`plugin update`
+  沿用原产物的信任姿态。`plugin verify` 对未安装的压缩包重跑来源校验。
 
 ## 与设计文档的偏差
 
@@ -86,8 +93,9 @@
 
 按依赖顺序：
 
-1. 签名链路：minisign / Sigstore 校验、provenance、撤销列表；未签名产物
-   默认拒绝，`--allow-unsigned` 仅对本地来源生效。
+1. 签名链路剩余部分：Sigstore（cosign）证书链与身份绑定、provenance、撤销
+   列表。minisign / ed25519 与「未签名默认拒绝、`--allow-unsigned` 仅本地」
+   已完成。
 2. 撤销列表命中时拒绝启动，并与 `quarantine` / `block` 共用状态迁移。
 3. 补齐 `BENCH-001` / `002` / `005` / `006`：握手冷 / 热启动、宿主空闲内存、
    100 个非 resident 插件的安装与列表。需要让基准能拉起 fixture 子进程

@@ -1479,7 +1479,29 @@ fn plugin_install_local_artifact_then_list_ops_and_verify() {
     let verified: serde_json::Value = serde_json::from_slice(&out.stdout).expect("verify 输出对象");
     assert_eq!(verified["id"], "demo");
     assert_eq!(verified["signed"], false);
-    assert_eq!(verified["trusted"], true);
+    assert_eq!(verified["trusted"], false);
+}
+
+/// `verify` 指向本地目录：只复查 manifest / descriptor，不报签名通过
+#[test]
+fn plugin_verify_local_directory_reports_unsigned() {
+    let home = temp_home();
+    let artifact = home.path().join("verify-plugin");
+    write_plugin_artifact(&artifact);
+    let out = run(
+        home.path(),
+        &[
+            "--output",
+            "json",
+            "plugin",
+            "verify",
+            artifact.to_str().expect("utf-8 path"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let verified: serde_json::Value = serde_json::from_slice(&out.stdout).expect("verify 输出对象");
+    assert_eq!(verified["signed"], false);
+    assert_eq!(verified["trusted"], false);
 }
 
 /// 配置读写与拉黑：全程不联网、不拉起宿主，CLI 与宿主共用的校验必须生效

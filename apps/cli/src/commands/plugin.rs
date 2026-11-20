@@ -345,8 +345,10 @@ fn update(id: &str, to: Option<String>, _prune: bool, printer: Printer) -> Resul
         crate::i18n::pick(printer.lang(), "正在升级插件…", "updating plugin…"),
         printer.is_human(),
     );
+    // 升级沿用原产物的信任姿态：原产物未签名才允许继续安装未签名产物。
+    let allow_unsigned = !record.signed;
     let result = service
-        .install(&origin, None, true)
+        .install(&origin, None, allow_unsigned)
         .map_err(anyhow::Error::from);
     spinner.finish();
     let outcome = result?;
@@ -874,13 +876,19 @@ fn logs(id: &str, follow: bool, tail: usize, printer: Printer) -> Result<()> {
 
 fn verify(target: &str, printer: Printer) -> Result<()> {
     let service = open()?;
-    let (root, expected, id) = if let Ok(id) = PluginId::parse(target) {
+    let expected = sha256_hint(target);
+    // 本地文件直接校验文件本体：目录里没有 `.minisig`，`.zip.minisig` 的签名
+    // 只对压缩包字节有意义。插件 id 与目录走安装记录 + 目录摘要复查。
+    let local_file = PluginId::parse(target)
+        .is_err()
+        .then(|| PathBuf::from(target));
+    let local_file = local_file
+        .filter(|path| path.is_file() && path.extension().is_none_or(|ext| ext != "minisig"));
+    let (target_path, id, signed, recheck) = if let Some(path) = local_file {
+        (path, None, false, true)
+    } else if let Ok(id) = PluginId::parse(target) {
         let record = service.record(&id)?;
-        let expected = record
-            .sha256
-            .as_deref()
-            .map(|hex| Checksum::new(ChecksumAlgorithm::Sha256, hex));
-        (record.artifact_dir, expected, Some(record.id))
+        (record.artifact_dir, Some(record.id), record.signed, false)
     } else {
         let path = PathBuf::from(target);
         if !path.exists() {
@@ -888,12 +896,23 @@ fn verify(target: &str, printer: Printer) -> Result<()> {
                 AppDiagnostic::not_found(format!("找不到插件 id 或目录: {target}"), None).into(),
             );
         }
-        (path, None, None)
+        (path, None, false, false)
     };
     let verifier = mcsup::provider::plugin::PluginArtifactVerifier::new();
-    let artifact = verifier
-        .verify(&root, expected.as_ref(), true)
-        .map_err(anyhow::Error::from)?;
+    let artifact = if recheck {
+        // 未安装的文件：重新走一遍来源校验（含签名），失败即拒绝。来源摘要
+        // 在这里就是文件本身的摘要，再与旁路 `.sha256` 比对。
+        let fetched = service
+            .fetch_artifact(&ArtifactOrigin::Local(target_path.clone()))
+            .map_err(anyhow::Error::from)?;
+        verifier
+            .verify(&fetched.artifact, expected.as_ref())
+            .map_err(anyhow::Error::from)?
+    } else {
+        verifier
+            .verify_installed(&target_path, expected.as_ref(), signed)
+            .map_err(anyhow::Error::from)?
+    };
     let manifest = Manifest::from_json(
         &serde_json::to_vec(&artifact.manifest).map_err(|err| anyhow!("{err}"))?,
     )
@@ -911,6 +930,20 @@ fn verify(target: &str, printer: Printer) -> Result<()> {
             "trusted": artifact.trusted,
         }),
     )
+}
+
+/// 旁路摘要：`<path>.sha256` 的首个十六进制串
+///
+/// 已安装插件不用它：安装记录里的摘要是解包目录摘要，与压缩包摘要不同。
+fn sha256_hint(target: &str) -> Option<Checksum> {
+    let path = PathBuf::from(target);
+    let mut name = path.file_name()?.to_os_string();
+    name.push(".sha256");
+    let text = std::fs::read_to_string(path.with_file_name(&name)).ok()?;
+    let hex = text
+        .split_whitespace()
+        .find(|token| token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit()))?;
+    Some(Checksum::new(ChecksumAlgorithm::Sha256, hex))
 }
 
 fn rollback(id: &str, printer: Printer) -> Result<()> {

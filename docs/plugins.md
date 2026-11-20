@@ -95,7 +95,7 @@ MCSUP 里同时存在三种容易混淆的「插件」：
 | **实例（instance）** | 一个插件的运行单位。默认机器级单实例，可声明为每服一实例 |
 | **resident** | 常驻标记。为真时宿主不因空闲回收该插件，且宿主随之存活 |
 | **产物（artifact）** | 可安装的压缩包：manifest + descriptor + 二进制 + 许可证 |
-| **可信产物** | 有有效签名且摘要匹配的产物；未签名产物需显式 `--allow-unsigned` |
+| **可信产物** | 有有效签名且摘要匹配的产物；未签名产物需显式 `--allow-unsigned`（仅本地来源） |
 
 ---
 
@@ -127,7 +127,7 @@ MCSUP 里同时存在三种容易混淆的「插件」：
 | H19 | 协议版本、API 版本、manifest schema、descriptor schema 各自独立递增 |
 | H20 | 所有耗时步骤必须有进度回显；JSON 模式下 stdout 只含数据 |
 | H21 | `[禁止]` 插件写前端资源。界面只能由 descriptor 投影生成 |
-| H22 | 插件产物必须可离线校验：摘要 + 平台匹配必备；签名缺失时必须显式 `--allow-unsigned` 并标记 `untrusted` |
+| H22 | 插件产物必须可离线校验：摘要 + 平台匹配必备；签名缺失时必须显式 `--allow-unsigned` 并标记 `untrusted`（仅本地来源；远端来源无签名一律拒绝） |
 | H23 | 每条硬规则与关键小节必须在 `docs/plugins-testing.md` 有测试 ID；没有对应用例的条款视为未实现 |
 
 # 4. 架构落位
@@ -239,7 +239,7 @@ SDK README 必须显式区分，避免作者把宿主 crate 写进插件依赖�
 | `NetProxy` | 宿主代发的出站请求（可选路径） | `provider` |
 | `PluginStore` | 安装记录、当前版本、授权状态 | `storage` |
 | `ArtifactSource` | git / url 解析到产物字节 | `provider` |
-| `ArtifactVerifier` | 摘要 + 签名校验 | `plugin` |
+| `ArtifactVerifier` | 来源摘要与解包目录复查（签名在来源阶段完成） | `plugin` |
 | `AuditSink` | 审计记录 | `storage` |
 | `PluginSupervisor` | 启停 / 状态 / 控制通道客户端 | `plugin` |
 
@@ -1086,7 +1086,7 @@ Java 能力的帧方法：
 | `FileOps` | `service::plugin::HostApiImpl` + `domain::path` 的路径校验 | service 内部经 `crate::fs` 入口 |
 | `KvStore` / `SecretStore` / `PluginStore` / `AuditSink` | `storage` | 一条记录一个 JSON；审计用追加 JSONL |
 | `ArtifactSource` | `provider` | git / url 解析与下载 |
-| `ArtifactVerifier` / `PluginSupervisor` | `plugin` | 摘要、签名、进程、端点、帧 |
+| `ArtifactVerifier` / `PluginSupervisor` | `plugin` | 摘要、进程、端点、帧；minisign 验签在 `provider::plugin_sig` |
 | `NetProxy` | `provider` | 复用现有 HTTP 栈与代理配置 |
 
 `service` 的 `HostApiImpl` 由门面 `bootstrap` 构造并注入 `plugin::PluginHost`。
@@ -1834,13 +1834,29 @@ Windows 还需拒绝保留名（`CON`、`NUL` 等）与尾随点 / 空格。
 
 | 场景 | 要求 |
 | --- | --- |
-| 市场来源 | 必须 Sigstore（cosign）签名，绑定仓库与 commit |
+| 市场来源 | 必须 Sigstore（cosign）签名，绑定仓库与 commit `[待实现]` |
 | 自建源 | 必须 minisign / ed25519 签名，公钥在 `plugins/trusted-keys/` |
 | 本地 `--from` | 可 `--allow-unsigned`，安装后标记 `untrusted` |
+| 远端 URL | `--allow-unsigned` 无效，无签名一律拒绝 |
 | `--dev` 源码构建 | 一律 `untrusted`，禁止发布到市场 |
 
-校验顺序：摘要 → 签名 → 证书链 / 公钥 → 身份（仓库、workflow）→ 撤销列表。
-任一步失败即拒绝安装。`[禁止]` 在签名失败时提供「仍然安装」的隐藏开关。
+已实现的 minisign 约定：
+
+- 只对压缩包产物签名：签名文件与被签文件同目录同名，追加 `.minisig`；
+  URL 来源取 `<url>.minisig`（404 视为未签名，其他失败一律拒绝）。
+- 目录来源没有稳定字节流，视为未签名。
+- 信任库是 `{data_dir}/plugins/trusted-keys/*.pub`，启动时创建为 `0700`；
+  加载时要求目录 `0700`、公钥文件 `0600`，符号链接与过宽权限一律拒绝。
+- 支持 `ED`（对 BLAKE2b-512 摘要签名）与 `Ed`（对原始字节签名）两种头；
+  签名文件第四行的全局签名同样校验，trusted comment 被改写即失败。
+- 校验顺序：来源摘要 → 签名 → 解包安全检查（Zip Slip / 符号链接 / 大小
+  与数量上限）→ manifest / descriptor。签名失败不可覆盖，`[禁止]` 提供
+  「仍然安装」的隐藏开关。
+- 未签名策略在 `service`：只有本地来源可以 `--allow-unsigned`，放行后
+  `signed` / `trusted` 仍为 `false`，安装记录如实标记。
+
+Sigstore、provenance、撤销列表尚未实现：仓库没有证书链解析与信任根，
+接上之前的签名只认 minisign 信任库。
 
 ## 15.4 安装流水线
 

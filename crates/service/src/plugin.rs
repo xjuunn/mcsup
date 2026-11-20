@@ -24,7 +24,7 @@ use domain::plugin::error::PluginErrorCode;
 use domain::plugin::manifest::Manifest;
 use domain::plugin::state::{PluginEvent, PluginState};
 use domain::plugin::{PluginId, PluginScope};
-use domain::server::artifact::Checksum;
+use domain::server::artifact::{Checksum, ChecksumAlgorithm};
 use domain::server::content::ContentKind;
 use domain::server::layout::console_log_path;
 use domain::server::meta::ServerName;
@@ -33,9 +33,10 @@ use port::plugin::{
     ArtifactOrigin, ArtifactSource, ArtifactVerifier, AuditEvent, AuditResult, AuditSink,
     BackupEntry, BackupOps, ConfigOps, ConsoleIo, ConsoleLine, ConsolePage, ContentEntry,
     ContentInstallRequest, ContentOps, FileEntry, FileOps, HostError, JavaOps, KvStore,
-    MAX_CONSOLE_LINE_BYTES, MAX_CONSOLE_LINES, MAX_FILE_BYTES, NetPolicy, PluginConfigStore,
-    PluginRecord, PluginRuntimeStatus, PluginStore, PluginSupervisor, SecretStore, ServerLifecycle,
-    ServerRead, ServerStatusView, ServerSummary, SessionInfo, StoredConfig,
+    MAX_CONSOLE_LINE_BYTES, MAX_CONSOLE_LINES, MAX_FILE_BYTES, NetPolicy, PluginArtifact,
+    PluginConfigStore, PluginRecord, PluginRuntimeStatus, PluginStore, PluginSupervisor,
+    SecretStore, ServerLifecycle, ServerRead, ServerStatusView, ServerSummary, SessionInfo,
+    StoredConfig,
 };
 use port::{ErrorCategory, RepositoryError, StopOutcome, StopSpec};
 use serde_json::Value;
@@ -667,6 +668,44 @@ impl PluginService {
         result
     }
 
+    /// 拉取并校验产物，但不安装
+    ///
+    /// `verify` 命令用它对未安装的压缩包重新跑一遍来源校验（含签名）。返回
+    /// 值在存活期间持有解包目录，丢弃时删除临时目录。
+    ///
+    /// # Errors
+    ///
+    /// 来源未装配、拉取失败、摘要不匹配或签名无效时返回 [`PluginError`]
+    pub fn fetch_artifact(
+        &self,
+        origin: &ArtifactOrigin,
+    ) -> Result<FetchedPluginArtifact, PluginError> {
+        let source = self.source.as_ref().ok_or_else(|| {
+            PluginError::Usage("no plugin artifact source is configured".to_owned())
+        })?;
+        std::fs::create_dir_all(&self.plugins_root)?;
+        let temp = self.plugins_root.join(format!(
+            "{TEMP_PREFIX}verify-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp)?;
+        let result = source
+            .fetch(origin, &temp)
+            .and_then(|fetched| match &self.verifier {
+                Some(verifier) => verifier.verify(&fetched, None),
+                None => Ok(fetched),
+            });
+        match result {
+            Ok(artifact) => Ok(FetchedPluginArtifact { artifact, temp }),
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(&temp);
+                Err(PluginError::from(err))
+            }
+        }
+    }
+
     fn install_into(
         &self,
         origin: &ArtifactOrigin,
@@ -677,16 +716,12 @@ impl PluginService {
     ) -> Result<InstallOutcome, PluginError> {
         let fetched = source.fetch(origin, temp)?;
         let artifact = if let Some(verifier) = &self.verifier {
-            verifier.verify(&fetched.root, expected_sha256, allow_unsigned)?
+            verifier.verify(&fetched, expected_sha256)?
         } else {
-            if !fetched.trusted && !allow_unsigned {
-                return Err(PluginError::Denied(
-                    "artifact is not signed; pass --allow-unsigned to install unsigned local builds"
-                        .to_owned(),
-                ));
-            }
+            check_source_checksum(expected_sha256, &fetched.sha256)?;
             fetched
         };
+        enforce_unsigned_policy(origin, allow_unsigned, &artifact)?;
         let manifest = Manifest::from_json(
             &serde_json::to_vec(&artifact.manifest)
                 .map_err(|err| PluginError::Usage(format!("serialize manifest: {err}")))?,
@@ -1081,6 +1116,54 @@ fn pending_capabilities(record: &PluginRecord) -> String {
         .map(|cap| cap.to_string())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// `fetch_artifact` 的返回值：持有临时解包目录，丢弃时一并删除
+#[derive(Debug)]
+pub struct FetchedPluginArtifact {
+    /// 已校验的产物
+    pub artifact: PluginArtifact,
+    /// 解包所在的临时目录
+    temp: PathBuf,
+}
+
+impl Drop for FetchedPluginArtifact {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.temp);
+    }
+}
+
+/// 未签名策略：只有本地来源允许 `--allow-unsigned`，远端来源没有签名一律
+/// 拒绝，且覆盖命令行的显式放行。
+fn enforce_unsigned_policy(
+    origin: &ArtifactOrigin,
+    allow_unsigned: bool,
+    artifact: &PluginArtifact,
+) -> Result<(), PluginError> {
+    if artifact.trusted {
+        return Ok(());
+    }
+    if allow_unsigned && matches!(origin, ArtifactOrigin::Local(_)) {
+        return Ok(());
+    }
+    let message = if matches!(origin, ArtifactOrigin::Local(_)) {
+        "artifact is not signed; pass --allow-unsigned to install unsigned local builds"
+    } else {
+        "artifact is not signed; remote sources require a trusted signature"
+    };
+    Err(PluginError::Denied(message.to_owned()))
+}
+
+fn check_source_checksum(expected: Option<&Checksum>, actual: &str) -> Result<(), PluginError> {
+    if let Some(expected) = expected
+        && (expected.algorithm() != ChecksumAlgorithm::Sha256 || !expected.matches(actual))
+    {
+        return Err(PluginError::Usage(format!(
+            "sha256 mismatch: expected {}, got {actual}",
+            expected.hex()
+        )));
+    }
+    Ok(())
 }
 
 fn origin_text(origin: &ArtifactOrigin) -> String {

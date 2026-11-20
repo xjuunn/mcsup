@@ -31,6 +31,7 @@ workspace = true
 [dev-dependencies]
 backup = { package = "mcsup-backup", path = "../backup" }
 modkit = { package = "mcsup-modkit", path = "../modkit" }
+provider = { package = "mcsup-provider", path = "../provider" }
 service = { package = "mcsup-service", path = "." }
 storage = { package = "mcsup-storage", path = "../storage" }
 tempfile.workspace = true

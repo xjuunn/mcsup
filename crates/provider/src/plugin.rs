@@ -7,12 +7,17 @@
 //!
 //! # 签名
 //!
-//! v1 的本地与自建源尚未接入 Sigstore / minisign；实现如实返回
-//! `signed = false`，由调用方要求 `--allow-unsigned`。`[禁止]` 在没有验证的
-//! 情况下把 `signed` 置真。
+//! 压缩包来源在解包前校验 minisign 签名：本地文件读 `<file>.minisig`，URL
+//! 取 `<url>.minisig`（404 视为未签名，其他失败一律拒绝）。目录来源没有稳定
+//! 字节流，视为未签名。签名失败不可覆盖；未签名策略由 `service` 决定。
+//! `[禁止]` 在没有验证的情况下把 `signed` 置真。
+//!
+//! `PluginArtifactVerifier` 只复查摘要与元数据：解包后压缩包已不存在，签名
+//! 必须在拉取阶段完成。
 
+use crate::plugin_sig::{MAX_SIGNATURE_BYTES, SignatureFile, TrustedKeys};
 use domain::plugin::manifest::Manifest;
-use domain::server::artifact::ChecksumAlgorithm;
+use domain::server::artifact::{Checksum, ChecksumAlgorithm};
 use port::plugin::{ArtifactOrigin, ArtifactSource, ArtifactVerifier, HostError, PluginArtifact};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
@@ -38,13 +43,23 @@ const UNPACK_DIR: &str = "artifact";
 
 /// 插件产物来源
 #[derive(Debug, Clone, Default)]
-pub struct PluginArtifactSource;
+pub struct PluginArtifactSource {
+    /// 信任库目录；未配置时任何签名都会因「无可信公钥」被拒
+    trusted_keys: Option<PathBuf>,
+}
 
 impl PluginArtifactSource {
     /// 新建
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// 设置 minisign 信任库目录
+    #[must_use]
+    pub fn with_trusted_keys(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.trusted_keys = Some(dir.into());
+        self
     }
 }
 
@@ -61,6 +76,8 @@ impl ArtifactSource for PluginArtifactSource {
         }
         std::fs::create_dir_all(&root)
             .map_err(|err| HostError::internal(format!("create unpack dir: {err}")))?;
+        let trusted_keys = self.trusted_keys.as_deref();
+        let mut signed = false;
         let sha256 = match origin {
             ArtifactOrigin::Local(path) => {
                 if path.is_dir() {
@@ -68,6 +85,10 @@ impl ArtifactSource for PluginArtifactSource {
                     digest_tree(&root)?
                 } else {
                     let sha = digest_file(path)?;
+                    if let Some(signature) = read_local_signature(path)? {
+                        verify_signature(trusted_keys, path, &signature)?;
+                        signed = true;
+                    }
                     extract_archive(path, &root)?;
                     sha
                 }
@@ -76,6 +97,10 @@ impl ArtifactSource for PluginArtifactSource {
                 let archive = dest_root.join("package.zip");
                 download(url, &archive)?;
                 let sha = digest_file(&archive)?;
+                if let Some(signature) = download_signature(url)? {
+                    verify_signature(trusted_keys, &archive, &signature)?;
+                    signed = true;
+                }
                 extract_archive(&archive, &root)?;
                 let _ = std::fs::remove_file(&archive);
                 sha
@@ -93,13 +118,16 @@ impl ArtifactSource for PluginArtifactSource {
             manifest,
             descriptor,
             sha256,
-            signed: false,
-            trusted: false,
+            signed,
+            trusted: signed,
         })
     }
 }
 
-/// 摘要 + 未签名策略校验
+/// 摘要与元数据复查
+///
+/// 签名结论由来源在拉取阶段给出；本类型只重算解包目录摘要，并保留
+/// `signed` / `trusted`，避免安装记录丢失签名状态。
 #[derive(Debug, Clone, Default)]
 pub struct PluginArtifactVerifier;
 
@@ -109,34 +137,165 @@ impl PluginArtifactVerifier {
     pub fn new() -> Self {
         Self
     }
-}
 
-impl ArtifactVerifier for PluginArtifactVerifier {
-    fn verify(
+    /// 校验已安装目录（`signed` 来自安装记录）
+    ///
+    /// # Errors
+    ///
+    /// 摘要不匹配返回 `invalid_input`；元数据不可读时返回 `invalid_input`。
+    pub fn verify_installed(
         &self,
         root: &Path,
-        expected_sha256: Option<&domain::server::artifact::Checksum>,
-        allow_unsigned: bool,
+        expected_sha256: Option<&Checksum>,
+        signed: bool,
     ) -> Result<PluginArtifact, HostError> {
         let sha256 = digest_tree(root)?;
-        if let Some(expected) = expected_sha256
-            && (expected.algorithm() != ChecksumAlgorithm::Sha256 || !expected.matches(&sha256))
-        {
-            return Err(HostError::invalid_input(format!(
-                "sha256 mismatch: expected {}, got {sha256}",
-                expected.hex()
-            )));
-        }
+        check_checksum(expected_sha256, &sha256)?;
         let (manifest, descriptor) = read_metadata(root)?;
         Ok(PluginArtifact {
             root: root.to_path_buf(),
             manifest,
             descriptor,
             sha256,
-            signed: false,
-            trusted: allow_unsigned,
+            signed,
+            trusted: signed,
         })
     }
+}
+
+impl ArtifactVerifier for PluginArtifactVerifier {
+    fn verify(
+        &self,
+        artifact: &PluginArtifact,
+        expected_sha256: Option<&Checksum>,
+    ) -> Result<PluginArtifact, HostError> {
+        // 期望摘要是来源摘要（压缩包字节或目录树），与安装记录里的树摘要
+        // 不同：先比对来源摘要，再重算并返回树摘要。
+        check_checksum(expected_sha256, &artifact.sha256)?;
+        let mut verified = self.verify_installed(&artifact.root, None, artifact.signed)?;
+        verified.trusted = artifact.trusted;
+        Ok(verified)
+    }
+}
+
+fn check_checksum(expected: Option<&Checksum>, actual: &str) -> Result<(), HostError> {
+    if let Some(expected) = expected
+        && (expected.algorithm() != ChecksumAlgorithm::Sha256 || !expected.matches(actual))
+    {
+        return Err(HostError::invalid_input(format!(
+            "sha256 mismatch: expected {}, got {actual}",
+            expected.hex()
+        )));
+    }
+    Ok(())
+}
+
+fn read_local_signature(archive: &Path) -> Result<Option<SignatureFile>, HostError> {
+    let signature_path = signature_path(archive);
+    match std::fs::read(&signature_path) {
+        Ok(bytes) => {
+            if bytes.len() as u64 > MAX_SIGNATURE_BYTES {
+                return Err(HostError::limit_exceeded(format!(
+                    "signature {} exceeds {MAX_SIGNATURE_BYTES} bytes",
+                    signature_path.display()
+                )));
+            }
+            let text = std::str::from_utf8(&bytes).map_err(|_| {
+                HostError::denied(format!(
+                    "signature {} is not UTF-8",
+                    signature_path.display()
+                ))
+            })?;
+            SignatureFile::parse(text).map(Some)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(HostError::internal(format!(
+            "read {}: {err}",
+            signature_path.display()
+        ))),
+    }
+}
+
+fn download_signature(url: &str) -> Result<Option<SignatureFile>, HostError> {
+    let signature_url = signature_url(url)?;
+    let client = http_client()?;
+    let response = client
+        .get(&signature_url)
+        .send()
+        .map_err(|err| network(format!("download {signature_url}: {err}")))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !response.status().is_success() {
+        return Err(network(format!(
+            "download {signature_url}: HTTP {}",
+            response.status()
+        )));
+    }
+    if let Some(length) = response.content_length()
+        && length > MAX_SIGNATURE_BYTES
+    {
+        return Err(HostError::limit_exceeded(format!(
+            "signature is {length} bytes; limit is {MAX_SIGNATURE_BYTES}"
+        )));
+    }
+    let mut bytes = Vec::new();
+    response
+        .take(MAX_SIGNATURE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|err| network(format!("read {signature_url}: {err}")))?;
+    if bytes.len() as u64 > MAX_SIGNATURE_BYTES {
+        return Err(HostError::limit_exceeded(format!(
+            "signature exceeds {MAX_SIGNATURE_BYTES} bytes"
+        )));
+    }
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| HostError::denied(format!("signature {signature_url} is not UTF-8")))?;
+    SignatureFile::parse(text).map(Some)
+}
+
+fn verify_signature(
+    trust_dir: Option<&Path>,
+    archive: &Path,
+    signature: &SignatureFile,
+) -> Result<(), HostError> {
+    let trust_dir = trust_dir.ok_or_else(|| {
+        HostError::denied(
+            "artifact is signed but no trusted key directory is configured".to_owned(),
+        )
+    })?;
+    let keys = TrustedKeys::load(trust_dir)?;
+    if keys.is_empty() {
+        return Err(HostError::denied(format!(
+            "artifact is signed but {} contains no public keys",
+            trust_dir.display()
+        )));
+    }
+    let message = std::fs::read(archive).map_err(|err| {
+        HostError::internal(format!("read {} for signature: {err}", archive.display()))
+    })?;
+    keys.verify(&message, signature)
+}
+
+fn signature_path(archive: &Path) -> PathBuf {
+    let mut name = archive.file_name().unwrap_or_default().to_os_string();
+    name.push(".minisig");
+    archive.with_file_name(name)
+}
+
+fn signature_url(url: &str) -> Result<String, HostError> {
+    let mut parsed = url::Url::parse(url)
+        .map_err(|err| HostError::invalid_input(format!("invalid artifact URL {url}: {err}")))?;
+    let path = format!("{}.minisig", parsed.path());
+    parsed.set_path(&path);
+    Ok(parsed.to_string())
+}
+
+fn http_client() -> Result<reqwest::blocking::Client, HostError> {
+    reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|err| HostError::internal(format!("build http client: {err}")))
 }
 
 fn network(message: impl Into<String>) -> HostError {
@@ -181,10 +340,7 @@ fn unwrap_single_dir(root: PathBuf) -> Result<PathBuf, HostError> {
 }
 
 fn download(url: &str, dest: &Path) -> Result<(), HostError> {
-    let response = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .map_err(|err| HostError::internal(format!("build http client: {err}")))?
+    let response = http_client()?
         .get(url)
         .send()
         .map_err(|err| network(format!("download {url}: {err}")))?;
@@ -478,6 +634,7 @@ fn to_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use blake2::Digest as _;
 
     fn manifest_json(id: &str) -> String {
         format!(
@@ -533,15 +690,21 @@ mod tests {
     }
 
     #[test]
-    fn verifier_requires_allow_unsigned() {
+    fn verifier_preserves_signature_state() {
         let dir = tempfile::tempdir().expect("tmp");
         std::fs::write(dir.path().join("manifest.json"), manifest_json("demo")).expect("manifest");
         std::fs::write(dir.path().join("descriptor.json"), descriptor_json("demo"))
             .expect("descriptor");
         let verifier = PluginArtifactVerifier;
-        let unsigned = verifier.verify(dir.path(), None, false).expect("verify");
+        let unsigned = verifier
+            .verify_installed(dir.path(), None, false)
+            .expect("verify");
+        assert!(!unsigned.signed);
         assert!(!unsigned.trusted);
-        let trusted = verifier.verify(dir.path(), None, true).expect("verify");
+        let trusted = verifier
+            .verify_installed(dir.path(), None, true)
+            .expect("verify");
+        assert!(trusted.signed);
         assert!(trusted.trusted);
     }
 
@@ -551,5 +714,164 @@ mod tests {
         assert!(is_reserved_name("nul.txt"));
         assert!(is_reserved_name("name. "));
         assert!(!is_reserved_name("console.txt"));
+    }
+
+    fn test_artifact_zip(path: &Path) {
+        use std::io::Write as _;
+
+        let file = std::fs::File::create(path).expect("create zip");
+        let mut zip = zip::ZipWriter::new(file);
+        for (name, content) in [
+            ("manifest.json", manifest_json("demo")),
+            ("descriptor.json", descriptor_json("demo")),
+        ] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .expect("entry");
+            zip.write_all(content.as_bytes()).expect("write entry");
+        }
+        zip.finish().expect("finish");
+    }
+
+    const TEST_KEYNUM: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+
+    fn test_signing_key() -> ed25519_dalek::SigningKey {
+        use ed25519_dalek::SigningKey;
+
+        SigningKey::from_bytes(&[42_u8; 32])
+    }
+
+    fn write_trust_store(dir: &Path, key: &ed25519_dalek::SigningKey) {
+        use base64::Engine as _;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                .expect("chmod trust dir");
+        }
+        let mut public = Vec::new();
+        public.extend_from_slice(b"Ed");
+        public.extend_from_slice(&TEST_KEYNUM);
+        public.extend_from_slice(key.verifying_key().as_bytes());
+        let key_path = dir.join("demo.pub");
+        std::fs::write(
+            &key_path,
+            format!(
+                "untrusted comment: test key\n{}\n",
+                base64::engine::general_purpose::STANDARD.encode(public)
+            ),
+        )
+        .expect("write key");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod key");
+        }
+    }
+
+    fn write_signature(archive: &Path, key: &ed25519_dalek::SigningKey) {
+        use base64::Engine as _;
+        use ed25519_dalek::Signer as _;
+
+        let message = std::fs::read(archive).expect("read archive");
+        let mut hasher = blake2::Blake2b512::new();
+        hasher.update(&message);
+        let digest = hasher.finalize();
+        let signature = key.sign(&digest).to_bytes();
+        let trusted = "timestamp:1700000000\tfile:demo.zip";
+        let mut package = Vec::new();
+        package.extend_from_slice(b"ED");
+        package.extend_from_slice(&TEST_KEYNUM);
+        package.extend_from_slice(&signature);
+        let mut global_message = signature.to_vec();
+        global_message.extend_from_slice(trusted.as_bytes());
+        let global = key.sign(&global_message).to_bytes();
+        let mut name = archive.file_name().expect("name").to_os_string();
+        name.push(".minisig");
+        std::fs::write(
+            archive.with_file_name(name),
+            format!(
+                "untrusted comment: test signature\n{}\ntrusted comment: {trusted}\n{}\n",
+                base64::engine::general_purpose::STANDARD.encode(package),
+                base64::engine::general_purpose::STANDARD.encode(global)
+            ),
+        )
+        .expect("write signature");
+    }
+
+    #[test]
+    fn signed_local_archive_is_trusted() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let archive = dir.path().join("demo.zip");
+        test_artifact_zip(&archive);
+        let key = test_signing_key();
+        write_signature(&archive, &key);
+        let trust = dir.path().join("trusted-keys");
+        std::fs::create_dir(&trust).expect("trust dir");
+        write_trust_store(&trust, &key);
+
+        let dest = tempfile::tempdir().expect("dest");
+        let artifact = PluginArtifactSource::new()
+            .with_trusted_keys(&trust)
+            .fetch(&ArtifactOrigin::Local(archive), dest.path())
+            .expect("fetch");
+        assert!(artifact.signed);
+        assert!(artifact.trusted);
+        assert_eq!(artifact.manifest.id, "demo");
+    }
+
+    #[test]
+    fn tampered_signed_archive_is_rejected() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let archive = dir.path().join("demo.zip");
+        test_artifact_zip(&archive);
+        let key = test_signing_key();
+        write_signature(&archive, &key);
+        let trust = dir.path().join("trusted-keys");
+        std::fs::create_dir(&trust).expect("trust dir");
+        write_trust_store(&trust, &key);
+
+        // 追加一个字节：签名包不变，内容已变
+        let mut bytes = std::fs::read(&archive).expect("read");
+        bytes.push(0);
+        std::fs::write(&archive, bytes).expect("tamper");
+
+        let dest = tempfile::tempdir().expect("dest");
+        let err = PluginArtifactSource::new()
+            .with_trusted_keys(&trust)
+            .fetch(&ArtifactOrigin::Local(archive), dest.path())
+            .expect_err("tampered");
+        assert_eq!(err.code, port::plugin::ErrorCode::Denied);
+    }
+
+    #[test]
+    fn signed_archive_without_trust_store_is_rejected() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let archive = dir.path().join("demo.zip");
+        test_artifact_zip(&archive);
+        write_signature(&archive, &test_signing_key());
+
+        let dest = tempfile::tempdir().expect("dest");
+        let err = PluginArtifactSource::new()
+            .fetch(&ArtifactOrigin::Local(archive), dest.path())
+            .expect_err("no trust store");
+        assert_eq!(err.code, port::plugin::ErrorCode::Denied);
+    }
+
+    #[test]
+    fn signature_url_appends_next_to_path_not_query() {
+        assert_eq!(
+            signature_url("https://example.test/plugins/demo.zip?token=1").expect("url"),
+            "https://example.test/plugins/demo.zip.minisig?token=1"
+        );
+    }
+
+    #[test]
+    fn signature_path_appends_suffix() {
+        assert_eq!(
+            signature_path(Path::new("/tmp/demo.zip")),
+            PathBuf::from("/tmp/demo.zip.minisig")
+        );
     }
 }

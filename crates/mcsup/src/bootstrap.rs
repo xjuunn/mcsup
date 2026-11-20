@@ -665,6 +665,14 @@ impl McsupBuilder {
             Arc::new(SecretFileStore::new(plugin_data.clone()));
         let plugin_config_store: Arc<dyn port::plugin::PluginConfigStore> =
             Arc::new(PluginConfigFileStore::new(plugin_data.clone()));
+        let plugins_root = data_dir.join("plugins");
+        let trusted_keys = plugins_root.join(provider::plugin_sig::TRUSTED_KEYS_DIR);
+        provider::plugin_sig::ensure_trusted_keys_dir(&trusted_keys).map_err(|source| {
+            BootstrapError::Dir {
+                path: trusted_keys.clone(),
+                source,
+            }
+        })?;
         let plugin_api = Arc::new(service::HostApiImpl::new(service::HostApiDeps {
             registry: Arc::clone(&registry),
             lifecycle: Arc::new(lifecycle.clone()),
@@ -680,10 +688,12 @@ impl McsupBuilder {
             Arc::clone(&plugin_store),
             Arc::clone(&plugin_config_store),
             Some(Arc::new(plugin::ControlClient::new(data_dir))),
-            Some(Arc::new(provider::plugin::PluginArtifactSource::new())),
+            Some(Arc::new(
+                provider::plugin::PluginArtifactSource::new().with_trusted_keys(trusted_keys),
+            )),
             Some(Arc::new(provider::plugin::PluginArtifactVerifier::new())),
             Arc::clone(&plugin_audit),
-            data_dir.join("plugins"),
+            plugins_root,
             plugin_data,
             plugin_logs,
         );

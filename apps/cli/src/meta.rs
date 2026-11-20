@@ -1247,7 +1247,10 @@ pub(crate) fn plugin_sha256_arg() -> &'static str {
 
 #[must_use]
 pub(crate) fn plugin_allow_unsigned_arg() -> &'static str {
-    t("允许未签名产物", "allow unsigned artifacts")
+    t(
+        "允许未签名的本地产物（远端来源仍需签名）",
+        "allow unsigned local artifacts (remote sources still require a signature)",
+    )
 }
 
 #[must_use]

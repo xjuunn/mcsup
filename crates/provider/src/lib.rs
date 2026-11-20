@@ -11,6 +11,7 @@ pub mod neoforge;
 pub mod papermc;
 pub mod plugin;
 pub mod plugin_net;
+pub mod plugin_sig;
 pub mod purpur;
 pub mod quilt;
 mod shared;
