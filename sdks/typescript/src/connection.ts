@@ -23,6 +23,9 @@ const NEWLINE = 0x0a;
 /** 单次能力调用的默认超时 */
 export const DEFAULT_CALL_TIMEOUT_MS = 15_000;
 
+/** 关闭时等待写缓冲 flush 与 socket 关闭的上限 */
+const CLOSE_TIMEOUT_MS = 1_000;
+
 /** 按端点连接：`tcp://host:port`、Windows 命名管道或 Unix socket 路径 */
 export function connect(endpoint: string): Promise<net.Socket> {
   const socket = endpoint.startsWith("tcp://")
@@ -66,6 +69,8 @@ export class Connection {
   private closedReason: string | undefined;
   private readonly pending = new Map<number, PendingCall>();
   private nextCallId = 1;
+  /** 写链：保证帧顺序，并在 `socket.write` 返回 false 时等 drain */
+  private writeChain: Promise<void> = Promise.resolve();
 
   private constructor(socket: net.Socket, handlers: ConnectionHandlers) {
     this.socket = socket;
@@ -85,16 +90,52 @@ export class Connection {
     return new Connection(await connect(endpoint), handlers);
   }
 
-  /** 发送一帧；连接已关闭时静默丢弃 */
-  public send(frame: OutboundFrame): void {
+  /**
+   * 发送一帧；返回的 promise 在数据实际交给内核后完成。
+   *
+   * 连接已关闭时立即完成（帧丢弃）。写背压时等 `drain`，避免大帧堆积在
+   * 用户态内存里。
+   */
+  public send(frame: OutboundFrame): Promise<void> {
     if (this.closedReason !== undefined) {
+      return Promise.resolve();
+    }
+    const payload = encodeFrame(frame);
+    const written = this.writeChain.then(async () => {
+      // 已入队的帧必须写出去：close() 也会先等这条写链 flush
+      await this.write(payload);
+    });
+    // 失败已在 write 内转成 fail；这里只保证写链不中断
+    this.writeChain = written.catch(() => {});
+    return written;
+  }
+
+  private async write(payload: string): Promise<void> {
+    if (this.socket.destroyed) {
       return;
     }
+    let flushed: boolean;
     try {
-      this.socket.write(encodeFrame(frame));
+      flushed = this.socket.write(payload);
     } catch (err) {
       this.fail(`write failed: ${String(err)}`);
+      return;
     }
+    if (flushed) {
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      const done = (): void => {
+        clearTimeout(timer);
+        this.socket.off("drain", done);
+        this.socket.off("close", done);
+        resolve();
+      };
+      // socket 已半关闭时可能永远不触发 drain/close，用上限兜底
+      const timer = setTimeout(done, CLOSE_TIMEOUT_MS);
+      this.socket.once("drain", done);
+      this.socket.once("close", done);
+    });
   }
 
   /**
@@ -123,10 +164,21 @@ export class Connection {
     });
   }
 
-  /** 关闭连接 */
-  public close(): void {
+  /** 关闭连接；等待写缓冲 flush 与 socket 关闭，最多 1 s */
+  public async close(): Promise<void> {
     this.fail("closed by plugin");
-    this.socket.end();
+    await withDeadline(this.writeChain, CLOSE_TIMEOUT_MS);
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        this.socket.destroy();
+        resolve();
+      }, CLOSE_TIMEOUT_MS);
+      this.socket.once("close", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      this.socket.end();
+    });
   }
 
   private consume(chunk: Buffer): void {
@@ -207,4 +259,21 @@ interface PendingCall {
   readonly resolve: (value: unknown) => void;
   readonly reject: (error: Error) => void;
   readonly timer: NodeJS.Timeout;
+}
+
+/** 等 promise 结束，最多 `ms` 毫秒；超时按完成处理（调用方只关心不再等待） */
+async function withDeadline(promise: Promise<unknown>, ms: number): Promise<void> {
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    promise.then(
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+    );
+  });
 }

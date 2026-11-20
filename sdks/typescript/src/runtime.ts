@@ -44,6 +44,15 @@ import {
 /** 流式总字节上限（plugins.md §5.4） */
 export const MAX_STREAM_BYTES = 16 * 1024 * 1024;
 
+/** 流式空闲超时（plugins.md §5.4：60 s 无新分块即终止） */
+export const STREAM_IDLE_TIMEOUT_MS = 60_000;
+
+/** shutdown 取消 inflight 后等待其收尾的上限 */
+const SHUTDOWN_ABORT_WAIT_MS = 1_000;
+
+/** 默认限额（welcome 之前的兜底值，与 §5.4 一致） */
+const DEFAULT_LIMITS = { inflight: 8, frameBytes: 1024 * 1024, eventQueue: 1024, logLinesPerSec: 200 };
+
 function frameBytes(chunk: unknown): number {
   return Buffer.byteLength(JSON.stringify(chunk) ?? "", "utf8");
 }
@@ -185,9 +194,11 @@ export async function run<C extends readonly Capability[], Id extends string>(
 export interface FrameChannel {
   onFrame(handler: (frame: InboundFrame) => void): void;
   onClose(handler: (reason: string) => void): void;
-  send(frame: OutboundFrame): void;
+  /** 发送一帧；返回 promise 表示已处理写背压 */
+  send(frame: OutboundFrame): void | Promise<void>;
   call(capability: string, method: string, input: unknown, timeoutMs?: number): Promise<unknown>;
-  close(): void;
+  /** 关闭通道；返回 promise 表示已 flush */
+  close(): void | Promise<void>;
 }
 
 class SocketChannel implements FrameChannel {
@@ -221,16 +232,16 @@ class SocketChannel implements FrameChannel {
     this.closeHandler = handler;
   }
 
-  public send(frame: OutboundFrame): void {
-    this.connection.send(frame);
+  public send(frame: OutboundFrame): Promise<void> {
+    return this.connection.send(frame);
   }
 
   public async call(capability: string, method: string, input: unknown, timeoutMs?: number): Promise<unknown> {
     return await this.connection.call(capability, method, input, timeoutMs);
   }
 
-  public close(): void {
-    this.connection.close();
+  public async close(): Promise<void> {
+    await this.connection.close();
   }
 }
 
@@ -246,14 +257,31 @@ export class Session<C extends readonly Capability[]> {
   private readonly ctxEnv: CtxEnvironment;
   private readonly events = new EventBus();
   private readonly inflight = new Map<number, AbortController>();
+  /** 超出 inflight 限额后排队等待的调用 */
+  private readonly callQueue: CallFrame[] = [];
+  /** 有界事件队列；满时丢最旧 */
+  private readonly eventQueue: Array<Extract<InboundFrame, { type: "event" }>> = [];
+  /** 等 inflight 清空的 waiter */
+  private readonly inflightWaiters: Array<() => void> = [];
+  /** 插件 → 宿主方向的活动调用数与排队者（§5.4 同一限额） */
+  private hostInflight = 0;
+  private readonly hostCallWaiters: Array<{ resolve: () => void; reject: (error: PluginError) => void }> = [];
 
   private ctx: CtxFor<C>;
   private readonly exitPromise: Promise<number>;
   private resolveExit: ((code: number) => void) | undefined;
+  private startPromise: Promise<void> | undefined;
 
   private exitCode: number = ExitCode.Ok;
   private welcomed = false;
   private closed = false;
+  /** 已收到 shutdown：不再接受新调用 / 事件 */
+  private stopping = false;
+  private drainingEvents = false;
+  private droppedEvents = 0;
+  private logWindowStart = Date.now();
+  private logWindowCount = 0;
+  private suppressedLogs = 0;
   private configValues: unknown = undefined;
   private configRevision = 0;
 
@@ -262,9 +290,6 @@ export class Session<C extends readonly Capability[]> {
     this.channel = channel;
     this.ops = new Map(collectOps(def).map((op) => [op.id, op]));
 
-    for (const kind of subscriptionKinds(def.subscriptions)) {
-      this.events.subscribe([kind]);
-    }
     for (const { kind, handler } of subscriptionHandlers(def.subscriptions)) {
       this.events.on(kind, handler as never);
     }
@@ -276,12 +301,18 @@ export class Session<C extends readonly Capability[]> {
 
     this.ctxEnv = {
       caller: {
-        call: async (capability: string, method: string, input: unknown, timeoutMs?: number) =>
-          await channel.call(capability, method, input, timeoutMs),
+        call: async (capability: string, method: string, input: unknown, timeoutMs?: number) => {
+          await this.acquireHostCall();
+          try {
+            return await channel.call(capability, method, input, timeoutMs);
+          } finally {
+            this.releaseHostCall();
+          }
+        },
       },
       config: () => this.configValues,
       sessionId: "",
-      limits: { inflight: 8, frameBytes: 1024 * 1024, eventQueue: 1024, logLinesPerSec: 200 },
+      limits: { ...DEFAULT_LIMITS },
       scope: { kind: def.scope ?? "machine" },
       events: this.events,
       logLine: (level: string, message: string) => {
@@ -299,11 +330,16 @@ export class Session<C extends readonly Capability[]> {
         return;
       }
       this.closed = true;
+      this.stopping = true;
       this.log("warn", `connection closed: ${reason}`);
       // 协议错误必须按 §6.7 以 2 退出，不能当成正常关闭
       if (reason.startsWith("protocol error")) {
         this.exitCode = ExitCode.Protocol;
       }
+      this.callQueue.length = 0;
+      this.eventQueue.length = 0;
+      this.rejectHostCallWaiters(new PluginError("unavailable", "connection closed"));
+      this.abortInflight(new PluginError("unavailable", "connection closed"));
       this.resolveExitOnce(this.exitCode);
     });
   }
@@ -319,7 +355,8 @@ export class Session<C extends readonly Capability[]> {
       platform: platformTag(),
       pid: process.pid,
       requested: this.def.capabilities,
-      subscriptions: this.events.subscribedKinds(),
+      // 订阅集合是静态声明；运行期不能再改（宿主按 hello 下发事件）
+      subscriptions: subscriptionKinds(this.def.subscriptions),
     });
     return await this.exitPromise;
   }
@@ -330,6 +367,24 @@ export class Session<C extends readonly Capability[]> {
   }
 
   private log(level: string, message: string): void {
+    // 日志限速（§5.4）：每窗口超过上限就丢行，窗口切换时汇总一次
+    const now = Date.now();
+    if (now - this.logWindowStart >= 1000) {
+      this.logWindowStart = now;
+      this.logWindowCount = 0;
+      if (this.suppressedLogs > 0) {
+        const suppressed = this.suppressedLogs;
+        this.suppressedLogs = 0;
+        // 汇总行直接写，避免被同一个限速器再次丢弃
+        process.stderr.write(`[${this.def.id}] warn: suppressed ${suppressed} log line(s)\n`);
+        this.logWindowCount = 1;
+      }
+    }
+    if (this.logWindowCount >= this.ctxEnv.limits.logLinesPerSec) {
+      this.suppressedLogs += 1;
+      return;
+    }
+    this.logWindowCount += 1;
     // 日志走 stderr，不进入帧（§5.3）
     process.stderr.write(`[${this.def.id}] ${level}: ${message}\n`);
   }
@@ -353,11 +408,11 @@ export class Session<C extends readonly Capability[]> {
         return;
       }
       case "call": {
-        void this.dispatchCall(frame);
+        this.enqueueCall(frame);
         return;
       }
       case "event": {
-        void this.dispatchEvent(frame);
+        this.enqueueEvent(frame);
         return;
       }
       case "config": {
@@ -365,7 +420,18 @@ export class Session<C extends readonly Capability[]> {
         return;
       }
       case "cancel": {
-        this.inflight.get(frame.id)?.abort(new PluginError("cancelled", frame.reason ?? "cancelled by host"));
+        const reason = frame.reason ?? "cancelled by host";
+        const controller = this.inflight.get(frame.id);
+        if (controller !== undefined) {
+          controller.abort(new PluginError("cancelled", reason));
+          return;
+        }
+        // 还在队列里的调用直接取消，回 cancelled 而不是等它开始
+        const index = this.callQueue.findIndex((queued) => queued.id === frame.id);
+        if (index >= 0) {
+          this.callQueue.splice(index, 1);
+          this.replyError(frame.id, new PluginError("cancelled", reason));
+        }
         return;
       }
       case "ping": {
@@ -409,7 +475,7 @@ export class Session<C extends readonly Capability[]> {
     }
     this.configRevision = frame.config.revision;
     this.configValues = parsed.data;
-    void this.runStart();
+    this.startPromise = this.runStart();
   }
 
   private async runStart(): Promise<void> {
@@ -420,6 +486,151 @@ export class Session<C extends readonly Capability[]> {
       this.log("error", `onStart failed: ${error.message}`);
       this.exitCode = error.code === "invalid_input" ? ExitCode.Config : ExitCode.Failure;
       this.finish();
+    }
+  }
+
+  /** 入站调用入口：超限额时排队，队列也满则直接拒绝（§5.4） */
+  private enqueueCall(frame: CallFrame): void {
+    if (this.stopping || this.closed) {
+      this.replyError(frame.id, new PluginError("unavailable", "plugin is not accepting calls"));
+      return;
+    }
+    const limit = Math.max(this.ctxEnv.limits.inflight, 1);
+    if (this.inflight.size >= limit) {
+      // 队列容量与 inflight 同量：总等待上限 2 * limit
+      if (this.callQueue.length >= limit) {
+        this.replyError(frame.id, new PluginError("limit_exceeded", `too many in-flight calls (limit ${limit})`));
+        return;
+      }
+      this.callQueue.push(frame);
+      return;
+    }
+    void this.runCall(frame);
+  }
+
+  private async runCall(frame: CallFrame): Promise<void> {
+    try {
+      await this.dispatchCall(frame);
+    } finally {
+      // 无论成功、失败还是早退，都要补上排队中的调用
+      this.pumpCalls();
+    }
+  }
+
+  private pumpCalls(): void {
+    if (this.stopping || this.closed) {
+      return;
+    }
+    const limit = Math.max(this.ctxEnv.limits.inflight, 1);
+    while (this.inflight.size < limit && this.callQueue.length > 0) {
+      const next = this.callQueue.shift();
+      if (next === undefined) {
+        break;
+      }
+      void this.runCall(next);
+    }
+  }
+
+  /** 事件入队；超过 event_queue 丢最旧并计数（§5.4） */
+  private enqueueEvent(frame: Extract<InboundFrame, { type: "event" }>): void {
+    if (this.stopping || this.closed) {
+      return;
+    }
+    const limit = Math.max(this.ctxEnv.limits.eventQueue, 1);
+    if (this.eventQueue.length >= limit) {
+      this.eventQueue.shift();
+      this.droppedEvents += 1;
+    }
+    this.eventQueue.push(frame);
+    void this.drainEvents();
+  }
+
+  private async drainEvents(): Promise<void> {
+    if (this.drainingEvents) {
+      return;
+    }
+    this.drainingEvents = true;
+    try {
+      while (!this.stopping && !this.closed) {
+        const frame = this.eventQueue.shift();
+        if (frame === undefined) {
+          break;
+        }
+        await this.dispatchEvent(frame);
+      }
+    } finally {
+      this.drainingEvents = false;
+      if (this.droppedEvents > 0) {
+        const dropped = this.droppedEvents;
+        this.droppedEvents = 0;
+        this.log("warn", `dropped ${dropped} event(s) because the event queue is full`);
+      }
+    }
+  }
+
+  private waitForInflight(): Promise<void> {
+    if (this.inflight.size === 0) {
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => {
+      this.inflightWaiters.push(resolve);
+    });
+  }
+
+  private notifyInflightIfIdle(): void {
+    if (this.inflight.size > 0) {
+      return;
+    }
+    const waiters = this.inflightWaiters.splice(0);
+    for (const waiter of waiters) {
+      waiter();
+    }
+  }
+
+  private abortInflight(error: PluginError): void {
+    for (const [, controller] of this.inflight) {
+      controller.abort(error);
+    }
+    // 不在这里 clear：调用在 dispatchCall 的 finally 里自行移除并唤醒 waiter，
+    // 否则 shutdown 会在结果帧发出前就关闭通道。
+  }
+
+  private frameLimit(): number {
+    return Math.min(MAX_FRAME_BYTES, Math.max(this.ctxEnv.limits.frameBytes, 1));
+  }
+
+  /** 取一个插件 → 宿主调用槽位；满额时排队，队列也满则拒绝 */
+  private async acquireHostCall(): Promise<void> {
+    if (this.stopping || this.closed) {
+      throw new PluginError("unavailable", "plugin is shutting down");
+    }
+    const limit = Math.max(this.ctxEnv.limits.inflight, 1);
+    if (this.hostInflight < limit) {
+      this.hostInflight += 1;
+      return;
+    }
+    if (this.hostCallWaiters.length >= limit) {
+      throw new PluginError("limit_exceeded", `too many in-flight host calls (limit ${limit})`);
+    }
+    await new Promise<void>((resolve, reject) => {
+      this.hostCallWaiters.push({ resolve, reject });
+    });
+  }
+
+  /** 释放槽位；有排队者时直接把槽位转交（hostInflight 不变） */
+  private releaseHostCall(): void {
+    const next = this.hostCallWaiters.shift();
+    if (next !== undefined) {
+      next.resolve();
+      return;
+    }
+    this.hostInflight = Math.max(this.hostInflight - 1, 0);
+  }
+
+  private rejectHostCallWaiters(error: PluginError): void {
+    const waiters = this.hostCallWaiters.splice(0);
+    for (const waiter of waiters) {
+      waiter.reject(error);
     }
   }
 
@@ -436,6 +647,10 @@ export class Session<C extends readonly Capability[]> {
   }
 
   private async applyConfig(frame: Extract<InboundFrame, { type: "config" }>): Promise<void> {
+    if (this.stopping || this.closed) {
+      this.replyError(frame.id, new PluginError("unavailable", "plugin is shutting down"));
+      return;
+    }
     if (frame.revision <= this.configRevision) {
       this.channel.send({ type: "result", id: frame.id, ok: true, output: { stale: true } });
       return;
@@ -477,23 +692,47 @@ export class Session<C extends readonly Capability[]> {
   }
 
   private async shutdown(graceMs: number): Promise<void> {
+    if (this.closed || this.stopping) {
+      return;
+    }
+    // §6.7：停止接受新调用 → 完成或取消 inflight → flush → 退出码 0
+    this.stopping = true;
+    this.rejectHostCallWaiters(new PluginError("cancelled", "plugin shutting down"));
+    while (this.callQueue.length > 0) {
+      const queued = this.callQueue.shift();
+      if (queued === undefined) {
+        break;
+      }
+      this.replyError(queued.id, new PluginError("unavailable", "plugin is shutting down"));
+    }
+    this.eventQueue.length = 0;
+
+    // onStart 尚未完成时也给它同样的 grace 窗口
+    if (this.startPromise !== undefined) {
+      await waitWithDeadline(this.startPromise, Math.max(graceMs, 0));
+    }
     if (this.closed) {
       return;
     }
-    this.closed = true;
-    for (const [, controller] of this.inflight) {
-      controller.abort(new PluginError("cancelled", "plugin shutting down"));
+
+    if (this.inflight.size > 0) {
+      await waitWithDeadline(this.waitForInflight(), Math.max(graceMs, 0));
     }
-    this.inflight.clear();
+    if (this.inflight.size > 0) {
+      // grace 用尽：取消剩余 inflight，并给收尾一点时间
+      this.abortInflight(new PluginError("cancelled", "plugin shutting down"));
+      await waitWithDeadline(this.waitForInflight(), SHUTDOWN_ABORT_WAIT_MS);
+    }
+
     try {
       await this.def.onStop?.(this.ctx);
     } catch (err) {
       this.log("error", `onStop failed: ${toPluginError(err).message}`);
       this.exitCode = ExitCode.Failure;
     }
-    // grace_ms 只是宿主给的上限，插件做完即退；这里不等满
-    void graceMs;
-    this.channel.close();
+    this.closed = true;
+    // close 会等待写缓冲 flush，避免退出前丢帧
+    await this.channel.close();
     this.resolveExitOnce(this.exitCode);
   }
 
@@ -502,9 +741,24 @@ export class Session<C extends readonly Capability[]> {
       return;
     }
     this.closed = true;
-    this.inflight.clear();
-    this.channel.close();
-    this.resolveExitOnce(this.exitCode);
+    this.stopping = true;
+    this.rejectHostCallWaiters(new PluginError("cancelled", "plugin shutting down"));
+    while (this.callQueue.length > 0) {
+      const queued = this.callQueue.shift();
+      if (queued === undefined) {
+        break;
+      }
+      this.replyError(queued.id, new PluginError("unavailable", "plugin is shutting down"));
+    }
+    this.eventQueue.length = 0;
+    this.abortInflight(new PluginError("cancelled", "plugin is shutting down"));
+    void this.closeChannel();
+  }
+
+  private async closeChannel(): Promise<void> {
+    const code = this.exitCode;
+    await this.channel.close();
+    this.resolveExitOnce(code);
   }
 
   private replyError(id: number, error: PluginError): void {
@@ -517,6 +771,10 @@ export class Session<C extends readonly Capability[]> {
   }
 
   private async dispatchCall(frame: CallFrame): Promise<void> {
+    if (this.stopping || this.closed) {
+      this.replyError(frame.id, new PluginError("unavailable", "plugin is shutting down"));
+      return;
+    }
     if (!this.welcomed) {
       this.replyError(frame.id, new PluginError("conflict", "call before welcome"));
       return;
@@ -561,15 +819,20 @@ export class Session<C extends readonly Capability[]> {
         );
         return;
       }
-      if (frameBytes(checked.data) > MAX_FRAME_BYTES) {
-        this.replyError(frame.id, new PluginError("limit_exceeded", `op ${op.id} output exceeds ${MAX_FRAME_BYTES} bytes`));
+      const result: OutboundFrame = { type: "result", id: frame.id, ok: true, output: checked.data };
+      if (frameBytes(result) > this.frameLimit()) {
+        this.replyError(
+          frame.id,
+          new PluginError("limit_exceeded", `op ${op.id} output exceeds ${this.frameLimit()} bytes`),
+        );
         return;
       }
-      this.channel.send({ type: "result", id: frame.id, ok: true, output: checked.data });
+      this.channel.send(result);
     } catch (err) {
       this.replyError(frame.id, toPluginError(err));
     } finally {
       this.inflight.delete(frame.id);
+      this.notifyInflightIfIdle();
     }
   }
 
@@ -589,7 +852,7 @@ export class Session<C extends readonly Capability[]> {
       this.replyError(callId, toPluginError(err));
       return;
     }
-    await pumpStream(chunks, op, this.channel, callId, signal);
+    await pumpStream(chunks, op, this.channel, callId, signal, { frameBytes: this.frameLimit() });
   }
 }
 
@@ -602,12 +865,21 @@ interface StreamOpShape {
   readonly output: z.ZodType;
 }
 
+/** 流式泵选项；测试可缩短空闲窗口 */
+export interface PumpStreamOptions {
+  /** 单帧字节上限，默认协议上限 1 MiB */
+  readonly frameBytes?: number;
+  /** 空闲超时毫秒，默认 60 s */
+  readonly idleMs?: number;
+}
+
 /**
  * 把迭代器泵成 stream 帧（§6.5）。
  *
  * - `seq` 从 0 连续递增，末尾发 `done: true` 并回 result
  * - 取消后停止读取，回 `cancelled` 结果，不再写流
  * - 每块按 output fragment schema 校验
+ * - 空闲超过 `idleMs` 终止流（§5.4）
  */
 export async function pumpStream(
   chunks: unknown,
@@ -615,10 +887,13 @@ export async function pumpStream(
   channel: FrameChannel,
   callId: number,
   signal: AbortSignal,
+  options: PumpStreamOptions = {},
 ): Promise<void> {
+  const frameLimit = Math.min(options.frameBytes ?? MAX_FRAME_BYTES, MAX_FRAME_BYTES);
+  const idleMs = options.idleMs ?? STREAM_IDLE_TIMEOUT_MS;
   const iterator = toAsyncIterator(chunks);
   if (iterator === undefined) {
-    channel.send({
+    await channel.send({
       type: "result",
       id: callId,
       ok: false,
@@ -633,14 +908,18 @@ export async function pumpStream(
   }
   let seq = 0;
   let total = 0;
+  let idleTimedOut = false;
   try {
     for (;;) {
       let next: IteratorResult<unknown>;
       try {
-        next = await raceAbort(iterator.next(), signal);
+        next = await raceAbort(nextWithIdleTimeout(iterator, idleMs, op.id, signal), signal);
       } catch (err) {
         if (signal.aborted) {
           throw new PluginError("cancelled", abortReason(signal));
+        }
+        if (err instanceof PluginError && err.code === "timeout") {
+          idleTimedOut = true;
         }
         throw err;
       }
@@ -649,7 +928,7 @@ export async function pumpStream(
       }
       const checked = op.output.safeParse(next.value);
       if (!checked.success) {
-        channel.send({
+        await channel.send({
           type: "result",
           id: callId,
           ok: false,
@@ -662,10 +941,11 @@ export async function pumpStream(
         });
         return;
       }
-      const bytes = frameBytes(checked.data);
-      total += bytes;
-      if (bytes > MAX_FRAME_BYTES || total > MAX_STREAM_BYTES) {
-        channel.send({
+      const chunkBytes = frameBytes(checked.data);
+      total += chunkBytes;
+      const frame: OutboundFrame = { type: "stream", id: callId, seq, chunk: checked.data, done: false };
+      if (frameBytes(frame) > frameLimit || total > MAX_STREAM_BYTES) {
+        await channel.send({
           type: "result",
           id: callId,
           ok: false,
@@ -678,22 +958,65 @@ export async function pumpStream(
         });
         return;
       }
-      channel.send({ type: "stream", id: callId, seq, chunk: checked.data, done: false });
+      // 等写背压，避免生产者把大流堆进内存
+      await channel.send(frame);
       seq += 1;
     }
-    channel.send({ type: "stream", id: callId, seq, chunk: {}, done: true });
-    channel.send({ type: "result", id: callId, ok: true, output: { completed: true, chunks: seq } });
+    await channel.send({ type: "stream", id: callId, seq, chunk: {}, done: true });
+    await channel.send({ type: "result", id: callId, ok: true, output: { completed: true, chunks: seq } });
   } catch (err) {
     const error = toPluginError(err);
-    channel.send({
+    await channel.send({
       type: "result",
       id: callId,
       ok: false,
       error: { code: error.code, category: error.category, retryable: error.retryable, message: error.message },
     });
   } finally {
-    await iterator.return?.();
+    if (idleTimedOut) {
+      // 空闲超时的迭代器可能永远不返回，不能等它的 return 阻塞退出
+      void Promise.resolve(iterator.return?.()).catch(() => {});
+    } else {
+      await iterator.return?.();
+    }
   }
+}
+
+/** 单次 `next()` 的空闲计时；超时抛 `timeout` */
+function nextWithIdleTimeout(
+  iterator: AsyncIterator<unknown>,
+  idleMs: number,
+  opId: string,
+  signal: AbortSignal,
+): Promise<IteratorResult<unknown>> {
+  if (!Number.isFinite(idleMs) || idleMs <= 0) {
+    return Promise.resolve(iterator.next());
+  }
+  return new Promise<IteratorResult<unknown>>((resolve, reject) => {
+    const cleanup = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+    };
+    const onAbort = (): void => {
+      cleanup();
+      reject(new PluginError("cancelled", abortReason(signal)));
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new PluginError("timeout", `stream op ${opId} was idle for ${idleMs} ms`));
+    }, idleMs);
+    signal.addEventListener("abort", onAbort, { once: true });
+    Promise.resolve(iterator.next()).then(
+      (value) => {
+        cleanup();
+        resolve(value);
+      },
+      (err: unknown) => {
+        cleanup();
+        reject(err instanceof Error ? err : new Error(String(err)));
+      },
+    );
+  });
 }
 
 function abortReason(signal: AbortSignal): string {
@@ -738,6 +1061,23 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T
         reject(err instanceof Error ? err : new Error(String(err)));
       },
     );
+  });
+}
+
+/** 等 promise 结束；返回 true 表示在 `ms` 内完成，false 表示超时 */
+async function waitWithDeadline(promise: Promise<unknown>, ms: number): Promise<boolean> {
+  if (!Number.isFinite(ms) || ms <= 0) {
+    return false;
+  }
+  return await new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => {
+      resolve(false);
+    }, ms);
+    const done = (): void => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    promise.then(done, done);
   });
 }
 

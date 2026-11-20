@@ -55,6 +55,10 @@ describe("general", () => {
     const s = "😀".repeat(5);
     expect(truncate(s, 3)).toBe("😀😀…");
     expect(() => truncate("x", 0)).toThrow(RangeError);
+    // 后缀本身达到或超过上限时不能把结果撑破
+    expect(truncate("abcdef", 2, "……")).toBe("……");
+    expect(truncate("abcdef", 1, "……")).toBe("…");
+    expect(truncate("abcdef", 4, "……")).toBe("ab……");
   });
 
   it("randomId 返回 16 位 hex 且不重复", () => {
@@ -222,6 +226,10 @@ describe("minecraft", () => {
   it("buildCommand 拒绝换行与控制字符", () => {
     expect(() => buildCommand("say", ["a\nb"])).toThrow(TypeError);
     expect(() => buildCommand("sa\ny")).toThrow(TypeError);
+    // 命令本体中间的控制字符同样会伪造第二行
+    expect(() => buildCommand("say\u0000x")).toThrow(TypeError);
+    expect(() => buildCommand("say\x7fx")).toThrow(TypeError);
+    expect(() => buildCommand("say\rz")).toThrow(TypeError);
   });
 });
 
@@ -327,5 +335,48 @@ describe("state", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("kvTtlCache 支持不过期条目", async () => {
+    vi.useFakeTimers();
+    try {
+      const kv = memKv();
+      const cache = kvTtlCache(kv);
+      await cache.set("forever", "v");
+      await cache.set("explicit", "v", null);
+      vi.advanceTimersByTime(365 * 24 * 60 * 60 * 1000);
+      expect(await cache.get("forever")).toBe("v");
+      expect(await cache.get("explicit")).toBe("v");
+      expect(await cache.getOrLoad("lazy", undefined, async () => "loaded")).toBe("loaded");
+      expect(await cache.get("lazy")).toBe("loaded");
+      // 不过期条目不该被 purge 清掉
+      expect(await cache.purge()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("kvTtlCache 坏数据按未命中处理", async () => {
+    const kv = memKv();
+    await kv.set("cache:bad", "not json");
+    expect(await kvTtlCache(kv).get("bad")).toBeNull();
+  });
+
+  it("state 工厂不依赖 this，可安全解构", async () => {
+    const counter = kvCounter(memKv(), "d:");
+    const { add, incr } = counter;
+    expect(await add("k", 2)).toBe(2);
+    expect(await incr("k")).toBe(3);
+
+    const cache = kvTtlCache(memKv(), "d:");
+    const { getOrLoad } = cache;
+    let loads = 0;
+    const loader = async (): Promise<number> => {
+      loads += 1;
+      return 7;
+    };
+    expect(await getOrLoad("k", 1000, loader)).toBe(7);
+    expect(await getOrLoad("k", 1000, loader)).toBe(7);
+    expect(loads).toBe(1);
   });
 });

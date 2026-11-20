@@ -6,57 +6,27 @@
  * 一一对应（plugins.md §6.4），作者据此决定是否重试，不需要解析文本。
  */
 
-/** 宿主错误码，与 `domain::plugin::error::PluginErrorCode` 一致 */
-export type PluginErrorCode =
-  | "invalid_input"
-  | "not_found"
-  | "denied"
-  | "conflict"
-  | "timeout"
-  | "cancelled"
-  | "unavailable"
-  | "crashed"
-  | "limit_exceeded"
-  | "unsupported"
-  | "internal";
+import {
+  ERROR_CATEGORY,
+  RETRYABLE_ERRORS,
+  type ErrorCategory,
+  type ErrorCode,
+} from "./contracts/v1.js";
 
-/** 线上分类文本，与 `category_of` 一致 */
-export type PluginErrorCategory =
-  | "usage"
-  | "not_found"
-  | "unauthorized"
-  | "conflict"
-  | "cancelled"
-  | "backend"
-  | "failure";
+/** 宿主错误码，直接来自生成契约 */
+export type PluginErrorCode = ErrorCode;
 
-/** 错误码 → 分类；与宿主 `category_of` 保持一致 */
+/** 线上分类文本，直接来自生成契约 */
+export type PluginErrorCategory = ErrorCategory;
+
+/** 错误码 → 分类；单表维护在契约生成物中 */
 export function categoryOf(code: PluginErrorCode): PluginErrorCategory {
-  switch (code) {
-    case "invalid_input":
-    case "limit_exceeded":
-    case "unsupported":
-      return "usage";
-    case "not_found":
-      return "not_found";
-    case "denied":
-      return "unauthorized";
-    case "conflict":
-      return "conflict";
-    case "cancelled":
-      return "cancelled";
-    case "timeout":
-    case "unavailable":
-    case "crashed":
-      return "backend";
-    default:
-      return "failure";
-  }
+  return ERROR_CATEGORY[code];
 }
 
-/** 错误码是否可重试；与宿主 `retryable()` 保持一致 */
+/** 错误码是否可重试；单表维护在契约生成物中 */
 export function isRetryable(code: PluginErrorCode): boolean {
-  return code === "timeout" || code === "unavailable" || code === "crashed";
+  return RETRYABLE_ERRORS.includes(code);
 }
 
 /** 插件侧统一错误 */

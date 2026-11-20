@@ -237,6 +237,24 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  # TypeScript 插件 SDK 不在 Cargo workspace 内，cargo 门禁覆盖不到；
+  # 单独成 job 跑同一个 check-sdk.sh（契约漂移 + 类型 + 构建 + 测试 + 一致性）。
+  sdk:
+    name: sdk (typescript)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: check typescript sdk
+        run: sh scripts/check-sdk.sh typescript
+
   # --all-features 抓不到「单独开某个 feature 编译不过」，而那正是第三方安装的边界。
   # 需要 `cargo install cargo-hack` 并编译全部 feature 组合，耗时远超其余门禁，
   # 故归入深度检查（手动勾选 deep 才跑），不计入合入结论。
@@ -401,7 +419,7 @@ jobs:
   required:
     name: required checks
     if: always()
-    needs: [architecture, fmt, clippy, test, msrv, docs, features, deny]
+    needs: [architecture, fmt, clippy, test, msrv, docs, sdk, features, deny]
     runs-on: ubuntu-latest
     steps:
       # required 失败时必须指出是哪个 job：原来 jq 输出丢进 /dev/null，日志是空的。

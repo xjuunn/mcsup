@@ -58,17 +58,18 @@ export function kvCounter(kv: KvClient, prefix = ""): KvCounter {
     const n = Number.parseInt(textDecoder.decode(raw), 10);
     return Number.isSafeInteger(n) ? n : 0;
   };
+  const add = async (key: string, delta = 1): Promise<number> => {
+    const next = decode(await kv.get(full(key))) + delta;
+    await kv.set(full(key), String(next));
+    return next;
+  };
   return {
     async get(key) {
       return decode(await kv.get(full(key)));
     },
-    async add(key, delta = 1) {
-      const next = decode(await kv.get(full(key))) + delta;
-      await kv.set(full(key), String(next));
-      return next;
-    },
+    add,
     incr(key) {
-      return this.add(key, 1);
+      return add(key, 1);
     },
     async reset(key) {
       await kv.set(full(key), "0");
@@ -111,7 +112,8 @@ export function kvCursor(kv: KvClient, key: string, initial = 0): KvCursor {
 /** TTL 缓存条目（落 KV 的编码形态） */
 interface CacheEntry {
   readonly value: unknown;
-  readonly expiresAt: number;
+  /** 过期时间戳；`null` 表示不过期。旧条目可能没有该字段，按不过期处理。 */
+  readonly expiresAt: number | null;
 }
 
 /**
@@ -122,9 +124,10 @@ interface CacheEntry {
  */
 export interface KvTtlCache {
   get<T>(key: string): Promise<T | null>;
-  set<T>(key: string, value: T, ttlMs: number): Promise<void>;
-  /** 读穿：未命中时执行 `loader` 并写入 */
-  getOrLoad<T>(key: string, ttlMs: number, loader: () => Promise<T>): Promise<T>;
+  /** `ttlMs` 省略或为 `null` 时不过期 */
+  set<T>(key: string, value: T, ttlMs?: number | null): Promise<void>;
+  /** 读穿：未命中时执行 `loader` 并写入；`ttlMs` 省略或为 `null` 时不过期 */
+  getOrLoad<T>(key: string, ttlMs: number | null | undefined, loader: () => Promise<T>): Promise<T>;
   /** 删除 */
   delete(key: string): Promise<boolean>;
   /** 清理前缀下已过期的条目，返回清理数量 */
@@ -134,27 +137,38 @@ export interface KvTtlCache {
 /** TTL 缓存。`cachePrefix` 下所有键被本缓存独占。 */
 export function kvTtlCache(kv: KvClient, cachePrefix = "cache:"): KvTtlCache {
   const json = kvJson<CacheEntry>(kv, cachePrefix);
-  return {
-    async get<T>(key: string): Promise<T | null> {
-      const entry = await json.get(key);
-      if (entry === null) return null;
-      if (entry.expiresAt <= Date.now()) {
-        await json.delete(key);
-        return null;
-      }
-      return entry.value as T;
-    },
-    async set<T>(key: string, value: T, ttlMs: number): Promise<void> {
+  const expired = (entry: CacheEntry): boolean =>
+    entry.expiresAt !== null && entry.expiresAt !== undefined && entry.expiresAt <= Date.now();
+
+  const get = async <T>(key: string): Promise<T | null> => {
+    const entry = await json.get(key);
+    if (entry === null) return null;
+    if (expired(entry)) {
+      await json.delete(key);
+      return null;
+    }
+    return entry.value as T;
+  };
+
+  const set = async <T>(key: string, value: T, ttlMs?: number | null): Promise<void> => {
+    let expiresAt: number | null = null;
+    if (ttlMs !== undefined && ttlMs !== null) {
       if (!Number.isInteger(ttlMs) || ttlMs < 1) {
         throw new RangeError(`ttlMs must be a positive integer, got ${ttlMs}`);
       }
-      await json.set(key, { value, expiresAt: Date.now() + ttlMs });
-    },
-    async getOrLoad<T>(key: string, ttlMs: number, loader: () => Promise<T>): Promise<T> {
-      const cached = await this.get<T>(key);
+      expiresAt = Date.now() + ttlMs;
+    }
+    await json.set(key, { value, expiresAt });
+  };
+
+  return {
+    get,
+    set,
+    async getOrLoad<T>(key: string, ttlMs: number | null | undefined, loader: () => Promise<T>): Promise<T> {
+      const cached = await get<T>(key);
       if (cached !== null) return cached;
       const value = await loader();
-      await this.set(key, value, ttlMs);
+      await set(key, value, ttlMs);
       return value;
     },
     delete(key) {
@@ -166,7 +180,7 @@ export function kvTtlCache(kv: KvClient, cachePrefix = "cache:"): KvTtlCache {
       for (const full of keys) {
         const key = full.slice(cachePrefix.length);
         const entry = await json.get(key);
-        if (entry !== null && entry.expiresAt <= Date.now() && (await json.delete(key))) {
+        if (entry !== null && expired(entry) && (await json.delete(key))) {
           removed += 1;
         }
       }

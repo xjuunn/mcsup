@@ -7,6 +7,8 @@
 
 import type { ConsoleLine, ConsoleReadClient, EventsClient, KvClient, LogClient } from "./index.js";
 import { PluginError } from "./errors.js";
+import { kvTtlCache } from "./utils/state.js";
+import { withRetry } from "./utils/retry.js";
 
 /**
  * Hook 只依赖上下文的公共部分：日志、配置、限额与作用域。
@@ -117,15 +119,17 @@ export function useConsoleTail(
     state.running = true;
     try {
       const page = await consoleRead.tail(state.server, state.cursor, batch);
-      state.cursor = page.cursor;
-      state.dropped = page.dropped;
-      state.backoff = interval;
       for (const text of page.lines) {
         if (state.stopped) {
+          // 游标尚未推进：下次订阅会重放整页（至少一次），而不是丢行
           return;
         }
         await state.handler({ text, server: state.server, at: Date.now() }, state.server);
       }
+      // 整页处理完才提交游标；handler 抛错时保持原游标，重试不会跳过剩余行
+      state.cursor = page.cursor;
+      state.dropped = page.dropped;
+      state.backoff = interval;
     } catch (err) {
       if (state.stopped) {
         return;
@@ -200,6 +204,8 @@ export interface RetryOptions {
   readonly baseMs?: number;
   /** 最大退避毫秒，默认 30_000 */
   readonly maxMs?: number;
+  /** 抖动比例（0..1），默认 0.2 */
+  readonly jitter?: number;
   /** 额外判定：返回 true 才重试 */
   readonly retryOn?: (error: PluginError) => boolean;
 }
@@ -212,31 +218,22 @@ export interface Retry {
 /**
  * 可重试错误（timeout / unavailable / crashed）自动退避重试；
  * 其他错误立即抛出，`code` 保持不变。
+ *
+ * 退避与抖动实现复用 `utils/retry.ts` 的 `withRetry`，避免两套算法漂移。
  */
 export function useRetry(
   ctx: HookContext,
   options: RetryOptions = {},
 ): Retry {
   requireObject(ctx, "useRetry");
-  const attempts = options.attempts ?? 3;
-  const baseMs = options.baseMs ?? 500;
-  const maxMs = options.maxMs ?? 30_000;
   return async function retry<T>(fn: () => Promise<T> | T): Promise<T> {
-    for (let attempt = 1; ; attempt += 1) {
-      try {
-        return await fn();
-      } catch (err) {
-        const error = err instanceof PluginError ? err : new PluginError("internal", String(err));
-        const retryable = error.retryable && (options.retryOn?.(error) ?? true);
-        if (!retryable || attempt >= attempts) {
-          throw error;
-        }
-        const delay = Math.min(baseMs * 2 ** (attempt - 1), maxMs);
-        await new Promise<void>((resolve) => {
-          setTimeout(resolve, delay);
-        });
-      }
-    }
+    return await withRetry(fn, {
+      attempts: options.attempts,
+      baseMs: options.baseMs,
+      maxMs: options.maxMs,
+      jitter: options.jitter,
+      retryOn: options.retryOn,
+    });
   };
 }
 
@@ -266,41 +263,17 @@ export function useKvCache(
 ): KvCache {
   const context = requireObject(ctx, "useKvCache");
   const kv = requireMember<KvClient>(context, "storage:kv", "useKvCache");
-  const prefix = options.prefix ?? "cache:";
-  const encoder = new TextEncoder();
-  const decoder = new TextDecoder();
-
-  const get = async <T>(key: string): Promise<T | null> => {
-    const raw = await kv.get(prefix + key);
-    if (raw === null) {
-      return null;
-    }
-    const parsed = JSON.parse(decoder.decode(raw)) as { at: number; value: T };
-    if (options.ttlMs !== undefined && Date.now() - parsed.at > options.ttlMs) {
-      return null;
-    }
-    return parsed.value;
-  };
-  const set = async (key: string, value: unknown): Promise<void> => {
-    await kv.set(prefix + key, encoder.encode(JSON.stringify({ at: Date.now(), value })));
-  };
-  const remove = async (key: string): Promise<void> => {
-    await kv.delete(prefix + key);
-  };
-
+  const cache = kvTtlCache(kv, options.prefix ?? "cache:");
   return {
-    get,
-    set,
-    delete: remove,
-    async remember<T>(key: string, loader: () => Promise<T> | T): Promise<T> {
-      const cached = await get<T>(key);
-      if (cached !== null) {
-        return cached;
-      }
-      const value = await loader();
-      await set(key, value);
-      return value;
+    get: <T>(key: string) => cache.get<T>(key),
+    set: async (key, value) => {
+      await cache.set(key, value, options.ttlMs);
     },
+    delete: async (key) => {
+      await cache.delete(key);
+    },
+    remember: <T>(key: string, loader: () => Promise<T> | T) =>
+      cache.getOrLoad(key, options.ttlMs, async () => await loader()),
   };
 }
 

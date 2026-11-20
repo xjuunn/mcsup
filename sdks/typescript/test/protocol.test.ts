@@ -41,6 +41,35 @@ describe("协议信封", () => {
     expect(() => parseFrame('{"v":1,"type":"welcome","session_id":"s"}')).toThrow(/limits/);
   });
 
+  it("welcome 的 limits / config / scope 逐字段校验", () => {
+    const welcome = (over: Record<string, unknown>): string =>
+      JSON.stringify({
+        v: 1,
+        type: "welcome",
+        session_id: "s",
+        host_version: "0",
+        granted: [],
+        limits: { inflight: 8, frame_bytes: 1048576, event_queue: 1024, log_lines_per_sec: 200 },
+        config: { revision: 1, values: {} },
+        scope: { kind: "machine" },
+        ...over,
+      });
+    expect(() => parseFrame(welcome({ limits: { inflight: 8 } }))).toThrow(/frame_bytes/);
+    expect(() =>
+      parseFrame(welcome({ limits: { inflight: 0, frame_bytes: 1, event_queue: 1, log_lines_per_sec: 1 } })),
+    ).toThrow(/inflight/);
+    expect(() => parseFrame(welcome({ config: { values: {} } }))).toThrow(/revision/);
+    expect(() => parseFrame(welcome({ config: { revision: 1 } }))).toThrow(/values/);
+    expect(() => parseFrame(welcome({ scope: {} }))).toThrow(/scope.kind/);
+    expect(() => parseFrame(welcome({ scope: { kind: "server", server: 1 } }))).toThrow(/scope.server/);
+    // 合法帧原样通过
+    expect(parseFrame(welcome({})).type).toBe("welcome");
+  });
+
+  it("config 帧必须有 values", () => {
+    expect(() => parseFrame('{"v":1,"type":"config","id":1,"revision":2}')).toThrow(/values/);
+  });
+
   it("call 区分 op / capability / contract", () => {
     const opCall = parseFrame('{"v":1,"type":"call","id":7,"op":"send","input":{}}');
     expect(opCall).toMatchObject({ type: "call", id: 7, op: "send" });

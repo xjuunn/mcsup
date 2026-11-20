@@ -64,7 +64,11 @@ export function isPlayerName(name: string): boolean {
  */
 export function buildCommand(command: string, args: readonly string[] = []): string {
   const trimmed = command.trim();
-  if (!/^[a-zA-Z][a-zA-Z0-9_.:-]*( [^]*)?$/.test(trimmed.replace(/^\//, ""))) {
+  // 换行 / 控制字符可以在命令本体里伪造第二行，必须在形状校验之前拒绝
+  if (/[\r\n\u0000-\u001f\u007f]/.test(trimmed)) {
+    throw new TypeError("command must not contain control characters or newlines");
+  }
+  if (!/^[a-zA-Z][a-zA-Z0-9_.:-]*( .*)?$/.test(trimmed.replace(/^\//, ""))) {
     throw new TypeError(`invalid command: ${JSON.stringify(command)}`);
   }
   const parts = [trimmed.startsWith("/") ? trimmed : `/${trimmed}`];

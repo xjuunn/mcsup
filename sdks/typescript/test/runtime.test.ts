@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { ExitCode } from "../src/index.js";
+import { ExitCode, definePlugin, query, z } from "../src/index.js";
+import { pumpStream, type FrameChannel } from "../src/runtime.js";
+import type { OutboundFrame } from "../src/protocol.js";
 import { createMockHost } from "../src/testing.js";
 import { chatBridge, counter, minimal, send } from "./fixtures.js";
 
@@ -73,6 +75,13 @@ describe("MockHost 握手", () => {
     const host = createMockHost(minimal);
     await host.start();
     await host.ping(7);
+    await host.shutdown();
+  });
+
+  it("hello 的 subscriptions 来自静态声明", async () => {
+    const host = createMockHost(chatBridge, { config: { token: "t" } });
+    await host.start();
+    expect(host.lastFrame("hello")).toMatchObject({ subscriptions: ["chat:message"] });
     await host.shutdown();
   });
 });
@@ -260,5 +269,182 @@ describe("Builder 片段", () => {
     expect(counter.kind).toBe("query");
     expect(send.kind).toBe("action");
     expect(send.risk).toBe("mutating");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 并发限额与优雅退出（§5.4 / §6.7）
+// ---------------------------------------------------------------------------
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve: () => void = () => {};
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+const slowPlugin = (gate: Promise<void>, delayMs = 0) =>
+  definePlugin({
+    id: "slow",
+    title: "slow",
+    version: "1.0.0",
+    license: "MIT",
+    capabilities: ["server:read"],
+    config: z.object({}),
+    queries: {
+      slow: query("slow")
+        .output(z.object({ done: z.boolean() }))
+        .run(async () => {
+          if (delayMs > 0) {
+            await new Promise((r) => setTimeout(r, delayMs));
+          } else {
+            await gate;
+          }
+          return { done: true };
+        }),
+    },
+  });
+
+describe("并发限额（§5.4）", () => {
+  it("插件 → 宿主调用也受 inflight 限额", async () => {
+    const gate = deferred();
+    let concurrent = 0;
+    let peak = 0;
+    const host = createMockHost(minimal, {
+      limits: { inflight: 1 },
+      handle: async ({ capability, method }) => {
+        if (capability === "server:read" && method === "list") {
+          concurrent += 1;
+          peak = Math.max(peak, concurrent);
+          await gate.promise;
+          concurrent -= 1;
+          return [];
+        }
+        throw new Error(`unexpected ${capability}.${method}`);
+      },
+    });
+    await host.start();
+    const a = host.ctx["server:read"].servers.list();
+    const b = host.ctx["server:read"].servers.list();
+    await expect(host.ctx["server:read"].servers.list()).rejects.toMatchObject({ code: "limit_exceeded" });
+    gate.resolve();
+    await expect(a).resolves.toEqual([]);
+    await expect(b).resolves.toEqual([]);
+    expect(peak).toBe(1);
+    await host.shutdown();
+  });
+
+  it("inflight 满时排队，队列满回 limit_exceeded", async () => {
+    const gate = deferred();
+    const host = createMockHost(slowPlugin(gate.promise), { limits: { inflight: 1 } });
+    await host.start();
+
+    const first = host.callOp("slow");
+    const second = host.callOp("slow");
+    // 第一个占满 inflight，第二个进队列；队列容量 = inflight，第三个直接拒绝
+    const third = await host.callOp("slow");
+    expect(third.ok).toBe(false);
+    if (!third.ok) {
+      expect(third.error.code).toBe("limit_exceeded");
+    }
+
+    gate.resolve();
+    await expect(first).resolves.toMatchObject({ ok: true });
+    await expect(second).resolves.toMatchObject({ ok: true });
+    await host.shutdown();
+  });
+
+  it("事件队列满时丢最旧，保留最新的事件", async () => {
+    const seen: number[] = [];
+    const plugin = definePlugin({
+      id: "events",
+      title: "events",
+      version: "1.0.0",
+      license: "MIT",
+      capabilities: ["events"],
+      subscriptions: ["chat:message"],
+      config: z.object({}),
+      onStart: (ctx) => {
+        ctx.events.on("chat:message", async (data) => {
+          seen.push((data as { n: number }).n);
+          await new Promise((r) => setTimeout(r, 20));
+        });
+      },
+    });
+    const host = createMockHost(plugin, { limits: { event_queue: 2 } });
+    await host.start();
+    for (let n = 1; n <= 4; n += 1) {
+      host.inject({ type: "event", seq: n, kind: "chat:message", at: new Date().toISOString(), data: { n } });
+    }
+    for (let i = 0; i < 100 && seen.length < 3; i += 1) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    // 1 正在处理；2 在队列满时被丢弃；3、4 保留
+    expect(seen).toEqual([1, 3, 4]);
+    await host.shutdown();
+  });
+});
+
+describe("shutdown（§6.7）", () => {
+  it("grace 内等待 inflight 完成后再退出", async () => {
+    const host = createMockHost(slowPlugin(Promise.resolve(), 30));
+    await host.start();
+    const pending = host.callOp("slow");
+    const code = await host.shutdown(1_000);
+    expect(code).toBe(ExitCode.Ok);
+    await expect(pending).resolves.toMatchObject({ ok: true, output: { done: true } });
+  });
+
+  it("grace 用尽后取消 inflight 并正常退出", async () => {
+    const host = createMockHost(slowPlugin(new Promise<void>(() => {})));
+    await host.start();
+    const pending = host.callOp("slow");
+    const code = await host.shutdown(10);
+    expect(code).toBe(ExitCode.Ok);
+    const result = await pending;
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.code).toBe("cancelled");
+    }
+  });
+
+  it("shutdown 后新调用回 unavailable", async () => {
+    const host = createMockHost(slowPlugin(new Promise<void>(() => {})));
+    await host.start();
+    const pending = host.callOp("slow");
+    await host.shutdown(10);
+    await pending;
+    host.inject({ type: "call", id: 999, op: "slow", input: {} });
+    const late = await host.awaitResult(999, 200);
+    expect(late.ok).toBe(false);
+    if (!late.ok) {
+      expect(late.error.code).toBe("unavailable");
+    }
+  });
+});
+
+describe("流式空闲超时（§5.4）", () => {
+  it("迭代器 60 s 无新分块则终止；测试用短窗口", async () => {
+    const frames: OutboundFrame[] = [];
+    const channel: FrameChannel = {
+      onFrame() {},
+      onClose() {},
+      send(frame) {
+        frames.push(frame);
+      },
+      async call() {
+        return null;
+      },
+      close() {},
+    };
+    const chunks = (async function* () {
+      await new Promise<void>(() => {});
+    })();
+    await pumpStream(chunks, { id: "idle", output: z.object({}) }, channel, 7, new AbortController().signal, {
+      idleMs: 20,
+    });
+    const last = frames[frames.length - 1];
+    expect(last).toMatchObject({ type: "result", id: 7, ok: false, error: { code: "timeout" } });
   });
 });

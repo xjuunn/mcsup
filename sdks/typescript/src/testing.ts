@@ -17,6 +17,9 @@ import { type FrameChannel, Session } from "./runtime.js";
 /** 宿主默认限额（§5.4） */
 const DEFAULT_LIMITS = { inflight: 8, frame_bytes: 1024 * 1024, event_queue: 1024, log_lines_per_sec: 200 };
 
+/** 测试可覆盖的 welcome.limits 字段 */
+export type MockLimits = Partial<typeof DEFAULT_LIMITS>;
+
 export interface MockHostOptions {
   /** 本次授予的能力；默认等于插件声明 */
   readonly granted?: readonly string[];
@@ -25,14 +28,12 @@ export interface MockHostOptions {
   readonly configRevision?: number;
   readonly sessionId?: string;
   readonly scope?: { readonly kind: string; readonly server?: string };
+  /** 握手下发的限额；未给出的字段用默认值 */
+  readonly limits?: MockLimits;
   /** 握手直接拒绝 */
   readonly reject?: { readonly code: RejectCode; readonly message: string };
   /** 宿主对能力调用的处理 */
   readonly handle?: (call: { readonly capability: string; readonly method: string; readonly input: unknown }) => unknown;
-}
-
-interface PendingResult {
-  readonly resolve: (frame: OutboundFrame) => void;
 }
 
 /** 断言失败 */
@@ -51,7 +52,7 @@ export class MockHost<C extends readonly Capability[]> {
 
   private readonly outbound: OutboundFrame[] = [];
   private readonly listeners = new Set<(frame: OutboundFrame) => void>();
-  private readonly waiting: PendingResult[] = [];
+  private readonly exitWaiters = new Set<(code: number) => void>();
   private frameHandler: ((frame: InboundFrame) => void) | undefined;
   private closeHandler: ((reason: string) => void) | undefined;
   private hostCallId = 100;
@@ -72,6 +73,11 @@ export class MockHost<C extends readonly Capability[]> {
     const done = this.session.start("0".repeat(64));
     done.then((code) => {
       this.exitCode = code;
+      const waiters = [...this.exitWaiters];
+      this.exitWaiters.clear();
+      for (const waiter of waiters) {
+        waiter(code);
+      }
     });
     // 等 hello 落地后自动完成握手
     await this.flush();
@@ -93,7 +99,7 @@ export class MockHost<C extends readonly Capability[]> {
       session_id: this.options.sessionId ?? "s-test",
       host_version: "0.0.0-test",
       granted: this.options.granted ?? this.def.capabilities,
-      limits: DEFAULT_LIMITS,
+      limits: { ...DEFAULT_LIMITS, ...this.options.limits },
       config: { revision: this.options.configRevision ?? 1, values: this.options.config ?? {} },
       scope: this.options.scope ?? { kind: this.def.scope ?? "machine" },
     });
@@ -158,37 +164,60 @@ export class MockHost<C extends readonly Capability[]> {
     }
   }
 
-  /** 等会话结束 */
-  public async waitExit(): Promise<number> {
+  /** 等会话结束（默认最多 5 s） */
+  public async waitExit(timeoutMs = 5_000): Promise<number> {
     if (this.exitCode !== undefined) {
       return this.exitCode;
     }
-    for (let i = 0; i < 200; i += 1) {
-      await tick();
-      if (this.exitCode !== undefined) {
-        return this.exitCode;
-      }
-    }
-    throw new MockAssertionError("session did not exit");
+    return await new Promise<number>((resolve, reject) => {
+      let timer: NodeJS.Timeout | undefined;
+      const onExit = (code: number): void => {
+        if (timer !== undefined) {
+          clearTimeout(timer);
+        }
+        resolve(code);
+      };
+      timer = setTimeout(() => {
+        this.exitWaiters.delete(onExit);
+        reject(new MockAssertionError("session did not exit"));
+      }, timeoutMs);
+      this.exitWaiters.add(onExit);
+    });
   }
 
-  /** 等待并返回某 id 的结果帧 */
-  public async awaitResult(id: number): Promise<CallResult> {
-    for (let i = 0; i < 400; i += 1) {
-      const existing = this.outbound.find((f) => f.type === "result" && f.id === id);
-      if (existing !== undefined) {
-        const result = existing as Extract<OutboundFrame, { type: "result" }>;
-        if (result.ok) {
-          return { ok: true, output: result.output };
-        }
-        return {
-          ok: false,
-          error: { code: result.error?.code ?? "internal", message: result.error?.message ?? "failed" },
-        };
-      }
-      await tick();
+  /** 等待并返回某 id 的结果帧（默认最多 5 s） */
+  public async awaitResult(id: number, timeoutMs = 5_000): Promise<CallResult> {
+    const existing = this.resultOf(id);
+    if (existing !== undefined) {
+      return existing;
     }
-    throw new MockAssertionError(`no result for call ${id}`);
+    return await new Promise<CallResult>((resolve, reject) => {
+      let timer: NodeJS.Timeout | undefined;
+      const listener = (frame: OutboundFrame): void => {
+        if (frame.type !== "result" || frame.id !== id) {
+          return;
+        }
+        this.listeners.delete(listener);
+        if (timer !== undefined) {
+          clearTimeout(timer);
+        }
+        resolve(toCallResult(frame));
+      };
+      timer = setTimeout(() => {
+        this.listeners.delete(listener);
+        reject(new MockAssertionError(`no result for call ${id}`));
+      }, timeoutMs);
+      this.listeners.add(listener);
+    });
+  }
+
+  private resultOf(id: number): CallResult | undefined {
+    for (const frame of this.outbound) {
+      if (frame.type === "result" && frame.id === id) {
+        return toCallResult(frame);
+      }
+    }
+    return undefined;
   }
 
   /** 某 id 的 stream 帧 */
@@ -251,8 +280,11 @@ export class MockHost<C extends readonly Capability[]> {
       },
       close() {
         const handler = host.closeHandler;
-        queueMicrotask(() => {
-          handler?.("closed by mock host");
+        return new Promise<void>((resolve) => {
+          queueMicrotask(() => {
+            handler?.("closed by mock host");
+            resolve();
+          });
         });
       },
     };
@@ -263,6 +295,16 @@ export class MockHost<C extends readonly Capability[]> {
 export type CallResult =
   | { readonly ok: true; readonly output: unknown }
   | { readonly ok: false; readonly error: { readonly code: string; readonly message: string } };
+
+function toCallResult(frame: Extract<OutboundFrame, { type: "result" }>): CallResult {
+  if (frame.ok) {
+    return { ok: true, output: frame.output };
+  }
+  return {
+    ok: false,
+    error: { code: frame.error?.code ?? "internal", message: frame.error?.message ?? "failed" },
+  };
+}
 
 function tick(): Promise<void> {
   return new Promise<void>((resolve) => {

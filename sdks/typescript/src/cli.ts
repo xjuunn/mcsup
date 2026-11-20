@@ -19,6 +19,9 @@ import { createRequire } from "node:module";
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
+
+import { serializeNormalized } from "./descriptor.js";
 
 interface BuildOptions {
   readonly cwd: string;
@@ -45,7 +48,7 @@ function fail(message: string): never {
   process.exit(1);
 }
 
-function main(argv: readonly string[]): void {
+export function main(argv: readonly string[]): void {
   const command = argv[2];
   if (command === undefined || command === "--help" || command === "-h" || command === "help") {
     process.stdout.write(HELP);
@@ -202,29 +205,32 @@ function writeLaunchers(options: BuildOptions, id: string): ProcessEntry {
   return {
     type: "process",
     cmd: "./bin/run.sh",
-    platforms: { "windows-x64": "./bin/run.cmd", "windows-arm64": "./bin/run.cmd" },
+    // 平台键必须与宿主 platform_key() 一致（darwin/linux/win32 + x64/arm64），
+    // 否则 Windows 会回退到无法执行的 run.sh。
+    platforms: platformEntries(),
+  };
+}
+
+/** 产物内置两个启动器：POSIX 用 run.sh，Windows 用 run.cmd。 */
+export function platformEntries(): Record<string, string> {
+  return {
+    "linux-x64": "./bin/run.sh",
+    "linux-arm64": "./bin/run.sh",
+    "darwin-x64": "./bin/run.sh",
+    "darwin-arm64": "./bin/run.sh",
+    "win32-x64": "./bin/run.cmd",
+    "win32-arm64": "./bin/run.cmd",
   };
 }
 
 function writeJson(file: string, value: unknown): void {
-  // 与 SDK 的归一化一致：键字典序 + 紧凑 JSON + 末尾换行
-  const normalized = (input: unknown): string => {
-    const sort = (v: unknown): unknown => {
-      if (Array.isArray(v)) {
-        return v.map(sort);
-      }
-      if (typeof v === "object" && v !== null) {
-        const out: Record<string, unknown> = {};
-        for (const key of Object.keys(v as Record<string, unknown>).sort()) {
-          out[key] = sort((v as Record<string, unknown>)[key]);
-        }
-        return out;
-      }
-      return v;
-    };
-    return `${JSON.stringify(sort(input))}\n`;
-  };
-  fs.writeFileSync(file, normalized(value), "utf8");
+  // 与 SDK 的归一化共用同一实现，避免两处排序规则漂移
+  fs.writeFileSync(file, serializeNormalized(value), "utf8");
 }
 
-main(process.argv);
+// 仅作为可执行入口时运行 main；被测试或 bin 启动器 import 时显式调用
+const invokedDirectly =
+  process.argv[1] !== undefined && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
+if (invokedDirectly) {
+  main(process.argv);
+}

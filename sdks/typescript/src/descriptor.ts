@@ -133,12 +133,41 @@ export function buildManifest<C extends readonly Capability[]>(def: PluginDefini
 const META_KEY_MAP: Record<string, string> = {
   secret: "x-mcsup-secret",
   label: "x-mcsup-label",
-  format: "x-mcsup-format",
   unit: "x-mcsup-unit",
   placeholder: "x-mcsup-placeholder",
 };
 
 const FORMATS = new Set(["plain", "minecraft-text", "markdown-sanitized", "datetime", "duration", "bytes"]);
+
+/**
+ * 标准 JSON Schema `format` 取值。
+ *
+ * zod 的 `.datetime()` / `.uuid()` / `.url()` 会生成标准 `format`，不能把它
+ * 当成 `.meta({ format })` 的自定义展示格式；否则合法 schema 会在构建期被
+ * `FORMATS` 拒绝。`duration` 同时出现在两边，按自定义展示格式处理，保持
+ * `.meta({ format: "duration" })` 的既有语义。
+ */
+const JSON_SCHEMA_FORMATS = new Set([
+  "date-time",
+  "date",
+  "time",
+  "duration",
+  "email",
+  "idn-email",
+  "hostname",
+  "idn-hostname",
+  "ipv4",
+  "ipv6",
+  "uri",
+  "uri-reference",
+  "iri",
+  "iri-reference",
+  "uuid",
+  "uri-template",
+  "json-pointer",
+  "relative-json-pointer",
+  "regex",
+]);
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
@@ -248,6 +277,24 @@ function applyMetaKeys(value: JsonValue, onOutput: boolean, path: string): JsonV
       out[key] = applyMetaKeys(item, onOutput, `${path}.${key}`);
       continue;
     }
+    if (key === "format") {
+      if (typeof item !== "string") {
+        throw new DescriptorError(`${path}.x-mcsup-format`, "must be a string");
+      }
+      // 自定义展示格式优先；其余标准 JSON Schema 格式原样保留
+      if (FORMATS.has(item)) {
+        out["x-mcsup-format"] = item;
+        continue;
+      }
+      if (JSON_SCHEMA_FORMATS.has(item)) {
+        out["format"] = item;
+        continue;
+      }
+      throw new DescriptorError(
+        `${path}.x-mcsup-format`,
+        `must be one of ${[...FORMATS].join(", ")} or a standard JSON Schema format`,
+      );
+    }
     const mapped = META_KEY_MAP[key];
     if (mapped === undefined) {
       out[key] = applyMetaKeys(item, onOutput, `${path}.${key}`);
@@ -260,11 +307,6 @@ function applyMetaKeys(value: JsonValue, onOutput: boolean, path: string): JsonV
       }
       out[mapped] = item;
       continue;
-    }
-    if (mapped === "x-mcsup-format") {
-      if (typeof item !== "string" || !FORMATS.has(item)) {
-        throw new DescriptorError(`${path}.x-mcsup-format`, `must be one of ${[...FORMATS].join(", ")}`);
-      }
     }
     out[mapped] = item;
   }

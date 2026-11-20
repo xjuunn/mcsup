@@ -1386,6 +1386,10 @@ JSON Schema 没有「密钥」「单位」的标准表达，统一用 `x-mcsup-`
 （`secret_on_output`）。原因是输出必然经过 Web、日志、审计三条路径，任何一条
 都可能把它变成明文；密钥只能写入，不能回读。
 
+标准 JSON Schema `format`（例如 zod `.datetime()` / `.uuid()` / `.url()` 生成的
+`date-time` / `uuid` / `uri`）原样保留，不映射为 `x-mcsup-format`。两处都有的
+`duration` 优先按自定义展示格式处理。无法识别的值在构建期报错，不静默丢弃。
+
 `[禁止]` 用 `x-mcsup-format` 表达富文本以外的任意 HTML。`markdown-sanitized`
 只允许白名单标签，禁止内联样式与事件属性。
 

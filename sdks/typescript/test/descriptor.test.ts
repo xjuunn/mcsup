@@ -161,6 +161,35 @@ describe("descriptor", () => {
     expect(() => jsonSchemaOf(z.object({ t: z.string().meta({ format: "html" }) }), false)).toThrow(/x-mcsup-format/);
   });
 
+  it("zod 标准 format 保留为 format，不当作展示格式", () => {
+    const json = jsonSchemaOf(
+      z.object({ at: z.iso.datetime(), id: z.uuid(), link: z.url() }),
+      false,
+    ) as { properties: Record<string, Record<string, unknown>> };
+    expect(json.properties["at"]?.["format"]).toBe("date-time");
+    expect(json.properties["id"]?.["format"]).toBe("uuid");
+    expect(json.properties["link"]?.["format"]).toBe("uri");
+    for (const key of ["at", "id", "link"]) {
+      expect(json.properties[key]?.["x-mcsup-format"]).toBeUndefined();
+    }
+  });
+
+  it("zod 标准 format 仍受 descriptor 子集校验", () => {
+    // email 不在契约允许的 format 集合里，构建期仍要明确拒绝
+    expect(() =>
+      buildDescriptor(
+        definePlugin({
+          id: "mail",
+          title: "mail",
+          version: "1.0.0",
+          license: "MIT",
+          capabilities: ["server:read"],
+          config: z.object({ mail: z.email() }),
+        }).definition,
+      ),
+    ).toThrow(/format/);
+  });
+
   it("两次构建逐字节一致", () => {
     const a = serializeNormalized(buildDescriptor(chatBridge.definition));
     const b = serializeNormalized(buildDescriptor(chatBridge.definition));

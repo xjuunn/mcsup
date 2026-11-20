@@ -64,12 +64,13 @@ run_ts() {
 		fi
 		printf '\n==> sdk typescript typecheck\n'
 		npx tsc -p tsconfig.test.json
+		# 真实进程用例直接 import dist/index.js，必须先构建再跑测试
+		printf '\n==> sdk typescript build\n'
+		npm run build
 		printf '\n==> sdk typescript test\n'
 		npm test
 		printf '\n==> sdk typescript conformance\n'
 		npm run conformance
-		printf '\n==> sdk typescript build\n'
-		npm run build
 	)
 }
 

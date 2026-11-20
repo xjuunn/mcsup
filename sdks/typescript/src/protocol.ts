@@ -22,7 +22,6 @@ import {
   type InboundFrame,
   type OutboundFrame,
   type ResultFrame,
-  type WelcomeLimits,
   type WireError,
 } from "./contracts/v1.js";
 
@@ -88,6 +87,29 @@ function optionalString(frame: LooseFrame, key: string): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
+function requireObjectField(frame: LooseFrame, key: string): Record<string, unknown> {
+  const value = frame[key];
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new ProtocolError(`frame field ${key} must be an object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function requireIntIn(record: Record<string, unknown>, path: string, key: string, min: number): number {
+  const value = record[key];
+  if (typeof value !== "number" || !Number.isInteger(value) || value < min) {
+    throw new ProtocolError(`frame field ${path}.${key} must be an integer >= ${min}`);
+  }
+  return value;
+}
+
+function requireOwn(record: Record<string, unknown>, path: string, key: string): unknown {
+  if (!Object.prototype.hasOwnProperty.call(record, key)) {
+    throw new ProtocolError(`frame field ${path}.${key} is required`);
+  }
+  return record[key];
+}
+
 function stringArray(frame: LooseFrame, key: string): string[] {
   const value = frame[key];
   if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
@@ -128,26 +150,36 @@ export function parseFrame(text: string): InboundFrame {
   }
   switch (kind) {
     case "welcome": {
-      const limits = frame["limits"];
-      if (typeof limits !== "object" || limits === null) {
-        throw new ProtocolError("welcome.limits must be an object");
+      const limits = requireObjectField(frame, "limits");
+      const config = requireObjectField(frame, "config");
+      const scope = requireObjectField(frame, "scope");
+      const scopeKind = scope["kind"];
+      if (typeof scopeKind !== "string" || scopeKind === "") {
+        throw new ProtocolError("frame field scope.kind must be a non-empty string");
       }
-      const config = frame["config"];
-      if (typeof config !== "object" || config === null) {
-        throw new ProtocolError("welcome.config must be an object");
-      }
-      const scope = frame["scope"];
-      if (typeof scope !== "object" || scope === null) {
-        throw new ProtocolError("welcome.scope must be an object");
+      const scopeServer = scope["server"];
+      if (scopeServer !== undefined && typeof scopeServer !== "string") {
+        throw new ProtocolError("frame field scope.server must be a string");
       }
       return {
         type: "welcome",
         session_id: requireString(frame, "session_id"),
         host_version: requireString(frame, "host_version"),
         granted: stringArray(frame, "granted"),
-        limits: limits as WelcomeLimits,
-        config: config as { revision: number; values: unknown },
-        scope: scope as { kind: string; server?: string },
+        limits: {
+          inflight: requireIntIn(limits, "limits", "inflight", 1),
+          frame_bytes: requireIntIn(limits, "limits", "frame_bytes", 1),
+          event_queue: requireIntIn(limits, "limits", "event_queue", 1),
+          log_lines_per_sec: requireIntIn(limits, "limits", "log_lines_per_sec", 1),
+        },
+        config: {
+          revision: requireIntIn(config, "config", "revision", 0),
+          values: requireOwn(config, "config", "values"),
+        },
+        scope: {
+          kind: scopeKind,
+          ...(scopeServer === undefined ? {} : { server: scopeServer }),
+        },
       };
     }
     case "reject":
@@ -209,12 +241,12 @@ export function parseFrame(text: string): InboundFrame {
         type: "config",
         id: requireInt(frame, "id"),
         revision: requireInt(frame, "revision"),
-        values: frame["values"],
+        values: requireOwn(frame, "config", "values"),
       };
     case "ping":
       return { type: "ping", n: requireInt(frame, "n") };
     case "shutdown":
-      return { type: "shutdown", grace_ms: requireInt(frame, "grace_ms") };
+      return { type: "shutdown", grace_ms: requireIntIn(frame, "shutdown", "grace_ms", 0) };
     default:
       // 未知类型：忽略并保持连接（§6.1）
       return { type: "unknown", kind };

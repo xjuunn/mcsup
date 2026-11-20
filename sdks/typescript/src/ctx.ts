@@ -215,28 +215,13 @@ export interface EventMeta {
 }
 
 export interface EventsClient {
-  /** 订阅事件名；handler 由内核 `onEvent` 或 subscriptions 提供 */
-  subscribe(kinds: readonly string[]): void;
+  /** 登记 handler；可订阅的事件名在 `definePlugin({ subscriptions })` 中静态声明 */
   on(kind: string, handler: (data: unknown, meta: EventMeta) => void | Promise<void>): () => void;
 }
 
 // ---------------------------------------------------------------------------
-// 流 / 日志
+// 日志
 // ---------------------------------------------------------------------------
-
-export interface StreamOptions {
-  /** 宿主给的调用 id；用于序列化分块 */
-  readonly callId: number;
-  /** 分块序号从 0 起 */
-  readonly seq?: number;
-}
-
-/** 流式 op 内部用：产出分块 */
-export interface StreamSink {
-  readonly callId: number;
-  push(chunk: unknown): void;
-  done(): void;
-}
 
 /** 日志（写 stderr，不进入帧） */
 export interface LogClient {
@@ -311,14 +296,6 @@ export interface CtxEnvironment {
 /** 事件总线：内核把宿主 event 帧投进来 */
 export class EventBus {
   private readonly handlers = new Map<string, Set<(data: unknown, meta: EventMeta) => void | Promise<void>>>();
-  private readonly pending = new Set<string>();
-
-  /** 登记订阅（`*` 为通配） */
-  public subscribe(kinds: readonly string[]): void {
-    for (const kind of kinds) {
-      this.pending.add(kind);
-    }
-  }
 
   /** 登记 handler，返回取消函数 */
   public on(kind: string, handler: (data: unknown, meta: EventMeta) => void | Promise<void>): () => void {
@@ -331,11 +308,6 @@ export class EventBus {
     return () => {
       set.delete(handler);
     };
-  }
-
-  /** 已登记的订阅名（写进 hello 的 subscriptions） */
-  public subscribedKinds(): readonly string[] {
-    return [...this.pending];
   }
 
   /** 投递一个事件；返回是否有人处理 */
@@ -379,8 +351,6 @@ interface BackupCreateOut { readonly snapshot: { readonly id: string; readonly c
 interface ContentListOut { readonly items: readonly { readonly file: string; readonly size: number; readonly identity?: unknown }[] }
 interface JavaListOut { readonly runtimes: readonly { readonly id: string; readonly path: string; readonly major: number; readonly version: string; readonly vendor: string; readonly managed: boolean; readonly created_at: string; readonly updated_at: string }[] }
 interface JavaInstallOut { readonly runtime: JavaListOut["runtimes"][number] }
-
-const STREAM_KEY = Symbol("streamSink");
 
 /**
  * 构造上下文。
@@ -565,9 +535,6 @@ export function createCtx<C extends readonly Capability[]>(
   }
   if (has("events")) {
     const events: EventsClient = {
-      subscribe: (kinds) => {
-        env.events.subscribe(kinds);
-      },
       on: (kind, handler) => env.events.on(kind, handler),
     };
     members["events"] = events;
@@ -600,7 +567,6 @@ export function createCtx<C extends readonly Capability[]>(
     get: () => env.config(),
     enumerable: true,
   });
-  Object.defineProperty(ctx, STREAM_KEY, { value: undefined, enumerable: false });
   // 声明过但未授予的能力：访问即 denied，而不是静默 undefined（§8.4 不降级）
   for (const capability of ungranted) {
     Object.defineProperty(ctx, capability, {
@@ -612,14 +578,4 @@ export function createCtx<C extends readonly Capability[]>(
     });
   }
   return ctx as CtxFor<C>;
-}
-
-/** 流式 op 的分块下沉（runtime 在调用 op 前注入） */
-export function attachStream(ctx: object, sink: StreamSink): void {
-  Object.defineProperty(ctx, STREAM_KEY, { value: sink, enumerable: false, configurable: true });
-}
-
-/** 取当前调用的流出通道；非流式 op 为 undefined */
-export function currentStream(ctx: object): StreamSink | undefined {
-  return (ctx as { [STREAM_KEY]?: StreamSink })[STREAM_KEY];
 }

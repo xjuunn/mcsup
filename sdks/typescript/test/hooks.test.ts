@@ -68,6 +68,42 @@ describe("useConsoleTail", () => {
     expect(() => useConsoleTail(stripped, {})).toThrow(/console:read/);
     await host.shutdown();
   });
+
+  it("handler 抛错时不推进游标，重试重放整页而不是跳过剩余行", async () => {
+    const pages = new Map<number | null, { cursor: number; lines: string[] }>([
+      [null, { cursor: 2, lines: ["a", "b"] }],
+      [0, { cursor: 2, lines: ["a", "b"] }],
+      [2, { cursor: 4, lines: ["c", "d"] }],
+    ]);
+    const host = createMockHost(reader, {
+      handle: ({ capability, input }) => {
+        if (capability !== "console:read") {
+          throw new PluginError("denied", capability);
+        }
+        const cursor = (input as { cursor: number | null }).cursor;
+        return { ...(pages.get(cursor) ?? { cursor: 4, lines: [] }), dropped: 0 };
+      },
+    });
+    await host.start();
+    let failures = 1;
+    const seen: string[] = [];
+    const tail = useConsoleTail(host.ctx, { intervalMs: 5 });
+    tail.subscribe("survival", (line) => {
+      if (line.text === "b" && failures > 0) {
+        failures -= 1;
+        throw new Error("boom");
+      }
+      seen.push(line.text);
+    });
+    for (let i = 0; i < 200 && !seen.includes("d"); i += 1) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    tail.stop();
+    // b 失败后游标未推进，第二页重放时 a/b 重新投递（至少一次），c/d 不丢
+    expect(seen).toEqual(["a", "a", "b", "c", "d"]);
+    expect(tail.cursor("survival")).toBe(null);
+    await host.shutdown();
+  });
 });
 
 describe("useRetry", () => {
@@ -104,6 +140,19 @@ describe("useKvCache", () => {
     expect(loader).toHaveBeenCalledTimes(1);
     await cache.delete("k");
     await expect(cache.get("k")).resolves.toBeNull();
+    await host.shutdown();
+  });
+
+  it("过期条目按未命中处理，坏 JSON 不抛错", async () => {
+    const { host, ctx, store } = await makeCtx();
+    const cache = useKvCache(ctx, { ttlMs: 10 });
+    await cache.set("k", { v: 1 });
+    await expect(cache.get("k")).resolves.toEqual({ v: 1 });
+    await new Promise((r) => setTimeout(r, 30));
+    await expect(cache.get("k")).resolves.toBeNull();
+
+    store.set("cache:bad", new TextEncoder().encode("not json"));
+    await expect(cache.get("bad")).resolves.toBeNull();
     await host.shutdown();
   });
 });

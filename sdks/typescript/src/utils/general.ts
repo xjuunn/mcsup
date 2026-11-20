@@ -46,8 +46,12 @@ export function truncate(text: string, max: number, suffix = "…"): string {
   }
   const cps = [...text];
   if (cps.length <= max) return text;
-  const keep = Math.max(max - [...suffix].length, 0);
-  return cps.slice(0, keep).join("") + suffix;
+  const suffixCps = [...suffix];
+  // 后缀本身已占满上限时只能截后缀，否则结果会超过 max（调用方用它做硬上限）
+  if (suffixCps.length >= max) {
+    return suffixCps.slice(0, max).join("");
+  }
+  return cps.slice(0, max - suffixCps.length).join("") + suffix;
 }
 
 /**
