@@ -31,3 +31,4 @@ pub use api::{DispatchContext, HostServices, dispatch};
 pub use control::{ControlClient, ControlServer, HostControl};
 pub use event::{EventBus, EventDelivery, EventSinkAdapter};
 pub use host::PluginHost;
+pub use session::Heartbeat;

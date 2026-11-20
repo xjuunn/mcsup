@@ -14,7 +14,7 @@ use crate::endpoint::Endpoint;
 use crate::event::EventBus;
 use crate::process::{SpawnPlan, SpawnedPlugin};
 use crate::rfc3339;
-use crate::session::{self, HandshakeOutcome, SessionConfig, SessionInner};
+use crate::session::{self, HandshakeOutcome, Heartbeat, SessionConfig, SessionInner};
 use domain::plugin::PluginId;
 use domain::plugin::capability::Capability;
 use domain::plugin::event::Subscription;
@@ -86,6 +86,8 @@ pub struct PluginHost {
     crashes: Mutex<HashMap<PluginId, Crashes>>,
     shutting_down: AtomicBool,
     idle_after: Duration,
+    /// 心跳节奏
+    heartbeat: Heartbeat,
     /// 自引用弱指针：后台监管线程需要拥有宿主
     self_ref: OnceLock<Weak<PluginHost>>,
 }
@@ -141,11 +143,23 @@ impl PluginHost {
             crashes: Mutex::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
             idle_after: IDLE_STOP_AFTER,
+            heartbeat: Heartbeat::default(),
             self_ref: OnceLock::new(),
         });
         router.attach(&host);
         let _ = host.self_ref.set(Arc::downgrade(&host));
         host
+    }
+
+    /// 覆盖心跳节奏（测试用）
+    ///
+    /// 只能在宿主尚未被共享时调用（`PluginHost::new` 之后立即调用）。
+    #[must_use]
+    pub fn with_heartbeat(mut self: Arc<Self>, heartbeat: Heartbeat) -> Arc<Self> {
+        if let Some(inner) = Arc::get_mut(&mut self) {
+            inner.heartbeat = heartbeat;
+        }
+        self
     }
 
     /// 覆盖空闲停止阈值（测试与 `--idle-timeout` 用）
@@ -443,6 +457,7 @@ impl PluginHost {
             audit: Arc::clone(&self.audit),
             handshake_timeout: HANDSHAKE_TIMEOUT,
             pid,
+            heartbeat: self.heartbeat,
         };
         let outcome = session::handshake(conn, config);
         drop(endpoint);

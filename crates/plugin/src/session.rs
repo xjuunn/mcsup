@@ -37,6 +37,27 @@ use crate::conn::Connection;
 /// 配置变更等待插件确认的上限
 const CONFIG_APPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// 心跳超时检查的轮询间隔
+const HEARTBEAT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// 心跳节奏：发一次 `ping` 后等待 `pong` 的窗口，以及连续丢失上限
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Heartbeat {
+    /// 单次 `ping` / `pong` 的等待窗口
+    pub interval: Duration,
+    /// 连续未回应多少次后判定失联
+    pub miss_limit: u32,
+}
+
+impl Default for Heartbeat {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(15),
+            miss_limit: 3,
+        }
+    }
+}
+
 /// 握手配置
 pub(crate) struct SessionConfig {
     pub record: PluginRecord,
@@ -49,6 +70,8 @@ pub(crate) struct SessionConfig {
     pub handshake_timeout: Duration,
     /// 已拉起的插件进程 PID；握手阶段就能填入会话表
     pub pid: u32,
+    /// 心跳节奏
+    pub heartbeat: Heartbeat,
 }
 
 /// 握手结果
@@ -233,6 +256,7 @@ pub(crate) fn handshake(
         process: Mutex::new(None),
         services: cfg.services,
         audit: cfg.audit,
+        heartbeat: cfg.heartbeat,
     });
     Ok(HandshakeOutcome::Accepted(inner))
 }
@@ -293,6 +317,7 @@ pub(crate) struct SessionInner {
     process: Mutex<Option<SpawnedPlugin>>,
     services: Arc<HostServices>,
     audit: Arc<dyn AuditSink>,
+    heartbeat: Heartbeat,
 }
 
 impl std::fmt::Debug for SessionInner {
@@ -746,23 +771,38 @@ impl SessionInner {
     fn heartbeat_loop(self: Arc<Self>) {
         let mut missed = 0_u32;
         while self.is_alive() {
-            std::thread::sleep(Duration::from_secs(15));
-            if !self.is_alive() {
-                break;
-            }
             let n = self.ping_seq.fetch_add(1, Ordering::SeqCst) + 1;
             if self.send(&Frame::Ping(n)).is_err() {
                 break;
             }
-            if self.last_pong.load(Ordering::SeqCst) >= n {
+            // 发出 ping 后必须留出窗口等 pong 回来再判定，否则本次心跳
+            // 永远记一次丢失，活跃插件也会在 miss_limit 个周期后被误杀。
+            if self.wait_pong(n) {
                 missed = 0;
             } else {
                 missed += 1;
             }
-            if missed >= 3 {
+            if !self.is_alive() {
+                break;
+            }
+            if missed >= self.heartbeat.miss_limit {
                 self.close("heartbeat timeout");
                 break;
             }
+        }
+    }
+
+    /// 在心跳窗口内等待第 `n` 次心跳的回应；停机时立即返回
+    fn wait_pong(&self, n: u64) -> bool {
+        let deadline = Instant::now() + self.heartbeat.interval;
+        loop {
+            if self.last_pong.load(Ordering::SeqCst) >= n {
+                return true;
+            }
+            if !self.is_alive() || Instant::now() >= deadline {
+                return self.last_pong.load(Ordering::SeqCst) >= n;
+            }
+            std::thread::sleep(HEARTBEAT_POLL_INTERVAL);
         }
     }
 

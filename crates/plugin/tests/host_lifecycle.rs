@@ -14,6 +14,7 @@ use domain::plugin::capability::Capability;
 use domain::plugin::error::PluginErrorCode;
 use domain::plugin::manifest::Manifest;
 use domain::plugin::state::PluginState;
+use plugin::Heartbeat;
 use plugin::api::HostServices;
 use plugin::control::{ControlClient, ControlServer, HostControl};
 use plugin::event::EventBus;
@@ -837,4 +838,35 @@ fn contract_unknown_trace_is_rejected() {
     assert_eq!(err.code, PluginErrorCode::Conflict);
 
     host.shutdown_all(Duration::from_secs(2));
+}
+
+#[test]
+fn live_session_survives_heartbeat_windows() {
+    // 心跳窗口 150ms × 3：活跃插件必须一直在线。旧实现发完 ping 立刻检查
+    // pong，活跃会话也会在 3 个窗口后被误判超时并重启。
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data_dir = dir.path().to_path_buf();
+    let id = fixture_id();
+    let artifact = install_fixture(&data_dir, &id);
+    let store = Arc::new(MemoryStore::default());
+    let fixture = record(&id, artifact, env!("CARGO_PKG_VERSION"));
+    store.put(&fixture).expect("put record");
+    let host = host(&data_dir, &store).with_heartbeat(Heartbeat {
+        interval: Duration::from_millis(150),
+        miss_limit: 3,
+    });
+
+    let info = host.start(&id).expect("start fixture");
+    std::thread::sleep(Duration::from_millis(1_200));
+
+    let status = host.status(&id).expect("status");
+    assert_eq!(status.state, PluginState::Running);
+    let session = status.session.expect("session stays alive");
+    assert_eq!(
+        session.session_id, info.session_id,
+        "active session must not be torn down by heartbeat"
+    );
+    assert_eq!(session.pid, info.pid);
+
+    host.stop(&id, Duration::from_secs(2)).expect("stop");
 }
