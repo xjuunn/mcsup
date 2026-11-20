@@ -46,9 +46,9 @@ MINGW* | MSYS* | CYGWIN* | Windows_NT*)
 	;;
 esac
 
-# 与其他构建共用一份缓存；本脚本也能单独运行，所以要自己接入。
+# 与门禁其余步骤共用本 worktree 的构建缓存；本脚本也能单独运行，所以要自己接入。
 . ./scripts/dev-tools-env.sh
-mcsup_use_shared_target
+mcsup_use_local_target
 
 # ---- 子进程模式：跑单个目标，结果写进 outdir ----
 #

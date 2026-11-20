@@ -611,8 +611,10 @@ dependencies = [
  "mcsup",
  "miette",
  "owo-colors",
+ "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "shell-words",
  "sys-locale",
  "tempfile",
@@ -1062,7 +1064,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1659,7 +1661,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1846,6 +1848,7 @@ dependencies = [
  "mcsup-file",
  "mcsup-java",
  "mcsup-modkit",
+ "mcsup-plugin",
  "mcsup-port",
  "mcsup-protocol",
  "mcsup-provider",
@@ -1868,6 +1871,7 @@ dependencies = [
 name = "mcsup-auth"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "keyring",
  "ring",
  "serde",
@@ -1917,6 +1921,9 @@ name = "mcsup-domain"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "regex",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -1960,6 +1967,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcsup-plugin"
+version = "0.1.0"
+dependencies = [
+ "mcsup-domain",
+ "mcsup-port",
+ "mcsup-protocol",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "mcsup-port"
 version = "0.1.0"
 dependencies = [
@@ -1980,6 +2002,7 @@ dependencies = [
  "mcsup-port",
  "serde",
  "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -1995,6 +2018,8 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",
@@ -2026,6 +2051,7 @@ dependencies = [
  "mcsup-domain",
  "mcsup-modkit",
  "mcsup-port",
+ "mcsup-provider",
  "mcsup-service",
  "mcsup-storage",
  "mcsup-testkit",
@@ -2046,10 +2072,13 @@ dependencies = [
 name = "mcsup-storage"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "mcsup-auth",
  "mcsup-domain",
  "mcsup-port",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 
@@ -2610,7 +2639,9 @@ dependencies = [
  "base64",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
+ "futures-util",
  "h2",
  "http",
  "http-body",
@@ -2719,7 +2750,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2776,7 +2807,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3252,7 +3283,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3828,7 +3859,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

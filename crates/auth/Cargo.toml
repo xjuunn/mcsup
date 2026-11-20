@@ -11,8 +11,10 @@ repository.workspace = true
 name = "auth"
 
 [dependencies]
-# 随机源与摘要：ring 已在依赖树内（rustls 的密码学后端），此处提升为直接依赖
+# 随机源、摘要与机器密钥的 AEAD：ring 已在依赖树内（rustls 的密码学后端），
+# 此处提升为直接依赖
 ring = "0.17"
+base64.workspace = true
 keyring = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

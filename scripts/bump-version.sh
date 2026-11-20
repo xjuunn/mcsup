@@ -43,7 +43,7 @@ old_version=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$m
 }
 
 # 内层依赖键。testkit 只作 dev-dependency，仍随 workspace 锁步。
-internal='auth|backend|backup|domain|file|java|modkit|mcsup|port|protocol|provider|runtime|service|storage|testkit|transport'
+internal='auth|backend|backup|domain|file|java|modkit|mcsup|plugin|port|protocol|provider|runtime|service|storage|testkit|transport'
 
 manifests="$manifest"
 for f in crates/*/Cargo.toml apps/*/Cargo.toml; do

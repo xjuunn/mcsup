@@ -3,7 +3,7 @@ resolver = "3"
 # crates/* 全部发布（package 名 mcsup-*）；apps/* 是并行 bin 入口，不进
 # crates.io。发布顺序与前置条件见 .github/workflows/publish.yml。
 # 新增成员时同步 scripts/check-architecture.sh 的允许集合表。
-members = ["apps/agent","apps/bench","apps/cli","apps/dev","crates/auth","crates/backend","crates/backup","crates/domain", "crates/file","crates/java", "crates/mcsup", "crates/modkit", "crates/port", "crates/protocol", "crates/provider", "crates/runtime", "crates/service", "crates/storage", "crates/testkit", "crates/transport"]
+members = ["apps/agent","apps/bench","apps/cli","apps/dev","crates/auth","crates/backend","crates/backup","crates/domain", "crates/file","crates/java", "crates/mcsup", "crates/modkit", "crates/plugin", "crates/port", "crates/protocol", "crates/provider", "crates/runtime", "crates/service", "crates/storage", "crates/testkit", "crates/transport"]
 
 [workspace.package]
 version = "0.1.0"
@@ -23,11 +23,13 @@ repository = "https://github.com/xjuunn/mcsup"
 tracing = "0.1.44"
 serde_json = "1.0.154"
 serde = "1.0.229"
+base64 = "0.23.1"
 thiserror = "2.0.21"
 async-trait = "0.1.92"
 dirs = "7.0.0"
 tokio = "1.53.2"
 url = "2.5.8"
+regex = "1.13.1"
 toml = "1.1.8"
 uuid = { version = "1", features = ["v4"] }
 tempfile = "3.27.0"

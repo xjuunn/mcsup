@@ -116,6 +116,23 @@ pub(crate) enum Command {
     #[command(about = crate::meta::version())]
     #[command(visible_alias = "ver")]
     Version,
+    /// 平台插件：安装、启停、调用、授权与日志
+    #[command(about = crate::meta::plugin())]
+    #[command(visible_alias = "pl")]
+    Plugin {
+        #[command(subcommand)]
+        action: PluginAction,
+    },
+    /// 隐藏入口：插件宿主进程（控制端点 + 长驻会话表）
+    #[command(name = "__plugin-host", hide = true, about = crate::meta::plugin_host())]
+    PluginHost {
+        /// 平台数据目录；缺省用当前配置
+        #[arg(long, value_name = "PATH", help = crate::meta::plugin_data_dir_arg())]
+        data_dir: Option<PathBuf>,
+        /// 非 resident 插件的空闲停止阈值（秒）
+        #[arg(long, value_name = "SECS", default_value_t = 300)]
+        idle_timeout: u64,
+    },
     /// 隐藏入口：为某台远端刷新本地缓存（由读命令在后台拉起）
     #[command(name = "__remote-refresh", hide = true, about = "刷新远端缓存")]
     RemoteRefresh {
@@ -1026,4 +1043,196 @@ mod tests {
             .expect_err("conflict");
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum PluginAction {
+    /// 列出已安装插件
+    #[command(about = crate::meta::plugin_list())]
+    #[command(visible_alias = "ls")]
+    List {
+        /// 输出 JSON
+        #[arg(long, help = crate::meta::plugin_json_arg())]
+        json: bool,
+    },
+    /// 安装插件（本地目录 / zip / URL / git）
+    #[command(about = crate::meta::plugin_install())]
+    #[command(visible_alias = "in")]
+    Install {
+        /// 本地路径或 URL（省略时由 --from / --url / --git 指定）
+        #[arg(help = crate::meta::plugin_source_arg())]
+        source: Option<String>,
+        #[arg(long = "from", value_name = "PATH", help = crate::meta::plugin_from_arg())]
+        from: Option<PathBuf>,
+        #[arg(long, value_name = "URL", help = crate::meta::plugin_url_arg())]
+        url: Option<String>,
+        #[arg(long, value_name = "URL", help = crate::meta::plugin_git_arg())]
+        git: Option<String>,
+        #[arg(long = "ref", value_name = "REV", help = crate::meta::plugin_ref_arg())]
+        reference: Option<String>,
+        #[arg(long, value_name = "HEX", help = crate::meta::plugin_sha256_arg())]
+        sha256: Option<String>,
+    },
+    /// 升级到新版本（沿用记录的来源）
+    #[command(about = crate::meta::plugin_update())]
+    Update {
+        id: String,
+        #[arg(long, value_name = "VERSION", help = crate::meta::plugin_to_arg())]
+        to: Option<String>,
+        #[arg(long, help = crate::meta::plugin_prune_arg())]
+        prune: bool,
+    },
+    /// 卸载插件
+    #[command(about = crate::meta::plugin_remove())]
+    #[command(visible_alias = "rm")]
+    Remove {
+        id: String,
+        #[arg(long, help = crate::meta::plugin_purge_arg())]
+        purge: bool,
+        /// 保留密钥文件（重装后继续使用同一凭据）
+        #[arg(long, help = crate::meta::plugin_keep_secrets_arg())]
+        keep_secrets: bool,
+    },
+    /// 允许插件运行
+    #[command(about = crate::meta::plugin_enable())]
+    Enable { id: String },
+    /// 停止并禁止插件运行
+    #[command(about = crate::meta::plugin_disable())]
+    Disable { id: String },
+    /// 拉起插件进程
+    #[command(about = crate::meta::plugin_start())]
+    #[command(visible_alias = "up")]
+    Start { id: String },
+    /// 停止插件进程
+    #[command(about = crate::meta::plugin_stop())]
+    Stop {
+        id: String,
+        #[arg(long, value_name = "SECS", default_value_t = 10, help = crate::meta::plugin_grace_arg())]
+        grace: u64,
+    },
+    /// 重启插件进程
+    #[command(about = crate::meta::plugin_restart())]
+    Restart { id: String },
+    /// 单插件状态
+    #[command(about = crate::meta::plugin_status())]
+    Status {
+        id: String,
+        #[arg(long, help = crate::meta::plugin_json_arg())]
+        json: bool,
+    },
+    /// 列出插件声明的 op
+    #[command(about = crate::meta::plugin_ops())]
+    Ops {
+        id: String,
+        #[arg(long, help = crate::meta::plugin_json_arg())]
+        json: bool,
+    },
+    /// 调用插件 op
+    #[command(about = crate::meta::plugin_call())]
+    Call {
+        id: String,
+        op: String,
+        #[arg(long, value_name = "JSON|@FILE|-", help = crate::meta::plugin_input_arg())]
+        input: Option<String>,
+        #[arg(long, help = crate::meta::plugin_json_arg())]
+        json: bool,
+        #[arg(long, help = crate::meta::plugin_stream_arg())]
+        stream: bool,
+    },
+    /// 配置读取 / 写入
+    #[command(about = crate::meta::plugin_config())]
+    Config {
+        #[command(subcommand)]
+        action: PluginConfigAction,
+    },
+    /// 追加能力授权
+    #[command(about = crate::meta::plugin_grant())]
+    Grant { id: String, capability: String },
+    /// 撤销能力授权（立即生效）
+    #[command(about = crate::meta::plugin_revoke())]
+    Revoke { id: String, capability: String },
+    /// 本机拉黑：立即停用且不再自动启动
+    #[command(about = crate::meta::plugin_block())]
+    Block { id: String },
+    /// 解除拉黑
+    #[command(about = crate::meta::plugin_unblock())]
+    Unblock { id: String },
+    /// 隔离：保留产物但禁止运行
+    #[command(about = crate::meta::plugin_quarantine())]
+    Quarantine { id: String },
+    /// 解除隔离
+    #[command(about = crate::meta::plugin_release())]
+    Release { id: String },
+    /// 读取插件日志
+    #[command(about = crate::meta::plugin_logs())]
+    Logs {
+        id: String,
+        #[arg(long, help = crate::meta::plugin_follow_arg())]
+        follow: bool,
+        #[arg(long, value_name = "N", default_value_t = 200, help = crate::meta::plugin_tail_arg())]
+        tail: usize,
+    },
+    /// 校验产物摘要与签名
+    #[command(about = crate::meta::plugin_verify())]
+    Verify {
+        /// 插件 id 或产物目录
+        #[arg(help = crate::meta::plugin_target_arg())]
+        target: String,
+    },
+    /// 回滚到上一版本
+    #[command(about = crate::meta::plugin_rollback())]
+    Rollback { id: String },
+    /// 撤销列表：查看生效的，或从文件 / URL 更新
+    #[command(about = crate::meta::plugin_revocations())]
+    Revocations {
+        #[command(subcommand)]
+        action: Option<PluginRevocationAction>,
+    },
+    /// 体检：记录、产物、宿主连通性
+    #[command(about = crate::meta::plugin_doctor())]
+    #[command(visible_alias = "doc")]
+    Doctor {
+        #[arg(long, help = crate::meta::plugin_json_arg())]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum PluginRevocationAction {
+    /// 从本地文件导入撤销列表
+    Import {
+        #[arg(help = crate::meta::plugin_revocation_file_arg())]
+        file: String,
+    },
+    /// 从 URL 拉取撤销列表
+    Fetch {
+        #[arg(help = crate::meta::plugin_revocation_url_arg())]
+        url: String,
+        #[arg(long, help = crate::meta::plugin_revocation_sha256_arg())]
+        sha256: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum PluginConfigAction {
+    /// 读取配置（密钥打码）
+    #[command(about = crate::meta::plugin_config_get())]
+    Get {
+        id: String,
+        #[arg(help = crate::meta::plugin_key_arg())]
+        key: Option<String>,
+        #[arg(long, help = crate::meta::plugin_json_arg())]
+        json: bool,
+    },
+    /// 写入配置
+    #[command(about = crate::meta::plugin_config_set())]
+    Set {
+        id: String,
+        #[arg(help = crate::meta::plugin_key_arg())]
+        key: String,
+        #[arg(help = crate::meta::plugin_value_arg())]
+        value: Option<String>,
+        #[arg(long, help = crate::meta::plugin_secret_arg())]
+        secret: bool,
+    },
 }

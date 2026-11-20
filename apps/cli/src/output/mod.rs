@@ -62,6 +62,13 @@ impl Printer {
         }
     }
 
+    /// 覆盖输出格式（命令级 `--json` 用）
+    #[must_use]
+    pub(crate) const fn with_format(mut self, format: OutputFormat) -> Self {
+        self.format = format;
+        self
+    }
+
     /// 打开全局 `--yes`：只影响确认式提问，不影响补参交互
     #[must_use]
     pub(crate) const fn with_yes(mut self, yes: bool) -> Self {

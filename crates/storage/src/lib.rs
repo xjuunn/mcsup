@@ -29,6 +29,7 @@
 //! 跨机器共享同一目录不在契约内。
 
 mod models;
+pub mod plugin;
 
 use crate::models::{JavaRuntimeEntry, ServerEntry, WorkspaceEntry, corrupt};
 use domain::java::JavaRuntime;

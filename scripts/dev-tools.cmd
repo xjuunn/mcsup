@@ -20,7 +20,7 @@ if not defined common (
 	exit /b 1
 )
 
-set "exe=%common%\mcsup-build\debug\mcsup-dev-tools.exe"
+set "exe=%common%\mcsup-build\dev-tools\mcsup-dev-tools.exe"
 if not exist "%exe%" (
 	echo [dev-tools] missing %exe% 1>&2
 	echo [dev-tools] build it once: cargo build -p dev --bin mcsup-dev-tools 1>&2

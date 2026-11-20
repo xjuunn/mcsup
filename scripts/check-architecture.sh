@@ -240,7 +240,7 @@ done
 #   mcsup   -> 任意内层（门面）
 #   apps    -> 只允许 mcsup
 # 实现层之间除 backend 外互不依赖。
-impl_layers='runtime java storage file backup provider modkit transport'
+impl_layers='runtime java storage file backup provider modkit transport plugin'
 
 for manifest in $manifests; do
 	pkg=$(pkg_key "$manifest")
@@ -365,7 +365,7 @@ check_module_layer service "service|$core_modules"
 check_module_layer protocol "protocol|$core_modules"
 
 # 实现层：只允许依赖 core 与自身
-for layer in backend runtime java storage file backup provider modkit; do
+for layer in backend runtime java storage file backup provider modkit plugin; do
 	check_module_layer "$layer" "$layer|$core_modules"
 done
 
@@ -449,17 +449,18 @@ if [ -f "$pkg_manifest" ] && [ -f "$pkg_lib" ]; then
 		java) printf '%s' 'domain port java' ;;
 		modkit) printf '%s' 'domain port modkit' ;;
 		provider) printf '%s' 'domain port provider' ;;
-		storage) printf '%s' 'domain port storage' ;;
+		storage) printf '%s' 'auth domain port storage' ;;
+		plugin) printf '%s' 'auth domain plugin port protocol' ;;
 		runtime) printf '%s' 'auth domain port protocol runtime' ;;
 		backup) printf '%s' 'domain port backup' ;;
 		transport) printf '%s' 'auth domain port protocol transport' ;;
 		backend) printf '%s' 'auth backend backup domain port protocol runtime transport' ;;
 		# 组合 feature：一次拉入全部内层（默认组合根）
-		bootstrap) printf '%s' 'auth backend backup domain file java modkit port protocol provider runtime service storage transport' ;;
+		bootstrap) printf '%s' 'auth backend backup domain file java modkit plugin port protocol provider runtime service storage transport' ;;
 		# 组合 feature：默认组合根 + 任务级接口（kit），不额外拉内层
-		kit) printf '%s' 'auth backend backup domain file java modkit port protocol provider runtime service storage transport' ;;
+		kit) printf '%s' 'auth backend backup domain file java modkit plugin port protocol provider runtime service storage transport' ;;
 		# 组合 feature：agent 侧要装配整套服务 + 传输 + supervisor 入口
-		remote) printf '%s' 'auth backend backup domain file java modkit port protocol provider runtime service storage transport' ;;
+		remote) printf '%s' 'auth backend backup domain file java modkit plugin port protocol provider runtime service storage transport' ;;
 		*) printf '%s' '' ;;
 		esac
 	}

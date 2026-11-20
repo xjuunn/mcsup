@@ -99,7 +99,7 @@
 | `CAP-GATE` | 能力门 |
 | `API-*` | HostApi 各能力 |
 | `CON-*` | 契约路由与载荷 |
-| `INST-*` | 安装、签名、升级 |
+| `INST-*` | 安装、校验、升级 |
 | `CLI-*` | 命令行契约 |
 | `WEB-*` | descriptor 投影与 REST / WS |
 | `SDK-*` | 四种 SDK |
@@ -175,11 +175,11 @@ TypeScript 侧用 `test("PROTO-FRM-004 ...")`，由报告器解析前缀。
 | H15 统一 op 表 | `CLI-CMD-010` `WEB-REST-006` | CLI / REST / MCP 对同一 op 的输入输出一致 |
 | H16 日志不走协议 | `HOST-LOG-001` `HOST-LOG-005` | stdout 混入 JSON 不会产生帧 |
 | H17 密钥只写不读 | `API-SEC-002` `CLI-OUT-006` | 读取返回 `***`；审计无明文 |
-| H18 卸载保留数据 | `INST-UPG-008` `CLI-CMD-016` | 默认保留；`--purge` 才删除 |
+| H18 卸载保留数据 | `INST-UPG-008` `CLI-CMD-016` | 默认保留数据、删除密钥；`--keep-secrets` 保留密钥；`--purge` 全删 |
 | H19 版本独立 | `PROTO-VER-001` `SDK-GEN-008` | 四个版本常量可独立递增，互不牵连 |
 | H20 进度回显 | `CLI-UI-002` `CLI-UI-004` | 长步骤有 spinner；JSON 模式无进度 |
 | H21 插件不写前端 | `DOM-DES-018` `WEB-RENDER-001` | 产物含 `.html/.css/.js` 被拒 |
-| H22 离线校验 | `INST-VER-002` `INST-SIG-005` | 摘要 / 平台 / 签名缺失时按规则拒绝 |
+| H22 离线校验 | `INST-VER-002` | 摘要 / 平台不匹配时拒绝；不校验签名 |
 | H23 条款有测试 | `PLAT-011` | 报告 ID 集合等于 `cases.json`；矩阵无空项 |
 
 ## 4.2 关键小节
@@ -220,10 +220,10 @@ TypeScript 侧用 `test("PROTO-FRM-004 ...")`，由报告器解析前缀。
 | 14.3 版本规则 | `SDK-GEN-009` | SDK 主版本 == plugin API 主版本 |
 | 15.4 安装流水线 | `INST-PKG-001..015` | 解析到登记的全链路 |
 | 15.6 升级回滚 | `INST-UPG-001..010` | 失败自动回滚 |
-| 16.2 审核清单 | `INST-SIG-008` `SEC-SIG-006` | 自动审核项逐条 |
+| 16.2 审核清单 | `SEC-SIG-006` | 自动审核项逐条（不含签名） |
 | 18.3 退出码 | `CLI-EXIT-001..010` | 七类错误 + 插件特有场景 |
 | 19.1 审计 | `HOST-EVT-007` `CON-RTE-011` | 字段完整、无明文 |
-| 20.5 性能 | `BENCH-001..004` | 握手、调用、扇出、内存 |
+| 20.5 性能 | `BENCH-001..006` | 握手、调用、扇出、内存、列表 |
 | 20.0 条款追踪 | `PLAT-011` | 报告 ID 集合等于 `cases.json`，缺项多项均失败 |
 
 # 5. Conformance 规范
@@ -518,6 +518,21 @@ java -jar conformance.jar --cases ../conformance/cases.json
 | `DOM-EVT-007` | 颜色码 `§` 保留在原始文本，渲染层处理 |
 | `DOM-EVT-008` | 玩家进出行解析 |
 
+## 6.6 配置实例（`DOM-CFG`）
+
+| ID | 输入 | 期望 |
+| --- | --- | --- |
+| `DOM-CFG-001` | 合法对象 | 通过 |
+| `DOM-CFG-002` | 缺必填 | 错误路径指向字段 |
+| `DOM-CFG-003` | `additionalProperties:false` 下多字段 | 拒绝 |
+| `DOM-CFG-004` | 整数 / 数值 / 布尔类型不符 | 拒绝 |
+| `DOM-CFG-005` | `minimum` / `maximum` / exclusive 边界 | 边界值按声明接受或拒绝 |
+| `DOM-CFG-006` | `minLength` / `maxLength` / `pattern` | 越界或模式不符拒绝 |
+| `DOM-CFG-007` | `minItems` / `maxItems` / `items` | 逐项校验 |
+| `DOM-CFG-008` | 默认值 | 递归收集，不臆造类型默认 |
+| `DOM-CFG-009` | `x-mcsup-secret` | 读取打码为 `***` |
+| `DOM-CFG-010` | 未知关键字 | 按注解忽略，不拒绝旧插件 |
+
 # 7. 协议测试矩阵
 
 ## 7.1 帧编解码（`PROTO-FRM`）
@@ -607,6 +622,7 @@ panic，只能返回错误。
 | `PROTO-CFG-004` | 乱序 revision | 丢弃过期帧 |
 | `PROTO-CFG-005` | 含密钥 | `config get` 返回 `***` |
 | `PROTO-CFG-006` | `starting` 期间变更 | 排队到 `welcome` 后 |
+| `PROTO-CFG-007` | `config.json` 落盘 | `0600`，`--purge` 时删除 |
 
 ## 7.6 控制通道（`PROTO-CTL`）
 
@@ -622,6 +638,7 @@ panic，只能返回错误。
 | `PROTO-CTL-008` | `grant/revoke` | 授权即时生效 |
 | `PROTO-CTL-009` | `reload` | 安装后宿主读到新记录 |
 | `PROTO-CTL-010` | TCP 回退认证 | 缺令牌拒绝，错误的拒绝 |
+| `PROTO-CTL-011` | `config_apply` | 只下发已落盘配置，revision 不双增 |
 
 ## 7.7 版本（`PROTO-VER`）
 
@@ -848,6 +865,10 @@ panic，只能返回错误。
 | `API-FS-007` | 运行中 jar | `conflict` |
 | `API-FS-008` | Windows 大小写 / UNC | 归一化后校验 |
 
+落位：`service::plugin` 的 `ServerFiles` 负责路径、限额与保留名判定，
+`crates/plugin/src/api.rs` 只做帧分发。单测名以 `api_fs_` 开头，可用
+`cargo test -p mcsup-service --lib api_fs` 过滤；符号链接用例在 unix 上执行。
+
 ## 9.8 生命周期 / 备份 / 内容 / Java（`API-LIFE` / `API-BAK` / `API-CNT` / `API-JAVA`）
 
 | ID | 场景 | 期望 |
@@ -875,6 +896,35 @@ panic，只能返回错误。
 | `API-JAVA-003` | 未授予 | `denied` |
 | `API-JAVA-004` | 平台不支持 | `unsupported` |
 
+落位：`server:lifecycle` / `backup` / `content` / `java` 由
+`service::plugin::HostApiImpl` 实现，`crates/plugin/src/api.rs` 只做帧分发。生命周期错误按「服务器状态」收敛：
+已在运行 / 未在运行 / EULA 未确认 / 缺核心均为 `conflict`，停机超时为
+`timeout`。备份错误按 `BackupError::category()` 映射（不存在 → `not_found`，
+运行中恢复 → `conflict`，磁盘 / 远端不可用 → `unavailable`）。内容错误按
+`ModError::category()` 映射（运行中 → `conflict`，选择器未命中 → `not_found`，
+纯客户端内容 → `invalid_input`，上游 / 磁盘失败 → `unavailable`），远端服务器
+返回 `unsupported`。Java 错误按 `JavaError::category()` 映射（未登记 →
+`not_found`，扫描 / 上游 / 下载 → `unavailable`）。
+
+审计在会话层统一记录：`action` 为 `capability:<能力>:<方法>`，成功结果只摘
+`snapshot` / `file` 字段（备份与内容审计的检索键），失败记录错误码与消息。
+对应单测可用 `cargo test -p mcsup-service --lib api_life` / `api_bak` / `api_cnt` /
+`api_java` 与 `cargo test -p mcsup-plugin --lib api::tests` 过滤。
+
+## 9.9 展示类型投影（`DESC-DISPLAY`）
+
+| ID | 场景 | 期望 |
+| --- | --- | --- |
+| `DESC-DISPLAY-001` | 六种 display 的合法形状 | descriptor 校验通过，类型不被改写 |
+| `DESC-DISPLAY-002` | 输出形状不匹配 | `DisplayShapeMismatch`，安装失败 |
+| `DESC-DISPLAY-003` | `chat` 引用未声明的 `send` / `stream` | `InvalidDisplayRef` |
+| `DESC-DISPLAY-004` | CLI `plugin ops` | 人类表格含「展示」列，JSON 含 `display` |
+
+落位：判定在 `domain::plugin::descriptor`（`validate_display_shape` /
+`validate_display_refs`），CLI 只投影 `ResolvedOp::display`，不重复判断。
+六种类型的正例见单测 `all_six_display_types_resolve`，可用
+`cargo test -p mcsup-domain --lib descriptor` 过滤。
+
 ---
 
 # 10. 契约测试矩阵
@@ -895,6 +945,8 @@ panic，只能返回错误。
 | `CON-RTE-010` | `@1` / `@2` 并存 | 按请求版本路由 |
 | `CON-RTE-011` | 审计 | caller / provider / contract / result |
 | `CON-RTE-012` | 单请求 32 次 | 第 33 次 `limit_exceeded` |
+| `CON-RTE-013` | 调用方未声明 `consumes` | `denied` |
+| `CON-RTE-014` | 未知或过期 `trace` | `conflict` |
 
 ## 10.2 各契约（`CON-CHAT` / `CON-AGENT` / `CON-MET` / `CON-INC` / `CON-LIFE`）
 
@@ -966,8 +1018,17 @@ panic，只能返回错误。
 | `INST-VER-008` | 解包超限 | 拒绝 |
 | `INST-VER-009` | 文件数超限 | 拒绝 |
 | `INST-VER-010` | 压缩比异常 | 拒绝 |
-| `INST-VER-011` | 签名缺失 | 按 H22 处理 |
+
 | `INST-VER-012` | 撤销列表命中 | 拒绝启动 |
+
+撤销相关的落位（`provider::plugin_revoke` 的缓存用例 + `crates/service/tests/plugin_revocation.rs`）：
+
+- `INST-VER-012`：命中版本 `enable` 被拒（`Unauthorized` / 退出码 6）；
+  `versions: []` 视为全部版本；其他版本不受影响。
+- 列表读不懂时不阻断已安装插件，`plugin doctor` 报 `warning`；
+  未装配撤销检查时不读文件也不阻断。
+- CLI 契约：`plugin revocations import` / 查看 / 命中后 `enable` 退出码 6、
+  非法列表整体拒绝（退出码 2）、`fetch` 只接受 https。
 
 ## 11.3 打包（`INST-PKG`）
 
@@ -999,27 +1060,10 @@ panic，只能返回错误。
 | `INST-UPG-004` | 运行中升级 | 先停进程 |
 | `INST-UPG-005` | 启动失败 | 自动回滚 |
 | `INST-UPG-006` | 降级且能力减少 | 直接生效 |
-| `INST-UPG-007` | 卸载 | 保留数据 |
+| `INST-UPG-007` | 卸载 | 保留数据、删除密钥；`--keep-secrets` 保留密钥 |
 | `INST-UPG-008` | `--purge` | 数据、日志、授权删除 |
 | `INST-UPG-009` | `--prune` | 旧版本清理 |
 | `INST-UPG-010` | 并发升级 | 第二个拒绝 |
-
-## 11.5 签名（`INST-SIG`）
-
-| ID | 场景 | 期望 |
-| --- | --- | --- |
-| `INST-SIG-001` | Sigstore 有效 | 通过 |
-| `INST-SIG-002` | 内容篡改 | 拒绝 |
-| `INST-SIG-003` | 身份不符 | 拒绝 |
-| `INST-SIG-004` | 证书过期 | 拒绝 |
-| `INST-SIG-005` | 市场来源无签名 | 拒绝 |
-| `INST-SIG-006` | 撤销 | 拒绝 |
-| `INST-SIG-007` | minisign 有效 | 通过 |
-| `INST-SIG-008` | 公钥错误 | 拒绝 |
-| `INST-SIG-009` | 本地无签名 + `--allow-unsigned` | 安装并标记 `untrusted` |
-| `INST-SIG-010` | 市场无签名 + `--allow-unsigned` | 仍拒绝 |
-| `INST-SIG-011` | provenance 仓库不符 | 拒绝 |
-| `INST-SIG-012` | 信任库权限 | `0600` / 目录 `0700` |
 
 ## 11.6 安全（`SEC-*`）
 
@@ -1035,16 +1079,11 @@ panic，只能返回错误。
 | `SEC-ZIP-008` | 路径深度 9 | 拒绝 |
 | `SEC-ZIP-009` | 可执行脚本 | 不执行，记录 |
 | `SEC-ZIP-010` | 保留名 / 尾随点 | 拒绝 |
-| `SEC-SIG-001` | 篡改 | 拒绝 |
-| `SEC-SIG-002` | 身份伪造 | 拒绝 |
-| `SEC-SIG-003` | 过期证书 | 拒绝 |
 | `SEC-SIG-004` | 撤销 | 拒绝 |
-| `SEC-SIG-005` | 密钥轮换 | 新旧公钥都可用 |
 | `SEC-SIG-006` | 自动审核项 | 逐条通过 / 拒绝 |
 | `SEC-SIG-007` | 摘要不匹配 | 拒绝 |
 | `SEC-SIG-008` | 平台产物错配 | 拒绝 |
 | `SEC-SIG-009` | 旧版本重放 | 拒绝或提示 |
-| `SEC-SIG-010` | 信任库权限 | 过宽拒绝 |
 | `SEC-SSRF-001` | `localhost` | 拒绝 |
 | `SEC-SSRF-002` | `127.0.0.1` | 拒绝 |
 | `SEC-SSRF-003` | `::1` | 拒绝 |
@@ -1069,6 +1108,8 @@ panic，只能返回错误。
 | `SEC-LOG-004` | 格式串 | 不解释 |
 | `SEC-LOG-005` | 超大行 | 截断 |
 | `SEC-LOG-006` | 密钥 | 替换 |
+| `SEC-LOG-007` | 已知密钥值 | 精确替换为 `***`；≥ 8 字节、最多 64 条 |
+| `SEC-LOG-008` | 过短 / 非 UTF-8 密钥值 | 不进打码表，避免整行被替换 |
 | `SEC-DOS-001` | JSON 深度 33 | 拒绝 |
 | `SEC-DOS-002` | 帧洪泛 | 限速 / 断开 |
 | `SEC-DOS-003` | 事件洪泛 | 丢弃 + 指标 |
@@ -1077,6 +1118,29 @@ panic，只能返回错误。
 | `SEC-DOS-006` | 慢握手 | 10 s 超时 |
 | `SEC-DOS-007` | 多插件同时启动 | 有上限，不拖垮宿主 |
 | `SEC-DOS-008` | 超大 schema | 安装拒绝 |
+| `SEC-KEY-001` | 有机器密钥 | `secrets.json` 中不出现明文，格式为 `v/nonce/data` 信封 |
+| `SEC-KEY-002` | 读取旧明文文件 | 可读，下一次写入即迁移为密文 |
+| `SEC-KEY-003` | 机器密钥不可用 | 读到密文时报 `denied`，不静默降级 |
+| `SEC-KEY-004` | 密文被改动 | 认证失败，报损坏 |
+| `SEC-KEY-005` | 密文跨插件复制 | AAD 绑定插件 id，解密失败 |
+| `SEC-KEY-006` | 卸载 | 默认删除 `secrets.json`，其余数据保留 |
+| `SEC-KEY-007` | 卸载 `--keep-secrets` | 密钥保留，供重装使用 |
+
+落位：
+
+- `SEC-LOG-006` / `007` / `008`：`crates/plugin/src/process.rs` 单测
+  （`known_secret_values_are_redacted`、`short_and_duplicate_secrets_are_skipped`、
+  `non_utf8_secret_is_skipped`、`redact_table_is_bounded`）；宿主在
+  `PluginHost::start_session` 把 `SecretStore::values` 并进 `SpawnPlan.redact`。
+- `SEC-KEY-001..005`：`crates/storage/src/plugin.rs` 单测
+  （`encrypted_secrets_do_not_contain_plaintext`、`..._migrates`、
+  `encrypted_secrets_need_the_machine_key`、`tampered_secrets_are_rejected`、
+  `encrypted_secrets_are_bound_to_the_plugin`）；密钥本身的密封 / 打开在
+  `crates/auth/src/machine_key.rs` 单测。
+- `SEC-KEY-006` / `007`：`crates/service/src/plugin.rs` 单测
+  `remove_handles_secrets_by_mode`（默认 / `keep_secrets` / `purge` 三种落点）。
+- 机器密钥只存系统钥匙串；不可用时退化为 `0600` 明文，`plugin doctor`
+  报告降级。退化路径没有「加密生效」的假象，因此不按 `SEC-KEY-001` 判通过。
 
 ## 11.7 平台（`PLAT`）
 
@@ -1115,11 +1179,14 @@ panic，只能返回错误。
 | `CLI-CMD-013` | `config get/set` | 密钥打码 |
 | `CLI-CMD-014` | `grant/revoke` | 即时生效 |
 | `CLI-CMD-015` | `logs --follow` | 游标续读 |
-| `CLI-CMD-016` | `remove` | 保留数据；`--purge` 删除 |
+| `CLI-CMD-016` | `remove` | 保留数据、删除密钥；`--keep-secrets` 保留密钥；`--purge` 全删 |
 | `CLI-CMD-017` | `update --to` | 切换版本 |
 | `CLI-CMD-018` | `rollback` | 切回上一版本 |
-| `CLI-CMD-019` | `verify` | 摘要与签名结果 |
+| `CLI-CMD-019` | `verify` | 摘要与元数据复查 |
 | `CLI-CMD-020` | `doctor` | 汇总检查项 |
+| `CLI-CMD-021` | `block` / `unblock` | 立即停止并禁用；解除后不自动启用 |
+| `CLI-CMD-022` | `quarantine` / `release` | 产物保留，启动被拒绝 |
+| `CLI-CMD-023` | `config set --secret` | 值从 stdin 读取，回显与输出均不含明文 |
 
 ## 12.2 输出（`CLI-OUT`）
 
@@ -1300,7 +1367,7 @@ panic，只能返回错误。
 | `E2E-007` | 崩溃循环 | `failed` 后不再重启 |
 | `E2E-008` | 配置错误 | 回滚并提示 |
 | `E2E-009` | 未授权操作 | 拒绝且有审计 |
-| `E2E-010` | 卸载 | 数据保留，进程退出 |
+| `E2E-010` | 卸载 | 数据保留、密钥删除，进程退出 |
 | `E2E-011` | 多服务器 | 事件不串服 |
 | `E2E-012` | 宿主重启 | 插件按策略恢复 |
 
@@ -1319,6 +1386,22 @@ panic，只能返回错误。
 
 基准不进入 `check.sh`；M1 起每个里程碑跑一次，结果写入
 `docs/plugins-progress.md`。回归超过 20% 必须解释或修复。
+
+落位（三个独立目标，均不进入 `check.sh`）：
+
+| 目标 | 覆盖 | 跑法 |
+| --- | --- | --- |
+| `apps/bench/benches/plugin.rs` | `BENCH-003`、`BENCH-004`、`BENCH-006` | `cargo bench -p bench --bench plugin` |
+| `apps/bench/benches/plugin_handshake.rs` | `BENCH-001`、`BENCH-002` | `cargo bench -p bench --bench plugin_handshake` |
+| `apps/bench/benches/plugin_memory.rs` | `BENCH-005` | `cargo bench -p bench --bench plugin_memory` |
+
+- `BENCH-001` / `002`：真实 `PluginHost` 拉起真实子进程。冷启动每次使用新拷贝
+  的 fixture（新 inode 的首次执行，含可执行校验），热启动复用同一产物目录。
+  自采样 30 次取 p95，超预算退出码非 0。fixture 是 `apps/bench` 自带的
+  `mcsup-plugin-bench-fixture`，只依赖门面，靠 `CARGO_BIN_EXE_*` 定位。
+- `BENCH-005`：基准把自身当宿主进程再拉一次，构造 `PluginHost` 后空闲，
+  父进程用 `ps` 采样 RSS（空宿主与 100 条记录各一次）。
+- `BENCH-006`：真实文件后端下 `PluginService::list` 100 条非 resident 记录。
 
 ---
 
@@ -1450,13 +1533,13 @@ cargo test -p cli plugin
 
 ```
 ./scripts/check-sdk.sh
-./scripts/check-plugin-tests.sh --only SDK-,INST-SIG,SEC-SIG
+./scripts/check-plugin-tests.sh --only SDK-,SEC-SIG
 ```
 
 验收：
 
 - 四语言 descriptor 一致；
-- 签名、撤销、provenance 全绿；
+- 摘要、撤销全绿；签名与 provenance 暂不实现（见 `docs/plugins-progress.md`）；
 - Python / Java SDK 过 conformance；
 - 升级失败自动回滚端到端通过。
 

@@ -27,6 +27,7 @@ transport = { package = "mcsup-transport", path = "../transport", version = "0.1
 file = { package = "mcsup-file", path = "../file", version = "0.1.0", optional = true }
 java = { package = "mcsup-java", path = "../java", version = "0.1.0", optional = true }
 modkit = { package = "mcsup-modkit", path = "../modkit", version = "0.1.0", optional = true }
+plugin = { package = "mcsup-plugin", path = "../plugin", version = "0.1.0", optional = true }
 provider = { package = "mcsup-provider", path = "../provider", version = "0.1.0", optional = true }
 storage = { package = "mcsup-storage", path = "../storage", version = "0.1.0", optional = true }
 runtime = { package = "mcsup-runtime", path = "../runtime", version = "0.1.0", optional = true }
@@ -50,8 +51,9 @@ backend = ["dep:backend", "port"]
 file = ["dep:file", "port"]
 java = ["dep:java", "port"]
 modkit = ["dep:modkit", "port"]
+plugin = ["dep:plugin", "port", "protocol"]
 provider = ["dep:provider", "port"]
-storage = ["dep:storage", "port"]
+storage = ["dep:storage", "port", "auth"]
 runtime = ["dep:runtime", "port", "protocol"]
 # 远端传输：TLS + 自签身份 + 帧收发（客户端与 agent 共用）
 transport = ["dep:transport", "protocol"]
@@ -68,6 +70,7 @@ remote = [
     "auth",
     "service",
     "protocol",
+    "plugin",
     "dep:thiserror",
     "dep:tracing",
     "dep:tokio",
@@ -78,7 +81,7 @@ remote = [
 #
 # 只引用 `bootstrap` 已经拉入的能力，不引入新的内层 crate；开本 feature
 # 同时具备 `Mcsup` 与 `Kit`。
-kit = ["bootstrap"]
+kit = ["bootstrap", "plugin"]
 # 默认组合根：一次装配全部默认实现（storage/service/file/java/provider/runtime）
 bootstrap = [
     "dep:storage",
@@ -88,6 +91,7 @@ bootstrap = [
     "dep:file",
     "dep:java",
     "dep:modkit",
+    "plugin",
     "dep:provider",
     "dep:runtime",
     "dep:tracing",

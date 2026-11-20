@@ -18,6 +18,11 @@ pub mod action;
 /// CLI `--output json` 的行类型（唯一真相来源，禁止各入口自行定义 DTO）
 pub mod cli;
 
+/// 插件帧协议：握手、事件、调用、流、配置、心跳与控制通道
+///
+/// 版本号独立于 [`PROTOCOL_VERSION`]，见 [`plugin::PLUGIN_PROTOCOL_VERSION`]。
+pub mod plugin;
+
 /// 远端 RPC：帧集、版本协商、线格式
 ///
 /// 与本地 IPC 共用 [`Frame`] 的编解码纪律，但版本号独立（

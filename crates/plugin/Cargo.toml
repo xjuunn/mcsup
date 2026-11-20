@@ -1,0 +1,43 @@
+[package]
+name = "mcsup-plugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Plugin host runtime for MCSUP: process, endpoint, frames, sessions"
+repository.workspace = true
+# `tests/fixture/main.rs` 同时是 fixture bin 的源文件；自动发现会把它当成
+# 第二个集成测试目标。集成测试一律显式声明。
+autotests = false
+
+[lib]
+name = "plugin"
+
+[features]
+# 只为集成测试构建 fixture 插件进程
+fixture = []
+
+[[bin]]
+name = "plugin-fixture"
+path = "tests/fixture/main.rs"
+required-features = ["fixture"]
+
+[[test]]
+name = "host_lifecycle"
+required-features = ["fixture"]
+
+[dependencies]
+domain = { package = "mcsup-domain", version = "0.1.0", path = "../domain" }
+port = { package = "mcsup-port", version = "0.1.0", path = "../port" }
+protocol = { package = "mcsup-protocol", version = "0.1.0", path = "../protocol" }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

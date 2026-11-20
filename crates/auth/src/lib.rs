@@ -9,6 +9,7 @@
 //! - 凭证落盘形态（[`CredentialStore`] / [`FileCredentialStore`] /
 //!   [`KeyringCredentialStore`]）：优先系统钥匙串，无钥匙串时退到 0600 文件
 //!   （[`CredentialVault`] 负责选择）
+//! - 机器密钥（[`MachineKey`]）：本机敏感数据的静态加密密钥，只存钥匙串
 //!
 //! 放在独立 crate 而不是 `service`，是因为它同时被两侧使用：agent 侧要签发与
 //! 校验，客户端侧要保存与出示；而 `service` 不允许依赖任何实现层，把凭证格式
@@ -21,6 +22,7 @@
 pub mod code;
 pub mod credential;
 pub mod grant;
+pub mod machine_key;
 pub mod registry;
 pub mod token;
 
@@ -30,9 +32,11 @@ pub use code::{
 pub use credential::{
     CREDENTIAL_STORE_ENV, CredentialError, CredentialStore, CredentialVault, FileCredentialStore,
     KEYRING_SERVICE, KeyringBackend, KeyringCredentialStore, StoredCredential, SystemKeyring,
+    system_keyring_available,
 };
 pub use grant::{
     DEFAULT_ON_DEMAND_TTL_SECS, GrantError, GrantStatus, MAX_TTL_SECS, MIN_TTL_SECS, PairingGrant,
 };
+pub use machine_key::{KEY_LEN, MachineKey, MachineKeyError, NONCE_LEN, Sealed};
 pub use registry::{ClientRecord, ClientRegistry, RegistryError};
 pub use token::{ClientId, Permission, RevocationList, Role, Token, TokenDigest, TokenError};

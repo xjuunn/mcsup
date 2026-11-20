@@ -20,6 +20,7 @@ port = { package = "mcsup-port", version = "0.1.0", path = "../port" }
 auth = { package = "mcsup-auth", version = "0.1.0", path = "../auth" }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true

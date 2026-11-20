@@ -1,4 +1,5 @@
 pub mod artifact;
+pub mod chat;
 pub mod content;
 pub mod download;
 pub mod error;

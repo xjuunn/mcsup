@@ -11,6 +11,9 @@ repository.workspace = true
 name = "domain"
 
 [dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+regex.workspace = true
 thiserror.workspace = true
 
 [lints]

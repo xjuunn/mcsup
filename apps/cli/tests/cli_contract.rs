@@ -816,13 +816,16 @@ fn no_args_help_is_chinese_on_stderr() {
 fn help_output_follows_lang_flag() {
     let home = temp_home();
     // 覆盖各层：顶层 / 一级子命令 / 二级子命令 / 带参数说明的命令
-    let cases: [&[&str]; 6] = [
+    let cases: [&[&str]; 9] = [
         &["--help", "--lang", "en"],
         &["workspace", "-h", "--lang", "en"],
         &["server", "--help", "--lang", "en"],
         &["server", "create", "--help", "--lang", "en"],
         &["java", "install", "--help", "--lang", "en"],
         &["workspace", "doctor", "--help", "--lang", "en"],
+        &["plugin", "--help", "--lang", "en"],
+        &["plugin", "install", "--help", "--lang", "en"],
+        &["plugin", "call", "--help", "--lang", "en"],
     ];
     for args in cases {
         let out = run(home.path(), args);
@@ -1397,5 +1400,321 @@ fn single_letter_shorthand_is_rejected() {
             "{args:?}: {}",
             stderr(&out)
         );
+    }
+}
+
+// ---- plugin ----
+
+/// 空数据目录：`plugin list --json` 输出空数组，不因宿主不在而失败
+#[test]
+fn plugin_list_json_is_empty_without_plugins() {
+    let home = temp_home();
+    let out = run(home.path(), &["plugin", "list", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let rows: serde_json::Value = serde_json::from_slice(&out.stdout).expect("list 输出数组");
+    assert_eq!(rows, serde_json::json!([]));
+}
+
+/// 未知插件是「不存在」而不是「用法错误」
+#[test]
+fn plugin_status_unknown_exits_3() {
+    let home = temp_home();
+    let out = run(home.path(), &["plugin", "status", "ghost"]);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    assert!(out.stdout.is_empty(), "失败不得输出数据");
+}
+
+#[test]
+fn plugin_invalid_id_exits_2() {
+    let home = temp_home();
+    let out = run(home.path(), &["plugin", "status", "Not A Plugin"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+}
+
+/// 本地目录安装 → 列表 → ops → 校验摘要。全程不联网、不拉起宿主。
+#[test]
+fn plugin_install_local_artifact_then_list_ops_and_verify() {
+    let home = temp_home();
+    let artifact = home.path().join("demo-plugin");
+    write_plugin_artifact(&artifact);
+
+    let out = run(
+        home.path(),
+        &[
+            "--output",
+            "json",
+            "plugin",
+            "install",
+            "--from",
+            artifact.to_str().expect("utf-8 path"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let installed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("install 输出对象");
+    assert_eq!(installed["id"], "demo");
+    assert_eq!(installed["version"], "0.1.0");
+
+    let out = run(home.path(), &["plugin", "list", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let rows: serde_json::Value = serde_json::from_slice(&out.stdout).expect("list 输出数组");
+    assert_eq!(rows[0]["id"], "demo");
+    // 安装后还没有 enable，离线状态是 disabled
+    assert_eq!(rows[0]["state"], "disabled");
+
+    let out = run(home.path(), &["plugin", "ops", "demo", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let ops: serde_json::Value = serde_json::from_slice(&out.stdout).expect("ops 输出数组");
+    assert_eq!(ops[0]["id"], "ping");
+    // 展示类型由 descriptor 推断：object 输出的 query 默认 `detail`
+    assert_eq!(ops[0]["display"], "detail");
+
+    let out = run(
+        home.path(),
+        &["--output", "json", "plugin", "verify", "demo"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let verified: serde_json::Value = serde_json::from_slice(&out.stdout).expect("verify 输出对象");
+    assert_eq!(verified["id"], "demo");
+    assert_eq!(verified["sha256"].as_str().map(str::len), Some(64));
+}
+
+/// `verify` 指向本地目录：复查摘要与 manifest / descriptor
+#[test]
+fn plugin_verify_local_directory_reports_digest() {
+    let home = temp_home();
+    let artifact = home.path().join("verify-plugin");
+    write_plugin_artifact(&artifact);
+    let out = run(
+        home.path(),
+        &[
+            "--output",
+            "json",
+            "plugin",
+            "verify",
+            artifact.to_str().expect("utf-8 path"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let verified: serde_json::Value = serde_json::from_slice(&out.stdout).expect("verify 输出对象");
+    assert_eq!(verified["id"], "demo");
+    assert_eq!(verified["sha256"].as_str().map(str::len), Some(64));
+}
+
+/// 配置读写与拉黑：全程不联网、不拉起宿主，CLI 与宿主共用的校验必须生效
+#[test]
+fn plugin_config_and_block_flags_are_visible_and_enforced() {
+    let home = temp_home();
+    let artifact = home.path().join("config-plugin");
+    write_plugin_artifact(&artifact);
+    let out = run(
+        home.path(),
+        &[
+            "--output",
+            "json",
+            "plugin",
+            "install",
+            "--from",
+            artifact.to_str().expect("utf-8 path"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    // 默认值来自 schema；写入后 revision 增加
+    let out = run(
+        home.path(),
+        &["--output", "json", "plugin", "config", "get", "demo"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let config: serde_json::Value = serde_json::from_slice(&out.stdout).expect("config 输出对象");
+    assert_eq!(config["revision"], 0);
+    assert_eq!(config["values"]["interval"], 60);
+
+    let out = run(
+        home.path(),
+        &[
+            "--output", "json", "plugin", "config", "set", "demo", "interval", "30",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let set: serde_json::Value = serde_json::from_slice(&out.stdout).expect("set 输出对象");
+    assert_eq!(set["revision"], 1);
+
+    let out = run(
+        home.path(),
+        &[
+            "--output", "json", "plugin", "config", "get", "demo", "interval",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let single: serde_json::Value = serde_json::from_slice(&out.stdout).expect("key 输出对象");
+    assert_eq!(single["value"], 30);
+
+    // 越界值走用法错误，且不写入
+    let out = run(
+        home.path(),
+        &["plugin", "config", "set", "demo", "interval", "1"],
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+
+    // 密钥不回显：写入与读取都不出现明文
+    let out = run(
+        home.path(),
+        &[
+            "--output", "json", "plugin", "config", "set", "demo", "token", "s3cret", "--secret",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("s3cret"));
+    assert!(!stderr(&out).contains("s3cret"));
+    let out = run(
+        home.path(),
+        &[
+            "--output", "json", "plugin", "config", "get", "demo", "token",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let single: serde_json::Value = serde_json::from_slice(&out.stdout).expect("key 输出对象");
+    assert_eq!(single["value"], "***");
+
+    // 拉黑立即禁用，解除后不自动启用
+    let out = run(
+        home.path(),
+        &["--output", "json", "plugin", "block", "demo"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let blocked: serde_json::Value = serde_json::from_slice(&out.stdout).expect("block 输出对象");
+    assert_eq!(blocked["blocked"], true);
+    assert_eq!(blocked["enabled"], false);
+
+    let out = run(home.path(), &["plugin", "enable", "demo"]);
+    assert_eq!(out.status.code(), Some(4), "{}", stderr(&out));
+
+    let out = run(
+        home.path(),
+        &["--output", "json", "plugin", "unblock", "demo"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let released: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("unblock 输出对象");
+    assert_eq!(released["blocked"], false);
+
+    let out = run(home.path(), &["--output", "json", "plugin", "list"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let rows: serde_json::Value = serde_json::from_slice(&out.stdout).expect("list 输出数组");
+    assert_eq!(rows[0]["blocked"], false);
+    assert_eq!(rows[0]["quarantined"], false);
+}
+
+/// `plugin revocations`：导入 → 查看 → 撤销命中阻止启用
+#[test]
+fn plugin_revocations_import_and_block_enable() {
+    let home = temp_home();
+    let artifact = home.path().join("revoked-plugin");
+    write_plugin_artifact(&artifact);
+    let out = run(
+        home.path(),
+        &[
+            "--output",
+            "json",
+            "plugin",
+            "install",
+            "--from",
+            artifact.to_str().expect("utf-8 path"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    let list_path = home.path().join("revoked.json");
+    std::fs::write(
+        &list_path,
+        r#"{"schema":1,"entries":[{"id":"demo","versions":[],"reason":"malware"}]}"#,
+    )
+    .expect("write revocation list");
+    let out = run(
+        home.path(),
+        &[
+            "--output",
+            "json",
+            "plugin",
+            "revocations",
+            "import",
+            list_path.to_str().expect("utf-8 path"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let list: serde_json::Value = serde_json::from_slice(&out.stdout).expect("列表输出对象");
+    assert_eq!(list["entries"][0]["id"], "demo");
+    assert_eq!(list["entries"][0]["reason"], "malware");
+
+    // 不带子命令 = 查看当前生效的列表
+    let out = run(home.path(), &["--output", "json", "plugin", "revocations"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let current: serde_json::Value = serde_json::from_slice(&out.stdout).expect("查看输出对象");
+    assert_eq!(current["entries"].as_array().expect("entries").len(), 1);
+
+    // 撤销命中：拒绝启用，退出码 6（Unauthorized）
+    let out = run(home.path(), &["plugin", "enable", "demo"]);
+    assert_eq!(out.status.code(), Some(6), "{}", stderr(&out));
+
+    // 非法列表整体拒绝，不落盘
+    std::fs::write(&list_path, b"not json").expect("write garbage");
+    let out = run(
+        home.path(),
+        &[
+            "plugin",
+            "revocations",
+            "import",
+            list_path.to_str().expect("utf-8 path"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+}
+
+/// 撤销列表只接受 https
+#[test]
+fn plugin_revocations_reject_plain_http() {
+    let home = temp_home();
+    let out = run(
+        home.path(),
+        &[
+            "plugin",
+            "revocations",
+            "fetch",
+            "http://127.0.0.1:1/revoked.json",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+}
+
+fn write_plugin_artifact(root: &Path) {
+    std::fs::create_dir_all(root.join("bin")).expect("create bin");
+    std::fs::write(
+        root.join("manifest.json"),
+        r#"{"schema":1,"id":"demo","name":"Demo","version":"0.1.0","api":1,
+            "entry":{"type":"process","cmd":"bin/demo"},
+            "capabilities":["events"],"license":"MIT"}"#,
+    )
+    .expect("write manifest");
+    std::fs::write(
+        root.join("descriptor.json"),
+        r#"{"schema":1,"plugin_id":"demo","api":1,
+            "config":{"type":"object","additionalProperties":false,
+                      "properties":{
+                        "interval":{"type":"integer","minimum":5,"default":60},
+                        "token":{"type":"string","x-mcsup-secret":true}}},
+            "ops":[{"id":"ping","kind":"query","title":"Ping","risk":"read",
+                    "input":{"type":"object"},"output":{"type":"object"}}]}"#,
+    )
+    .expect("write descriptor");
+    std::fs::write(root.join("bin/demo"), "#!/bin/sh\nexit 0\n").expect("write entry");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            root.join("bin/demo"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod entry");
     }
 }

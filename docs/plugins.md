@@ -95,7 +95,7 @@ MCSUP 里同时存在三种容易混淆的「插件」：
 | **实例（instance）** | 一个插件的运行单位。默认机器级单实例，可声明为每服一实例 |
 | **resident** | 常驻标记。为真时宿主不因空闲回收该插件，且宿主随之存活 |
 | **产物（artifact）** | 可安装的压缩包：manifest + descriptor + 二进制 + 许可证 |
-| **可信产物** | 有有效签名且摘要匹配的产物；未签名产物需显式 `--allow-unsigned` |
+| **可信产物** | 摘要匹配、通过解包安全检查与 manifest / descriptor 校验的产物；当前不校验签名 |
 
 ---
 
@@ -127,7 +127,7 @@ MCSUP 里同时存在三种容易混淆的「插件」：
 | H19 | 协议版本、API 版本、manifest schema、descriptor schema 各自独立递增 |
 | H20 | 所有耗时步骤必须有进度回显；JSON 模式下 stdout 只含数据 |
 | H21 | `[禁止]` 插件写前端资源。界面只能由 descriptor 投影生成 |
-| H22 | 插件产物必须可离线校验：摘要 + 平台匹配必备；签名缺失时必须显式 `--allow-unsigned` 并标记 `untrusted` |
+| H22 | 插件产物必须可离线校验：摘要 + 平台匹配必备；当前不校验签名，安装记录如实保存摘要 |
 | H23 | 每条硬规则与关键小节必须在 `docs/plugins-testing.md` 有测试 ID；没有对应用例的条款视为未实现 |
 
 # 4. 架构落位
@@ -197,7 +197,7 @@ SDK README 必须显式区分，避免作者把宿主 crate 写进插件依赖�
 
 ## 4.4 新增模块的落位
 
-### `domain::plugin` `[待实现]`
+### `domain::plugin` `[规范]`
 
 纯词汇与纯规则，不依赖本仓库任何模块：
 
@@ -223,7 +223,7 @@ SDK README 必须显式区分，避免作者把宿主 crate 写进插件依赖�
 - 展示类型与 op 形状的静态一致性检查；
 - 契约标识解析（`chat.publish@1`）。
 
-### `port::plugin` `[待实现]`
+### `port::plugin` `[规范]`
 
 | trait | 作用 | 实现方 |
 | --- | --- | --- |
@@ -239,14 +239,14 @@ SDK README 必须显式区分，避免作者把宿主 crate 写进插件依赖�
 | `NetProxy` | 宿主代发的出站请求（可选路径） | `provider` |
 | `PluginStore` | 安装记录、当前版本、授权状态 | `storage` |
 | `ArtifactSource` | git / url 解析到产物字节 | `provider` |
-| `ArtifactVerifier` | 摘要 + 签名校验 | `plugin` |
+| `ArtifactVerifier` | 来源摘要与解包目录复查 | `plugin` |
 | `AuditSink` | 审计记录 | `storage` |
 | `PluginSupervisor` | 启停 / 状态 / 控制通道客户端 | `plugin` |
 
 `port` 不得依赖 `protocol`（现有断言 `protocol -> port`，反向会成环）。因此
 宿主错误码定义在 `port::plugin::PluginErrorCode`，`protocol` 负责其线格式。
 
-### `protocol::plugin` `[待实现]`
+### `protocol::plugin` `[规范]`
 
 | 模块 | 内容 |
 | --- | --- |
@@ -594,6 +594,36 @@ Unix socket 权限 `0600`；Windows 管道使用当前用户 DACL。`[禁止]` �
  "input":{"server":"survival","line":"say hi"}}
 ```
 
+插件调用另一个插件提供的契约（`target` 仅单播可用，`trace` 由宿主分配）：
+
+```json
+{"v":1,"type":"call","id":8,"contract":"chat.publish@1",
+ "input":{"server":"survival","text":"hi"}}
+```
+
+根调用不带 `trace`。宿主在接受根调用时分配一个不透明令牌并随调用链登记；
+提供方再次发起契约调用时必须把收到的 `trace` 原样带回，宿主据此做循环、
+深度与扇出判定。提供方无法伪造链路：未知或过期的 `trace` 返回 `conflict`。
+
+宿主向提供方投递契约时使用 op `contract.call`，调用链令牌在 `input.trace`：
+
+```json
+{"v":1,"type":"call","id":9,"op":"contract.call",
+ "input":{"contract":"chat.publish@1","caller":"monitor","trace":"<64 hex>",
+          "input":{"server":"survival","text":"hi"}}}
+```
+
+`net:outbound` 的宿主方法为 `request`：
+
+```json
+{"v":1,"type":"call","id":10,"capability":"net:outbound","method":"request",
+ "input":{"method":"GET","url":"https://api.example.com/status",
+          "headers":{"accept":"application/json"},"body":null,"timeout_ms":5000}}
+```
+
+请求体与响应体都用 base64；响应为
+`{"status":200,"headers":{...},"body":"<base64>","body_len":123}`。
+
 `id` 由发起方分配，在**同一方向**内唯一。两个方向各自维护 id 空间，`result`
 按方向归属，不会混淆。
 
@@ -705,6 +735,7 @@ CLI / `apps/server` / `apps/agent` 与宿主之间的连接使用独立的控制
 | `stream` | 订阅插件 stream，返回 `stream` 帧 |
 | `logs` | 游标读取插件日志 |
 | `config_get` / `config_set` | 配置读取（密钥打码）/ 写入 |
+| `config_apply` | 只下发已由管理端校验并落盘的配置，不重复写盘 |
 | `grant` / `revoke` | 授权变更 |
 | `reload` | 安装 / 卸载后让宿主重读记录 |
 | `shutdown` | 宿主退出 |
@@ -939,10 +970,83 @@ pub trait SecretStore: Send + Sync {
 pub trait NetProxy: Send + Sync {
     fn request(&self, plugin: &PluginId, req: NetRequest) -> Result<NetResponse, HostError>;
 }
+
+pub trait FileOps: Send + Sync {
+    fn read(&self, server: &ServerName, rel: &Path) -> Result<Vec<u8>, HostError>;
+    fn write(&self, server: &ServerName, rel: &Path, bytes: &[u8], overwrite: bool)
+        -> Result<(), HostError>;
+    fn list(&self, server: &ServerName, rel_dir: &Path) -> Result<Vec<FileEntry>, HostError>;
+    fn remove(&self, server: &ServerName, rel: &Path) -> Result<bool, HostError>;
+}
 ```
 
 `BackupOps` / `ContentOps` / `JavaOps` / `FileOps` 按同样风格定义，方法集合与
 现有 `service` 的公开方法一一对应，不新增业务语义。
+
+生命周期能力的帧方法：
+
+| 能力 | `method` | 输入 | 输出 |
+| --- | --- | --- | --- |
+| `server:lifecycle` | `start` | `{server}` | `{ok: true}` |
+| `server:lifecycle` | `stop` | `{server, grace_secs?}`；默认 30 秒 | `{outcome: "stopped", elapsed_ms}` / `{outcome: "already_stopped"}` |
+| `server:lifecycle` | `restart` | `{server, grace_secs?}` | `{ok: true}` |
+
+插件触发的启动不接受 EULA 条款：`eula.txt` 未同意时返回 `conflict`，必须由
+管理员在 CLI 显式确认。停机宽限到期仍未退出返回 `timeout`，服务器保持运行。
+
+备份能力的帧方法：
+
+| 能力 | `method` | 输入 | 输出 |
+| --- | --- | --- | --- |
+| `backup` | `create` | `{server, label?}` | `{snapshot}` |
+| `backup` | `list` | `{server}` | `{snapshots:[{id, created_at, added_bytes}]}` |
+| `backup` | `restore` | `{server, snapshot}` | `{ok: true}` |
+| `backup` | `verify` | `{server, snapshot}` | `{healthy}` |
+| `backup` | `prune` | `{server, keep}` | `{removed}` |
+| `backup` | `delete` | `{server, snapshot}` | `{deleted}` |
+
+`restore` 只执行原地恢复；服务器运行中返回 `conflict`。快照不存在统一返回
+`not_found`，磁盘 / 远端不可用返回 `unavailable`（可重试）。
+
+内容能力的帧方法：
+
+| 能力 | `method` | 输入 | 输出 |
+| --- | --- | --- | --- |
+| `content` | `list` | `{server, kind?, identify?}`；`kind` 默认 `mod` | `{items:[{file, size, identity?}]}` |
+| `content` | `install` | `{server, project, version?, kind?}` | `{file, size, project, version}` |
+| `content` | `remove` | `{server, selector, kind?}` | `{removed}` |
+
+`kind` 只接受 `mod` / `plugin` / `resourcepack` / `datapack` / `shader` / `modpack`。
+`identify=true` 需要联网反查来源与版本，失败项按「身份未知」返回而不让整次
+列表失败。安装沿用服务端条件挑版本，服务器运行中返回 `conflict`，上游不可用
+返回 `unavailable`（可重试），该类内容为纯客户端时返回 `invalid_input`。移除的
+`selector` 可以是文件名或 modid，未命中返回 `not_found`，命中多个返回
+`invalid_input` 并列候选。
+
+文件能力的帧方法：
+
+| 能力 | `method` | 输入 | 输出 |
+| --- | --- | --- | --- |
+| `files:read` | `read` | `{server, path}` | `{path, size, data}`（`data` 为 base64） |
+| `files:read` | `list` | `{server, path?}`；省略 / `""` / `"."` 表示根 | `{entries:[{path, is_dir, size}]}` |
+| `files:write` | `write` | `{server, path, data, overwrite?}`；`overwrite` 默认 `false` | `{ok, size}` |
+| `files:write` | `remove` | `{server, path}` | `{removed}` |
+
+`write` 覆盖已存在文件时必须显式 `overwrite:true`；目标存在且未允许覆盖返回
+`conflict`。`mcsup.json` 与运行中的启动文件（JAR / 参数文件）禁止改写与删除：
+前者返回 `denied`，后者返回 `conflict`。
+
+Java 能力的帧方法：
+
+| 能力 | `method` | 输入 | 输出 |
+| --- | --- | --- | --- |
+| `java` | `list` | `{}` | `{runtimes:[{id, path, major, version, vendor, managed, created_at, updated_at}]}` |
+| `java` | `install` | `{major}`；十进制整数或字符串 | `{runtime}` |
+| `java` | `remove` | `{path}`；绝对路径，需与已登记项一致 | `{removed}` |
+
+安装固定 `jdk` 包类型，厂商交给来源排序挑最优，与 CLI `java install` 的默认
+路径一致；未登记的路径返回 `not_found`，上游 / 下载 / 磁盘失败返回
+`unavailable`。大版本不在 8–99 区间返回 `invalid_input`。
 
 ## 9.2 限额
 
@@ -966,6 +1070,10 @@ pub trait NetProxy: Send + Sync {
 
 - 路径必须是相对路径；拒绝 `..`、绝对路径、盘符、UNC、符号链接逃逸。
 - 解析后必须仍在服务端目录内（`canonicalize` 后前缀比较，注意 Windows 大小写）。
+- 文件能力在创建父目录前先校验最深的已存在祖先，避免先写后查；符号链接
+  指向目录内部允许，指向目录外一律 `denied`。
+- `mcsup.json` 与运行中的启动文件是保留名：写 / 删分别返回 `denied` /
+  `conflict`；判定对大小写不敏感，覆盖 Windows 的大小写不敏感文件系统。
 - `NetProxy` 默认拒绝回环、私网、链路本地地址与云元数据地址；`manifest.net.allow`
   为空时拒绝所有请求并返回 `denied`。
 - `[禁止]` 用字符串包含判断域名；必须解析后按主机名后缀精确匹配。
@@ -975,10 +1083,10 @@ pub trait NetProxy: Send + Sync {
 | 实现 | 位置 | 说明 |
 | --- | --- | --- |
 | `ServerRead` / `ConsoleIo` / `ServerLifecycle` / `BackupOps` / `ContentOps` / `JavaOps` | `service::plugin::HostApiImpl` | 复用现有 service，不复制业务逻辑 |
-| `FileOps` | `service::plugin::HostApiImpl` + `file` 的路径校验 | service 内部经 `crate::fs` 入口 |
+| `FileOps` | `service::plugin::HostApiImpl` + `domain::path` 的路径校验 | service 内部经 `crate::fs` 入口 |
 | `KvStore` / `SecretStore` / `PluginStore` / `AuditSink` | `storage` | 一条记录一个 JSON；审计用追加 JSONL |
 | `ArtifactSource` | `provider` | git / url 解析与下载 |
-| `ArtifactVerifier` / `PluginSupervisor` | `plugin` | 摘要、签名、进程、端点、帧 |
+| `ArtifactVerifier` / `PluginSupervisor` | `plugin` | 摘要、进程、端点、帧 |
 | `NetProxy` | `provider` | 复用现有 HTTP 栈与代理配置 |
 
 `service` 的 `HostApiImpl` 由门面 `bootstrap` 构造并注入 `plugin::PluginHost`。
@@ -1009,7 +1117,7 @@ pub trait NetProxy: Send + Sync {
 | `resources` | object | 否 | `{recommended_memory_mb, recommended_cpu_percent}`，仅声明 |
 | `publisher` | object | 否 | `{name, url}`，市场审核用 |
 | `license` | string | 是 | SPDX 标识 |
-| `source` | object | 安装时写入 | 来源、commit、摘要、签名信息 |
+| `source` | object | 安装时写入 | 来源、commit、摘要 |
 
 ## 10.2 示例
 
@@ -1206,6 +1314,11 @@ descriptor 由 SDK 在构建时生成，与二进制一起打包。宿主只读�
 渲染器只按字段名取值，不做语义猜测。字段不存在时显示空值并记录一次 schema
 不匹配告警，不 panic、不白屏。
 
+实现落位：形状与引用校验在 `domain::plugin::descriptor`
+（`validate_display_shape` / `validate_display_refs`），CLI / Web / MCP 只投影
+`ResolvedOp::display`，不各判一套。CLI 的 `plugin ops` 在人类表格列出「展示」
+列、在 JSON 里给出 `display` 字段，取值即 [`Display::type_name`]。
+
 ## 11.4 默认推断
 
 - `kind=action` 且无 `display` → `form`。
@@ -1399,10 +1512,14 @@ RE2 子集，禁止回溯引用与环视。
 | 目标 | `target` 是 `plugin_id`，只允许在单播契约中使用 |
 | 深度 | 调用链 ≤ 4 层 |
 | 循环 | 同一 `(plugin_id, contract)` 在调用栈中出现两次即拒绝，返回 `conflict` |
-| 扇出 | 单次请求内契约调用总数 ≤ 32 |
+| 扇出 | 单次请求内契约调用总数 ≤ 32；按实际投递的提供方次数计数 |
 | 超时 | 每个契约有独立超时；父调用超时同时取消子调用 |
 | 审计 | 每次调用记录 caller、provider、契约、结果、耗时 |
 | 版本 | 调用方声明版本；提供方不支持即 `not_found`，不做降级猜测 |
+
+根调用由宿主分配 `trace`，提供方嵌套调用原样带回；每层压入
+`(caller, contract)`，循环判定与深度判定都基于这条显式调用链，不依赖宿主
+线程栈。广播没有提供方时返回空 `responses` 与空 `failures`，不算失败。
 
 广播的聚合结果：
 
@@ -1679,7 +1796,7 @@ Git 解析步骤（不执行任何代码）：
 
 1. `git ls-remote` 或托管方 API 把 `--ref` 解析成 commit SHA。
 2. 读取该 commit 的 `mcsup-plugin.json`（索引）或 Release 元数据。
-3. 索引给出各平台产物的 URL、`sha256`、`size`、可选签名。
+3. 索引给出各平台产物的 URL、`sha256`、`size`。
 4. 下载、校验、解包、登记。
 
 `--ref` 必须是 tag 或完整 SHA；`[禁止]` 默认跟随分支头，避免同一命令装到
@@ -1713,22 +1830,39 @@ chat-bridge-0.3.1/
 解包必须防 Zip Slip：拒绝绝对路径、`..`、符号链接、硬链接、设备文件。
 Windows 还需拒绝保留名（`CON`、`NUL` 等）与尾随点 / 空格。
 
-## 15.3 签名
+## 15.3 签名（暂不实现）
 
-| 场景 | 要求 |
+当前不做签名校验：任何人都可以构建并发布插件，安装只校验**摘要**与**包
+安全**。这是明确的产品决定，不是遗漏。
+
+| 场景 | 当前行为 |
 | --- | --- |
-| 市场来源 | 必须 Sigstore（cosign）签名，绑定仓库与 commit |
-| 自建源 | 必须 minisign / ed25519 签名，公钥在 `plugins/trusted-keys/` |
-| 本地 `--from` | 可 `--allow-unsigned`，安装后标记 `untrusted` |
-| `--dev` 源码构建 | 一律 `untrusted`，禁止发布到市场 |
+| 市场来源 | 与自建源、本地来源相同：只校验摘要与包安全 |
+| 自建源 | 同上；`plugins/trusted-keys/` 目录不再创建 |
+| 本地 `--from` | 直接安装，无需额外开关 |
+| 远端 URL | 只校验摘要（`--sha256` 或同名 `.sha256`），不要求签名 |
+| 签名文件 | 忽略：`.minisig` / `.sigstore` 不影响安装结果 |
 
-校验顺序：摘要 → 签名 → 证书链 / 公钥 → 身份（仓库、workflow）→ 撤销列表。
-任一步失败即拒绝安装。`[禁止]` 在签名失败时提供「仍然安装」的隐藏开关。
+保留的校验：
+
+- 压缩包上限、解包安全（Zip Slip / 符号链接 / 大小与数量上限）、
+  manifest 与 descriptor 校验。
+- 摘要：安装记录保存解包目录摘要；`plugin verify` 重算并比对。摘要能发现
+  下载损坏与传输截断，但不提供身份保证——它防不了「有人发布一个恶意插件」，
+  只能保证「装到的东西与校验过的东西一致」。
+
+已移除：minisign / ed25519 验签、信任库（`plugins/trusted-keys/`）、
+`--allow-unsigned` / `--dev` 开关、安装记录里的 `signed` / `trusted` 字段、
+`plugin verify` 的签名结论。
+
+将来若接入签名，计划是市场来源用 Sigstore（cosign）绑定仓库与 commit、
+自建源用 minisign；届时需要先解决证书链解析与信任根。当前用**能力授权 +
+撤销列表 + 审计**承担运行时风险，而不是产物来源。
 
 ## 15.4 安装流水线
 
 ```
-解析来源 → 下载 → 校验摘要 → 校验签名 → 解包到临时目录
+解析来源 → 下载 → 校验摘要 → 解包到临时目录
 → 校验 manifest → 校验 descriptor → 计算能力清单
 → 原子移动到 plugins/<id>/<version>/
 → 写安装记录 → 状态 disabled / pending_approval
@@ -1749,7 +1883,7 @@ Windows 还需拒绝保留名（`CON`、`NUL` 等）与尾随点 / 空格。
 
 ```
 将安装 chat-bridge 0.3.1
-  来源：git https://... @ 3f9c2a1（已签名）
+  来源：git https://... @ 3f9c2a1
   能力：
     events, storage:kv, server:read        低风险，自动允许
     console:read, net:outbound, secret:rw  需确认
@@ -1769,7 +1903,8 @@ Windows 还需拒绝保留名（`CON`、`NUL` 等）与尾随点 / 空格。
 | 升级 | 新版本并存；切换 `active_version` 后重启；保留上一版本用于回滚 |
 | 回滚 | `plugin rollback <id>` 切回上一版本并重启；不重新确认未变化的授权 |
 | 降级 | 允许，但若目标版本能力更少，直接生效；更多则 `pending_approval` |
-| 卸载 | 必须 `disabled` 且进程退出；默认保留 `plugin-data/<id>/` |
+| 卸载 | 必须 `disabled` 且进程退出；默认保留 `plugin-data/<id>/`，但删除 `secrets.json`（凭据不随同名插件重装继承） |
+| 保留密钥 | `--keep-secrets` 保留密钥，用于重装后继续使用同一凭据 |
 | 彻底删除 | `--purge` 同时删数据、日志、授权、审计引用标记 |
 | 版本保留 | 默认保留 2 个版本；`--prune` 清理更旧的 |
 
@@ -1789,7 +1924,7 @@ Windows 还需拒绝保留名（`CON`、`NUL` 等）与尾随点 / 空格。
 | 威胁 | 现有措施 | 残余风险 |
 | --- | --- | --- |
 | 插件执行任意命令 | 能力门只拦「宿主代做」；插件自身进程可做任何 OS 允许的事 | 需要 OS 级沙箱才能消除；文案不得承诺 |
-| 供应链投毒 | 固定 commit、摘要、签名、provenance、审核 | 作者账号被盗；靠撤销与举报缓解 |
+| 供应链投毒 | 固定 commit、摘要、审核 | 作者账号被盗；靠撤销与举报缓解（当前不做产物签名） |
 | 能力扩张 | 升级重新确认授权 | 用户习惯性点确认 |
 | 密钥泄露 | 只写不读、日志脱敏、文件权限 0600 | 插件自身可读明文（它需要用） |
 | SSRF | `NetProxy` 默认拒绝私网与元数据地址 | 插件自己开 socket 不受限 |
@@ -1807,7 +1942,7 @@ Windows 还需拒绝保留名（`CON`、`NUL` 等）与尾随点 / 空格。
    标记「能力冗余」要求解释。
 3. 契约闭集与能力匹配（12.2）。
 4. 产物无符号链接、无超出平台目录的路径、无可执行脚本文件（`.sh` / `.ps1`）。
-5. 签名有效且身份与发布者一致。
+5. 摘要与安装记录一致。
 6. 二进制平台覆盖与 manifest 一致。
 7. descriptor 中不得出现 `x-mcsup-*` 以外的扩展键（未知扩展忽略但记录）。
 8. 包内不得包含 `.git`、`node_modules`、构建缓存。
@@ -1825,17 +1960,26 @@ Windows 还需拒绝保留名（`CON`、`NUL` 等）与尾随点 / 空格。
 
 ## 16.3 密钥处理
 
-- 存储在 `plugin-data/<id>/secrets.json`，文件权限 0600，内容用机器密钥加密。
-- 机器密钥由 `auth` 的凭据设施提供；不可用时退化为文件权限 + 明确警告。
+- 存储在 `plugin-data/<id>/secrets.json`，文件权限 0600，内容用机器密钥加密：
+  AES-256-GCM，一条数据一个随机 nonce，插件 id 作为 AAD（密文复制到别的插件
+  目录解不开）。文件是 `v` / `nonce` / `data` 信封；旧版明文文件仍可读，下次
+  写入时迁移为密文。
+- 机器密钥由 `auth` 的凭据设施提供，只存系统钥匙串，不在磁盘上再落一份：
+  密钥与密文同目录时，拿到目录副本的人同时拿到密钥，加密等于没有。
+- 钥匙串不可用时退化为 `0600` 明文，并由 `mcsup plugin doctor` 明确报告；
+  已有密文在密钥缺失时读取报 `denied`，不静默当作不存在。
 - 读取接口永不返回明文给入口；插件在 `welcome.config` 中收到明文（它需要使用）。
-- 日志采集对已知密钥值做精确替换；`[禁止]` 把密钥写入审计、错误消息、URL。
+- 日志采集对已知密钥值做精确替换：宿主在拉起进程前把该插件的密钥值并入
+  打码表（只收 UTF-8、长度 ≥ 8 字节、最多 64 条）。过短的值会在日志里命中
+  无关文本，替换后日志不可读，反而掩盖问题；`[禁止]` 把密钥写入审计、错误
+  消息、URL。
 - 卸载默认删除密钥，`--keep-secrets` 可保留（用于重装）。
 
 ## 16.4 撤销与举报
 
 | 机制 | 行为 |
 | --- | --- |
-| 撤销列表 | 宿主定期拉取；命中的版本拒绝启动并提示升级 |
+| 撤销列表 | 宿主定期拉取；命中的版本拒绝启动并提示升级。当前实现由 `mcsup plugin revocations import` / `fetch` 写入 `plugins/revoked.json`，尚无内置定时拉取 |
 | 本地拉黑 | `plugin block <id>` 立即停用且不再自动启动 |
 | 举报 | CLI / Web 生成带诊断包的举报；不包含密钥与聊天内容 |
 | 隔离 | `plugin quarantine <id>` 保留产物但禁止运行，用于取证 |
@@ -1863,11 +2007,11 @@ Windows 还需拒绝保留名（`CON`、`NUL` 等）与尾随点 / 空格。
 ├── plugins/
 │   ├── <id>/
 │   │   ├── 0.3.0/                     # 不可变产物
-│   │   ├── 0.3.1/
-│   │   └── trusted-keys/              # 自建源公钥
+│   │   └── 0.3.1/
 ├── plugin-data/
 │   └── <id>/
 │       ├── kv/                        # 键值，一键一文件
+│       ├── config.json                # 配置（0600，可能含密钥字段）
 │       └── secrets.json               # 加密凭据
 ├── logs/
 │   ├── plugin-host.log
@@ -1883,6 +2027,9 @@ Windows 还需拒绝保留名（`CON`、`NUL` 等）与尾随点 / 空格。
 - 当前版本记录在 `db/plugins/<id>.json` 的 `active_version`，不另设指针文件，
   避免双真相源。
 - `plugin-data/<id>/` 是插件唯一可写目录；宿主不清理，除非 `--purge`。
+  例外是 `secrets.json`：卸载默认删除，`--keep-secrets` 才保留。
+- `plugin-data/<id>/config.json` 与 `secrets.json` 同为 `0600`：配置可能含
+  `x-mcsup-secret` 字段，读取接口必须打码，`--purge` 时随目录删除。
 - 审计用 JSONL 而不是「一条记录一个 JSON」：记录不可变、写入高频、按时间
   追加；这是对既有存储约定的有意例外，必须在实现中注释原因。
 - 所有写入先写临时文件再原子重命名；跨进程写用 `db/.lock`。
@@ -1895,6 +2042,8 @@ Windows 还需拒绝保留名（`CON`、`NUL` 等）与尾随点 / 空格。
   "id": "chat-bridge",
   "active_version": "0.3.1",
   "enabled": true,
+  "blocked": false,
+  "quarantined": false,
   "approved": ["events", "storage:kv", "server:read", "console:read"],
   "last_state": "running",
   "installed_at": "2026-11-18T09:00:00Z",
@@ -1903,9 +2052,7 @@ Windows 还需拒绝保留名（`CON`、`NUL` 等）与尾随点 / 空格。
     "type": "git",
     "url": "https://github.com/example/chat-bridge",
     "commit": "3f9c2a1d4e5f60718293a4b5c6d7e8f901234567",
-    "artifact_sha256": "9f2c...",
-    "signature": { "kind": "sigstore", "identity": "https://github.com/example/chat-bridge/.github/workflows/release.yml@refs/tags/v0.3.1" },
-    "trusted": true
+    "artifact_sha256": "9f2c..."
   },
   "versions": ["0.3.0", "0.3.1"],
   "last_error": null
@@ -1914,6 +2061,9 @@ Windows 还需拒绝保留名（`CON`、`NUL` 等）与尾随点 / 空格。
 
 `last_state` 是最近一次已知实际状态；进程实时状态以宿主会话表为准，读取时合并。
 `last_error` 记录最近一次失败的结构化原因（code + message + at）。
+
+`blocked` / `quarantined` 是只对本机生效的安全标记：写入时立即停止进程并禁用，
+读取时优先于 `enabled`；解除后不自动启用，由用户显式 `enable`。
 
 ## 17.3 锁
 
@@ -1935,9 +2085,9 @@ Windows 还需拒绝保留名（`CON`、`NUL` 等）与尾随点 / 空格。
 ```
 mcsup plugin list [--json]
 mcsup plugin install <source> [--from|--url|--git] [--ref <tag|sha>] [--sha256 <hex>]
-                              [--allow-unsigned] [--dev] [--yes] [--json]
+                              [--yes] [--json]
 mcsup plugin update <id> [--to <version>] [--prune] [--yes]
-mcsup plugin remove <id> [--purge] [--yes]
+mcsup plugin remove <id> [--purge] [--keep-secrets] [--yes]
 mcsup plugin enable <id>
 mcsup plugin disable <id> [--yes]
 mcsup plugin start <id>
@@ -1955,8 +2105,9 @@ mcsup plugin unblock <id>
 mcsup plugin quarantine <id>
 mcsup plugin release <id>
 mcsup plugin logs <id> [--follow] [--tail <n>]
-mcsup plugin verify <path|id>
+mcsup plugin verify <path|id>            # 重算摘要并复查 manifest / descriptor
 mcsup plugin rollback <id>
+mcsup plugin revocations [import <file>|fetch <url> [--sha256 <hex>]]
 mcsup plugin doctor [--json]
 mcsup __plugin-host --data-dir <path> [--idle-timeout <secs>]   # 隐藏
 ```
@@ -1986,11 +2137,11 @@ $ mcsup plugin call watchdog health --json
 ```
 $ mcsup plugin install --git https://github.com/example/chat-bridge --ref v0.3.1
 正在解析来源…
-  已解析 commit 3f9c2a1（签名有效）
+  已解析 commit 3f9c2a1
 正在下载产物…
   12.4 MiB / 12.4 MiB
 正在校验…
-  摘要匹配，签名有效
+  摘要匹配
 正在安装…
   能力：events, storage:kv, server:read（自动允许）
         console:read, net:outbound, secret:rw（需确认）
@@ -2021,7 +2172,6 @@ $ mcsup plugin install --git https://github.com/example/chat-bridge --ref v0.3.1
 | 插件未运行 / 崩溃 | `Backend` | 5 |
 | 状态不允许（已启用、正在运行） | `Conflict` | 4 |
 | descriptor 不合法 | `Usage` | 2 |
-| 签名失败 | `Unauthorized` | 6 |
 | 用户取消 | `Cancelled` | 130 |
 
 ## 18.4 进度回显
@@ -2033,7 +2183,7 @@ $ mcsup plugin install --git https://github.com/example/chat-bridge --ref v0.3.1
 | --- | --- |
 | 解析来源 | `正在解析来源…` |
 | 下载 | `正在下载产物…` + 字节进度 |
-| 校验 | `正在校验摘要与签名…` |
+| 校验 | `正在校验摘要与包安全…` |
 | 解包 | `正在解包…` |
 | 校验 descriptor | `正在校验插件描述…` |
 | 启动 | `正在启动 <id>…` |
@@ -2049,7 +2199,7 @@ $ mcsup plugin install --git https://github.com/example/chat-bridge --ref v0.3.1
 
 | 事件 | 字段 |
 | --- | --- |
-| `plugin.install` | id, version, source, sha256, trusted, actor |
+| `plugin.install` | id, version, source, sha256, actor |
 | `plugin.remove` | id, purge, actor |
 | `plugin.enable` / `disable` | id, actor |
 | `plugin.start` / `stop` / `restart` | id, reason, actor |
@@ -2168,7 +2318,6 @@ $ mcsup plugin install --git https://github.com/example/chat-bridge --ref v0.3.1
 | 契约深度 | 第 5 层被拒 |
 | 安装不执行代码 | 用带陷阱的产物（含 `preinstall` 脚本）验证未被运行 |
 | 路径逃逸 | 含 `../`、符号链接的产物被拒 |
-| 签名失败 | 安装被拒，无「仍然安装」路径 |
 | 卸载保留数据 | `plugin-data` 仍在；`--purge` 后消失 |
 
 ## 20.3 testkit
@@ -2209,7 +2358,7 @@ $ mcsup plugin install --git https://github.com/example/chat-bridge --ref v0.3.1
 | 100 个非 resident 插件 | 安装与列表 < 1 s，无进程常驻 |
 
 性能测试放在 `apps/bench`，不进入 `check.sh`，但 M1 起每次里程碑跑一次并把
-结果写进 `docs/plugins-progress.md`（`[待实现]`，与 `remote-progress.md` 同构）。
+结果写进 `docs/plugins-progress.md`（与 `remote-progress.md` 同构）。
 
 ---
 
@@ -2291,22 +2440,21 @@ $ mcsup plugin install --git https://github.com/example/chat-bridge --ref v0.3.1
 - 六种 display 的 fixture 在渲染测试中全部通过；
 - 破坏性 op 需要 Admin + 二次确认。
 
-## M4：Java、签名与市场
+## M4：Java、撤销与市场
 
 交付：
 
 - 能力：`java`；
-- Sigstore / minisign 校验、provenance、撤销列表、`quarantine`；
-- Python / Java SDK；
-- 市场审核清单自动化；
+- 撤销列表、`quarantine`；
+- 市场审核清单自动化（后续）；
 - `docs/plugins-progress.md` 记录里程碑与实测性能。
 
 验收：
 
-- 未签名产物默认拒绝；`--allow-unsigned` 仅对本地来源生效；
 - 撤销列表命中时拒绝启动；
-- 四种语言 SDK 的 descriptor 逐字节一致；
 - 升级失败自动回滚，用户不需要手工恢复。
+
+签名、provenance 与 SDK 当前不做，见 `docs/plugins-progress.md`「明确不做」。
 
 ## 阶段依赖
 
@@ -2325,8 +2473,8 @@ M0 ─→ M1 ─→ M2 ─→ M3 ─→ M4
 | --- | --- |
 | 原生动态库插件 | ABI 不稳、崩溃拖垮宿主、跨语言成本高、无法审计 |
 | WASM（v1） | 需要额外运行时与能力映射；等进程模型稳定后再评估 |
-| npm / pip / cargo 安装插件 | 安装即执行任意代码；与签名、审核、回滚全部冲突 |
-| 安装时构建源码 | 同上；只允许 `--dev` 且标记 `untrusted` |
+| npm / pip / cargo 安装插件 | 安装即执行任意代码；与审核、回滚全部冲突 |
+| 安装时构建源码 | 同上；产物无法复用、无法校验摘要 |
 | 插件自带前端 | XSS、CSP、审核、版本漂移；且与「作者不写前端」矛盾 |
 | 任意布局 DSL（v1） | 把界面设计责任推给作者，负担反而上升 |
 | 插件直连插件 | 绕过能力门、审计、超时、循环检测 |
@@ -2544,15 +2692,13 @@ descriptor、打包 zip。作者不接触端点、帧、路由与界面。
       "platform": "darwin-arm64",
       "url": "https://github.com/example/chat-bridge/releases/download/v0.3.1/chat-bridge-0.3.1-darwin-arm64.zip",
       "sha256": "9f2c...",
-      "size": 13002342,
-      "signature": "https://github.com/example/chat-bridge/releases/download/v0.3.1/chat-bridge-0.3.1-darwin-arm64.zip.sigstore"
+      "size": 13002342
     },
     {
       "platform": "linux-x64",
       "url": "https://github.com/example/chat-bridge/releases/download/v0.3.1/chat-bridge-0.3.1-linux-x64.zip",
       "sha256": "ab41...",
-      "size": 12888111,
-      "signature": "https://github.com/example/chat-bridge/releases/download/v0.3.1/chat-bridge-0.3.1-linux-x64.zip.sigstore"
+      "size": 12888111
     }
   ]
 }
@@ -2576,7 +2722,7 @@ descriptor、打包 zip。作者不接触端点、帧、路由与界面。
 7. 接 CLI 的 `plugin` 命令与 `__plugin-host` 外壳。
 8. 写 Rust SDK，再写 TS SDK；两边过同一份 conformance。
 9. 补第 20.2 节用例；跑 `scripts/check.sh` 与 `scripts/check-sdk.sh`。
-10. 更新 `docs/plugins-progress.md`（`[待实现]`）记录完成项与实测值。
+10. 更新 `docs/plugins-progress.md` 记录完成项与实测值。
 
 `[禁止]` 在第 2 步之前写宿主：帧与 descriptor 未冻结时，后续所有代码都会
 围绕错误契约返工。
