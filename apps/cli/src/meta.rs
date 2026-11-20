@@ -1303,6 +1303,14 @@ pub(crate) fn plugin_purge_arg() -> &'static str {
 }
 
 #[must_use]
+pub(crate) fn plugin_keep_secrets_arg() -> &'static str {
+    t(
+        "卸载时保留密钥文件（默认删除）",
+        "keep the secrets file on removal (deleted by default)",
+    )
+}
+
+#[must_use]
 pub(crate) fn plugin_grace_arg() -> &'static str {
     t("优雅退出等待秒数", "graceful shutdown timeout in seconds")
 }

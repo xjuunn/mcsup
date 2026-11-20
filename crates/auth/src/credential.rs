@@ -562,7 +562,7 @@ fn choose_backend(raw: Option<&str>, keyring_available: bool) -> StoreChoice {
 /// 不看平台 / 环境变量，而是真的读一个不存在的探针条目：
 /// `Ok(None)` / `Ok(Some(_))` 说明后端能工作，`Err` 说明没有可用的钥匙串
 /// （headless 机器、没有 Secret Service 等），此时退到 0600 文件。
-fn keyring_available() -> bool {
+pub fn system_keyring_available() -> bool {
     static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *AVAILABLE.get_or_init(|| SystemKeyring.get(KEYRING_SERVICE, PROBE_ACCOUNT).is_ok())
 }
@@ -598,7 +598,7 @@ impl CredentialVault {
     #[must_use]
     pub fn open_with(file_path: impl Into<PathBuf>, choice: Option<&str>) -> Self {
         let file_path = file_path.into();
-        let choice = choose_backend(choice, keyring_available());
+        let choice = choose_backend(choice, system_keyring_available());
         match choice {
             StoreChoice::Keyring => {
                 Self::Keyring(KeyringCredentialStore::new(KEYRING_SERVICE, SystemKeyring))

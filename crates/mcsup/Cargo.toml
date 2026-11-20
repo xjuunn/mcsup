@@ -53,7 +53,7 @@ java = ["dep:java", "port"]
 modkit = ["dep:modkit", "port"]
 plugin = ["dep:plugin", "port", "protocol"]
 provider = ["dep:provider", "port"]
-storage = ["dep:storage", "port"]
+storage = ["dep:storage", "port", "auth"]
 runtime = ["dep:runtime", "port", "protocol"]
 # 远端传输：TLS + 自签身份 + 帧收发（客户端与 agent 共用）
 transport = ["dep:transport", "protocol"]

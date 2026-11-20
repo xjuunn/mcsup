@@ -19,7 +19,7 @@ use mcsup::domain::plugin::manifest::Manifest;
 use mcsup::domain::plugin::revocation::RevocationList;
 use mcsup::domain::server::artifact::{Checksum, ChecksumAlgorithm};
 use mcsup::port::plugin::ArtifactVerifier as _;
-use mcsup::port::plugin::{ArtifactOrigin, StreamSink};
+use mcsup::port::plugin::{ArtifactOrigin, SecretProtection, StreamSink};
 use mcsup::service::PluginService;
 use serde_json::{Value, json};
 use std::io::Read;
@@ -50,7 +50,11 @@ pub(crate) fn run(action: PluginAction, printer: Printer) -> Result<()> {
             printer,
         ),
         PluginAction::Update { id, to, prune } => update(&id, to, prune, printer),
-        PluginAction::Remove { id, purge } => remove(&id, purge, printer),
+        PluginAction::Remove {
+            id,
+            purge,
+            keep_secrets,
+        } => remove(&id, purge, keep_secrets, printer),
         PluginAction::Enable { id } => set_enabled(&id, true, printer),
         PluginAction::Disable { id } => set_enabled(&id, false, printer),
         PluginAction::Start { id } => start(&id, printer),
@@ -388,17 +392,25 @@ fn origin_from_source(source: Option<&str>) -> Option<ArtifactOrigin> {
     None
 }
 
-fn remove(id: &str, purge: bool, printer: Printer) -> Result<()> {
+fn remove(id: &str, purge: bool, keep_secrets: bool, printer: Printer) -> Result<()> {
     let id = parse_id(id)?;
     let service = open()?;
-    service.remove(&id, purge)?;
+    service.remove_with(&id, purge, keep_secrets)?;
     printer.print_outcome(
         &crate::i18n::pick(
             printer.lang(),
-            format!("已卸载 {id}{}", if purge { "（含数据）" } else { "" }),
-            format!("removed {id}{}", if purge { " (with data)" } else { "" }),
+            format!(
+                "已卸载 {id}{}{}",
+                if purge { "（含数据）" } else { "" },
+                if keep_secrets { "，保留密钥" } else { "" }
+            ),
+            format!(
+                "removed {id}{}{}",
+                if purge { " (with data)" } else { "" },
+                if keep_secrets { ", secrets kept" } else { "" }
+            ),
         ),
-        &json!({ "id": id.to_string(), "purge": purge }),
+        &json!({ "id": id.to_string(), "purge": purge, "keep_secrets": keep_secrets }),
     )
 }
 
@@ -1112,9 +1124,74 @@ fn rollback(id: &str, printer: Printer) -> Result<()> {
     )
 }
 
+/// 检查单个插件的产物；撤销命中时不再继续看产物
+fn scan_record(
+    service: &PluginService,
+    record: &mcsup::port::plugin::PluginRecord,
+    revocation_unavailable: bool,
+) -> Vec<Value> {
+    let id = record.id.to_string();
+    let artifact = &record.artifact_dir;
+    if !artifact.is_dir() {
+        return vec![json!({
+            "level": "error",
+            "id": id,
+            "message": format!("产物目录缺失: {}", artifact.display()),
+        })];
+    }
+    if let Some(message) = revoked_finding(service, record, revocation_unavailable) {
+        return vec![message];
+    }
+    let mut findings = Vec::new();
+    if let Err(err) = std::fs::read(artifact.join("manifest.json"))
+        .map_err(anyhow::Error::from)
+        .and_then(|bytes| Manifest::from_json(&bytes).map_err(|err| anyhow!("{err}")))
+    {
+        findings.push(json!({
+            "level": "error",
+            "id": id,
+            "message": format!("manifest 非法: {err}"),
+        }));
+    }
+    if let Err(err) = std::fs::read(artifact.join("descriptor.json"))
+        .map_err(anyhow::Error::from)
+        .and_then(|bytes| Descriptor::from_json(&bytes, &record.id).map_err(|err| anyhow!("{err}")))
+    {
+        findings.push(json!({
+            "level": "error",
+            "id": id,
+            "message": format!("descriptor 非法: {err}"),
+        }));
+    }
+    if record.needs_approval() {
+        findings.push(json!({
+            "level": "warning",
+            "id": id,
+            "message": "存在待确认能力，插件不会启动",
+        }));
+    }
+    findings
+}
+
+/// 机器密钥不可用时密钥只能靠 0600 文件权限保护。这是安全降级，必须让用户
+/// 看见，不能因为「加密代码存在」就当作加密生效。
+fn secret_protection_finding(protection: SecretProtection) -> Option<Value> {
+    (protection == SecretProtection::FilePermissions).then(|| {
+        json!({
+            "level": "warning",
+            "id": Value::Null,
+            "message": "插件密钥未加密：系统钥匙串不可用，secrets.json 仅由 0600 文件权限保护",
+        })
+    })
+}
+
 fn doctor(printer: Printer, json: bool) -> Result<()> {
     let printer = json_printer(printer, json);
-    let service = open()?;
+    // 密钥保护方式只有装配层知道（机器密钥来自钥匙串）；这里多取一次整体，
+    // 避免 CLI 自己拼 `plugin-data` 路径去猜。
+    let mc = bootstrap::open_mcsup()?;
+    let protection = mc.plugin_api.secrets().protection();
+    let service = mc.plugins;
     let records = service.list()?;
     // 撤销列表读不懂只报一次，不逐插件重复：它是全局设施。
     let revocation_error = match service.revocation_list_check() {
@@ -1129,51 +1206,11 @@ fn doctor(printer: Printer, json: bool) -> Result<()> {
             "message": format!("撤销列表不可用，已跳过撤销检查: {message}"),
         }));
     }
+    if let Some(finding) = secret_protection_finding(protection) {
+        findings.push(finding);
+    }
     for record in &records {
-        let artifact = record.artifact_dir.clone();
-        if !artifact.is_dir() {
-            findings.push(json!({
-                "level": "error",
-                "id": record.id.to_string(),
-                "message": format!("产物目录缺失: {}", artifact.display()),
-            }));
-            continue;
-        }
-        if let Some(message) = revoked_finding(&service, record, revocation_error.is_some()) {
-            findings.push(message);
-            continue;
-        }
-        let manifest_path = artifact.join("manifest.json");
-        if let Err(err) = std::fs::read(&manifest_path)
-            .map_err(anyhow::Error::from)
-            .and_then(|bytes| Manifest::from_json(&bytes).map_err(|err| anyhow!("{err}")))
-        {
-            findings.push(json!({
-                "level": "error",
-                "id": record.id.to_string(),
-                "message": format!("manifest 非法: {err}"),
-            }));
-        }
-        let descriptor_path = artifact.join("descriptor.json");
-        if let Err(err) = std::fs::read(&descriptor_path)
-            .map_err(anyhow::Error::from)
-            .and_then(|bytes| {
-                Descriptor::from_json(&bytes, &record.id).map_err(|err| anyhow!("{err}"))
-            })
-        {
-            findings.push(json!({
-                "level": "error",
-                "id": record.id.to_string(),
-                "message": format!("descriptor 非法: {err}"),
-            }));
-        }
-        if record.needs_approval() {
-            findings.push(json!({
-                "level": "warning",
-                "id": record.id.to_string(),
-                "message": "存在待确认能力，插件不会启动",
-            }));
-        }
+        findings.extend(scan_record(&service, record, revocation_error.is_some()));
     }
     let host = mcsup::plugin::ControlClient::new(&config::platform_data_dir()).is_available();
     if !host {

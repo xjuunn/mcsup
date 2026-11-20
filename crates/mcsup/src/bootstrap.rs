@@ -661,8 +661,11 @@ impl McsupBuilder {
         let plugin_audit: Arc<dyn port::plugin::AuditSink> =
             Arc::new(JsonlAuditSink::new(db_root.join("audit").join("plugins")));
         let kv: Arc<dyn port::plugin::KvStore> = Arc::new(KvFileStore::new(plugin_data.clone()));
+        // 机器密钥只存系统钥匙串：把它和密文放在同一个目录，等于拿到目录副本
+        // 的人同时拿到密钥。钥匙串不可用时存储退化为 0600 明文，`plugin
+        // doctor` 会如实报告。
         let secrets: Arc<dyn port::plugin::SecretStore> =
-            Arc::new(SecretFileStore::new(plugin_data.clone()));
+            Arc::new(SecretFileStore::with_system_keyring(plugin_data.clone()));
         let plugin_config_store: Arc<dyn port::plugin::PluginConfigStore> =
             Arc::new(PluginConfigFileStore::new(plugin_data.clone()));
         let plugins_root = data_dir.join("plugins");

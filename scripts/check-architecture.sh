@@ -449,7 +449,7 @@ if [ -f "$pkg_manifest" ] && [ -f "$pkg_lib" ]; then
 		java) printf '%s' 'domain port java' ;;
 		modkit) printf '%s' 'domain port modkit' ;;
 		provider) printf '%s' 'domain port provider' ;;
-		storage) printf '%s' 'domain port storage' ;;
+		storage) printf '%s' 'auth domain port storage' ;;
 		plugin) printf '%s' 'auth domain plugin port protocol' ;;
 		runtime) printf '%s' 'auth domain port protocol runtime' ;;
 		backup) printf '%s' 'domain port backup' ;;

@@ -175,7 +175,7 @@ TypeScript 侧用 `test("PROTO-FRM-004 ...")`，由报告器解析前缀。
 | H15 统一 op 表 | `CLI-CMD-010` `WEB-REST-006` | CLI / REST / MCP 对同一 op 的输入输出一致 |
 | H16 日志不走协议 | `HOST-LOG-001` `HOST-LOG-005` | stdout 混入 JSON 不会产生帧 |
 | H17 密钥只写不读 | `API-SEC-002` `CLI-OUT-006` | 读取返回 `***`；审计无明文 |
-| H18 卸载保留数据 | `INST-UPG-008` `CLI-CMD-016` | 默认保留；`--purge` 才删除 |
+| H18 卸载保留数据 | `INST-UPG-008` `CLI-CMD-016` | 默认保留数据、删除密钥；`--keep-secrets` 保留密钥；`--purge` 全删 |
 | H19 版本独立 | `PROTO-VER-001` `SDK-GEN-008` | 四个版本常量可独立递增，互不牵连 |
 | H20 进度回显 | `CLI-UI-002` `CLI-UI-004` | 长步骤有 spinner；JSON 模式无进度 |
 | H21 插件不写前端 | `DOM-DES-018` `WEB-RENDER-001` | 产物含 `.html/.css/.js` 被拒 |
@@ -1060,7 +1060,7 @@ panic，只能返回错误。
 | `INST-UPG-004` | 运行中升级 | 先停进程 |
 | `INST-UPG-005` | 启动失败 | 自动回滚 |
 | `INST-UPG-006` | 降级且能力减少 | 直接生效 |
-| `INST-UPG-007` | 卸载 | 保留数据 |
+| `INST-UPG-007` | 卸载 | 保留数据、删除密钥；`--keep-secrets` 保留密钥 |
 | `INST-UPG-008` | `--purge` | 数据、日志、授权删除 |
 | `INST-UPG-009` | `--prune` | 旧版本清理 |
 | `INST-UPG-010` | 并发升级 | 第二个拒绝 |
@@ -1141,6 +1141,8 @@ panic，只能返回错误。
 | `SEC-LOG-004` | 格式串 | 不解释 |
 | `SEC-LOG-005` | 超大行 | 截断 |
 | `SEC-LOG-006` | 密钥 | 替换 |
+| `SEC-LOG-007` | 已知密钥值 | 精确替换为 `***`；≥ 8 字节、最多 64 条 |
+| `SEC-LOG-008` | 过短 / 非 UTF-8 密钥值 | 不进打码表，避免整行被替换 |
 | `SEC-DOS-001` | JSON 深度 33 | 拒绝 |
 | `SEC-DOS-002` | 帧洪泛 | 限速 / 断开 |
 | `SEC-DOS-003` | 事件洪泛 | 丢弃 + 指标 |
@@ -1149,6 +1151,29 @@ panic，只能返回错误。
 | `SEC-DOS-006` | 慢握手 | 10 s 超时 |
 | `SEC-DOS-007` | 多插件同时启动 | 有上限，不拖垮宿主 |
 | `SEC-DOS-008` | 超大 schema | 安装拒绝 |
+| `SEC-KEY-001` | 有机器密钥 | `secrets.json` 中不出现明文，格式为 `v/nonce/data` 信封 |
+| `SEC-KEY-002` | 读取旧明文文件 | 可读，下一次写入即迁移为密文 |
+| `SEC-KEY-003` | 机器密钥不可用 | 读到密文时报 `denied`，不静默降级 |
+| `SEC-KEY-004` | 密文被改动 | 认证失败，报损坏 |
+| `SEC-KEY-005` | 密文跨插件复制 | AAD 绑定插件 id，解密失败 |
+| `SEC-KEY-006` | 卸载 | 默认删除 `secrets.json`，其余数据保留 |
+| `SEC-KEY-007` | 卸载 `--keep-secrets` | 密钥保留，供重装使用 |
+
+落位：
+
+- `SEC-LOG-006` / `007` / `008`：`crates/plugin/src/process.rs` 单测
+  （`known_secret_values_are_redacted`、`short_and_duplicate_secrets_are_skipped`、
+  `non_utf8_secret_is_skipped`、`redact_table_is_bounded`）；宿主在
+  `PluginHost::start_session` 把 `SecretStore::values` 并进 `SpawnPlan.redact`。
+- `SEC-KEY-001..005`：`crates/storage/src/plugin.rs` 单测
+  （`encrypted_secrets_do_not_contain_plaintext`、`..._migrates`、
+  `encrypted_secrets_need_the_machine_key`、`tampered_secrets_are_rejected`、
+  `encrypted_secrets_are_bound_to_the_plugin`）；密钥本身的密封 / 打开在
+  `crates/auth/src/machine_key.rs` 单测。
+- `SEC-KEY-006` / `007`：`crates/service/src/plugin.rs` 单测
+  `remove_handles_secrets_by_mode`（默认 / `keep_secrets` / `purge` 三种落点）。
+- 机器密钥只存系统钥匙串；不可用时退化为 `0600` 明文，`plugin doctor`
+  报告降级。退化路径没有「加密生效」的假象，因此不按 `SEC-KEY-001` 判通过。
 
 ## 11.7 平台（`PLAT`）
 
@@ -1187,7 +1212,7 @@ panic，只能返回错误。
 | `CLI-CMD-013` | `config get/set` | 密钥打码 |
 | `CLI-CMD-014` | `grant/revoke` | 即时生效 |
 | `CLI-CMD-015` | `logs --follow` | 游标续读 |
-| `CLI-CMD-016` | `remove` | 保留数据；`--purge` 删除 |
+| `CLI-CMD-016` | `remove` | 保留数据、删除密钥；`--keep-secrets` 保留密钥；`--purge` 全删 |
 | `CLI-CMD-017` | `update --to` | 切换版本 |
 | `CLI-CMD-018` | `rollback` | 切回上一版本 |
 | `CLI-CMD-019` | `verify` | 摘要与签名结果 |
@@ -1375,7 +1400,7 @@ panic，只能返回错误。
 | `E2E-007` | 崩溃循环 | `failed` 后不再重启 |
 | `E2E-008` | 配置错误 | 回滚并提示 |
 | `E2E-009` | 未授权操作 | 拒绝且有审计 |
-| `E2E-010` | 卸载 | 数据保留，进程退出 |
+| `E2E-010` | 卸载 | 数据保留、密钥删除，进程退出 |
 | `E2E-011` | 多服务器 | 事件不串服 |
 | `E2E-012` | 宿主重启 | 插件按策略恢复 |
 

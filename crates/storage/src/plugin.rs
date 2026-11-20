@@ -6,7 +6,7 @@
 //! {db}/plugins/<id>.json                 一条安装记录
 //! {db}/audit/plugins/<YYYY-MM>.jsonl     追加写审计
 //! {plugin-data}/<id>/kv/<hash>.json      一个键一个文件
-//! {plugin-data}/<id>/secrets.json        凭据（0600）
+//! {plugin-data}/<id>/secrets.json        凭据（0600；有机器密钥时是密文）
 //! ```
 //!
 //! # 为什么审计用 JSONL
@@ -18,8 +18,11 @@
 //! # 权限
 //!
 //! 密钥文件创建即 `0600`；读取前校验权限，比 `0600` 宽时**拒绝读取**而不是
-//! 静默继续。键值文件与安装记录不含凭据，按默认权限写入。
+//! 静默继续。有机器密钥时内容再经 AES-256-GCM 加密，密钥只在系统钥匙串；
+//! 钥匙串不可用时退化为 `0600` 明文，由 [`SecretFileStore::protection`] 报告，
+//! 入口据此提示用户。键值文件与安装记录不含凭据，按默认权限写入。
 
+use base64::Engine as _;
 use domain::plugin::capability::Capability;
 use domain::plugin::manifest::Manifest;
 use domain::plugin::state::PluginState;
@@ -28,7 +31,7 @@ use port::RepositoryError;
 use port::plugin::{
     AuditEvent, AuditSink, HostError, KvStore, MAX_KV_KEY_BYTES, MAX_KV_LIST, MAX_KV_TOTAL_BYTES,
     MAX_KV_VALUE_BYTES, MAX_SECRET_KEY_BYTES, MAX_SECRET_VALUE_BYTES, PluginConfigStore,
-    PluginRecord, PluginStore, SecretStore, SecretValue, StoredConfig,
+    PluginRecord, PluginStore, SecretProtection, SecretStore, SecretValue, StoredConfig,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -537,24 +540,86 @@ fn validate_kv_key(key: &str) -> Result<(), HostError> {
     Ok(())
 }
 
+/// 密钥文件格式版本
+const SECRETS_VERSION: u8 = 1;
+
+/// 加密后的密钥文件：`v` / `nonce` / `data` 三个字段都是密文信封的一部分
+///
+/// 有 `v` 字段即视为密文；没有则按旧版明文映射读取（加密上线前写下的文件）。
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SealedSecrets {
+    v: u8,
+    /// base64(AES-256-GCM nonce)
+    nonce: String,
+    /// base64(密文 + tag)
+    data: String,
+}
+
+/// 机器密钥来源
+///
+/// 惰性加载：每次 CLI 命令都会装配存储，但绝大多数命令不碰插件密钥，不该为
+/// 它们付一次钥匙串访问。
+#[derive(Debug)]
+enum SecretKeySource {
+    /// 不加密，仅 `0600`
+    None,
+    /// 显式注入的密钥（测试与嵌入式装配）
+    Fixed(auth::machine_key::MachineKey),
+    /// 首次使用时从系统钥匙串读取；不可用则退化为文件权限
+    SystemKeyring,
+}
+
 /// 密钥存储：整个插件一个 JSON 文件，权限 `0600`
+///
+/// 有机器密钥时文件内容是密文信封（插件 id 作为 AAD），否则退化为明文映射并
+/// 由 [`SecretFileStore::protection`] 如实报告。明文只在钥匙串不可用时出现，
+/// 属于「至少不比以前更弱」的退化，不是默认路径。
 pub struct SecretFileStore {
     root: PathBuf,
+    source: SecretKeySource,
+    key: std::sync::OnceLock<Option<auth::machine_key::MachineKey>>,
 }
 
 impl std::fmt::Debug for SecretFileStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let source = match &self.source {
+            SecretKeySource::None => "none",
+            SecretKeySource::Fixed(_) => "fixed",
+            SecretKeySource::SystemKeyring => "keyring",
+        };
         f.debug_struct("SecretFileStore")
             .field("root", &self.root)
+            .field("source", &source)
             .finish_non_exhaustive()
     }
 }
 
 impl SecretFileStore {
-    /// `root` 是 `plugin-data` 目录
+    /// `root` 是 `plugin-data` 目录；不加密（测试与无钥匙串环境的显式装配）
     #[must_use]
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self::with_source(root, SecretKeySource::None)
+    }
+
+    /// 用给定机器密钥加密
+    #[must_use]
+    pub fn with_machine_key(root: PathBuf, key: auth::machine_key::MachineKey) -> Self {
+        Self::with_source(root, SecretKeySource::Fixed(key))
+    }
+
+    /// 首次读写时从系统钥匙串取机器密钥；钥匙串不可用时退化为 `0600` 明文
+    #[must_use]
+    pub fn with_system_keyring(root: PathBuf) -> Self {
+        Self::with_source(root, SecretKeySource::SystemKeyring)
+    }
+
+    fn with_source(root: PathBuf, source: SecretKeySource) -> Self {
+        Self {
+            root,
+            source,
+            key: std::sync::OnceLock::new(),
+        }
     }
 
     fn dir(&self, plugin: &PluginId) -> PathBuf {
@@ -565,22 +630,106 @@ impl SecretFileStore {
         self.dir(plugin).join("secrets.json")
     }
 
+    /// 机器密钥（首次调用时解析并缓存）
+    fn key(&self) -> Option<&auth::machine_key::MachineKey> {
+        self.key
+            .get_or_init(|| match &self.source {
+                SecretKeySource::None => None,
+                SecretKeySource::Fixed(key) => Some(key.clone()),
+                SecretKeySource::SystemKeyring => auth::machine_key::MachineKey::load_or_create(
+                    auth::machine_key::MACHINE_KEY_SERVICE,
+                    auth::machine_key::MACHINE_KEY_ACCOUNT,
+                ),
+            })
+            .as_ref()
+    }
+
+    /// 是否会有机器密钥；不创建密钥，只探测
+    fn has_machine_key(&self) -> bool {
+        match self.key.get() {
+            Some(key) => key.is_some(),
+            None => match &self.source {
+                SecretKeySource::None => false,
+                SecretKeySource::Fixed(_) => true,
+                SecretKeySource::SystemKeyring => auth::system_keyring_available(),
+            },
+        }
+    }
+
     fn load(&self, plugin: &PluginId) -> Result<BTreeMap<String, String>, HostError> {
         let path = self.path(plugin);
         check_secret_permissions(&path)?;
-        match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map_err(|err| HostError::internal(format!("corrupt secrets file: {err}"))),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
-            Err(err) => Err(HostError::internal(format!("read secrets: {err}"))),
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+            Err(err) => return Err(HostError::internal(format!("read secrets: {err}"))),
+        };
+        let value: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|err| HostError::internal(format!("corrupt secrets file: {err}")))?;
+        if value.get("v").is_some() {
+            return self.open_sealed(plugin, value);
         }
+        serde_json::from_value(value)
+            .map_err(|err| HostError::internal(format!("corrupt secrets file: {err}")))
+    }
+
+    fn open_sealed(
+        &self,
+        plugin: &PluginId,
+        value: serde_json::Value,
+    ) -> Result<BTreeMap<String, String>, HostError> {
+        let envelope: SealedSecrets = serde_json::from_value(value)
+            .map_err(|err| HostError::internal(format!("corrupt secrets file: {err}")))?;
+        if envelope.v != SECRETS_VERSION {
+            return Err(HostError::internal(format!(
+                "unsupported secrets format version {}",
+                envelope.v
+            )));
+        }
+        let Some(key) = self.key() else {
+            return Err(HostError::denied(
+                "secrets are encrypted with the machine key, but the system keyring is unavailable; \
+                 restore keyring access to read them",
+            ));
+        };
+        let nonce = base64::engine::general_purpose::STANDARD
+            .decode(&envelope.nonce)
+            .ok()
+            .and_then(|raw| <[u8; auth::machine_key::NONCE_LEN]>::try_from(raw).ok())
+            .ok_or_else(|| HostError::internal("corrupt secrets file: bad nonce"))?;
+        let ciphertext = base64::engine::general_purpose::STANDARD
+            .decode(&envelope.data)
+            .map_err(|_| HostError::internal("corrupt secrets file: bad ciphertext"))?;
+        let plaintext = key
+            .open(
+                plugin.as_str().as_bytes(),
+                &auth::machine_key::Sealed { nonce, ciphertext },
+            )
+            .map_err(|err| HostError::internal(format!("decrypt secrets: {err}")))?;
+        serde_json::from_slice(&plaintext)
+            .map_err(|err| HostError::internal(format!("corrupt secrets file: {err}")))
     }
 
     fn save(&self, plugin: &PluginId, values: &BTreeMap<String, String>) -> Result<(), HostError> {
         std::fs::create_dir_all(self.dir(plugin))
             .map_err(|err| HostError::internal(format!("create secret dir: {err}")))?;
-        let bytes = serde_json::to_vec_pretty(values)
-            .map_err(|err| HostError::internal(format!("serialize secrets: {err}")))?;
+        let bytes = match self.key() {
+            Some(key) => {
+                let plaintext = serde_json::to_vec(values)
+                    .map_err(|err| HostError::internal(format!("serialize secrets: {err}")))?;
+                let sealed = key
+                    .seal(plugin.as_str().as_bytes(), &plaintext)
+                    .map_err(|err| HostError::internal(format!("encrypt secrets: {err}")))?;
+                serde_json::to_vec_pretty(&SealedSecrets {
+                    v: SECRETS_VERSION,
+                    nonce: base64::engine::general_purpose::STANDARD.encode(sealed.nonce),
+                    data: base64::engine::general_purpose::STANDARD.encode(&sealed.ciphertext),
+                })
+                .map_err(|err| HostError::internal(format!("serialize secrets: {err}")))?
+            }
+            None => serde_json::to_vec_pretty(values)
+                .map_err(|err| HostError::internal(format!("serialize secrets: {err}")))?,
+        };
         write_atomic_bytes(&self.path(plugin), &bytes, 0o600)
             .map_err(|err| HostError::internal(format!("write secrets: {err}")))
     }
@@ -619,6 +768,25 @@ impl SecretStore for SecretFileStore {
             self.save(plugin, &values)?;
         }
         Ok(removed)
+    }
+
+    fn values(&self, plugin: &PluginId) -> Result<Vec<SecretValue>, HostError> {
+        self.load(plugin)?
+            .values()
+            .map(|encoded| {
+                decode(encoded)
+                    .map(SecretValue::from_bytes)
+                    .map_err(|err| HostError::internal(format!("corrupt secret: {err}")))
+            })
+            .collect()
+    }
+
+    fn protection(&self) -> SecretProtection {
+        if self.has_machine_key() {
+            SecretProtection::MachineKey
+        } else {
+            SecretProtection::FilePermissions
+        }
     }
 }
 
@@ -917,6 +1085,7 @@ fn month_key(unix: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use domain::plugin::error::PluginErrorCode;
 
     fn sample(id: &str) -> PluginRecord {
         let manifest = Manifest::from_json(
@@ -1034,6 +1203,150 @@ mod tests {
             assert_eq!(mode, 0o600);
         }
         assert!(store.delete(&plugin, "token").expect("delete"));
+        assert_eq!(store.protection(), SecretProtection::FilePermissions);
+    }
+
+    #[test]
+    fn encrypted_secrets_do_not_contain_plaintext() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SecretFileStore::with_machine_key(dir.path().to_path_buf(), test_key());
+        let plugin = PluginId::parse("demo").expect("id");
+        store
+            .set(&plugin, "token", &SecretValue::from_text("hunter2"))
+            .expect("set");
+        assert_eq!(
+            store
+                .get(&plugin, "token")
+                .expect("get")
+                .expect("value")
+                .expose(),
+            b"hunter2"
+        );
+        assert_eq!(store.protection(), SecretProtection::MachineKey);
+        let raw = std::fs::read(dir.path().join("demo/secrets.json")).expect("read raw");
+        let text = String::from_utf8_lossy(&raw);
+        assert!(!text.contains("hunter2"), "plaintext leaked: {text}");
+        let value: serde_json::Value = serde_json::from_slice(&raw).expect("json");
+        assert_eq!(value["v"], 1);
+        assert!(value["nonce"].is_string());
+        assert!(value["data"].is_string());
+    }
+
+    #[test]
+    fn secret_values_lists_every_value_for_redaction() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plugin = PluginId::parse("demo").expect("id");
+        let store = SecretFileStore::with_machine_key(dir.path().to_path_buf(), test_key());
+        store
+            .set(&plugin, "a", &SecretValue::from_text("first-secret"))
+            .expect("set");
+        store
+            .set(&plugin, "b", &SecretValue::from_text("second-secret"))
+            .expect("set");
+        let mut values: Vec<String> = store
+            .values(&plugin)
+            .expect("values")
+            .into_iter()
+            .map(|value| String::from_utf8(value.expose().to_vec()).expect("utf8"))
+            .collect();
+        values.sort();
+        assert_eq!(values, ["first-secret", "second-secret"]);
+    }
+
+    #[test]
+    fn encrypted_store_reads_existing_plaintext_and_migrates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plugin = PluginId::parse("demo").expect("id");
+        let legacy = SecretFileStore::new(dir.path().to_path_buf());
+        legacy
+            .set(&plugin, "old", &SecretValue::from_text("legacy"))
+            .expect("set");
+
+        let store = SecretFileStore::with_machine_key(dir.path().to_path_buf(), test_key());
+        assert_eq!(
+            store
+                .get(&plugin, "old")
+                .expect("get")
+                .expect("value")
+                .expose(),
+            b"legacy"
+        );
+        store
+            .set(&plugin, "new", &SecretValue::from_text("fresh"))
+            .expect("set");
+        let text =
+            String::from_utf8(std::fs::read(dir.path().join("demo/secrets.json")).expect("read"))
+                .expect("utf8");
+        assert!(!text.contains("legacy"), "migration kept plaintext: {text}");
+        assert_eq!(
+            store
+                .get(&plugin, "old")
+                .expect("get")
+                .expect("value")
+                .expose(),
+            b"legacy"
+        );
+    }
+
+    #[test]
+    fn encrypted_secrets_need_the_machine_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plugin = PluginId::parse("demo").expect("id");
+        SecretFileStore::with_machine_key(dir.path().to_path_buf(), test_key())
+            .set(&plugin, "token", &SecretValue::from_text("hunter2"))
+            .expect("set");
+        let err = SecretFileStore::new(dir.path().to_path_buf())
+            .get(&plugin, "token")
+            .expect_err("must not silently degrade");
+        assert_eq!(err.code, PluginErrorCode::Denied);
+    }
+
+    #[test]
+    fn tampered_secrets_are_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plugin = PluginId::parse("demo").expect("id");
+        let store = SecretFileStore::with_machine_key(dir.path().to_path_buf(), test_key());
+        store
+            .set(&plugin, "token", &SecretValue::from_text("hunter2"))
+            .expect("set");
+        let path = dir.path().join("demo/secrets.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("json");
+        let data = value["data"].as_str().expect("data").to_owned();
+        let mut raw = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .expect("decode");
+        raw[0] ^= 0xff;
+        value["data"] =
+            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(raw));
+        std::fs::write(&path, serde_json::to_vec(&value).expect("json")).expect("write");
+        let err = store.get(&plugin, "token").expect_err("tamper must fail");
+        assert_eq!(err.code, PluginErrorCode::Internal);
+    }
+
+    #[test]
+    fn encrypted_secrets_are_bound_to_the_plugin() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let demo = PluginId::parse("demo").expect("id");
+        let other = PluginId::parse("other").expect("id");
+        let store = SecretFileStore::with_machine_key(dir.path().to_path_buf(), test_key());
+        store
+            .set(&demo, "token", &SecretValue::from_text("hunter2"))
+            .expect("set");
+        std::fs::create_dir_all(dir.path().join("other")).expect("mkdir");
+        std::fs::copy(
+            dir.path().join("demo/secrets.json"),
+            dir.path().join("other/secrets.json"),
+        )
+        .expect("copy");
+        let err = store
+            .get(&other, "token")
+            .expect_err("aad must bind to plugin");
+        assert_eq!(err.code, PluginErrorCode::Internal);
+    }
+
+    fn test_key() -> auth::machine_key::MachineKey {
+        auth::machine_key::MachineKey::from_bytes(&[3_u8; auth::machine_key::KEY_LEN]).expect("key")
     }
 
     #[test]

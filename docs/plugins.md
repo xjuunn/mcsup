@@ -1907,7 +1907,8 @@ Sigstore 与 provenance 尚未实现：仓库没有证书链解析与信任根�
 | 升级 | 新版本并存；切换 `active_version` 后重启；保留上一版本用于回滚 |
 | 回滚 | `plugin rollback <id>` 切回上一版本并重启；不重新确认未变化的授权 |
 | 降级 | 允许，但若目标版本能力更少，直接生效；更多则 `pending_approval` |
-| 卸载 | 必须 `disabled` 且进程退出；默认保留 `plugin-data/<id>/` |
+| 卸载 | 必须 `disabled` 且进程退出；默认保留 `plugin-data/<id>/`，但删除 `secrets.json`（凭据不随同名插件重装继承） |
+| 保留密钥 | `--keep-secrets` 保留密钥，用于重装后继续使用同一凭据 |
 | 彻底删除 | `--purge` 同时删数据、日志、授权、审计引用标记 |
 | 版本保留 | 默认保留 2 个版本；`--prune` 清理更旧的 |
 
@@ -1963,10 +1964,19 @@ Sigstore 与 provenance 尚未实现：仓库没有证书链解析与信任根�
 
 ## 16.3 密钥处理
 
-- 存储在 `plugin-data/<id>/secrets.json`，文件权限 0600，内容用机器密钥加密。
-- 机器密钥由 `auth` 的凭据设施提供；不可用时退化为文件权限 + 明确警告。
+- 存储在 `plugin-data/<id>/secrets.json`，文件权限 0600，内容用机器密钥加密：
+  AES-256-GCM，一条数据一个随机 nonce，插件 id 作为 AAD（密文复制到别的插件
+  目录解不开）。文件是 `v` / `nonce` / `data` 信封；旧版明文文件仍可读，下次
+  写入时迁移为密文。
+- 机器密钥由 `auth` 的凭据设施提供，只存系统钥匙串，不在磁盘上再落一份：
+  密钥与密文同目录时，拿到目录副本的人同时拿到密钥，加密等于没有。
+- 钥匙串不可用时退化为 `0600` 明文，并由 `mcsup plugin doctor` 明确报告；
+  已有密文在密钥缺失时读取报 `denied`，不静默当作不存在。
 - 读取接口永不返回明文给入口；插件在 `welcome.config` 中收到明文（它需要使用）。
-- 日志采集对已知密钥值做精确替换；`[禁止]` 把密钥写入审计、错误消息、URL。
+- 日志采集对已知密钥值做精确替换：宿主在拉起进程前把该插件的密钥值并入
+  打码表（只收 UTF-8、长度 ≥ 8 字节、最多 64 条）。过短的值会在日志里命中
+  无关文本，替换后日志不可读，反而掩盖问题；`[禁止]` 把密钥写入审计、错误
+  消息、URL。
 - 卸载默认删除密钥，`--keep-secrets` 可保留（用于重装）。
 
 ## 16.4 撤销与举报
@@ -2022,6 +2032,7 @@ Sigstore 与 provenance 尚未实现：仓库没有证书链解析与信任根�
 - 当前版本记录在 `db/plugins/<id>.json` 的 `active_version`，不另设指针文件，
   避免双真相源。
 - `plugin-data/<id>/` 是插件唯一可写目录；宿主不清理，除非 `--purge`。
+  例外是 `secrets.json`：卸载默认删除，`--keep-secrets` 才保留。
 - `plugin-data/<id>/config.json` 与 `secrets.json` 同为 `0600`：配置可能含
   `x-mcsup-secret` 字段，读取接口必须打码，`--purge` 时随目录删除。
 - 审计用 JSONL 而不是「一条记录一个 JSON」：记录不可变、写入高频、按时间
@@ -2083,7 +2094,7 @@ mcsup plugin list [--json]
 mcsup plugin install <source> [--from|--url|--git] [--ref <tag|sha>] [--sha256 <hex>]
                               [--allow-unsigned] [--dev] [--yes] [--json]
 mcsup plugin update <id> [--to <version>] [--prune] [--yes]
-mcsup plugin remove <id> [--purge] [--yes]
+mcsup plugin remove <id> [--purge] [--keep-secrets] [--yes]
 mcsup plugin enable <id>
 mcsup plugin disable <id> [--yes]
 mcsup plugin start <id>

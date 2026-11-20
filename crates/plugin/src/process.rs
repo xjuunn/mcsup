@@ -5,7 +5,7 @@
 //! 前缀与已知令牌打码后写入 `logs/plugins/<id>.log`。
 
 use domain::plugin::manifest::EntrySpec;
-use port::plugin::HostError;
+use port::plugin::{HostError, SecretValue};
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -18,6 +18,18 @@ pub const MAX_LOG_LINE_BYTES: usize = 8 * 1024;
 
 /// 每插件日志限速（行/秒）
 pub const LOG_LINES_PER_SEC: u32 = 200;
+
+/// 进打码表的密钥最小长度
+///
+/// 太短的值（`1`、`on`）会在日志里命中无关文本，整行替换成 `***` 后日志不可
+/// 读，问题反而更难排查；这类短值单独泄漏也通常不足以直接利用。
+pub const MIN_REDACT_LEN: usize = 8;
+
+/// 打码表上限
+///
+/// 异常配置（几百条密钥）会把整份日志变成 `***`，上限保证打码仍然只作用于
+/// 少数敏感片段。
+pub const MAX_REDACT_VALUES: usize = 64;
 
 /// 拉起参数
 #[derive(Debug, Clone)]
@@ -86,6 +98,27 @@ impl SpawnPlan {
             prefix,
             redact: vec![token.to_owned()],
         })
+    }
+}
+
+impl SpawnPlan {
+    /// 把已知密钥值并入日志打码表
+    ///
+    /// 日志是文本，非 UTF-8 的密钥值不会以原样出现，直接跳过；重复值与过短的
+    /// 值也跳过，总数受限。
+    pub fn extend_redact(&mut self, values: impl IntoIterator<Item = SecretValue>) {
+        for value in values {
+            if self.redact.len() >= MAX_REDACT_VALUES {
+                break;
+            }
+            let Ok(text) = std::str::from_utf8(value.expose()) else {
+                continue;
+            };
+            if text.len() < MIN_REDACT_LEN || self.redact.iter().any(|known| known == text) {
+                continue;
+            }
+            self.redact.push(text.to_owned());
+        }
     }
 }
 
@@ -350,6 +383,64 @@ mod tests {
     fn redaction_is_exact_match() {
         let redacted = redact_values("token=abc123 ok", &["abc123".to_owned()]);
         assert_eq!(redacted, "token=*** ok");
+    }
+
+    fn plan() -> SpawnPlan {
+        SpawnPlan {
+            program: PathBuf::from("/bin/true"),
+            cwd: PathBuf::new(),
+            args: Vec::new(),
+            env: Vec::new(),
+            log_file: PathBuf::new(),
+            prefix: "demo".to_owned(),
+            redact: vec!["handshake-token".to_owned()],
+        }
+    }
+
+    #[test]
+    fn known_secret_values_are_redacted() {
+        let mut plan = plan();
+        plan.extend_redact([
+            SecretValue::from_text("sk-live-0123456789"),
+            SecretValue::from_text("s3cret-value"),
+        ]);
+        assert_eq!(
+            plan.redact,
+            ["handshake-token", "sk-live-0123456789", "s3cret-value"]
+        );
+        assert_eq!(
+            redact_values("auth sk-live-0123456789 and s3cret-value", &plan.redact),
+            "auth *** and ***"
+        );
+    }
+
+    #[test]
+    fn short_and_duplicate_secrets_are_skipped() {
+        let mut plan = plan();
+        plan.extend_redact([
+            SecretValue::from_text("on"),              // 太短
+            SecretValue::from_text("handshake-token"), // 已存在
+            SecretValue::from_text("long-enough-secret"),
+        ]);
+        assert_eq!(plan.redact, ["handshake-token", "long-enough-secret"]);
+    }
+
+    #[test]
+    fn non_utf8_secret_is_skipped() {
+        let mut plan = plan();
+        plan.extend_redact([SecretValue::from_bytes(vec![0xff, 0xfe, 0xfd, 0xfc, 0xfb])]);
+        assert_eq!(plan.redact, ["handshake-token"]);
+    }
+
+    #[test]
+    fn redact_table_is_bounded() {
+        let mut plan = plan();
+        plan.redact.clear();
+        plan.extend_redact(
+            (0..MAX_REDACT_VALUES + 10)
+                .map(|index| SecretValue::from_text(format!("secret-value-{index:04}"))),
+        );
+        assert_eq!(plan.redact.len(), MAX_REDACT_VALUES);
     }
 
     #[test]

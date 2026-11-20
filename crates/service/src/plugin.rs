@@ -960,12 +960,30 @@ impl PluginService {
 
     /// 卸载：要求已停用且进程退出
     ///
-    /// `purge` 同时删除 `plugin-data/<id>` 与日志；默认保留数据。
+    /// `purge` 同时删除 `plugin-data/<id>` 与日志。默认保留数据，但**删除密钥**：
+    /// 卸载后同名插件（可能是别人发布的同名包）不该继承上一份凭据。需要重装
+    /// 后继续用时走 [`Self::remove_with`] 的 `keep_secrets`。
     ///
     /// # Errors
     ///
     /// 仍启用或进程仍在运行时返回 [`PluginError::Conflict`]
     pub fn remove(&self, id: &PluginId, purge: bool) -> Result<(), PluginError> {
+        self.remove_with(id, purge, false)
+    }
+
+    /// 卸载，并显式指定是否保留密钥
+    ///
+    /// `keep_secrets` 只影响默认路径；`purge` 仍会删掉整个数据目录。
+    ///
+    /// # Errors
+    ///
+    /// 仍启用或进程仍在运行时返回 [`PluginError::Conflict`]
+    pub fn remove_with(
+        &self,
+        id: &PluginId,
+        purge: bool,
+        keep_secrets: bool,
+    ) -> Result<(), PluginError> {
         let record = self.record(id)?;
         if let Some(supervisor) = &self.supervisor
             && let Ok(status) = supervisor.status(id)
@@ -994,6 +1012,8 @@ impl PluginService {
             if log.exists() {
                 std::fs::remove_file(&log)?;
             }
+        } else if !keep_secrets {
+            remove_secrets(&self.plugin_data, id)?;
         }
         self.audit.record(&AuditEvent {
             at: now_secs(),
@@ -1001,7 +1021,7 @@ impl PluginService {
             action: "remove".to_owned(),
             capability: None,
             result: AuditResult::Allowed,
-            detail: Some(format!("purge={purge}")),
+            detail: Some(format!("purge={purge} keep_secrets={keep_secrets}")),
         });
         Ok(())
     }
@@ -1014,6 +1034,23 @@ impl PluginService {
             )
         })
     }
+}
+
+/// 删除某个插件的密钥文件
+///
+/// 保留 `plugin-data/<id>/` 里的键值与配置，只删 `secrets.json`；目录因此变空
+/// 时一并移除，免得留下空壳。密钥是凭据，卸载即失效——同名插件（可能是别人
+/// 发布的同名包）重装后不该继承上一份凭据。
+fn remove_secrets(plugin_data: &Path, id: &PluginId) -> Result<(), PluginError> {
+    let dir = plugin_data.join(id.as_str());
+    match std::fs::remove_file(dir.join("secrets.json")) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    // 目录里还有键值 / 配置时删不掉，`NotFound` 之外也不该报错：密钥已经删了。
+    let _ = std::fs::remove_dir(&dir);
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2956,6 +2993,75 @@ mod tests {
             .code,
             port::plugin::ErrorCode::InvalidInput
         );
+    }
+
+    /// 卸载的三种落点：默认删密钥、`keep_secrets` 保留、`purge` 全删
+    ///
+    /// 密钥是凭据：卸载后同名插件重装时不该继承。所以默认路径就要删掉
+    /// `secrets.json`，而键值 / 配置仍按「默认保留数据」的约定留着。
+    #[test]
+    fn remove_handles_secrets_by_mode() {
+        // (purge, keep_secrets, secrets_left, data_left)
+        let cases = [
+            (false, false, false, true),
+            (false, true, true, true),
+            (true, false, false, false),
+        ];
+        for (purge, keep_secrets, secrets_left, data_left) in cases {
+            let label = format!("purge={purge} keep_secrets={keep_secrets}");
+            let dir = tempfile::tempdir().expect("tempdir");
+            let plugins_root = dir.path().join("plugins");
+            let plugin_data = dir.path().join("plugin-data");
+            let log_root = dir.path().join("logs");
+            let id = PluginId::parse("demo").expect("id");
+            let mut demo = record("demo", false, &[]);
+            demo.last_state = PluginState::Disabled;
+            demo.artifact_dir = plugins_root.join("demo");
+            std::fs::create_dir_all(demo.artifact_dir.join("bin")).expect("artifact");
+            std::fs::write(demo.artifact_dir.join("bin/plugin"), b"binary").expect("write entry");
+            std::fs::create_dir_all(plugin_data.join("demo/kv")).expect("data dir");
+            std::fs::write(plugin_data.join("demo/secrets.json"), b"{}").expect("secrets");
+            std::fs::write(plugin_data.join("demo/kv/k.json"), b"{}").expect("kv");
+            std::fs::create_dir_all(&log_root).expect("logs");
+            std::fs::write(log_root.join("demo.log"), b"log").expect("log file");
+            let store = Arc::new(MemoryStore::default());
+            store.put(&demo).expect("put");
+
+            let service = PluginService::new(
+                store,
+                Arc::new(MemoryConfigStore::default()),
+                None,
+                None,
+                None,
+                Arc::new(port::plugin::NoopAuditSink),
+                plugins_root.clone(),
+                plugin_data.clone(),
+                log_root.clone(),
+            );
+            service
+                .remove_with(&id, purge, keep_secrets)
+                .expect("remove");
+
+            assert_eq!(
+                plugin_data.join("demo/secrets.json").exists(),
+                secrets_left,
+                "{label}: secrets"
+            );
+            assert_eq!(
+                plugin_data.join("demo/kv/k.json").exists(),
+                data_left,
+                "{label}: kv"
+            );
+            assert!(
+                !plugins_root.join("demo").exists(),
+                "{label}: artifact must be gone"
+            );
+            assert_eq!(
+                log_root.join("demo.log").exists(),
+                data_left,
+                "{label}: log"
+            );
+        }
     }
 
     fn all_capabilities() -> [Capability; 4] {

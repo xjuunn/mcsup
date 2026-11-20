@@ -15,6 +15,7 @@
 | M4 | `java` 能力 | 完成 |
 | M4 | 签名 / provenance / 撤销列表、Python / Java SDK、市场审核 | 部分完成（minisign 与撤销列表已完成；provenance / Sigstore / SDK / 市场审核未开始） |
 | M4 | 性能实测与回归基线 | 完成（`BENCH-001`~`006` 全部落位，见「性能」） |
+| M4 | 密钥静态加密 | 完成（AES-256-GCM + 钥匙串机器密钥；无钥匙串时降级并报告） |
 
 ## 已完成
 

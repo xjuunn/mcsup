@@ -625,6 +625,18 @@ impl fmt::Debug for SecretValue {
     }
 }
 
+/// 密钥落盘的保护方式
+///
+/// 入口用它提示降级：机器密钥不可用时只能靠 `0600` 文件权限，这一点必须让
+/// 用户看见，而不是静默当作加密仍然生效。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretProtection {
+    /// 机器密钥加密（密钥在系统钥匙串，磁盘上只有密文）
+    MachineKey,
+    /// 仅文件权限 `0600`
+    FilePermissions,
+}
+
 /// `secret:rw`：插件命名空间的凭据
 ///
 /// 写接口接收明文；读接口同样返回 [`SecretValue`]，由调用方决定用途。
@@ -655,6 +667,25 @@ pub trait SecretStore: Send + Sync {
     /// 未开放返回 `unsupported`
     fn delete(&self, _plugin: &PluginId, _key: &str) -> Result<bool, HostError> {
         Err(HostError::unsupported("secret:rw is not available"))
+    }
+
+    /// 列出该插件的全部密钥值
+    ///
+    /// 只给日志打码用：宿主在拉起进程前把已知值并入打码表，插件把密钥打到
+    /// stdout 时被精确替换。调用方 `[禁止]` 把它写进审计、错误消息或状态输出。
+    ///
+    /// # Errors
+    ///
+    /// 存储不可读时返回底层错误
+    fn values(&self, _plugin: &PluginId) -> Result<Vec<SecretValue>, HostError> {
+        Ok(Vec::new())
+    }
+
+    /// 落盘保护方式
+    ///
+    /// 只报告事实，不触发任何密钥创建：入口可能在只读命令里调用它。
+    fn protection(&self) -> SecretProtection {
+        SecretProtection::FilePermissions
     }
 }
 
@@ -1220,6 +1251,8 @@ mod tests {
         impl SecretStore for Empty {}
         impl NetProxy for Empty {}
 
+        // 未实现的存储只报告文件权限，不能默认说成「已加密」。
+        assert_eq!(Empty.protection(), SecretProtection::FilePermissions);
         let server = ServerName::parse("survival").expect("name");
         assert!(matches!(
             Empty.start(&server).map_err(|err| err.code),

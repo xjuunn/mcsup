@@ -2008,6 +2008,7 @@ dependencies = [
 name = "mcsup-auth"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "keyring",
  "ring",
  "serde",
@@ -2211,6 +2212,8 @@ dependencies = [
 name = "mcsup-storage"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "mcsup-auth",
  "mcsup-domain",
  "mcsup-port",
  "serde",

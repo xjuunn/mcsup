@@ -1093,6 +1093,9 @@ pub(crate) enum PluginAction {
         id: String,
         #[arg(long, help = crate::meta::plugin_purge_arg())]
         purge: bool,
+        /// 保留密钥文件（重装后继续使用同一凭据）
+        #[arg(long, help = crate::meta::plugin_keep_secrets_arg())]
+        keep_secrets: bool,
     },
     /// 允许插件运行
     #[command(about = crate::meta::plugin_enable())]

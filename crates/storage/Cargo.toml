@@ -11,8 +11,11 @@ repository.workspace = true
 name = "storage"
 
 [dependencies]
+# 机器密钥来自 `auth` 的凭证设施：密钥存系统钥匙串，密文落 `plugin-data`
+auth = { package = "mcsup-auth", version = "0.1.0", path = "../auth" }
 domain = { package = "mcsup-domain", version = "0.1.0", path = "../domain" }
 port = { package = "mcsup-port", version = "0.1.0", path = "../port" }
+base64.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2 = "0.11.0"

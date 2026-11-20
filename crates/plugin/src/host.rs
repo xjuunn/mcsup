@@ -381,7 +381,7 @@ impl PluginHost {
             })?;
         let token = new_token();
         let log_file = self.log_dir.join(format!("{id}.log"));
-        let plan = SpawnPlan::new(
+        let mut plan = SpawnPlan::new(
             &record.artifact_dir,
             &record.manifest.entry,
             log_file,
@@ -395,6 +395,14 @@ impl PluginHost {
                 .as_ref()
                 .map(domain::server::meta::ServerName::as_str),
         )?;
+        // 已知密钥值进入日志打码表：插件把凭据打到 stdout / stderr 时按精确值
+        // 替换。读不到密钥不该阻止启动——打码是加固，不是启动前置条件；插件
+        // 真要用密钥时会在 `secret:rw` 上拿到同一个错误。
+        if let Some(secrets) = &self.services.secrets
+            && let Ok(values) = secrets.values(id)
+        {
+            plan.extend_redact(values);
+        }
         let mut process = SpawnedPlugin::spawn(&plan)?;
         let pid = process.pid();
         let conn = match endpoint.accept(HANDSHAKE_TIMEOUT) {
