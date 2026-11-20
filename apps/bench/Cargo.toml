@@ -20,6 +20,11 @@ name = "hot_paths"
 harness = false
 doc = false
 
+[[bench]]
+name = "plugin"
+harness = false
+doc = false
+
 [dependencies]
 mcsup = { version = "0.1.0", path = "../../crates/mcsup", features = ["bootstrap", "backup"] }
 

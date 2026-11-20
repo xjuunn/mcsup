@@ -1375,6 +1375,11 @@ panic，只能返回错误。
 基准不进入 `check.sh`；M1 起每个里程碑跑一次，结果写入
 `docs/plugins-progress.md`。回归超过 20% 必须解释或修复。
 
+落位：`apps/bench/benches/plugin.rs` 覆盖 `BENCH-003`（`server:read` 分发
+开销）与 `BENCH-004`（事件扇出），跑法 `cargo bench -p bench --bench plugin`。
+`BENCH-001` / `002` / `005` / `006` 需要基准拉起 fixture 子进程与独立的宿主
+进程采样，尚未落位。
+
 ---
 
 # 14. 覆盖率与门禁

@@ -197,7 +197,7 @@ SDK README 必须显式区分，避免作者把宿主 crate 写进插件依赖�
 
 ## 4.4 新增模块的落位
 
-### `domain::plugin` `[待实现]`
+### `domain::plugin` `[规范]`
 
 纯词汇与纯规则，不依赖本仓库任何模块：
 
@@ -223,7 +223,7 @@ SDK README 必须显式区分，避免作者把宿主 crate 写进插件依赖�
 - 展示类型与 op 形状的静态一致性检查；
 - 契约标识解析（`chat.publish@1`）。
 
-### `port::plugin` `[待实现]`
+### `port::plugin` `[规范]`
 
 | trait | 作用 | 实现方 |
 | --- | --- | --- |
@@ -246,7 +246,7 @@ SDK README 必须显式区分，避免作者把宿主 crate 写进插件依赖�
 `port` 不得依赖 `protocol`（现有断言 `protocol -> port`，反向会成环）。因此
 宿主错误码定义在 `port::plugin::PluginErrorCode`，`protocol` 负责其线格式。
 
-### `protocol::plugin` `[待实现]`
+### `protocol::plugin` `[规范]`
 
 | 模块 | 内容 |
 | --- | --- |
@@ -2334,7 +2334,7 @@ $ mcsup plugin install --git https://github.com/example/chat-bridge --ref v0.3.1
 | 100 个非 resident 插件 | 安装与列表 < 1 s，无进程常驻 |
 
 性能测试放在 `apps/bench`，不进入 `check.sh`，但 M1 起每次里程碑跑一次并把
-结果写进 `docs/plugins-progress.md`（`[待实现]`，与 `remote-progress.md` 同构）。
+结果写进 `docs/plugins-progress.md`（与 `remote-progress.md` 同构）。
 
 ---
 
@@ -2701,7 +2701,7 @@ descriptor、打包 zip。作者不接触端点、帧、路由与界面。
 7. 接 CLI 的 `plugin` 命令与 `__plugin-host` 外壳。
 8. 写 Rust SDK，再写 TS SDK；两边过同一份 conformance。
 9. 补第 20.2 节用例；跑 `scripts/check.sh` 与 `scripts/check-sdk.sh`。
-10. 更新 `docs/plugins-progress.md`（`[待实现]`）记录完成项与实测值。
+10. 更新 `docs/plugins-progress.md` 记录完成项与实测值。
 
 `[禁止]` 在第 2 步之前写宿主：帧与 descriptor 未冻结时，后续所有代码都会
 围绕错误契约返工。

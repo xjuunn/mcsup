@@ -14,7 +14,7 @@
 | M3 | 生命周期、备份、文件、内容能力；六类展示投影 | 完成（REST / WS、MCP 入口不在本仓库） |
 | M4 | `java` 能力 | 完成 |
 | M4 | 签名 / provenance / 撤销列表、Python / Java SDK、市场审核 | 未开始 |
-| M4 | 性能实测与回归基线 | 未开始（`apps/bench` 无插件用例） |
+| M4 | 性能实测与回归基线 | 部分完成（descriptor / 帧 / 分发 / 扇出已测，见「性能」） |
 
 ## 已完成
 
@@ -89,13 +89,35 @@
 1. 签名链路：minisign / Sigstore 校验、provenance、撤销列表；未签名产物
    默认拒绝，`--allow-unsigned` 仅对本地来源生效。
 2. 撤销列表命中时拒绝启动，并与 `quarantine` / `block` 共用状态迁移。
-3. `apps/bench` 增加插件用例：握手冷 / 热启动、op 额外开销、事件扇出、
-   空闲内存、100 个非 resident 插件的安装与列表；结果回填本文件。
+3. 补齐 `BENCH-001` / `002` / `005` / `006`：握手冷 / 热启动、宿主空闲内存、
+   100 个非 resident 插件的安装与列表。需要让基准能拉起 fixture 子进程
+   （当前 fixture 是 `mcsup-plugin` 的测试 bin，依赖包不会为基准构建它）。
 4. `sdks/` 建立后再补 Python / Java SDK 与四语言 descriptor 一致性验收。
 5. REST / WS、MCP 入口在其仓库落地后补投影，判定仍复用 `domain` / `service`。
 
 ## 性能
 
-`docs/plugins.md` §20.5 的目标尚未测量：`apps/bench` 目前没有插件用例，
-`scripts/check.sh` 也不跑性能测试。首次测量后在此记录实测值、机器环境与
-回归阈值，在此之前不写「达标」结论。
+基准落位 `apps/bench/benches/plugin.rs`，跑法：
+
+```
+cargo bench -p bench --bench plugin
+```
+
+环境：Apple M4 / macOS 26.6.2 / rustc 1.98.1，release profile，criterion
+默认采样（100 样本）。数值是均值，仅用于回归对比，不与不同机器比较。
+
+| 用例 | 对应目标 | 实测 | 结论 |
+| --- | --- | --- | --- |
+| descriptor 校验 1 op | 安装路径 | 3.02 µs | — |
+| descriptor 校验 20 op | 安装路径 | 54.4 µs | — |
+| descriptor 校验 100 op | 安装路径 | 273.9 µs | — |
+| call 帧写入 + 读回 | 每帧编解码 | 16.07 µs | — |
+| result 帧写入 + 读回 | 每帧编解码 | 15.87 µs | — |
+| `server:read.list` 分发 | `BENCH-003`（< 5 ms） | 1.73 µs | 达标 |
+| 事件扇出 1 订阅者 | `BENCH-004`（≥ 5000/s） | 542.7 ns ≈ 1.84M/s | 达标 |
+| 事件扇出 10 订阅者 | `BENCH-004` | 544.5 ns ≈ 1.84M/s | 达标（订阅者为空实现，只测分发开销） |
+
+`BENCH-001` / `002`（握手冷 / 热启动）、`BENCH-005`（宿主空闲内存）、
+`BENCH-006`（100 个非 resident 插件安装与列表）尚未测量：它们需要基准拉起
+真实 fixture 子进程，而 fixture 目前只是 `mcsup-plugin` 的测试 bin，Cargo
+不会为依赖包的基准构建它。未测项不写「达标」结论。
