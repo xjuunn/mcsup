@@ -28,7 +28,12 @@ describe("真实进程", () => {
 
   it("握手 → 调用 → 关闭，退出码 0", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mcsup-plugin-test-"));
-    const socketPath = path.join(dir, "host.sock");
+    // Windows 上 Unix socket 路径不可监听（EACCES）；node 的 net 模块原生支持
+    // 命名管道（`\\.\pipe\name`），SDK 的 `connect` 走同一条 `net.createConnection`。
+    const socketPath =
+      process.platform === "win32"
+        ? `\\\\.\\pipe\\mcsup-plugin-test-${process.pid}-${Math.random().toString(36).slice(2)}`
+        : path.join(dir, "host.sock");
     const frames: Record<string, unknown>[] = [];
     const server = net.createServer();
     await new Promise<void>((resolve) => {
@@ -103,7 +108,12 @@ describe("真实进程", () => {
 
   it("协议错误退出码 2", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mcsup-plugin-test-"));
-    const socketPath = path.join(dir, "host.sock");
+    // Windows 上 Unix socket 路径不可监听（EACCES）；node 的 net 模块原生支持
+    // 命名管道（`\\.\pipe\name`），SDK 的 `connect` 走同一条 `net.createConnection`。
+    const socketPath =
+      process.platform === "win32"
+        ? `\\\\.\\pipe\\mcsup-plugin-test-${process.pid}-${Math.random().toString(36).slice(2)}`
+        : path.join(dir, "host.sock");
     const server = net.createServer();
     await new Promise<void>((resolve) => {
       server.listen(socketPath, resolve);

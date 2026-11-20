@@ -14,7 +14,6 @@ use crate::event::{EventDelivery, event_frame};
 use crate::process::SpawnedPlugin;
 use domain::plugin::PLUGIN_API_VERSION;
 use domain::plugin::capability::{self, Capability};
-use domain::plugin::descriptor::DEFAULT_OP_TIMEOUT_MS;
 use domain::plugin::event::{self, Subscription};
 use port::plugin::{
     AuditEvent, AuditResult, AuditSink, HostError, PluginRecord, SessionInfo, StreamSink,
@@ -919,10 +918,4 @@ fn wire_to_host(error: Option<WireError>, fallback: &str) -> HostError {
         },
         None => HostError::new(port::plugin::ErrorCode::Internal, fallback),
     }
-}
-
-/// 插件 op 的默认超时（descriptor 未声明时）
-#[must_use]
-pub(crate) fn default_timeout() -> Duration {
-    Duration::from_millis(DEFAULT_OP_TIMEOUT_MS)
 }

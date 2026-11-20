@@ -146,7 +146,8 @@ pub fn event_server(event: &DomainEvent) -> Option<&str> {
     match event {
         DomainEvent::ChatMessage { server, .. }
         | DomainEvent::PlayerJoined { server, .. }
-        | DomainEvent::PlayerLeft { server, .. } => Some(server),
+        | DomainEvent::PlayerLeft { server, .. }
+        | DomainEvent::ConsoleLine { server, .. } => Some(server),
         DomainEvent::ServerStarting { name }
         | DomainEvent::ServerStarted { name }
         | DomainEvent::ServerStopped { name }
@@ -162,7 +163,7 @@ pub fn event_server(event: &DomainEvent) -> Option<&str> {
 #[must_use]
 pub fn event_at(event: &DomainEvent) -> Option<&str> {
     match event {
-        DomainEvent::ChatMessage { at, .. } => Some(at),
+        DomainEvent::ChatMessage { at, .. } | DomainEvent::ConsoleLine { at, .. } => Some(at),
         _ => None,
     }
 }
@@ -180,6 +181,7 @@ pub fn event_payload(event: &DomainEvent) -> Value {
         DomainEvent::PlayerJoined { player, .. } | DomainEvent::PlayerLeft { player, .. } => {
             json!({ "player": player })
         }
+        DomainEvent::ConsoleLine { line, at, .. } => json!({ "line": line, "at": at }),
         DomainEvent::ServerStarting { name }
         | DomainEvent::ServerStarted { name }
         | DomainEvent::ServerStopped { name } => json!({ "name": name }),

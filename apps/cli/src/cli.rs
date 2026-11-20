@@ -1072,6 +1072,8 @@ pub(crate) enum PluginAction {
         reference: Option<String>,
         #[arg(long, value_name = "HEX", help = crate::meta::plugin_sha256_arg())]
         sha256: Option<String>,
+        #[arg(long, help = crate::meta::plugin_yes_arg())]
+        yes: bool,
     },
     /// 升级到新版本（沿用记录的来源）
     #[command(about = crate::meta::plugin_update())]
@@ -1081,6 +1083,8 @@ pub(crate) enum PluginAction {
         to: Option<String>,
         #[arg(long, help = crate::meta::plugin_prune_arg())]
         prune: bool,
+        #[arg(long, help = crate::meta::plugin_yes_arg())]
+        yes: bool,
     },
     /// 卸载插件
     #[command(about = crate::meta::plugin_remove())]
@@ -1138,6 +1142,8 @@ pub(crate) enum PluginAction {
         json: bool,
         #[arg(long, help = crate::meta::plugin_stream_arg())]
         stream: bool,
+        #[arg(long, help = crate::meta::plugin_yes_arg())]
+        yes: bool,
     },
     /// 配置读取 / 写入
     #[command(about = crate::meta::plugin_config())]

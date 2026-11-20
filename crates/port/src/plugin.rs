@@ -847,6 +847,46 @@ impl PluginRecord {
             .filter_map(|raw| Capability::parse(raw).ok())
             .collect()
     }
+
+    /// 追加授权
+    ///
+    /// 判定（已声明、当前版本可用）在 `domain::plugin::capability`，状态迁移
+    /// 在 `domain::plugin::state`；这里只把两者串起来改记录。授权 / 撤销的
+    /// 两条入口（`service::PluginService` 与宿主控制通道）都必须走这里，
+    /// 不允许各自实现一份。
+    ///
+    /// # Errors
+    ///
+    /// 能力未声明或当前版本不可用时返回
+    /// [`domain::plugin::capability::GrantError`]
+    pub fn grant_capability(
+        &mut self,
+        capability: Capability,
+    ) -> Result<(), domain::plugin::capability::GrantError> {
+        domain::plugin::capability::check_grantable(&self.declared_capabilities(), capability)?;
+        self.approved.insert(capability);
+        self.last_state = self.last_state.after_grant(self.needs_approval());
+        Ok(())
+    }
+
+    /// 撤销授权
+    ///
+    /// # Errors
+    ///
+    /// 能力尚未授予时返回
+    /// [`domain::plugin::capability::GrantError::NotGranted`]
+    pub fn revoke_capability(
+        &mut self,
+        capability: Capability,
+    ) -> Result<(), domain::plugin::capability::GrantError> {
+        if !self.approved.remove(&capability) {
+            return Err(domain::plugin::capability::GrantError::NotGranted(
+                capability,
+            ));
+        }
+        self.last_state = self.last_state.after_revoke(self.needs_approval());
+        Ok(())
+    }
 }
 
 /// 撤销列表的缓存读写
@@ -961,6 +1001,12 @@ pub struct PluginArtifact {
     pub descriptor: Vec<u8>,
     /// 产物摘要（小写 hex）
     pub sha256: String,
+    /// 解析后的来源描述
+    ///
+    /// 只有在来源内部能解析出比请求更精确的定位时才填写：git 来源在这里
+    /// 带上解析到的 commit，安装记录据此固定「装的是哪个提交」。本地目录与
+    /// URL 没有更精确的定位，保持 `None`，由调用方按请求参数记录。
+    pub resolved_source: Option<String>,
 }
 
 /// `ArtifactSource`：把来源解析成解包后的产物
@@ -990,6 +1036,20 @@ pub trait ArtifactVerifier: Send + Sync {
     fn verify(
         &self,
         artifact: &PluginArtifact,
+        expected_sha256: Option<&Checksum>,
+    ) -> Result<PluginArtifact, HostError>;
+
+    /// 校验一个已解包的产物目录
+    ///
+    /// 版本切换（`update --to`、rollback）需要重新确认目标版本目录的
+    /// manifest / descriptor / 摘要，不能只看目录存在。
+    ///
+    /// # Errors
+    ///
+    /// 摘要不匹配或元数据不可读时返回 [`HostError`]
+    fn verify_installed(
+        &self,
+        root: &Path,
         expected_sha256: Option<&Checksum>,
     ) -> Result<PluginArtifact, HostError>;
 }

@@ -1,0 +1,1 @@
+{ "scenario": "op", "op": "counter", "op_kind": "query", "input": { "channel": "global" } }

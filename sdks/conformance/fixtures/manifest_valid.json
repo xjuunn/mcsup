@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "id": "sample-echo",
+  "version": "1.0.0",
+  "api": 1,
+  "entry": { "type": "process", "cmd": ["sample-echo"] },
+  "capabilities": ["console:read", "events"],
+  "subscriptions": ["console:line"],
+  "scope": "machine"
+}

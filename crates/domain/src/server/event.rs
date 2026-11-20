@@ -68,6 +68,19 @@ pub enum DomainEvent {
         /// 失败原因
         reason: String,
     },
+    /// 原始控制台行（`console:line`）
+    ///
+    /// 与 [`Self::ChatMessage`] / [`Self::PlayerJoined`] / [`Self::PlayerLeft`]
+    /// 是同一份控制台输出的两种投影：结构化事件用于需要语义的插件，原始行
+    /// 用于日志转发。默认不订阅，繁忙服务器每秒数百行。
+    ConsoleLine {
+        /// 来源服务器
+        server: String,
+        /// 完整原始行（已去掉行尾换行）
+        line: String,
+        /// RFC3339 UTC 时间
+        at: String,
+    },
     /// 游戏内聊天（由控制台行解析，插件订阅 `chat:message`）
     ///
     /// 字段名按 `docs/plugins.md` 第 4.6 节固定为 `server` / `from`：同时携带

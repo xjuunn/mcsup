@@ -1,99 +1,19 @@
 {
-  "schema": 1,
-  "note": "跨语言行为用例：同一 PluginDefinition 在任一语言 SDK 下应给出相同结果。由各语言测试驱动。",
+  "version": 1,
+  "note": "跨语言用例唯一登记处（docs/plugins-testing.md §5.1）。kind ∈ frames/schema/behavior/render/security；input/expect 相对 conformance/。Rust 侧宿主用例在 crates/plugin/tests/（ID 写进测试函数名），SDK 行为用例由各语言 runner 驱动。",
   "cases": [
-    {
-      "id": "query.returns-output",
-      "op": "counter",
-      "kind": "query",
-      "input": { "channel": "global" },
-      "expect": { "ok": true, "output": { "count": 0, "channel": "global" } }
-    },
-    {
-      "id": "query.input-invalid",
-      "op": "counter",
-      "kind": "query",
-      "input": { "channel": 42 },
-      "expect": { "ok": false, "error": { "code": "invalid_input" } }
-    },
-    {
-      "id": "call.unknown-op",
-      "op": "missing",
-      "kind": "query",
-      "input": {},
-      "expect": { "ok": false, "error": { "code": "not_found" } }
-    },
-    {
-      "id": "action.throwing-is-internal",
-      "op": "failing",
-      "kind": "action",
-      "input": {},
-      "expect": { "ok": false, "error": { "code": "internal" } }
-    },
-    {
-      "id": "call.reentrant",
-      "op": "reentrant",
-      "kind": "action",
-      "input": {},
-      "expect": { "ok": true, "output": { "ok": true } }
-    },
-    {
-      "id": "call.capability-denied",
-      "op": "reentrant",
-      "kind": "action",
-      "granted": ["console:read", "console:write", "events"],
-      "input": {},
-      "expect": { "ok": false, "error": { "code": "denied" } }
-    },
-    {
-      "id": "frame.unknown-type-ignored",
-      "kind": "unknown-frame",
-      "inject": { "type": "future.frame", "payload": {} },
-      "op": "counter",
-      "input": { "channel": "global" },
-      "expect": { "ok": true }
-    },
-    {
-      "id": "stream.sequence",
-      "op": "messages",
-      "kind": "stream",
-      "input": { "prefix": "#" },
-      "expect": {
-        "ok": true,
-        "chunks": [{ "at": "2026-11-18T09:31:00Z", "text": "#你" }, { "at": "2026-11-18T09:31:00Z", "text": "#好" }, { "at": "2026-11-18T09:31:00Z", "text": "#" }],
-        "done": true,
-        "seq_from": 0
-      }
-    },
-    {
-      "id": "config.applied",
-      "kind": "config",
-      "input": { "revision": 2, "values": { "token": "t2", "channels": ["global"] } },
-      "expect": { "ok": true }
-    },
-    {
-      "id": "config.invalid-keeps-previous",
-      "kind": "config",
-      "input": { "revision": 2, "values": { "token": "" } },
-      "expect": { "ok": false, "error": { "code": "invalid_input" } }
-    },
-    {
-      "id": "handshake.reject-api-mismatch",
-      "kind": "handshake",
-      "input": { "reject": { "code": "api_mismatch", "message": "api mismatch" } },
-      "expect": { "exit_code": 4 }
-    },
-    {
-      "id": "handshake.invalid-config",
-      "kind": "handshake",
-      "input": { "config": { "token": "" } },
-      "expect": { "exit_code": 3 }
-    },
-    {
-      "id": "shutdown.clean-exit",
-      "kind": "shutdown",
-      "input": { "grace_ms": 1000 },
-      "expect": { "exit_code": 0 }
-    }
+    { "id": "SDK-BHV-001", "kind": "behavior", "input": "behavior/query_returns_output.json", "expect": "behavior/query_returns_output.expected.json" },
+    { "id": "SDK-BHV-002", "kind": "behavior", "input": "behavior/query_input_invalid.json", "expect": "behavior/query_input_invalid.expected.json" },
+    { "id": "SDK-BHV-003", "kind": "behavior", "input": "behavior/call_unknown_op.json", "expect": "behavior/call_unknown_op.expected.json" },
+    { "id": "SDK-BHV-004", "kind": "behavior", "input": "behavior/action_throwing_is_internal.json", "expect": "behavior/action_throwing_is_internal.expected.json" },
+    { "id": "SDK-BHV-005", "kind": "behavior", "input": "behavior/call_reentrant.json", "expect": "behavior/call_reentrant.expected.json" },
+    { "id": "SDK-BHV-006", "kind": "behavior", "input": "behavior/call_capability_denied.json", "expect": "behavior/call_capability_denied.expected.json" },
+    { "id": "SDK-BHV-007", "kind": "behavior", "input": "behavior/frame_unknown_type_ignored.json", "expect": "behavior/frame_unknown_type_ignored.expected.json" },
+    { "id": "SDK-BHV-008", "kind": "behavior", "input": "behavior/stream_sequence.json", "expect": "behavior/stream_sequence.expected.json" },
+    { "id": "SDK-BHV-009", "kind": "behavior", "input": "behavior/config_applied.json", "expect": "behavior/config_applied.expected.json" },
+    { "id": "SDK-BHV-010", "kind": "behavior", "input": "behavior/config_invalid_keeps_previous.json", "expect": "behavior/config_invalid_keeps_previous.expected.json" },
+    { "id": "SDK-BHV-011", "kind": "behavior", "input": "behavior/handshake_reject_api_mismatch.json", "expect": "behavior/handshake_reject_api_mismatch.expected.json" },
+    { "id": "SDK-BHV-012", "kind": "behavior", "input": "behavior/handshake_invalid_config.json", "expect": "behavior/handshake_invalid_config.expected.json" },
+    { "id": "SDK-BHV-013", "kind": "behavior", "input": "behavior/shutdown_clean_exit.json", "expect": "behavior/shutdown_clean_exit.expected.json" }
   ]
 }

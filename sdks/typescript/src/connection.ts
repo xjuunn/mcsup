@@ -23,7 +23,7 @@ const NEWLINE = 0x0a;
 /** 单次能力调用的默认超时 */
 export const DEFAULT_CALL_TIMEOUT_MS = 15_000;
 
-/** 按端点连接：`tcp://host:port` 或 Unix socket 路径 */
+/** 按端点连接：`tcp://host:port`、Windows 命名管道或 Unix socket 路径 */
 export function connect(endpoint: string): Promise<net.Socket> {
   const socket = endpoint.startsWith("tcp://")
     ? socketForTcp(endpoint)

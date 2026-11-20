@@ -166,6 +166,33 @@ impl PluginState {
         };
         Ok(next)
     }
+
+    /// 授权后的展示状态
+    ///
+    /// 授权只影响「待确认 → 可用」这一条边：仍存在待确认能力时状态不变；
+    /// 没有待确认项且当前卡在 `pending_approval` 时回到 `disabled`（等待用户
+    /// enable，而不是自动启动）。其余状态一律不动——授权不会启动进程。
+    #[must_use]
+    pub const fn after_grant(self, needs_approval: bool) -> Self {
+        if !needs_approval && matches!(self, Self::PendingApproval) {
+            Self::Disabled
+        } else {
+            self
+        }
+    }
+
+    /// 撤销后的展示状态
+    ///
+    /// 撤销可能让插件重新出现待确认能力：此时回到 `pending_approval`；
+    /// 其余状态不变——撤销不会停止正在运行的进程，能力集合在会话内即时收缩。
+    #[must_use]
+    pub const fn after_revoke(self, needs_approval: bool) -> Self {
+        if needs_approval {
+            Self::PendingApproval
+        } else {
+            self
+        }
+    }
 }
 
 impl PluginState {

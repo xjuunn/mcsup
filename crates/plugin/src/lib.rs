@@ -17,10 +17,13 @@
 pub mod api;
 pub mod base64;
 pub mod conn;
+pub mod console_events;
 pub mod contract;
 pub mod control;
 pub mod event;
 pub mod host;
+#[cfg(windows)]
+mod job;
 pub mod process;
 pub mod rfc3339;
 pub mod session;

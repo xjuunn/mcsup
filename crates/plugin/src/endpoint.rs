@@ -1,10 +1,11 @@
-//! 插件端点：优先 Unix socket，超长路径或非 Unix 平台回退回环 TCP
+//! 插件端点：Unix socket / Windows 命名管道，不可用时回退回环 TCP
 //!
-//! 端点只服务一次握手。文件名带 64 位 FNV-1a 哈希，输入是
-//! `(plugin_id, scope, server)`：同 id 不同作用域不会撞名。
+//! 端点只服务一次握手。文件名与管道名都带 64 位 FNV-1a 哈希，输入是
+//! `(run_dir, plugin_id, scope, server)`：同 id 不同作用域不会撞名。
 //!
 //! macOS 的 Unix socket 路径上限约 104 字节，超过 100 字节时改用系统临时目录；
-//! 仍超限则回退 TCP。TCP 只绑定 `127.0.0.1`，不允许其它地址。
+//! 仍超限则回退 TCP。Windows 命名管道在管道系统不可用时同样回退 TCP。
+//! TCP 只绑定 `127.0.0.1`，不允许其它地址。
 
 use crate::conn::Connection;
 use domain::plugin::{PluginId, PluginScope};
@@ -15,19 +16,30 @@ use std::net::{SocketAddr, TcpListener};
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::net::UnixListener;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+#[cfg(windows)]
+use interprocess::local_socket::ListenerNonblockingMode;
+#[cfg(windows)]
+use interprocess::local_socket::prelude::*;
 
 /// 端点：一个尚未完成握手的监听器
 pub struct Endpoint {
     inner: Inner,
     #[cfg(unix)]
     path: Option<PathBuf>,
+    #[cfg(windows)]
+    pipe_name: String,
 }
 
 enum Inner {
     #[cfg(unix)]
     Unix(UnixListener),
+    #[cfg(windows)]
+    Pipe(interprocess::local_socket::Listener),
     Tcp(TcpListener, SocketAddr),
 }
 
@@ -51,15 +63,16 @@ impl Endpoint {
         scope: PluginScope,
         server: Option<&ServerName>,
     ) -> io::Result<Self> {
-        // 哈希带上 `run_dir`：回退到系统临时目录时，不同 data_dir 的实例
-        // 不会因为同 id 撞名。文档里的 `(data_dir, plugin_id, scope, server)`
-        // 在 `run_dir` 派生自 `data_dir` 时等价。
+        // 哈希带上 `run_dir`：不同 data_dir 的实例不会因为同 id 撞名，
+        // 回退到系统临时目录时也不必额外区分。
         let hash = endpoint_hash_salted(run_dir.as_os_str().as_encoded_bytes(), id, scope, server);
         #[cfg(unix)]
-        {
-            if let Ok(endpoint) = Self::bind_unix(run_dir, hash) {
-                return Ok(endpoint);
-            }
+        if let Ok(endpoint) = Self::bind_unix(run_dir, hash) {
+            return Ok(endpoint);
+        }
+        #[cfg(windows)]
+        if let Ok(endpoint) = Self::bind_pipe(hash) {
+            return Ok(endpoint);
         }
         Self::bind_tcp()
     }
@@ -85,12 +98,33 @@ impl Endpoint {
         })
     }
 
+    #[cfg(windows)]
+    fn bind_pipe(hash: u64) -> io::Result<Self> {
+        use interprocess::os::windows::local_socket::NamedPipe;
+        let pipe_name = endpoint_pipe_name(hash);
+        let name = pipe_name
+            .clone()
+            .to_fs_name::<NamedPipe>()
+            .map_err(io::Error::other)?;
+        let listener = interprocess::local_socket::ListenerOptions::new()
+            .name(name)
+            .create_sync()?;
+        Ok(Self {
+            inner: Inner::Pipe(listener),
+            pipe_name,
+        })
+    }
+
     fn bind_tcp() -> io::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         Ok(Self {
             inner: Inner::Tcp(listener, addr),
+            #[cfg(unix)]
             path: None,
+            // 回退 TCP 时管道名不再使用；保留空串避免 Option 判空。
+            #[cfg(windows)]
+            pipe_name: String::new(),
         })
     }
 
@@ -104,6 +138,8 @@ impl Endpoint {
                 .as_ref()
                 .map(|path| path.to_string_lossy().into_owned())
                 .unwrap_or_default(),
+            #[cfg(windows)]
+            Inner::Pipe(_) => self.pipe_name.clone(),
             Inner::Tcp(_, addr) => format!("tcp://{addr}"),
         }
     }
@@ -131,15 +167,36 @@ impl Endpoint {
                         Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                             if Instant::now() >= deadline {
                                 let _ = listener.set_nonblocking(false);
-                                return Err(io::Error::new(
-                                    io::ErrorKind::TimedOut,
-                                    "plugin did not connect before the handshake deadline",
-                                ));
+                                return Err(timed_out());
                             }
                             std::thread::sleep(Duration::from_millis(20));
                         }
                         Err(err) => {
                             let _ = listener.set_nonblocking(false);
+                            return Err(err);
+                        }
+                    }
+                }
+            }
+            #[cfg(windows)]
+            Inner::Pipe(listener) => {
+                listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
+                loop {
+                    match listener.accept() {
+                        Ok(stream) => {
+                            // `Accept` 模式只影响 accept 本身，流仍是阻塞的；
+                            // 会话读循环依赖这一点。
+                            return Ok(Connection::pipe(stream));
+                        }
+                        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= deadline {
+                                let _ = listener.set_nonblocking(ListenerNonblockingMode::Neither);
+                                return Err(timed_out());
+                            }
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        Err(err) => {
+                            let _ = listener.set_nonblocking(ListenerNonblockingMode::Neither);
                             return Err(err);
                         }
                     }
@@ -158,10 +215,7 @@ impl Endpoint {
                         Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                             if Instant::now() >= deadline {
                                 let _ = listener.set_nonblocking(false);
-                                return Err(io::Error::new(
-                                    io::ErrorKind::TimedOut,
-                                    "plugin did not connect before the handshake deadline",
-                                ));
+                                return Err(timed_out());
                             }
                             std::thread::sleep(Duration::from_millis(20));
                         }
@@ -176,6 +230,13 @@ impl Endpoint {
     }
 }
 
+fn timed_out() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        "plugin did not connect before the handshake deadline",
+    )
+}
+
 #[cfg(unix)]
 impl Drop for Endpoint {
     fn drop(&mut self) {
@@ -183,6 +244,16 @@ impl Drop for Endpoint {
             let _ = std::fs::remove_file(path);
         }
     }
+}
+
+/// Windows 命名管道名（插件端点）
+///
+/// 路径进不了管道命名空间，按哈希取名；同一 `(run_dir, id, scope, server)`
+/// 推出同一名字，两端不需要额外交换端点文件。
+#[cfg(any(windows, test))]
+#[must_use]
+pub fn endpoint_pipe_name(hash: u64) -> String {
+    format!(r"\\.\pipe\mcsup-plugin-{hash:016x}")
 }
 
 /// 端点哈希：`(plugin_id, scope, server)` 的 FNV-1a 64
@@ -241,6 +312,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pipe_name_is_stable_and_hash_sensitive() {
+        let name = endpoint_pipe_name(0x1234_5678_9abc_def0);
+        assert_eq!(name, endpoint_pipe_name(0x1234_5678_9abc_def0));
+        assert!(name.starts_with(r"\\.\pipe\mcsup-plugin-"));
+        assert_ne!(name, endpoint_pipe_name(0x1234_5678_9abc_def1));
+    }
+
     #[cfg(unix)]
     #[test]
     fn unix_endpoint_accepts_and_cleans_up() {
@@ -264,11 +343,38 @@ mod tests {
         assert!(!Path::new(&address).exists());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn pipe_endpoint_round_trips() {
+        use std::io::{Read as _, Write as _};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = PluginId::parse("demo").expect("id");
+        let endpoint = Endpoint::bind(dir.path(), &id, PluginScope::Machine, None).expect("bind");
+        let address = endpoint.address();
+        assert!(
+            matches!(&endpoint.inner, Inner::Pipe(_)),
+            "Windows 上绑定命名管道而不是回退 TCP"
+        );
+        let client = std::thread::spawn(move || {
+            use interprocess::os::windows::local_socket::NamedPipe;
+            let name = address.to_fs_name::<NamedPipe>().expect("pipe name");
+            let mut stream = interprocess::local_socket::Stream::connect(name).expect("connect");
+            stream.write_all(b"ping\n").expect("write");
+        });
+        let mut conn = endpoint.accept(Duration::from_secs(2)).expect("accept");
+        let mut buf = [0_u8; 5];
+        conn.read_exact(&mut buf).expect("read");
+        assert_eq!(&buf, b"ping\n");
+        client.join().expect("join");
+    }
+
     #[test]
     fn accept_times_out_without_a_client() {
         let id = PluginId::parse("demo").expect("id");
-        let endpoint = Endpoint::bind(Path::new("."), &id, PluginScope::Machine, None);
-        // 这个测试同时覆盖 unix / tcp 两种实现：没有客户端时必须超时而不是挂起。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let endpoint = Endpoint::bind(dir.path(), &id, PluginScope::Machine, None);
+        // 这个测试同时覆盖各平台实现：没有客户端时必须超时而不是挂起。
         let result = endpoint.expect("bind").accept(Duration::from_millis(50));
         assert!(result.is_err());
     }

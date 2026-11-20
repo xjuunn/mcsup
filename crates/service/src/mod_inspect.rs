@@ -584,9 +584,12 @@ pub fn collect_jars(dir: &Path) -> Result<Vec<PathBuf>, FsError> {
 /// 用户看到的是相对路径——绝对路径既长又会随工作区搬动而变化，报错信息
 /// 里的路径应该能直接粘进 `mods/` 下的 ls。
 fn relative(server_dir: &Path, path: &str) -> String {
-    Path::new(path)
-        .strip_prefix(server_dir)
-        .map_or_else(|_| path.to_owned(), |rel| rel.display().to_string())
+    Path::new(path).strip_prefix(server_dir).map_or_else(
+        |_| path.to_owned(),
+        // 报告文本用 `/`：能直接粘进 `mods/` 下的 ls 与配置，Windows 的
+        // `\` 在这里没有意义。
+        |rel| rel.display().to_string().replace('\\', "/"),
+    )
 }
 
 #[cfg(test)]

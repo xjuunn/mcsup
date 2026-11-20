@@ -51,6 +51,64 @@ use thiserror::Error;
 /// 清理安装临时目录时使用的固定前缀
 const TEMP_PREFIX: &str = ".install-";
 
+/// 安装锁视为崩溃残留的阈值
+///
+/// 正常安装（含下载）远小于此值；超时的锁文件会被下一次安装抢走。
+const INSTALL_LOCK_STALE: Duration = Duration::from_secs(3600);
+
+/// 按 id 的安装锁
+///
+/// `create_new` 抢锁，丢弃时删除。锁文件带 pid 与时间戳用于诊断；持有进程
+/// 崩溃后文件残留，下一次安装按时间戳判断并接管。
+struct InstallLock {
+    path: PathBuf,
+}
+
+impl InstallLock {
+    fn acquire(root: &Path, id: &PluginId) -> Result<Self, PluginError> {
+        let path = root.join(format!(".{id}.install.lock"));
+        for attempt in 0..2 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    use std::io::Write as _;
+                    let _ = writeln!(file, "pid={} at={}", std::process::id(), now_secs());
+                    return Ok(Self { path });
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // 时钟漂移导致 modified 读不出来时按残留处理：宁可多抢，
+                    // 也不把用户锁死在永远装不上的状态。
+                    let stale = std::fs::metadata(&path)
+                        .and_then(|meta| meta.modified())
+                        .map_or(true, |at| {
+                            at.elapsed().map_or(true, |age| age >= INSTALL_LOCK_STALE)
+                        });
+                    if !stale || attempt == 1 {
+                        return Err(PluginError::Conflict(format!(
+                            "another install for {id} is in progress"
+                        )));
+                    }
+                    let _ = std::fs::remove_file(&path);
+                }
+                Err(err) => return Err(PluginError::Fs(FsError::io(&path, err))),
+            }
+        }
+        // 循环两次，每次每个分支都 return；这里只是让类型检查器满意
+        Err(PluginError::Conflict(format!(
+            "another install for {id} is in progress"
+        )))
+    }
+}
+
+impl Drop for InstallLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// 插件业务失败
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -588,23 +646,9 @@ impl PluginService {
         capability: Capability,
     ) -> Result<PluginRecord, PluginError> {
         let mut record = self.record(id)?;
-        let declared = record.declared_capabilities();
-        if !declared.contains(&capability) {
-            return Err(PluginError::Usage(format!(
-                "capability {capability} is not declared by plugin {id}"
-            )));
-        }
-        if !capability.is_open() {
-            return Err(PluginError::Usage(format!(
-                "capability {capability} is not available in this version"
-            )));
-        }
-        record.approved.insert(capability);
-        if record.needs_approval() {
-            // 仍有待确认项
-        } else if record.last_state == PluginState::PendingApproval {
-            record.last_state = PluginState::Disabled;
-        }
+        record
+            .grant_capability(capability)
+            .map_err(|err| PluginError::Usage(format!("{err} for plugin {id}")))?;
         record.updated_at = now_secs();
         self.store.put(&record)?;
         self.audit.record(&AuditEvent {
@@ -629,11 +673,9 @@ impl PluginService {
         capability: Capability,
     ) -> Result<PluginRecord, PluginError> {
         let mut record = self.record(id)?;
-        if !record.approved.remove(&capability) {
-            return Err(PluginError::NotFound(format!(
-                "capability {capability} is not granted to plugin {id}"
-            )));
-        }
+        record
+            .revoke_capability(capability)
+            .map_err(|err| PluginError::NotFound(format!("{err} for plugin {id}")))?;
         if let Some(supervisor) = &self.supervisor {
             // 会话内的授予集合同步收缩；宿主不在时忽略（下次握手自然按记录计算）。
             match supervisor.revoke(id, capability) {
@@ -641,10 +683,6 @@ impl PluginService {
                 Err(err) if err.code == port::plugin::ErrorCode::Unavailable => {}
                 Err(err) => return Err(err.into()),
             }
-        }
-        // 撤销后若重新出现待确认能力，状态回到 `pending_approval`。
-        if record.needs_approval() {
-            record.last_state = PluginState::PendingApproval;
         }
         record.updated_at = now_secs();
         self.store.put(&record)?;
@@ -739,14 +777,18 @@ impl PluginService {
     /// 流水线：拉取 → 摘要校验 → 解包（由来源实现）→ manifest / descriptor →
     /// 原子移动到 `plugins/<id>/<version>` → 写记录。安装期间不启动进程。
     ///
+    /// 升级已存在的插件时：进程先停；`enabled` 与仍声明且已确认的授权保留；
+    /// 默认保留上一版本（共 2 个），`prune` 只保留当前版本。
+    ///
     /// # Errors
     ///
-    /// 来源不可用、校验失败、manifest / descriptor 非法、同版本已存在时返回
-    /// [`PluginError`]
+    /// 来源不可用、校验失败、manifest / descriptor 非法、同版本已存在、
+    /// 已有同 id 安装进行中时返回 [`PluginError`]
     pub fn install(
         &self,
         origin: &ArtifactOrigin,
         expected_sha256: Option<&Checksum>,
+        prune: bool,
     ) -> Result<InstallOutcome, PluginError> {
         let source = self.source.as_ref().ok_or_else(|| {
             PluginError::Usage("no plugin artifact source is configured".to_owned())
@@ -760,7 +802,7 @@ impl PluginService {
         ));
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp)?;
-        let result = self.install_into(origin, expected_sha256, &source, &temp);
+        let result = self.install_into(origin, expected_sha256, &source, &temp, prune);
         if result.is_err() {
             let _ = std::fs::remove_dir_all(&temp);
         }
@@ -805,12 +847,16 @@ impl PluginService {
         }
     }
 
+    // 安装流水线单函数承载：fetch → 校验 → 加锁 → rename → 登记 → prune →
+    // 审计 → 恢复运行。拆开只会把同一份状态变更切成两个互相引用的一半。
+    #[allow(clippy::too_many_lines)]
     fn install_into(
         &self,
         origin: &ArtifactOrigin,
         expected_sha256: Option<&Checksum>,
         source: &Arc<dyn ArtifactSource>,
         temp: &Path,
+        prune: bool,
     ) -> Result<InstallOutcome, PluginError> {
         let fetched = source.fetch(origin, temp)?;
         let artifact = if let Some(verifier) = &self.verifier {
@@ -832,8 +878,34 @@ impl PluginService {
         }
         Descriptor::from_json(&artifact.descriptor, &manifest.id)
             .map_err(|err| PluginError::Usage(format!("invalid descriptor: {err}")))?;
+        // 入口文件存在且形态合法（docs 10.3 第 5 条）；产物已解包，正是检查点。
+        manifest
+            .raw
+            .entry
+            .check_entry_file(&artifact.root, &domain::plugin::platform_key())
+            .map_err(|err| PluginError::Usage(format!("entry check failed: {err}")))?;
         let id = manifest.id.clone();
         let version = manifest.raw.version.clone();
+        // 按 id 加锁：两个并发 install 拉到一半互相看到对方的半成品，或者把
+        // 记录互相覆盖，都比直接失败更糟。锁在临时目录之外，不随清理消失。
+        let _lock = InstallLock::acquire(&self.plugins_root, &id)?;
+        if manifest.scope == PluginScope::Server {
+            return Err(PluginError::Usage(
+                "server-scoped plugins require `--server <name>`".to_owned(),
+            ));
+        }
+        let previous = self.store.get(&id).ok();
+        // 升级时进程必须先停：旧进程还在用旧产物目录，rename 后它写的是
+        // 已被移走的目录。旧状态走一次 UpdateStarted 迁移，留下审计痕迹。
+        let was_running = previous.is_some()
+            && self
+                .supervisor
+                .as_ref()
+                .and_then(|supervisor| supervisor.status(&id).ok())
+                .is_some_and(|status| status.session.is_some());
+        if was_running && let Some(supervisor) = &self.supervisor {
+            supervisor.stop(&id, Duration::from_secs(10))?;
+        }
         let target = self.plugins_root.join(id.as_str()).join(&version);
         if target.exists() {
             return Err(PluginError::AlreadyExists(format!(
@@ -843,17 +915,11 @@ impl PluginService {
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        if manifest.scope == PluginScope::Server {
-            return Err(PluginError::Usage(
-                "server-scoped plugins require `--server <name>`".to_owned(),
-            ));
-        }
         // 同文件系统内 rename 才是原子的：临时目录建在 `plugins_root` 下。
         std::fs::rename(&artifact.root, &target)
             .map_err(|err| PluginError::Fs(FsError::io(&artifact.root, err)))?;
         let _ = std::fs::remove_dir_all(temp);
         // 升级：只保留新版本仍声明、且此前已确认的能力；低风险照常自动通过。
-        let previous = self.store.get(&id).ok();
         let mut approved: BTreeSet<Capability> = manifest
             .capabilities
             .iter()
@@ -875,13 +941,18 @@ impl PluginService {
             .filter(|cap| !approved.contains(cap))
             .collect();
         let now = now_secs();
+        // 升级保留启用状态；scope 变了则视为新插件，回默认关闭。
+        let enabled = previous
+            .as_ref()
+            .filter(|old| old.scope == manifest.scope)
+            .is_some_and(|old| old.enabled);
         let record = PluginRecord {
             id: id.clone(),
             version: version.clone(),
             api: manifest.raw.api,
             scope: manifest.scope,
             server: None,
-            enabled: false,
+            enabled,
             approved,
             manifest: manifest.raw.clone(),
             artifact_dir: target,
@@ -890,12 +961,21 @@ impl PluginService {
             last_state: PluginState::after_install(!pending.is_empty()),
             last_error: None,
             previous_version: previous.as_ref().map(|record| record.version.clone()),
-            source: Some(origin_text(origin)),
+            source: artifact
+                .resolved_source
+                .clone()
+                .or_else(|| Some(origin_text(origin))),
             sha256: Some(artifact.sha256),
-            blocked: false,
-            quarantined: false,
+            blocked: previous.as_ref().is_some_and(|old| old.blocked),
+            quarantined: previous.as_ref().is_some_and(|old| old.quarantined),
         };
         self.store.put(&record)?;
+        // 版本保留：默认留当前 + 上一版本；`--prune` 只留当前。
+        let mut keep = vec![version.as_str()];
+        if !prune && let Some(old) = &previous {
+            keep.push(old.version.as_str());
+        }
+        self.prune_versions(&id, &keep)?;
         self.audit.record(&AuditEvent {
             at: now,
             plugin: id.to_string(),
@@ -904,7 +984,126 @@ impl PluginService {
             result: AuditResult::Allowed,
             detail: Some(format!("version {version}")),
         });
+        // 升级自运行状态：恢复运行。启动失败向上传播——升级没完成，调用方
+        // 看到 `Failed` 记录，产物仍是新版本（自动回滚属后续闭环节点）。
+        if was_running && record.enabled {
+            self.start(&id)?;
+        }
         Ok(InstallOutcome { record, pending })
+    }
+
+    /// 清理同 id 的旧版本目录，只保留 `keep` 里的版本
+    fn prune_versions(&self, id: &PluginId, keep: &[&str]) -> Result<(), PluginError> {
+        let root = self.plugins_root.join(id.as_str());
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            return Ok(());
+        };
+        for entry in entries {
+            let entry = entry.map_err(|err| PluginError::Fs(FsError::io(&root, err)))?;
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if keep.contains(&name.as_str()) {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                std::fs::remove_dir_all(&path)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 切换到已安装的版本（`update --to <version>`、rollback 的底层操作）
+    ///
+    /// 目标版本目录必须存在且通过校验。进程运行中先停，切换后恢复运行。
+    /// 授权按目标 manifest 重算：仍声明且已确认的保留，新出现的进
+    /// `pending_approval`。`prune` 清掉除目标版本外的全部版本目录。
+    ///
+    /// # Errors
+    ///
+    /// 记录不存在、目标版本缺失、manifest / descriptor 非法、停机失败时返回
+    /// [`PluginError`]
+    pub fn activate_version(
+        &self,
+        id: &PluginId,
+        version: &str,
+        prune: bool,
+    ) -> Result<PluginRecord, PluginError> {
+        let mut record = self.record(id)?;
+        let artifact = self.plugins_root.join(id.as_str()).join(version);
+        let verifier = self.verifier.as_ref().ok_or_else(|| {
+            PluginError::Usage("no plugin artifact verifier is configured".to_owned())
+        })?;
+        let checked = verifier
+            .verify_installed(&artifact, None)
+            .map_err(|err| PluginError::Usage(format!("version {version} is not usable: {err}")))?;
+        if checked.manifest.id != id.as_str() {
+            return Err(PluginError::Usage(format!(
+                "artifact in version {version} declares id {}",
+                checked.manifest.id
+            )));
+        }
+        let manifest = Manifest::from_json(
+            &serde_json::to_vec(&checked.manifest)
+                .map_err(|err| PluginError::Usage(format!("serialize manifest: {err}")))?,
+        )
+        .map_err(|err| PluginError::Usage(format!("invalid manifest: {err}")))?;
+        // 目标版本的入口文件同样要过形态检查
+        manifest
+            .raw
+            .entry
+            .check_entry_file(&artifact, &domain::plugin::platform_key())
+            .map_err(|err| PluginError::Usage(format!("entry check failed: {err}")))?;
+        let was_running = self
+            .supervisor
+            .as_ref()
+            .and_then(|supervisor| supervisor.status(id).ok())
+            .is_some_and(|status| status.session.is_some());
+        if was_running && let Some(supervisor) = &self.supervisor {
+            supervisor.stop(id, Duration::from_secs(10))?;
+        }
+        // 授权重算：新版本仍声明且已确认的保留，低风险自动通过。
+        let mut approved: BTreeSet<Capability> = manifest
+            .capabilities
+            .iter()
+            .copied()
+            .filter(|cap| cap.default_policy() == capability::DefaultPolicy::Allow)
+            .collect();
+        approved.extend(
+            record
+                .approved
+                .iter()
+                .copied()
+                .filter(|cap| manifest.capabilities.contains(cap)),
+        );
+        let current = record.version.clone();
+        version.clone_into(&mut record.version);
+        record.previous_version = Some(current);
+        record.api = manifest.raw.api;
+        record.manifest = manifest.raw.clone();
+        record.artifact_dir = artifact;
+        record.sha256 = Some(checked.sha256);
+        record.approved = approved;
+        record.last_state = PluginState::Stopped;
+        record.last_error = None;
+        record.updated_at = now_secs();
+        self.store.put(&record)?;
+        self.audit.record(&AuditEvent {
+            at: now_secs(),
+            plugin: id.to_string(),
+            action: "activate".to_owned(),
+            capability: None,
+            result: AuditResult::Allowed,
+            detail: Some(format!("version {}", record.version)),
+        });
+        if prune {
+            self.prune_versions(id, &[version])?;
+        }
+        if was_running && record.enabled {
+            self.start(id)?;
+        }
+        Ok(record)
     }
 
     /// 回滚到上一版本
@@ -1589,7 +1788,11 @@ impl ServerFiles {
     }
 
     fn relative(rel: &Path) -> Result<RelPath, HostError> {
-        RelPath::from_path(rel).map_err(|err| HostError::denied(err.to_string()))
+        // 插件传来的路径是文本（帧里的 POSIX 路径），不是本机路径对象：
+        // `from_path` 在 Windows 上会把 `\` 当分隔符切开，`world\level.dat`
+        // 就静默变成了 `world/level.dat`。文本一律按 POSIX 规则解析，
+        // `\` 在任何平台都是非法字符。
+        RelPath::parse(&rel.to_string_lossy()).map_err(|err| HostError::denied(err.to_string()))
     }
 
     /// 已存在路径：解析符号链接后必须仍在根内

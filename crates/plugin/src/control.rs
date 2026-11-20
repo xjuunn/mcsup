@@ -26,6 +26,11 @@ use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::net::UnixListener;
+
+#[cfg(windows)]
+use interprocess::local_socket::ListenerNonblockingMode;
+#[cfg(windows)]
+use interprocess::local_socket::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -73,6 +78,8 @@ pub struct ControlServer {
 enum Listener {
     #[cfg(unix)]
     Unix(UnixListener),
+    #[cfg(windows)]
+    Pipe(interprocess::local_socket::Listener),
     Tcp(TcpListener),
 }
 
@@ -80,7 +87,7 @@ impl std::fmt::Debug for ControlServer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ControlServer")
             .field("run_dir", &self.run_dir)
-            .field("tcp", &matches!(self.inner, Listener::Tcp(_)))
+            .field("address", &self.address())
             .finish_non_exhaustive()
     }
 }
@@ -113,17 +120,55 @@ impl ControlServer {
                 }
                 Err(_) => {}
             }
+            // 路径超过平台上限：回退回环 TCP，令牌仍然生效。
+            let (listener, token) = bind_tcp(&run_dir)?;
+            Ok(Self {
+                inner: Listener::Tcp(listener),
+                token: Some(token),
+                socket_path: None,
+                run_dir,
+                shutdown: Arc::new(AtomicBool::new(false)),
+                _lock: lock,
+            })
         }
-        let (listener, token) = bind_tcp(&run_dir)?;
-        Ok(Self {
-            inner: Listener::Tcp(listener),
-            token: Some(token),
-            #[cfg(unix)]
-            socket_path: None,
-            run_dir,
-            shutdown: Arc::new(AtomicBool::new(false)),
-            _lock: lock,
-        })
+        #[cfg(windows)]
+        {
+            match Self::bind_pipe(&run_dir) {
+                Ok(listener) => {
+                    return Ok(Self {
+                        inner: Listener::Pipe(listener),
+                        token: None,
+                        run_dir,
+                        shutdown: Arc::new(AtomicBool::new(false)),
+                        _lock: lock,
+                    });
+                }
+                Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
+                    return Err(ControlError::AlreadyRunning);
+                }
+                // 管道系统不可用：回退回环 TCP，令牌仍然生效。
+                Err(_) => {}
+            }
+            let (listener, token) = bind_tcp(&run_dir)?;
+            Ok(Self {
+                inner: Listener::Tcp(listener),
+                token: Some(token),
+                run_dir,
+                shutdown: Arc::new(AtomicBool::new(false)),
+                _lock: lock,
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let (listener, token) = bind_tcp(&run_dir)?;
+            Ok(Self {
+                inner: Listener::Tcp(listener),
+                token: Some(token),
+                run_dir,
+                shutdown: Arc::new(AtomicBool::new(false)),
+                _lock: lock,
+            })
+        }
     }
 
     #[cfg(unix)]
@@ -155,6 +200,17 @@ impl ControlServer {
         Ok((listener, path))
     }
 
+    #[cfg(windows)]
+    fn bind_pipe(run_dir: &Path) -> io::Result<interprocess::local_socket::Listener> {
+        use interprocess::os::windows::local_socket::NamedPipe;
+        let name = control_pipe_name(run_dir)
+            .to_fs_name::<NamedPipe>()
+            .map_err(io::Error::other)?;
+        interprocess::local_socket::ListenerOptions::new()
+            .name(name)
+            .create_sync()
+    }
+
     /// 端点地址（日志与诊断用）
     #[must_use]
     pub fn address(&self) -> String {
@@ -165,6 +221,8 @@ impl ControlServer {
                 .as_ref()
                 .map(|path| path.to_string_lossy().into_owned())
                 .unwrap_or_default(),
+            #[cfg(windows)]
+            Listener::Pipe(_) => control_pipe_name(&self.run_dir),
             Listener::Tcp(listener) => listener
                 .local_addr()
                 .map_or_else(|_| "tcp://?".to_owned(), |addr| format!("tcp://{addr}")),
@@ -223,6 +281,12 @@ impl ControlServer {
         match &self.inner {
             #[cfg(unix)]
             Listener::Unix(listener) => listener.set_nonblocking(flag),
+            #[cfg(windows)]
+            Listener::Pipe(listener) => listener.set_nonblocking(if flag {
+                ListenerNonblockingMode::Accept
+            } else {
+                ListenerNonblockingMode::Neither
+            }),
             Listener::Tcp(listener) => listener.set_nonblocking(flag),
         }
     }
@@ -234,6 +298,8 @@ impl ControlServer {
                 let (stream, _) = listener.accept()?;
                 Ok(Connection::unix(stream))
             }
+            #[cfg(windows)]
+            Listener::Pipe(listener) => Ok(Connection::pipe(listener.accept()?)),
             Listener::Tcp(listener) => {
                 let (stream, _) = listener.accept()?;
                 // 只接受本机回环：绑定地址已是 127.0.0.1，这里再确认对端。
@@ -249,15 +315,39 @@ impl ControlServer {
     }
 }
 
-#[cfg(unix)]
 impl Drop for ControlServer {
     fn drop(&mut self) {
+        #[cfg(unix)]
         if let Some(path) = self.socket_path.take() {
             let _ = std::fs::remove_file(path);
         }
         let _ = std::fs::remove_file(self.run_dir.join(ENDPOINT_FILE));
         let _ = std::fs::remove_file(self.run_dir.join(TOKEN_FILE));
     }
+}
+
+/// 控制端点的 Windows 命名管道名
+///
+/// 与插件端点用不同前缀，避免和插件自身的管道撞名；哈希输入是 `run_dir`，
+/// 两端从同一数据目录推出同一名字。
+#[cfg(windows)]
+#[must_use]
+fn control_pipe_name(run_dir: &Path) -> String {
+    format!(
+        r"\\.\pipe\mcsup-plugin-host-{hash:016x}",
+        hash = fnv1a_bytes(run_dir.to_string_lossy().as_bytes())
+    )
+}
+
+/// FNV-1a（64 位）：无依赖的稳定哈希，仅用于生成管道名
+#[cfg(windows)]
+fn fnv1a_bytes(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// 取得单实例锁
@@ -850,20 +940,12 @@ impl ControlHandler for HostControl {
             }
             other => HostError::internal(format!("read plugin {id}: {other}")),
         })?;
-        if !record.declared_capabilities().contains(&capability) {
-            return Err(HostError::invalid_input(format!(
-                "capability {capability} is not declared by plugin {id}"
-            )));
-        }
-        if !capability.is_open() {
-            return Err(HostError::invalid_input(format!(
-                "capability {capability} is not available in this version"
-            )));
-        }
-        record.approved.insert(capability);
-        if !record.needs_approval() && record.last_state == PluginState::PendingApproval {
-            record.last_state = PluginState::Disabled;
-        }
+        // 判定与状态迁移在 `PluginRecord::grant_capability`（领域收敛点），
+        // 与 `service::PluginService::grant` 共用同一份。授予只可能返回
+        // `NotDeclared` / `NotOpen`，都按输入错误报出。
+        record
+            .grant_capability(capability)
+            .map_err(|err| HostError::invalid_input(err.to_string()))?;
         record.updated_at = now_secs();
         self.store
             .put(&record)
@@ -887,14 +969,9 @@ impl ControlHandler for HostControl {
             }
             other => HostError::internal(format!("read plugin {id}: {other}")),
         })?;
-        if !record.approved.remove(&capability) {
-            return Err(HostError::not_found(format!(
-                "capability {capability} is not granted to plugin {id}"
-            )));
-        }
-        if record.needs_approval() {
-            record.last_state = PluginState::PendingApproval;
-        }
+        record
+            .revoke_capability(capability)
+            .map_err(|err| HostError::not_found(err.to_string()))?;
         record.updated_at = now_secs();
         self.store
             .put(&record)
@@ -978,6 +1055,20 @@ impl ControlClient {
                     .set_write_timeout(Some(IO_TIMEOUT))
                     .map_err(io_error)?;
                 return Ok(Connection::unix(stream));
+            }
+        }
+        #[cfg(windows)]
+        {
+            // 优先命名管道：没有端点文件也就没有令牌，认证由管道 ACL 承担。
+            let pipe_name = control_pipe_name(&self.run_dir);
+            let connected = pipe_name
+                .to_fs_name::<interprocess::os::windows::local_socket::NamedPipe>()
+                .and_then(|name| interprocess::local_socket::Stream::connect(name));
+            if let Ok(stream) = connected {
+                let conn = Connection::pipe(stream);
+                conn.set_read_timeout(Some(IO_TIMEOUT)).map_err(io_error)?;
+                conn.set_write_timeout(Some(IO_TIMEOUT)).map_err(io_error)?;
+                return Ok(conn);
             }
         }
         let endpoint = self.run_dir.join(ENDPOINT_FILE);

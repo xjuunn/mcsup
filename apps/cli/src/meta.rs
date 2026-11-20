@@ -1077,8 +1077,8 @@ pub(crate) fn plugin_install() -> &'static str {
 #[must_use]
 pub(crate) fn plugin_update() -> &'static str {
     t(
-        "升级到新版本（沿用记录的来源）",
-        "upgrade to a new version using the recorded source",
+        "升级到新版本（沿用记录的来源；--to 切换到已安装的版本）",
+        "upgrade using the recorded source; --to activates an installed version",
     )
 }
 
@@ -1282,6 +1282,14 @@ pub(crate) fn plugin_to_arg() -> &'static str {
 #[must_use]
 pub(crate) fn plugin_prune_arg() -> &'static str {
     t("删除旧版本产物", "delete old version artifacts")
+}
+
+#[must_use]
+pub(crate) fn plugin_yes_arg() -> &'static str {
+    t(
+        "跳过确认提问（不跳过高风险能力的显式 grant）",
+        "skip confirmation prompts (does not skip explicit grant for high-risk capabilities)",
+    )
 }
 
 #[must_use]

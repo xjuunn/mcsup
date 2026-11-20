@@ -1689,11 +1689,19 @@ fn plugin_revocations_reject_plain_http() {
 
 fn write_plugin_artifact(root: &Path) {
     std::fs::create_dir_all(root.join("bin")).expect("create bin");
+    // 入口文件按平台命名：Windows 上 `check_entry_file` 要求 `.exe` 扩展名。
+    // 这些用例只走安装流水线，不真的运行插件，文件内容无关紧要。
+    #[cfg(windows)]
+    let (entry_rel, entry_cmd) = ("bin/demo.exe", "bin/demo.exe");
+    #[cfg(not(windows))]
+    let (entry_rel, entry_cmd) = ("bin/demo", "bin/demo");
     std::fs::write(
         root.join("manifest.json"),
-        r#"{"schema":1,"id":"demo","name":"Demo","version":"0.1.0","api":1,
-            "entry":{"type":"process","cmd":"bin/demo"},
-            "capabilities":["events"],"license":"MIT"}"#,
+        format!(
+            r#"{{"schema":1,"id":"demo","name":"Demo","version":"0.1.0","api":1,
+            "entry":{{"type":"process","cmd":"{entry_cmd}"}},
+            "capabilities":["events"],"license":"MIT"}}"#
+        ),
     )
     .expect("write manifest");
     std::fs::write(
@@ -1707,14 +1715,15 @@ fn write_plugin_artifact(root: &Path) {
                     "input":{"type":"object"},"output":{"type":"object"}}]}"#,
     )
     .expect("write descriptor");
-    std::fs::write(root.join("bin/demo"), "#!/bin/sh\nexit 0\n").expect("write entry");
+    // Windows 上入口还必须带 PE 头（MZ）：写两字节占位即可，测试不真的运行它。
+    #[cfg(windows)]
+    std::fs::write(root.join(entry_rel), b"MZ").expect("write PE stub");
+    #[cfg(not(windows))]
+    std::fs::write(root.join(entry_rel), "#!/bin/sh\nexit 0\n").expect("write entry");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            root.join("bin/demo"),
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .expect("chmod entry");
+        std::fs::set_permissions(root.join(entry_rel), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod entry");
     }
 }

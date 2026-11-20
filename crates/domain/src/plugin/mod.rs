@@ -33,6 +33,27 @@ pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 /// descriptor schema 版本
 pub const DESCRIPTOR_SCHEMA_VERSION: u32 = 1;
 
+/// 当前平台标识：`darwin-arm64` / `linux-x64` / `win32-x64`
+///
+/// manifest 的 `entry.platforms` 键与 Git 来源索引的 `platform` 字段共用这一
+/// 套命名。安装（`provider`）与运行（`plugin`）都要选平台产物，放在领域层
+/// 才能保证两边不会在新增平台时分叉。
+#[must_use]
+pub fn platform_key() -> String {
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        "windows" => "win32",
+        other => other,
+    };
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        "x86" => "x86",
+        other => other,
+    };
+    format!("{os}-{arch}")
+}
+
 /// 插件进程退出码（`plugins.md` §6.7）
 ///
 /// SDK 与宿主共用这一份定义：Rust SDK 直接引用，TypeScript / Python 由

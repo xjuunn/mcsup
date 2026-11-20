@@ -8,8 +8,8 @@
 
 | 阶段 | 内容 | 状态 |
 | --- | --- | --- |
-| M0 | 契约冻结：manifest / descriptor / 能力 / 状态 / 错误码 / 帧 | 完成（conformance 清单目录未建，见「偏差」） |
-| M1 | 宿主进程、握手、帧循环、退避、空闲回收；最小能力与 CLI | 完成（Rust SDK 未在本仓库提供） |
+| M0 | 契约冻结：manifest / descriptor / 能力 / 状态 / 错误码 / 帧 | 完成（conformance 清单目录已建，`SDK-BHV-001..013` 已登记，见 `sdks/conformance/README.md`；render / security 用例待 runner 支持后登记） |
+| M1 | 宿主进程、握手、帧循环、退避、空闲回收；最小能力、事件链路与 CLI | 完成（Rust SDK 未在本仓库提供） |
 | M2 | 写能力、出站代发、契约路由、配置回滚与隔离 | 完成 |
 | M3 | 生命周期、备份、文件、内容能力；六类展示投影 | 完成（REST / WS、MCP 入口不在本仓库） |
 | M4 | `java` 能力 | 完成 |
@@ -33,10 +33,31 @@
 
 - `crates/plugin`：进程拉起、端点、握手（失败诊断含退出方式与日志尾部）、
   心跳、帧循环、退避、空闲回收、隔离 / 熔断。
+- 平台端点：Unix socket / Windows 命名管道（插件端点
+  `\\.\pipe\mcsup-plugin-<hash>`、控制端点
+  `\\.\pipe\mcsup-plugin-host-<hash>`），不可用时回退回环 TCP；Windows 插件
+  进程放进带 `KILL_ON_JOB_CLOSE` 的 Job Object，宿主退出时整棵进程树一并终止
+  （`win32job` 安全封装，避免 `unsafe`）。
+- 宿主 op 执行约束：`call` / `stream` 执行前读已安装的 `descriptor.json`
+  校验输入 schema 与超时（判定收敛在 `plugin::host::op_constraints`）。
+- 控制通道 `grant`：授予判定收敛在 `PluginRecord::grant_capability`，
+  错误统一按 `invalid_input` 报出。
 - `service::plugin::HostApiImpl`：`ServerRead` / `ConsoleIo`。
 - `storage`：`PluginStore` / `KvStore` / `SecretStore` / `AuditSink`。
-- `provider`：`ArtifactSource`（`from` / `url` / GitHub `git`）、
+- `provider`：`ArtifactSource`（`from` / `url` / `git` tag / SHA，git 来源经
+  `mcsup-plugin.json` 索引解析，安装记录固定到 commit）、
   `ArtifactVerifier`（摘要校验）。
+- 事件链路：常驻宿主跟随 `console.log`，发布 `console:line` 与解析出的
+  `chat:message` / `player:joined` / `player:left`。
+- 安装与升级：按 id 安装锁；升级先停进程、保留 `enabled` 与仍声明的授权、
+  默认保留 2 个版本（`--prune` 只留当前）；`update --to` 切换到已安装的
+  版本（`PluginService::activate_version`）。
+- op 执行约束：宿主按 descriptor 校验输入 schema，超时取 descriptor 声明的
+  `timeout_ms`；授权判定收敛到 `PluginRecord::grant_capability` /
+  `revoke_capability` 与 `PluginState::after_grant` / `after_revoke`。
+- 风险映射与确认：`auth::Role::for_risk` 把 op 风险（`read` / `mutating` /
+  `destructive`）映射到最低角色，未知分级按 `Admin` 处理；CLI 的
+  `plugin call` / `install` / `update` 在交互模式下先确认，`--yes` 跳过提问。
 - CLI：`list` / `install` / `enable` / `disable` / `status` / `call` /
   `ops` / `logs` / `config` / `grant` / `revoke` / `restart` / `rollback` /
   `block` / `unblock` / `quarantine` / `release` / `doctor` 等。
@@ -101,6 +122,14 @@
 ## 待办
 
 按依赖顺序：
+
+0. 测试 ID 对齐：`crates/plugin/tests/host_lifecycle.rs` 中与矩阵对应的用例已带
+   ID 前缀（`CON-RTE-*` / `HOST-HB-*` / `PROTO-STR-004` / `PROTO-CTL-001` 等）；
+   其余 Rust 测试与 `cases.json` 的全量 ID 集合比对（`PLAT-011`）待
+   `scripts/check-plugin-tests.sh` 类汇总步骤立项后收口。
+   fixture 插件已实现 §5.5 全部 20 种故障注入模式（`MCSUP_FIXTURE_MODE`），
+   部分模式（sleep-handshake / oversize / event-drop / stdout-flood 等）尚缺
+   对应的宿主侧集成测试用例。
 
 1. 撤销列表的自动拉取：当前只能 `plugin revocations fetch` 手工更新，尚无内置
    定时任务与上游地址配置（需市场侧先确定地址与格式）。

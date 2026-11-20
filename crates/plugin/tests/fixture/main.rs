@@ -13,6 +13,14 @@
 //!
 //! 这个 bin 只在 `fixture` feature 下构建；集成测试通过
 //! `CARGO_BIN_EXE_plugin-fixture` 找到它，复制进伪产物目录后拉起。
+//!
+//! 故障注入模式：`MCSUP_FIXTURE_MODE` 环境变量选择 docs/plugins-testing.md
+//! §5.5 的行为表；缺省即 `ok` 模式。已实现：`sleep-handshake`、`reject-api`、
+//! `deny-token`、`unknown-frame`、`oversize`、`crash-start`、`crash-after`、
+//! `ignore-ping`（等价 `mute_pong` op）、`ignore-cancel`、`stream-gap`、
+//! `slow-op`、`bad-config`、`stdout-json`、`stdout-flood`、`exit-2`、
+//! `reentry`（等价 `call_contract`）、`secret-leak`、`event-drop`、
+//! `multi-instance`。
 
 use domain::plugin::error::PluginErrorCode;
 use protocol::plugin::{
@@ -24,6 +32,12 @@ use std::net::TcpStream;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
+
+#[cfg(windows)]
+use interprocess::TryClone as _;
+#[cfg(windows)]
+use interprocess::local_socket::prelude::*;
 
 #[cfg(unix)]
 enum Stream {
@@ -31,7 +45,13 @@ enum Stream {
     Unix(UnixStream),
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+enum Stream {
+    Tcp(TcpStream),
+    Pipe(interprocess::local_socket::Stream),
+}
+
+#[cfg(not(any(unix, windows)))]
 enum Stream {
     Tcp(TcpStream),
 }
@@ -45,7 +65,16 @@ impl Stream {
         {
             Ok(Self::Unix(UnixStream::connect(address)?))
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let name = address
+                .to_fs_name::<interprocess::os::windows::local_socket::NamedPipe>()
+                .map_err(io::Error::other)?;
+            Ok(Self::Pipe(interprocess::local_socket::Stream::connect(
+                name,
+            )?))
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -59,6 +88,8 @@ impl Stream {
             Self::Tcp(stream) => Ok(Self::Tcp(stream.try_clone()?)),
             #[cfg(unix)]
             Self::Unix(stream) => Ok(Self::Unix(stream.try_clone()?)),
+            #[cfg(windows)]
+            Self::Pipe(stream) => Ok(Self::Pipe(stream.try_clone()?)),
         }
     }
 }
@@ -69,6 +100,8 @@ impl Read for Stream {
             Self::Tcp(stream) => stream.read(buf),
             #[cfg(unix)]
             Self::Unix(stream) => stream.read(buf),
+            #[cfg(windows)]
+            Self::Pipe(stream) => stream.read(buf),
         }
     }
 }
@@ -79,6 +112,8 @@ impl Write for Stream {
             Self::Tcp(stream) => stream.write(buf),
             #[cfg(unix)]
             Self::Unix(stream) => stream.write(buf),
+            #[cfg(windows)]
+            Self::Pipe(stream) => stream.write(buf),
         }
     }
 
@@ -87,6 +122,8 @@ impl Write for Stream {
             Self::Tcp(stream) => stream.flush(),
             #[cfg(unix)]
             Self::Unix(stream) => stream.flush(),
+            #[cfg(windows)]
+            Self::Pipe(stream) => stream.flush(),
         }
     }
 }
@@ -95,38 +132,155 @@ impl Write for Stream {
 static NEXT_CALL_ID: AtomicU64 = AtomicU64::new(1);
 /// 故障注入：置位后不再回应 `ping`，让宿主在 `miss_limit` 后判定失联
 static MUTE_PONG: AtomicBool = AtomicBool::new(false);
+/// 故障注入：收到 `cancel` 后继续发流
+static IGNORE_CANCEL: AtomicBool = AtomicBool::new(false);
 
 type Outcome = Result<Value, WireError>;
 
-// 测试 fixture：stderr 由宿主采集进插件日志，是唯一可观测输出通道
-#[allow(clippy::print_stderr)]
-fn main() -> io::Result<()> {
-    let endpoint = parse_endpoint()?;
-    let token = env_or("MCSUP_PLUGIN_TOKEN", "");
-    let plugin_id = env_or("MCSUP_PLUGIN_ID", "fixture");
-    let scope = env_or("MCSUP_PLUGIN_SCOPE", "machine");
-    let stream = Stream::connect(&endpoint)?;
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut writer = stream;
+/// docs/plugins-testing.md §5.5 的故障注入模式
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Ok,
+    SleepHandshake,
+    RejectApi,
+    DenyToken,
+    UnknownFrame,
+    Oversize,
+    CrashStart,
+    CrashAfter,
+    IgnoreCancel,
+    SlowOp,
+    BadConfig,
+    StdoutJson,
+    StdoutFlood,
+    Exit2,
+    SecretLeak,
+    EventDrop,
+    MultiInstance,
+}
 
+fn mode() -> Mode {
+    match env_or("MCSUP_FIXTURE_MODE", "ok").as_str() {
+        "sleep-handshake" => Mode::SleepHandshake,
+        "reject-api" => Mode::RejectApi,
+        "deny-token" => Mode::DenyToken,
+        "unknown-frame" => Mode::UnknownFrame,
+        "oversize" => Mode::Oversize,
+        "crash-start" => Mode::CrashStart,
+        "crash-after" => Mode::CrashAfter,
+        "ignore-cancel" => Mode::IgnoreCancel,
+        "slow-op" => Mode::SlowOp,
+        "bad-config" => Mode::BadConfig,
+        "stdout-json" => Mode::StdoutJson,
+        "stdout-flood" => Mode::StdoutFlood,
+        "exit-2" => Mode::Exit2,
+        "secret-leak" => Mode::SecretLeak,
+        "event-drop" => Mode::EventDrop,
+        "multi-instance" => Mode::MultiInstance,
+        _ => Mode::Ok,
+    }
+}
+
+/// 帧循环前的故障注入阶段：crash、握手变体、stdout 注入、event-drop
+///
+/// 返回 `None` 表示进程应立即正常退出（oversize / event-drop 不再进帧循环）。
+#[allow(clippy::print_stderr, clippy::print_stdout)]
+fn pre_loop(selected: Mode) -> io::Result<Option<(BufReader<Stream>, Stream)>> {
+    // crash-start：握手前退出码 1
+    if selected == Mode::CrashStart {
+        return Err(io::Error::other("fixture crash-start"));
+    }
+    // secret-leak：把配置里的密钥打到 stdout（宿主采集时应被 `***` 打码）
+    if selected == Mode::SecretLeak {
+        println!("token={}", env_or("MCSUP_PLUGIN_TOKEN", ""));
+    }
+    let endpoint = parse_endpoint()?;
+    let mut token = env_or("MCSUP_PLUGIN_TOKEN", "");
+    let mut api = domain::plugin::PLUGIN_API_VERSION;
+    if selected == Mode::DenyToken {
+        token = "wrong-token".into();
+    }
+    if selected == Mode::RejectApi {
+        api = domain::plugin::PLUGIN_API_VERSION + 1;
+    }
+    // sleep-handshake：连接后 30 s 才发 hello，宿主按握手超时处理
+    if selected == Mode::SleepHandshake {
+        std::thread::sleep(Duration::from_secs(30));
+    }
+    let stream = Stream::connect(&endpoint)?;
+    let mut writer = stream;
+    // multi-instance：占住端点后再连一次，第二个实例必须被拒
+    let _second = if selected == Mode::MultiInstance {
+        Some(Stream::connect(&endpoint)?)
+    } else {
+        None
+    };
     let hello = Hello {
         token,
-        api: domain::plugin::PLUGIN_API_VERSION,
-        plugin_id,
+        api,
+        plugin_id: env_or("MCSUP_PLUGIN_ID", "fixture"),
         plugin_version: env!("CARGO_PKG_VERSION").to_owned(),
         platform: plugin::process::platform_key(),
         pid: std::process::id(),
         requested: Vec::new(),
         subscriptions: Vec::new(),
     };
-    let _ = scope;
     write_frame(&mut writer, &Frame::Hello(hello)).map_err(frame_io)?;
+    if selected == Mode::EventDrop {
+        // event-drop：不读端点，宿主事件队列溢出后丢最旧，随后心跳失联收尾
+        std::thread::sleep(Duration::from_secs(60));
+        return Ok(None);
+    }
+    // oversize：握手后发 1 MiB + 1 字节超限帧，宿主必须按协议错误终止。
+    // 超限帧会被宿主断开；继续读只会得到 EOF，直接退出。
+    if selected == Mode::Oversize {
+        let payload = vec![b'a'; protocol::plugin::MAX_FRAME_BYTES + 1];
+        writer.write_all(&payload).map_err(io::Error::other)?;
+        return Ok(None);
+    }
+    // unknown-frame：握手后发未知 type 的原始 JSON 行，宿主必须忽略并继续工作
+    if selected == Mode::UnknownFrame {
+        let unknown = json!({
+            "v": protocol::plugin::PLUGIN_PROTOCOL_VERSION,
+            "type": "future.frame",
+            "payload": {},
+        });
+        writeln!(writer, "{unknown}").map_err(io::Error::other)?;
+    }
+    // stdout-json：向 stdout 打印完整 JSON 帧，宿主不得把它当作协议帧
+    if selected == Mode::StdoutJson {
+        println!("{{\"v\":1,\"type\":\"call\",\"id\":999,\"op\":\"bogus\",\"input\":{{}}}}");
+    }
+    // stdout-flood：1 s 打 1000 行，验证限速丢弃与汇总
+    if selected == Mode::StdoutFlood {
+        for _ in 0..1000 {
+            println!("flood line");
+        }
+        io::stdout().flush().ok();
+    }
     eprintln!(
         "fixture ready: {}@{}",
         env!("CARGO_PKG_NAME"),
         env!("CARGO_PKG_VERSION")
     );
+    if selected == Mode::IgnoreCancel {
+        IGNORE_CANCEL.store(true, Ordering::SeqCst);
+    }
+    // crash-after：握手成功后立即崩溃（退出码 1）
+    if selected == Mode::CrashAfter {
+        return Err(io::Error::other("fixture crash-after"));
+    }
+    let reader = BufReader::new(writer.try_clone()?);
+    Ok(Some((reader, writer)))
+}
 
+// 测试 fixture：stderr 由宿主采集进插件日志，是唯一可观测输出通道
+#[allow(clippy::print_stderr)]
+fn main() -> io::Result<()> {
+    let selected = mode();
+    let Some((mut reader, mut writer)) = pre_loop(selected)? else {
+        return Ok(());
+    };
     let mut stream_seq = 0_u64;
     let mut config_revision = 0_u64;
     loop {
@@ -146,14 +300,29 @@ fn main() -> io::Result<()> {
                     write_frame(&mut writer, &Frame::Pong(seq)).map_err(frame_io)?;
                 }
             }
-            Frame::Shutdown { .. } | Frame::Reject(_) => return Ok(()),
+            Frame::Shutdown { .. } => {
+                // exit-2：收到 shutdown 后以退出码 2 结束
+                if selected == Mode::Exit2 {
+                    std::process::exit(2);
+                }
+                return Ok(());
+            }
+            Frame::Reject(_) => return Ok(()),
             Frame::Welcome(welcome) => config_revision = welcome.config.revision,
             Frame::Config(config) => {
                 config_revision = config.revision;
-                let result = ResultFrame::ok(
-                    config.id,
-                    serde_json::json!({ "revision": config.revision }),
-                );
+                let result = if selected == Mode::BadConfig {
+                    // bad-config：对 config 回 ok:false，宿主应回滚旧 revision
+                    ResultFrame::error(
+                        config.id,
+                        WireError::from_code(
+                            PluginErrorCode::InvalidInput,
+                            "fixture rejects config",
+                        ),
+                    )
+                } else {
+                    ResultFrame::ok(config.id, json!({ "revision": config.revision }))
+                };
                 write_frame(&mut writer, &Frame::Result(result)).map_err(frame_io)?;
             }
             Frame::Unknown { .. }
@@ -166,6 +335,9 @@ fn main() -> io::Result<()> {
         }
     }
 }
+
+/// docs/plugins-testing.md §5.5：slow-op 模式下 echo 延迟 5 s，宿主按超时处理
+const SLOW_OP_DELAY: Duration = Duration::from_secs(5);
 
 fn handle_call(
     reader: &mut BufReader<Stream>,
@@ -234,6 +406,10 @@ fn handle_call(
             Ok(stream_seq)
         }
         _ => {
+            // slow-op：echo 延迟 5 s，宿主按 op 超时处理
+            if mode() == Mode::SlowOp {
+                std::thread::sleep(SLOW_OP_DELAY);
+            }
             let result = ResultFrame::ok(
                 call.id,
                 serde_json::json!({

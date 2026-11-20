@@ -306,6 +306,50 @@ pub fn granted(
         .collect()
 }
 
+/// 授权判定的错误
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantError {
+    /// 能力不在 manifest 声明内
+    NotDeclared(Capability),
+    /// 能力在当前版本不可用（closed stage）
+    NotOpen(Capability),
+    /// 能力尚未授予，无法撤销
+    NotGranted(Capability),
+}
+
+impl fmt::Display for GrantError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotDeclared(cap) => write!(f, "capability {cap} is not declared"),
+            Self::NotOpen(cap) => {
+                write!(f, "capability {cap} is not available in this version")
+            }
+            Self::NotGranted(cap) => write!(f, "capability {cap} is not granted"),
+        }
+    }
+}
+
+/// 授权前判定：能力必须已声明且当前版本可用
+///
+/// 不改任何状态；是否修改授予集合与状态迁移由调用方按返回值处理。
+///
+/// # Errors
+///
+/// 未声明返回 [`GrantError::NotDeclared`]，closed stage 返回
+/// [`GrantError::NotOpen`]
+pub fn check_grantable(
+    declared: &BTreeSet<Capability>,
+    capability: Capability,
+) -> Result<(), GrantError> {
+    if !declared.contains(&capability) {
+        return Err(GrantError::NotDeclared(capability));
+    }
+    if !capability.is_open() {
+        return Err(GrantError::NotOpen(capability));
+    }
+    Ok(())
+}
+
 /// 未开放能力的声明检查
 ///
 /// 返回声明了但 v1 不开放的能力，供安装直接拒绝。

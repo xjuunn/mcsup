@@ -48,7 +48,7 @@ pub fn load_revocation_list(path: &Path) -> Result<Option<RevocationList>, HostE
             path.display()
         )));
     }
-    private_file::check_permissions(path, &metadata, false)?;
+    private_file::check_permissions(path, &metadata, false);
     let file = std::fs::File::open(path).map_err(|err| {
         HostError::internal(format!("open revocation list {}: {err}", path.display()))
     })?;

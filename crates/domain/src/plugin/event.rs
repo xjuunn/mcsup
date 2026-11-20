@@ -147,6 +147,7 @@ pub fn subscription_of(event: &DomainEvent) -> Subscription {
         DomainEvent::JarDownloadCompleted { .. } | DomainEvent::JarDownloadFailed { .. } => {
             Subscription::ConsoleLine
         }
+        DomainEvent::ConsoleLine { .. } => Subscription::ConsoleLine,
     }
 }
 

@@ -23,7 +23,7 @@ env:
     mcsup-domain mcsup-auth mcsup-port mcsup-protocol
     mcsup-file mcsup-java mcsup-provider mcsup-storage
     mcsup-backup mcsup-modkit mcsup-runtime mcsup-transport
-    mcsup-service mcsup-backend
+    mcsup-plugin mcsup-service mcsup-backend
 
 jobs:
   verify:

@@ -10,6 +10,7 @@ pub mod mojang;
 pub mod neoforge;
 pub mod papermc;
 pub mod plugin;
+mod plugin_git;
 pub mod plugin_net;
 pub mod plugin_revoke;
 pub mod plugin_revoke_file;

@@ -125,18 +125,7 @@ impl SpawnPlan {
 /// 平台标识：`darwin-arm64` / `linux-x64` / `win32-x64`
 #[must_use]
 pub fn platform_key() -> String {
-    let os = match std::env::consts::OS {
-        "macos" => "darwin",
-        "windows" => "win32",
-        other => other,
-    };
-    let arch = match std::env::consts::ARCH {
-        "x86_64" => "x64",
-        "aarch64" => "arm64",
-        "x86" => "x86",
-        other => other,
-    };
-    format!("{os}-{arch}")
+    domain::plugin::platform_key()
 }
 
 fn check_executable(path: &Path) -> Result<(), HostError> {
@@ -169,6 +158,9 @@ fn check_executable(path: &Path) -> Result<(), HostError> {
 pub struct SpawnedPlugin {
     child: Child,
     pid: u32,
+    /// 进程树随宿主退出：句柄关闭即终止插件与其子进程
+    #[cfg(windows)]
+    job: Option<crate::job::JobObject>,
 }
 
 impl std::fmt::Debug for SpawnedPlugin {
@@ -207,6 +199,16 @@ impl SpawnedPlugin {
                 )
             })?;
         let pid = child.id();
+        // 进程树清理是安全兜底：Job Object 建不出来时插件仍可运行，降级为
+        // 只杀直接子进程（与 Unix 平台行为一致）。
+        #[cfg(windows)]
+        let job = match crate::job::JobObject::assign(&child) {
+            Ok(job) => Some(job),
+            Err(err) => {
+                tracing::warn!(plugin = %plan.prefix, error = %err, "job object unavailable; plugin subtree will not follow host exit");
+                None
+            }
+        };
         let writer = match OpenOptions::new()
             .create(true)
             .append(true)
@@ -225,7 +227,19 @@ impl SpawnedPlugin {
                 collect(stderr, writer.clone(), prefix, redact);
             }
         }
-        Ok(Self { child, pid })
+        Ok(Self {
+            child,
+            pid,
+            #[cfg(windows)]
+            job,
+        })
+    }
+
+    /// 是否已把进程树交给 Job Object 管理（Windows）
+    #[cfg(all(windows, test))]
+    #[must_use]
+    pub(crate) fn has_job_object(&self) -> bool {
+        self.job.is_some()
     }
 
     /// 进程号
@@ -247,6 +261,11 @@ impl SpawnedPlugin {
     pub fn kill(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // 直接子进程已回收，接着关掉 Job 句柄：插件自己拉起的子进程不能留下。
+        #[cfg(windows)]
+        {
+            drop(self.job.take());
+        }
     }
 
     /// 在 `timeout` 内等待退出；返回是否已退出
@@ -267,6 +286,11 @@ impl Drop for SpawnedPlugin {
         // 会话异常结束时不留下孤儿进程。正常停机路径已先行等待退出。
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // 关闭 Job 句柄：插件拉起的整棵进程树随宿主一起终止。
+        #[cfg(windows)]
+        {
+            drop(self.job.take());
+        }
     }
 }
 
@@ -441,6 +465,27 @@ mod tests {
                 .map(|index| SecretValue::from_text(format!("secret-value-{index:04}"))),
         );
         assert_eq!(plan.redact.len(), MAX_REDACT_VALUES);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn spawn_assigns_a_job_object() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let program = std::env::var_os("COMSPEC").map_or_else(
+            || PathBuf::from(r"C:\Windows\System32\cmd.exe"),
+            PathBuf::from,
+        );
+        let mut plan = plan();
+        plan.program = program;
+        plan.cwd = dir.path().to_path_buf();
+        plan.args = vec!["/C".to_owned(), "exit".to_owned(), "0".to_owned()];
+        plan.log_file = dir.path().join("plugin.log");
+        let mut spawned = SpawnedPlugin::spawn(&plan).expect("spawn");
+        assert!(
+            spawned.has_job_object(),
+            "spawn must assign the plugin process to a job object"
+        );
+        assert!(spawned.wait_timeout(Duration::from_secs(5)));
     }
 
     #[test]

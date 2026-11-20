@@ -1,0 +1,1 @@
+{ "scenario": "unknown-frame", "inject": { "type": "future.frame", "payload": {} }, "op": "counter", "op_kind": "query", "input": { "channel": "global" } }

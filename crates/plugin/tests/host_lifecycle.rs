@@ -152,7 +152,44 @@ fn install_fixture(data_dir: &Path, id: &PluginId) -> PathBuf {
         }
     }
     warm_up_fixture(&target, &artifact_dir.join("warmup-missing.sock"));
+    write_fixture_descriptor(&artifact_dir, id);
     artifact_dir
+}
+
+/// fixture 插件不经过 `service::install`，`descriptor.json` 由测试补齐
+///
+/// `PluginHost::call` / `stream` 执行前按已安装的 descriptor 校验输入与超时，
+/// 缺文件时按安装损坏处理。这里声明 fixture 会应答的全部 op。
+fn write_fixture_descriptor(artifact_dir: &Path, id: &PluginId) {
+    let object = || json!({ "type": "object" });
+    let op = |id: &str, kind: &str, risk: &str| {
+        json!({
+            "id": id,
+            "kind": kind,
+            "title": id,
+            "risk": risk,
+            "input": object(),
+            "output": object(),
+        })
+    };
+    let descriptor = json!({
+        "schema": domain::plugin::DESCRIPTOR_SCHEMA_VERSION,
+        "plugin_id": id.as_str(),
+        "api": domain::plugin::PLUGIN_API_VERSION,
+        "ops": [
+            op("echo", "query", "read"),
+            op("stream", "stream", "read"),
+            op("stream_gap", "stream", "read"),
+            op("fail", "action", "mutating"),
+            op("mute_pong", "action", "mutating"),
+            op("call_contract", "action", "mutating"),
+        ],
+    });
+    std::fs::write(
+        artifact_dir.join("descriptor.json"),
+        serde_json::to_vec(&descriptor).expect("encode descriptor"),
+    )
+    .expect("write descriptor");
 }
 
 /// 预热 fixture，把首次执行的开销挪到握手计时之外
@@ -261,7 +298,7 @@ fn host_with_audit(
 }
 
 #[test]
-fn host_starts_calls_streams_and_stops_fixture() {
+fn host_prc_001_starts_calls_streams_and_stops_fixture() {
     let dir = tempfile::tempdir().expect("tempdir");
     let data_dir = dir.path().to_path_buf();
     let id = fixture_id();
@@ -315,7 +352,7 @@ fn host_starts_calls_streams_and_stops_fixture() {
 /// 宿主侧职责（plugins.md §6.7：心跳超时 → 关闭端点 + 强杀）。fixture 用
 /// `mute_pong` 置位后静默，这里确认会话被摘除且不再应答调用。
 #[test]
-fn muted_plugin_is_closed_by_heartbeat_timeout() {
+fn host_hb_002_muted_plugin_is_closed_by_heartbeat_timeout() {
     let dir = tempfile::tempdir().expect("tempdir");
     let data_dir = dir.path().to_path_buf();
     let id = fixture_id();
@@ -362,7 +399,7 @@ fn muted_plugin_is_closed_by_heartbeat_timeout() {
 
 /// 流式缺口：seq 不连续时宿主终止流，不把残缺序列当作成功
 #[test]
-fn stream_seq_gap_terminates_the_stream() {
+fn proto_str_004_stream_seq_gap_terminates_the_stream() {
     let dir = tempfile::tempdir().expect("tempdir");
     let data_dir = dir.path().to_path_buf();
     let id = fixture_id();
@@ -390,7 +427,7 @@ fn stream_seq_gap_terminates_the_stream() {
 /// 监管线程每 250 ms 轮询一次存活状态，崩溃退避从 1 s 起。停机后 1.6 s 仍
 /// 没有会话，才算「停止」真的停住了；`stop` 先摘会话时这里会重新拉起。
 #[test]
-fn stopped_plugin_is_not_auto_restarted() {
+fn host_prc_009_stopped_plugin_is_not_auto_restarted() {
     let dir = tempfile::tempdir().expect("tempdir");
     let data_dir = dir.path().to_path_buf();
     let id = fixture_id();
@@ -413,7 +450,7 @@ fn stopped_plugin_is_not_auto_restarted() {
 }
 
 #[test]
-fn disabled_plugin_is_rejected_before_spawn() {
+fn host_prc_010_disabled_plugin_is_rejected_before_spawn() {
     let dir = tempfile::tempdir().expect("tempdir");
     let data_dir = dir.path().to_path_buf();
     let id = fixture_id();
@@ -429,7 +466,7 @@ fn disabled_plugin_is_rejected_before_spawn() {
 }
 
 #[test]
-fn handshake_identity_mismatch_is_reported_as_crashed() {
+fn proto_hsk_003_handshake_identity_mismatch_is_reported_as_crashed() {
     let dir = tempfile::tempdir().expect("tempdir");
     let data_dir = dir.path().to_path_buf();
     let id = fixture_id();
@@ -446,7 +483,7 @@ fn handshake_identity_mismatch_is_reported_as_crashed() {
 }
 
 #[test]
-fn welcome_and_live_config_reach_the_plugin() {
+fn proto_cfg_001_welcome_and_live_config_reach_the_plugin() {
     let dir = tempfile::tempdir().expect("tempdir");
     let data_dir = dir.path().to_path_buf();
     let id = fixture_id();
@@ -482,7 +519,7 @@ fn welcome_and_live_config_reach_the_plugin() {
 }
 
 #[test]
-fn blocked_and_quarantined_plugins_are_rejected_before_spawn() {
+fn cap_gate_006_blocked_and_quarantined_plugins_are_rejected_before_spawn() {
     let dir = tempfile::tempdir().expect("tempdir");
     let data_dir = dir.path().to_path_buf();
     let id = fixture_id();
@@ -506,7 +543,7 @@ fn blocked_and_quarantined_plugins_are_rejected_before_spawn() {
 }
 
 #[test]
-fn control_channel_lists_calls_and_shuts_down() {
+fn proto_ctl_001_control_channel_lists_calls_and_shuts_down() {
     let dir = tempfile::tempdir().expect("tempdir");
     let data_dir = dir.path().to_path_buf();
     let id = fixture_id();
@@ -600,7 +637,7 @@ fn plugin_id(raw: &str) -> PluginId {
 }
 
 #[test]
-fn contract_broadcast_aggregates_responses_and_failures() {
+fn con_rte_001_contract_broadcast_aggregates_responses_and_failures() {
     let dir = tempfile::tempdir().expect("tempdir");
     let data_dir = dir.path().to_path_buf();
     let store = Arc::new(MemoryStore::default());
@@ -682,7 +719,7 @@ fn contract_broadcast_aggregates_responses_and_failures() {
 }
 
 #[test]
-fn contract_unicast_requires_target_when_multiple_providers() {
+fn con_rte_002_contract_unicast_requires_target_when_multiple_providers() {
     let dir = tempfile::tempdir().expect("tempdir");
     let data_dir = dir.path().to_path_buf();
     let store = Arc::new(MemoryStore::default());
@@ -745,7 +782,7 @@ fn contract_unicast_requires_target_when_multiple_providers() {
 }
 
 #[test]
-fn contract_cycle_is_rejected_as_conflict() {
+fn con_rte_005_contract_cycle_is_rejected_as_conflict() {
     let dir = tempfile::tempdir().expect("tempdir");
     let data_dir = dir.path().to_path_buf();
     let store = Arc::new(MemoryStore::default());
@@ -789,7 +826,7 @@ fn contract_cycle_is_rejected_as_conflict() {
 }
 
 #[test]
-fn contract_depth_is_bounded() {
+fn con_rte_006_contract_depth_is_bounded() {
     let dir = tempfile::tempdir().expect("tempdir");
     let data_dir = dir.path().to_path_buf();
     let store = Arc::new(MemoryStore::default());
@@ -848,7 +885,7 @@ fn contract_depth_is_bounded() {
 }
 
 #[test]
-fn contract_caller_must_declare_consumes() {
+fn con_rte_003_contract_caller_must_declare_consumes() {
     let dir = tempfile::tempdir().expect("tempdir");
     let data_dir = dir.path().to_path_buf();
     let store = Arc::new(MemoryStore::default());
@@ -881,7 +918,7 @@ fn contract_caller_must_declare_consumes() {
 }
 
 #[test]
-fn contract_unknown_trace_is_rejected() {
+fn con_rte_004_contract_unknown_trace_is_rejected() {
     let dir = tempfile::tempdir().expect("tempdir");
     let data_dir = dir.path().to_path_buf();
     let store = Arc::new(MemoryStore::default());
@@ -916,7 +953,7 @@ fn contract_unknown_trace_is_rejected() {
 }
 
 #[test]
-fn live_session_survives_heartbeat_windows() {
+fn host_hb_001_live_session_survives_heartbeat_windows() {
     // 心跳窗口 150ms × 3：活跃插件必须一直在线。旧实现发完 ping 立刻检查
     // pong，活跃会话也会在 3 个窗口后被误判超时并重启。
     let dir = tempfile::tempdir().expect("tempdir");

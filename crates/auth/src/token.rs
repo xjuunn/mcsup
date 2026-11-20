@@ -160,6 +160,23 @@ impl Role {
             .copied()
             .filter(move |permission| self.permits(*permission))
     }
+
+    /// 插件 op 风险对应的最低角色
+    ///
+    /// 风险分级是 `domain::plugin::descriptor::OpRisk`（`read` / `mutating` /
+    /// `destructive`）；auth 不依赖 domain，这里按线上文本映射，调用方传
+    /// `OpRisk::as_str()`（`domain::plugin::descriptor::OpRisk` 的方法；auth
+    /// 不依赖 domain，故不作 doc-link）。未知文本按最高风险处理：宁可多要权限，也不把
+    /// 破坏性操作放给只读角色。
+    #[must_use]
+    pub fn for_risk(risk: &str) -> Self {
+        match risk {
+            "read" => Self::Viewer,
+            "mutating" => Self::Operator,
+            // destructive 与任何未知分级都按 Admin 处理
+            _ => Self::Admin,
+        }
+    }
 }
 
 impl std::fmt::Display for Role {
@@ -450,6 +467,18 @@ mod tests {
         for permission in &operator {
             assert!(admin.contains(permission), "{permission} 必须被 Admin 继承");
         }
+    }
+
+    /// 插件 op 风险到最低角色的映射：未知分级按最高风险处理
+    #[test]
+    fn risk_to_role_mapping_is_total_and_conservative() {
+        assert_eq!(Role::for_risk("read"), Role::Viewer);
+        assert_eq!(Role::for_risk("mutating"), Role::Operator);
+        assert_eq!(Role::for_risk("destructive"), Role::Admin);
+        // 未知分级不能落在低角色上
+        assert_eq!(Role::for_risk("unknown"), Role::Admin);
+        assert_eq!(Role::for_risk(""), Role::Admin);
+        assert_eq!(Role::for_risk("READ"), Role::Admin, "匹配是精确的");
     }
 
     #[test]

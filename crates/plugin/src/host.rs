@@ -293,6 +293,28 @@ impl PluginHost {
         &self.bus
     }
 
+    /// 能力集合
+    ///
+    /// 控制台跟随线程需要 `server:read` 与 `console`，两者都由门面注入。
+    #[must_use]
+    pub fn services(&self) -> Option<&Arc<HostServices>> {
+        Some(&self.services)
+    }
+
+    /// 是否已进入关停流程
+    #[must_use]
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::SeqCst)
+    }
+
+    /// 启动控制台行 → 事件的后台线程
+    ///
+    /// 与 [`Self::spawn_idle_reaper`] 一样只由常驻宿主进程调用；线程持有弱
+    /// 引用，宿主丢弃或关停时自行退出。
+    pub fn spawn_console_events(self: &Arc<Self>) {
+        crate::console_events::spawn(self);
+    }
+
     /// 数据目录
     #[must_use]
     pub fn data_dir(&self) -> &Path {
@@ -681,6 +703,20 @@ impl PluginHost {
         })
     }
 
+    /// op 的执行约束：输入 schema 校验 + descriptor 声明的超时
+    ///
+    /// 判定收敛在执行入口：无论调用方走直连还是控制通道，输入合法性判定与
+    /// 超时都以已安装的 descriptor 为准，不信任调用方自带的数值。
+    fn op_constraints(
+        &self,
+        id: &PluginId,
+        op: &str,
+        input: &Value,
+        allow_stream: bool,
+    ) -> Result<Duration, HostError> {
+        op_constraints(&self.record(id)?, op, input, allow_stream)
+    }
+
     /// 握手时下发的配置：明文，插件需要用它工作
     fn welcome_config(&self, id: &PluginId) -> ConfigValues {
         match self.config_store.get(id) {
@@ -769,8 +805,9 @@ impl PluginSupervisor for PluginHost {
     }
 
     fn call(&self, id: &PluginId, op: &str, input: Value) -> Result<Value, HostError> {
+        let timeout = self.op_constraints(id, op, &input, false)?;
         let session = self.ensure_session(id)?;
-        session.call(op, input, session::default_timeout())
+        session.call(op, input, timeout)
     }
 
     fn stream(
@@ -780,8 +817,9 @@ impl PluginSupervisor for PluginHost {
         input: Value,
         sink: &mut dyn StreamSink,
     ) -> Result<(), HostError> {
+        let timeout = self.op_constraints(id, op, &input, true)?;
         let session = self.ensure_session(id)?;
-        session.stream(op, input, session::default_timeout(), sink)
+        session.stream(op, input, timeout, sink)
     }
 
     fn reload(&self) -> Result<(), HostError> {
@@ -820,6 +858,47 @@ impl PluginSupervisor for PluginHost {
         // 会话不在：配置已落盘，下次握手经 `welcome.config` 下发。
         Ok(())
     }
+}
+
+/// op 的执行约束：输入 schema 校验 + descriptor 声明的超时
+///
+/// 判定收敛在执行入口：无论调用方走直连还是控制通道，输入合法性判定与
+/// 超时都以已安装的 descriptor 为准，不信任调用方自带的数值。
+fn op_constraints(
+    record: &PluginRecord,
+    op: &str,
+    input: &Value,
+    allow_stream: bool,
+) -> Result<Duration, HostError> {
+    let path = record.artifact_dir.join("descriptor.json");
+    let bytes = std::fs::read(&path)
+        .map_err(|err| HostError::internal(format!("read descriptor for {}: {err}", record.id)))?;
+    let descriptor = domain::plugin::descriptor::Descriptor::from_json(&bytes, &record.id)
+        .map_err(|err| {
+            HostError::internal(format!("invalid descriptor for {}: {err}", record.id))
+        })?;
+    let resolved = descriptor.op(op).ok_or_else(|| {
+        HostError::not_found(format!("op {op} is not declared by plugin {}", record.id))
+    })?;
+    // call 入口不能触发 stream op；stream 入口只能订阅 stream op。
+    let is_stream = resolved.op.kind == domain::plugin::descriptor::OpKind::Stream;
+    if is_stream != allow_stream {
+        let hint = if is_stream {
+            "subscribe via stream instead of call"
+        } else {
+            "call it via call instead of stream"
+        };
+        return Err(HostError::invalid_input(format!(
+            "op {op} kind does not match the entry point; {hint}"
+        )));
+    }
+    domain::plugin::schema::validate_instance(&resolved.input, input, "input")
+        .map_err(|err| HostError::invalid_input(format!("input for op {op}: {err}")))?;
+    let timeout_ms = resolved
+        .op
+        .timeout_ms
+        .unwrap_or(domain::plugin::descriptor::DEFAULT_OP_TIMEOUT_MS);
+    Ok(Duration::from_millis(timeout_ms))
 }
 
 /// 离线状态：记录里没有实时会话时用于展示
@@ -950,6 +1029,76 @@ mod tests {
         assert!(!tail.contains("line 11"));
         let missing = PluginId::parse("missing").expect("id");
         assert!(plugin_log_tail(dir.path(), &missing).is_empty());
+    }
+
+    #[test]
+    fn op_constraints_validate_input_and_timeout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("descriptor.json"),
+            br#"{
+                "schema":1,
+                "plugin_id":"demo",
+                "api":1,
+                "ops":[{
+                    "id":"greet",
+                    "kind":"action",
+                    "title":"Greet",
+                    "risk":"read",
+                    "input":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]},
+                    "output":{"type":"object"},
+                    "timeout_ms":2500
+                },{
+                    "id":"follow",
+                    "kind":"stream",
+                    "title":"Follow",
+                    "risk":"read",
+                    "input":{"type":"object"},
+                    "output":{"type":"object"}
+                }]
+            }"#,
+        )
+        .expect("write descriptor");
+        let mut record = sample_record();
+        record.artifact_dir = dir.path().to_path_buf();
+
+        let input = serde_json::json!({ "name": "Steve" });
+        let timeout = op_constraints(&record, "greet", &input, false).expect("valid");
+        assert_eq!(timeout, Duration::from_millis(2_500));
+
+        let default = op_constraints(&record, "follow", &serde_json::json!({}), true)
+            .expect("stream without declared timeout");
+        assert_eq!(
+            default,
+            Duration::from_millis(domain::plugin::descriptor::DEFAULT_OP_TIMEOUT_MS)
+        );
+
+        // 缺必填字段
+        let err =
+            op_constraints(&record, "greet", &serde_json::json!({}), false).expect_err("required");
+        assert_eq!(err.code, port::plugin::ErrorCode::InvalidInput);
+
+        // 未声明的 op
+        let err =
+            op_constraints(&record, "nope", &serde_json::json!({}), false).expect_err("unknown op");
+        assert_eq!(err.code, port::plugin::ErrorCode::NotFound);
+
+        // kind 与入口不匹配
+        let err = op_constraints(&record, "follow", &serde_json::json!({}), false)
+            .expect_err("stream via call");
+        assert_eq!(err.code, port::plugin::ErrorCode::InvalidInput);
+        let err = op_constraints(&record, "greet", &input, true).expect_err("action via stream");
+        assert_eq!(err.code, port::plugin::ErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn op_constraints_reject_missing_descriptor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut record = sample_record();
+        record.artifact_dir = dir.path().to_path_buf();
+        let err =
+            op_constraints(&record, "greet", &serde_json::json!({}), false).expect_err("missing");
+        assert_eq!(err.code, port::plugin::ErrorCode::Internal);
     }
 
     fn sample_record() -> PluginRecord {

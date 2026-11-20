@@ -1,13 +1,22 @@
 //! 端点连接的统一视图
 //!
-//! Unix socket 与回环 TCP 的读写接口相同，差异集中在构造函数里。上层
-//! （握手、会话循环）只依赖本类型，不写 `cfg` 分支。
+//! Unix socket、Windows 命名管道与回环 TCP 的读写接口相同，差异集中在构造
+//! 函数里。上层（握手、会话循环）只依赖本类型，不写 `cfg` 分支。
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
+
+#[cfg(windows)]
+use interprocess::TryClone as _;
+#[cfg(windows)]
+use interprocess::local_socket::Stream as PipeStream;
+#[cfg(windows)]
+use interprocess::local_socket::prelude::*;
+#[cfg(windows)]
+use std::sync::{Mutex, MutexGuard};
 
 /// 一条已建立的插件连接
 #[derive(Debug)]
@@ -19,6 +28,8 @@ pub struct Connection {
 enum Inner {
     #[cfg(unix)]
     Unix(UnixStream),
+    #[cfg(windows)]
+    Pipe(Mutex<Option<PipeStream>>),
     Tcp(TcpStream),
 }
 
@@ -29,6 +40,15 @@ impl Connection {
     pub fn unix(stream: UnixStream) -> Self {
         Self {
             inner: Inner::Unix(stream),
+        }
+    }
+
+    /// 包装 Windows 命名管道
+    #[cfg(windows)]
+    #[must_use]
+    pub fn pipe(stream: PipeStream) -> Self {
+        Self {
+            inner: Inner::Pipe(Mutex::new(Some(stream))),
         }
     }
 
@@ -62,12 +82,21 @@ impl Connection {
         let inner = match &self.inner {
             #[cfg(unix)]
             Inner::Unix(stream) => Inner::Unix(stream.try_clone()?),
+            #[cfg(windows)]
+            Inner::Pipe(stream) => {
+                let guard = pipe_guard(stream)?;
+                let cloned = pipe_stream(&guard)?.try_clone()?;
+                Inner::Pipe(Mutex::new(Some(cloned)))
+            }
             Inner::Tcp(stream) => Inner::Tcp(stream.try_clone()?),
         };
         Ok(Self { inner })
     }
 
     /// 设置读超时
+    ///
+    /// Windows 命名管道不支持 I/O 超时，`interprocess` 返回 `Unsupported`。
+    /// 那是平台能力缺失而不是设置失败，放行由上层的心跳 / 截止时间兜底。
     ///
     /// # Errors
     ///
@@ -76,6 +105,11 @@ impl Connection {
         match &self.inner {
             #[cfg(unix)]
             Inner::Unix(stream) => stream.set_read_timeout(timeout),
+            #[cfg(windows)]
+            Inner::Pipe(stream) => {
+                let guard = pipe_guard(stream)?;
+                unsupported_ok(pipe_stream(&guard)?.set_recv_timeout(timeout))
+            }
             Inner::Tcp(stream) => stream.set_read_timeout(timeout),
         }
     }
@@ -92,11 +126,18 @@ impl Connection {
         match &self.inner {
             #[cfg(unix)]
             Inner::Unix(stream) => stream.set_nonblocking(nonblocking),
+            #[cfg(windows)]
+            Inner::Pipe(stream) => {
+                let guard = pipe_guard(stream)?;
+                pipe_stream(&guard)?.set_nonblocking(nonblocking)
+            }
             Inner::Tcp(stream) => stream.set_nonblocking(nonblocking),
         }
     }
 
     /// 设置写超时
+    ///
+    /// 同 [`Self::set_read_timeout`]：命名管道的 `Unsupported` 不算失败。
     ///
     /// # Errors
     ///
@@ -105,19 +146,66 @@ impl Connection {
         match &self.inner {
             #[cfg(unix)]
             Inner::Unix(stream) => stream.set_write_timeout(timeout),
+            #[cfg(windows)]
+            Inner::Pipe(stream) => {
+                let guard = pipe_guard(stream)?;
+                unsupported_ok(pipe_stream(&guard)?.set_send_timeout(timeout))
+            }
             Inner::Tcp(stream) => stream.set_write_timeout(timeout),
         }
     }
 
     /// 关闭读端与写端
+    ///
+    /// 命名管道没有半关闭：这里丢掉句柄（连同克隆出的读端一起）让对端读到
+    /// EOF；已关闭时重复调用是无害的。
     pub fn shutdown(&self) {
-        let result = match &self.inner {
+        match &self.inner {
             #[cfg(unix)]
-            Inner::Unix(stream) => stream.shutdown(std::net::Shutdown::Both),
-            Inner::Tcp(stream) => stream.shutdown(std::net::Shutdown::Both),
-        };
-        // 对端已关闭时 shutdown 返回 NotConnected，属正常情况。
-        let _ = result;
+            Inner::Unix(stream) => {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+            #[cfg(windows)]
+            Inner::Pipe(stream) => {
+                if let Ok(mut guard) = stream.lock() {
+                    let _ = guard.take();
+                }
+            }
+            Inner::Tcp(stream) => {
+                // 对端已关闭时 shutdown 返回 NotConnected，属正常情况。
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+}
+
+/// 命名管道句柄的互斥锁
+#[cfg(windows)]
+fn pipe_guard(
+    stream: &Mutex<Option<PipeStream>>,
+) -> io::Result<MutexGuard<'_, Option<PipeStream>>> {
+    stream
+        .lock()
+        .map_err(|_| io::Error::other("plugin pipe lock is poisoned"))
+}
+
+/// 已关闭的管道不能继续读写
+#[cfg(windows)]
+fn pipe_stream<'a>(guard: &'a MutexGuard<'_, Option<PipeStream>>) -> io::Result<&'a PipeStream> {
+    guard.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "plugin pipe connection is closed",
+        )
+    })
+}
+
+/// 平台不支持的超时设置放行；其余错误照常返回
+#[cfg(windows)]
+fn unsupported_ok(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(err) if err.kind() == io::ErrorKind::Unsupported => Ok(()),
+        other => other,
     }
 }
 
@@ -126,6 +214,14 @@ impl Read for Connection {
         match &mut self.inner {
             #[cfg(unix)]
             Inner::Unix(stream) => stream.read(buf),
+            #[cfg(windows)]
+            Inner::Pipe(stream) => {
+                let mut guard = pipe_guard(stream)?;
+                match guard.as_mut() {
+                    Some(stream) => stream.read(buf),
+                    None => Err(closed_pipe()),
+                }
+            }
             Inner::Tcp(stream) => stream.read(buf),
         }
     }
@@ -136,6 +232,14 @@ impl Write for Connection {
         match &mut self.inner {
             #[cfg(unix)]
             Inner::Unix(stream) => stream.write(buf),
+            #[cfg(windows)]
+            Inner::Pipe(stream) => {
+                let mut guard = pipe_guard(stream)?;
+                match guard.as_mut() {
+                    Some(stream) => stream.write(buf),
+                    None => Err(closed_pipe()),
+                }
+            }
             Inner::Tcp(stream) => stream.write(buf),
         }
     }
@@ -144,9 +248,25 @@ impl Write for Connection {
         match &mut self.inner {
             #[cfg(unix)]
             Inner::Unix(stream) => stream.flush(),
+            #[cfg(windows)]
+            Inner::Pipe(stream) => {
+                let mut guard = pipe_guard(stream)?;
+                match guard.as_mut() {
+                    Some(stream) => stream.flush(),
+                    None => Err(closed_pipe()),
+                }
+            }
             Inner::Tcp(stream) => stream.flush(),
         }
     }
+}
+
+#[cfg(windows)]
+fn closed_pipe() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::BrokenPipe,
+        "plugin pipe connection is closed",
+    )
 }
 
 #[cfg(test)]

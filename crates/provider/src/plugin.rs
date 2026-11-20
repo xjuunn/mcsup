@@ -61,6 +61,9 @@ impl ArtifactSource for PluginArtifactSource {
         }
         std::fs::create_dir_all(&root)
             .map_err(|err| HostError::internal(format!("create unpack dir: {err}")))?;
+        // git 来源额外要求包内 manifest 与索引声明一致，先记下期望值。
+        let mut git_expectation = None;
+        let mut resolved_source = None;
         let sha256 = match origin {
             ArtifactOrigin::Local(path) => {
                 if path.is_dir() {
@@ -80,19 +83,52 @@ impl ArtifactSource for PluginArtifactSource {
                 let _ = std::fs::remove_file(&archive);
                 sha
             }
-            ArtifactOrigin::Git { .. } => {
-                return Err(HostError::unsupported(
-                    "git plugin sources are not implemented yet; use --from or --url",
-                ));
+            ArtifactOrigin::Git { url, rev } => {
+                let source = crate::plugin_git::resolve(url, rev.as_deref(), dest_root)?;
+                let archive = dest_root.join("package.zip");
+                download(&source.artifact_url, &archive)?;
+                let size = std::fs::metadata(&archive)
+                    .map_err(|err| HostError::internal(format!("stat artifact: {err}")))?
+                    .len();
+                if let Some(expected) = source.size
+                    && size != expected
+                {
+                    return Err(HostError::invalid_input(format!(
+                        "artifact size mismatch: index declares {expected} bytes, got {size}"
+                    )));
+                }
+                let sha = digest_file(&archive)?;
+                if sha != source.sha256 {
+                    return Err(HostError::invalid_input(format!(
+                        "artifact sha256 mismatch: index declares {}, got {sha}",
+                        source.sha256
+                    )));
+                }
+                extract_archive(&archive, &root)?;
+                let _ = std::fs::remove_file(&archive);
+                // 安装记录要固定到 commit，而不是可移动的 tag。
+                resolved_source = Some(format!("git:{url}@{}", source.commit));
+                git_expectation = Some((source.id, source.version, source.api));
+                sha
             }
         };
         let root = unwrap_single_dir(root)?;
         let (manifest, descriptor) = read_metadata(&root)?;
+        if let Some((id, version, api)) = git_expectation
+            && (manifest.id != id || manifest.version != version || manifest.api != api)
+        {
+            return Err(HostError::invalid_input(format!(
+                "git index declares {id} {version} (api {api}), \
+                 package contains {} {} (api {})",
+                manifest.id, manifest.version, manifest.api
+            )));
+        }
         Ok(PluginArtifact {
             root,
             manifest,
             descriptor,
             sha256,
+            resolved_source,
         })
     }
 }
@@ -109,13 +145,15 @@ impl PluginArtifactVerifier {
     pub fn new() -> Self {
         Self
     }
+}
 
+impl ArtifactVerifier for PluginArtifactVerifier {
     /// 校验已安装目录
     ///
     /// # Errors
     ///
     /// 摘要不匹配返回 `invalid_input`；元数据不可读时返回 `invalid_input`。
-    pub fn verify_installed(
+    fn verify_installed(
         &self,
         root: &Path,
         expected_sha256: Option<&Checksum>,
@@ -128,11 +166,10 @@ impl PluginArtifactVerifier {
             manifest,
             descriptor,
             sha256,
+            resolved_source: None,
         })
     }
-}
 
-impl ArtifactVerifier for PluginArtifactVerifier {
     fn verify(
         &self,
         artifact: &PluginArtifact,
@@ -141,7 +178,13 @@ impl ArtifactVerifier for PluginArtifactVerifier {
         // 期望摘要是来源摘要（压缩包字节或目录树），与安装记录里的树摘要
         // 不同：先比对来源摘要，再重算并返回树摘要。
         check_checksum(expected_sha256, &artifact.sha256)?;
-        self.verify_installed(&artifact.root, None)
+        // 只重算摘要与元数据；来源定位是来源解析的产物，重算节点拿不到，
+        // 必须原样保留，否则 git 来源会退化成可移动的 tag。
+        let mut verified = self.verify_installed(&artifact.root, None)?;
+        verified
+            .resolved_source
+            .clone_from(&artifact.resolved_source);
+        Ok(verified)
     }
 }
 

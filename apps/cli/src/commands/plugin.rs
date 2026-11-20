@@ -37,8 +37,9 @@ pub(crate) fn run(action: PluginAction, printer: Printer) -> Result<()> {
             git,
             reference,
             sha256,
-        } => install(source, from, url, git, reference, sha256, printer),
-        PluginAction::Update { id, to, prune } => update(&id, to, prune, printer),
+            yes,
+        } => install(source, from, url, git, reference, sha256, yes, printer),
+        PluginAction::Update { id, to, prune, yes } => update(&id, to, prune, yes, printer),
         PluginAction::Remove {
             id,
             purge,
@@ -57,7 +58,8 @@ pub(crate) fn run(action: PluginAction, printer: Printer) -> Result<()> {
             input,
             json,
             stream,
-        } => call(&id, &op, input.as_deref(), stream, printer, json),
+            yes,
+        } => call(&id, &op, input.as_deref(), stream, yes, printer, json),
         PluginAction::Config { action } => config_cmd(&action, printer),
         PluginAction::Grant { id, capability } => grant(&id, &capability, printer),
         PluginAction::Revoke { id, capability } => revoke(&id, &capability, printer),
@@ -87,6 +89,7 @@ pub(crate) fn run_host(data_dir: Option<PathBuf>, idle_timeout: u64) -> Result<(
         other => AppDiagnostic::failure(other.to_string(), None),
     })?;
     host.spawn_idle_reaper();
+    host.spawn_console_events();
     let control = Arc::new(mcsup::plugin::HostControl::new(
         Arc::clone(&host) as Arc<dyn mcsup::port::plugin::PluginSupervisor>,
         Arc::clone(&mcsup.plugin_store),
@@ -210,17 +213,42 @@ fn install(
     git: Option<String>,
     reference: Option<String>,
     sha256: Option<String>,
+    yes: bool,
     printer: Printer,
 ) -> Result<()> {
     let origin = resolve_origin(source, from, url, git, reference)?;
     let expected = sha256.map(|hex| Checksum::new(ChecksumAlgorithm::Sha256, hex));
     let service = open()?;
+    // 安装前确认（docs §15.5）：`--yes` 或非交互模式直接执行。待确认能力
+    // 在安装后展示，grant 仍需显式确认，这里只确认「装」这个动作本身。
+    if printer.is_human() && !yes {
+        let origin_text = match &origin {
+            ArtifactOrigin::Local(path) => path.display().to_string(),
+            ArtifactOrigin::Url(url) => url.clone(),
+            ArtifactOrigin::Git { url, rev } => match rev {
+                Some(rev) => format!("git {url}@{rev}"),
+                None => format!("git {url}"),
+            },
+        };
+        let confirmed = crate::prompts::confirm_or_yes(
+            printer,
+            &crate::i18n::pick(
+                printer.lang(),
+                format!("确认安装插件（来源：{origin_text}）？"),
+                format!("install plugin from {origin_text}?"),
+            ),
+            false,
+        )?;
+        if !confirmed {
+            return Ok(());
+        }
+    }
     let spinner = TaskSpinner::new(
         crate::i18n::pick(printer.lang(), "正在安装插件…", "installing plugin…"),
         printer.is_human(),
     );
     let outcome = service
-        .install(&origin, expected.as_ref())
+        .install(&origin, expected.as_ref(), false)
         .map_err(anyhow::Error::from);
     spinner.finish();
     let outcome = outcome?;
@@ -312,46 +340,68 @@ fn resolve_origin(
     }
 }
 
-fn update(id: &str, to: Option<String>, _prune: bool, printer: Printer) -> Result<()> {
+fn update(id: &str, to: Option<String>, prune: bool, yes: bool, printer: Printer) -> Result<()> {
     let id = parse_id(id)?;
     let service = open()?;
-    let record = service.record(&id)?;
-    if let Some(to) = to
-        && to != record.version
-    {
-        return Err(AppDiagnostic::usage(
-            format!(
-                "当前实现按来源中的最新产物安装，不能单独指定 --to {to}；请安装包含该版本的来源"
+    let spinner_text = if to.is_some() {
+        "正在切换插件版本…"
+    } else {
+        "正在升级插件…"
+    };
+    if printer.is_human() && !yes {
+        let confirmed = crate::prompts::confirm_or_yes(
+            printer,
+            &crate::i18n::pick(
+                printer.lang(),
+                if to.is_some() {
+                    format!(
+                        "确认切换 {id} 到版本 {}？",
+                        to.as_deref().unwrap_or_default()
+                    )
+                } else {
+                    format!("确认升级 {id}？")
+                },
+                if to.is_some() {
+                    format!(
+                        "switch {id} to version {}?",
+                        to.as_deref().unwrap_or_default()
+                    )
+                } else {
+                    format!("update {id}?")
+                },
             ),
-            None,
-        )
-        .into());
+            false,
+        )?;
+        if !confirmed {
+            return Ok(());
+        }
     }
-    let origin = origin_from_source(record.source.as_deref()).ok_or_else(|| {
-        AppDiagnostic::usage(
-            format!("插件 {id} 没有可复用的安装来源；用 `mcsup plugin install <source>` 升级"),
-            None,
-        )
-    })?;
     let spinner = TaskSpinner::new(
-        crate::i18n::pick(printer.lang(), "正在升级插件…", "updating plugin…"),
+        crate::i18n::pick(printer.lang(), spinner_text, "updating plugin…"),
         printer.is_human(),
     );
-    let result = service.install(&origin, None).map_err(anyhow::Error::from);
+    let result = if let Some(to) = to {
+        // 目标版本已安装：直接切换 active version
+        let to = to.trim().to_owned();
+        service
+            .activate_version(&id, &to, prune)
+            .map(|record| (record.id, record.version))
+            .map_err(anyhow::Error::from)
+    } else {
+        upgrade_from_source(&service, &id, prune)
+    };
     spinner.finish();
-    let outcome = result?;
+    let (updated_id, version) = result?;
     printer.print_outcome(
         &crate::i18n::pick(
             printer.lang(),
-            format!("已升级 {} 到 {}", outcome.record.id, outcome.record.version),
-            format!(
-                "updated {} to {}",
-                outcome.record.id, outcome.record.version
-            ),
+            format!("已切换 {updated_id} 到 {version}"),
+            format!("updated {updated_id} to {version}"),
         ),
         &json!({
-            "id": outcome.record.id.to_string(),
-            "version": outcome.record.version,
+            "id": updated_id.to_string(),
+            "version": version,
+            "prune": prune,
         }),
     )
 }
@@ -372,6 +422,23 @@ fn origin_from_source(source: Option<&str>) -> Option<ArtifactOrigin> {
         return Some(ArtifactOrigin::Git { url, rev });
     }
     None
+}
+
+/// 按记录里的安装来源重新拉取并升级
+fn upgrade_from_source(
+    service: &PluginService,
+    id: &PluginId,
+    prune: bool,
+) -> Result<(PluginId, String)> {
+    let record = service.record(id)?;
+    let origin = origin_from_source(record.source.as_deref()).ok_or_else(|| {
+        AppDiagnostic::usage(
+            format!("插件 {id} 没有可复用的安装来源；用 `mcsup plugin install <source>` 升级"),
+            None,
+        )
+    })?;
+    let outcome = service.install(&origin, None, prune)?;
+    Ok((outcome.record.id, outcome.record.version))
 }
 
 fn remove(id: &str, purge: bool, keep_secrets: bool, printer: Printer) -> Result<()> {
@@ -605,6 +672,7 @@ fn call(
     op: &str,
     input: Option<&str>,
     stream: bool,
+    yes: bool,
     printer: Printer,
     json: bool,
 ) -> Result<()> {
@@ -613,6 +681,41 @@ fn call(
     let input = read_input(input)?;
     ensure_host()?;
     let service = open()?;
+    // 风险确认：mutating / destructive 的 op 在动手前问一次。`--yes` 跳过
+    // 提问；JSON 模式没有交互终端，直接执行（调用方是脚本，结果可读回）。
+    let descriptor = service.descriptor(&id)?;
+    let resolved = descriptor.ops.iter().find(|resolved| resolved.op.id == op);
+    if let Some(resolved) = resolved
+        && printer.is_human()
+        && !yes
+    {
+        let required = mcsup::auth::Role::for_risk(resolved.op.risk.as_str());
+        let needs_confirm = !matches!(required, mcsup::auth::Role::Viewer);
+        if needs_confirm {
+            let confirmed = crate::prompts::confirm_or_yes(
+                printer,
+                &crate::i18n::pick(
+                    printer.lang(),
+                    format!(
+                        "调用 {} 的 op `{}`（风险：{}，需要 {} 角色），继续？",
+                        id,
+                        op,
+                        resolved.op.risk.as_str(),
+                        required
+                    ),
+                    format!(
+                        "call op `{op}` of {id} (risk: {}, requires {} role); continue?",
+                        resolved.op.risk.as_str(),
+                        required
+                    ),
+                ),
+                false,
+            )?;
+            if !confirmed {
+                return Ok(());
+            }
+        }
+    }
     if stream {
         let mut sink = PrintSink::new(printer);
         service.stream(&id, op, input, &mut sink)?;

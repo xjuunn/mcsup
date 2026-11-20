@@ -1,0 +1,1 @@
+{ "scenario": "contract", "caller": "caller-a", "contract": "incident.report@1", "route": "cycle", "input": { "title": "boom" } }

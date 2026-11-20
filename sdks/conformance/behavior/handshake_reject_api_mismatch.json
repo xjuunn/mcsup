@@ -1,0 +1,1 @@
+{ "scenario": "handshake", "input": { "reject": { "code": "api_mismatch", "message": "api mismatch" } } }

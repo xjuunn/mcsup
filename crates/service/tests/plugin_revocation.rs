@@ -15,13 +15,14 @@ use std::sync::Arc;
 use storage::plugin::{JsonlAuditSink, PluginConfigFileStore, PluginFileStore};
 use tempfile::TempDir;
 
-/// 最小可安装产物：无待确认能力，安装后即可启用
+/// 最小可安装产物：无待确认能力，安装后即可启用；入口文件按平台形态写出
 fn write_plugin(dir: &Path) {
     std::fs::create_dir_all(dir).expect("artifact dir");
     std::fs::write(
         dir.join("manifest.json"),
         r#"{"schema":1,"id":"demo","name":"Demo","version":"0.1.0","api":1,
-            "entry":{"type":"process","cmd":"bin/demo"},
+            "entry":{"type":"process","cmd":"bin/demo",
+            "platforms":{"win32-x64":"bin/demo.exe"}},
             "capabilities":["events"],"license":"MIT"}"#,
     )
     .expect("manifest");
@@ -30,6 +31,17 @@ fn write_plugin(dir: &Path) {
         r#"{"schema":1,"plugin_id":"demo","api":1,"ops":[]}"#,
     )
     .expect("descriptor");
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).expect("bin dir");
+    let unix_entry = bin.join("demo");
+    std::fs::write(&unix_entry, b"#!/bin/sh\nexit 0\n").expect("entry");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&unix_entry, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+    }
+    std::fs::write(bin.join("demo.exe"), b"MZ\x90\x00payload").expect("entry exe");
 }
 
 struct Fixture {
@@ -70,7 +82,7 @@ impl Fixture {
         let dir = self.tmp.path().join("demo");
         write_plugin(&dir);
         self.service
-            .install(&ArtifactOrigin::Local(dir), None)
+            .install(&ArtifactOrigin::Local(dir), None, false)
             .expect("install")
             .record
     }

@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "plugin_id": "sample-echo",
+  "api": 1,
+  "ops": [
+    {
+      "id": "echo",
+      "kind": "query",
+      "title": "回显一",
+      "risk": "read",
+      "input": { "type": "object" },
+      "output": { "type": "object" }
+    },
+    {
+      "id": "echo",
+      "kind": "query",
+      "title": "回显二",
+      "risk": "read",
+      "input": { "type": "object" },
+      "output": { "type": "object" }
+    }
+  ]
+}

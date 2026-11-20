@@ -6,18 +6,38 @@ import { createMockHost } from "../src/testing.js";
 import type { RejectCode } from "../src/protocol.js";
 import { chatBridge } from "./fixtures.js";
 
-interface ConformanceCase {
+/** docs/plugins-testing.md §5.1：cases.json 是唯一登记处 */
+interface RegisteredCase {
   readonly id: string;
-  readonly kind: "query" | "action" | "stream" | "config" | "handshake" | "shutdown" | "unknown-frame";
-  readonly op?: string;
-  readonly input?: unknown;
-  readonly granted?: readonly string[];
-  readonly inject?: Record<string, unknown>;
-  readonly expect: Record<string, unknown>;
+  readonly kind: string;
+  readonly input: string;
+  readonly expect: string;
 }
 
-const CASES = path.resolve("..", "conformance", "cases.json");
-const cases = (JSON.parse(fs.readFileSync(CASES, "utf8")) as { cases: ConformanceCase[] }).cases;
+/** behavior 输入文件：scenario 决定 runner 走哪条驱动路径 */
+interface BehaviorInput {
+  readonly scenario: "op" | "unknown-frame" | "stream" | "config" | "handshake" | "shutdown" | "contract";
+  readonly op?: string;
+  readonly op_kind?: string;
+  readonly granted?: readonly string[];
+  readonly inject?: Record<string, unknown>;
+  readonly input?: unknown;
+}
+
+const CONFORMANCE = path.resolve("..", "conformance");
+const cases = (JSON.parse(fs.readFileSync(path.join(CONFORMANCE, "cases.json"), "utf8")) as {
+  cases: RegisteredCase[];
+}).cases;
+
+function loadCase(testCase: RegisteredCase): { input: BehaviorInput; expect: Record<string, unknown> } {
+  if (testCase.kind !== "behavior") {
+    throw new Error(`unsupported conformance kind ${testCase.kind} for ${testCase.id}`);
+  }
+  return {
+    input: JSON.parse(fs.readFileSync(path.join(CONFORMANCE, testCase.input), "utf8")) as BehaviorInput,
+    expect: JSON.parse(fs.readFileSync(path.join(CONFORMANCE, testCase.expect), "utf8")) as Record<string, unknown>,
+  };
+}
 
 /** 与本文件 fixtures 对应的会话（`counter` 计数在测试间会累加，用例以相对值断言） */
 async function startBridge(granted?: readonly string[]) {
@@ -29,70 +49,71 @@ async function startBridge(granted?: readonly string[]) {
 describe("conformance cases", () => {
   for (const testCase of cases) {
     it(testCase.id, async () => {
-      if (testCase.kind === "query" || testCase.kind === "action") {
-        const host = await startBridge(testCase.granted);
-        const result = await host.callOp(testCase.op ?? "", testCase.input ?? {});
-        if (testCase.expect["ok"] === true) {
+      const { input, expect: expected } = loadCase(testCase);
+      if (input.scenario === "op") {
+        const host = await startBridge(input.granted);
+        const result = await host.callOp(input.op ?? "", input.input ?? {});
+        if (expected["ok"] === true) {
           expect(result.ok).toBe(true);
-          if (testCase.id === "query.returns-output" && result.ok) {
+          if (result.ok && input.op === "counter") {
             expect(result.output).toMatchObject({ channel: "global" });
           }
         } else {
           expect(result.ok).toBe(false);
           if (!result.ok) {
-            expect(result.error.code).toBe((testCase.expect["error"] as { code: string }).code);
+            expect(result.error.code).toBe((expected["error"] as { code: string }).code);
           }
         }
         await host.shutdown();
         return;
       }
-      if (testCase.kind === "unknown-frame") {
+      if (input.scenario === "unknown-frame") {
         const host = await startBridge();
-        host.inject(testCase.inject as never);
-        const result = await host.callOp(testCase.op ?? "", testCase.input ?? {});
-        expect(result.ok).toBe(testCase.expect["ok"]);
+        host.inject(input.inject as never);
+        const result = await host.callOp(input.op ?? "", input.input ?? {});
+        expect(result.ok).toBe(expected["ok"]);
         await host.shutdown();
         return;
       }
-      if (testCase.kind === "stream") {
+      if (input.scenario === "stream") {
         const host = await startBridge();
-        const result = await host.callOp(testCase.op ?? "", testCase.input ?? {});
+        const result = await host.callOp(input.op ?? "", input.input ?? {});
         expect(result.ok).toBe(true);
         const chunks = host.frames.filter((f) => f.type === "stream").map((f) => (f as { chunk: unknown }).chunk);
         const doneAt = chunks.findIndex((c) => JSON.stringify(c) === "{}");
         expect(doneAt).toBeGreaterThan(0);
-        expect(chunks.slice(0, doneAt)).toEqual(testCase.expect["chunks"]);
-        expect(testCase.expect["done"]).toBe(true);
+        expect(chunks.slice(0, doneAt)).toEqual(expected["chunks"]);
+        expect(expected["done"]).toBe(true);
         await host.shutdown();
         return;
       }
-      if (testCase.kind === "config") {
+      if (input.scenario === "config") {
         const host = await startBridge();
-        const input = testCase.input as { revision: number; values: unknown };
-        const result = await host.changeConfig(input.revision, input.values);
-        expect(result.ok).toBe(testCase.expect["ok"]);
-        if (!result.ok && testCase.expect["error"] !== undefined) {
-          expect(result.error.code).toBe((testCase.expect["error"] as { code: string }).code);
+        const payload = input.input as { revision: number; values: unknown };
+        const result = await host.changeConfig(payload.revision, payload.values);
+        expect(result.ok).toBe(expected["ok"]);
+        if (!result.ok && expected["error"] !== undefined) {
+          expect(result.error.code).toBe((expected["error"] as { code: string }).code);
         }
         await host.shutdown();
         return;
       }
-      if (testCase.kind === "handshake") {
-        const input = testCase.input as Record<string, unknown>;
+      if (input.scenario === "handshake") {
+        const payload = (input.input ?? {}) as Record<string, unknown>;
         const host = createMockHost(chatBridge, {
-          config: input["config"] ?? { token: "t" },
-          reject: input["reject"] as { code: RejectCode; message: string } | undefined,
+          config: payload["config"] ?? { token: "t" },
+          reject: payload["reject"] as { code: RejectCode; message: string } | undefined,
         });
         await host.start();
-        expect(await host.waitExit()).toBe(testCase.expect["exit_code"]);
+        expect(await host.waitExit()).toBe(expected["exit_code"]);
         return;
       }
-      if (testCase.kind === "shutdown") {
+      if (input.scenario === "shutdown") {
         const host = await startBridge();
-        expect(await host.shutdown((testCase.input as { grace_ms: number }).grace_ms)).toBe(0);
+        expect(await host.shutdown((input.input as { grace_ms: number }).grace_ms)).toBe(0);
         return;
       }
-      throw new Error(`unknown conformance kind ${String(testCase.kind)}`);
+      throw new Error(`unsupported behavior scenario ${String(input.scenario)} for ${testCase.id}`);
     });
   }
 });

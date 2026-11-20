@@ -1,0 +1,7 @@
+{
+  "type": "detail",
+  "fields": [
+    { "key": "count", "label": "发送计数" },
+    { "key": "channel", "label": "频道" }
+  ]
+}

@@ -818,6 +818,7 @@ fn check_secret_permissions(path: &Path) -> Result<(), HostError> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)] // 与 unix 版本保持同一签名
 fn check_secret_permissions(_path: &Path) -> Result<(), HostError> {
     Ok(())
 }

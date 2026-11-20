@@ -21,6 +21,7 @@ const BUFFER_SIZE: usize = 64 * 1024;
 ///
 /// 文件内容已由暂存文件的 `sync_all` 落盘；不刷目录的话，掉电后可能出现
 /// 「对象文件在、目录记录不在」，恢复时按哈希查不到刚写入的对象。
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))] // 非 unix 无目录同步语义，签名保持一致
 fn sync_dir(dir: &Path) -> Result<(), CasError> {
     #[cfg(unix)]
     {

@@ -88,6 +88,81 @@ impl EntrySpec {
             .map(String::as_str)
             .or(Some(self.cmd.as_str()))
     }
+
+    /// 校验入口文件在产物目录里真实可用
+    ///
+    /// 规则（`docs/plugins.md` 10.3 第 5 条）：解析到当前平台的 `cmd` 必须
+    /// 指向一个存在的普通文件；Unix 校验可执行位（`0o111` 任一位），Windows
+    /// 校验 `.exe` 扩展名与 PE 头（`MZ`）——Windows 上「可执行」由扩展名与
+    /// 头部决定， mode 位不存在。
+    ///
+    /// # Errors
+    ///
+    /// 平台命令缺失、文件不存在、不是普通文件或平台形态不符时返回
+    /// [`ManifestError::InvalidEntry`]
+    pub fn check_entry_file(
+        &self,
+        artifact_root: &Path,
+        platform: &str,
+    ) -> Result<(), ManifestError> {
+        let Some(cmd) = self.cmd_for(platform) else {
+            return Err(ManifestError::InvalidEntry {
+                reason: format!("no entry command for platform {platform}"),
+            });
+        };
+        // `cmd` 已过 `validate_cmd` 的相对路径校验；这里只拼路径。
+        let path = artifact_root.join(cmd.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let meta = std::fs::metadata(&path).map_err(|err| ManifestError::InvalidEntry {
+            reason: format!("entry file {} is missing: {err}", path.display()),
+        })?;
+        if !meta.is_file() {
+            return Err(ManifestError::InvalidEntry {
+                reason: format!("entry {} is not a regular file", path.display()),
+            });
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if meta.permissions().mode() & 0o111 == 0 {
+                return Err(ManifestError::InvalidEntry {
+                    reason: format!("entry {} is not executable", path.display()),
+                });
+            }
+        }
+        #[cfg(windows)]
+        {
+            if !path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+            {
+                return Err(ManifestError::InvalidEntry {
+                    reason: format!("entry {} must have an .exe extension", path.display()),
+                });
+            }
+            // PE 头：文件前两字节必须是 `MZ`。损坏或改名的文件在这里拦下。
+            let mut header = [0_u8; 2];
+            let read = std::fs::File::open(&path)
+                .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut header));
+            match read {
+                Ok(()) if header == *b"MZ" => {}
+                Ok(()) => {
+                    return Err(ManifestError::InvalidEntry {
+                        reason: format!("entry {} does not have a PE header (MZ)", path.display()),
+                    });
+                }
+                Err(err) => {
+                    return Err(ManifestError::InvalidEntry {
+                        reason: format!("entry {} is unreadable: {err}", path.display()),
+                    });
+                }
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = platform;
+        }
+        Ok(())
+    }
 }
 
 /// 出站白名单
@@ -689,6 +764,97 @@ mod tests {
             [Capability::Events].into_iter().collect()
         );
         assert!(!validated.needs_approval());
+    }
+
+    /// 入口文件检查：存在 + 平台形态（unix 可执行位 / Windows exe + PE 头）
+    #[test]
+    fn entry_file_check_requires_a_real_executable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entry = EntrySpec {
+            kind: "process".to_owned(),
+            cmd: "bin/demo".to_owned(),
+            platforms: BTreeMap::from([("win32-x64".to_owned(), "bin/demo.exe".to_owned())]),
+        };
+
+        // 文件缺失
+        let err = entry
+            .check_entry_file(dir.path(), "linux-x64")
+            .expect_err("missing");
+        assert!(err.to_string().contains("missing"), "{err}");
+
+        // 存在但不可执行（unix）
+        std::fs::create_dir_all(dir.path().join("bin")).expect("bin");
+        std::fs::write(dir.path().join("bin/demo"), b"text").expect("entry");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(
+                dir.path().join("bin/demo"),
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .expect("chmod");
+            let err = entry
+                .check_entry_file(dir.path(), "linux-x64")
+                .expect_err("not executable");
+            assert!(err.to_string().contains("not executable"), "{err}");
+        }
+
+        // 平台覆盖的命令缺失
+        let err = entry
+            .check_entry_file(dir.path(), "win32-x64")
+            .expect_err("missing override");
+        assert!(err.to_string().contains("missing"), "{err}");
+
+        // 未声明平台时回退默认命令（Windows 语义在下面单独验证）
+        #[cfg(not(windows))]
+        let fallback = EntrySpec {
+            kind: "process".to_owned(),
+            cmd: "bin/demo".to_owned(),
+            platforms: BTreeMap::new(),
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(
+                dir.path().join("bin/demo"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod");
+        }
+        #[cfg(not(windows))]
+        {
+            fallback
+                .check_entry_file(dir.path(), "linux-x64")
+                .expect("ok on unix");
+        }
+
+        // Windows：扩展名与 PE 头都必须满足
+        #[cfg(windows)]
+        {
+            // 扩展名不是 exe
+            let wrong_ext = EntrySpec {
+                kind: "process".to_owned(),
+                cmd: "bin/demo".to_owned(),
+                platforms: BTreeMap::new(),
+            };
+            let err = wrong_ext
+                .check_entry_file(dir.path(), "win32-x64")
+                .expect_err("not .exe");
+            assert!(err.to_string().contains(".exe"), "{err}");
+
+            // exe 存在但没有 MZ 头
+            std::fs::write(dir.path().join("bin/demo.exe"), b"plain text").expect("exe");
+            let err = entry
+                .check_entry_file(dir.path(), "win32-x64")
+                .expect_err("no PE header");
+            assert!(err.to_string().contains("PE header"), "{err}");
+
+            // 都满足
+            std::fs::write(dir.path().join("bin/demo.exe"), b"MZ\x90payload").expect("exe");
+            entry
+                .check_entry_file(dir.path(), "win32-x64")
+                .expect("valid exe");
+        }
     }
 
     #[test]

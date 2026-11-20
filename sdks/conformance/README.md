@@ -9,8 +9,43 @@
 | --- | --- |
 | `schema/*.json` | schema 归一化用例（§14.5）：同一组声明 → 期望 descriptor 片段；含禁止构造与超限的失败用例 |
 | `frames/*.json` | 帧级用例（§14.1）：握手、调用、错误结果、取消、未知帧 |
-| `cases.json` | 行为用例：调用 / 配置变更 / 握手 / 关闭的期望结果 |
+| `behavior/*.json` | 行为用例输入 `<name>.json` 与期望 `<name>.expected.json`：调用 / 配置变更 / 握手 / 关闭 / 契约 |
+| `render/*.json` | descriptor → 渲染计划：输入 `<name>.json` 与期望计划 `<name>.plan.json` |
+| `fixtures/*.json` | 合法 / 非法 manifest、descriptor 样例（安装与审核用例共用） |
 | `descriptor/chat-bridge.json` | 参考 descriptor：`chat-bridge` 用例的归一化产物（紧凑 JSON + 换行） |
+| `cases.json` | 全部跨语言用例的唯一登记处（§5.1）；`report/` 是 CI 产物，不提交 |
+
+## cases.json 格式
+
+```json
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "SDK-BHV-001",
+      "kind": "behavior",
+      "input": "behavior/query_returns_output.json",
+      "expect": "behavior/query_returns_output.expected.json"
+    }
+  ]
+}
+```
+
+- `kind` ∈ `frames` / `schema` / `behavior` / `render` / `security`。
+- `input` / `expect` 相对 `conformance/`。
+- 新增用例先登记，再实现；报告 ID 集合必须等于 `cases.json`（§3.2 / `PLAT-011`）。
+
+## behavior 输入格式
+
+```json
+{ "scenario": "op", "op": "counter", "op_kind": "query", "input": { "channel": "global" } }
+```
+
+- `scenario` ∈ `op` / `unknown-frame` / `stream` / `config` / `handshake` /
+  `shutdown` / `contract`。
+- 期望文件与 `plugins.md` 的结果帧同形：`{ "ok": ..., "output": ... }` 或
+  `{ "ok": false, "error": { "code": ... } }`；握手 / 关闭类用
+  `{ "exit_code": ... }`。
 
 ## schema 用例格式
 
@@ -41,32 +76,27 @@
 }
 ```
 
-`kind` ∈ `handshake`（可带 `reject`）/ `call` / `cancel` / `unknown-frame`
-（`inject` 一帧未知 type）。字节级错误（单帧 1 MiB、深度 32）属传输层，
-由各语言的传输测试覆盖，不在此列。
+## Runner 契约
 
-## cases.json 用例格式
+各语言提供同名入口（§5.2）：
 
-| 键 | 说明 |
-| --- | --- |
-| `kind` | `query` / `action` / `stream` / `config` / `handshake` / `shutdown` / `unknown-frame` |
-| `granted` | 可选；覆盖宿主实际授予的能力（默认等于插件声明），用于越界能力用例 |
-| `expect` | 期望结果；错误只断言 `code` |
+```
+cargo run -p mcsup-plugin-sdk-conformance -- --cases ../conformance/cases.json
+npm run conformance -- --cases ../conformance/cases.json
+python -m mcsup_plugin.conformance --cases ../conformance/cases.json
+java -jar conformance.jar --cases ../conformance/cases.json
+```
 
-## 新增用例
+- 按 `cases.json` 顺序执行，退出码：全过 0，任一失败 1，清单非法 2。
+- 报告行：`{"id":"SDK-BHV-001","status":"pass","duration_ms":1}`。
+- 比较前先经 `conformance::canonicalize` 规范化易变字段（§5.3）。
 
-1. 在对应目录追加一个文件，或在 `cases.json` 的 `cases` 数组追加一条，
-   `id` 用 `<领域>.<行为>` 命名；
-2. 用例必须能由任意语言的测试驱动复现（不依赖语言特有 API）；
-3. 若改变了 `descriptor/chat-bridge.json`，同一次提交里更新它，并在提交信息
-   说明归一化规则的变化。
+## 当前状态
 
-## 覆盖范围
-
-- schema：§14.5 表中 12 条，含 union / 递归 / 外部 `$ref` / 超限的失败路径
-- 帧与行为：握手成功 / 拒绝、调用成功 / 输入非法 / 未知 op / 处理器抛错 /
-  重入调用 / 越界能力（`denied`）、未知帧忽略、超时、取消、seq 连续与 done、
-  配置回滚、关闭退出码
-
-宿主侧职责（心跳丢失检测、流式 seq 缺口检测）由宿主测试套件覆盖：
-插件侧的对偶不变量（连续 seq、按时回 pong）已在上述用例中断言。
+- `behavior`：13 个 SDK 用例（`SDK-BHV-001..013`）已登记，TypeScript runner
+  已驱动；Rust / Python / Java runner 待补。
+- `render` / `contract` 样例文件已就位（`render/chat_descriptor.*`、
+  `behavior/contract_cycle.*`），待 runner 支持后登记对应
+  `WEB-RENDER-*` / `CON-RTE-*` ID。
+- Rust 宿主侧用例在 `crates/plugin/tests/host_lifecycle.rs`，矩阵 ID 写进
+  测试函数名（如 `con_rte_005_contract_cycle_is_rejected_as_conflict`）。

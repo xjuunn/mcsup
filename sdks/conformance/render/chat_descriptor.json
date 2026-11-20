@@ -1,0 +1,13 @@
+{
+  "plugin_id": "chat-bridge",
+  "op": "counter",
+  "display": { "type": "detail" },
+  "output": {
+    "type": "object",
+    "properties": {
+      "count": { "type": "integer", "x-mcsup-label": "发送计数" },
+      "channel": { "type": "string", "x-mcsup-label": "频道" }
+    },
+    "required": ["count", "channel"]
+  }
+}
