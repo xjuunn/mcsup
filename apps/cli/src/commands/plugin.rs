@@ -37,18 +37,7 @@ pub(crate) fn run(action: PluginAction, printer: Printer) -> Result<()> {
             git,
             reference,
             sha256,
-            allow_unsigned,
-            dev,
-        } => install(
-            source,
-            from,
-            url,
-            git,
-            reference,
-            sha256,
-            allow_unsigned || dev,
-            printer,
-        ),
+        } => install(source, from, url, git, reference, sha256, printer),
         PluginAction::Update { id, to, prune } => update(&id, to, prune, printer),
         PluginAction::Remove {
             id,
@@ -208,7 +197,6 @@ fn list(printer: Printer, json: bool) -> Result<()> {
             "needs_approval": record.needs_approval(),
             "blocked": record.blocked,
             "quarantined": record.quarantined,
-            "signed": record.signed,
         }));
     }
     printer.print_outcome("", &items)
@@ -222,7 +210,6 @@ fn install(
     git: Option<String>,
     reference: Option<String>,
     sha256: Option<String>,
-    allow_unsigned: bool,
     printer: Printer,
 ) -> Result<()> {
     let origin = resolve_origin(source, from, url, git, reference)?;
@@ -233,7 +220,7 @@ fn install(
         printer.is_human(),
     );
     let outcome = service
-        .install(&origin, expected.as_ref(), allow_unsigned)
+        .install(&origin, expected.as_ref())
         .map_err(anyhow::Error::from);
     spinner.finish();
     let outcome = outcome?;
@@ -273,7 +260,6 @@ fn install(
             "id": record.id.to_string(),
             "version": record.version,
             "pending": outcome.pending.iter().map(ToString::to_string).collect::<Vec<_>>(),
-            "signed": record.signed,
         }),
     )
 }
@@ -351,11 +337,7 @@ fn update(id: &str, to: Option<String>, _prune: bool, printer: Printer) -> Resul
         crate::i18n::pick(printer.lang(), "正在升级插件…", "updating plugin…"),
         printer.is_human(),
     );
-    // 升级沿用原产物的信任姿态：原产物未签名才允许继续安装未签名产物。
-    let allow_unsigned = !record.signed;
-    let result = service
-        .install(&origin, None, allow_unsigned)
-        .map_err(anyhow::Error::from);
+    let result = service.install(&origin, None).map_err(anyhow::Error::from);
     spinner.finish();
     let outcome = result?;
     printer.print_outcome(
@@ -1041,18 +1023,10 @@ fn revoked_finding(
 fn verify(target: &str, printer: Printer) -> Result<()> {
     let service = open()?;
     let expected = sha256_hint(target);
-    // 本地文件直接校验文件本体：目录里没有 `.minisig`，`.zip.minisig` 的签名
-    // 只对压缩包字节有意义。插件 id 与目录走安装记录 + 目录摘要复查。
-    let local_file = PluginId::parse(target)
-        .is_err()
-        .then(|| PathBuf::from(target));
-    let local_file = local_file
-        .filter(|path| path.is_file() && path.extension().is_none_or(|ext| ext != "minisig"));
-    let (target_path, id, signed, recheck) = if let Some(path) = local_file {
-        (path, None, false, true)
-    } else if let Ok(id) = PluginId::parse(target) {
+    // 压缩包 / 目录：重新走一遍来源校验；插件 id：按安装记录找到产物目录。
+    let (target_path, id, recheck) = if let Ok(id) = PluginId::parse(target) {
         let record = service.record(&id)?;
-        (record.artifact_dir, Some(record.id), record.signed, false)
+        (record.artifact_dir, Some(record.id), false)
     } else {
         let path = PathBuf::from(target);
         if !path.exists() {
@@ -1060,21 +1034,20 @@ fn verify(target: &str, printer: Printer) -> Result<()> {
                 AppDiagnostic::not_found(format!("找不到插件 id 或目录: {target}"), None).into(),
             );
         }
-        (path, None, false, false)
+        (path.clone(), None, path.is_file())
     };
     let verifier = mcsup::provider::plugin::PluginArtifactVerifier::new();
     let artifact = if recheck {
-        // 未安装的文件：重新走一遍来源校验（含签名），失败即拒绝。来源摘要
-        // 在这里就是文件本身的摘要，再与旁路 `.sha256` 比对。
+        // 未安装的文件：先解包并计算来源摘要，再与旁路 `.sha256` 比对。
         let fetched = service
-            .fetch_artifact(&ArtifactOrigin::Local(target_path.clone()))
+            .fetch_artifact(&ArtifactOrigin::Local(target_path))
             .map_err(anyhow::Error::from)?;
         verifier
             .verify(&fetched.artifact, expected.as_ref())
             .map_err(anyhow::Error::from)?
     } else {
         verifier
-            .verify_installed(&target_path, expected.as_ref(), signed)
+            .verify_installed(&target_path, expected.as_ref())
             .map_err(anyhow::Error::from)?
     };
     let manifest = Manifest::from_json(
@@ -1090,8 +1063,6 @@ fn verify(target: &str, printer: Printer) -> Result<()> {
         &json!({
             "id": id.map_or_else(|| manifest.id.to_string(), |id| id.to_string()),
             "sha256": artifact.sha256,
-            "signed": artifact.signed,
-            "trusted": artifact.trusted,
         }),
     )
 }

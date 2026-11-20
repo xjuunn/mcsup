@@ -13,7 +13,7 @@ pub mod plugin;
 pub mod plugin_net;
 pub mod plugin_revoke;
 pub mod plugin_revoke_file;
-pub mod plugin_sig;
+mod private_file;
 pub mod purpur;
 pub mod quilt;
 mod shared;

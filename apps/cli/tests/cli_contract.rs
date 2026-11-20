@@ -1447,7 +1447,6 @@ fn plugin_install_local_artifact_then_list_ops_and_verify() {
             "install",
             "--from",
             artifact.to_str().expect("utf-8 path"),
-            "--allow-unsigned",
         ],
     );
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
@@ -1455,7 +1454,6 @@ fn plugin_install_local_artifact_then_list_ops_and_verify() {
         serde_json::from_slice(&out.stdout).expect("install 输出对象");
     assert_eq!(installed["id"], "demo");
     assert_eq!(installed["version"], "0.1.0");
-    assert_eq!(installed["signed"], false);
 
     let out = run(home.path(), &["plugin", "list", "--json"]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
@@ -1478,13 +1476,12 @@ fn plugin_install_local_artifact_then_list_ops_and_verify() {
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     let verified: serde_json::Value = serde_json::from_slice(&out.stdout).expect("verify 输出对象");
     assert_eq!(verified["id"], "demo");
-    assert_eq!(verified["signed"], false);
-    assert_eq!(verified["trusted"], false);
+    assert_eq!(verified["sha256"].as_str().map(str::len), Some(64));
 }
 
-/// `verify` 指向本地目录：只复查 manifest / descriptor，不报签名通过
+/// `verify` 指向本地目录：复查摘要与 manifest / descriptor
 #[test]
-fn plugin_verify_local_directory_reports_unsigned() {
+fn plugin_verify_local_directory_reports_digest() {
     let home = temp_home();
     let artifact = home.path().join("verify-plugin");
     write_plugin_artifact(&artifact);
@@ -1500,8 +1497,8 @@ fn plugin_verify_local_directory_reports_unsigned() {
     );
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     let verified: serde_json::Value = serde_json::from_slice(&out.stdout).expect("verify 输出对象");
-    assert_eq!(verified["signed"], false);
-    assert_eq!(verified["trusted"], false);
+    assert_eq!(verified["id"], "demo");
+    assert_eq!(verified["sha256"].as_str().map(str::len), Some(64));
 }
 
 /// 配置读写与拉黑：全程不联网、不拉起宿主，CLI 与宿主共用的校验必须生效
@@ -1519,7 +1516,6 @@ fn plugin_config_and_block_flags_are_visible_and_enforced() {
             "install",
             "--from",
             artifact.to_str().expect("utf-8 path"),
-            "--allow-unsigned",
         ],
     );
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
@@ -1625,7 +1621,6 @@ fn plugin_revocations_import_and_block_enable() {
             "install",
             "--from",
             artifact.to_str().expect("utf-8 path"),
-            "--allow-unsigned",
         ],
     );
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));

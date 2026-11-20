@@ -783,10 +783,9 @@ pub trait ContractInvoker: Send + Sync {
 /// 实时状态不在这里：`enabled` 是用户期望，进程跑没跑由 [`PluginSupervisor`]
 /// 回答。记录里的 [`Self::last_state`] 只用于宿主不在时的离线展示。
 ///
-/// 四个布尔字段互相独立，组合都有意义：`enabled`（期望状态）、`signed`
-/// （来源可信度）、`blocked`（本机拉黑）、`quarantined`（取证隔离）。刻意
-/// 不合并成状态机：拉黑后仍保留原 `last_state`，解除后能回到用户上一份
-/// 期望状态。
+/// 三个布尔字段互相独立，组合都有意义：`enabled`（期望状态）、`blocked`
+/// （本机拉黑）、`quarantined`（取证隔离）。刻意不合并成状态机：拉黑后仍
+/// 保留原 `last_state`，解除后能回到用户上一份期望状态。
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct PluginRecord {
@@ -822,8 +821,6 @@ pub struct PluginRecord {
     pub source: Option<String>,
     /// 产物摘要
     pub sha256: Option<String>,
-    /// 是否通过签名校验
-    pub signed: bool,
     /// 本机拉黑：立即停用且不再自动启动
     pub blocked: bool,
     /// 隔离：保留产物但禁止运行，用于取证
@@ -964,11 +961,6 @@ pub struct PluginArtifact {
     pub descriptor: Vec<u8>,
     /// 产物摘要（小写 hex）
     pub sha256: String,
-    /// 是否带有效签名
-    pub signed: bool,
-    /// 是否被信任（签名有效；未签名产物即使经 `--allow-unsigned` 放行也保持
-    /// `false`，由安装记录标记为 `untrusted`）
-    pub trusted: bool,
 }
 
 /// `ArtifactSource`：把来源解析成解包后的产物
@@ -987,8 +979,8 @@ pub trait ArtifactSource: Send + Sync {
 
 /// `ArtifactVerifier`：摘要与元数据复查
 ///
-/// 签名在来源拉取阶段完成（签名对象是压缩包，解包后已不可恢复）；本 trait
-/// 只复核来源摘要与解包目录，并原样保留 `signed` / `trusted`。
+/// 来源拉取阶段与安装前各校验一次：先比对来源摘要，再重算解包目录摘要，
+/// 保证落盘的内容与校验过的内容一致。
 pub trait ArtifactVerifier: Send + Sync {
     /// 复查已拉取产物
     ///

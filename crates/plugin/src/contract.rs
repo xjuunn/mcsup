@@ -402,7 +402,6 @@ mod tests {
             previous_version: None,
             source: None,
             sha256: None,
-            signed: false,
             blocked: false,
             quarantined: false,
         }

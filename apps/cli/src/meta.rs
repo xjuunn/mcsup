@@ -1181,7 +1181,10 @@ pub(crate) fn plugin_logs() -> &'static str {
 
 #[must_use]
 pub(crate) fn plugin_verify() -> &'static str {
-    t("校验产物摘要与签名", "verify artifact digest and signature")
+    t(
+        "校验产物摘要与元数据",
+        "verify artifact digest and metadata",
+    )
 }
 
 #[must_use]
@@ -1269,22 +1272,6 @@ pub(crate) fn plugin_ref_arg() -> &'static str {
 #[must_use]
 pub(crate) fn plugin_sha256_arg() -> &'static str {
     t("期望的 SHA-256", "expected SHA-256")
-}
-
-#[must_use]
-pub(crate) fn plugin_allow_unsigned_arg() -> &'static str {
-    t(
-        "允许未签名的本地产物（远端来源仍需签名）",
-        "allow unsigned local artifacts (remote sources still require a signature)",
-    )
-}
-
-#[must_use]
-pub(crate) fn plugin_dev_arg() -> &'static str {
-    t(
-        "开发模式（等同 --allow-unsigned）",
-        "development mode (same as --allow-unsigned)",
-    )
 }
 
 #[must_use]

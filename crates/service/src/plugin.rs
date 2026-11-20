@@ -736,7 +736,7 @@ impl PluginService {
 
     /// 安装插件
     ///
-    /// 流水线：拉取 → 校验 → 解包（由来源实现）→ manifest / descriptor →
+    /// 流水线：拉取 → 摘要校验 → 解包（由来源实现）→ manifest / descriptor →
     /// 原子移动到 `plugins/<id>/<version>` → 写记录。安装期间不启动进程。
     ///
     /// # Errors
@@ -747,7 +747,6 @@ impl PluginService {
         &self,
         origin: &ArtifactOrigin,
         expected_sha256: Option<&Checksum>,
-        allow_unsigned: bool,
     ) -> Result<InstallOutcome, PluginError> {
         let source = self.source.as_ref().ok_or_else(|| {
             PluginError::Usage("no plugin artifact source is configured".to_owned())
@@ -761,7 +760,7 @@ impl PluginService {
         ));
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp)?;
-        let result = self.install_into(origin, expected_sha256, allow_unsigned, &source, &temp);
+        let result = self.install_into(origin, expected_sha256, &source, &temp);
         if result.is_err() {
             let _ = std::fs::remove_dir_all(&temp);
         }
@@ -770,12 +769,12 @@ impl PluginService {
 
     /// 拉取并校验产物，但不安装
     ///
-    /// `verify` 命令用它对未安装的压缩包重新跑一遍来源校验（含签名）。返回
-    /// 值在存活期间持有解包目录，丢弃时删除临时目录。
+    /// `verify` 命令用它对未安装的压缩包重新跑一遍来源校验。返回值在存活
+    /// 期间持有解包目录，丢弃时删除临时目录。
     ///
     /// # Errors
     ///
-    /// 来源未装配、拉取失败、摘要不匹配或签名无效时返回 [`PluginError`]
+    /// 来源未装配、拉取失败或摘要不匹配时返回 [`PluginError`]
     pub fn fetch_artifact(
         &self,
         origin: &ArtifactOrigin,
@@ -810,7 +809,6 @@ impl PluginService {
         &self,
         origin: &ArtifactOrigin,
         expected_sha256: Option<&Checksum>,
-        allow_unsigned: bool,
         source: &Arc<dyn ArtifactSource>,
         temp: &Path,
     ) -> Result<InstallOutcome, PluginError> {
@@ -821,7 +819,6 @@ impl PluginService {
             check_source_checksum(expected_sha256, &fetched.sha256)?;
             fetched
         };
-        enforce_unsigned_policy(origin, allow_unsigned, &artifact)?;
         let manifest = Manifest::from_json(
             &serde_json::to_vec(&artifact.manifest)
                 .map_err(|err| PluginError::Usage(format!("serialize manifest: {err}")))?,
@@ -895,7 +892,6 @@ impl PluginService {
             previous_version: previous.as_ref().map(|record| record.version.clone()),
             source: Some(origin_text(origin)),
             sha256: Some(artifact.sha256),
-            signed: artifact.signed,
             blocked: false,
             quarantined: false,
         };
@@ -1268,27 +1264,6 @@ impl Drop for FetchedPluginArtifact {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.temp);
     }
-}
-
-/// 未签名策略：只有本地来源允许 `--allow-unsigned`，远端来源没有签名一律
-/// 拒绝，且覆盖命令行的显式放行。
-fn enforce_unsigned_policy(
-    origin: &ArtifactOrigin,
-    allow_unsigned: bool,
-    artifact: &PluginArtifact,
-) -> Result<(), PluginError> {
-    if artifact.trusted {
-        return Ok(());
-    }
-    if allow_unsigned && matches!(origin, ArtifactOrigin::Local(_)) {
-        return Ok(());
-    }
-    let message = if matches!(origin, ArtifactOrigin::Local(_)) {
-        "artifact is not signed; pass --allow-unsigned to install unsigned local builds"
-    } else {
-        "artifact is not signed; remote sources require a trusted signature"
-    };
-    Err(PluginError::Denied(message.to_owned()))
 }
 
 fn check_source_checksum(expected: Option<&Checksum>, actual: &str) -> Result<(), PluginError> {
@@ -2398,7 +2373,6 @@ mod tests {
             previous_version: None,
             source: None,
             sha256: None,
-            signed: false,
             blocked: false,
             quarantined: false,
         }

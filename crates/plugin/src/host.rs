@@ -409,7 +409,7 @@ impl PluginHost {
             Ok(conn) => conn,
             Err(err) => {
                 // 先看进程是否已经自己退出。握手超时的根因经常是插件启动即
-                // 死亡（缺文件、签名被拒、启动 panic），而 kill() 会把真实
+                // 死亡（缺文件、权限不足、启动 panic），而 kill() 会把真实
                 // 退出状态覆盖成我们自己发的 SIGKILL。
                 let before = process.try_wait().ok().flatten();
                 let exit = if let Some(status) = before {
@@ -922,7 +922,6 @@ mod tests {
             previous_version: None,
             source: None,
             sha256: None,
-            signed: false,
             blocked: false,
             quarantined: false,
         }

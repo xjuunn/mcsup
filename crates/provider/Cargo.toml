@@ -12,10 +12,7 @@ name = "provider"
 
 [dependencies]
 async-trait.workspace = true
-base64.workspace = true
-blake2.workspace = true
 domain = { package = "mcsup-domain", version = "0.1.0", path = "../domain" }
-ed25519-dalek.workspace = true
 port = { package = "mcsup-port", version = "0.1.0", path = "../port" }
 # default-features = false 砍掉默认的 rustls(aws-lc-rs) 栈：aws-lc 要从源码
 # 编译整套 C 库（cc/cmake 构建脚本 + 数百 C 文件），拖慢构建、放大 MSVC

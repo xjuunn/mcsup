@@ -70,7 +70,7 @@ impl Fixture {
         let dir = self.tmp.path().join("demo");
         write_plugin(&dir);
         self.service
-            .install(&ArtifactOrigin::Local(dir), None, true)
+            .install(&ArtifactOrigin::Local(dir), None)
             .expect("install")
             .record
     }

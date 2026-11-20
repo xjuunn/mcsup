@@ -99,7 +99,7 @@
 | `CAP-GATE` | 能力门 |
 | `API-*` | HostApi 各能力 |
 | `CON-*` | 契约路由与载荷 |
-| `INST-*` | 安装、签名、升级 |
+| `INST-*` | 安装、校验、升级 |
 | `CLI-*` | 命令行契约 |
 | `WEB-*` | descriptor 投影与 REST / WS |
 | `SDK-*` | 四种 SDK |
@@ -179,7 +179,7 @@ TypeScript 侧用 `test("PROTO-FRM-004 ...")`，由报告器解析前缀。
 | H19 版本独立 | `PROTO-VER-001` `SDK-GEN-008` | 四个版本常量可独立递增，互不牵连 |
 | H20 进度回显 | `CLI-UI-002` `CLI-UI-004` | 长步骤有 spinner；JSON 模式无进度 |
 | H21 插件不写前端 | `DOM-DES-018` `WEB-RENDER-001` | 产物含 `.html/.css/.js` 被拒 |
-| H22 离线校验 | `INST-VER-002` `INST-SIG-005` | 摘要 / 平台 / 签名缺失时按规则拒绝 |
+| H22 离线校验 | `INST-VER-002` | 摘要 / 平台不匹配时拒绝；不校验签名 |
 | H23 条款有测试 | `PLAT-011` | 报告 ID 集合等于 `cases.json`；矩阵无空项 |
 
 ## 4.2 关键小节
@@ -220,7 +220,7 @@ TypeScript 侧用 `test("PROTO-FRM-004 ...")`，由报告器解析前缀。
 | 14.3 版本规则 | `SDK-GEN-009` | SDK 主版本 == plugin API 主版本 |
 | 15.4 安装流水线 | `INST-PKG-001..015` | 解析到登记的全链路 |
 | 15.6 升级回滚 | `INST-UPG-001..010` | 失败自动回滚 |
-| 16.2 审核清单 | `INST-SIG-008` `SEC-SIG-006` | 自动审核项逐条 |
+| 16.2 审核清单 | `SEC-SIG-006` | 自动审核项逐条（不含签名） |
 | 18.3 退出码 | `CLI-EXIT-001..010` | 七类错误 + 插件特有场景 |
 | 19.1 审计 | `HOST-EVT-007` `CON-RTE-011` | 字段完整、无明文 |
 | 20.5 性能 | `BENCH-001..006` | 握手、调用、扇出、内存、列表 |
@@ -1018,7 +1018,7 @@ panic，只能返回错误。
 | `INST-VER-008` | 解包超限 | 拒绝 |
 | `INST-VER-009` | 文件数超限 | 拒绝 |
 | `INST-VER-010` | 压缩比异常 | 拒绝 |
-| `INST-VER-011` | 签名缺失 | 按 H22 处理 |
+
 | `INST-VER-012` | 撤销列表命中 | 拒绝启动 |
 
 撤销相关的落位（`provider::plugin_revoke` 的缓存用例 + `crates/service/tests/plugin_revocation.rs`）：
@@ -1065,34 +1065,6 @@ panic，只能返回错误。
 | `INST-UPG-009` | `--prune` | 旧版本清理 |
 | `INST-UPG-010` | 并发升级 | 第二个拒绝 |
 
-## 11.5 签名（`INST-SIG`）
-
-| ID | 场景 | 期望 |
-| --- | --- | --- |
-| `INST-SIG-001` | Sigstore 有效 | 通过 |
-| `INST-SIG-002` | 内容篡改 | 拒绝 |
-| `INST-SIG-003` | 身份不符 | 拒绝 |
-| `INST-SIG-004` | 证书过期 | 拒绝 |
-| `INST-SIG-005` | 市场来源无签名 | 拒绝 |
-| `INST-SIG-006` | 撤销 | 拒绝 |
-| `INST-SIG-007` | minisign 有效 | 通过 |
-| `INST-SIG-008` | 公钥错误 | 拒绝 |
-| `INST-SIG-009` | 本地无签名 + `--allow-unsigned` | 安装并标记 `untrusted` |
-| `INST-SIG-010` | 市场无签名 + `--allow-unsigned` | 仍拒绝 |
-| `INST-SIG-011` | provenance 仓库不符 | 拒绝 |
-| `INST-SIG-012` | 信任库权限 | `0600` / 目录 `0700` |
-
-落位：
-
-- `INST-SIG-002` / `007` / `008` / `012`：`crates/provider/src/plugin_sig.rs`
-  单测（内容篡改、trusted comment 篡改、错 key、未知 key id、权限）。
-- `INST-SIG-009` / `010`：`crates/service/tests/plugin_signing.rs`（本地放行与
-  远端拒绝）；`plugin update` 的信任姿态沿用同处在 CLI 契约测试覆盖。
-- `INST-SIG-006`（撤销）：按「插件 id + 版本」命中即拒绝启动，与签名无关，
-  见 `crates/service/tests/plugin_revocation.rs`。
-- `INST-SIG-001` / `003` / `004` / `005` / `011` 依赖 Sigstore 证书链、身份绑定与
-  provenance，尚未实现，不写「通过」。
-
 ## 11.6 安全（`SEC-*`）
 
 | ID | 场景 | 期望 |
@@ -1107,16 +1079,11 @@ panic，只能返回错误。
 | `SEC-ZIP-008` | 路径深度 9 | 拒绝 |
 | `SEC-ZIP-009` | 可执行脚本 | 不执行，记录 |
 | `SEC-ZIP-010` | 保留名 / 尾随点 | 拒绝 |
-| `SEC-SIG-001` | 篡改 | 拒绝 |
-| `SEC-SIG-002` | 身份伪造 | 拒绝 |
-| `SEC-SIG-003` | 过期证书 | 拒绝 |
 | `SEC-SIG-004` | 撤销 | 拒绝 |
-| `SEC-SIG-005` | 密钥轮换 | 新旧公钥都可用 |
 | `SEC-SIG-006` | 自动审核项 | 逐条通过 / 拒绝 |
 | `SEC-SIG-007` | 摘要不匹配 | 拒绝 |
 | `SEC-SIG-008` | 平台产物错配 | 拒绝 |
 | `SEC-SIG-009` | 旧版本重放 | 拒绝或提示 |
-| `SEC-SIG-010` | 信任库权限 | 过宽拒绝 |
 | `SEC-SSRF-001` | `localhost` | 拒绝 |
 | `SEC-SSRF-002` | `127.0.0.1` | 拒绝 |
 | `SEC-SSRF-003` | `::1` | 拒绝 |
@@ -1215,7 +1182,7 @@ panic，只能返回错误。
 | `CLI-CMD-016` | `remove` | 保留数据、删除密钥；`--keep-secrets` 保留密钥；`--purge` 全删 |
 | `CLI-CMD-017` | `update --to` | 切换版本 |
 | `CLI-CMD-018` | `rollback` | 切回上一版本 |
-| `CLI-CMD-019` | `verify` | 摘要与签名结果 |
+| `CLI-CMD-019` | `verify` | 摘要与元数据复查 |
 | `CLI-CMD-020` | `doctor` | 汇总检查项 |
 | `CLI-CMD-021` | `block` / `unblock` | 立即停止并禁用；解除后不自动启用 |
 | `CLI-CMD-022` | `quarantine` / `release` | 产物保留，启动被拒绝 |
@@ -1566,13 +1533,13 @@ cargo test -p cli plugin
 
 ```
 ./scripts/check-sdk.sh
-./scripts/check-plugin-tests.sh --only SDK-,INST-SIG,SEC-SIG
+./scripts/check-plugin-tests.sh --only SDK-,SEC-SIG
 ```
 
 验收：
 
 - 四语言 descriptor 一致；
-- 签名、撤销、provenance 全绿；
+- 摘要、撤销全绿；签名与 provenance 暂不实现（见 `docs/plugins-progress.md`）；
 - Python / Java SDK 过 conformance；
 - 升级失败自动回滚端到端通过。
 

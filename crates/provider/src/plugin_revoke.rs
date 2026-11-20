@@ -6,7 +6,7 @@
 //! 缓存是安全设施：读不懂不能当成空表放行，所以权限过宽、符号链接、内容
 //! 超限、JSON 非法一律返回错误，由调用方按「无法检查」处理。
 
-use crate::plugin_sig;
+use crate::private_file;
 use domain::plugin::revocation::{MAX_REVOCATION_BYTES, RevocationList};
 use port::plugin::HostError;
 use std::io::ErrorKind;
@@ -48,7 +48,7 @@ pub fn load_revocation_list(path: &Path) -> Result<Option<RevocationList>, HostE
             path.display()
         )));
     }
-    plugin_sig::check_permissions(path, &metadata, false)?;
+    private_file::check_permissions(path, &metadata, false)?;
     let file = std::fs::File::open(path).map_err(|err| {
         HostError::internal(format!("open revocation list {}: {err}", path.display()))
     })?;

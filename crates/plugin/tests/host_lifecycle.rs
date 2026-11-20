@@ -225,7 +225,6 @@ fn record_with(
         previous_version: None,
         source: None,
         sha256: None,
-        signed: true,
         blocked: false,
         quarantined: false,
     }

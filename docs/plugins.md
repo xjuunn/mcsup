@@ -95,7 +95,7 @@ MCSUP 里同时存在三种容易混淆的「插件」：
 | **实例（instance）** | 一个插件的运行单位。默认机器级单实例，可声明为每服一实例 |
 | **resident** | 常驻标记。为真时宿主不因空闲回收该插件，且宿主随之存活 |
 | **产物（artifact）** | 可安装的压缩包：manifest + descriptor + 二进制 + 许可证 |
-| **可信产物** | 有有效签名且摘要匹配的产物；未签名产物需显式 `--allow-unsigned`（仅本地来源） |
+| **可信产物** | 摘要匹配、通过解包安全检查与 manifest / descriptor 校验的产物；当前不校验签名 |
 
 ---
 
@@ -127,7 +127,7 @@ MCSUP 里同时存在三种容易混淆的「插件」：
 | H19 | 协议版本、API 版本、manifest schema、descriptor schema 各自独立递增 |
 | H20 | 所有耗时步骤必须有进度回显；JSON 模式下 stdout 只含数据 |
 | H21 | `[禁止]` 插件写前端资源。界面只能由 descriptor 投影生成 |
-| H22 | 插件产物必须可离线校验：摘要 + 平台匹配必备；签名缺失时必须显式 `--allow-unsigned` 并标记 `untrusted`（仅本地来源；远端来源无签名一律拒绝） |
+| H22 | 插件产物必须可离线校验：摘要 + 平台匹配必备；当前不校验签名，安装记录如实保存摘要 |
 | H23 | 每条硬规则与关键小节必须在 `docs/plugins-testing.md` 有测试 ID；没有对应用例的条款视为未实现 |
 
 # 4. 架构落位
@@ -239,7 +239,7 @@ SDK README 必须显式区分，避免作者把宿主 crate 写进插件依赖�
 | `NetProxy` | 宿主代发的出站请求（可选路径） | `provider` |
 | `PluginStore` | 安装记录、当前版本、授权状态 | `storage` |
 | `ArtifactSource` | git / url 解析到产物字节 | `provider` |
-| `ArtifactVerifier` | 来源摘要与解包目录复查（签名在来源阶段完成） | `plugin` |
+| `ArtifactVerifier` | 来源摘要与解包目录复查 | `plugin` |
 | `AuditSink` | 审计记录 | `storage` |
 | `PluginSupervisor` | 启停 / 状态 / 控制通道客户端 | `plugin` |
 
@@ -1086,7 +1086,7 @@ Java 能力的帧方法：
 | `FileOps` | `service::plugin::HostApiImpl` + `domain::path` 的路径校验 | service 内部经 `crate::fs` 入口 |
 | `KvStore` / `SecretStore` / `PluginStore` / `AuditSink` | `storage` | 一条记录一个 JSON；审计用追加 JSONL |
 | `ArtifactSource` | `provider` | git / url 解析与下载 |
-| `ArtifactVerifier` / `PluginSupervisor` | `plugin` | 摘要、进程、端点、帧；minisign 验签在 `provider::plugin_sig` |
+| `ArtifactVerifier` / `PluginSupervisor` | `plugin` | 摘要、进程、端点、帧 |
 | `NetProxy` | `provider` | 复用现有 HTTP 栈与代理配置 |
 
 `service` 的 `HostApiImpl` 由门面 `bootstrap` 构造并注入 `plugin::PluginHost`。
@@ -1117,7 +1117,7 @@ Java 能力的帧方法：
 | `resources` | object | 否 | `{recommended_memory_mb, recommended_cpu_percent}`，仅声明 |
 | `publisher` | object | 否 | `{name, url}`，市场审核用 |
 | `license` | string | 是 | SPDX 标识 |
-| `source` | object | 安装时写入 | 来源、commit、摘要、签名信息 |
+| `source` | object | 安装时写入 | 来源、commit、摘要 |
 
 ## 10.2 示例
 
@@ -1796,7 +1796,7 @@ Git 解析步骤（不执行任何代码）：
 
 1. `git ls-remote` 或托管方 API 把 `--ref` 解析成 commit SHA。
 2. 读取该 commit 的 `mcsup-plugin.json`（索引）或 Release 元数据。
-3. 索引给出各平台产物的 URL、`sha256`、`size`、可选签名。
+3. 索引给出各平台产物的 URL、`sha256`、`size`。
 4. 下载、校验、解包、登记。
 
 `--ref` 必须是 tag 或完整 SHA；`[禁止]` 默认跟随分支头，避免同一命令装到
@@ -1830,43 +1830,39 @@ chat-bridge-0.3.1/
 解包必须防 Zip Slip：拒绝绝对路径、`..`、符号链接、硬链接、设备文件。
 Windows 还需拒绝保留名（`CON`、`NUL` 等）与尾随点 / 空格。
 
-## 15.3 签名
+## 15.3 签名（暂不实现）
 
-| 场景 | 要求 |
+当前不做签名校验：任何人都可以构建并发布插件，安装只校验**摘要**与**包
+安全**。这是明确的产品决定，不是遗漏。
+
+| 场景 | 当前行为 |
 | --- | --- |
-| 市场来源 | 必须 Sigstore（cosign）签名，绑定仓库与 commit `[待实现]` |
-| 自建源 | 必须 minisign / ed25519 签名，公钥在 `plugins/trusted-keys/` |
-| 本地 `--from` | 可 `--allow-unsigned`，安装后标记 `untrusted` |
-| 远端 URL | `--allow-unsigned` 无效，无签名一律拒绝 |
-| `--dev` 源码构建 | 一律 `untrusted`，禁止发布到市场 |
+| 市场来源 | 与自建源、本地来源相同：只校验摘要与包安全 |
+| 自建源 | 同上；`plugins/trusted-keys/` 目录不再创建 |
+| 本地 `--from` | 直接安装，无需额外开关 |
+| 远端 URL | 只校验摘要（`--sha256` 或同名 `.sha256`），不要求签名 |
+| 签名文件 | 忽略：`.minisig` / `.sigstore` 不影响安装结果 |
 
-已实现的 minisign 约定：
+保留的校验：
 
-- 只对压缩包产物签名：签名文件与被签文件同目录同名，追加 `.minisig`；
-  URL 来源取 `<url>.minisig`（404 视为未签名，其他失败一律拒绝）。
-- 目录来源没有稳定字节流，视为未签名。
-- 信任库是 `{data_dir}/plugins/trusted-keys/*.pub`，启动时创建为 `0700`；
-  加载时要求目录 `0700`、公钥文件 `0600`，符号链接与过宽权限一律拒绝。
-- 支持 `ED`（对 BLAKE2b-512 摘要签名）与 `Ed`（对原始字节签名）两种头；
-  签名文件第四行的全局签名同样校验，trusted comment 被改写即失败。
-- 校验顺序：来源摘要 → 签名 → 解包安全检查（Zip Slip / 符号链接 / 大小
-  与数量上限）→ manifest / descriptor。签名失败不可覆盖，`[禁止]` 提供
-  「仍然安装」的隐藏开关。
-- 未签名策略在 `service`：只有本地来源可以 `--allow-unsigned`，放行后
-  `signed` / `trusted` 仍为 `false`，安装记录如实标记。
+- 压缩包上限、解包安全（Zip Slip / 符号链接 / 大小与数量上限）、
+  manifest 与 descriptor 校验。
+- 摘要：安装记录保存解包目录摘要；`plugin verify` 重算并比对。摘要能发现
+  下载损坏与传输截断，但不提供身份保证——它防不了「有人发布一个恶意插件」，
+  只能保证「装到的东西与校验过的东西一致」。
 
-Sigstore 与 provenance 尚未实现：仓库没有证书链解析与信任根，接上之前的签名
-只认 minisign 信任库。
+已移除：minisign / ed25519 验签、信任库（`plugins/trusted-keys/`）、
+`--allow-unsigned` / `--dev` 开关、安装记录里的 `signed` / `trusted` 字段、
+`plugin verify` 的签名结论。
 
-撤销列表已实现（§16.4）：`plugins/revoked.json` 由
-`mcsup plugin revocations import|fetch` 写入，权限 `0600`、原子替换；命中
-「插件 id + 版本」时 `enable` / `start` 一律 `denied`，`versions: []` 表示整个
-插件下架。列表读不懂或不可用时只记 `warning`、不阻断已安装插件。
+将来若接入签名，计划是市场来源用 Sigstore（cosign）绑定仓库与 commit、
+自建源用 minisign；届时需要先解决证书链解析与信任根。当前用**能力授权 +
+撤销列表 + 审计**承担运行时风险，而不是产物来源。
 
 ## 15.4 安装流水线
 
 ```
-解析来源 → 下载 → 校验摘要 → 校验签名 → 解包到临时目录
+解析来源 → 下载 → 校验摘要 → 解包到临时目录
 → 校验 manifest → 校验 descriptor → 计算能力清单
 → 原子移动到 plugins/<id>/<version>/
 → 写安装记录 → 状态 disabled / pending_approval
@@ -1887,7 +1883,7 @@ Sigstore 与 provenance 尚未实现：仓库没有证书链解析与信任根�
 
 ```
 将安装 chat-bridge 0.3.1
-  来源：git https://... @ 3f9c2a1（已签名）
+  来源：git https://... @ 3f9c2a1
   能力：
     events, storage:kv, server:read        低风险，自动允许
     console:read, net:outbound, secret:rw  需确认
@@ -1928,7 +1924,7 @@ Sigstore 与 provenance 尚未实现：仓库没有证书链解析与信任根�
 | 威胁 | 现有措施 | 残余风险 |
 | --- | --- | --- |
 | 插件执行任意命令 | 能力门只拦「宿主代做」；插件自身进程可做任何 OS 允许的事 | 需要 OS 级沙箱才能消除；文案不得承诺 |
-| 供应链投毒 | 固定 commit、摘要、签名、provenance、审核 | 作者账号被盗；靠撤销与举报缓解 |
+| 供应链投毒 | 固定 commit、摘要、审核 | 作者账号被盗；靠撤销与举报缓解（当前不做产物签名） |
 | 能力扩张 | 升级重新确认授权 | 用户习惯性点确认 |
 | 密钥泄露 | 只写不读、日志脱敏、文件权限 0600 | 插件自身可读明文（它需要用） |
 | SSRF | `NetProxy` 默认拒绝私网与元数据地址 | 插件自己开 socket 不受限 |
@@ -1946,7 +1942,7 @@ Sigstore 与 provenance 尚未实现：仓库没有证书链解析与信任根�
    标记「能力冗余」要求解释。
 3. 契约闭集与能力匹配（12.2）。
 4. 产物无符号链接、无超出平台目录的路径、无可执行脚本文件（`.sh` / `.ps1`）。
-5. 签名有效且身份与发布者一致。
+5. 摘要与安装记录一致。
 6. 二进制平台覆盖与 manifest 一致。
 7. descriptor 中不得出现 `x-mcsup-*` 以外的扩展键（未知扩展忽略但记录）。
 8. 包内不得包含 `.git`、`node_modules`、构建缓存。
@@ -2011,8 +2007,7 @@ Sigstore 与 provenance 尚未实现：仓库没有证书链解析与信任根�
 ├── plugins/
 │   ├── <id>/
 │   │   ├── 0.3.0/                     # 不可变产物
-│   │   ├── 0.3.1/
-│   │   └── trusted-keys/              # 自建源公钥
+│   │   └── 0.3.1/
 ├── plugin-data/
 │   └── <id>/
 │       ├── kv/                        # 键值，一键一文件
@@ -2057,9 +2052,7 @@ Sigstore 与 provenance 尚未实现：仓库没有证书链解析与信任根�
     "type": "git",
     "url": "https://github.com/example/chat-bridge",
     "commit": "3f9c2a1d4e5f60718293a4b5c6d7e8f901234567",
-    "artifact_sha256": "9f2c...",
-    "signature": { "kind": "sigstore", "identity": "https://github.com/example/chat-bridge/.github/workflows/release.yml@refs/tags/v0.3.1" },
-    "trusted": true
+    "artifact_sha256": "9f2c..."
   },
   "versions": ["0.3.0", "0.3.1"],
   "last_error": null
@@ -2092,7 +2085,7 @@ Sigstore 与 provenance 尚未实现：仓库没有证书链解析与信任根�
 ```
 mcsup plugin list [--json]
 mcsup plugin install <source> [--from|--url|--git] [--ref <tag|sha>] [--sha256 <hex>]
-                              [--allow-unsigned] [--dev] [--yes] [--json]
+                              [--yes] [--json]
 mcsup plugin update <id> [--to <version>] [--prune] [--yes]
 mcsup plugin remove <id> [--purge] [--keep-secrets] [--yes]
 mcsup plugin enable <id>
@@ -2112,7 +2105,7 @@ mcsup plugin unblock <id>
 mcsup plugin quarantine <id>
 mcsup plugin release <id>
 mcsup plugin logs <id> [--follow] [--tail <n>]
-mcsup plugin verify <path|id>
+mcsup plugin verify <path|id>            # 重算摘要并复查 manifest / descriptor
 mcsup plugin rollback <id>
 mcsup plugin revocations [import <file>|fetch <url> [--sha256 <hex>]]
 mcsup plugin doctor [--json]
@@ -2144,11 +2137,11 @@ $ mcsup plugin call watchdog health --json
 ```
 $ mcsup plugin install --git https://github.com/example/chat-bridge --ref v0.3.1
 正在解析来源…
-  已解析 commit 3f9c2a1（签名有效）
+  已解析 commit 3f9c2a1
 正在下载产物…
   12.4 MiB / 12.4 MiB
 正在校验…
-  摘要匹配，签名有效
+  摘要匹配
 正在安装…
   能力：events, storage:kv, server:read（自动允许）
         console:read, net:outbound, secret:rw（需确认）
@@ -2179,7 +2172,6 @@ $ mcsup plugin install --git https://github.com/example/chat-bridge --ref v0.3.1
 | 插件未运行 / 崩溃 | `Backend` | 5 |
 | 状态不允许（已启用、正在运行） | `Conflict` | 4 |
 | descriptor 不合法 | `Usage` | 2 |
-| 签名失败 | `Unauthorized` | 6 |
 | 用户取消 | `Cancelled` | 130 |
 
 ## 18.4 进度回显
@@ -2191,7 +2183,7 @@ $ mcsup plugin install --git https://github.com/example/chat-bridge --ref v0.3.1
 | --- | --- |
 | 解析来源 | `正在解析来源…` |
 | 下载 | `正在下载产物…` + 字节进度 |
-| 校验 | `正在校验摘要与签名…` |
+| 校验 | `正在校验摘要与包安全…` |
 | 解包 | `正在解包…` |
 | 校验 descriptor | `正在校验插件描述…` |
 | 启动 | `正在启动 <id>…` |
@@ -2207,7 +2199,7 @@ $ mcsup plugin install --git https://github.com/example/chat-bridge --ref v0.3.1
 
 | 事件 | 字段 |
 | --- | --- |
-| `plugin.install` | id, version, source, sha256, trusted, actor |
+| `plugin.install` | id, version, source, sha256, actor |
 | `plugin.remove` | id, purge, actor |
 | `plugin.enable` / `disable` | id, actor |
 | `plugin.start` / `stop` / `restart` | id, reason, actor |
@@ -2326,7 +2318,6 @@ $ mcsup plugin install --git https://github.com/example/chat-bridge --ref v0.3.1
 | 契约深度 | 第 5 层被拒 |
 | 安装不执行代码 | 用带陷阱的产物（含 `preinstall` 脚本）验证未被运行 |
 | 路径逃逸 | 含 `../`、符号链接的产物被拒 |
-| 签名失败 | 安装被拒，无「仍然安装」路径 |
 | 卸载保留数据 | `plugin-data` 仍在；`--purge` 后消失 |
 
 ## 20.3 testkit
@@ -2449,22 +2440,21 @@ $ mcsup plugin install --git https://github.com/example/chat-bridge --ref v0.3.1
 - 六种 display 的 fixture 在渲染测试中全部通过；
 - 破坏性 op 需要 Admin + 二次确认。
 
-## M4：Java、签名与市场
+## M4：Java、撤销与市场
 
 交付：
 
 - 能力：`java`；
-- Sigstore / minisign 校验、provenance、撤销列表、`quarantine`；
-- Python / Java SDK；
-- 市场审核清单自动化；
+- 撤销列表、`quarantine`；
+- 市场审核清单自动化（后续）；
 - `docs/plugins-progress.md` 记录里程碑与实测性能。
 
 验收：
 
-- 未签名产物默认拒绝；`--allow-unsigned` 仅对本地来源生效；
 - 撤销列表命中时拒绝启动；
-- 四种语言 SDK 的 descriptor 逐字节一致；
 - 升级失败自动回滚，用户不需要手工恢复。
+
+签名、provenance 与 SDK 当前不做，见 `docs/plugins-progress.md`「明确不做」。
 
 ## 阶段依赖
 
@@ -2483,8 +2473,8 @@ M0 ─→ M1 ─→ M2 ─→ M3 ─→ M4
 | --- | --- |
 | 原生动态库插件 | ABI 不稳、崩溃拖垮宿主、跨语言成本高、无法审计 |
 | WASM（v1） | 需要额外运行时与能力映射；等进程模型稳定后再评估 |
-| npm / pip / cargo 安装插件 | 安装即执行任意代码；与签名、审核、回滚全部冲突 |
-| 安装时构建源码 | 同上；只允许 `--dev` 且标记 `untrusted` |
+| npm / pip / cargo 安装插件 | 安装即执行任意代码；与审核、回滚全部冲突 |
+| 安装时构建源码 | 同上；产物无法复用、无法校验摘要 |
 | 插件自带前端 | XSS、CSP、审核、版本漂移；且与「作者不写前端」矛盾 |
 | 任意布局 DSL（v1） | 把界面设计责任推给作者，负担反而上升 |
 | 插件直连插件 | 绕过能力门、审计、超时、循环检测 |
@@ -2702,15 +2692,13 @@ descriptor、打包 zip。作者不接触端点、帧、路由与界面。
       "platform": "darwin-arm64",
       "url": "https://github.com/example/chat-bridge/releases/download/v0.3.1/chat-bridge-0.3.1-darwin-arm64.zip",
       "sha256": "9f2c...",
-      "size": 13002342,
-      "signature": "https://github.com/example/chat-bridge/releases/download/v0.3.1/chat-bridge-0.3.1-darwin-arm64.zip.sigstore"
+      "size": 13002342
     },
     {
       "platform": "linux-x64",
       "url": "https://github.com/example/chat-bridge/releases/download/v0.3.1/chat-bridge-0.3.1-linux-x64.zip",
       "sha256": "ab41...",
-      "size": 12888111,
-      "signature": "https://github.com/example/chat-bridge/releases/download/v0.3.1/chat-bridge-0.3.1-linux-x64.zip.sigstore"
+      "size": 12888111
     }
   ]
 }

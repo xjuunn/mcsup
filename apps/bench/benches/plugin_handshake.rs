@@ -134,7 +134,6 @@ fn record(id: &PluginId, artifact_dir: PathBuf) -> PluginRecord {
         previous_version: None,
         source: None,
         sha256: None,
-        signed: false,
         blocked: false,
         quarantined: false,
     }

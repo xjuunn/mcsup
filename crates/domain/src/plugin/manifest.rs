@@ -134,9 +134,6 @@ pub struct SourceInfo {
     /// 产物摘要
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
-    /// 是否通过签名校验
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub signed: Option<bool>,
 }
 
 /// manifest 原始结构

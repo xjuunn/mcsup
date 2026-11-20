@@ -716,7 +716,6 @@ fn record_json(record: &PluginRecord, status: &PluginRuntimeStatus) -> Value {
         "last_error": status.last_error,
         "blocked": record.blocked,
         "quarantined": record.quarantined,
-        "signed": record.signed,
         "sha256": record.sha256,
         "source": record.source,
     })

@@ -1072,10 +1072,6 @@ pub(crate) enum PluginAction {
         reference: Option<String>,
         #[arg(long, value_name = "HEX", help = crate::meta::plugin_sha256_arg())]
         sha256: Option<String>,
-        #[arg(long, help = crate::meta::plugin_allow_unsigned_arg())]
-        allow_unsigned: bool,
-        #[arg(long, help = crate::meta::plugin_dev_arg())]
-        dev: bool,
     },
     /// 升级到新版本（沿用记录的来源）
     #[command(about = crate::meta::plugin_update())]

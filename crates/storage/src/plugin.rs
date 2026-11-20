@@ -78,8 +78,6 @@ struct FileRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sha256: Option<String>,
     #[serde(default)]
-    signed: bool,
-    #[serde(default)]
     blocked: bool,
     #[serde(default)]
     quarantined: bool,
@@ -110,7 +108,6 @@ impl FileRecord {
             previous_version: record.previous_version.clone(),
             source: record.source.clone(),
             sha256: record.sha256.clone(),
-            signed: record.signed,
             blocked: record.blocked,
             quarantined: record.quarantined,
             artifact_dir: Some(record.artifact_dir.to_string_lossy().into_owned()),
@@ -176,7 +173,6 @@ impl FileRecord {
             previous_version: self.previous_version,
             source: self.source,
             sha256: self.sha256,
-            signed: self.signed,
             blocked: self.blocked,
             quarantined: self.quarantined,
         })
@@ -1114,7 +1110,6 @@ mod tests {
             previous_version: None,
             source: None,
             sha256: None,
-            signed: false,
             blocked: false,
             quarantined: false,
         }
