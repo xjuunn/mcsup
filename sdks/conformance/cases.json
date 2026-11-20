@@ -1,0 +1,76 @@
+{
+  "schema": 1,
+  "note": "跨语言行为用例：同一 PluginDefinition 在任一语言 SDK 下应给出相同结果。由各语言测试驱动。",
+  "cases": [
+    {
+      "id": "query.returns-output",
+      "op": "counter",
+      "kind": "query",
+      "input": { "channel": "global" },
+      "expect": { "ok": true, "output": { "count": 0, "channel": "global" } }
+    },
+    {
+      "id": "query.input-invalid",
+      "op": "counter",
+      "kind": "query",
+      "input": { "channel": 42 },
+      "expect": { "ok": false, "error": { "code": "invalid_input" } }
+    },
+    {
+      "id": "call.unknown-op",
+      "op": "missing",
+      "kind": "query",
+      "input": {},
+      "expect": { "ok": false, "error": { "code": "not_found" } }
+    },
+    {
+      "id": "action.throwing-is-internal",
+      "op": "failing",
+      "kind": "action",
+      "input": {},
+      "expect": { "ok": false, "error": { "code": "internal" } }
+    },
+    {
+      "id": "stream.sequence",
+      "op": "messages",
+      "kind": "stream",
+      "input": { "prefix": "#" },
+      "expect": {
+        "ok": true,
+        "chunks": [{ "delta": "#你" }, { "delta": "#好" }, { "delta": "#" }],
+        "done": true,
+        "seq_from": 0
+      }
+    },
+    {
+      "id": "config.applied",
+      "kind": "config",
+      "input": { "revision": 2, "values": { "token": "t2", "channels": ["global"] } },
+      "expect": { "ok": true }
+    },
+    {
+      "id": "config.invalid-keeps-previous",
+      "kind": "config",
+      "input": { "revision": 2, "values": { "token": "" } },
+      "expect": { "ok": false, "error": { "code": "invalid_input" } }
+    },
+    {
+      "id": "handshake.reject-api-mismatch",
+      "kind": "handshake",
+      "input": { "reject": { "code": "api_mismatch", "message": "api mismatch" } },
+      "expect": { "exit_code": 4 }
+    },
+    {
+      "id": "handshake.invalid-config",
+      "kind": "handshake",
+      "input": { "config": { "token": "" } },
+      "expect": { "exit_code": 3 }
+    },
+    {
+      "id": "shutdown.clean-exit",
+      "kind": "shutdown",
+      "input": { "grace_ms": 1000 },
+      "expect": { "exit_code": 0 }
+    }
+  ]
+}

@@ -9,7 +9,7 @@
 | 阶段 | 内容 | 状态 |
 | --- | --- | --- |
 | M0 | 契约冻结：manifest / descriptor / 能力 / 状态 / 错误码 / 帧 | 完成（conformance 清单目录未建，见「偏差」） |
-| M1 | 宿主进程、握手、帧循环、退避、空闲回收；最小能力与 CLI | 完成（Rust / TS SDK 未在本仓库提供） |
+| M1 | 宿主进程、握手、帧循环、退避、空闲回收；最小能力与 CLI | 完成（Rust SDK 未在本仓库提供） |
 | M2 | 写能力、出站代发、契约路由、配置回滚与隔离 | 完成 |
 | M3 | 生命周期、备份、文件、内容能力；六类展示投影 | 完成（REST / WS、MCP 入口不在本仓库） |
 | M4 | `java` 能力 | 完成 |
@@ -92,9 +92,9 @@
 | 设计文档要求 | 仓库现状 |
 | --- | --- |
 | 入口含 `apps/server`、`apps/mcp` | 仓库只有 `apps/agent` / `bench` / `cli` / `dev`；REST / WS、MCP 投影无法在本仓库实现 |
-| `sdks/` 四语言 SDK 与 `sdks/conformance` 用例登记 | 无 `sdks/` 目录；测试以 Rust 单测 / 集成测试承载，用例 ID 写在测试函数名或注释里 |
-| `scripts/check-plugin-tests.sh` 汇总用例 ID | 已决定不做；用例由 `scripts/check.sh` 的常规 `test` 步骤覆盖 |
-| M1 交付 Rust / TS SDK | 已决定不做；只有测试 fixture 插件 |
+| `sdks/` 四语言 SDK | 仅 TypeScript（`sdks/typescript`，npm 包 `mcsup-plugin`）落地；Rust / Python / Go 待立项 |
+| `scripts/check-plugin-tests.sh` 汇总用例 ID | 已决定不做；Rust 用例由 `scripts/check.sh` 的 `test` 步骤覆盖，SDK 用例由 `scripts/check-sdk.sh` 覆盖 |
+| M1 交付 Rust / TS SDK | TypeScript 已完成，见「TS SDK」一节；Rust SDK 仍未提供 |
 | 市场来源必须 Sigstore 签名 | 已移除该要求；当前不校验签名 |
 
 ## 待办
@@ -124,7 +124,30 @@
 | `plugin report` 举报 | 不做 |
 | `scripts/check-plugin-tests.sh` | 不做；用例由 `scripts/check.sh` 覆盖 |
 
-## 性能
+## TS SDK
+
+`sdks/typescript` 按 `docs/sdk-design.md` 实现，npm 包名 `mcsup-plugin`：
+
+| 项 | 落点 |
+| --- | --- |
+| 单一内核 | `definePlugin({...})`，manifest / descriptor 由同一份定义生成 |
+| Builder | `query` / `action` / `stream` / `op` / `lineFilter`，产物是内核可接受的片段 |
+| Hooks | `useConsoleTail` / `useRetry` / `useKvCache` / `useEvents`，签名 `useX(ctx, options)` |
+| 类型安全 | 能力驱动 `ctx`（未声明即编译期不存在）、zod v4 唯一 schema 层、输出 schema 双向校验、`PluginError` 统一错误 |
+| 协议 | 帧编解码、深度与 1 MiB 限制、握手、调用、流（seq / done / cancel）、config、ping/pong、shutdown、退出码 0/1/2/3/4 |
+| 构建 | `mcsup-plugin build`：tsc → `--mcsup-dump-descriptor` → 打包 + 平台启动器 |
+| 测试 | 63+ 用例：协议、descriptor 归一化、Builder 类型、Hooks、MockHost、真实进程、`sdks/conformance/cases.json` |
+| 门禁 | `scripts/check-sdk.sh`（已接入 `scripts/check.sh` 的 `sdk` 步骤） |
+
+行为差异（相对宿主侧文档，已在此记录）：
+
+- 声明的能力若未被授予，运行期访问 `ctx.<能力>` 抛 `denied`，而不是返回
+  `undefined`；`Hook` 同样报 `denied`。
+- Builder 的 `.capabilities([...])` 决定 op 处理函数里 `ctx` 的类型；省略时
+  `ctx` 为完整能力集合。
+- `contract.call` 在 v1 返回 `unsupported`，SDK 不内置契约路由。
+
+# 性能
 
 基准分三个目标，互不依赖：
 
