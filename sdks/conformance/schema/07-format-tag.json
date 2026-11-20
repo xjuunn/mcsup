@@ -1,0 +1,6 @@
+{
+  "id": "format-tag",
+  "description": "文本格式 → x-mcsup-format",
+  "field": { "name": "text", "type": "string", "required": true, "meta": { "format": "minecraft-text" } },
+  "expect": { "type": "string", "x-mcsup-format": "minecraft-text" }
+}

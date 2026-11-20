@@ -1,0 +1,7 @@
+{
+  "id": "optional-field",
+  "description": "非必填字段：不在 required，且不出现 null 类型",
+  "field": { "name": "note", "type": "string", "required": false },
+  "expect": { "type": "string" },
+  "absent": ["null", "anyOf"]
+}

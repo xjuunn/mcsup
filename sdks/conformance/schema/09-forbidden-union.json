@@ -1,0 +1,5 @@
+{
+  "id": "forbidden-union",
+  "description": "禁止：union → 构建失败，错误指名字段",
+  "failure": { "reason": "union", "message-contains": "union" }
+}

@@ -33,6 +33,32 @@ pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 /// descriptor schema 版本
 pub const DESCRIPTOR_SCHEMA_VERSION: u32 = 1;
 
+/// 插件进程退出码（`plugins.md` §6.7）
+///
+/// SDK 与宿主共用这一份定义：Rust SDK 直接引用，TypeScript / Python 由
+/// `protocol::plugin::contracts` 生成，避免各自手写。
+pub mod exit_code {
+    /// 正常退出
+    pub const OK: i32 = 0;
+    /// 未分类失败
+    pub const FAILURE: i32 = 1;
+    /// 协议或握手错误
+    pub const PROTOCOL: i32 = 2;
+    /// 配置无效
+    pub const CONFIG: i32 = 3;
+    /// API 版本不支持
+    pub const API_MISMATCH: i32 = 4;
+
+    /// 全部退出码与线上名（生成器按此顺序输出）
+    pub const ALL: [(&str, i32); 5] = [
+        ("ok", OK),
+        ("failure", FAILURE),
+        ("protocol", PROTOCOL),
+        ("config", CONFIG),
+        ("api_mismatch", API_MISMATCH),
+    ];
+}
+
 /// 插件 id 最大字节数（含）
 pub const MAX_PLUGIN_ID_LEN: usize = 64;
 

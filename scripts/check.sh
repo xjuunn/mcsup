@@ -23,16 +23,16 @@ mcsup_use_local_target
 
 # 选定要跑的步骤：无参数即全部。
 #
-# `architecture fmt check clippy test e2e doc` 是单 token；
+# `architecture fmt check clippy test e2e doc sdk` 是单 token；
 # `feature powerset` 与 `deny` 含空格，作为整串一次传入（`"feature powerset"`）。
 requested=''
 if [ "$#" -gt 0 ]; then
 	for arg in "$@"; do
-		case " architecture fmt check clippy test e2e doc deny feature powerset " in
+		case " architecture fmt check clippy test e2e doc sdk deny feature powerset " in
 			*" $arg "*) ;;
 			*)
 				printf '未知步骤：%s\n' "$arg" >&2
-				printf '可选：architecture / fmt / check / clippy / test / e2e / doc / deny\n' >&2
+				printf '可选：architecture / fmt / check / clippy / test / e2e / doc / sdk / deny\n' >&2
 				printf '多词步骤要整串传：scripts/check.sh "feature powerset"\n' >&2
 				exit 2
 				;;
@@ -91,6 +91,9 @@ else
 fi
 
 run 'doc' env 'RUSTDOCFLAGS=-D warnings' cargo doc --workspace --all-features --no-deps
+
+# 插件 SDK 不在 Cargo workspace 内，单独把门（sdks/*）。未安装 Node 时脚本内部跳过。
+run 'sdk' sh scripts/check-sdk.sh
 
 if want 'feature powerset'; then
 	printf '\n==> feature powerset\n'

@@ -12,6 +12,9 @@ use domain::plugin::error::PluginErrorCode;
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Write};
 
+/// 契约导出（`plugins.md` §14.4）：SDK 的类型文件由这里生成
+pub mod contracts;
+
 /// 插件协议版本
 pub const PLUGIN_PROTOCOL_VERSION: u32 = 1;
 
@@ -148,6 +151,35 @@ pub enum RejectCode {
     AlreadyRunning,
     /// 其它宿主侧拒绝
     Rejected,
+}
+
+impl RejectCode {
+    /// 全部拒绝原因
+    pub const ALL: [Self; 8] = [
+        Self::Unauthorized,
+        Self::IdentityMismatch,
+        Self::ApiMismatch,
+        Self::SchemaMismatch,
+        Self::ScopeMismatch,
+        Self::NotApproved,
+        Self::AlreadyRunning,
+        Self::Rejected,
+    ];
+
+    /// 线上文本；必须与 `#[serde(rename_all = "snake_case")]` 一致
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unauthorized => "unauthorized",
+            Self::IdentityMismatch => "identity_mismatch",
+            Self::ApiMismatch => "api_mismatch",
+            Self::SchemaMismatch => "schema_mismatch",
+            Self::ScopeMismatch => "scope_mismatch",
+            Self::NotApproved => "not_approved",
+            Self::AlreadyRunning => "already_running",
+            Self::Rejected => "rejected",
+        }
+    }
 }
 
 /// 拒绝帧

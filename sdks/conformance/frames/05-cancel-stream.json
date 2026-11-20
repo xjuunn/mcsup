@@ -1,0 +1,8 @@
+{
+  "id": "stream.cancel",
+  "kind": "cancel",
+  "description": "取消流 → 1 s 内停止并回 result（cancelled），不再写流",
+  "op": "slow",
+  "input": {},
+  "expect": { "error": { "code": "cancelled" } }
+}

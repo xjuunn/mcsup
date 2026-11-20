@@ -1,0 +1,9 @@
+{
+  "id": "limit-overflow",
+  "description": "禁止：超限 → 构建失败，报实际值与上限",
+  "failure": {
+    "reason": "limit",
+    "field": { "name": "s", "type": "string", "required": true, "maxLength": 8193 },
+    "message-contains": "limit is 8192"
+  }
+}

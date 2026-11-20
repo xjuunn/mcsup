@@ -1,0 +1,5 @@
+{
+  "id": "forbidden-external-ref",
+  "description": "禁止：外部 $ref → 构建失败",
+  "failure": { "reason": "external-ref", "message-contains": "$ref" }
+}

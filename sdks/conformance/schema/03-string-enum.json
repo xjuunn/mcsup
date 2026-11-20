@@ -1,0 +1,6 @@
+{
+  "id": "string-enum",
+  "description": "字符串枚举",
+  "field": { "name": "level", "type": "string", "required": true, "enum": ["debug", "info"] },
+  "expect": { "type": "string", "enum": ["debug", "info"] }
+}

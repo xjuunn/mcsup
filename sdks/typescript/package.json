@@ -1,0 +1,50 @@
+{
+  "name": "mcsup-plugin",
+  "version": "0.1.0",
+  "description": "MCSUP 插件 SDK：声明式定义插件，SDK 负责协议、类型与生命周期",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "bin",
+    "src",
+    "README.md"
+  ],
+  "bin": {
+    "mcsup-plugin": "./bin/mcsup-plugin.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.ts",
+      "default": "./dist/testing.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "gen": "cargo run -q -p mcsup-protocol --manifest-path ../../Cargo.toml --example gen-contracts -- typescript src/contracts/v1.ts",
+    "test": "vitest run",
+    "conformance": "vitest run test/conformance.test.ts test/schema-conformance.test.ts test/frames-conformance.test.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "peerDependencies": {
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "vitest": "^3.0.0",
+    "zod": "^4.0.0",
+    "@types/node": "^22.10.2"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

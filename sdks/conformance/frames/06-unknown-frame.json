@@ -1,0 +1,9 @@
+{
+  "id": "frame.unknown-type",
+  "kind": "unknown-frame",
+  "description": "未知 type 忽略并保持连接，后续调用不受影响",
+  "inject": { "type": "future.frame", "payload": {} },
+  "op": "counter",
+  "input": { "channel": "global" },
+  "expect": { "ok": true }
+}

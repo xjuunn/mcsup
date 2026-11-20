@@ -1,0 +1,16 @@
+{
+  "id": "array-of-objects",
+  "description": "对象数组",
+  "field": {
+    "name": "rows", "type": "array", "required": true,
+    "items": { "type": "object", "required": ["name"], "fields": [{ "name": "name", "type": "string", "required": true }] }
+  },
+  "expect": {
+    "type": "array",
+    "items": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name"],
+      "properties": { "name": { "type": "string" } }
+    }
+  }
+}

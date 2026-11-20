@@ -1,0 +1,19 @@
+{
+  "id": "nested-object",
+  "description": "嵌套对象：深度 ≤ 6，键排序",
+  "field": {
+    "name": "outer", "type": "object", "required": true,
+    "fields": [{ "name": "inner", "type": "object", "required": true, "fields": [{ "name": "leaf", "type": "string", "required": true }] }]
+  },
+  "expect": {
+    "type": "object", "additionalProperties": false,
+    "required": ["inner"],
+    "properties": {
+      "inner": {
+        "type": "object", "additionalProperties": false,
+        "required": ["leaf"],
+        "properties": { "leaf": { "type": "string" } }
+      }
+    }
+  }
+}

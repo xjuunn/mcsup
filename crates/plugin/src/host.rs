@@ -85,9 +85,11 @@ pub struct PluginHost {
     starting: Mutex<HashSet<PluginId>>,
     crashes: Mutex<HashMap<PluginId, Crashes>>,
     shutting_down: AtomicBool,
-    idle_after: Duration,
-    /// 心跳节奏
-    heartbeat: Heartbeat,
+    /// 空闲停止阈值；同 [`Self::heartbeat`]，只能经锁改写
+    idle_after: Mutex<Duration>,
+    /// 心跳节奏；`new` 里已经把 `Arc<Self>` 交给契约路由，`Arc::get_mut`
+    /// 拿不到独占引用，只能经由锁改写
+    heartbeat: Mutex<Heartbeat>,
     /// 自引用弱指针：后台监管线程需要拥有宿主
     self_ref: OnceLock<Weak<PluginHost>>,
 }
@@ -142,8 +144,8 @@ impl PluginHost {
             starting: Mutex::new(HashSet::new()),
             crashes: Mutex::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
-            idle_after: IDLE_STOP_AFTER,
-            heartbeat: Heartbeat::default(),
+            idle_after: Mutex::new(IDLE_STOP_AFTER),
+            heartbeat: Mutex::new(Heartbeat::default()),
             self_ref: OnceLock::new(),
         });
         router.attach(&host);
@@ -153,24 +155,56 @@ impl PluginHost {
 
     /// 覆盖心跳节奏（测试用）
     ///
-    /// 只能在宿主尚未被共享时调用（`PluginHost::new` 之后立即调用）。
+    /// `PluginHost::new` 返回前已留下两个 `Weak` 自引用（`self_ref` 与契约
+    /// 路由），`Arc::get_mut` 因此永远返回 `None`，早期实现会静默丢弃覆盖
+    /// 值。这里改为经锁写入，任何时刻调用都生效。
     #[must_use]
-    pub fn with_heartbeat(mut self: Arc<Self>, heartbeat: Heartbeat) -> Arc<Self> {
-        if let Some(inner) = Arc::get_mut(&mut self) {
-            inner.heartbeat = heartbeat;
+    pub fn with_heartbeat(self: Arc<Self>, heartbeat: Heartbeat) -> Arc<Self> {
+        {
+            let mut slot = self
+                .heartbeat
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *slot = heartbeat;
         }
         self
     }
 
+    /// 当前心跳节奏
+    fn heartbeat(&self) -> Heartbeat {
+        *self
+            .heartbeat
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// 心跳节奏（测试断言覆盖值是否生效）
+    #[must_use]
+    pub fn heartbeat_for_test(&self) -> Heartbeat {
+        self.heartbeat()
+    }
+
     /// 覆盖空闲停止阈值（测试与 `--idle-timeout` 用）
     ///
-    /// 只能在宿主尚未被共享时调用（`PluginHost::new` 之后立即调用）。
+    /// 与 [`Self::with_heartbeat`] 同理，必须经锁写入。
     #[must_use]
-    pub fn with_idle_after(mut self: Arc<Self>, idle_after: Duration) -> Arc<Self> {
-        if let Some(inner) = Arc::get_mut(&mut self) {
-            inner.idle_after = idle_after;
+    pub fn with_idle_after(self: Arc<Self>, idle_after: Duration) -> Arc<Self> {
+        {
+            let mut slot = self
+                .idle_after
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *slot = idle_after;
         }
         self
+    }
+
+    /// 当前空闲停止阈值
+    fn idle_after(&self) -> Duration {
+        *self
+            .idle_after
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// 启动空闲回收线程
@@ -194,13 +228,15 @@ impl PluginHost {
 
     /// 停止空闲的非 resident 会话
     pub fn reap_idle(&self) {
+        // 锁只取一次：闭包里逐元素加锁会被会话数量放大
+        let idle_after = self.idle_after();
         let idle = self
             .sessions
             .lock()
             .map(|map| {
                 map.values()
                     .filter(|session| !session.record.manifest.resident)
-                    .filter(|session| session.idle_for() >= self.idle_after)
+                    .filter(|session| session.idle_for() >= idle_after)
                     .cloned()
                     .collect::<Vec<_>>()
             })
@@ -212,7 +248,7 @@ impl PluginHost {
                 action: "lifecycle:idle_stop".to_owned(),
                 capability: None,
                 result: AuditResult::Allowed,
-                detail: Some(format!("idle for {} s", self.idle_after.as_secs())),
+                detail: Some(format!("idle for {} s", idle_after.as_secs())),
             });
             session.shutdown(Duration::from_secs(5));
             self.forget_session(&session.record.id);
@@ -457,7 +493,7 @@ impl PluginHost {
             audit: Arc::clone(&self.audit),
             handshake_timeout: HANDSHAKE_TIMEOUT,
             pid,
-            heartbeat: self.heartbeat,
+            heartbeat: self.heartbeat(),
         };
         let outcome = session::handshake(conn, config);
         drop(endpoint);
@@ -555,13 +591,13 @@ impl PluginHost {
     }
 
     fn on_session_exit(&self, id: &PluginId) {
-        let stopped_by_user = {
+        let (stopped_by_user, close_reason) = {
             let Ok(mut map) = self.sessions.lock() else {
                 return;
             };
             match map.remove(id) {
-                Some(session) => session.is_stopping(),
-                None => false,
+                Some(session) => (session.is_stopping(), session.close_reason()),
+                None => (false, None),
             }
         };
         self.bus.unsubscribe(id);
@@ -573,6 +609,9 @@ impl PluginHost {
             record_state(self.store.as_ref(), id, PluginState::Stopped, None);
             return;
         }
+        // 会话被动断开时把原因写进记录：没有它，插件静默消失后只能看到
+        // 「restarting」，排查需要翻插件日志
+        let exit = close_reason.unwrap_or_else(|| "connection closed".to_owned());
         let attempts = match self.crashes.lock() {
             Ok(mut map) => map
                 .entry(id.clone())
@@ -589,7 +628,7 @@ impl PluginHost {
         }
         if attempts >= MAX_CRASHES {
             let reason = format!(
-                "crashed {attempts} times within {} s; automatic restart disabled",
+                "crashed {attempts} times within {} s ({exit}); automatic restart disabled",
                 CRASH_WINDOW.as_secs()
             );
             record_state(self.store.as_ref(), id, PluginState::Failed, Some(&reason));
@@ -608,7 +647,7 @@ impl PluginHost {
             self.store.as_ref(),
             id,
             PluginState::Starting,
-            Some(&format!("restarting in {} s", delay.as_secs())),
+            Some(&format!("restarting in {} s after {exit}", delay.as_secs())),
         );
         self.audit.record(&AuditEvent {
             at: now_secs(),
@@ -616,7 +655,10 @@ impl PluginHost {
             action: "lifecycle:restart".to_owned(),
             capability: None,
             result: AuditResult::Failed,
-            detail: Some(format!("crash #{attempts}, backoff {} s", delay.as_secs())),
+            detail: Some(format!(
+                "crash #{attempts} ({exit}), backoff {} s",
+                delay.as_secs()
+            )),
         });
         std::thread::sleep(delay);
         if self.shutting_down.load(Ordering::SeqCst) {

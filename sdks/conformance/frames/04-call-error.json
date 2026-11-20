@@ -1,0 +1,8 @@
+{
+  "id": "call.error-internal",
+  "kind": "call",
+  "description": "处理器抛错 → result（ok:false，internal）",
+  "op": "failing",
+  "input": {},
+  "expect": { "ok": false, "error": { "code": "internal" } }
+}
