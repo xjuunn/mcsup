@@ -261,9 +261,19 @@ export interface ServerClientGroup {
   readonly servers: ConsoleClient;
 }
 
-type SectionOf<C extends readonly Capability[]> = {
-  [K in C[number]]: K extends keyof CtxMembers ? CtxMembers[K] : never;
-}[C[number]];
+/** 限额视图（`welcome.limits` 的内部形态） */
+export interface LimitsView {
+  readonly inflight: number;
+  readonly frameBytes: number;
+  readonly eventQueue: number;
+  readonly logLinesPerSec: number;
+}
+
+/** 作用域视图（`welcome.scope`） */
+export interface ScopeView {
+  readonly kind: string;
+  readonly server?: string;
+}
 
 /**
  * 能力驱动的上下文（`CtxFor<capabilities, config>`）。
@@ -277,14 +287,8 @@ export type CtxFor<C extends readonly Capability[], Cfg extends SchemaLike = Sch
   readonly log: LogClient;
   readonly config: InferSchema<Cfg>;
   readonly sessionId: string;
-  readonly limits: {
-    readonly inflight: number;
-    readonly frameBytes: number;
-    readonly eventQueue: number;
-    readonly logLinesPerSec: number;
-  };
-  /** 当前作用域 */
-  readonly scope: { readonly kind: string; readonly server?: string };
+  readonly limits: LimitsView;
+  readonly scope: ScopeView;
 };
 
 /** 运行期构造上下文所需的环境（welcome 后会被改写） */
@@ -292,8 +296,8 @@ export interface CtxEnvironment {
   readonly caller: CapabilityCaller;
   readonly config: () => unknown;
   sessionId: string;
-  limits: CtxFor<readonly Capability[]>["limits"];
-  scope: CtxFor<readonly Capability[]>["scope"];
+  limits: LimitsView;
+  scope: ScopeView;
   readonly events: EventBus;
   readonly logLine: (level: string, message: string) => void;
 }
@@ -332,8 +336,11 @@ export class EventBus {
   }
 }
 
+/** 编解码用的共享编码器：避免每次调用新建实例 */
+const textEncoder = new TextEncoder();
+
 function asBytes(value: string | Uint8Array): Uint8Array {
-  return typeof value === "string" ? new TextEncoder().encode(value) : value;
+  return typeof value === "string" ? textEncoder.encode(value) : value;
 }
 
 function b64(bytes: Uint8Array): string {
@@ -343,6 +350,10 @@ function b64(bytes: Uint8Array): string {
 function unb64(text: string): Uint8Array {
   return new Uint8Array(Buffer.from(text, "base64"));
 }
+
+// ---------------------------------------------------------------------------
+// 宿主返回的线上形状（snake_case，§9 的能力方法返回值）
+// ---------------------------------------------------------------------------
 
 interface KvGetOut { readonly value: string | null }
 interface KvListOut { readonly keys: readonly string[] }
@@ -563,15 +574,13 @@ export function createCtx<C extends readonly Capability[], Cfg extends SchemaLik
   const ctx = {
     ...members,
     log,
-    config: env.config(),
+    get config(): unknown {
+      return env.config();
+    },
     sessionId: env.sessionId,
     limits: env.limits,
     scope: env.scope,
   };
-  Object.defineProperty(ctx, "config", {
-    get: () => env.config(),
-    enumerable: true,
-  });
   // 声明过但未授予的能力：访问即 denied，而不是静默 undefined（§8.4 不降级）
   for (const capability of ungranted) {
     Object.defineProperty(ctx, capability, {

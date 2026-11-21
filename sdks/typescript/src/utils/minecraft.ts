@@ -5,6 +5,8 @@
  * 聊天 sanitize、玩家名与命令注入。这里集中实现，避免各插件各写一套。
  */
 
+import { truncate } from "./general.js";
+
 /** SECTION 符号（Minecraft 颜色码前缀） */
 const SECTION = "\u00a7";
 /** 颜色 / 格式码字符集：0-9 颜色，a-f 颜色，k-o 格式，r 重置 */
@@ -41,8 +43,11 @@ const CONTROL = /[\u0000-\u001f\u007f]/g;
 export function sanitizeChat(text: string, max = 256): string {
   const stripped = stripColorCodes(text).replace(CONTROL, " ");
   const collapsed = stripped.replace(/ {2,}/g, " ").trim();
-  // truncate 内部按码点截断
-  return collapsed.length <= max ? collapsed : [...collapsed].slice(0, max).join("");
+  // 与 truncate 共用码点截断；max <= 0 表示硬截断为空
+  if (max <= 0) {
+    return "";
+  }
+  return truncate(collapsed, max, "");
 }
 
 /** 玩家名：`[A-Za-z0-9_]`，1..16 字符（Java 版规则） */

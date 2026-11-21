@@ -69,7 +69,9 @@ export function pLimit(limit: number): <T>(fn: () => Promise<T>) => Promise<T> {
   const next = (): void => {
     active -= 1;
     const resume = queue.shift();
-    if (resume !== undefined) resume();
+    if (resume !== undefined) {
+      resume();
+    }
   };
 
   return async <T>(fn: () => Promise<T>): Promise<T> => {
@@ -99,13 +101,19 @@ export async function mapLimit<T, R>(
 
 /** 把 query 对象拼到 URL 上；值为 null / undefined 的键跳过，值 encodeURIComponent。 */
 export function buildUrl(base: string, query?: Readonly<Record<string, string | number | boolean | null>>): string {
-  if (query === undefined) return base;
+  if (query === undefined) {
+    return base;
+  }
   const search = new URLSearchParams();
   for (const [key, value] of Object.entries(query)) {
-    if (value === null) continue;
+    if (value === null) {
+      continue;
+    }
     search.set(key, String(value));
   }
   const qs = search.toString();
-  if (qs === "") return base;
+  if (qs === "") {
+    return base;
+  }
   return base + (base.includes("?") ? "&" : "?") + qs;
 }

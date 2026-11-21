@@ -6,7 +6,14 @@
  */
 
 import type { ConsoleLine } from "./builders.js";
-import type { ConsoleReadClient, EventsClient, KvClient, LogClient } from "./ctx.js";
+import type {
+  ConsoleReadClient,
+  EventsClient,
+  KvClient,
+  LimitsView,
+  LogClient,
+  ScopeView,
+} from "./ctx.js";
 import { PluginError } from "./errors.js";
 import { kvTtlCache } from "./utils/state.js";
 import { withRetry } from "./utils/retry.js";
@@ -20,13 +27,8 @@ export interface HookContext<Cfg = unknown> {
   readonly log: LogClient;
   readonly config: Cfg;
   readonly sessionId: string;
-  readonly limits: {
-    readonly inflight: number;
-    readonly frameBytes: number;
-    readonly eventQueue: number;
-    readonly logLinesPerSec: number;
-  };
-  readonly scope: { readonly kind: string; readonly server?: string };
+  readonly limits: LimitsView;
+  readonly scope: ScopeView;
 }
 
 /** 从上下文里取能力成员；未声明该能力时为 undefined */

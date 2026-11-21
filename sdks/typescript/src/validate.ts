@@ -114,7 +114,10 @@ export const DISPLAY_TYPES = ["form", "table", "detail", "chat", "log", "metrics
 /** 展示类型 */
 export type DisplayType = (typeof DISPLAY_TYPES)[number];
 
-/** 各展示类型允许的额外字段 */
+/**
+ * 各展示类型允许的额外字段。字段缺省值（`text_field: "text"` 等）按 §11.3
+ * 由宿主在 descriptor 未写时取值，SDK 不重复写进产物。
+ */
 const DISPLAY_FIELDS: Record<DisplayType, readonly string[]> = {
   form: [],
   table: ["columns"],
@@ -123,15 +126,6 @@ const DISPLAY_FIELDS: Record<DisplayType, readonly string[]> = {
   log: ["text_field", "level_field", "at_field"],
   metrics: ["value_field", "at_field", "unit"],
 };
-
-/** 字段名缺省值（§11.3） */
-export const DISPLAY_FIELD_DEFAULTS = {
-  text_field: "text",
-  from_field: "from",
-  at_field: "at",
-  level_field: "level",
-  value_field: "value",
-} as const;
 
 /** 校验 display 对象本身的形状；`path` 形如 `ops.<id>.display` */
 export function validateDisplayObject(path: string, display: unknown): DisplayType | undefined {

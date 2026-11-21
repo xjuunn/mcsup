@@ -17,12 +17,21 @@ const textEncoder = new TextEncoder();
  * JSON 存取视图：KV 的值本体是 bytes，这里约定「值 = UTF-8 JSON」。
  * `get` 解析失败按 `null` 处理（视为未写入），不抛错。
  */
-export function kvJson<T>(kv: KvClient, prefix = "") {
+export interface KvJson<T> {
+  get(key: string): Promise<T | null>;
+  set(key: string, value: T): Promise<void>;
+  delete(key: string): Promise<boolean>;
+}
+
+/** JSON 存取视图工厂。 */
+export function kvJson<T>(kv: KvClient, prefix = ""): KvJson<T> {
   const full = (key: string): string => prefix + key;
   return {
     async get(key: string): Promise<T | null> {
       const raw = await kv.get(full(key));
-      if (raw === null) return null;
+      if (raw === null) {
+        return null;
+      }
       try {
         return JSON.parse(textDecoder.decode(raw)) as T;
       } catch {
@@ -54,7 +63,9 @@ export interface KvCounter {
 export function kvCounter(kv: KvClient, prefix = ""): KvCounter {
   const full = (key: string): string => prefix + key;
   const decode = (raw: Uint8Array | null): number => {
-    if (raw === null) return 0;
+    if (raw === null) {
+      return 0;
+    }
     const n = Number.parseInt(textDecoder.decode(raw), 10);
     return Number.isSafeInteger(n) ? n : 0;
   };
@@ -92,7 +103,9 @@ export interface KvCursor {
 /** 游标（单键版，多游标请传不同 key 或用 prefix 前缀化）。 */
 export function kvCursor(kv: KvClient, key: string, initial = 0): KvCursor {
   const decode = (raw: Uint8Array | null): number => {
-    if (raw === null) return initial;
+    if (raw === null) {
+      return initial;
+    }
     const n = Number.parseInt(textDecoder.decode(raw), 10);
     return Number.isSafeInteger(n) && n >= 0 ? n : initial;
   };
@@ -102,7 +115,9 @@ export function kvCursor(kv: KvClient, key: string, initial = 0): KvCursor {
     },
     async advance(next) {
       const current = decode(await kv.get(key));
-      if (next <= current) return current;
+      if (next <= current) {
+        return current;
+      }
       await kv.set(key, String(next));
       return next;
     },
@@ -142,7 +157,9 @@ export function kvTtlCache(kv: KvClient, cachePrefix = "cache:"): KvTtlCache {
 
   const get = async <T>(key: string): Promise<T | null> => {
     const entry = await json.get(key);
-    if (entry === null) return null;
+    if (entry === null) {
+      return null;
+    }
     if (expired(entry)) {
       await json.delete(key);
       return null;
@@ -166,7 +183,9 @@ export function kvTtlCache(kv: KvClient, cachePrefix = "cache:"): KvTtlCache {
     set,
     async getOrLoad<T>(key: string, ttlMs: number | null | undefined, loader: () => Promise<T>): Promise<T> {
       const cached = await get<T>(key);
-      if (cached !== null) return cached;
+      if (cached !== null) {
+        return cached;
+      }
       const value = await loader();
       await set(key, value, ttlMs);
       return value;

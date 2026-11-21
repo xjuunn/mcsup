@@ -5,6 +5,7 @@
  */
 
 import type { Capability, DefinedPlugin, PluginDefinition } from "./define.js";
+import type { CtxFor, ScopeView } from "./ctx.js";
 import {
   DEFAULT_EVENT_QUEUE,
   DEFAULT_INFLIGHT,
@@ -19,6 +20,7 @@ import {
 } from "./protocol.js";
 import { type FrameChannel } from "./connection.js";
 import { Session } from "./runtime.js";
+import type { PluginErrorCode } from "./errors.js";
 import type { SchemaLike } from "./schema.js";
 
 /** 宿主默认限额（§5.4）：数值来自生成契约，形状对应 welcome.limits */
@@ -39,7 +41,7 @@ export interface MockHostOptions {
   readonly config?: unknown;
   readonly configRevision?: number;
   readonly sessionId?: string;
-  readonly scope?: { readonly kind: string; readonly server?: string };
+  readonly scope?: ScopeView;
   /** 握手下发的限额；未给出的字段用默认值 */
   readonly limits?: MockLimits;
   /** 握手直接拒绝 */
@@ -123,7 +125,7 @@ export class MockHost<C extends readonly Capability[], Cfg extends SchemaLike = 
   }
 
   /** 插件上下文（测试可直接调用能力） */
-  public get ctx() {
+  public get ctx(): CtxFor<C, Cfg> {
     return this.session.context;
   }
 
@@ -256,14 +258,15 @@ export class MockHost<C extends readonly Capability[], Cfg extends SchemaLike = 
     return this.hostCallId;
   }
 
-  private deliver(frame: Omit<InboundFrame, "v"> | InboundFrame): void {
+  private deliver(frame: InboundFrame): void {
     if (this.frameHandler === undefined) {
       throw new MockAssertionError("session is not started");
     }
-    const payload = { v: PROTOCOL_VERSION, ...(frame as object) };
-    this.frameHandler(payload as unknown as InboundFrame);
+    // 内存通道直接投递类型化的帧；信封 `v` 由这里补上
+    this.frameHandler({ v: PROTOCOL_VERSION, ...frame } as unknown as InboundFrame);
   }
 
+  /** 让出若干轮事件循环，等运行时把已投递的帧处理完 */
   private async flush(): Promise<void> {
     for (let i = 0; i < 8; i += 1) {
       await tick();
@@ -284,8 +287,6 @@ export class MockHost<C extends readonly Capability[], Cfg extends SchemaLike = 
         for (const listener of host.listeners) {
           listener(frame);
         }
-        // live/stream 帧不会改变会话状态，立即回放给运行时也不会重入
-        // （运行时只在事件循环里处理帧），这里只把 result 之外的控制帧回放给它
       },
       async call(capability, method, input) {
         if (host.options.handle !== undefined) {
@@ -309,7 +310,7 @@ export class MockHost<C extends readonly Capability[], Cfg extends SchemaLike = 
 /** 调用结果 */
 export type CallResult =
   | { readonly ok: true; readonly output: unknown }
-  | { readonly ok: false; readonly error: { readonly code: string; readonly message: string } };
+  | { readonly ok: false; readonly error: { readonly code: PluginErrorCode; readonly message: string } };
 
 function toCallResult(frame: Extract<OutboundFrame, { type: "result" }>): CallResult {
   if (frame.ok) {

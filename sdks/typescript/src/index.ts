@@ -56,11 +56,13 @@ export type {
   JavaRuntime,
   KvClient,
   LifecycleClient,
+  LimitsView,
   LogClient,
   NetClient,
   NetRequest,
   NetResponse,
   SecretClient,
+  ScopeView,
   ServerName,
   ServerStatusView,
   ServerSummary,
@@ -117,4 +119,4 @@ export {
   unique,
   withRetry,
 } from "./utils/index.js";
-export type { KvCounter, KvCursor, KvTtlCache, WithRetryOptions } from "./utils/index.js";
+export type { KvCounter, KvCursor, KvJson, KvTtlCache, WithRetryOptions } from "./utils/index.js";

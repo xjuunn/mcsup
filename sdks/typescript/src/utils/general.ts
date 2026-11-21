@@ -14,7 +14,9 @@ export function sleep(ms: number): Promise<void> {
 
 /** 把 `n` 限制在 `[min, max]` 内。NaN 视为 `min`。 */
 export function clamp(n: number, min: number, max: number): number {
-  if (Number.isNaN(n)) return min;
+  if (Number.isNaN(n)) {
+    return min;
+  }
   return Math.min(Math.max(n, min), max);
 }
 
@@ -45,7 +47,9 @@ export function truncate(text: string, max: number, suffix = "…"): string {
     throw new RangeError(`truncate max must be a positive integer, got ${max}`);
   }
   const cps = [...text];
-  if (cps.length <= max) return text;
+  if (cps.length <= max) {
+    return text;
+  }
   const suffixCps = [...suffix];
   // 后缀本身已占满上限时只能截后缀，否则结果会超过 max（调用方用它做硬上限）
   if (suffixCps.length >= max) {
