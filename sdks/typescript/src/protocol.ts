@@ -280,6 +280,4 @@ export function wireError(code: string, message: string): WireError {
 }
 
 /** `reject.code` 的线上文本；未知码由宿主日志记录，插件按 `rejected` 处理 */
-type RejectCodeText = InboundRejectCode;
-
-type InboundRejectCode = Extract<InboundFrame, { type: "reject" }>["code"];
+type RejectCodeText = Extract<InboundFrame, { type: "reject" }>["code"];

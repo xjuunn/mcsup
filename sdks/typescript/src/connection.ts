@@ -163,7 +163,7 @@ export class Connection {
         reject(new PluginError("timeout", `${capability}.${method} timed out after ${timeoutMs} ms`));
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
-      this.send({ type: "call", id, capability, method, input });
+      void this.send({ type: "call", id, capability, method, input });
     });
   }
 

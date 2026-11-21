@@ -136,7 +136,12 @@ export async function pumpStream(
       // 空闲超时的迭代器可能永远不返回，不能等它的 return 阻塞退出
       void Promise.resolve(iterator.return?.()).catch(() => {});
     } else {
-      await iterator.return?.();
+      // 结果帧已发出；return 抛错不应再覆盖它
+      try {
+        await iterator.return?.();
+      } catch {
+        // 忽略：清理失败不改变已确定的调用结果
+      }
     }
   }
 }

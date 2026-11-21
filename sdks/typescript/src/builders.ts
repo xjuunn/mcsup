@@ -17,7 +17,7 @@ const emptyObject = (): z.ZodType => z.object({}).strict();
 
 interface Draft {
   id: string;
-  kind?: OpKind;
+  kind: OpKind;
   title?: string;
   description?: string;
   risk?: OpRisk;
@@ -40,7 +40,7 @@ type InputOf<B> = B extends { readonly [InputKey]: infer S extends SchemaLike } 
 type OutputOf<B> = B extends { readonly [OutputKey]: infer S extends SchemaLike } ? S : SchemaLike;
 type CapOf<B> = B extends { readonly [CapKey]: infer C extends readonly Capability[] } ? C : readonly Capability[];
 
-abstract class BaseOpBuilder<K extends OpKind, I extends SchemaLike, O extends SchemaLike, R> {
+abstract class BaseOpBuilder<K extends OpKind> {
   protected readonly draft: Draft;
 
   protected constructor(id: string, kind: K) {
@@ -113,7 +113,7 @@ abstract class BaseOpBuilder<K extends OpKind, I extends SchemaLike, O extends S
 }
 
 /** 查询型 op builder */
-export class QueryBuilder<I extends SchemaLike = SchemaLike, O extends SchemaLike = SchemaLike> extends BaseOpBuilder<"query", I, O, { query: true }> {
+export class QueryBuilder extends BaseOpBuilder<"query"> {
   private constructor(id: string) {
     super(id, "query");
   }
@@ -137,7 +137,7 @@ export class QueryBuilder<I extends SchemaLike = SchemaLike, O extends SchemaLik
 }
 
 /** 动作型 op builder */
-export class ActionBuilder<I extends SchemaLike = SchemaLike, O extends SchemaLike = SchemaLike> extends BaseOpBuilder<"action", I, O, { action: true }> {
+export class ActionBuilder extends BaseOpBuilder<"action"> {
   private constructor(id: string) {
     super(id, "action");
   }
@@ -160,7 +160,7 @@ export class ActionBuilder<I extends SchemaLike = SchemaLike, O extends SchemaLi
 }
 
 /** 流式 op builder：run 返回分块迭代器 */
-export class StreamBuilder<I extends SchemaLike = SchemaLike, O extends SchemaLike = SchemaLike> extends BaseOpBuilder<"stream", I, O, { stream: true }> {
+export class StreamBuilder extends BaseOpBuilder<"stream"> {
   private constructor(id: string) {
     super(id, "stream");
   }
@@ -184,18 +184,18 @@ export class StreamBuilder<I extends SchemaLike = SchemaLike, O extends SchemaLi
 }
 
 /** 工厂：查询 */
-export function query<I extends SchemaLike, O extends SchemaLike = SchemaLike>(id: string): QueryBuilder<I, O> {
-  return QueryBuilder.of(id) as QueryBuilder<I, O>;
+export function query(id: string): QueryBuilder {
+  return QueryBuilder.of(id);
 }
 
 /** 工厂：动作 */
-export function action<I extends SchemaLike, O extends SchemaLike = SchemaLike>(id: string): ActionBuilder<I, O> {
-  return ActionBuilder.of(id) as ActionBuilder<I, O>;
+export function action(id: string): ActionBuilder {
+  return ActionBuilder.of(id);
 }
 
 /** 工厂：流 */
-export function stream<I extends SchemaLike, O extends SchemaLike = SchemaLike>(id: string): StreamBuilder<I, O> {
-  return StreamBuilder.of(id) as StreamBuilder<I, O>;
+export function stream(id: string): StreamBuilder {
+  return StreamBuilder.of(id);
 }
 
 /** 通用 op 工厂：先声明 id，再 `.kind(...)` */
@@ -222,9 +222,6 @@ export interface OpBuilderEntry {
 }
 
 function finalize(draft: Draft): OpSpec {
-  if (draft.kind === undefined) {
-    throw new Error(`op ${draft.id} has no kind`);
-  }
   if (draft.kind === "query" && draft.risk !== undefined && draft.risk !== "read") {
     throw new Error(`op ${draft.id}: query must use risk read`);
   }
@@ -255,29 +252,29 @@ export interface ConsoleLine {
 
 /** 行过滤管线：纯值构造，无 IO */
 export class LineFilter {
-  private readonly steps: (() => (line: ConsoleLine) => ConsoleLine | ConsoleLine[] | null)[] = [];
+  private readonly steps: Array<(line: ConsoleLine) => ConsoleLine | ConsoleLine[] | null> = [];
 
   /** 去掉 ANSI 颜色 / 控制序列 */
   public stripAnsi(): this {
-    this.steps.push(() => (line) => ({ ...line, text: stripAnsi(line.text) }));
+    this.steps.push((line) => ({ ...line, text: stripAnsi(line.text) }));
     return this;
   }
 
   /** 只保留匹配的行 */
   public include(pattern: RegExp): this {
-    this.steps.push(() => (line) => (pattern.test(line.text) ? line : null));
+    this.steps.push((line) => (pattern.test(line.text) ? line : null));
     return this;
   }
 
   /** 丢弃匹配的行 */
   public exclude(pattern: RegExp): this {
-    this.steps.push(() => (line) => (pattern.test(line.text) ? null : line));
+    this.steps.push((line) => (pattern.test(line.text) ? null : line));
     return this;
   }
 
   /** 一行变多行（如把 log 展开为多个聊天段） */
   public flatMap(fn: (line: ConsoleLine) => readonly ConsoleLine[]): this {
-    this.steps.push(() => (line) => {
+    this.steps.push((line) => {
       const out = fn(line);
       return out.length === 0 ? null : [...out];
     });
@@ -286,13 +283,13 @@ export class LineFilter {
 
   /** 改写一行 */
   public map(fn: (line: ConsoleLine) => ConsoleLine): this {
-    this.steps.push(() => (line) => fn(line));
+    this.steps.push(fn);
     return this;
   }
 
   /** 收尾：得到一个纯函数（`null` 表示丢弃） */
   public build(): (line: ConsoleLine) => readonly ConsoleLine[] {
-    const compiled = this.steps.map((make) => make());
+    const compiled = [...this.steps];
     return (line) => {
       let current: readonly ConsoleLine[] = [line];
       for (const step of compiled) {

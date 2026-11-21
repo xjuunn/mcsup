@@ -36,9 +36,7 @@ export type OpKind = "query" | "action" | "stream";
 export type OpRisk = "read" | "mutating" | "destructive";
 
 /** 允许 Builder / 原生对象两种写法的结构子集 */
-export type OpSpecLike = Partial<ResolvedOp> & {
-  readonly kind?: OpKind;
-};
+export type OpSpecLike = Partial<ResolvedOp>;
 
 /** op 处理函数签名 */
 export type OpRun = (input: unknown, ctx: PluginContext) => unknown;

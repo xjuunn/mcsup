@@ -168,7 +168,7 @@ export interface ShapeHint {
 }
 
 /** 从 schema 形状取推断所需的两个信号 */
-export function shapeHint(shape: { readonly type: string | undefined; readonly hasItemsArray: boolean }): ShapeHint {
+export function shapeHint(shape: SchemaShape): ShapeHint {
   return { isObject: shape.type === "object", hasItemsArray: shape.hasItemsArray };
 }
 
@@ -661,7 +661,7 @@ function visitZod(path: string, schema: z.ZodType, seen: Set<z.ZodType>): void {
   }
   seen.add(schema);
   for (const check of def.checks ?? []) {
-    const kind = check.def?.type ?? (check as unknown as { _zod?: { def?: { check?: string } } })._zod?.def?.check;
+    const kind = check.def?.type ?? check._zod?.def?.check;
     if (kind === "custom") {
       return fail(path, ".refine() / .superRefine() is not allowed; validate inside the handler");
     }

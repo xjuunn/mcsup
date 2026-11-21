@@ -15,8 +15,8 @@ export type {
   DefinedPlugin,
   EventHandler,
   OpSpec,
-  PluginContext,
   PluginDefinition,
+  PluginContext,
   StreamChunks,
   Subscription,
 } from "./define.js";
@@ -61,8 +61,8 @@ export type {
   NetClient,
   NetRequest,
   NetResponse,
-  SecretClient,
   ScopeView,
+  SecretClient,
   ServerName,
   ServerStatusView,
   ServerSummary,
@@ -73,8 +73,8 @@ export type {
 // Builder（次版本可选 API）
 export {
   action,
-  lineFilter,
   labeled,
+  lineFilter,
   op,
   pagedInput,
   query,
@@ -86,10 +86,10 @@ export type { ActionBuilder, ConsoleLine, LineFilter, OpKind, OpRisk, QueryBuild
 // Hooks（次版本可选 API）
 export { useConsoleTail, useEvents, useKvCache, useRetry } from "./hooks.js";
 export type {
-  HookContext,
   ConsoleTail,
   ConsoleTailHandler,
   ConsoleTailOptions,
+  HookContext,
   KvCache,
   KvCacheOptions,
   Retry,
