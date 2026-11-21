@@ -893,7 +893,7 @@ OP，风险分级失效。
 
 | 时机 | 行为 |
 | --- | --- |
-| 安装 | 低风险自动通过；中风险一行确认；高风险提示「需手动 grant」 |
+| 安装 | 低风险自动通过；中 / 高风险列成清单一次确认（默认 `y`，拒绝则留 `pending_approval`）；`--yes` 视为同意 |
 | 启用 | `approved` 写入记录，宿主据此计算 `granted` |
 | 升级 | 新增能力 → `pending_approval`；减少能力直接生效 |
 | 撤销 | 立即生效；下一次调用即被拒，不需要重启进程 |
@@ -1186,10 +1186,18 @@ descriptor 由 SDK 在构建时生成，与二进制一起打包。宿主只读�
 
 ```json
 {
-  "schema": 1,
+  "schema": 2,
   "plugin_id": "chat-bridge",
   "api": 1,
   "config": { "$ref": "#/schemas/config" },
+  "setup": {
+    "start": true,
+    "fields": [
+      { "path": "qq.appId", "required": true, "label": "AppID" },
+      { "path": "qq.clientSecret", "required": true, "secret": true },
+      { "path": "qq.groups" }
+    ]
+  },
   "ops": [
     {
       "id": "history",
@@ -1405,6 +1413,36 @@ JSON Schema 没有「密钥」「单位」的标准表达，统一用 `x-mcsup-`
 4. 对象键按字典序排序，数组保持声明顺序；
 5. 强制限值检查，超限失败并指名字段；
 6. 输出紧凑 JSON（无多余空格）+ 末尾换行。
+
+## 11.8 安装向导 `setup`
+
+`schema: 2` 起 descriptor 可声明可选 `setup`，宿主在安装 / 升级时据此逐项
+询问配置，写完后按 `start` 启用并启动，做到「装完即用」。`schema: 1` 的
+旧产物没有该块，宿主仍按旧流程处理。
+
+| 字段 | 必填 | 约束 |
+| --- | --- | --- |
+| `setup.start` | 否 | 布尔，默认 `true`；配置写完后是否自动启用并启动 |
+| `setup.fields` | 否 | 数组，≤ 32 项，顺序即提问顺序 |
+| `fields[].path` | 是 | 点号分隔，必须命中 config schema 的**叶子**属性；同一 descriptor 内唯一 |
+| `fields[].required` | 否 | 布尔，默认 `false`；必填项留空会重问 |
+| `fields[].secret` | 否 | 布尔，默认 `false`；输入遮蔽，字段类型必须是 `string` |
+| `fields[].label` | 否 | ≤ 64 字符；省略时取 schema 的 `x-mcsup-label`，再退到 `path` |
+| `fields[].description` | 否 | ≤ 512 字符；省略时取 schema 的 `description` |
+| `fields[].default` | 否 | 提示默认值，必须符合该字段 schema；省略时取 schema 的 `default` |
+
+宿主行为：
+
+- 安装 / 升级后先列出待确认能力并**一次确认**（默认授予，`--yes` 视为同意）；
+- 全新安装（配置 revision 为 0）逐项询问全部 `setup.fields`，升级只补仍缺失
+  的字段，用户已填过的值不会被重问或覆盖；
+- 字段值通过深度合并写入：只改目标键，同级配置与已存密钥保持不变；
+- 写入后 `enable` + `start`，已在运行则 `restart`；
+- 用户拒绝授权或必填项未填时，安装仍然成功，但跳过启动并在结果里报告
+  `pending` / `missing`；
+- `--no-setup` 跳过整个向导（不授权、不补配置、不启动），与旧版行为一致；
+- 非交互（`--json` / 非 TTY）不提问：只有 `--yes` 才授予能力，缺失必填项
+  以 `missing` 返回，提示用 `mcsup plugin config set` 补齐。
 
 # 12. 契约与组合
 
@@ -1891,9 +1929,10 @@ Windows 还需拒绝保留名（`CON`、`NUL` 等）与尾随点 / 空格。
 
 ```
 解析来源 → 下载 → 校验摘要 → 解包到临时目录
-→ 校验 manifest → 校验 descriptor → 计算能力清单
+→ 校验 manifest → 校验 descriptor（含 setup 解析）→ 计算能力清单
 → 原子移动到 plugins/<id>/<version>/
 → 写安装记录 → 状态 disabled / pending_approval
+→ （交互）列出能力并确认授权 → 逐项填写 setup → enable + start
 ```
 
 关键约束：
@@ -1907,22 +1946,23 @@ Windows 还需拒绝保留名（`CON`、`NUL` 等）与尾随点 / 空格。
 
 ## 15.5 授权展示
 
-安装前必须展示：
+安装完成后、启动之前，宿主机集中展示待确认能力并要求一次确认：
 
 ```
-将安装 chat-bridge 0.3.1
-  来源：git https://... @ 3f9c2a1
-  能力：
-    events, storage:kv, server:read        低风险，自动允许
-    console:read, net:outbound, secret:rw  需确认
-    console:write                          高风险，需手动 grant
-  订阅：chat:message, server:crashed
-  提供：chat.publish@1, chat.ask@1
-  消费：incident.report@1
-确认安装？[y/N]
+插件申请以下权限：
+  - events          接收服务器事件
+  - console:read    读取控制台输出
+  - console:write   向控制台执行命令
+  - server:read     读取服务器信息
+授予以上权限？[Y/n]
 ```
 
-`--yes` 只跳过确认式提问，不跳过高风险能力的显式 `grant`。
+- 默认 `Y`；输入 `n` 则保留待授权状态并跳过启动，之后可用
+  `mcsup plugin grant <id> <capability>` 逐项补齐。
+- `--yes`（脚本模式）视为同意；非交互且未给 `--yes` 时不静默授权。
+- 低风险能力在安装阶段已自动通过，不会出现在清单里。
+- 随后按 descriptor 的 `setup.fields` 逐项询问配置；密钥字段遮蔽输入，
+  按键不会被回显，也不会写进审计日志。
 
 ## 15.6 升级、回滚、卸载
 
@@ -2113,8 +2153,8 @@ Windows 还需拒绝保留名（`CON`、`NUL` 等）与尾随点 / 空格。
 ```
 mcsup plugin list [--json]
 mcsup plugin install <source> [--from|--url|--git] [--ref <tag|sha>] [--sha256 <hex>]
-                              [--yes] [--json]
-mcsup plugin update <id> [--to <version>] [--prune] [--yes]
+                              [--yes] [--no-setup] [--json]
+mcsup plugin update <id> [--to <version>] [--prune] [--yes] [--no-setup]
 mcsup plugin remove <id> [--purge] [--keep-secrets] [--yes]
 mcsup plugin enable <id>
 mcsup plugin disable <id> [--yes]
@@ -2145,8 +2185,10 @@ mcsup __plugin-host --data-dir <path> [--idle-timeout <secs>]   # 隐藏
 - `install` 的 `<source>` 可省略，由 `--from` / `--url` / `--git` 指定；三者互斥。
 - `call` 的 `--input` 缺省为 `{}`；`-` 表示从 stdin 读 JSON。
 - `--output json` 时 stdout 只含一行 JSON；进度与提示走 stderr。
-- `--yes` 跳过确认式提问，不跳过必填参数补参与高风险 `grant`。
-- 非交互缺必填参数：退出码 2，stderr 说明缺什么。
+- `--yes` 跳过确认式提问，不跳过必填参数补参；安装向导里视为同意能力授权。
+- `--no-setup` 跳过安装向导：不授权、不补配置、不自动启动（脚本与旧版行为）。
+- 非交互缺必填参数：退出码 2，stderr 说明缺什么；配置必填项缺失时以
+  `missing` 字段返回并在下一轮 `config set` 后补上。
 
 ## 18.2 输出示例
 
@@ -2171,10 +2213,16 @@ $ mcsup plugin install --git https://github.com/example/chat-bridge --ref v0.3.1
 正在校验…
   摘要匹配
 正在安装…
-  能力：events, storage:kv, server:read（自动允许）
-        console:read, net:outbound, secret:rw（需确认）
-  高风险：console:write（需 mcsup plugin grant chat-bridge console:write）
-安装完成：chat-bridge 0.3.1（未启用）
+插件申请以下权限：
+  - events          接收服务器事件
+  - console:read    读取控制台输出
+  - console:write   向控制台执行命令
+  - server:read     读取服务器信息
+授予以上权限？[Y/n] y
+AppID: 1906491720
+ClientSecret: ••••••••
+群 openid（留空表示不限制群）:
+已安装并启动 chat-bridge 0.3.1
 ```
 
 ## 18.3 退出码

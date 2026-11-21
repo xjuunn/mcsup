@@ -63,6 +63,31 @@ describe("descriptor", () => {
     ]);
     expect(d.config).toEqual({ $ref: "#/schemas/config" });
     expect(d.ops.map((op) => op.id)).toEqual(["counter", "send", "failing", "reentrant", "messages", "slow"]);
+    // 未声明 setup 时保持旧版本，兼容只认识 schema 1 的宿主
+    expect(d.schema).toBe(1);
+    expect(d.setup).toBeUndefined();
+  });
+
+  it("setup 生成 schema 2 与逐项提示块", () => {
+    const def = {
+      ...chatBridge.definition,
+      setup: {
+        start: false,
+        fields: [
+          { path: "token", required: true, secret: true, label: "Token", description: "访问令牌" },
+          { path: "nested", default: "x" },
+        ],
+      },
+    } as typeof chatBridge.definition;
+    const d = buildDescriptor(def);
+    expect(d.schema).toBe(2);
+    expect(d.setup).toEqual({
+      start: false,
+      fields: [
+        { path: "token", required: true, secret: true, label: "Token", description: "访问令牌" },
+        { path: "nested", default: "x" },
+      ],
+    });
   });
 
   it("op 元数据与 display 缺省", () => {

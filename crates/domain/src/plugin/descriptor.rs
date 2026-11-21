@@ -7,6 +7,7 @@
 //! 检查每个 schema。两步都必须在安装阶段完成：运行时才发现 schema 用了
 //! `oneOf`，要么白屏，要么四语言客户端各写一套解释器。
 
+use crate::plugin::schema;
 use crate::plugin::{DESCRIPTOR_SCHEMA_VERSION, PLUGIN_API_VERSION, PluginId};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -47,6 +48,18 @@ pub const MAX_OP_TITLE_CHARS: usize = 64;
 
 /// op 描述长度上限（字符）
 pub const MAX_OP_DESCRIPTION_CHARS: usize = 512;
+
+/// setup 字段数上限
+pub const MAX_SETUP_FIELDS: usize = 32;
+
+/// setup 路径长度上限（字符）
+pub const MAX_SETUP_PATH_CHARS: usize = 128;
+
+/// setup 标签长度上限（字符）
+pub const MAX_SETUP_LABEL_CHARS: usize = 64;
+
+/// setup 描述长度上限（字符）
+pub const MAX_SETUP_DESCRIPTION_CHARS: usize = 512;
 
 /// op 种类
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -310,6 +323,130 @@ pub struct Op {
     pub pagination: Option<Pagination>,
 }
 
+/// 安装向导：授权后由宿主逐项询问配置，装完即可启动
+///
+/// 字段值由宿主写入配置（深度合并），插件无需实现任何安装逻辑。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Setup {
+    /// 配置写完后是否自动启用并启动；默认 `true`
+    #[serde(default = "start_default")]
+    pub start: bool,
+    /// 逐项提示的配置字段
+    #[serde(default)]
+    pub fields: Vec<SetupField>,
+}
+
+const fn start_default() -> bool {
+    true
+}
+
+/// 单个安装提示字段
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetupField {
+    /// 配置路径，点号分隔（如 `qq.appId`）
+    pub path: String,
+    /// 是否必填；必填项不允许留空
+    #[serde(default)]
+    pub required: bool,
+    /// 输入时遮蔽；只能用于 `string` 字段
+    #[serde(default)]
+    pub secret: bool,
+    /// 覆盖 schema 的 `x-mcsup-label`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// 覆盖 schema 的 `description`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// 提示默认值；省略时取 schema 的 `default`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<serde_json::Value>,
+}
+
+/// 校验通过的 setup
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSetup {
+    /// 是否自动启动
+    pub start: bool,
+    /// 按声明顺序排列的字段
+    pub fields: Vec<ResolvedSetupField>,
+}
+
+/// 校验通过的 setup 字段：类型与默认值已从 config schema 解析
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSetupField {
+    /// 配置路径
+    pub path: String,
+    /// 展示标签
+    pub label: String,
+    /// 帮助行
+    pub description: Option<String>,
+    /// 是否必填
+    pub required: bool,
+    /// 是否遮蔽输入
+    pub secret: bool,
+    /// 默认值（声明优先，其次 schema）
+    pub default: Option<serde_json::Value>,
+    /// 输入形态
+    pub kind: SetupKind,
+    /// 该路径的 schema，用于逐项复校验
+    pub schema: serde_json::Value,
+}
+
+/// setup 字段的输入形态
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetupKind {
+    /// 文本，可选枚举
+    Text {
+        /// 枚举取值，空表示自由文本
+        choices: Vec<String>,
+    },
+    /// 整数
+    Integer,
+    /// 浮点数
+    Number,
+    /// 布尔
+    Boolean,
+    /// 字符串列表
+    StringList,
+}
+
+impl SetupKind {
+    fn from_schema(schema: &serde_json::Value) -> Option<Self> {
+        let kind = schema.get("type").and_then(serde_json::Value::as_str)?;
+        match kind {
+            "string" => {
+                let choices = schema
+                    .get("enum")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(ToOwned::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Some(Self::Text { choices })
+            }
+            "integer" => Some(Self::Integer),
+            "number" => Some(Self::Number),
+            "boolean" => Some(Self::Boolean),
+            "array"
+                if schema
+                    .get("items")
+                    .and_then(|items| items.get("type"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("string") =>
+            {
+                Some(Self::StringList)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// descriptor 原始结构
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -323,6 +460,9 @@ pub struct Descriptor {
     /// 配置 schema
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<serde_json::Value>,
+    /// 安装向导（schema 2 起可用）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<Setup>,
     /// op 列表
     #[serde(default)]
     pub ops: Vec<Op>,
@@ -351,6 +491,8 @@ pub struct ValidatedDescriptor {
     pub raw: Descriptor,
     /// 内联后的配置 schema
     pub config: Option<serde_json::Value>,
+    /// 安装向导（已解析类型与默认值）
+    pub setup: Option<ResolvedSetup>,
     /// 按 id 排序的 op
     pub ops: Vec<ResolvedOp>,
 }
@@ -400,7 +542,7 @@ impl Descriptor {
     ///
     /// 同 [`Self::from_json`]
     pub fn validate(self, expected: &PluginId) -> Result<ValidatedDescriptor, DescriptorError> {
-        if self.schema != DESCRIPTOR_SCHEMA_VERSION {
+        if !(1..=DESCRIPTOR_SCHEMA_VERSION).contains(&self.schema) {
             return Err(DescriptorError::UnsupportedSchema {
                 found: self.schema,
                 supported: DESCRIPTOR_SCHEMA_VERSION,
@@ -475,6 +617,19 @@ impl Descriptor {
         for entry in &resolved {
             validate_display_shape(entry)?;
         }
+        let (config, setup) = self.resolve_config_and_setup()?;
+        Ok(ValidatedDescriptor {
+            raw: self,
+            config,
+            setup,
+            ops: resolved,
+        })
+    }
+
+    /// 归一化 config schema，并据它校验 setup 的每个字段路径
+    fn resolve_config_and_setup(
+        &self,
+    ) -> Result<(Option<serde_json::Value>, Option<ResolvedSetup>), DescriptorError> {
         let config = match &self.config {
             Some(schema) => {
                 let inlined = self.inline_refs(schema)?;
@@ -483,11 +638,19 @@ impl Descriptor {
             }
             None => None,
         };
-        Ok(ValidatedDescriptor {
-            raw: self,
-            config,
-            ops: resolved,
-        })
+        let setup = match &self.setup {
+            Some(setup) => {
+                if self.schema < 2 {
+                    return Err(DescriptorError::SetupRequiresSchema { found: self.schema });
+                }
+                let Some(config) = &config else {
+                    return Err(DescriptorError::SetupWithoutConfig);
+                };
+                Some(resolve_setup(setup, config)?)
+            }
+            None => None,
+        };
+        Ok((config, setup))
     }
 
     fn inline_refs(
@@ -524,6 +687,141 @@ impl Descriptor {
         }
         Ok(())
     }
+}
+
+/// 解析 setup：路径必须落在 config schema 的叶子字段上
+fn resolve_setup(
+    setup: &Setup,
+    config: &serde_json::Value,
+) -> Result<ResolvedSetup, DescriptorError> {
+    if setup.fields.len() > MAX_SETUP_FIELDS {
+        return Err(DescriptorError::SetupTooManyFields {
+            count: setup.fields.len(),
+            limit: MAX_SETUP_FIELDS,
+        });
+    }
+    let mut seen = BTreeSet::new();
+    let mut fields = Vec::with_capacity(setup.fields.len());
+    for field in &setup.fields {
+        let path = field.path.trim();
+        if path.is_empty() || path.chars().count() > MAX_SETUP_PATH_CHARS {
+            return Err(DescriptorError::InvalidSetupPath {
+                path: field.path.clone(),
+            });
+        }
+        let segments = path.split('.').collect::<Vec<_>>();
+        if segments.iter().any(|segment| segment.is_empty()) {
+            return Err(DescriptorError::InvalidSetupPath {
+                path: path.to_owned(),
+            });
+        }
+        if !seen.insert(path.to_owned()) {
+            return Err(DescriptorError::DuplicateSetupPath {
+                path: path.to_owned(),
+            });
+        }
+        fields.push(resolve_setup_field(field, path, config)?);
+    }
+    Ok(ResolvedSetup {
+        start: setup.start,
+        fields,
+    })
+}
+
+/// 校验单个 setup 字段，返回可直接展示与提问的解析结果
+fn resolve_setup_field(
+    field: &SetupField,
+    path: &str,
+    config: &serde_json::Value,
+) -> Result<ResolvedSetupField, DescriptorError> {
+    let segments = path.split('.').collect::<Vec<_>>();
+    let schema = resolve_config_path(config, &segments).ok_or_else(|| {
+        DescriptorError::UnknownSetupPath {
+            path: path.to_owned(),
+        }
+    })?;
+    if schema.get("type").and_then(serde_json::Value::as_str) == Some("object")
+        || schema.get("properties").is_some()
+    {
+        return Err(DescriptorError::SetupPathNotLeaf {
+            path: path.to_owned(),
+        });
+    }
+    let kind =
+        SetupKind::from_schema(schema).ok_or_else(|| DescriptorError::SetupUnsupportedKind {
+            path: path.to_owned(),
+            kind: schema
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned(),
+        })?;
+    if field.secret && !matches!(kind, SetupKind::Text { .. }) {
+        return Err(DescriptorError::SetupSecretNotString {
+            path: path.to_owned(),
+        });
+    }
+    let label = field
+        .label
+        .clone()
+        .or_else(|| {
+            schema
+                .get("x-mcsup-label")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| path.to_owned());
+    if label.trim().is_empty() || label.chars().count() > MAX_SETUP_LABEL_CHARS {
+        return Err(DescriptorError::InvalidSetupLabel {
+            path: path.to_owned(),
+        });
+    }
+    if let Some(description) = &field.description
+        && description.chars().count() > MAX_SETUP_DESCRIPTION_CHARS
+    {
+        return Err(DescriptorError::InvalidSetupDescription {
+            path: path.to_owned(),
+        });
+    }
+    let default = field
+        .default
+        .clone()
+        .or_else(|| schema.get("default").cloned());
+    if let Some(default) = &default {
+        schema::validate_instance(schema, default, path).map_err(|err| {
+            DescriptorError::SetupDefaultInvalid {
+                path: path.to_owned(),
+                reason: err.to_string(),
+            }
+        })?;
+    }
+    Ok(ResolvedSetupField {
+        path: path.to_owned(),
+        label,
+        description: field.description.clone().or_else(|| {
+            schema
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+        }),
+        required: field.required,
+        secret: field.secret,
+        default,
+        kind,
+        schema: schema.clone(),
+    })
+}
+
+/// 沿 `properties` 找 config schema 的某个路径
+fn resolve_config_path<'a>(
+    root: &'a serde_json::Value,
+    segments: &[&str],
+) -> Option<&'a serde_json::Value> {
+    let mut node = root;
+    for segment in segments {
+        node = node.get("properties")?.as_object()?.get(*segment)?;
+    }
+    Some(node)
 }
 
 fn op_id_is_valid(id: &str) -> bool {
@@ -1041,6 +1339,81 @@ pub enum DescriptorError {
         /// 路径
         path: std::path::PathBuf,
     },
+    /// setup 需要 schema 2
+    #[error("setup requires descriptor schema 2 or newer, found {found}")]
+    SetupRequiresSchema {
+        /// 声明值
+        found: u32,
+    },
+    /// 声明了 setup 但没有 config schema
+    #[error("setup requires a config schema")]
+    SetupWithoutConfig,
+    /// setup 字段过多
+    #[error("setup declares {count} fields, limit is {limit}")]
+    SetupTooManyFields {
+        /// 实际数量
+        count: usize,
+        /// 上限
+        limit: usize,
+    },
+    /// setup 路径非法
+    #[error("invalid setup path: {path}")]
+    InvalidSetupPath {
+        /// 路径
+        path: String,
+    },
+    /// setup 路径重复
+    #[error("duplicate setup path: {path}")]
+    DuplicateSetupPath {
+        /// 路径
+        path: String,
+    },
+    /// setup 路径不在 config schema 中
+    #[error("setup path does not exist in config schema: {path}")]
+    UnknownSetupPath {
+        /// 路径
+        path: String,
+    },
+    /// setup 路径指向对象
+    #[error("setup path must point to a leaf value, not an object: {path}")]
+    SetupPathNotLeaf {
+        /// 路径
+        path: String,
+    },
+    /// setup 字段类型不支持提示
+    #[error("setup path {path} has unsupported type {kind}")]
+    SetupUnsupportedKind {
+        /// 路径
+        path: String,
+        /// 类型
+        kind: String,
+    },
+    /// secret 只能用于字符串字段
+    #[error("setup path {path} is secret but its type is not string")]
+    SetupSecretNotString {
+        /// 路径
+        path: String,
+    },
+    /// setup 标签非法
+    #[error("invalid label for setup path {path}")]
+    InvalidSetupLabel {
+        /// 路径
+        path: String,
+    },
+    /// setup 描述过长
+    #[error("setup description too long for {path}")]
+    InvalidSetupDescription {
+        /// 路径
+        path: String,
+    },
+    /// setup 默认值不符合字段 schema
+    #[error("invalid default for setup path {path}: {reason}")]
+    SetupDefaultInvalid {
+        /// 路径
+        path: String,
+        /// 原因
+        reason: String,
+    },
 }
 
 #[cfg(test)]
@@ -1083,6 +1456,101 @@ mod tests {
         let descriptor = parse(base()).expect("valid");
         assert_eq!(descriptor.ops.len(), 1);
         assert_eq!(descriptor.ops[0].display.type_name(), "detail");
+        assert!(descriptor.setup.is_none());
+    }
+
+    fn with_config(properties: serde_json::Value) -> serde_json::Value {
+        let mut value = base();
+        value["schema"] = json!(2);
+        value["config"] = object_schema(properties);
+        value
+    }
+
+    #[test]
+    fn setup_is_resolved_against_config_schema() {
+        let mut value = with_config(json!({
+            "token": { "type": "string", "x-mcsup-secret": true, "x-mcsup-label": "令牌" },
+            "nested": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "appId": { "type": "string" },
+                    "retries": { "type": "integer", "default": 3 }
+                }
+            }
+        }));
+        value["setup"] = json!({
+            "start": false,
+            "fields": [
+                { "path": "token", "required": true, "secret": true },
+                { "path": "nested.appId", "required": true, "default": "abc" },
+                { "path": "nested.retries" }
+            ]
+        });
+        let descriptor = parse(value).expect("valid setup");
+        let setup = descriptor.setup.expect("setup");
+        assert!(!setup.start);
+        assert_eq!(setup.fields.len(), 3);
+        // 未声明 label 时取 schema 的 x-mcsup-label
+        assert_eq!(setup.fields[0].label, "令牌");
+        assert_eq!(
+            setup.fields[0].kind,
+            SetupKind::Text {
+                choices: Vec::new()
+            }
+        );
+        assert_eq!(setup.fields[1].default, Some(json!("abc")));
+        assert_eq!(setup.fields[2].kind, SetupKind::Integer);
+        assert_eq!(setup.fields[2].default, Some(json!(3)));
+        assert_eq!(setup.fields[2].schema["type"], "integer");
+    }
+
+    #[test]
+    fn setup_rejects_bad_paths_defaults_and_schema1() {
+        let mut value = with_config(json!({ "token": { "type": "string" } }));
+        value["setup"] = json!({ "fields": [{ "path": "missing" }] });
+        assert!(matches!(
+            parse(value),
+            Err(DescriptorError::UnknownSetupPath { .. })
+        ));
+
+        // schema 1 不认识 setup
+        let mut value = base();
+        value["config"] = object_schema(json!({ "token": { "type": "string" } }));
+        value["setup"] = json!({ "fields": [{ "path": "token" }] });
+        assert!(matches!(
+            parse(value),
+            Err(DescriptorError::SetupRequiresSchema { .. })
+        ));
+
+        // setup 只能指向叶子
+        let mut value = with_config(json!({
+            "nested": {
+                "type": "object",
+                "properties": { "a": { "type": "string" } }
+            }
+        }));
+        value["setup"] = json!({ "fields": [{ "path": "nested" }] });
+        assert!(matches!(
+            parse(value),
+            Err(DescriptorError::SetupPathNotLeaf { .. })
+        ));
+
+        // secret 只能是字符串
+        let mut value = with_config(json!({ "count": { "type": "integer" } }));
+        value["setup"] = json!({ "fields": [{ "path": "count", "secret": true }] });
+        assert!(matches!(
+            parse(value),
+            Err(DescriptorError::SetupSecretNotString { .. })
+        ));
+
+        // 默认值必须符合字段 schema
+        let mut value = with_config(json!({ "token": { "type": "string" } }));
+        value["setup"] = json!({ "fields": [{ "path": "token", "default": 1 }] });
+        assert!(matches!(
+            parse(value),
+            Err(DescriptorError::SetupDefaultInvalid { .. })
+        ));
     }
 
     #[test]

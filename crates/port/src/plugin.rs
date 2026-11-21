@@ -1252,6 +1252,19 @@ pub trait ConfigOps: Send + Sync {
     /// schema 校验失败返回 `invalid_input`；插件应用失败返回对应错误，
     /// 且上一版本保持不变
     fn set(&self, id: &PluginId, values: &Value) -> Result<Value, HostError>;
+
+    /// 深度合并配置：对象递归并入，数组与标量整体替换
+    ///
+    /// 安装向导逐项写 `qq.appId` 这类嵌套字段时只传该字段，不必回读并重写
+    /// 整个 `qq` 对象，也就不会把打码后的密钥写回去。默认实现退化为顶层
+    /// [`ConfigOps::set`]；宿主实现应覆盖为递归合并。
+    ///
+    /// # Errors
+    ///
+    /// 同 [`ConfigOps::set`]
+    fn merge(&self, id: &PluginId, values: &Value) -> Result<Value, HostError> {
+        self.set(id, values)
+    }
 }
 
 #[cfg(test)]

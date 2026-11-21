@@ -17,6 +17,7 @@ import {
   type OpSpecLike,
   type PluginDefinition,
   type ResolvedOp,
+  type SetupSpec,
 } from "./define.js";
 import { toZod, type SchemaLike } from "./schema.js";
 import {
@@ -408,10 +409,12 @@ export function jsonSchemaOf(schema: z.ZodType, onOutput: boolean, path = "schem
 
 /** descriptor 结构（plugins.md §11.1） */
 export interface Descriptor {
-  readonly schema: 1;
+  readonly schema: 1 | 2;
   readonly plugin_id: string;
   readonly api: number;
   readonly config: JsonValue;
+  /** schema 2 起可用：安装向导 */
+  readonly setup?: JsonValue;
   readonly ops: readonly DescriptorOp[];
   readonly schemas: Record<string, JsonValue>;
 }
@@ -442,6 +445,34 @@ function opKinds(resolved: readonly ResolvedOp[]): Map<string, OpKind> {
   return kinds;
 }
 
+/** 安装向导归一化：只保留声明过的键，字段顺序保持声明顺序 */
+function buildSetup(setup: SetupSpec): JsonValue {
+  const fields = setup.fields.map((field) => {
+    const entry: Record<string, JsonValue> = { path: field.path };
+    if (field.required !== undefined) {
+      entry["required"] = field.required;
+    }
+    if (field.secret !== undefined) {
+      entry["secret"] = field.secret;
+    }
+    if (field.label !== undefined) {
+      entry["label"] = field.label;
+    }
+    if (field.description !== undefined) {
+      entry["description"] = field.description;
+    }
+    if (field.default !== undefined) {
+      entry["default"] = field.default as JsonValue;
+    }
+    return sortKeys(entry);
+  });
+  const result: Record<string, JsonValue> = { fields };
+  if (setup.start !== undefined) {
+    result["start"] = setup.start;
+  }
+  return sortKeys(result);
+}
+
 /**
  * 从定义生成 descriptor。
  *
@@ -456,6 +487,7 @@ export function buildDescriptor<
   Cfg extends SchemaLike,
 >(def: PluginDefinition<C, Id, Cfg>): Descriptor {
   const resolved = collectOps(def);
+  const setup = def.setup === undefined ? undefined : buildSetup(def.setup);
   const kinds = opKinds(resolved);
   const ops: DescriptorOp[] = [];
   const schemas: Record<string, JsonValue> = {
@@ -506,13 +538,16 @@ export function buildDescriptor<
     throw new DescriptorError("ops", `${ops.length} ops declared, limit is 64`);
   }
   const descriptor: Descriptor = {
-    schema: 1,
+    schema: setup === undefined ? 1 : 2,
     plugin_id: def.id,
     api: PLUGIN_API_VERSION,
     config: { $ref: "#/schemas/config" },
     ops,
     schemas,
   };
+  if (setup !== undefined) {
+    (descriptor as { setup?: JsonValue }).setup = setup;
+  }
   validateDescriptorSize("descriptor", serializeNormalized(descriptor));
   return descriptor;
 }

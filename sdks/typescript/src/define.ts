@@ -76,6 +76,30 @@ export type Subscription<
   Cfg extends SchemaLike = z.ZodType,
 > = string | readonly string[] | { readonly kind: string; readonly handler: EventHandler<C, Cfg> };
 
+/** 安装向导字段：宿主在授权后逐项询问，写入配置 */
+export interface SetupFieldSpec {
+  /** 配置路径，点号分隔（如 `qq.appId`） */
+  readonly path: string;
+  /** 是否必填；必填项不允许留空 */
+  readonly required?: boolean;
+  /** 输入时遮蔽；只能用于字符串字段 */
+  readonly secret?: boolean;
+  /** 覆盖 schema 的 `x-mcsup-label` */
+  readonly label?: string;
+  /** 覆盖 schema 的 description */
+  readonly description?: string;
+  /** 提示默认值；省略时取 schema 的 default */
+  readonly default?: unknown;
+}
+
+/** 安装向导：声明一次「装完即用」需要问哪些值 */
+export interface SetupSpec {
+  /** 配置写完是否自动启用并启动；默认 true */
+  readonly start?: boolean;
+  /** 按顺序提示的字段 */
+  readonly fields: readonly SetupFieldSpec[];
+}
+
 /** 插件定义（`definePlugin` 的参数） */
 export interface PluginDefinition<
   C extends readonly Capability[] = readonly Capability[],
@@ -108,6 +132,8 @@ export interface PluginDefinition<
   readonly publisher?: { readonly name: string; readonly url?: string };
   /** 配置 schema；热更新用同一 schema 校验 */
   readonly config: Cfg;
+  /** 安装向导；声明后宿主在安装时补齐配置并自动启动 */
+  readonly setup?: SetupSpec;
   readonly queries?: Readonly<Record<string, OpSpec>>;
   readonly actions?: Readonly<Record<string, OpSpec>>;
   readonly streams?: Readonly<Record<string, OpSpec>>;

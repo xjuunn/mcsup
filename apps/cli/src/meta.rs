@@ -1287,8 +1287,24 @@ pub(crate) fn plugin_prune_arg() -> &'static str {
 #[must_use]
 pub(crate) fn plugin_yes_arg() -> &'static str {
     t(
-        "跳过确认提问（不跳过高风险能力的显式 grant）",
-        "skip confirmation prompts (does not skip explicit grant for high-risk capabilities)",
+        "跳过确认提问；安装向导中视为同意授权",
+        "skip confirmation prompts; in the setup wizard this also approves capabilities",
+    )
+}
+
+#[must_use]
+pub(crate) fn plugin_no_setup_arg() -> &'static str {
+    t(
+        "跳过安装向导（不询问授权、不填写配置、不自动启动）",
+        "skip the install wizard (no capability prompt, no configuration, no auto-start)",
+    )
+}
+
+#[must_use]
+pub(crate) fn plugin_update_no_setup_arg() -> &'static str {
+    t(
+        "跳过升级向导（不询问授权、不补齐配置、不重启）",
+        "skip the update wizard (no capability prompt, no top-up, no restart)",
     )
 }
 

@@ -463,6 +463,18 @@ impl PluginService {
         Ok(self.config.set(id, values)?)
     }
 
+    /// 深度合并配置：嵌套对象逐层并入，数组与标量整体替换
+    ///
+    /// 安装向导只传单个字段（如 `{"qq":{"appId":"..."}}`），不会覆盖同级的
+    /// 其它配置，也不会把打码后的密钥写回去。
+    ///
+    /// # Errors
+    ///
+    /// schema 校验失败返回 [`PluginError::Usage`]；插件应用失败时保留上一版本
+    pub fn config_merge(&self, id: &PluginId, values: &Value) -> Result<Value, PluginError> {
+        Ok(self.config.merge(id, values)?)
+    }
+
     /// 本机拉黑：立即停用且不再自动启动
     ///
     /// # Errors
@@ -1353,6 +1365,17 @@ impl ConfigOps for PluginConfig {
     }
 
     fn set(&self, id: &PluginId, values: &Value) -> Result<Value, HostError> {
+        self.write(id, values, false)
+    }
+
+    fn merge(&self, id: &PluginId, values: &Value) -> Result<Value, HostError> {
+        self.write(id, values, true)
+    }
+}
+
+impl PluginConfig {
+    /// 读—合并—校验—落盘—下发；`deep` 为 true 时递归合并对象
+    fn write(&self, id: &PluginId, values: &Value, deep: bool) -> Result<Value, HostError> {
         let record = self.record(id)?;
         let schema = Self::schema(&record)?.ok_or_else(|| {
             HostError::unsupported(format!("plugin {id} does not declare a config schema"))
@@ -1362,11 +1385,18 @@ impl ConfigOps for PluginConfig {
             .ok_or_else(|| HostError::invalid_input("config values must be an object"))?;
         let previous = self.current(id, &schema)?;
         let mut merged = previous.values.clone();
-        let Some(object) = merged.as_object_mut() else {
+        if merged.as_object().is_none() {
             return Err(HostError::internal("stored config is not an object"));
-        };
-        for (key, value) in patch {
-            object.insert(key.clone(), value.clone());
+        }
+        if deep {
+            merge_value(&mut merged, values);
+        } else {
+            let object = merged
+                .as_object_mut()
+                .ok_or_else(|| HostError::internal("stored config is not an object"))?;
+            for (key, value) in patch {
+                object.insert(key.clone(), value.clone());
+            }
         }
         domain::plugin::schema::validate_instance(&schema, &merged, "config")
             .map_err(|err| HostError::invalid_input(err.to_string()))?;
@@ -1390,10 +1420,11 @@ impl ConfigOps for PluginConfig {
             }
         }
         let changed = patch.keys().cloned().collect::<Vec<_>>().join(", ");
+        let action = if deep { "config:merge" } else { "config:set" };
         self.audit.record(&AuditEvent {
             at: now_secs(),
             plugin: id.to_string(),
-            action: "config:set".to_owned(),
+            action: action.to_owned(),
             capability: None,
             result: AuditResult::Allowed,
             // 审计只记键名，绝不记值。
@@ -1420,6 +1451,23 @@ impl PluginConfig {
         record.last_error = Some(format!("config apply failed: {}", err.message));
         record.updated_at = now_secs();
         let _ = self.store.put(&record);
+    }
+}
+
+/// 深度合并：对象递归并入，数组与标量整体替换
+fn merge_value(target: &mut Value, patch: &Value) {
+    match (target, patch) {
+        (Value::Object(base), Value::Object(patch)) => {
+            for (key, value) in patch {
+                match base.get_mut(key) {
+                    Some(existing) => merge_value(existing, value),
+                    None => {
+                        base.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        (target, patch) => *target = patch.clone(),
     }
 }
 
@@ -2667,7 +2715,7 @@ mod tests {
         );
     }
 
-    fn config_service(dir: &Path) -> (PluginService, PluginId) {
+    fn config_service_with_store(dir: &Path) -> (PluginService, PluginId, Arc<MemoryConfigStore>) {
         let id = PluginId::parse("demo").expect("id");
         std::fs::write(
             dir.join("descriptor.json"),
@@ -2680,7 +2728,16 @@ mod tests {
                     "additionalProperties": false,
                     "properties": {
                         "interval_secs": { "type": "integer", "minimum": 5, "default": 60 },
-                        "token": { "type": "string", "x-mcsup-secret": true }
+                        "token": { "type": "string", "x-mcsup-secret": true },
+                        "qq": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "appId": { "type": "string" },
+                                "clientSecret": { "type": "string", "x-mcsup-secret": true },
+                                "groups": { "type": "array", "items": { "type": "string" } }
+                            }
+                        }
                     }
                 }
             }))
@@ -2691,9 +2748,10 @@ mod tests {
         let mut stored = record("demo", false, &[]);
         stored.artifact_dir = dir.to_path_buf();
         store.put(&stored).expect("put");
+        let config_store = Arc::new(MemoryConfigStore::default());
         let service = PluginService::new(
             Arc::clone(&store),
-            Arc::new(MemoryConfigStore::default()),
+            Arc::clone(&config_store) as Arc<dyn PluginConfigStore>,
             None,
             None,
             None,
@@ -2702,6 +2760,11 @@ mod tests {
             dir.join("plugin-data"),
             dir.join("logs"),
         );
+        (service, id, config_store)
+    }
+
+    fn config_service(dir: &Path) -> (PluginService, PluginId) {
+        let (service, id, _) = config_service_with_store(dir);
         (service, id)
     }
 
@@ -2727,6 +2790,34 @@ mod tests {
             service.config_get(&id).expect("get")["values"]["interval_secs"],
             30
         );
+    }
+
+    /// 安装向导逐项写嵌套字段：只覆盖目标键，同级配置与已存密钥保持不变
+    #[test]
+    fn config_merge_keeps_nested_siblings_and_secret() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (service, id, store) = config_service_with_store(dir.path());
+        service
+            .config_set(
+                &id,
+                &json!({
+                    "interval_secs": 30,
+                    "qq": { "appId": "app-1", "clientSecret": "s3cret", "groups": ["g1"] }
+                }),
+            )
+            .expect("seed");
+        let config = service
+            .config_merge(&id, &json!({ "qq": { "groups": ["g2"] } }))
+            .expect("merge");
+        // 数组整体替换，嵌套对象的其它键保留
+        assert_eq!(config["values"]["qq"]["groups"], json!(["g2"]));
+        assert_eq!(config["values"]["qq"]["appId"], "app-1");
+        assert_eq!(config["values"]["interval_secs"], 30);
+        // 读取打码；落盘值仍是原文，`***` 不会被写回
+        assert_eq!(config["values"]["qq"]["clientSecret"], "***");
+        assert_eq!(config["revision"], 2);
+        let stored = store.get(&id).expect("get").expect("stored");
+        assert_eq!(stored.values["qq"]["clientSecret"], "s3cret");
     }
 
     #[test]

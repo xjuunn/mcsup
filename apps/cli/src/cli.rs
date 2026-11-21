@@ -1074,6 +1074,9 @@ pub(crate) enum PluginAction {
         sha256: Option<String>,
         #[arg(long, help = crate::meta::plugin_yes_arg())]
         yes: bool,
+        /// 跳过安装向导（不询问授权、不填写配置、不自动启动）
+        #[arg(long = "no-setup", help = crate::meta::plugin_no_setup_arg())]
+        no_setup: bool,
     },
     /// 升级到新版本（沿用记录的来源）
     #[command(about = crate::meta::plugin_update())]
@@ -1085,6 +1088,9 @@ pub(crate) enum PluginAction {
         prune: bool,
         #[arg(long, help = crate::meta::plugin_yes_arg())]
         yes: bool,
+        /// 跳过升级向导（不询问授权、不补齐配置、不重启）
+        #[arg(long = "no-setup", help = crate::meta::plugin_update_no_setup_arg())]
+        no_setup: bool,
     },
     /// 卸载插件
     #[command(about = crate::meta::plugin_remove())]

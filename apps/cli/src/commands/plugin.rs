@@ -15,13 +15,14 @@ use comfy_table::Table;
 use mcsup::domain::plugin::PluginId;
 use mcsup::domain::plugin::capability::Capability;
 use mcsup::domain::plugin::descriptor::Descriptor;
+use mcsup::domain::plugin::descriptor::{ResolvedSetupField, SetupKind};
 use mcsup::domain::plugin::manifest::Manifest;
 use mcsup::domain::plugin::revocation::RevocationList;
 use mcsup::domain::server::artifact::{Checksum, ChecksumAlgorithm};
 use mcsup::port::plugin::ArtifactVerifier as _;
-use mcsup::port::plugin::{ArtifactOrigin, SecretProtection, StreamSink};
+use mcsup::port::plugin::{ArtifactOrigin, PluginRecord, SecretProtection, StreamSink};
 use mcsup::service::PluginService;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -38,8 +39,17 @@ pub(crate) fn run(action: PluginAction, printer: Printer) -> Result<()> {
             reference,
             sha256,
             yes,
-        } => install(source, from, url, git, reference, sha256, yes, printer),
-        PluginAction::Update { id, to, prune, yes } => update(&id, to, prune, yes, printer),
+            no_setup,
+        } => install(
+            source, from, url, git, reference, sha256, yes, !no_setup, printer,
+        ),
+        PluginAction::Update {
+            id,
+            to,
+            prune,
+            yes,
+            no_setup,
+        } => update(&id, to, prune, yes, !no_setup, printer),
         PluginAction::Remove {
             id,
             purge,
@@ -205,6 +215,399 @@ fn list(printer: Printer, json: bool) -> Result<()> {
     printer.print_outcome("", &items)
 }
 
+/// 安装向导的输出：写入了哪些字段、还缺哪些必填项、是否应自动启动
+#[derive(Debug, Default)]
+struct SetupReport {
+    /// 已写入的字段路径
+    configured: Vec<String>,
+    /// 仍缺失的必填字段路径
+    missing: Vec<String>,
+    /// descriptor 是否要求自动启动
+    start: bool,
+}
+
+/// 安装/升级后仍需确认的能力
+fn pending_of(record: &PluginRecord) -> Vec<Capability> {
+    record
+        .manifest
+        .capabilities
+        .iter()
+        .filter_map(|raw| Capability::parse(raw).ok())
+        .filter(|cap| cap.risk().needs_approval() && !record.approved.contains(cap))
+        .collect()
+}
+
+/// 能力的中英说明：授权清单里让用户知道自己在同意什么
+fn capability_summary(cap: Capability) -> (&'static str, &'static str) {
+    match cap.as_str() {
+        "events" => ("接收服务器事件", "receive server events"),
+        "storage:kv" => (
+            "读写插件私有键值存储",
+            "read/write private key-value storage",
+        ),
+        "server:read" => ("读取服务器信息", "read server info"),
+        "console:read" => ("读取控制台输出", "read console output"),
+        "console:write" => ("向控制台执行命令", "run console commands"),
+        "net:outbound" => ("访问网络", "access the network"),
+        "secret:rw" => ("读写插件密钥", "read/write plugin secrets"),
+        "backup" => ("创建与恢复备份", "create and restore backups"),
+        "files:read" => ("读取服务器文件", "read server files"),
+        "files:write" => ("写入服务器文件", "write server files"),
+        "server:lifecycle" => ("启动与停止服务器", "start and stop servers"),
+        "content" => ("管理模组与整合包内容", "manage mod and modpack content"),
+        "java" => ("管理 Java 运行时", "manage Java runtimes"),
+        "process:spawn" => ("启动子进程", "spawn subprocesses"),
+        "mc:client" => ("以玩家身份连服", "connect as a player"),
+        _ => ("其它能力", "another capability"),
+    }
+}
+
+/// 列出待授权能力并一次确认；非交互模式下只有 `--yes` 才授予
+fn approve_pending(
+    service: &PluginService,
+    id: &PluginId,
+    pending: &[Capability],
+    printer: Printer,
+) -> Result<Vec<Capability>> {
+    if pending.is_empty() {
+        return Ok(Vec::new());
+    }
+    if printer.is_human() {
+        let lang = printer.lang();
+        let mut lines = vec![crate::i18n::pick(
+            lang,
+            "插件申请以下权限：",
+            "the plugin requests these capabilities:",
+        )];
+        for cap in pending {
+            let (zh, en) = capability_summary(*cap);
+            lines.push(format!("  - {cap}  {}", crate::i18n::pick(lang, zh, en)));
+        }
+        printer.print_section(&lines.join("\n"));
+    }
+    let confirmed = if printer.is_interactive() {
+        crate::prompts::confirm_or_yes(
+            printer,
+            &crate::i18n::pick(
+                printer.lang(),
+                "授予以上权限？",
+                "grant these capabilities?",
+            ),
+            true,
+        )?
+    } else {
+        // 脚本模式不能静默授权：只有显式 `--yes` 才视为同意
+        printer.assumes_yes()
+    };
+    if !confirmed {
+        return Ok(Vec::new());
+    }
+    let mut granted = Vec::with_capacity(pending.len());
+    for cap in pending {
+        service.grant(id, *cap)?;
+        granted.push(*cap);
+    }
+    Ok(granted)
+}
+
+/// 逐项补齐安装向导声明的配置；只询问「新装」或「仍为空」的字段
+fn run_setup(service: &PluginService, id: &PluginId, printer: Printer) -> Result<SetupReport> {
+    let Ok(descriptor) = service.descriptor(id) else {
+        return Ok(SetupReport::default());
+    };
+    let Some(setup) = descriptor.setup.as_ref() else {
+        return Ok(SetupReport::default());
+    };
+    let current = service.config_get(id)?;
+    let revision = current.get("revision").and_then(Value::as_u64).unwrap_or(0);
+    let values = current.get("values").cloned().unwrap_or_else(|| json!({}));
+    // 全新安装时配置里只有 schema 默认值；升级时只补真正缺失的字段，
+    // 避免每次升级都重问一遍。
+    let fresh = revision == 0;
+    let interactive = printer.is_interactive();
+    let lang = printer.lang();
+    let mut patch = Map::new();
+    let mut report = SetupReport {
+        start: setup.start,
+        ..SetupReport::default()
+    };
+
+    for field in &setup.fields {
+        let missing = value_missing(&values, &field.path);
+        if !fresh && !missing {
+            continue;
+        }
+        if !interactive {
+            if field.required && missing {
+                report.missing.push(field.path.clone());
+            }
+            continue;
+        }
+        let value = loop {
+            let Some(value) = prompt_setup_field(field, printer)? else {
+                break None;
+            };
+            if field.required && value_is_empty(&value) {
+                printer.print_section(&crate::i18n::pick(
+                    lang,
+                    format!("{} 为必填项，请重新输入", field.label),
+                    format!("{} is required; please try again", field.label),
+                ));
+                continue;
+            }
+            match mcsup::domain::plugin::schema::validate_instance(
+                &field.schema,
+                &value,
+                &field.path,
+            ) {
+                Ok(()) => break Some(value),
+                Err(err) => printer.print_section(&crate::i18n::pick(
+                    lang,
+                    format!("{} 无效：{err}", field.label),
+                    format!("{} is invalid: {err}", field.label),
+                )),
+            }
+        };
+        if let Some(value) = value {
+            set_path(&mut patch, &field.path, value);
+            report.configured.push(field.path.clone());
+        } else if field.required {
+            report.missing.push(field.path.clone());
+        }
+    }
+
+    if !patch.is_empty() {
+        service.config_merge(id, &Value::Object(patch))?;
+    }
+    Ok(report)
+}
+
+/// 询问单个字段；返回 `None` 表示非必填项被留空跳过
+fn prompt_setup_field(field: &ResolvedSetupField, printer: Printer) -> Result<Option<Value>> {
+    let lang = printer.lang();
+    let help = field.description.clone().unwrap_or_default();
+    let default_text = setup_default_text(field);
+    let value = match &field.kind {
+        SetupKind::Boolean => {
+            let default = field
+                .default
+                .as_ref()
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            json!(crate::prompts::select_bool(lang, &field.label, default)?)
+        }
+        SetupKind::Text { choices } if !choices.is_empty() => {
+            let default = field.default.as_ref().and_then(Value::as_str);
+            let picked = crate::prompts::select_choice(lang, &field.label, choices, default)?;
+            json!(picked)
+        }
+        SetupKind::Text { .. } => {
+            let input = if field.secret {
+                crate::prompts::input_secret(lang, &field.label, &help)?
+            } else {
+                crate::prompts::input_text(lang, &field.label, &default_text, &help)?
+            };
+            if input.is_empty() && !field.required {
+                return Ok(None);
+            }
+            json!(input)
+        }
+        SetupKind::Integer => {
+            let input = crate::prompts::input_text(lang, &field.label, &default_text, &help)?;
+            // 解析失败也交给 schema 复校验，统一走「重输」分支
+            match input.trim().parse::<i64>() {
+                Ok(number) => json!(number),
+                Err(_) => json!(input.trim()),
+            }
+        }
+        SetupKind::Number => {
+            let input = crate::prompts::input_text(lang, &field.label, &default_text, &help)?;
+            match input.trim().parse::<f64>() {
+                Ok(number) => json!(number),
+                Err(_) => json!(input.trim()),
+            }
+        }
+        SetupKind::StringList => {
+            let input = crate::prompts::input_text(lang, &field.label, &default_text, &help)?;
+            let items = split_list(&input);
+            if items.is_empty() && !field.required {
+                return Ok(None);
+            }
+            json!(items)
+        }
+    };
+    Ok(Some(value))
+}
+
+/// 默认值渲染成输入框提示文本
+fn setup_default_text(field: &ResolvedSetupField) -> String {
+    match &field.default {
+        None => String::new(),
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| match item {
+                Value::String(text) => text.clone(),
+                other => other.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+        Some(other) => other.to_string(),
+    }
+}
+
+/// 列表输入：逗号（中英文）或分号分隔
+fn split_list(input: &str) -> Vec<String> {
+    input
+        .split([',', '，', ';', '；'])
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn value_is_empty(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(text) => text.trim().is_empty(),
+        Value::Array(items) => items.is_empty(),
+        Value::Object(map) => map.is_empty(),
+        Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
+fn value_missing(values: &Value, path: &str) -> bool {
+    let mut node = values;
+    for segment in path.split('.') {
+        let Some(next) = node.get(segment) else {
+            return true;
+        };
+        node = next;
+    }
+    value_is_empty(node)
+}
+
+/// 把 `qq.appId` 写进嵌套补丁对象
+fn set_path(map: &mut Map<String, Value>, path: &str, value: Value) {
+    let segments = path.split('.').collect::<Vec<_>>();
+    set_path_at(map, &segments, value);
+}
+
+fn set_path_at(map: &mut Map<String, Value>, segments: &[&str], value: Value) {
+    match segments {
+        [] => {}
+        [last] => {
+            map.insert((*last).to_owned(), value);
+        }
+        [head, rest @ ..] => {
+            let entry = map
+                .entry((*head).to_owned())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if !entry.is_object() {
+                *entry = Value::Object(Map::new());
+            }
+            if let Some(child) = entry.as_object_mut() {
+                set_path_at(child, rest, value);
+            }
+        }
+    }
+}
+
+/// 启用并启动；已在运行时重启以加载新配置
+fn activate(service: &PluginService, id: &PluginId) -> Result<()> {
+    service.enable(id)?;
+    ensure_host()?;
+    if service.status(id)?.session.is_some() {
+        service.restart(id, Duration::from_secs(10))?;
+    } else {
+        service.start(id)?;
+    }
+    Ok(())
+}
+
+/// 向导前半段：确认待授权能力，再按 descriptor 的 setup 逐项补配置
+fn approve_and_configure(
+    service: &PluginService,
+    id: &PluginId,
+    pending: &[Capability],
+    setup: bool,
+    printer: Printer,
+) -> Result<(Vec<Capability>, Vec<Capability>, SetupReport)> {
+    let granted = if setup {
+        approve_pending(service, id, pending, printer)?
+    } else {
+        Vec::new()
+    };
+    let remaining = pending
+        .iter()
+        .copied()
+        .filter(|cap| !granted.contains(cap))
+        .collect::<Vec<_>>();
+    let report = if setup {
+        run_setup(service, id, printer)?
+    } else {
+        SetupReport::default()
+    };
+    Ok((granted, remaining, report))
+}
+
+/// 权限齐备且必填配置无缺口时才允许自动启动
+fn should_start(report: &SetupReport, remaining: &[Capability]) -> bool {
+    report.start && remaining.is_empty() && report.missing.is_empty()
+}
+
+/// 权限齐备才启动；缺权限或启动失败都只提示，不视为安装 / 升级失败
+fn start_if_ready(
+    service: &PluginService,
+    id: &PluginId,
+    remaining: &[Capability],
+    printer: Printer,
+    failure_zh: &str,
+    failure_en: &str,
+) -> bool {
+    if !remaining.is_empty() {
+        printer.print_section(&crate::i18n::pick(
+            printer.lang(),
+            format!(
+                "仍有权限未授予，已跳过启动；运行 `mcsup plugin grant {id} <capability>` 后重试"
+            ),
+            format!(
+                "some capabilities are still pending, so start was skipped; run `mcsup plugin grant {id} <capability>` and retry"
+            ),
+        ));
+        return false;
+    }
+    match activate(service, id) {
+        Ok(()) => true,
+        Err(err) => {
+            printer.print_section(&crate::i18n::pick(
+                printer.lang(),
+                format!("{failure_zh}：{err:#}\n运行 `mcsup plugin logs {id}` 查看原因"),
+                format!("{failure_en}: {err:#}\nrun `mcsup plugin logs {id}` for details"),
+            ));
+            false
+        }
+    }
+}
+
+/// 必填配置仍未补齐时给出可直接复制的修复命令
+fn print_missing(printer: Printer, id: &PluginId, missing: &[String]) {
+    if missing.is_empty() {
+        return;
+    }
+    printer.print_section(&crate::i18n::pick(
+        printer.lang(),
+        format!(
+            "必填配置仍缺失：{}；运行 `mcsup plugin config set {id} <key> <value>` 补齐",
+            missing.join(", ")
+        ),
+        format!(
+            "required configuration is still missing: {}; run `mcsup plugin config set {id} <key> <value>` to fill it",
+            missing.join(", ")
+        ),
+    ));
+}
+
 #[allow(clippy::too_many_arguments)]
 fn install(
     source: Option<String>,
@@ -214,6 +617,7 @@ fn install(
     reference: Option<String>,
     sha256: Option<String>,
     yes: bool,
+    setup: bool,
     printer: Printer,
 ) -> Result<()> {
     let origin = resolve_origin(source, from, url, git, reference)?;
@@ -253,41 +657,50 @@ fn install(
     spinner.finish();
     let outcome = outcome?;
     let record = outcome.record;
-    if printer.is_human() && !outcome.pending.is_empty() {
-        printer.print_section(&crate::i18n::pick(
-            printer.lang(),
-            format!(
-                "安装完成，仍待确认: {}；运行 `mcsup plugin grant {} <capability>`",
-                outcome
-                    .pending
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                record.id
-            ),
-            format!(
-                "installed; pending approval: {}; run `mcsup plugin grant {} <capability>`",
-                outcome
-                    .pending
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                record.id
-            ),
-        ));
-    }
+    let pending = outcome.pending.iter().copied().collect::<Vec<_>>();
+
+    let (granted, remaining, report) =
+        approve_and_configure(&service, &record.id, &pending, setup, printer)?;
+    // 安装向导默认启动；`--no-setup` 时 report.start 为 false，保持旧的
+    // 「装完不启动」行为。必填配置仍缺失时也不启动，避免带着坏配置反复崩溃。
+    let started = if should_start(&report, &remaining) {
+        start_if_ready(
+            &service,
+            &record.id,
+            &remaining,
+            printer,
+            "配置已保存，但启动失败",
+            "configuration saved, but start failed",
+        )
+    } else {
+        false
+    };
+    print_missing(printer, &record.id, &report.missing);
+
     printer.print_outcome(
         &crate::i18n::pick(
             printer.lang(),
-            format!("已安装 {} {}", record.id, record.version),
-            format!("installed {} {}", record.id, record.version),
+            format!(
+                "已安装{} {} {}",
+                if started { "并启动" } else { "" },
+                record.id,
+                record.version
+            ),
+            format!(
+                "installed{} {} {}",
+                if started { " and started" } else { "" },
+                record.id,
+                record.version
+            ),
         ),
         &json!({
             "id": record.id.to_string(),
             "version": record.version,
-            "pending": outcome.pending.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "granted": granted.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "pending": remaining.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "configured": report.configured,
+            "missing": report.missing,
+            "started": started,
         }),
     )
 }
@@ -340,7 +753,14 @@ fn resolve_origin(
     }
 }
 
-fn update(id: &str, to: Option<String>, prune: bool, yes: bool, printer: Printer) -> Result<()> {
+fn update(
+    id: &str,
+    to: Option<String>,
+    prune: bool,
+    yes: bool,
+    setup: bool,
+    printer: Printer,
+) -> Result<()> {
     let id = parse_id(id)?;
     let service = open()?;
     let spinner_text = if to.is_some() {
@@ -392,16 +812,48 @@ fn update(id: &str, to: Option<String>, prune: bool, yes: bool, printer: Printer
     };
     spinner.finish();
     let (updated_id, version) = result?;
+    let record = service.record(&updated_id)?;
+    let pending = pending_of(&record);
+    let (granted, remaining, report) =
+        approve_and_configure(&service, &updated_id, &pending, setup, printer)?;
+
+    // 升级沿用原有的启用状态：用户主动停用的插件不会被升级顺手拉起。
+    // 必填配置仍缺失时同样跳过重启，先让用户补齐再手动启动。
+    let started = if record.enabled && remaining.is_empty() && report.missing.is_empty() {
+        start_if_ready(
+            &service,
+            &updated_id,
+            &remaining,
+            printer,
+            "升级完成，但重启失败",
+            "updated, but restart failed",
+        )
+    } else {
+        false
+    };
+    print_missing(printer, &updated_id, &report.missing);
+
     printer.print_outcome(
         &crate::i18n::pick(
             printer.lang(),
-            format!("已切换 {updated_id} 到 {version}"),
-            format!("updated {updated_id} to {version}"),
+            format!(
+                "已切换 {updated_id} 到 {version}{}",
+                if started { "（已重启）" } else { "" }
+            ),
+            format!(
+                "updated {updated_id} to {version}{}",
+                if started { " (restarted)" } else { "" }
+            ),
         ),
         &json!({
             "id": updated_id.to_string(),
             "version": version,
             "prune": prune,
+            "granted": granted.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "pending": remaining.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "configured": report.configured,
+            "missing": report.missing,
+            "started": started,
         }),
     )
 }
@@ -1034,7 +1486,7 @@ fn print_revocations(list: &RevocationList, printer: Printer) -> Result<()> {
     )
 }
 
-fn flag_text(record: &mcsup::port::plugin::PluginRecord) -> &'static str {
+fn flag_text(record: &PluginRecord) -> &'static str {
     match (record.blocked, record.quarantined) {
         (true, true) => "blocked+quarantined",
         (true, false) => "blocked",
@@ -1107,11 +1559,7 @@ fn logs(id: &str, follow: bool, tail: usize, printer: Printer) -> Result<()> {
 }
 
 /// 撤销命中时给出拒绝启动的诊断；列表不可用时跳过
-fn revoked_finding(
-    service: &PluginService,
-    record: &mcsup::port::plugin::PluginRecord,
-    skip: bool,
-) -> Option<Value> {
+fn revoked_finding(service: &PluginService, record: &PluginRecord, skip: bool) -> Option<Value> {
     if skip {
         return None;
     }
@@ -1201,7 +1649,7 @@ fn rollback(id: &str, printer: Printer) -> Result<()> {
 /// 检查单个插件的产物；撤销命中时不再继续看产物
 fn scan_record(
     service: &PluginService,
-    record: &mcsup::port::plugin::PluginRecord,
+    record: &PluginRecord,
     revocation_unavailable: bool,
 ) -> Vec<Value> {
     let id = record.id.to_string();
@@ -1328,6 +1776,52 @@ fn doctor(printer: Printer, json: bool) -> Result<()> {
 
 /// 测试与诊断用：产物根
 #[allow(dead_code)]
-fn artifact_root(record: &mcsup::port::plugin::PluginRecord) -> &Path {
+fn artifact_root(record: &PluginRecord) -> &Path {
     &record.artifact_dir
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn report(start: bool, missing: &[&str]) -> SetupReport {
+        SetupReport {
+            configured: Vec::new(),
+            missing: missing.iter().map(|path| (*path).to_owned()).collect(),
+            start,
+        }
+    }
+
+    /// 必填配置没补齐时绝不能自动启动：否则插件带着坏配置反复崩溃
+    #[test]
+    fn auto_start_requires_complete_required_config() {
+        assert!(should_start(&report(true, &[]), &[]));
+        assert!(!should_start(&report(true, &["qq.appId"]), &[]));
+        assert!(!should_start(&report(false, &[]), &[]));
+        let pending = [Capability::ConsoleWrite];
+        assert!(!should_start(&report(true, &[]), &pending));
+    }
+
+    #[test]
+    fn missing_paths_track_nested_empties() {
+        let values = json!({ "platforms": ["qq"], "qq": { "appId": "a", "groups": [] } });
+        assert!(!value_missing(&values, "platforms"));
+        assert!(!value_missing(&values, "qq.appId"));
+        assert!(value_missing(&values, "qq.clientSecret"));
+        assert!(value_missing(&values, "qq.groups"));
+    }
+
+    #[test]
+    fn set_path_builds_nested_patch_and_replaces_non_object() {
+        let mut patch = Map::new();
+        set_path(&mut patch, "qq.appId", json!("a"));
+        set_path(&mut patch, "qq.clientSecret", json!("b"));
+        assert_eq!(patch["qq"], json!({ "appId": "a", "clientSecret": "b" }));
+
+        let mut odd = Map::new();
+        odd.insert("qq".to_owned(), json!("not-an-object"));
+        set_path(&mut odd, "qq.groups", json!(["g"]));
+        assert_eq!(odd["qq"], json!({ "groups": ["g"] }));
+    }
 }

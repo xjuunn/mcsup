@@ -31,7 +31,9 @@ pub const PLUGIN_API_VERSION: u32 = 1;
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 
 /// descriptor schema 版本
-pub const DESCRIPTOR_SCHEMA_VERSION: u32 = 1;
+///
+/// 2 起支持 `setup` 安装向导；校验同时接受 1（旧产物）。
+pub const DESCRIPTOR_SCHEMA_VERSION: u32 = 2;
 
 /// 当前平台标识：`darwin-arm64` / `linux-x64` / `win32-x64`
 ///

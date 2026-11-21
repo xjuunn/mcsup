@@ -10,7 +10,7 @@ use crate::output::Printer;
 use anyhow::{Context, Result};
 use inquire::autocompletion::Replacement;
 use inquire::validator::{ErrorMessage, Validation};
-use inquire::{Autocomplete, Confirm, CustomUserError, Select, Text};
+use inquire::{Autocomplete, Confirm, CustomUserError, Password, Select, Text};
 use mcsup::domain::workspace::WorkspaceName;
 use mcsup::port::RemoteName;
 use mcsup::service::{MARKER_FILE, NOISE_ENTRIES, absolute_path};
@@ -449,6 +449,44 @@ pub(crate) fn select_bool(lang: Lang, label: &str, default: bool) -> Result<bool
         .prompt()
         .context(l(lang, "读取选择", "reading the choice"))?;
     Ok(picked == "true")
+}
+
+/// 从固定取值中选择（安装向导的枚举字段）
+///
+/// # Errors
+///
+/// 读取终端输入失败时返回底层错误
+pub(crate) fn select_choice(
+    lang: Lang,
+    label: &str,
+    choices: &[String],
+    default: Option<&str>,
+) -> Result<String> {
+    crate::input::discard_pending_input();
+    let mut prompt = Select::new(label, choices.to_vec());
+    if let Some(index) = default.and_then(|value| choices.iter().position(|item| item == value)) {
+        prompt = prompt.with_starting_cursor(index);
+    }
+    prompt
+        .prompt()
+        .context(l(lang, "读取选择", "reading the choice"))
+}
+
+/// 遮蔽输入（安装向导的密钥字段）：不回显、不进入命令历史
+///
+/// # Errors
+///
+/// 读取终端输入失败时返回底层错误
+pub(crate) fn input_secret(lang: Lang, label: &str, help: &str) -> Result<String> {
+    crate::input::discard_pending_input();
+    let mut prompt = Password::new(label).without_confirmation();
+    if !help.is_empty() {
+        prompt = prompt.with_help_message(help);
+    }
+    let input = prompt
+        .prompt()
+        .context(l(lang, "读取输入", "reading input"))?;
+    Ok(input.trim().to_owned())
 }
 
 /// 提示是否被 Esc / Ctrl+C 取消：交互循环据此静默退出而非报错

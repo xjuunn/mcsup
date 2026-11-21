@@ -17,6 +17,8 @@ export type {
   OpSpec,
   PluginDefinition,
   PluginContext,
+  SetupFieldSpec,
+  SetupSpec,
   StreamChunks,
   Subscription,
 } from "./define.js";
