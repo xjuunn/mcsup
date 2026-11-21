@@ -30,6 +30,7 @@ import {
 } from "./define.js";
 import { EventBus, createCtx, type CtxEnvironment, type CtxFor } from "./ctx.js";
 import { PluginError, toPluginError } from "./errors.js";
+import { toZod, type InferSchema, type SchemaLike } from "./schema.js";
 import { DEFAULT_OP_TIMEOUT_MS } from "./validate.js";
 import {
   ExitCode,
@@ -119,15 +120,46 @@ function platformTag(): string {
 }
 
 /**
+ * 已启动的会话，按插件定义去重。
+ *
+ * 入口包装器与作者自己写的 `run(plugin)` 拿到的是同一个定义对象，重复调用
+ * 共用同一会话；不同插件互不影响，因此这里不设进程级「只跑一次」开关。
+ */
+const activeRuns = new WeakMap<object, Promise<number>>();
+
+/**
  * 启动插件进程。
  *
- * @returns 进程退出码；入口执行 `process.exit(await run(plugin))`
+ * 幂等：同一插件定义再次调用会复用进行中的会话，方便插件入口自动运行，
+ * 同时兼容作者自己写 `process.exit(await run(plugin))`。
+ *
+ * @returns 进程退出码
  */
-export async function run<C extends readonly Capability[], Id extends string>(
-  plugin: DefinedPlugin<C, Id> | PluginDefinition<C, Id>,
+export async function run<
+  C extends readonly Capability[],
+  Id extends string,
+  Cfg extends SchemaLike,
+>(
+  plugin: DefinedPlugin<C, Id, Cfg> | PluginDefinition<C, Id, Cfg>,
   options: RunOptions = {},
 ): Promise<number> {
-  const def = ("definition" in plugin ? plugin.definition : plugin) as PluginDefinition<C, Id>;
+  const def = ("definition" in plugin ? plugin.definition : plugin) as PluginDefinition<C, Id, Cfg>;
+  let active = activeRuns.get(def);
+  if (active === undefined) {
+    active = runOnce(def, options);
+    activeRuns.set(def, active);
+  }
+  return await active;
+}
+
+async function runOnce<
+  C extends readonly Capability[],
+  Id extends string,
+  Cfg extends SchemaLike,
+>(
+  def: PluginDefinition<C, Id, Cfg>,
+  options: RunOptions,
+): Promise<number> {
   const argv = options.argv ?? process.argv;
   const env = options.env ?? process.env;
 
@@ -178,7 +210,7 @@ export async function run<C extends readonly Capability[], Id extends string>(
     process.stderr.write(`mcsup-plugin: cannot reach host endpoint: ${String(err)}\n`);
     return ExitCode.Failure;
   }
-  return await new Session<C>(def, channel).start(token);
+  return await new Session<C, Cfg>(def, channel).start(token);
 }
 
 // ---------------------------------------------------------------------------
@@ -250,8 +282,8 @@ class SocketChannel implements FrameChannel {
 // ---------------------------------------------------------------------------
 
 /** 一次插件会话（握手完成后的运行期） */
-export class Session<C extends readonly Capability[]> {
-  private readonly def: PluginDefinition<C>;
+export class Session<C extends readonly Capability[], Cfg extends SchemaLike = SchemaLike> {
+  private readonly def: PluginDefinition<C, string, Cfg>;
   private readonly channel: FrameChannel;
   private readonly ops: ReadonlyMap<string, ResolvedOp>;
   private readonly ctxEnv: CtxEnvironment;
@@ -267,7 +299,7 @@ export class Session<C extends readonly Capability[]> {
   private hostInflight = 0;
   private readonly hostCallWaiters: Array<{ resolve: () => void; reject: (error: PluginError) => void }> = [];
 
-  private ctx: CtxFor<C>;
+  private ctx: CtxFor<C, Cfg>;
   private readonly exitPromise: Promise<number>;
   private resolveExit: ((code: number) => void) | undefined;
   private startPromise: Promise<void> | undefined;
@@ -282,16 +314,17 @@ export class Session<C extends readonly Capability[]> {
   private logWindowStart = Date.now();
   private logWindowCount = 0;
   private suppressedLogs = 0;
-  private configValues: unknown = undefined;
+  private configValues: InferSchema<Cfg> | undefined = undefined;
   private configRevision = 0;
 
-  public constructor(def: PluginDefinition<C>, channel: FrameChannel) {
+  public constructor(def: PluginDefinition<C, string, Cfg>, channel: FrameChannel) {
     this.def = def;
     this.channel = channel;
     this.ops = new Map(collectOps(def).map((op) => [op.id, op]));
 
     for (const { kind, handler } of subscriptionHandlers(def.subscriptions)) {
-      this.events.on(kind, handler as never);
+      // EventBus 只投递 (data, meta)；作者写的是 (data, ctx, meta)
+      this.events.on(kind, (data, meta) => handler(data, this.ctx, meta));
     }
 
     // 先建 promise 再挂 ctx，避免闭包提前读取未初始化的字段
@@ -320,7 +353,7 @@ export class Session<C extends readonly Capability[]> {
       },
     };
     // 握手前先按声明构造；welcome 后按实际授予重建
-    this.ctx = createCtx<C>(this.ctxEnv, def.capabilities);
+    this.ctx = createCtx<C, Cfg>(this.ctxEnv, def.capabilities);
 
     channel.onFrame((frame) => {
       this.handleFrame(frame);
@@ -362,7 +395,7 @@ export class Session<C extends readonly Capability[]> {
   }
 
   /** 供测试观察的上下文 */
-  public get context(): CtxFor<C> {
+  public get context(): CtxFor<C, Cfg> {
     return this.ctx;
   }
 
@@ -465,8 +498,8 @@ export class Session<C extends readonly Capability[]> {
     this.ctxEnv.scope = frame.scope;
     const granted = this.def.capabilities.filter((cap) => frame.granted.includes(cap));
     const ungranted = this.def.capabilities.filter((cap) => !frame.granted.includes(cap));
-    this.ctx = createCtx<C>(this.ctxEnv, granted as unknown as C, ungranted);
-    const parsed = this.def.config.safeParse(frame.config.values);
+    this.ctx = createCtx<C, Cfg>(this.ctxEnv, granted as unknown as C, ungranted);
+    const parsed = toZod(this.def.config).safeParse(frame.config.values);
     if (!parsed.success) {
       this.log("error", `initial config is invalid: ${z.prettifyError(parsed.error)}`);
       this.exitCode = ExitCode.Config;
@@ -474,7 +507,7 @@ export class Session<C extends readonly Capability[]> {
       return;
     }
     this.configRevision = frame.config.revision;
-    this.configValues = parsed.data;
+    this.configValues = parsed.data as InferSchema<Cfg>;
     this.startPromise = this.runStart();
   }
 
@@ -655,7 +688,7 @@ export class Session<C extends readonly Capability[]> {
       this.channel.send({ type: "result", id: frame.id, ok: true, output: { stale: true } });
       return;
     }
-    const parsed = this.def.config.safeParse(frame.values);
+    const parsed = toZod(this.def.config).safeParse(frame.values);
     if (!parsed.success) {
       this.channel.send({
         type: "result",
@@ -672,10 +705,10 @@ export class Session<C extends readonly Capability[]> {
     }
     const previousValues = this.configValues;
     const previousRevision = this.configRevision;
-    this.configValues = parsed.data;
+    this.configValues = parsed.data as InferSchema<Cfg>;
     this.configRevision = frame.revision;
     try {
-      await this.def.onConfigChange?.(parsed.data, this.ctx);
+      await this.def.onConfigChange?.(parsed.data as InferSchema<Cfg>, this.ctx);
       this.channel.send({ type: "result", id: frame.id, ok: true, output: { revision: frame.revision } });
     } catch (err) {
       // 应用失败：回滚并回 ok:false（§6.6 宿主侧转 degraded）

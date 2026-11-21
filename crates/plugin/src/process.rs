@@ -128,6 +128,36 @@ pub fn platform_key() -> String {
     domain::plugin::platform_key()
 }
 
+/// 脚本型入口：Windows 上必须经 `cmd.exe /C` 启动，`CreateProcess` 不能直接
+/// 执行 `.cmd` / `.bat`。
+#[cfg(windows)]
+fn is_script(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
+}
+
+/// 展开为实际执行命令：`(程序, 参数)`
+///
+/// 非 Windows 平台原样返回；Windows 上脚本入口改走 `COMSPEC /C <script>`，
+/// 解释器缺失时回退到 `System32\cmd.exe`。
+fn command_line(program: &Path, args: &[String]) -> (PathBuf, Vec<String>) {
+    #[cfg(windows)]
+    {
+        if is_script(program) {
+            let comspec = std::env::var_os("COMSPEC").map_or_else(
+                || PathBuf::from(r"C:\Windows\System32\cmd.exe"),
+                PathBuf::from,
+            );
+            let mut expanded = Vec::with_capacity(args.len() + 2);
+            expanded.push("/C".to_owned());
+            expanded.push(program.to_string_lossy().into_owned());
+            expanded.extend(args.iter().cloned());
+            return (comspec, expanded);
+        }
+    }
+    (program.to_path_buf(), args.to_vec())
+}
+
 fn check_executable(path: &Path) -> Result<(), HostError> {
     let metadata = std::fs::metadata(path).map_err(|err| {
         HostError::not_found(format!(
@@ -184,8 +214,9 @@ impl SpawnedPlugin {
                 HostError::internal(format!("create plugin log dir {}: {err}", parent.display()))
             })?;
         }
-        let mut child = Command::new(&plan.program)
-            .args(&plan.args)
+        let (program, args) = command_line(&plan.program, &plan.args);
+        let mut child = Command::new(&program)
+            .args(&args)
             .current_dir(&plan.cwd)
             .envs(plan.env.iter().map(|(key, value)| (key, value)))
             .stdin(Stdio::null())
@@ -486,6 +517,79 @@ mod tests {
             "spawn must assign the plugin process to a job object"
         );
         assert!(spawned.wait_timeout(Duration::from_secs(5)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn script_entry_runs_through_cmd_exe() {
+        let (program, args) = command_line(
+            Path::new(r"C:\plugins\demo\bin\run.cmd"),
+            &["--endpoint".to_owned(), "tcp://x".to_owned()],
+        );
+        assert!(
+            program
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .ends_with("cmd.exe"),
+            "{}",
+            program.display()
+        );
+        assert_eq!(args[0], "/C");
+        assert_eq!(args[1], r"C:\plugins\demo\bin\run.cmd");
+        assert_eq!(args[2], "--endpoint");
+        assert_eq!(args[3], "tcp://x");
+
+        let (program, args) = command_line(
+            Path::new(r"C:\plugins\demo\bin\run.bat"),
+            &["--server".to_owned()],
+        );
+        assert_eq!(args[0], "/C");
+        assert_eq!(args[1], r"C:\plugins\demo\bin\run.bat");
+        assert!(
+            program
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .ends_with("cmd.exe")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exe_entry_runs_directly() {
+        let exe = Path::new(r"C:\plugins\demo\bin\demo.exe");
+        let (program, args) = command_line(exe, &["--endpoint".to_owned()]);
+        assert_eq!(program, exe);
+        assert_eq!(args, ["--endpoint"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn script_plugin_spawns_and_logs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("run.cmd");
+        std::fs::write(
+            &script,
+            "@echo off\r\necho hello-from-plugin\r\nexit /b 0\r\n",
+        )
+        .expect("script");
+        let mut plan = plan();
+        plan.program = script;
+        plan.cwd = dir.path().to_path_buf();
+        plan.log_file = dir.path().join("plugin.log");
+        let mut spawned = SpawnedPlugin::spawn(&plan).expect("spawn");
+        assert!(spawned.wait_timeout(Duration::from_secs(10)));
+
+        let log = dir.path().join("plugin.log");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut text = String::new();
+        while Instant::now() < deadline {
+            text = std::fs::read_to_string(&log).unwrap_or_default();
+            if text.contains("hello-from-plugin") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(text.contains("hello-from-plugin"), "log: {text}");
     }
 
     #[test]

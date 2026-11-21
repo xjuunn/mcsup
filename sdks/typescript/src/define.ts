@@ -9,7 +9,9 @@ import { z } from "zod";
 
 import type { OpenCapabilityName } from "./contracts/v1.js";
 import type { OpSpecLike, ResolvedOp } from "./descriptor.js";
-import type { CtxFor } from "./ctx.js";
+import type { CtxFor, EventMeta } from "./ctx.js";
+import type { InferSchema, SchemaLike } from "./schema.js";
+import { PLUGIN_API_VERSION } from "./protocol.js";
 
 /** 能力名（plugins.md §8.2）：来自生成契约，未开放项不在列表内 */
 export type Capability = OpenCapabilityName;
@@ -18,37 +20,46 @@ export type Capability = OpenCapabilityName;
  * 能力驱动的插件上下文：`ctx` 上只出现已声明能力对应的方法组。
  *
  * 未声明 `console:read` 时 `ctx.console` 在类型上不存在，越权调用在编译期
- * 报错（sdk-design.md §6.1）。
+ * 报错（sdk-design.md §6.1）。`config` 的类型由 `config` 字段的 schema 推导。
  */
-export type PluginContext<C extends readonly Capability[] = readonly Capability[]> = CtxFor<C>;
+export type PluginContext<
+  C extends readonly Capability[] = readonly Capability[],
+  Cfg extends SchemaLike = z.ZodType,
+> = CtxFor<C, Cfg>;
 
 /** 流式 op 的分块产出：同步或异步迭代器均可 */
 export type StreamChunks<T> = Iterable<T> | AsyncIterable<T>;
 
 /** op 片段：原生对象或 Builder 产物（descriptor.ts `OpSpecLike`） */
-export type OpSpec<I extends z.ZodType = z.ZodType, O extends z.ZodType = z.ZodType> = OpSpecLike & {
+export type OpSpec<I extends SchemaLike = SchemaLike, O extends SchemaLike = SchemaLike> = OpSpecLike & {
   readonly input: I;
   readonly output: O;
   readonly kind: "query" | "action" | "stream";
 };
 
 /** 事件处理函数 */
-export type EventHandler<C extends readonly Capability[]> = (
+export type EventHandler<C extends readonly Capability[], Cfg extends SchemaLike = z.ZodType> = (
   data: unknown,
-  ctx: PluginContext<C>,
-  meta: { readonly kind: string; readonly server?: string; readonly at: string },
+  ctx: PluginContext<C, Cfg>,
+  meta: EventMeta,
 ) => void | Promise<void>;
 
 /** 事件订阅声明：`kind` 或 `{kind, handler}` */
-export type Subscription = string | readonly string[] | { readonly kind: string; readonly handler: EventHandler<never> };
+export type Subscription<
+  C extends readonly Capability[] = readonly Capability[],
+  Cfg extends SchemaLike = z.ZodType,
+> = string | readonly string[] | { readonly kind: string; readonly handler: EventHandler<C, Cfg> };
 
 /** 插件定义（`definePlugin` 的参数） */
 export interface PluginDefinition<
   C extends readonly Capability[] = readonly Capability[],
   Id extends string = string,
+  Cfg extends SchemaLike = z.ZodType,
 > {
   /** 全局唯一 id，`^[a-z][a-z0-9-]{1,63}$` */
   readonly id: Id;
+  /** 插件 API 主版本；省略时取当前 SDK 版本，写错值在装配时报错 */
+  readonly api?: number;
   /** 展示名，≤ 64 字符 */
   readonly title: string;
   /** SemVer，与产物目录一致 */
@@ -63,33 +74,34 @@ export interface PluginDefinition<
   /** 申请的能力；同时决定 `ctx` 的形状 */
   readonly capabilities: C;
   /** 订阅的领域事件；要求声明 `events` 能力 */
-  readonly subscriptions?: readonly Subscription[];
+  readonly subscriptions?: readonly Subscription<C, Cfg>[];
   /** `net:outbound` 的域名白名单 */
   readonly net?: { readonly allow: readonly string[] };
   readonly provides?: readonly string[];
   readonly consumes?: readonly string[];
   readonly publisher?: { readonly name: string; readonly url?: string };
-  /** 配置 schema（zod），热更新用同一 schema 校验 */
-  readonly config: z.ZodType;
+  /** 配置 schema；热更新用同一 schema 校验 */
+  readonly config: Cfg;
   readonly queries?: Readonly<Record<string, OpSpec>>;
   readonly actions?: Readonly<Record<string, OpSpec>>;
   readonly streams?: Readonly<Record<string, OpSpec>>;
   /** 握手完成、配置就绪后调用 */
-  readonly onStart?: (ctx: PluginContext<C>) => void | Promise<void>;
+  readonly onStart?: (ctx: PluginContext<C, Cfg>) => void | Promise<void>;
   /** 收到 shutdown 时调用；超时由宿主裁定 */
-  readonly onStop?: (ctx: PluginContext<C>) => void | Promise<void>;
-  /** 配置变更；返回后 SDK 回 result */
-  readonly onConfigChange?: (config: unknown, ctx: PluginContext<C>) => void | Promise<void>;
+  readonly onStop?: (ctx: PluginContext<C, Cfg>) => void | Promise<void>;
+  /** 配置变更；`config` 已按同一 schema 校验，返回后 SDK 回 result */
+  readonly onConfigChange?: (config: InferSchema<Cfg>, ctx: PluginContext<C, Cfg>) => void | Promise<void>;
   /** 事件投递；未在 `subscriptions` 里写 handler 时回落于此 */
-  readonly onEvent?: EventHandler<C>;
+  readonly onEvent?: EventHandler<C, Cfg>;
 }
 
 /** `definePlugin` 的返回值：原定义 + 归约出的 op 列表 */
 export interface DefinedPlugin<
   C extends readonly Capability[] = readonly Capability[],
   Id extends string = string,
+  Cfg extends SchemaLike = z.ZodType,
 > {
-  readonly definition: PluginDefinition<C, Id>;
+  readonly definition: PluginDefinition<C, Id, Cfg>;
 }
 
 /**
@@ -97,11 +109,15 @@ export interface DefinedPlugin<
  *
  * 只做静态归约：记录定义、归一化 op 列表，不产生注册副作用、不触达 IO。
  *
- * @throws {Error} 能力未声明却使用了对应字段（如订阅事件但无 `events`）
+ * @throws {Error} 能力未声明却使用了对应字段（如订阅事件但无 `events`）、
+ *   `api` 与当前插件 API 主版本不一致
  */
-export function definePlugin<const C extends readonly Capability[], Id extends string>(
-  def: PluginDefinition<C, Id>,
-): DefinedPlugin<C, Id> {
+export function definePlugin<const C extends readonly Capability[], Id extends string, Cfg extends SchemaLike>(
+  def: PluginDefinition<C, Id, Cfg>,
+): DefinedPlugin<C, Id, Cfg> {
+  if (def.api !== undefined && def.api !== PLUGIN_API_VERSION) {
+    throw new Error(`plugin api ${def.api} does not match SDK api ${PLUGIN_API_VERSION}`);
+  }
   if (def.subscriptions !== undefined && !(def.capabilities as readonly string[]).includes("events")) {
     throw new Error("subscriptions require the events capability");
   }
@@ -121,8 +137,11 @@ export function definePlugin<const C extends readonly Capability[], Id extends s
   return { definition: def };
 }
 
+/** 订阅声明的结构子集：只读 `kind`，不关心 handler 的能力形状 */
+export type SubscriptionShape = string | readonly string[] | { readonly kind: string };
+
 /** 从订阅声明里取事件名（归约用） */
-export function subscriptionKinds(subscriptions: readonly Subscription[] | undefined): readonly string[] {
+export function subscriptionKinds(subscriptions: readonly SubscriptionShape[] | undefined): readonly string[] {
   if (subscriptions === undefined) {
     return [];
   }
@@ -140,14 +159,16 @@ export function subscriptionKinds(subscriptions: readonly Subscription[] | undef
 }
 
 /** 从订阅声明里取 handler（`onEvent` 兜底） */
-export function subscriptionHandlers(
-  subscriptions: readonly Subscription[] | undefined,
-): readonly { readonly kind: string; readonly handler: EventHandler<never> }[] {
+export function subscriptionHandlers<C extends readonly Capability[], Cfg extends SchemaLike>(
+  subscriptions: readonly Subscription<C, Cfg>[] | undefined,
+): readonly { readonly kind: string; readonly handler: EventHandler<C, Cfg> }[] {
   if (subscriptions === undefined) {
     return [];
   }
   return subscriptions.flatMap((item) =>
-    typeof item === "string" || Array.isArray(item) ? [] : [item as { kind: string; handler: EventHandler<never> }],
+    typeof item === "string" || Array.isArray(item)
+      ? []
+      : [(item as { kind: string; handler: EventHandler<C, Cfg> })],
   );
 }
 

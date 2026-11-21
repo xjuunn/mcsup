@@ -2,11 +2,14 @@
  * MCSUP 插件 SDK
  *
  * 公开面（plugins.md §14.2）刻意保持小：
- * `definePlugin` / `z` / `PluginContext` / `PluginError`；
- * Builder 与 Hooks 是次版本可选 API（sdk-design.md §9）。
+ * 内核 `definePlugin` / `run` + 字段 DSL `s` / `z` / `PluginContext` /
+ * `PluginError`；Builder 与 Hooks 是次版本可选 API（sdk-design.md §9）。
+ *
+ * 内部实现（会话、descriptor 校验常量、订阅归约）不从这里导出：作者写插件
+ * 不需要它们，测试从具体模块导入即可。
  */
 
-export { definePlugin, subscriptionKinds, subscriptionHandlers } from "./define.js";
+export { definePlugin } from "./define.js";
 export type {
   Capability,
   DefinedPlugin,
@@ -26,22 +29,12 @@ export {
 } from "./errors.js";
 export type { PluginErrorCategory, PluginErrorCode } from "./errors.js";
 
-export { run, ExitCode, Session } from "./runtime.js";
-export type { ExitCode as ExitCodeValue, FrameChannel, RunOptions } from "./runtime.js";
+export { run } from "./runtime.js";
+export type { RunOptions } from "./runtime.js";
 
-// descriptor 校验（plugins.md §11.2–§11.5）：作者构建期遇到错误时定位用
-export { DescriptorError } from "./validate.js";
-export {
-  DEFAULT_OP_TIMEOUT_MS,
-  MAX_DESCRIPTOR_BYTES,
-  MAX_ENUM_VALUES,
-  MAX_OBJECT_PROPERTIES,
-  MAX_SCHEMA_BYTES,
-  MAX_SCHEMA_DEPTH,
-  MAX_SCHEMA_NODES,
-  MAX_STRING_LENGTH,
-  OP_ID_PATTERN,
-} from "./validate.js";
+// 字段 DSL（plugins.md §11.5 子集）：归约为 zod，作者不必直接写 zod
+export { s, isField, toZod } from "./schema.js";
+export type { Field, InferSchema, SchemaLike } from "./schema.js";
 
 export { z } from "./zod.js";
 
@@ -125,6 +118,3 @@ export {
   withRetry,
 } from "./utils/index.js";
 export type { KvCounter, KvCursor, KvTtlCache, WithRetryOptions } from "./utils/index.js";
-
-// 协议常量（作者偶尔需要，如手写集成测试）
-export { MAX_FRAME_BYTES, MAX_JSON_DEPTH, PLUGIN_API_VERSION, PROTOCOL_VERSION } from "./protocol.js";

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { action, definePlugin, query, z } from "../src/index.js";
+import { action, definePlugin, query, s, z } from "../src/index.js";
 
 /**
  * 类型层断言：`@ts-expect-error` 由 `tsc -p tsconfig.test.json` 校验，
@@ -56,5 +56,45 @@ describe("类型安全", () => {
       .run(() => ({ text: 1 }));
     // 运行期仍会由 schema 兜底
     expect(bad.kind).toBe("query");
+  });
+
+  it("字段 DSL 推导 input / output 类型", () => {
+    const op = query("dsl-typed")
+      .input(s.object({ name: s.string(), count: s.integer() }))
+      .output(s.object({ ok: s.boolean() }))
+      .run((input) => {
+        const name: string = input.name;
+        const count: number = input.count;
+        void name;
+        void count;
+        // @ts-expect-error 字段是 string
+        const wrong: number = input.name;
+        void wrong;
+        return { ok: true };
+      });
+    expect(op.kind).toBe("query");
+  });
+
+  it("config 类型推导到 ctx.config，并支持默认值", () => {
+    const plugin = definePlugin({
+      id: "dsl-config",
+      title: "DSL 配置",
+      version: "1.0.0",
+      license: "MIT",
+      capabilities: ["server:read"],
+      config: s.object({ greeting: s.string({ default: "hi" }), limit: s.integer(), note: s.optional(s.string()) }),
+      onStart(ctx) {
+        const greeting: string = ctx.config.greeting;
+        const limit: number = ctx.config.limit;
+        const note: string | undefined = ctx.config.note;
+        void greeting;
+        void limit;
+        void note;
+        // @ts-expect-error 推导为 string
+        const wrong: number = ctx.config.greeting;
+        void wrong;
+      },
+    });
+    expect(plugin.definition.id).toBe("dsl-config");
   });
 });

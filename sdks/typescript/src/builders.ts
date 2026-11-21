@@ -8,6 +8,7 @@
 import { z } from "zod";
 
 import type { OpSpec, PluginContext, Capability, StreamChunks } from "./define.js";
+import { annotate, toZod, type Field, type InferSchema, type SchemaLike } from "./schema.js";
 
 /** 风险等级（plugins.md §8.3） */
 export type OpRisk = "read" | "mutating" | "destructive";
@@ -24,8 +25,8 @@ interface Draft {
   description?: string;
   risk?: OpRisk;
   display?: unknown;
-  input: z.ZodType;
-  output: z.ZodType;
+  input: SchemaLike;
+  output: SchemaLike;
   timeoutMs?: number;
   pagination?: unknown;
   run?: unknown;
@@ -36,13 +37,13 @@ const InputKey: unique symbol = Symbol("input");
 const OutputKey: unique symbol = Symbol("output");
 const CapKey: unique symbol = Symbol("capabilities");
 
-type WithInput<B, S extends z.ZodType> = B & { readonly [InputKey]: S };
-type WithOutput<B, S extends z.ZodType> = B & { readonly [OutputKey]: S };
-type InputOf<B> = B extends { readonly [InputKey]: infer S extends z.ZodType } ? S : z.ZodType;
-type OutputOf<B> = B extends { readonly [OutputKey]: infer S extends z.ZodType } ? S : z.ZodType;
+type WithInput<B, S extends SchemaLike> = B & { readonly [InputKey]: S };
+type WithOutput<B, S extends SchemaLike> = B & { readonly [OutputKey]: S };
+type InputOf<B> = B extends { readonly [InputKey]: infer S extends SchemaLike } ? S : SchemaLike;
+type OutputOf<B> = B extends { readonly [OutputKey]: infer S extends SchemaLike } ? S : SchemaLike;
 type CapOf<B> = B extends { readonly [CapKey]: infer C extends readonly Capability[] } ? C : readonly Capability[];
 
-abstract class BaseOpBuilder<K extends OpKind, I extends z.ZodType, O extends z.ZodType, R> {
+abstract class BaseOpBuilder<K extends OpKind, I extends SchemaLike, O extends SchemaLike, R> {
   protected readonly draft: Draft;
 
   protected constructor(id: string, kind: K) {
@@ -72,14 +73,14 @@ abstract class BaseOpBuilder<K extends OpKind, I extends z.ZodType, O extends z.
     return this;
   }
 
-  /** 输入 schema */
-  public input<S extends z.ZodType>(schema: S): this & { readonly [InputKey]: S } {
+  /** 输入 schema（字段 DSL 或 zod） */
+  public input<S extends SchemaLike>(schema: S): this & { readonly [InputKey]: S } {
     this.draft.input = schema;
     return this as unknown as this & { readonly [InputKey]: S };
   }
 
-  /** 输出 schema */
-  public output<S extends z.ZodType>(schema: S): this & { readonly [OutputKey]: S } {
+  /** 输出 schema（字段 DSL 或 zod） */
+  public output<S extends SchemaLike>(schema: S): this & { readonly [OutputKey]: S } {
     this.draft.output = schema;
     return this as unknown as this & { readonly [OutputKey]: S };
   }
@@ -115,7 +116,7 @@ abstract class BaseOpBuilder<K extends OpKind, I extends z.ZodType, O extends z.
 }
 
 /** 查询型 op builder */
-export class QueryBuilder<I extends z.ZodType = z.ZodType, O extends z.ZodType = z.ZodType> extends BaseOpBuilder<"query", I, O, { query: true }> {
+export class QueryBuilder<I extends SchemaLike = SchemaLike, O extends SchemaLike = SchemaLike> extends BaseOpBuilder<"query", I, O, { query: true }> {
   private constructor(id: string) {
     super(id, "query");
     this.draft.risk = "read";
@@ -128,7 +129,7 @@ export class QueryBuilder<I extends z.ZodType = z.ZodType, O extends z.ZodType =
   /** 处理函数：输入已校验，返回值需与 output schema 一致 */
   public run<B extends this>(
     this: B,
-    fn: (input: z.output<InputOf<B>>, ctx: PluginContext<CapOf<B>>) => Promise<z.output<OutputOf<B>>> | z.output<OutputOf<B>>,
+    fn: (input: InferSchema<InputOf<B>>, ctx: PluginContext<CapOf<B>>) => Promise<InferSchema<OutputOf<B>>> | InferSchema<OutputOf<B>>,
   ): OpSpec<InputOf<B>, OutputOf<B>> {
     this.draft.run = fn;
     return this.build();
@@ -140,7 +141,7 @@ export class QueryBuilder<I extends z.ZodType = z.ZodType, O extends z.ZodType =
 }
 
 /** 动作型 op builder */
-export class ActionBuilder<I extends z.ZodType = z.ZodType, O extends z.ZodType = z.ZodType> extends BaseOpBuilder<"action", I, O, { action: true }> {
+export class ActionBuilder<I extends SchemaLike = SchemaLike, O extends SchemaLike = SchemaLike> extends BaseOpBuilder<"action", I, O, { action: true }> {
   private constructor(id: string) {
     super(id, "action");
     this.draft.risk = "mutating";
@@ -152,7 +153,7 @@ export class ActionBuilder<I extends z.ZodType = z.ZodType, O extends z.ZodType 
 
   public run<B extends this>(
     this: B,
-    fn: (input: z.output<InputOf<B>>, ctx: PluginContext<CapOf<B>>) => Promise<z.output<OutputOf<B>>> | z.output<OutputOf<B>>,
+    fn: (input: InferSchema<InputOf<B>>, ctx: PluginContext<CapOf<B>>) => Promise<InferSchema<OutputOf<B>>> | InferSchema<OutputOf<B>>,
   ): OpSpec<InputOf<B>, OutputOf<B>> {
     this.draft.run = fn;
     return this.build();
@@ -164,7 +165,7 @@ export class ActionBuilder<I extends z.ZodType = z.ZodType, O extends z.ZodType 
 }
 
 /** 流式 op builder：run 返回分块迭代器 */
-export class StreamBuilder<I extends z.ZodType = z.ZodType, O extends z.ZodType = z.ZodType> extends BaseOpBuilder<"stream", I, O, { stream: true }> {
+export class StreamBuilder<I extends SchemaLike = SchemaLike, O extends SchemaLike = SchemaLike> extends BaseOpBuilder<"stream", I, O, { stream: true }> {
   private constructor(id: string) {
     super(id, "stream");
     this.draft.risk = "read";
@@ -177,7 +178,7 @@ export class StreamBuilder<I extends z.ZodType = z.ZodType, O extends z.ZodType 
   /** 处理函数返回同步或异步分块迭代器；SDK 负责 stream 帧与 seq */
   public run<B extends this>(
     this: B,
-    fn: (input: z.output<InputOf<B>>, ctx: PluginContext<CapOf<B>>) => StreamChunks<z.output<OutputOf<B>>>,
+    fn: (input: InferSchema<InputOf<B>>, ctx: PluginContext<CapOf<B>>) => StreamChunks<InferSchema<OutputOf<B>>>,
   ): OpSpec<InputOf<B>, OutputOf<B>> {
     this.draft.run = fn;
     return this.build();
@@ -189,17 +190,17 @@ export class StreamBuilder<I extends z.ZodType = z.ZodType, O extends z.ZodType 
 }
 
 /** 工厂：查询 */
-export function query<I extends z.ZodType, O extends z.ZodType = z.ZodType>(id: string): QueryBuilder<I, O> {
+export function query<I extends SchemaLike, O extends SchemaLike = SchemaLike>(id: string): QueryBuilder<I, O> {
   return QueryBuilder.of(id) as QueryBuilder<I, O>;
 }
 
 /** 工厂：动作 */
-export function action<I extends z.ZodType, O extends z.ZodType = z.ZodType>(id: string): ActionBuilder<I, O> {
+export function action<I extends SchemaLike, O extends SchemaLike = SchemaLike>(id: string): ActionBuilder<I, O> {
   return ActionBuilder.of(id) as ActionBuilder<I, O>;
 }
 
 /** 工厂：流 */
-export function stream<I extends z.ZodType, O extends z.ZodType = z.ZodType>(id: string): StreamBuilder<I, O> {
+export function stream<I extends SchemaLike, O extends SchemaLike = SchemaLike>(id: string): StreamBuilder<I, O> {
   return StreamBuilder.of(id) as StreamBuilder<I, O>;
 }
 
@@ -336,19 +337,28 @@ function stripAnsi(text: string): string {
 // ---------------------------------------------------------------------------
 
 /** 可选的 title 包装：给 schema 加展示名（→ x-mcsup-label） */
-export function labeled<T extends z.ZodType>(schema: T, label: string): T {
-  return schema.meta({ label }) as T;
+export function labeled<S extends SchemaLike>(schema: S, label: string): S {
+  return annotate(schema, { label });
 }
 
 /** 标记为密钥输入（→ x-mcsup-secret） */
-export function secretInput<T extends z.ZodType>(schema: T): T {
-  return schema.meta({ secret: true }) as T;
+export function secretInput<S extends SchemaLike>(schema: S): S {
+  return annotate(schema, { secret: true });
 }
 
 /** 统一分页输入片段：在已有对象 schema 上追加 `cursor` / `limit` */
-export function pagedInput(base: z.ZodObject<z.ZodRawShape>): z.ZodType {
-  return base.extend({
-    cursor: z.number().int().optional(),
-    limit: z.number().int().min(1).max(500).optional(),
-  });
+export function pagedInput<S extends SchemaLike>(
+  base: S,
+): Field<InferSchema<S> & { readonly cursor?: number; readonly limit?: number }> {
+  const zodBase = toZod(base);
+  if (!(zodBase instanceof z.ZodObject)) {
+    throw new Error("pagedInput requires an object schema");
+  }
+  return {
+    kind: "field",
+    schema: zodBase.extend({
+      cursor: z.number().int().optional(),
+      limit: z.number().int().min(1).max(500).optional(),
+    }),
+  };
 }

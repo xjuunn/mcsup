@@ -1,6 +1,6 @@
 # mcsup-plugin（TypeScript 插件 SDK）
 
-MCSUP 平台插件的 TypeScript SDK。插件作者只需声明一个 `PluginDefinition`，
+MCSUP 平台插件的 TypeScript SDK。插件作者只需 `export default definePlugin({...})`，
 SDK 负责协议帧、握手、分派、流、配置热更新、心跳与退出。
 
 - 规范：`docs/plugins.md`（协议、能力、manifest、descriptor）
@@ -11,7 +11,7 @@ SDK 负责协议帧、握手、分派、流、配置热更新、心跳与退出�
 ## 最小插件
 
 ```ts
-import { definePlugin, run, z } from "mcsup-plugin";
+import { definePlugin, query, s } from "mcsup-plugin";
 
 export default definePlugin({
   id: "hello-world",
@@ -19,29 +19,57 @@ export default definePlugin({
   version: "0.1.0",
   license: "MIT",
   capabilities: ["server:read"],
-  config: z.object({ greeting: z.string().default("hi") }),
+  config: s.object({ greeting: s.string({ default: "hi" }) }),
   queries: {
-    servers: {
-      kind: "query",
-      input: z.object({}),
-      output: z.array(z.string()),
-      run: async (_input, ctx) => (await ctx["server:read"].servers.list()).map((s) => s.name),
-    },
+    servers: query("servers")
+      .output(s.object({ items: s.array(s.string()), next: s.optional(s.string()) }))
+      .pagination({ cursorField: "next", limitField: "limit" })
+      .run(async (_input, ctx) => ({
+        items: (await ctx["server:read"].servers.list()).map((server) => server.name),
+      })),
   },
 });
-
-process.exit(await run((await import("./plugin.js")).default));
 ```
 
-入口文件必须调用 `run(...)`；构建产物由 `mcsup-plugin build` 打包。
+入口文件只需导出定义，**不用**写 `run()` 样板：`mcsup-plugin build` 会生成
+`bin/entry.mjs`，由它导入默认导出并交给 `run()`。若作者自己写了
+`process.exit(await run(plugin))`，`run()` 幂等，不会连接两次。
+
+## 字段 DSL（不必直接写 zod）
+
+`s.*` 覆盖 `docs/plugins.md` §11.5 允许的 schema 子集，SDK 内部归约为 zod，
+因此仍然同时得到：编译期类型、运行期校验、descriptor 的 JSON Schema。
+
+| 构造 | 产出 |
+| --- | --- |
+| `s.string({ min, max, pattern, default, label, secret, describe })` | 字符串 |
+| `s.integer({ min, max, default })` / `s.number(...)` | 整数 / 浮点 |
+| `s.boolean({ default })` | 布尔 |
+| `s.enum(["a", "b"], { default })` | 字符串枚举 |
+| `s.datetime({ offset })` / `s.uuid()` / `s.url()` | 标准 JSON Schema `format` |
+| `s.array(items, { minItems, maxItems })` | 数组 |
+| `s.object(shape)` | 对象；值可为 `undefined` 的键成为非必填 |
+| `s.optional(schema)` | 可选字段 |
+
+```ts
+config: s.object({
+  token: s.string({ min: 1, secret: true, label: "Bot Token" }),
+  channels: s.array(s.string(), { label: "频道" }),
+}),
+```
+
+超出子集时直接用 zod（逃生口）：`input` / `output` / `config` 接受
+`Field<T> | z.ZodType`，两者可以混用，例如 `s.object({ raw: z.string().email() })`。
+`z` 仍是 peer dependency。
 
 ## 公开面
 
 | 导出 | 作用 |
 | --- | --- |
 | `definePlugin({...})` | 唯一的插件装配点 |
-| `run(plugin)` | 连接宿主、握手、分派、退出 |
-| `z` | 重新导出的 zod（peer dependency） |
+| `s` | 字段 DSL（上方） |
+| `z` | 重新导出的 zod（peer dependency，逃生口） |
+| `run(plugin)` | 连接宿主、握手、分派、退出（构建产物已自动调用） |
 | `PluginContext` | 能力客户端，形状由 `capabilities` 推导 |
 | `PluginError` | 带 `code` / `category` / `retryable` 的错误 |
 | `testing.createMockHost()` | 内存双工宿主，不开 socket |
@@ -49,6 +77,9 @@ process.exit(await run((await import("./plugin.js")).default));
 Builder（`query` / `action` / `stream` / `op` / `lineFilter`）、Hooks
 （`useConsoleTail` / `useRetry` / `useKvCache` / `useEvents`）与预设属次版本
 可选 API，用法见 `docs/sdk-design.md` §4。
+
+内部实现（`Session`、`ExitCode`、descriptor 校验常量、订阅归约函数）不从包入口
+导出；测试需要时从具体模块导入。
 
 ## 工具集
 
@@ -104,12 +135,21 @@ const plugin = definePlugin({
 运行期只挂载宿主实际授予的字段；声明了但未被授予时，访问会抛出
 `PluginError("denied")`，而不是静默返回 `undefined`。
 
+`config` 的类型同样来自 schema，`onStart` / `onConfigChange` / `run` 里都能直接用：
+
+```ts
+config: s.object({ greeting: s.string({ default: "hi" }) }),
+onStart(ctx) {
+  ctx.log.info(ctx.config.greeting); // string
+},
+```
+
 Builder 写法用 `.capabilities([...])` 收紧处理函数里的 `ctx`：
 
 ```ts
 const status = query("status")
   .capabilities(["server:read"])
-  .output(z.object({ state: z.string() }))
+  .output(s.object({ state: s.string() }))
   .run(async (_input, ctx) => {
     const servers = await ctx["server:read"].servers.list();
     return { state: servers[0]?.status ?? "unknown" };
@@ -135,11 +175,13 @@ npx mcsup-plugin build --out build
 build/
 ├── manifest.json      # plugins.md §10
 ├── descriptor.json    # plugins.md §11（归一化后，紧凑 JSON + 换行）
+├── bin/entry.mjs      # 固定名入口包装：导入默认导出并调用 run()
 ├── bin/run.sh         # 平台启动器（Windows 为 bin/run.cmd）
 └── dist/...           # tsc 编译产物
 ```
 
-`manifest.entry.cmd` 指向 `bin/run.sh`；宿主拉起时追加
+`manifest.entry.cmd` 指向 `bin/run.sh`，`platforms` 给出各平台启动器；
+Windows 上宿主经 `cmd.exe /C` 执行 `bin/run.cmd`。宿主拉起时追加
 `--endpoint ...` 并注入 `MCSUP_PLUGIN_TOKEN`。
 
 ## 测试
@@ -154,5 +196,5 @@ SDK 共用同一组行为用例。
 
 ## 版本
 
-SDK 主版本 == plugin API 主版本（`docs/plugins.md` §14.3）。`PLUGIN_API_VERSION`
-导出于本包，握手时由 SDK 自动填写。
+SDK 主版本 == plugin API 主版本（`docs/plugins.md` §14.3）。插件写不写 `api`
+都可以：省略时握手使用当前 SDK 版本，写了不一致的值会在 `definePlugin` 时报错。

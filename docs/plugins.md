@@ -1159,7 +1159,8 @@ Java 能力的帧方法：
 2. `version` 是合法 SemVer，且不是已安装版本（除非 `--force`）。
 3. `api` 等于宿主支持的主版本；高于宿主 → `unsupported_api`。
 4. `entry.cmd` 是相对路径，无 `..`、无绝对路径、无符号链接逃逸。
-5. `entry` 解析到当前平台后文件存在；Unix 校验可执行位，Windows 校验 `.exe`。
+5. `entry` 解析到当前平台后文件存在；Unix 校验可执行位，Windows 允许 `.exe`
+   （校验 PE 头 `MZ`）与 `.cmd` / `.bat`（宿主经 `cmd.exe /C` 启动）。
 6. `capabilities` 每项属于能力目录；未知能力 → 拒绝（不忽略）。
 7. `subscriptions` 每项属于事件目录；`console:line` 需要 `console:read`。
 8. `subscriptions` 非空时必须有 `events`。
@@ -1273,7 +1274,7 @@ descriptor 由 SDK 在构建时生成，与二进制一起打包。宿主只读�
 | `kind` | 是 | `query` / `action` / `stream` |
 | `title` | 是 | ≤ 64 字符，界面标题 |
 | `description` | 否 | ≤ 512 字符 |
-| `risk` | 是 | `read` / `mutating` / `destructive` |
+| `risk` | 是 | `read` / `mutating` / `destructive`；作者未声明时按 kind 取缺省：query / stream → `read`，action → `mutating`（有副作用的 op 不得缺省成只读） |
 | `display` | 是 | 见 11.3；缺省按 11.4 推断 |
 | `input` / `output` | 是 | schema 或 `$ref` |
 | `timeout_ms` | 否 | 1000..=300000，默认 30000 |
@@ -1695,12 +1696,20 @@ TypeScript：
 
 | 项 | 作用 |
 | --- | --- |
-| `definePlugin({...})` | 注册元数据 |
-| `z` | 重新导出的 zod（peer） |
+| `definePlugin({...})` | 注册元数据，入口只需 `export default` 它 |
+| `s` | 字段 DSL：`plugins.md` §11.5 子集，内部归约为 zod |
+| `z` | 重新导出的 zod（peer），超出子集的逃生口 |
+| `run(plugin)` | 连接、握手、帧循环、退出；构建产物自动调用 |
 | `PluginContext` | 能力客户端 |
 | `PluginError` | 带 `code` / `retryable` 的错误 |
 | `testing.createMockHost()` | 内存双工 |
 | `utils` | 纯函数工具（文本 / 时间 / 重试 / Minecraft 命令转义 / KV 包装），不含第三方平台客户端 |
+
+Builder 与 Hooks 是次版本可选 API（见 `sdk-design.md` §9），不算主版本承诺的
+最小面。`Session` / `ExitCode` / descriptor 校验常量属内部实现，不从包入口导出。
+
+`mcsup-plugin build` 生成固定名 `bin/entry.mjs`，由它导入插件默认导出并调用
+`run()`；作者不写启动样板，`run()` 幂等以兼容作者自行调用。
 
 `[禁止]` 在 SDK 里实现业务能力（内置 Telegram 客户端、内置 AI 客户端等）。
 SDK 只做协议、类型、生命周期。
@@ -2624,74 +2633,78 @@ fn main() -> mcsup_plugin_sdk::Exit {
 # 附录 D：最小 TypeScript 插件（SDK 形态）
 
 ```ts
-import { definePlugin, z } from "mcsup-plugin";
+import { action, definePlugin, query, s } from "mcsup-plugin";
 
 export default definePlugin({
   id: "chat-bridge",
+  title: "聊天桥",
+  version: "0.1.0",
+  license: "MIT",
   api: 1,
   provides: ["chat.publish@1"],
+  capabilities: ["console:read", "console:write", "events"],
+  subscriptions: ["chat:message"],
 
-  config: z.object({
-    token: z.string().min(1).meta({ secret: true, label: "Bot Token" }),
-    channels: z.array(z.string()).default([]).meta({ label: "频道" }),
+  config: s.object({
+    token: s.string({ min: 1, secret: true, label: "Bot Token" }),
+    channels: s.array(s.string(), { label: "频道" }),
   }),
 
   queries: {
-    history: {
-      title: "聊天记录",
-      risk: "read",
-      display: { type: "chat", send: "send", stream: "messages" },
-      input: z.object({
-        channel: z.string(),
-        cursor: z.string().optional(),
-        limit: z.number().int().max(100).default(50),
-      }),
-      output: z.object({
-        items: z.array(z.object({
-          id: z.string(),
-          at: z.string().datetime(),
-          from: z.string(),
-          text: z.string().meta({ format: "minecraft-text" }),
-          direction: z.enum(["in", "out"]),
+    history: query("history")
+      .title("聊天记录")
+      .input(s.object({
+        channel: s.string(),
+        cursor: s.optional(s.integer()),
+        limit: s.integer({ max: 100, default: 50 }),
+      }))
+      .output(s.object({
+        items: s.array(s.object({
+          id: s.string(),
+          at: s.datetime(),
+          from: s.string(),
+          text: s.string({ format: "minecraft-text" }),
+          direction: s.enum(["in", "out"]),
         })),
-        next: z.string().optional(),
+        next: s.optional(s.integer()),
+      }))
+      .pagination({ cursorField: "next", limitField: "limit" })
+      .run(async (input, ctx) => {
+        const page = await ctx["console:read"].tail(input.channel, input.cursor ?? null, input.limit);
+        return {
+          items: page.lines.map((text, index) => ({
+            id: `${page.cursor}-${index}`,
+            at: new Date().toISOString(),
+            from: "console",
+            text,
+            direction: "in" as const,
+          })),
+          next: page.cursor,
+        };
       }),
-    },
   },
 
   actions: {
-    send: {
-      title: "发送消息",
-      risk: "mutating",
-      input: z.object({
-        channel: z.string(),
-        text: z.string().min(1).max(4000),
+    send: action("send")
+      .title("发送消息")
+      .input(s.object({ text: s.string({ min: 1, max: 4000 }) }))
+      .output(s.object({ ok: s.boolean() }))
+      .run(async (input, ctx) => {
+        await ctx["console:write"].sendLine("survival", `say ${input.text}`);
+        return { ok: true };
       }),
-      output: z.object({ ok: z.boolean(), messageId: z.string() }),
-    },
   },
 
-  streams: {
-    messages: {
-      title: "实时消息",
-      output: z.object({
-        channel: z.string(),
-        from: z.string(),
-        text: z.string(),
-        at: z.string().datetime(),
-      }),
-    },
+  onEvent(data, ctx) {
+    ctx.log.info(`event: ${JSON.stringify(data)}`);
   },
-
-  async onStart(ctx) {
-    ctx.on("chat:message", (m) => {
-      ctx.streams.messages.push({ ...m, at: new Date().toISOString() });
-    });
-  },
-
-  async onStop(_ctx) { /* 断开外部连接 */ },
 });
 ```
+
+作者只写这些。`s.*` 覆盖 §11.5 的 schema 子集，SDK 内部归约为 zod，仍同时得到
+编译期类型、运行期校验与构造期 JSON Schema；超出子集时可直接写 `z`（逃生口），
+两者可混用。启动样板也不需要写：`mcsup-plugin build` 生成 `bin/entry.mjs`，导入
+默认导出后调用 `run()`。
 
 `mcsup-plugin build` 做三件事：`tsc` 编译、运行 `--mcsup-dump-descriptor` 取
 descriptor、打包 zip。作者不接触端点、帧、路由与界面。

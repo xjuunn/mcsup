@@ -92,9 +92,11 @@ impl EntrySpec {
     /// 校验入口文件在产物目录里真实可用
     ///
     /// 规则（`docs/plugins.md` 10.3 第 5 条）：解析到当前平台的 `cmd` 必须
-    /// 指向一个存在的普通文件；Unix 校验可执行位（`0o111` 任一位），Windows
-    /// 校验 `.exe` 扩展名与 PE 头（`MZ`）——Windows 上「可执行」由扩展名与
-    /// 头部决定， mode 位不存在。
+    /// 指向一个存在的普通文件；Unix 校验可执行位（`0o111` 任一位），
+    /// Windows 校验扩展名：原生插件用 `.exe` 并检查 PE 头（`MZ`），
+    /// 脚本型插件（如 Node SDK 产物）允许 `.cmd` / `.bat`，由宿主经
+    /// `cmd.exe /C` 启动——Windows 上「可执行」由扩展名与头部决定，mode
+    /// 位不存在。
     ///
     /// # Errors
     ///
@@ -131,30 +133,40 @@ impl EntrySpec {
         }
         #[cfg(windows)]
         {
-            if !path
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
-            {
+            let has_ext = |expected: &str| {
+                path.extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case(expected))
+            };
+            if has_ext("cmd") || has_ext("bat") {
+                // 脚本启动器：内容由 `cmd.exe` 解释，没有 PE 头可校验
+            } else if has_ext("exe") {
+                // PE 头：文件前两字节必须是 `MZ`。损坏或改名的文件在这里拦下。
+                let mut header = [0_u8; 2];
+                let read = std::fs::File::open(&path)
+                    .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut header));
+                match read {
+                    Ok(()) if header == *b"MZ" => {}
+                    Ok(()) => {
+                        return Err(ManifestError::InvalidEntry {
+                            reason: format!(
+                                "entry {} does not have a PE header (MZ)",
+                                path.display()
+                            ),
+                        });
+                    }
+                    Err(err) => {
+                        return Err(ManifestError::InvalidEntry {
+                            reason: format!("entry {} is unreadable: {err}", path.display()),
+                        });
+                    }
+                }
+            } else {
                 return Err(ManifestError::InvalidEntry {
-                    reason: format!("entry {} must have an .exe extension", path.display()),
+                    reason: format!(
+                        "entry {} must have an .exe, .cmd or .bat extension",
+                        path.display()
+                    ),
                 });
-            }
-            // PE 头：文件前两字节必须是 `MZ`。损坏或改名的文件在这里拦下。
-            let mut header = [0_u8; 2];
-            let read = std::fs::File::open(&path)
-                .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut header));
-            match read {
-                Ok(()) if header == *b"MZ" => {}
-                Ok(()) => {
-                    return Err(ManifestError::InvalidEntry {
-                        reason: format!("entry {} does not have a PE header (MZ)", path.display()),
-                    });
-                }
-                Err(err) => {
-                    return Err(ManifestError::InvalidEntry {
-                        reason: format!("entry {} is unreadable: {err}", path.display()),
-                    });
-                }
             }
         }
         #[cfg(not(any(unix, windows)))]
@@ -828,7 +840,7 @@ mod tests {
                 .expect("ok on unix");
         }
 
-        // Windows：扩展名与 PE 头都必须满足
+        // Windows：.exe 需 PE 头，.cmd/.bat 放行
         #[cfg(windows)]
         {
             // 扩展名不是 exe
@@ -854,6 +866,29 @@ mod tests {
             entry
                 .check_entry_file(dir.path(), "win32-x64")
                 .expect("valid exe");
+
+            // 脚本型插件：.cmd / .bat 不需要 PE 头
+            let scripted = EntrySpec {
+                kind: "process".to_owned(),
+                cmd: "bin/run.cmd".to_owned(),
+                platforms: BTreeMap::from([("win32-x64".to_owned(), "bin/run.cmd".to_owned())]),
+            };
+            std::fs::write(
+                dir.path().join("bin/run.cmd"),
+                b"@echo off\r\nnode entry.mjs %*\r\n",
+            )
+            .expect("cmd");
+            scripted
+                .check_entry_file(dir.path(), "win32-x64")
+                .expect("valid cmd");
+            std::fs::write(dir.path().join("bin/run.bat"), b"@echo off\r\n").expect("bat");
+            let bat = EntrySpec {
+                kind: "process".to_owned(),
+                cmd: "bin/run.bat".to_owned(),
+                platforms: BTreeMap::new(),
+            };
+            bat.check_entry_file(dir.path(), "win32-x64")
+                .expect("valid bat");
         }
     }
 

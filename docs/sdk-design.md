@@ -233,14 +233,20 @@ export default chatBridgePreset({
 越权调用在编译期失败，而不是等宿主拒绝。第三方 Hook 的 `ctx` 参数同样受此
 约束，非官方 hook 无法要求未声明的能力。
 
-## 6.2 zod 是唯一 schema 层
+## 6.2 内核唯一 schema 层，DSL 是归约适配器
 
-- config 与 op 的输入输出只写一遍 zod，同时得到：编译期类型、运行时校验、
+- config 与 op 的输入输出只声明一遍，同时得到：编译期类型、运行时校验、
   descriptor 的 JSON schema（构建时生成，`plugins.md` §14.4）
-- `[禁止]` 绕过 zod 手写类型再单独手写 schema
+- 承载 schema 的是 zod；`s.*` 是覆盖 `plugins.md` §11.5 子集的归约适配器，
+  产物仍是 zod schema，因此校验与 descriptor 生成只有一条路径，不为 DSL
+  另写第二套
+- `[禁止]` 绕过 schema 手写类型再单独手写 schema
 - `[规范]` default 写齐后字段类型非空；热更新用同一 schema 校验，编译期与
   运行时零漂移
-- 密钥、展示标签等扩展语义走 zod `.meta()`（对齐附录 D 的 `secret` / `label`）
+- 超出 §11.5 子集时允许直接写 zod（逃生口）；`[禁止]` 在 DSL 里为超集需求
+  加旁路，否则子集之外会出现两种实现
+- 密钥、展示标签等扩展语义走 schema 的 `.meta()`（DSL 的 `secret` / `label`
+  选项是它的语法糖）
 
 ## 6.3 推导优先
 

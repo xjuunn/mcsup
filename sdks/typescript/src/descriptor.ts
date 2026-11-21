@@ -9,7 +9,8 @@
 import { z } from "zod";
 
 import { PLUGIN_API_VERSION, PROTOCOL_VERSION } from "./protocol.js";
-import { subscriptionKinds, type Capability, type PluginDefinition } from "./define.js";
+import { subscriptionKinds, type Capability, type PluginContext, type PluginDefinition } from "./define.js";
+import { toZod, type SchemaLike } from "./schema.js";
 import {
   DEFAULT_OP_TIMEOUT_MS,
   DescriptorError,
@@ -64,7 +65,11 @@ const ID_PATTERN = /^[a-z][a-z0-9-]{1,63}$/;
  *
  * @throws {Error} id / version / capabilities 不合法
  */
-export function buildManifest<C extends readonly Capability[]>(def: PluginDefinition<C>, entryCmd: string): Manifest {
+export function buildManifest<
+  C extends readonly Capability[],
+  Id extends string,
+  Cfg extends SchemaLike,
+>(def: PluginDefinition<C, Id, Cfg>, entryCmd: string): Manifest {
   if (!ID_PATTERN.test(def.id)) {
     throw new Error(`manifest.id ${def.id} must match ${ID_PATTERN.source}`);
   }
@@ -72,8 +77,8 @@ export function buildManifest<C extends readonly Capability[]>(def: PluginDefini
     throw new Error(`manifest.version ${def.version} must be semver`);
   }
   const capabilities = def.capabilities as readonly string[];
-  if (capabilities.length === 0 || capabilities.length > 16) {
-    throw new Error("manifest.capabilities must contain 1..16 items");
+  if (capabilities.length > 16) {
+    throw new Error("manifest.capabilities must contain at most 16 items");
   }
   if (new Set(capabilities).size !== capabilities.length) {
     throw new Error("manifest.capabilities must be deduplicated");
@@ -437,12 +442,16 @@ function opKinds(resolved: readonly ResolvedOp[]): Map<string, string> {
  *
  * @throws {DescriptorError} 超出自集 / 超限 / 引用不存在 / 输出方向出现 secret
  */
-export function buildDescriptor<C extends readonly Capability[]>(def: PluginDefinition<C>): Descriptor {
+export function buildDescriptor<
+  C extends readonly Capability[],
+  Id extends string,
+  Cfg extends SchemaLike,
+>(def: PluginDefinition<C, Id, Cfg>): Descriptor {
   const resolved = collectOps(def);
   const kinds = opKinds(resolved);
   const ops: DescriptorOp[] = [];
   const schemas: Record<string, JsonValue> = {
-    config: jsonSchemaOf(def.config, false, "config"),
+    config: jsonSchemaOf(toZod(def.config), false, "config"),
   };
   const seen = new Set<string>();
   for (const op of resolved) {
@@ -454,8 +463,8 @@ export function buildDescriptor<C extends readonly Capability[]>(def: PluginDefi
     seen.add(op.id);
     const inputName = schemaName(op.id, "in");
     const outputName = schemaName(op.id, "out");
-    schemas[inputName] = jsonSchemaOf(op.input, false, `${path}.input`);
-    const output = jsonSchemaOf(op.output, true, `${path}.output`);
+    schemas[inputName] = jsonSchemaOf(toZod(op.input), false, `${path}.input`);
+    const output = jsonSchemaOf(toZod(op.output), true, `${path}.output`);
     schemas[outputName] = output;
     const shape = schemaShape(output);
     const declaredType = validateDisplayObject(`${path}.display`, op.display);
@@ -506,7 +515,11 @@ export function serializeNormalized(value: unknown): string {
 }
 
 /** 收集定义中的全部 op（queries / actions / streams / 预构造片段） */
-export function collectOps<C extends readonly Capability[]>(def: PluginDefinition<C>): readonly ResolvedOp[] {
+export function collectOps<
+  C extends readonly Capability[],
+  Id extends string,
+  Cfg extends SchemaLike,
+>(def: PluginDefinition<C, Id, Cfg>): readonly ResolvedOp[] {
   const resolved: ResolvedOp[] = [];
   const push = (id: string, spec: OpSpecLike): void => {
     if (spec.kind === undefined) {
@@ -520,10 +533,11 @@ export function collectOps<C extends readonly Capability[]>(def: PluginDefinitio
       kind: spec.kind,
       title: spec.title ?? id,
       description: spec.description,
-      risk: spec.risk ?? "read",
+      // 默认 risk 按 kind 决定：query / stream 只读，action 有副作用
+      risk: spec.risk ?? defaultRisk(spec.kind),
       display: spec.display,
-      input: spec.input,
-      output: spec.output,
+      input: toZod(spec.input),
+      output: toZod(spec.output),
       timeoutMs: spec.timeoutMs,
       pagination: spec.pagination,
       run: spec.run,
@@ -539,6 +553,11 @@ export function collectOps<C extends readonly Capability[]>(def: PluginDefinitio
     push(id, spec);
   }
   return resolved;
+}
+
+/** 未声明 risk 时的默认值：有副作用的 action 不能默认成 `read`（§11.2） */
+function defaultRisk(kind: "query" | "action" | "stream"): "read" | "mutating" {
+  return kind === "action" ? "mutating" : "read";
 }
 
 /** 归约后的 op 描述（内部表示） */
@@ -557,7 +576,7 @@ export interface ResolvedOp {
 }
 
 /** op 处理函数签名 */
-export type OpRun = (input: unknown, ctx: unknown) => unknown;
+export type OpRun = (input: unknown, ctx: PluginContext) => unknown;
 
 /** 允许 Builder / 原生对象两种写法的结构子集 */
 export type OpSpecLike = Partial<ResolvedOp> & {

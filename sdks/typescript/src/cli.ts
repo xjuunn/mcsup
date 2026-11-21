@@ -3,16 +3,19 @@
  *
  * `mcsup-plugin build` 的执行顺序：
  *   1. tsc 把插件源码编译到 dist
- *   2. 用 node --mcsup-dump-descriptor 取归一化 descriptor
- *   3. 用 node --mcsup-dump-manifest 取 manifest（entry 由本工具写入）
- *   4. 生成平台启动器（bin/run.sh / bin/run.cmd）并写进 manifest.entry
+ *   2. 生成 `bin/entry.mjs`：导入编译产物默认导出并调用 `run()`
+ *   3. 用 node --mcsup-dump-descriptor 取归一化 descriptor
+ *   4. 用 node --mcsup-dump-manifest 取 manifest（entry 由本工具写入）
+ *   5. 生成平台启动器（bin/run.sh / bin/run.cmd）并写进 manifest.entry
  *
  * 产物目录布局（plugins.md §10 / §11）：
  *   <out>/manifest.json
  *   <out>/descriptor.json
  *   <out>/dist/...
  *   <out>/bin/run.sh, bin/run.cmd
- *   <out>/bin/<id>.mjs（插件入口的薄包装）
+ *   <out>/bin/entry.mjs（固定名：插件入口的薄包装，负责自动 run）
+ *
+ * 作者只需 `export default definePlugin({...})`，不必写 `run()` 样板。
  */
 
 import { createRequire } from "node:module";
@@ -30,6 +33,9 @@ interface BuildOptions {
   readonly descriptor: string;
   readonly manifest: string;
 }
+
+/** 启动器固定名：与插件 id 无关，manifest 里的路径不随 id 变化 */
+const ENTRY_WRAPPER = "entry.mjs";
 
 const HELP = `mcsup-plugin <command> [options]
 
@@ -103,7 +109,7 @@ function build(options: BuildOptions): void {
   const tsconfig = findTsconfig(options.cwd);
   process.stderr.write(`[build] 编译 ${tsconfig} ...\n`);
   try {
-    execFileSync(process.execPath, [requireBinPath("typescript", "bin/tsc"), "-p", tsconfig, "--outDir", path.join(options.outDir, "dist")], {
+    execFileSync(process.execPath, [requireBinPath("typescript", "bin/tsc"), "-p", tsconfig, "--outDir", path.join(options.outDir, "dist"), "--noEmit", "false"], {
       cwd: options.cwd,
       stdio: ["ignore", "inherit", "inherit"],
     });
@@ -115,16 +121,57 @@ function build(options: BuildOptions): void {
   if (!fs.existsSync(compiledEntry)) {
     fail(`compiled entry not found: ${compiledEntry}`);
   }
+  const wrapper = writeEntryWrapper(options);
 
-  const manifest = dumpManifest(options, compiledEntry);
-  manifest.entry = writeLaunchers(options, manifest.id as string);
+  // dump 也走启动器：导入插件模块再走 run() 的 dump 分支，
+  // 与真实启动同一条路径，避免两处入口行为分叉
+  const manifest = dumpManifest(options, wrapper);
+  manifest.entry = writeLaunchers(options);
   writeJson(path.join(options.outDir, options.manifest), manifest);
 
   process.stderr.write(`[build] 生成 descriptor ...\n`);
-  const descriptor = dumpDescriptor(options, compiledEntry);
+  const descriptor = dumpDescriptor(options, wrapper);
   writeJson(path.join(options.outDir, options.descriptor), descriptor);
 
   process.stderr.write(`[build] 完成：${options.outDir}\n`);
+}
+
+/**
+ * 写 `bin/entry.mjs`：导入编译产物，取默认导出交给 `run()`。
+ *
+ * `run()` 幂等，作者的模块若自己写过 `run(plugin)` 也不会跑第二次。
+ */
+function writeEntryWrapper(options: BuildOptions): string {
+  const binDir = path.join(options.outDir, "bin");
+  fs.mkdirSync(binDir, { recursive: true });
+  const wrapper = path.join(binDir, ENTRY_WRAPPER);
+  const target = `../dist/${relJs(options.entry).split(path.sep).join("/")}`;
+  fs.writeFileSync(wrapper, entryWrapperSource(target), "utf8");
+  return wrapper;
+}
+
+/** 启动器源码；单独导出便于断言生成内容 */
+export function entryWrapperSource(target: string): string {
+  return `#!/usr/bin/env node
+import { run } from "mcsup-plugin";
+
+let mod;
+try {
+  mod = await import(${JSON.stringify(target)});
+} catch (err) {
+  console.error("[mcsup-plugin] failed to load plugin module:", err);
+  process.exit(1);
+}
+
+// 默认导出优先；同时兼容具名导出 plugin
+const plugin = mod.default ?? mod.plugin;
+if (plugin === undefined) {
+  console.error("[mcsup-plugin] plugin module has no default export; use 'export default definePlugin({...})'");
+  process.exit(1);
+}
+
+process.exitCode = await run(plugin);
+`;
 }
 
 function dumpDescriptor(options: BuildOptions, entry: string): Record<string, unknown> {
@@ -179,28 +226,18 @@ interface ProcessEntry {
   readonly platforms?: Record<string, string>;
 }
 
-function writeLaunchers(options: BuildOptions, id: string): ProcessEntry {
+function writeLaunchers(options: BuildOptions): ProcessEntry {
   const binDir = path.join(options.outDir, "bin");
-  fs.mkdirSync(binDir, { recursive: true });
-  const wrapperName = `${id}.mjs`;
-  const wrapper = path.join(binDir, wrapperName);
-  // 包装：把 argv 原样交给编译产物，进程退出码即插件退出码
-  fs.writeFileSync(
-    wrapper,
-    `#!/usr/bin/env node\nimport(${JSON.stringify("../dist/" + relJs(options.entry).split(path.sep).join("/"))}).catch((err) => {\n  console.error(err);\n  process.exit(1);\n});\n`,
-    "utf8",
-  );
-
   const unix = path.join(binDir, "run.sh");
   fs.writeFileSync(
     unix,
-    `#!/bin/sh\nexec node "$(dirname "$0")/${wrapperName}" "$@"\n`,
+    `#!/bin/sh\nexec node "$(dirname "$0")/${ENTRY_WRAPPER}" "$@"\n`,
     "utf8",
   );
   fs.chmodSync(unix, 0o755);
 
   const win = path.join(binDir, "run.cmd");
-  fs.writeFileSync(win, `@echo off\r\nnode "%~dp0${wrapperName}" %*\r\n`, "utf8");
+  fs.writeFileSync(win, `@echo off\r\nnode "%~dp0${ENTRY_WRAPPER}" %*\r\n`, "utf8");
 
   return {
     type: "process",

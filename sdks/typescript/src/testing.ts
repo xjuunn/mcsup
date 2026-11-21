@@ -13,6 +13,7 @@ import {
   type RejectCode,
 } from "./protocol.js";
 import { type FrameChannel, Session } from "./runtime.js";
+import type { SchemaLike } from "./schema.js";
 
 /** 宿主默认限额（§5.4） */
 const DEFAULT_LIMITS = { inflight: 8, frame_bytes: 1024 * 1024, event_queue: 1024, log_lines_per_sec: 200 };
@@ -45,10 +46,10 @@ export class MockAssertionError extends Error {
 }
 
 /** 内存宿主 */
-export class MockHost<C extends readonly Capability[]> {
-  private readonly def: PluginDefinition<C>;
+export class MockHost<C extends readonly Capability[], Cfg extends SchemaLike = SchemaLike> {
+  private readonly def: PluginDefinition<C, string, Cfg>;
   private readonly options: MockHostOptions;
-  private readonly session: Session<C>;
+  private readonly session: Session<C, Cfg>;
 
   private readonly outbound: OutboundFrame[] = [];
   private readonly listeners = new Set<(frame: OutboundFrame) => void>();
@@ -61,7 +62,10 @@ export class MockHost<C extends readonly Capability[]> {
   /** 会话结束的退出码 */
   public exitCode: number | undefined;
 
-  public constructor(plugin: DefinedPlugin<C> | PluginDefinition<C>, options: MockHostOptions = {}) {
+  public constructor(
+    plugin: DefinedPlugin<C, string, Cfg> | PluginDefinition<C, string, Cfg>,
+    options: MockHostOptions = {},
+  ) {
     this.def = "definition" in plugin ? plugin.definition : plugin;
     this.options = options;
     const channel = this.makeChannel();
@@ -313,10 +317,10 @@ function tick(): Promise<void> {
 }
 
 /** 创建内存宿主 */
-export function createMockHost<C extends readonly Capability[]>(
-  plugin: DefinedPlugin<C> | PluginDefinition<C>,
+export function createMockHost<C extends readonly Capability[], Cfg extends SchemaLike = SchemaLike>(
+  plugin: DefinedPlugin<C, string, Cfg> | PluginDefinition<C, string, Cfg>,
   options: MockHostOptions = {},
-): MockHost<C> {
+): MockHost<C, Cfg> {
   return new MockHost(plugin, options);
 }
 

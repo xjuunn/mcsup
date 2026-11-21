@@ -7,6 +7,7 @@
 
 import type { Capability } from "./define.js";
 import { PluginError } from "./errors.js";
+import type { InferSchema, SchemaLike } from "./schema.js";
 
 /** 服务器名 */
 export type ServerName = string;
@@ -262,15 +263,16 @@ type SectionOf<C extends readonly Capability[]> = {
 }[C[number]];
 
 /**
- * 能力驱动的上下文（`CtxFor<capabilities>`）。
+ * 能力驱动的上下文（`CtxFor<capabilities, config>`）。
  *
- * 未声明的能力对应字段在类型上不存在；`log` 恒可用。
+ * 未声明的能力对应字段在类型上不存在；`log` 恒可用。`config` 的类型由
+ * `config` 字段的 schema 推导。
  */
-export type CtxFor<C extends readonly Capability[]> = {
+export type CtxFor<C extends readonly Capability[], Cfg extends SchemaLike = SchemaLike> = {
   [K in keyof CtxMembers as K extends C[number] ? K : never]: CtxMembers[K];
 } & {
   readonly log: LogClient;
-  readonly config: unknown;
+  readonly config: InferSchema<Cfg>;
   readonly sessionId: string;
   readonly limits: {
     readonly inflight: number;
@@ -357,11 +359,11 @@ interface JavaInstallOut { readonly runtime: JavaListOut["runtimes"][number] }
  *
  * 只挂载已声明的能力对应的字段；运行期与类型层保持一致。
  */
-export function createCtx<C extends readonly Capability[]>(
+export function createCtx<C extends readonly Capability[], Cfg extends SchemaLike = SchemaLike>(
   env: CtxEnvironment,
   capabilities: C,
   ungranted: readonly Capability[] = [],
-): CtxFor<C> {
+): CtxFor<C, Cfg> {
   const call = async (capability: string, method: string, input: unknown, timeoutMs?: number): Promise<unknown> =>
     await env.caller.call(capability, method, input, timeoutMs);
 
@@ -577,5 +579,5 @@ export function createCtx<C extends readonly Capability[]>(
       },
     });
   }
-  return ctx as CtxFor<C>;
+  return ctx as CtxFor<C, Cfg>;
 }

@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { ExitCode, definePlugin, query, z } from "../src/index.js";
-import { pumpStream, type FrameChannel } from "../src/runtime.js";
-import type { OutboundFrame } from "../src/protocol.js";
+import { definePlugin, query, z } from "../src/index.js";
+import { pumpStream, run, type FrameChannel } from "../src/runtime.js";
+import { ExitCode, type OutboundFrame } from "../src/protocol.js";
 import { createMockHost } from "../src/testing.js";
 import { chatBridge, counter, minimal, send } from "./fixtures.js";
 
@@ -446,5 +446,43 @@ describe("流式空闲超时（§5.4）", () => {
     });
     const last = frames[frames.length - 1];
     expect(last).toMatchObject({ type: "result", id: 7, ok: false, error: { code: "timeout" } });
+  });
+});
+
+describe("内联订阅 handler", () => {
+  it("第二个参数是 ctx，不是 EventMeta", async () => {
+    const seen: unknown[] = [];
+    const plugin = definePlugin({
+      id: "inline-sub",
+      title: "内联订阅",
+      version: "1.0.0",
+      license: "MIT",
+      capabilities: ["events"],
+      config: z.object({}),
+      subscriptions: [
+        {
+          kind: "chat:message",
+          handler: (data, ctx) => {
+            seen.push(ctx);
+            void data;
+          },
+        },
+      ],
+    });
+    const host = createMockHost(plugin);
+    await host.start();
+    await host.emit("chat:message", { text: "hi" });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toBe(host.ctx);
+  });
+});
+
+describe("run 幂等", () => {
+  it("重复调用复用同一会话，不会二次连接", async () => {
+    // 缺端点：第一次调用直接以协议错误收尾
+    const first = run(minimal, { argv: ["node", "entry.mjs"], env: {} });
+    const second = run(minimal, { argv: ["node", "entry.mjs"], env: {} });
+    expect(await second).toBe(ExitCode.Protocol);
+    expect(await first).toBe(ExitCode.Protocol);
   });
 });

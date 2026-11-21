@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
-import { platformEntries } from "../src/cli.js";
+import { entryWrapperSource, platformEntries } from "../src/cli.js";
 
 describe("平台启动器（§10.1）", () => {
   it("平台键与宿主 platform_key() 一致", () => {
@@ -36,5 +36,13 @@ describe("平台启动器（§10.1）", () => {
     } catch (err) {
       expect((err as { status?: number }).status).toBe(1);
     }
+  });
+
+  it("entry 包装器导入默认导出并交给 run，作者不必写启动样板", () => {
+    const source = entryWrapperSource("../dist/index.js");
+    expect(source).toContain('import { run } from "mcsup-plugin"');
+    expect(source).toContain('await import("../dist/index.js")');
+    expect(source).toContain("mod.default ?? mod.plugin");
+    expect(source).toContain("process.exitCode = await run(plugin)");
   });
 });
