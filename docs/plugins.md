@@ -1193,6 +1193,7 @@ descriptor 由 SDK 在构建时生成，与二进制一起打包。宿主只读�
   "setup": {
     "start": true,
     "fields": [
+      { "path": "platforms", "required": true, "choices": ["qq", "log"] },
       { "path": "qq.appId", "required": true, "label": "AppID" },
       { "path": "qq.clientSecret", "required": true, "secret": true },
       { "path": "qq.groups" }
@@ -1430,12 +1431,18 @@ JSON Schema 没有「密钥」「单位」的标准表达，统一用 `x-mcsup-`
 | `fields[].label` | 否 | ≤ 64 字符；省略时取 schema 的 `x-mcsup-label`，再退到 `path` |
 | `fields[].description` | 否 | ≤ 512 字符；省略时取 schema 的 `description` |
 | `fields[].default` | 否 | 提示默认值，必须符合该字段 schema；省略时取 schema 的 `default` |
+| `fields[].choices` | 否 | 数组，≤ 32 项、每项 1–64 字符且不重复；仅用于字符串列表字段，声明后渲染成多选框 |
 
 宿主行为：
 
 - 安装 / 升级后先列出待确认能力并**一次确认**（默认授予，`--yes` 视为同意）；
-- 全新安装（配置 revision 为 0）逐项询问全部 `setup.fields`，升级只补仍缺失
-  的字段，用户已填过的值不会被重问或覆盖；
+- 安装视为全新安装：**总是**逐项询问全部 `setup.fields`；因此重装也能核对并
+  更新 AppID 等必填项；
+- 已有值**不预填**到输入框（避免把旧值当成新输入一把回车提交），改在帮助行
+  提示「已设置；留空保持不变」；字符串列表会预勾选当前值；
+- 字符串列表声明了 `choices` 时渲染成多选框：`■` / `□` 表示勾选状态，
+  空格切换、回车确认；
+- 升级只补仍缺失的字段，用户已填过的值不会被重问或覆盖；
 - 字段值通过深度合并写入：只改目标键，同级配置与已存密钥保持不变；
 - 写入后 `enable` + `start`，已在运行则 `restart`；
 - 用户拒绝授权或必填项未填时，安装仍然成功，但跳过启动并在结果里报告
@@ -1961,8 +1968,9 @@ Windows 还需拒绝保留名（`CON`、`NUL` 等）与尾随点 / 空格。
   `mcsup plugin grant <id> <capability>` 逐项补齐。
 - `--yes`（脚本模式）视为同意；非交互且未给 `--yes` 时不静默授权。
 - 低风险能力在安装阶段已自动通过，不会出现在清单里。
-- 随后按 descriptor 的 `setup.fields` 逐项询问配置；密钥字段遮蔽输入，
-  按键不会被回显，也不会写进审计日志。
+- 随后按 descriptor 的 `setup.fields` 逐项询问配置；安装时询问全部字段
+  （已有值作默认），升级只补缺失项。密钥字段遮蔽输入，按键不会被回显，
+  也不会写进审计日志。
 
 ## 15.6 升级、回滚、卸载
 

@@ -61,6 +61,12 @@ pub const MAX_SETUP_LABEL_CHARS: usize = 64;
 /// setup 描述长度上限（字符）
 pub const MAX_SETUP_DESCRIPTION_CHARS: usize = 512;
 
+/// setup 列表字段的可选值上限（项）
+pub const MAX_SETUP_CHOICES: usize = 32;
+
+/// setup 单个可选值的长度上限（字符）
+pub const MAX_SETUP_CHOICE_CHARS: usize = 64;
+
 /// op 种类
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OpKind {
@@ -353,6 +359,9 @@ pub struct SetupField {
     /// 输入时遮蔽；只能用于 `string` 字段
     #[serde(default)]
     pub secret: bool,
+    /// 列表字段的可选值；声明后向导渲染成多选框
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choices: Option<Vec<String>>,
     /// 覆盖 schema 的 `x-mcsup-label`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
@@ -408,8 +417,11 @@ pub enum SetupKind {
     Number,
     /// 布尔
     Boolean,
-    /// 字符串列表
-    StringList,
+    /// 字符串列表；`choices` 非空时渲染成多选框
+    StringList {
+        /// 可选值，空表示自由输入
+        choices: Vec<String>,
+    },
 }
 
 impl SetupKind {
@@ -440,7 +452,9 @@ impl SetupKind {
                     .and_then(serde_json::Value::as_str)
                     == Some("string") =>
             {
-                Some(Self::StringList)
+                Some(Self::StringList {
+                    choices: Vec::new(),
+                })
             }
             _ => None,
         }
@@ -761,6 +775,17 @@ fn resolve_setup_field(
             path: path.to_owned(),
         });
     }
+    let kind = match (kind, field.choices.as_ref()) {
+        (SetupKind::StringList { .. }, choices) => SetupKind::StringList {
+            choices: resolve_setup_choices(path, choices)?,
+        },
+        (_, Some(_)) => {
+            return Err(DescriptorError::SetupChoicesNotList {
+                path: path.to_owned(),
+            });
+        }
+        (kind, None) => kind,
+    };
     let label = field
         .label
         .clone()
@@ -810,6 +835,38 @@ fn resolve_setup_field(
         kind,
         schema: schema.clone(),
     })
+}
+
+/// 校验列表字段的可选值：非空、去重、长度受限
+fn resolve_setup_choices(
+    path: &str,
+    choices: Option<&Vec<String>>,
+) -> Result<Vec<String>, DescriptorError> {
+    let Some(choices) = choices else {
+        return Ok(Vec::new());
+    };
+    if choices.len() > MAX_SETUP_CHOICES {
+        return Err(DescriptorError::InvalidSetupChoices {
+            path: path.to_owned(),
+            reason: format!("at most {MAX_SETUP_CHOICES} choices are allowed"),
+        });
+    }
+    let mut seen = BTreeSet::new();
+    for choice in choices {
+        if choice.trim().is_empty() || choice.chars().count() > MAX_SETUP_CHOICE_CHARS {
+            return Err(DescriptorError::InvalidSetupChoices {
+                path: path.to_owned(),
+                reason: format!("each choice must be 1..={MAX_SETUP_CHOICE_CHARS} characters"),
+            });
+        }
+        if !seen.insert(choice.as_str()) {
+            return Err(DescriptorError::InvalidSetupChoices {
+                path: path.to_owned(),
+                reason: format!("duplicate choice: {choice}"),
+            });
+        }
+    }
+    Ok(choices.clone())
 }
 
 /// 沿 `properties` 找 config schema 的某个路径
@@ -1414,6 +1471,20 @@ pub enum DescriptorError {
         /// 原因
         reason: String,
     },
+    /// `choices` 只能用于 string 列表字段
+    #[error("setup path {path} declares choices but is not a string list")]
+    SetupChoicesNotList {
+        /// 路径
+        path: String,
+    },
+    /// `choices` 声明非法
+    #[error("invalid choices for setup path {path}: {reason}")]
+    InvalidSetupChoices {
+        /// 路径
+        path: String,
+        /// 原因
+        reason: String,
+    },
 }
 
 #[cfg(test)]
@@ -1550,6 +1621,44 @@ mod tests {
         assert!(matches!(
             parse(value),
             Err(DescriptorError::SetupDefaultInvalid { .. })
+        ));
+    }
+
+    #[test]
+    fn setup_list_choices_become_multi_select() {
+        let mut value = with_config(json!({
+            "platforms": { "type": "array", "items": { "type": "string" }, "default": ["qq"] }
+        }));
+        value["setup"] = json!({
+            "fields": [{ "path": "platforms", "required": true, "choices": ["qq", "log"] }]
+        });
+        let descriptor = parse(value).expect("valid");
+        let setup = descriptor.setup.expect("setup");
+        assert_eq!(
+            setup.fields[0].kind,
+            SetupKind::StringList {
+                choices: vec!["qq".to_owned(), "log".to_owned()]
+            }
+        );
+
+        // choices 只能用于字符串列表
+        let mut value = with_config(json!({ "token": { "type": "string" } }));
+        value["setup"] = json!({ "fields": [{ "path": "token", "choices": ["a"] }] });
+        assert!(matches!(
+            parse(value),
+            Err(DescriptorError::SetupChoicesNotList { .. })
+        ));
+
+        // 重复选项被拒绝
+        let mut value = with_config(json!({
+            "platforms": { "type": "array", "items": { "type": "string" } }
+        }));
+        value["setup"] = json!({
+            "fields": [{ "path": "platforms", "choices": ["qq", "qq"] }]
+        });
+        assert!(matches!(
+            parse(value),
+            Err(DescriptorError::InvalidSetupChoices { .. })
         ));
     }
 

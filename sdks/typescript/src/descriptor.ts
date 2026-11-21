@@ -464,6 +464,9 @@ function buildSetup(setup: SetupSpec): JsonValue {
     if (field.default !== undefined) {
       entry["default"] = field.default as JsonValue;
     }
+    if (field.choices !== undefined) {
+      entry["choices"] = [...field.choices];
+    }
     return sortKeys(entry);
   });
   const result: Record<string, JsonValue> = { fields };

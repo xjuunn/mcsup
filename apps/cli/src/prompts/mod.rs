@@ -10,7 +10,7 @@ use crate::output::Printer;
 use anyhow::{Context, Result};
 use inquire::autocompletion::Replacement;
 use inquire::validator::{ErrorMessage, Validation};
-use inquire::{Autocomplete, Confirm, CustomUserError, Password, Select, Text};
+use inquire::{Autocomplete, Confirm, CustomUserError, MultiSelect, Password, Select, Text};
 use mcsup::domain::workspace::WorkspaceName;
 use mcsup::port::RemoteName;
 use mcsup::service::{MARKER_FILE, NOISE_ENTRIES, absolute_path};
@@ -72,19 +72,29 @@ pub(crate) fn step(printer: Printer, step: usize, total: usize, title: &str) {
     printer.print_section(&format!("[{step}/{total}] {title}"));
 }
 
-/// 统一交互提示符号：去掉 inquire 默认的 `?` 前缀
+/// 统一交互外观：所有提示共用一套符号与配色
 ///
-/// inquire 默认在问题行前渲染一个绿色 `?`，与本项目自有选择器的
-/// `标签 > 输入` 风格冲突，看起来像渲染错误。这里把待答前缀清空、已答前缀
-/// 统一成 `>`，两类组件由此看起来是同一套提示。
+/// - 待答：`?` 青
+/// - 已答：`✔` 绿
+/// - 帮助：`[…]` 暗灰
+/// - 错误：`✖` 红
+/// - 光标：`❯`；勾选框：`■` / `□`
 ///
-/// 从 [`RenderConfig::default`] 出发而不是 `empty()`：要保留 `NO_COLOR`
-/// 的判定与错误 / 帮助行的配色，只替换两个前缀符号。
+/// 从 [`RenderConfig::default`] 出发而不是 `empty()`：保留 `NO_COLOR`
+/// 判定，只覆盖符号与强调色。
 pub(crate) fn init_render_config() {
-    use inquire::ui::{Color, RenderConfig, Styled};
+    use inquire::ui::{Color, ErrorMessageRenderConfig, RenderConfig, StyleSheet, Styled};
     let config = RenderConfig::default()
-        .with_prompt_prefix(Styled::new(""))
-        .with_answered_prompt_prefix(Styled::new(">").with_fg(Color::LightCyan));
+        .with_prompt_prefix(Styled::new("?").with_fg(Color::LightCyan))
+        .with_answered_prompt_prefix(Styled::new("✔").with_fg(Color::LightGreen))
+        .with_help_message(StyleSheet::new().with_fg(Color::DarkGrey))
+        .with_error_message(
+            ErrorMessageRenderConfig::default_colored().with_prefix(Styled::new("✖")),
+        )
+        .with_highlighted_option_prefix(Styled::new("❯").with_fg(Color::LightCyan))
+        .with_selected_checkbox(Styled::new("■").with_fg(Color::LightCyan))
+        .with_unselected_checkbox(Styled::new("□").with_fg(Color::DarkGrey))
+        .with_answer(StyleSheet::new().with_fg(Color::LightCyan));
     inquire::set_global_render_config(config);
 }
 
@@ -443,12 +453,34 @@ fn text_input<'a>(label: &'a str, default: &'a str, help: &'a str) -> Text<'a, '
 ///
 /// 读取终端输入失败时返回底层错误
 pub(crate) fn select_bool(lang: Lang, label: &str, default: bool) -> Result<bool> {
-    let choices = vec!["true", "false"];
-    let picked = Select::new(label, choices)
-        .with_starting_cursor(usize::from(!default))
+    select_bool_with_help(lang, label, default, "")
+}
+
+/// 带帮助行的布尔选择（安装向导用）
+///
+/// # Errors
+///
+/// 读取终端输入失败时返回底层错误
+pub(crate) fn select_bool_with_help(
+    lang: Lang,
+    label: &str,
+    default: bool,
+    help: &str,
+) -> Result<bool> {
+    crate::input::discard_pending_input();
+    let (yes, no) = match lang {
+        Lang::Zh => ("是", "否"),
+        Lang::En => ("Yes", "No"),
+    };
+    let choices = vec![yes, no];
+    let mut prompt = Select::new(label, choices).with_starting_cursor(usize::from(!default));
+    if !help.is_empty() {
+        prompt = prompt.with_help_message(help);
+    }
+    let picked = prompt
         .prompt()
         .context(l(lang, "读取选择", "reading the choice"))?;
-    Ok(picked == "true")
+    Ok(picked == yes)
 }
 
 /// 从固定取值中选择（安装向导的枚举字段）
@@ -461,15 +493,69 @@ pub(crate) fn select_choice(
     label: &str,
     choices: &[String],
     default: Option<&str>,
+    help: &str,
 ) -> Result<String> {
     crate::input::discard_pending_input();
     let mut prompt = Select::new(label, choices.to_vec());
     if let Some(index) = default.and_then(|value| choices.iter().position(|item| item == value)) {
         prompt = prompt.with_starting_cursor(index);
     }
+    if !help.is_empty() {
+        prompt = prompt.with_help_message(help);
+    }
     prompt
         .prompt()
         .context(l(lang, "读取选择", "reading the choice"))
+}
+
+/// 多选列表：空格切换、回车确认；返回按候选顺序排列的勾选值
+///
+/// 勾选框用 `■` / `□`，当前项用 `❯`；`checked` 决定初始勾选状态。
+///
+/// # Errors
+///
+/// 读取终端输入失败时返回底层错误
+pub(crate) fn select_many(
+    lang: Lang,
+    label: &str,
+    help: &str,
+    choices: &[String],
+    checked: &[String],
+    required: bool,
+) -> Result<Vec<String>> {
+    crate::input::discard_pending_input();
+    let defaults = choices
+        .iter()
+        .enumerate()
+        .filter(|(_, choice)| checked.iter().any(|item| item == *choice))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let mut prompt = MultiSelect::new(label, choices.to_vec());
+    if !defaults.is_empty() {
+        prompt = prompt.with_default(&defaults);
+    }
+    if !help.is_empty() {
+        prompt = prompt.with_help_message(help);
+    }
+    if required {
+        prompt = prompt.with_validator(
+            move |selected: &[inquire::list_option::ListOption<&String>]| {
+                if selected.is_empty() {
+                    Ok(Validation::Invalid(ErrorMessage::Custom(l(
+                        lang,
+                        "至少选择一项",
+                        "select at least one option",
+                    ))))
+                } else {
+                    Ok(Validation::Valid)
+                }
+            },
+        );
+    }
+    let picked = prompt
+        .prompt()
+        .context(l(lang, "读取选择", "reading the choice"))?;
+    Ok(picked)
 }
 
 /// 遮蔽输入（安装向导的密钥字段）：不回显、不进入命令历史

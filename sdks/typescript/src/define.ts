@@ -90,6 +90,8 @@ export interface SetupFieldSpec {
   readonly description?: string;
   /** 提示默认值；省略时取 schema 的 default */
   readonly default?: unknown;
+  /** 列表字段的可选值；声明后向导渲染成多选框（仅数组字符串字段） */
+  readonly choices?: readonly string[];
 }
 
 /** 安装向导：声明一次「装完即用」需要问哪些值 */

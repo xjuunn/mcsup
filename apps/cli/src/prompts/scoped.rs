@@ -583,7 +583,11 @@ impl<'a> Picker<'a> {
         let max = max_line_cols();
         let mut lines = Vec::new();
         if let Some(error) = &self.error {
-            lines.push(styled(error, &Style::new().for_stderr().red(), max));
+            lines.push(styled(
+                &format!("✖ {error}"),
+                &Style::new().for_stderr().red(),
+                max,
+            ));
         }
         let (input_line, column) = self.input_line(max);
         let row = lines.len();
@@ -642,11 +646,12 @@ impl<'a> Picker<'a> {
     ///
     /// 输入按尾部显示：关键字在尾部输入，超宽截头部不截尾部。
     fn input_line(&self, max: usize) -> (String, usize) {
-        let mut prefix = format!("{} > ", self.label);
+        // 与 inquire 组件同款：`? 标签 输入`
+        let mut prefix = format!("? {} ", self.label);
         let mut prefix_width = measure_text_width(&prefix);
         if prefix_width + MIN_INPUT_COLS > max {
             // 窄终端：先缩短标签，保住输入区
-            "> ".clone_into(&mut prefix);
+            "? ".clone_into(&mut prefix);
             prefix_width = 2;
         }
         let budget = max.saturating_sub(prefix_width);
@@ -671,7 +676,7 @@ impl<'a> Picker<'a> {
     /// 也不该抢走视线；宽度不够时先截说明、再截正文，保证名字可读。
     fn suggestion_line(&self, suggestion: &str, index: usize, max: usize) -> String {
         let highlighted = self.highlight == Some(index);
-        let marker = if highlighted { ">" } else { " " };
+        let marker = if highlighted { "❯" } else { " " };
         let choice = self
             .choices
             .iter()
@@ -870,8 +875,8 @@ impl Frame {
 fn print_answer(label: &str, picked: &str) {
     let prefix = Style::new()
         .for_stderr()
-        .cyan()
-        .apply_to(format!("{label} > "));
+        .green()
+        .apply_to(format!("✔ {label} "));
     eprintln!("{prefix}{picked}");
 }
 
@@ -1480,7 +1485,7 @@ mod tests {
             .into_iter()
             .find(|line| line.contains("vanilla"))
             .expect("应渲染 vanilla 行");
-        assert!(line.starts_with("> "), "高亮行应带 `>` 标记：{line:?}");
+        assert!(line.starts_with("❯ "), "高亮行应带 `❯` 标记：{line:?}");
         assert!(line.contains("官方"), "高亮行仍要带说明：{line:?}");
         // 说明在正文之后
         let body = line.find("vanilla").expect("正文");

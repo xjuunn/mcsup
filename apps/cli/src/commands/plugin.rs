@@ -310,8 +310,16 @@ fn approve_pending(
     Ok(granted)
 }
 
-/// 逐项补齐安装向导声明的配置；只询问「新装」或「仍为空」的字段
-fn run_setup(service: &PluginService, id: &PluginId, printer: Printer) -> Result<SetupReport> {
+/// 逐项补齐安装向导声明的配置
+///
+/// `fresh` 为真（全新安装）时询问全部字段：已有值作为输入默认值，密钥留空
+/// 表示保持原值；升级只补仍为空的字段，避免每次升级重问一遍。
+fn run_setup(
+    service: &PluginService,
+    id: &PluginId,
+    printer: Printer,
+    fresh: bool,
+) -> Result<SetupReport> {
     let Ok(descriptor) = service.descriptor(id) else {
         return Ok(SetupReport::default());
     };
@@ -319,11 +327,7 @@ fn run_setup(service: &PluginService, id: &PluginId, printer: Printer) -> Result
         return Ok(SetupReport::default());
     };
     let current = service.config_get(id)?;
-    let revision = current.get("revision").and_then(Value::as_u64).unwrap_or(0);
     let values = current.get("values").cloned().unwrap_or_else(|| json!({}));
-    // 全新安装时配置里只有 schema 默认值；升级时只补真正缺失的字段，
-    // 避免每次升级都重问一遍。
-    let fresh = revision == 0;
     let interactive = printer.is_interactive();
     let lang = printer.lang();
     let mut patch = Map::new();
@@ -332,22 +336,27 @@ fn run_setup(service: &PluginService, id: &PluginId, printer: Printer) -> Result
         ..SetupReport::default()
     };
 
-    for field in &setup.fields {
+    for field in fields_to_ask(setup, &values, fresh) {
+        let existing = value_at(&values, &field.path).cloned();
         let missing = value_missing(&values, &field.path);
-        if !fresh && !missing {
-            continue;
-        }
         if !interactive {
             if field.required && missing {
                 report.missing.push(field.path.clone());
             }
             continue;
         }
+        // 重装时留空表示沿用旧值，但旧值本身为空不算「沿用」
+        let kept = existing
+            .as_ref()
+            .is_some_and(|value| !value_is_empty(value));
         let value = loop {
-            let Some(value) = prompt_setup_field(field, printer)? else {
+            let Some(value) = prompt_setup_field(field, printer, existing.as_ref())? else {
                 break None;
             };
             if field.required && value_is_empty(&value) {
+                if kept {
+                    break None;
+                }
                 printer.print_section(&crate::i18n::pick(
                     lang,
                     format!("{} 为必填项，请重新输入", field.label),
@@ -371,7 +380,7 @@ fn run_setup(service: &PluginService, id: &PluginId, printer: Printer) -> Result
         if let Some(value) = value {
             set_path(&mut patch, &field.path, value);
             report.configured.push(field.path.clone());
-        } else if field.required {
+        } else if field.required && missing {
             report.missing.push(field.path.clone());
         }
     }
@@ -382,23 +391,57 @@ fn run_setup(service: &PluginService, id: &PluginId, printer: Printer) -> Result
     Ok(report)
 }
 
-/// 询问单个字段；返回 `None` 表示非必填项被留空跳过
-fn prompt_setup_field(field: &ResolvedSetupField, printer: Printer) -> Result<Option<Value>> {
+/// 安装（`fresh`）问全部字段，升级只问仍为空的字段
+fn fields_to_ask<'a>(
+    setup: &'a mcsup::domain::plugin::descriptor::ResolvedSetup,
+    values: &Value,
+    fresh: bool,
+) -> Vec<&'a ResolvedSetupField> {
+    setup
+        .fields
+        .iter()
+        .filter(|field| fresh || value_missing(values, &field.path))
+        .collect()
+}
+
+/// 询问单个字段；返回 `None` 表示留空跳过或沿用已有值
+///
+/// 已有值不预填成输入默认值：否则一个回车就把旧值当成新输入提交，用户
+/// 也分不清「默认值」与「上次填的值」。改为在帮助行标注「已设置，留空保持
+/// 不变」。
+fn prompt_setup_field(
+    field: &ResolvedSetupField,
+    printer: Printer,
+    existing: Option<&Value>,
+) -> Result<Option<Value>> {
     let lang = printer.lang();
-    let help = field.description.clone().unwrap_or_default();
-    let default_text = setup_default_text(field);
+    let keeps = existing.is_some_and(|value| !value_is_empty(value));
+    let help = setup_help(field, keeps && is_free_form(&field.kind), lang);
+    // 已有值时不预填；否则只把 schema 默认值作为提示
+    let default_text = if keeps {
+        String::new()
+    } else {
+        setup_default_text(field)
+    };
     let value = match &field.kind {
         SetupKind::Boolean => {
-            let default = field
-                .default
-                .as_ref()
+            let default = existing
                 .and_then(Value::as_bool)
+                .or_else(|| field.default.as_ref().and_then(Value::as_bool))
                 .unwrap_or(false);
-            json!(crate::prompts::select_bool(lang, &field.label, default)?)
+            json!(crate::prompts::select_bool_with_help(
+                lang,
+                &field.label,
+                default,
+                &help
+            )?)
         }
         SetupKind::Text { choices } if !choices.is_empty() => {
-            let default = field.default.as_ref().and_then(Value::as_str);
-            let picked = crate::prompts::select_choice(lang, &field.label, choices, default)?;
+            let default = existing
+                .and_then(Value::as_str)
+                .or_else(|| field.default.as_ref().and_then(Value::as_str));
+            let picked =
+                crate::prompts::select_choice(lang, &field.label, choices, default, &help)?;
             json!(picked)
         }
         SetupKind::Text { .. } => {
@@ -407,13 +450,16 @@ fn prompt_setup_field(field: &ResolvedSetupField, printer: Printer) -> Result<Op
             } else {
                 crate::prompts::input_text(lang, &field.label, &default_text, &help)?
             };
-            if input.is_empty() && !field.required {
+            if input.is_empty() {
                 return Ok(None);
             }
             json!(input)
         }
         SetupKind::Integer => {
             let input = crate::prompts::input_text(lang, &field.label, &default_text, &help)?;
+            if input.trim().is_empty() {
+                return Ok(None);
+            }
             // 解析失败也交给 schema 复校验，统一走「重输」分支
             match input.trim().parse::<i64>() {
                 Ok(number) => json!(number),
@@ -422,15 +468,42 @@ fn prompt_setup_field(field: &ResolvedSetupField, printer: Printer) -> Result<Op
         }
         SetupKind::Number => {
             let input = crate::prompts::input_text(lang, &field.label, &default_text, &help)?;
+            if input.trim().is_empty() {
+                return Ok(None);
+            }
             match input.trim().parse::<f64>() {
                 Ok(number) => json!(number),
                 Err(_) => json!(input.trim()),
             }
         }
-        SetupKind::StringList => {
+        SetupKind::StringList { choices } if !choices.is_empty() => {
+            let current = existing
+                .and_then(Value::as_array)
+                .or_else(|| field.default.as_ref().and_then(Value::as_array))
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let picked = crate::prompts::select_many(
+                lang,
+                &field.label,
+                &help,
+                choices,
+                &current,
+                field.required,
+            )?;
+            if picked.is_empty() {
+                return Ok(None);
+            }
+            json!(picked)
+        }
+        SetupKind::StringList { .. } => {
             let input = crate::prompts::input_text(lang, &field.label, &default_text, &help)?;
             let items = split_list(&input);
-            if items.is_empty() && !field.required {
+            if items.is_empty() {
                 return Ok(None);
             }
             json!(items)
@@ -439,9 +512,42 @@ fn prompt_setup_field(field: &ResolvedSetupField, printer: Printer) -> Result<Op
     Ok(Some(value))
 }
 
-/// 默认值渲染成输入框提示文本
+/// 自由输入（相对于选择器 / 多选框）的字段：留空才有「保持原值」语义
+fn is_free_form(kind: &SetupKind) -> bool {
+    match kind {
+        SetupKind::Text { choices } | SetupKind::StringList { choices } => choices.is_empty(),
+        SetupKind::Integer | SetupKind::Number => true,
+        SetupKind::Boolean => false,
+    }
+}
+
+/// 帮助行：描述 + 多选操作提示 + 已有值提示
+fn setup_help(field: &ResolvedSetupField, keeps: bool, lang: crate::locale::Lang) -> String {
+    let mut parts = Vec::new();
+    if let Some(description) = field.description.as_ref().filter(|text| !text.is_empty()) {
+        parts.push(description.clone());
+    }
+    if matches!(&field.kind, SetupKind::StringList { choices } if !choices.is_empty()) {
+        parts.push(
+            crate::i18n::pick(lang, "空格切换、回车确认", "space toggles, enter confirms").clone(),
+        );
+    }
+    if keeps {
+        parts.push(
+            crate::i18n::pick(
+                lang,
+                "已设置；留空保持不变",
+                "already set; leave blank to keep it",
+            )
+            .clone(),
+        );
+    }
+    parts.join("；")
+}
+
+/// schema 默认值渲染成输入框提示文本
 fn setup_default_text(field: &ResolvedSetupField) -> String {
-    match &field.default {
+    match field.default.as_ref() {
         None => String::new(),
         Some(Value::String(text)) => text.clone(),
         Some(Value::Array(items)) => items
@@ -477,14 +583,16 @@ fn value_is_empty(value: &Value) -> bool {
 }
 
 fn value_missing(values: &Value, path: &str) -> bool {
+    value_at(values, path).is_none_or(value_is_empty)
+}
+
+/// 按 `qq.appId` 这样的点分路径读取配置值
+fn value_at<'a>(values: &'a Value, path: &str) -> Option<&'a Value> {
     let mut node = values;
     for segment in path.split('.') {
-        let Some(next) = node.get(segment) else {
-            return true;
-        };
-        node = next;
+        node = node.get(segment)?;
     }
-    value_is_empty(node)
+    Some(node)
 }
 
 /// 把 `qq.appId` 写进嵌套补丁对象
@@ -526,11 +634,15 @@ fn activate(service: &PluginService, id: &PluginId) -> Result<()> {
 }
 
 /// 向导前半段：确认待授权能力，再按 descriptor 的 setup 逐项补配置
+///
+/// `fresh` 区分安装与升级：安装始终询问全部字段（已有值作默认），
+/// 升级只补仍为空的字段。
 fn approve_and_configure(
     service: &PluginService,
     id: &PluginId,
     pending: &[Capability],
     setup: bool,
+    fresh: bool,
     printer: Printer,
 ) -> Result<(Vec<Capability>, Vec<Capability>, SetupReport)> {
     let granted = if setup {
@@ -544,7 +656,7 @@ fn approve_and_configure(
         .filter(|cap| !granted.contains(cap))
         .collect::<Vec<_>>();
     let report = if setup {
-        run_setup(service, id, printer)?
+        run_setup(service, id, printer, fresh)?
     } else {
         SetupReport::default()
     };
@@ -660,7 +772,7 @@ fn install(
     let pending = outcome.pending.iter().copied().collect::<Vec<_>>();
 
     let (granted, remaining, report) =
-        approve_and_configure(&service, &record.id, &pending, setup, printer)?;
+        approve_and_configure(&service, &record.id, &pending, setup, true, printer)?;
     // 安装向导默认启动；`--no-setup` 时 report.start 为 false，保持旧的
     // 「装完不启动」行为。必填配置仍缺失时也不启动，避免带着坏配置反复崩溃。
     let started = if should_start(&report, &remaining) {
@@ -815,7 +927,7 @@ fn update(
     let record = service.record(&updated_id)?;
     let pending = pending_of(&record);
     let (granted, remaining, report) =
-        approve_and_configure(&service, &updated_id, &pending, setup, printer)?;
+        approve_and_configure(&service, &updated_id, &pending, setup, false, printer)?;
 
     // 升级沿用原有的启用状态：用户主动停用的插件不会被升级顺手拉起。
     // 必填配置仍缺失时同样跳过重启，先让用户补齐再手动启动。
@@ -1783,6 +1895,7 @@ fn artifact_root(record: &PluginRecord) -> &Path {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mcsup::domain::plugin::descriptor::ResolvedSetup;
     use serde_json::json;
 
     fn report(start: bool, missing: &[&str]) -> SetupReport {
@@ -1810,6 +1923,34 @@ mod tests {
         assert!(!value_missing(&values, "qq.appId"));
         assert!(value_missing(&values, "qq.clientSecret"));
         assert!(value_missing(&values, "qq.groups"));
+        assert_eq!(value_at(&values, "qq.appId"), Some(&json!("a")));
+    }
+
+    /// 重装已有配置的插件时仍必须询问 `AppID` / `ClientSecret` 等必填项
+    #[test]
+    fn fresh_install_asks_every_field_even_when_configured() {
+        let field = |path: &str| ResolvedSetupField {
+            path: path.to_owned(),
+            label: path.to_owned(),
+            description: None,
+            required: true,
+            secret: false,
+            default: None,
+            kind: SetupKind::Text {
+                choices: Vec::new(),
+            },
+            schema: json!({ "type": "string" }),
+        };
+        let setup = ResolvedSetup {
+            start: true,
+            fields: vec![field("qq.appId"), field("qq.groups")],
+        };
+        let values = json!({ "qq": { "appId": "a", "groups": [] } });
+
+        assert_eq!(fields_to_ask(&setup, &values, true).len(), 2);
+        let update = fields_to_ask(&setup, &values, false);
+        assert_eq!(update.len(), 1);
+        assert_eq!(update[0].path, "qq.groups");
     }
 
     #[test]
