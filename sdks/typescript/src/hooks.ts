@@ -5,18 +5,20 @@
  * 缓存）。显式接收 `ctx`，不在模块级注册任何东西；缺少所需能力时立即抛错。
  */
 
-import type { ConsoleLine, ConsoleReadClient, EventsClient, KvClient, LogClient } from "./index.js";
+import type { ConsoleLine } from "./builders.js";
+import type { ConsoleReadClient, EventsClient, KvClient, LogClient } from "./ctx.js";
 import { PluginError } from "./errors.js";
 import { kvTtlCache } from "./utils/state.js";
 import { withRetry } from "./utils/retry.js";
 
 /**
  * Hook 只依赖上下文的公共部分：日志、配置、限额与作用域。
- * 能力成员按需取，未授予即报 denied。
+ * 能力成员按需取，未授予即报 denied。`Cfg` 与 `ctx.config` 的推导类型一致，
+ * 自定义 hook 可写 `HookContext<typeof ctx.config>` 保留配置类型。
  */
-export interface HookContext {
+export interface HookContext<Cfg = unknown> {
   readonly log: LogClient;
-  readonly config: unknown;
+  readonly config: Cfg;
   readonly sessionId: string;
   readonly limits: {
     readonly inflight: number;

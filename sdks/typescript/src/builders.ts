@@ -5,16 +5,13 @@
  * 终点不是插件，`.build()` 回来的片段要回填进 `definePlugin({...})`。
  */
 
-import { z } from "zod";
+import { z } from "./zod.js";
 
-import type { OpSpec, PluginContext, Capability, StreamChunks } from "./define.js";
+import type { Capability, OpKind, OpRisk, OpSpec, PluginContext, StreamChunks } from "./define.js";
 import { annotate, toZod, type Field, type InferSchema, type SchemaLike } from "./schema.js";
 
-/** 风险等级（plugins.md §8.3） */
-export type OpRisk = "read" | "mutating" | "destructive";
-
-/** op 种类 */
-export type OpKind = "query" | "action" | "stream";
+/** op 种类与风险等级由内核定义，Builder 只做复用 */
+export type { OpKind, OpRisk };
 
 const emptyObject = (): z.ZodType => z.object({}).strict();
 
@@ -61,7 +58,7 @@ abstract class BaseOpBuilder<K extends OpKind, I extends SchemaLike, O extends S
     return this;
   }
 
-  /** 风险等级；默认 `read`。query 必须是 read，action/stream 可用更高等级 */
+  /** 风险等级；缺省由 descriptor 按 kind 决定（query/stream → read，action → mutating） */
   public risk(risk: OpRisk): this {
     this.draft.risk = risk;
     return this;
@@ -119,7 +116,6 @@ abstract class BaseOpBuilder<K extends OpKind, I extends SchemaLike, O extends S
 export class QueryBuilder<I extends SchemaLike = SchemaLike, O extends SchemaLike = SchemaLike> extends BaseOpBuilder<"query", I, O, { query: true }> {
   private constructor(id: string) {
     super(id, "query");
-    this.draft.risk = "read";
   }
 
   public static of(id: string): QueryBuilder {
@@ -144,7 +140,6 @@ export class QueryBuilder<I extends SchemaLike = SchemaLike, O extends SchemaLik
 export class ActionBuilder<I extends SchemaLike = SchemaLike, O extends SchemaLike = SchemaLike> extends BaseOpBuilder<"action", I, O, { action: true }> {
   private constructor(id: string) {
     super(id, "action");
-    this.draft.risk = "mutating";
   }
 
   public static of(id: string): ActionBuilder {
@@ -168,7 +163,6 @@ export class ActionBuilder<I extends SchemaLike = SchemaLike, O extends SchemaLi
 export class StreamBuilder<I extends SchemaLike = SchemaLike, O extends SchemaLike = SchemaLike> extends BaseOpBuilder<"stream", I, O, { stream: true }> {
   private constructor(id: string) {
     super(id, "stream");
-    this.draft.risk = "read";
   }
 
   public static of(id: string): StreamBuilder {

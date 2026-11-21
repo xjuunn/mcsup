@@ -5,9 +5,12 @@
  * 每次调用都是一次 `call` 帧，错误已归一为 `PluginError`。
  */
 
-import type { Capability } from "./define.js";
+import type { OpenCapabilityName } from "./contracts/v1.js";
 import { PluginError } from "./errors.js";
 import type { InferSchema, SchemaLike } from "./schema.js";
+
+/** 能力名，与内核的 `Capability` 同义；直接指向生成契约以保持依赖单向 */
+type Capability = OpenCapabilityName;
 
 /** 服务器名 */
 export type ServerName = string;

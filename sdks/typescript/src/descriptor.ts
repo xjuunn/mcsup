@@ -6,10 +6,18 @@
  * 保证不同语言的产物可逐字节比对。
  */
 
-import { z } from "zod";
+import { z } from "./zod.js";
 
-import { PLUGIN_API_VERSION, PROTOCOL_VERSION } from "./protocol.js";
-import { subscriptionKinds, type Capability, type PluginContext, type PluginDefinition } from "./define.js";
+import { PLUGIN_API_VERSION } from "./protocol.js";
+import {
+  subscriptionKinds,
+  type Capability,
+  type OpKind,
+  type OpRisk,
+  type OpSpecLike,
+  type PluginDefinition,
+  type ResolvedOp,
+} from "./define.js";
 import { toZod, type SchemaLike } from "./schema.js";
 import {
   DEFAULT_OP_TIMEOUT_MS,
@@ -426,8 +434,8 @@ function schemaName(opId: string, direction: "in" | "out"): string {
 }
 
 /** 已声明 op 的 id → kind（display 引用校验用） */
-function opKinds(resolved: readonly ResolvedOp[]): Map<string, string> {
-  const kinds = new Map<string, string>();
+function opKinds(resolved: readonly ResolvedOp[]): Map<string, OpKind> {
+  const kinds = new Map<string, OpKind>();
   for (const op of resolved) {
     kinds.set(op.id, op.kind);
   }
@@ -556,32 +564,6 @@ export function collectOps<
 }
 
 /** 未声明 risk 时的默认值：有副作用的 action 不能默认成 `read`（§11.2） */
-function defaultRisk(kind: "query" | "action" | "stream"): "read" | "mutating" {
+function defaultRisk(kind: OpKind): OpRisk {
   return kind === "action" ? "mutating" : "read";
 }
-
-/** 归约后的 op 描述（内部表示） */
-export interface ResolvedOp {
-  readonly id: string;
-  readonly kind: "query" | "action" | "stream";
-  readonly title: string;
-  readonly description?: string;
-  readonly risk: "read" | "mutating" | "destructive";
-  readonly display?: unknown;
-  readonly input: z.ZodType;
-  readonly output: z.ZodType;
-  readonly timeoutMs?: number;
-  readonly pagination?: unknown;
-  readonly run?: OpRun;
-}
-
-/** op 处理函数签名 */
-export type OpRun = (input: unknown, ctx: PluginContext) => unknown;
-
-/** 允许 Builder / 原生对象两种写法的结构子集 */
-export type OpSpecLike = Partial<ResolvedOp> & {
-  readonly kind?: "query" | "action" | "stream";
-};
-
-/** 协议版本常量（供生成器写入产物校验） */
-export const SDK_PROTOCOL_VERSION = PROTOCOL_VERSION;

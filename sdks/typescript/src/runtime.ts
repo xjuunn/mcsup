@@ -11,52 +11,52 @@
  */
 
 import { arch, platform } from "node:os";
-import { z } from "zod";
+import { z } from "./zod.js";
 
-import { Connection } from "./connection.js";
+import { SocketChannel, type FrameChannel } from "./connection.js";
 import {
   buildDescriptor,
   buildManifest,
   collectOps,
   serializeNormalized,
-  type ResolvedOp,
 } from "./descriptor.js";
 import {
   type Capability,
   type DefinedPlugin,
   type PluginDefinition,
+  type ResolvedOp,
   subscriptionHandlers,
   subscriptionKinds,
 } from "./define.js";
 import { EventBus, createCtx, type CtxEnvironment, type CtxFor } from "./ctx.js";
 import { PluginError, toPluginError } from "./errors.js";
 import { toZod, type InferSchema, type SchemaLike } from "./schema.js";
+import { pumpStream, raceAbort } from "./stream.js";
 import { DEFAULT_OP_TIMEOUT_MS } from "./validate.js";
 import {
+  DEFAULT_EVENT_QUEUE,
+  DEFAULT_INFLIGHT,
+  DEFAULT_LOG_LINES_PER_SEC,
   ExitCode,
   MAX_FRAME_BYTES,
   PLUGIN_API_VERSION,
+  frameBytes,
   type CallFrame,
   type ExitCodeValue,
   type InboundFrame,
   type OutboundFrame,
 } from "./protocol.js";
 
-/** 流式总字节上限（plugins.md §5.4） */
-export const MAX_STREAM_BYTES = 16 * 1024 * 1024;
-
-/** 流式空闲超时（plugins.md §5.4：60 s 无新分块即终止） */
-export const STREAM_IDLE_TIMEOUT_MS = 60_000;
-
 /** shutdown 取消 inflight 后等待其收尾的上限 */
 const SHUTDOWN_ABORT_WAIT_MS = 1_000;
 
-/** 默认限额（welcome 之前的兜底值，与 §5.4 一致） */
-const DEFAULT_LIMITS = { inflight: 8, frameBytes: 1024 * 1024, eventQueue: 1024, logLinesPerSec: 200 };
-
-function frameBytes(chunk: unknown): number {
-  return Buffer.byteLength(JSON.stringify(chunk) ?? "", "utf8");
-}
+/** 默认限额（welcome 之前的兜底值，数值来自生成契约，与 §5.4 一致） */
+const DEFAULT_LIMITS = {
+  inflight: DEFAULT_INFLIGHT,
+  frameBytes: MAX_FRAME_BYTES,
+  eventQueue: DEFAULT_EVENT_QUEUE,
+  logLinesPerSec: DEFAULT_LOG_LINES_PER_SEC,
+};
 
 /**
  * 退出码（§6.7）：来自生成契约，禁止手写
@@ -211,70 +211,6 @@ async function runOnce<
     return ExitCode.Failure;
   }
   return await new Session<C, Cfg>(def, channel).start(token);
-}
-
-// ---------------------------------------------------------------------------
-// 通道抽象
-// ---------------------------------------------------------------------------
-
-/**
- * 帧通道：真实实现走 socket，测试实现走内存双工。
- *
- * 方向与 `plugins.md` §6 一致；`result` 配对由通道自己完成，不会进入
- * `onFrame`。
- */
-export interface FrameChannel {
-  onFrame(handler: (frame: InboundFrame) => void): void;
-  onClose(handler: (reason: string) => void): void;
-  /** 发送一帧；返回 promise 表示已处理写背压 */
-  send(frame: OutboundFrame): void | Promise<void>;
-  call(capability: string, method: string, input: unknown, timeoutMs?: number): Promise<unknown>;
-  /** 关闭通道；返回 promise 表示已 flush */
-  close(): void | Promise<void>;
-}
-
-class SocketChannel implements FrameChannel {
-  private readonly connection: Connection;
-  private frameHandler: (frame: InboundFrame) => void = () => {};
-  private closeHandler: (reason: string) => void = () => {};
-
-  private constructor(connection: Connection) {
-    this.connection = connection;
-  }
-
-  public static async open(endpoint: string): Promise<SocketChannel> {
-    let channel: SocketChannel | undefined;
-    const connection = await Connection.open(endpoint, {
-      onFrame: (frame) => {
-        channel?.frameHandler(frame);
-      },
-      onClose: (reason) => {
-        channel?.closeHandler(reason);
-      },
-    });
-    channel = new SocketChannel(connection);
-    return channel;
-  }
-
-  public onFrame(handler: (frame: InboundFrame) => void): void {
-    this.frameHandler = handler;
-  }
-
-  public onClose(handler: (reason: string) => void): void {
-    this.closeHandler = handler;
-  }
-
-  public send(frame: OutboundFrame): Promise<void> {
-    return this.connection.send(frame);
-  }
-
-  public async call(capability: string, method: string, input: unknown, timeoutMs?: number): Promise<unknown> {
-    return await this.connection.call(capability, method, input, timeoutMs);
-  }
-
-  public async close(): Promise<void> {
-    await this.connection.close();
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -890,194 +826,8 @@ export class Session<C extends readonly Capability[], Cfg extends SchemaLike = S
 }
 
 // ---------------------------------------------------------------------------
-// 流式泵
+// 超时与等待
 // ---------------------------------------------------------------------------
-
-interface StreamOpShape {
-  readonly id: string;
-  readonly output: z.ZodType;
-}
-
-/** 流式泵选项；测试可缩短空闲窗口 */
-export interface PumpStreamOptions {
-  /** 单帧字节上限，默认协议上限 1 MiB */
-  readonly frameBytes?: number;
-  /** 空闲超时毫秒，默认 60 s */
-  readonly idleMs?: number;
-}
-
-/**
- * 把迭代器泵成 stream 帧（§6.5）。
- *
- * - `seq` 从 0 连续递增，末尾发 `done: true` 并回 result
- * - 取消后停止读取，回 `cancelled` 结果，不再写流
- * - 每块按 output fragment schema 校验
- * - 空闲超过 `idleMs` 终止流（§5.4）
- */
-export async function pumpStream(
-  chunks: unknown,
-  op: StreamOpShape,
-  channel: FrameChannel,
-  callId: number,
-  signal: AbortSignal,
-  options: PumpStreamOptions = {},
-): Promise<void> {
-  const frameLimit = Math.min(options.frameBytes ?? MAX_FRAME_BYTES, MAX_FRAME_BYTES);
-  const idleMs = options.idleMs ?? STREAM_IDLE_TIMEOUT_MS;
-  const iterator = toAsyncIterator(chunks);
-  if (iterator === undefined) {
-    await channel.send({
-      type: "result",
-      id: callId,
-      ok: false,
-      error: {
-        code: "internal",
-        category: "failure",
-        retryable: false,
-        message: `stream op ${op.id} did not return an iterator`,
-      },
-    });
-    return;
-  }
-  let seq = 0;
-  let total = 0;
-  let idleTimedOut = false;
-  try {
-    for (;;) {
-      let next: IteratorResult<unknown>;
-      try {
-        next = await raceAbort(nextWithIdleTimeout(iterator, idleMs, op.id, signal), signal);
-      } catch (err) {
-        if (signal.aborted) {
-          throw new PluginError("cancelled", abortReason(signal));
-        }
-        if (err instanceof PluginError && err.code === "timeout") {
-          idleTimedOut = true;
-        }
-        throw err;
-      }
-      if (next.done === true) {
-        break;
-      }
-      const checked = op.output.safeParse(next.value);
-      if (!checked.success) {
-        await channel.send({
-          type: "result",
-          id: callId,
-          ok: false,
-          error: {
-            code: "internal",
-            category: "failure",
-            retryable: false,
-            message: `stream op ${op.id} produced an invalid chunk: ${z.prettifyError(checked.error)}`,
-          },
-        });
-        return;
-      }
-      const chunkBytes = frameBytes(checked.data);
-      total += chunkBytes;
-      const frame: OutboundFrame = { type: "stream", id: callId, seq, chunk: checked.data, done: false };
-      if (frameBytes(frame) > frameLimit || total > MAX_STREAM_BYTES) {
-        await channel.send({
-          type: "result",
-          id: callId,
-          ok: false,
-          error: {
-            code: "limit_exceeded",
-            category: "usage",
-            retryable: false,
-            message: `stream op ${op.id} exceeds the stream limit (${total} bytes)`,
-          },
-        });
-        return;
-      }
-      // 等写背压，避免生产者把大流堆进内存
-      await channel.send(frame);
-      seq += 1;
-    }
-    await channel.send({ type: "stream", id: callId, seq, chunk: {}, done: true });
-    await channel.send({ type: "result", id: callId, ok: true, output: { completed: true, chunks: seq } });
-  } catch (err) {
-    const error = toPluginError(err);
-    await channel.send({
-      type: "result",
-      id: callId,
-      ok: false,
-      error: { code: error.code, category: error.category, retryable: error.retryable, message: error.message },
-    });
-  } finally {
-    if (idleTimedOut) {
-      // 空闲超时的迭代器可能永远不返回，不能等它的 return 阻塞退出
-      void Promise.resolve(iterator.return?.()).catch(() => {});
-    } else {
-      await iterator.return?.();
-    }
-  }
-}
-
-/** 单次 `next()` 的空闲计时；超时抛 `timeout` */
-function nextWithIdleTimeout(
-  iterator: AsyncIterator<unknown>,
-  idleMs: number,
-  opId: string,
-  signal: AbortSignal,
-): Promise<IteratorResult<unknown>> {
-  if (!Number.isFinite(idleMs) || idleMs <= 0) {
-    return Promise.resolve(iterator.next());
-  }
-  return new Promise<IteratorResult<unknown>>((resolve, reject) => {
-    const cleanup = (): void => {
-      clearTimeout(timer);
-      signal.removeEventListener("abort", onAbort);
-    };
-    const onAbort = (): void => {
-      cleanup();
-      reject(new PluginError("cancelled", abortReason(signal)));
-    };
-    const timer = setTimeout(() => {
-      cleanup();
-      reject(new PluginError("timeout", `stream op ${opId} was idle for ${idleMs} ms`));
-    }, idleMs);
-    signal.addEventListener("abort", onAbort, { once: true });
-    Promise.resolve(iterator.next()).then(
-      (value) => {
-        cleanup();
-        resolve(value);
-      },
-      (err: unknown) => {
-        cleanup();
-        reject(err instanceof Error ? err : new Error(String(err)));
-      },
-    );
-  });
-}
-
-function abortReason(signal: AbortSignal): string {
-  const reason = signal.reason as unknown;
-  return reason instanceof Error ? reason.message : "cancelled by host";
-}
-
-function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
-  if (signal.aborted) {
-    return Promise.reject(new PluginError("cancelled", abortReason(signal)));
-  }
-  return new Promise<T>((resolve, reject) => {
-    const onAbort = (): void => {
-      reject(new PluginError("cancelled", abortReason(signal)));
-    };
-    signal.addEventListener("abort", onAbort, { once: true });
-    promise.then(
-      (value) => {
-        signal.removeEventListener("abort", onAbort);
-        resolve(value);
-      },
-      (err: unknown) => {
-        signal.removeEventListener("abort", onAbort);
-        reject(err instanceof Error ? err : new Error(String(err)));
-      },
-    );
-  });
-}
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   return await new Promise<T>((resolve, reject) => {
@@ -1112,23 +862,4 @@ async function waitWithDeadline(promise: Promise<unknown>, ms: number): Promise<
     };
     promise.then(done, done);
   });
-}
-
-function toAsyncIterator(chunks: unknown): AsyncIterator<unknown> | undefined {
-  if (chunks === null || typeof chunks !== "object") {
-    return undefined;
-  }
-  const asyncIter = (chunks as AsyncIterable<unknown>)[Symbol.asyncIterator];
-  if (typeof asyncIter === "function") {
-    return asyncIter.call(chunks) as AsyncIterator<unknown>;
-  }
-  const syncIter = (chunks as Iterable<unknown>)[Symbol.iterator];
-  if (typeof syncIter === "function") {
-    const iterator = syncIter.call(chunks) as Iterator<unknown>;
-    return {
-      next: async () => iterator.next(),
-      return: async (value?: unknown) => iterator.return?.(value) ?? { done: true, value: undefined },
-    };
-  }
-  return undefined;
 }

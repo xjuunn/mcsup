@@ -5,10 +5,9 @@
  * Builder 与 Hooks 的产物最终都回填进这里，manifest 与 descriptor 由它生成。
  */
 
-import { z } from "zod";
+import { z } from "./zod.js";
 
 import type { OpenCapabilityName } from "./contracts/v1.js";
-import type { OpSpecLike, ResolvedOp } from "./descriptor.js";
 import type { CtxFor, EventMeta } from "./ctx.js";
 import type { InferSchema, SchemaLike } from "./schema.js";
 import { PLUGIN_API_VERSION } from "./protocol.js";
@@ -30,11 +29,40 @@ export type PluginContext<
 /** 流式 op 的分块产出：同步或异步迭代器均可 */
 export type StreamChunks<T> = Iterable<T> | AsyncIterable<T>;
 
-/** op 片段：原生对象或 Builder 产物（descriptor.ts `OpSpecLike`） */
+/** op 种类（plugins.md §11.2） */
+export type OpKind = "query" | "action" | "stream";
+
+/** 风险等级（plugins.md §8.3） */
+export type OpRisk = "read" | "mutating" | "destructive";
+
+/** 允许 Builder / 原生对象两种写法的结构子集 */
+export type OpSpecLike = Partial<ResolvedOp> & {
+  readonly kind?: OpKind;
+};
+
+/** op 处理函数签名 */
+export type OpRun = (input: unknown, ctx: PluginContext) => unknown;
+
+/** 归约后的 op 描述（内核内部表示） */
+export interface ResolvedOp {
+  readonly id: string;
+  readonly kind: OpKind;
+  readonly title: string;
+  readonly description?: string;
+  readonly risk: OpRisk;
+  readonly display?: unknown;
+  readonly input: z.ZodType;
+  readonly output: z.ZodType;
+  readonly timeoutMs?: number;
+  readonly pagination?: unknown;
+  readonly run?: OpRun;
+}
+
+/** op 片段：原生对象或 Builder 产物（`OpSpecLike` 加必填 schema） */
 export type OpSpec<I extends SchemaLike = SchemaLike, O extends SchemaLike = SchemaLike> = OpSpecLike & {
   readonly input: I;
   readonly output: O;
-  readonly kind: "query" | "action" | "stream";
+  readonly kind: OpKind;
 };
 
 /** 事件处理函数 */
@@ -171,9 +199,3 @@ export function subscriptionHandlers<C extends readonly Capability[], Cfg extend
       : [(item as { kind: string; handler: EventHandler<C, Cfg> })],
   );
 }
-
-/** op 运行期失败统一映射：op 抛出的任意值由运行时归一为 PluginError */
-export type OpFailure = unknown;
-
-/** 归约后的 op（对外可见的只读视图） */
-export type PluginOp = ResolvedOp;

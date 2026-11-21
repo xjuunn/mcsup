@@ -4,6 +4,9 @@
  * 读取端把字节流切成行，逐帧交给上层；写入端串行化 JSON 并 flush。
  * 插件 → 宿主的调用按 id 配对，超时或断开时统一拒绝。宿主 → 插件方向
  * 的帧交给 `onFrame`，协议错误触发 `onClose`。
+ *
+ * `SocketChannel` 把 `Connection` 适配成运行时使用的 `FrameChannel`；
+ * 测试用内存双工实现同一接口（`testing.ts`）。
  */
 
 import * as net from "node:net";
@@ -276,4 +279,69 @@ async function withDeadline(promise: Promise<unknown>, ms: number): Promise<void
       },
     );
   });
+}
+
+// ---------------------------------------------------------------------------
+// 帧通道
+// ---------------------------------------------------------------------------
+
+/**
+ * 帧通道：真实实现走 socket，测试实现走内存双工。
+ *
+ * 方向与 `plugins.md` §6 一致；`result` 配对由通道自己完成，不会进入
+ * `onFrame`。
+ */
+export interface FrameChannel {
+  onFrame(handler: (frame: InboundFrame) => void): void;
+  onClose(handler: (reason: string) => void): void;
+  /** 发送一帧；返回 promise 表示已处理写背压 */
+  send(frame: OutboundFrame): void | Promise<void>;
+  call(capability: string, method: string, input: unknown, timeoutMs?: number): Promise<unknown>;
+  /** 关闭通道；返回 promise 表示已 flush */
+  close(): void | Promise<void>;
+}
+
+/** socket 通道：把 `Connection` 适配成 `FrameChannel` */
+export class SocketChannel implements FrameChannel {
+  private readonly connection: Connection;
+  private frameHandler: (frame: InboundFrame) => void = () => {};
+  private closeHandler: (reason: string) => void = () => {};
+
+  private constructor(connection: Connection) {
+    this.connection = connection;
+  }
+
+  public static async open(endpoint: string): Promise<SocketChannel> {
+    let channel: SocketChannel | undefined;
+    const connection = await Connection.open(endpoint, {
+      onFrame: (frame) => {
+        channel?.frameHandler(frame);
+      },
+      onClose: (reason) => {
+        channel?.closeHandler(reason);
+      },
+    });
+    channel = new SocketChannel(connection);
+    return channel;
+  }
+
+  public onFrame(handler: (frame: InboundFrame) => void): void {
+    this.frameHandler = handler;
+  }
+
+  public onClose(handler: (reason: string) => void): void {
+    this.closeHandler = handler;
+  }
+
+  public send(frame: OutboundFrame): Promise<void> {
+    return this.connection.send(frame);
+  }
+
+  public async call(capability: string, method: string, input: unknown, timeoutMs?: number): Promise<unknown> {
+    return await this.connection.call(capability, method, input, timeoutMs);
+  }
+
+  public async close(): Promise<void> {
+    await this.connection.close();
+  }
 }

@@ -72,7 +72,7 @@ config: s.object({
 | `run(plugin)` | 连接宿主、握手、分派、退出（构建产物已自动调用） |
 | `PluginContext` | 能力客户端，形状由 `capabilities` 推导 |
 | `PluginError` | 带 `code` / `category` / `retryable` 的错误 |
-| `testing.createMockHost()` | 内存双工宿主，不开 socket |
+| `mcsup-plugin/testing` 的 `createMockHost()` | 内存双工宿主，不开 socket |
 
 Builder（`query` / `action` / `stream` / `op` / `lineFilter`）、Hooks
 （`useConsoleTail` / `useRetry` / `useKvCache` / `useEvents`）与预设属次版本

@@ -6,20 +6,31 @@
 
 import type { Capability, DefinedPlugin, PluginDefinition } from "./define.js";
 import {
+  DEFAULT_EVENT_QUEUE,
+  DEFAULT_INFLIGHT,
+  DEFAULT_LOG_LINES_PER_SEC,
+  MAX_FRAME_BYTES,
   PROTOCOL_VERSION,
   type CallFrame,
   type InboundFrame,
   type OutboundFrame,
   type RejectCode,
+  type WelcomeLimits,
 } from "./protocol.js";
-import { type FrameChannel, Session } from "./runtime.js";
+import { type FrameChannel } from "./connection.js";
+import { Session } from "./runtime.js";
 import type { SchemaLike } from "./schema.js";
 
-/** 宿主默认限额（§5.4） */
-const DEFAULT_LIMITS = { inflight: 8, frame_bytes: 1024 * 1024, event_queue: 1024, log_lines_per_sec: 200 };
+/** 宿主默认限额（§5.4）：数值来自生成契约，形状对应 welcome.limits */
+const DEFAULT_LIMITS: WelcomeLimits = {
+  inflight: DEFAULT_INFLIGHT,
+  frame_bytes: MAX_FRAME_BYTES,
+  event_queue: DEFAULT_EVENT_QUEUE,
+  log_lines_per_sec: DEFAULT_LOG_LINES_PER_SEC,
+};
 
 /** 测试可覆盖的 welcome.limits 字段 */
-export type MockLimits = Partial<typeof DEFAULT_LIMITS>;
+export type MockLimits = Partial<WelcomeLimits>;
 
 export interface MockHostOptions {
   /** 本次授予的能力；默认等于插件声明 */

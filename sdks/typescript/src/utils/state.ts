@@ -8,7 +8,7 @@
  * 取 client 处直接 denied，与能力模型一致。
  */
 
-import type { KvClient } from "../index.js";
+import type { KvClient } from "../ctx.js";
 
 const textDecoder = new TextDecoder();
 const textEncoder = new TextEncoder();

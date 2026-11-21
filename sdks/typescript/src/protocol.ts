@@ -258,6 +258,16 @@ export function encodeFrame(frame: OutboundFrame): string {
   return `${JSON.stringify({ v: PROTOCOL_VERSION, ...frame })}\n`;
 }
 
+/**
+ * 估算一帧 JSON 的字节数。
+ *
+ * 用于限额检查，不含版本前缀与换行；与实际编码长度的差值固定，不影响
+ * 与宿主约定的上限判定。
+ */
+export function frameBytes(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value) ?? "", "utf8");
+}
+
 /** 构造线上错误对象；分类与可重试性来自生成的契约表 */
 export function wireError(code: string, message: string): WireError {
   const known = (ERROR_CATEGORY as Record<string, string | undefined>)[code];

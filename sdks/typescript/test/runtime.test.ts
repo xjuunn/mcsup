@@ -1,7 +1,9 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
 import { definePlugin, query, z } from "../src/index.js";
-import { pumpStream, run, type FrameChannel } from "../src/runtime.js";
+import { type FrameChannel } from "../src/connection.js";
+import { pumpStream } from "../src/stream.js";
+import { run } from "../src/runtime.js";
 import { ExitCode, type OutboundFrame } from "../src/protocol.js";
 import { createMockHost } from "../src/testing.js";
 import { chatBridge, counter, minimal, send } from "./fixtures.js";
