@@ -491,7 +491,7 @@ fn prompt_setup_field(
                 lang,
                 &field.label,
                 &help,
-                choices,
+                &choices_with_current(choices, &current),
                 &current,
                 field.required,
             )?;
@@ -510,6 +510,20 @@ fn prompt_setup_field(
         }
     };
     Ok(Some(value))
+}
+
+/// 多选选项 = 声明值 + 当前值里未声明的项
+///
+/// 少这一步，用户手写进配置、插件却没在 `choices` 里声明的值在向导里看不见，
+/// 回车一提交就被静默丢掉。把它们追加成额外选项，至少看得见、可取消。
+fn choices_with_current(choices: &[String], current: &[String]) -> Vec<String> {
+    let mut offered = choices.to_vec();
+    for value in current {
+        if !offered.contains(value) {
+            offered.push(value.clone());
+        }
+    }
+    offered
 }
 
 /// 自由输入（相对于选择器 / 多选框）的字段：留空才有「保持原值」语义
@@ -1947,6 +1961,19 @@ mod tests {
     use super::*;
     use mcsup::domain::plugin::descriptor::ResolvedSetup;
     use serde_json::json;
+
+    /// 多选框不能吞掉配置里已有、但插件没声明的值
+    #[test]
+    fn multiselect_keeps_values_outside_choices() {
+        let choices = vec!["qq".to_owned(), "log".to_owned()];
+        let current = vec!["log".to_owned(), "custom".to_owned()];
+        assert_eq!(
+            choices_with_current(&choices, &current),
+            vec!["qq".to_owned(), "log".to_owned(), "custom".to_owned()]
+        );
+        // 已在 choices 里的当前值不重复追加
+        assert_eq!(choices_with_current(&choices, &choices), choices);
+    }
 
     fn report(start: bool, missing: &[&str]) -> SetupReport {
         SetupReport {
