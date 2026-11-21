@@ -622,8 +622,17 @@ fn set_path_at(map: &mut Map<String, Value>, segments: &[&str], value: Value) {
 }
 
 /// 启用并启动；已在运行时重启以加载新配置
+///
+/// 升级已启用的插件时 `enable` 会因「已启用」报冲突，所以先看标志位：
+/// 只有未启用才需要补一次 `enable`。
 fn activate(service: &PluginService, id: &PluginId) -> Result<()> {
-    service.enable(id)?;
+    let enabled = service
+        .list()?
+        .iter()
+        .any(|record| &record.id == id && record.enabled);
+    if !enabled {
+        service.enable(id)?;
+    }
     ensure_host()?;
     if service.status(id)?.session.is_some() {
         service.restart(id, Duration::from_secs(10))?;

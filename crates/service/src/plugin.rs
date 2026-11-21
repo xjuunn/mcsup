@@ -970,7 +970,7 @@ impl PluginService {
             artifact_dir: target,
             installed_at: now,
             updated_at: now,
-            last_state: PluginState::after_install(!pending.is_empty()),
+            last_state: state_after_install(enabled, !pending.is_empty()),
             last_error: None,
             previous_version: previous.as_ref().map(|record| record.version.clone()),
             source: artifact
@@ -1468,6 +1468,21 @@ fn merge_value(target: &mut Value, patch: &Value) {
             }
         }
         (target, patch) => *target = patch.clone(),
+    }
+}
+
+/// 安装 / 升级后的记录状态
+///
+/// 升级会保留 `enabled`，所以仍启用的插件必须落到 `stopped`：`disabled` 与
+/// `enabled=true` 同时存在时，`enable` 会因「已启用」报冲突、`start` 又会因
+/// 「已停用」被状态机拒绝，插件再也起不来。
+fn state_after_install(enabled: bool, needs_approval: bool) -> PluginState {
+    if needs_approval {
+        PluginState::PendingApproval
+    } else if enabled {
+        PluginState::Stopped
+    } else {
+        PluginState::Disabled
     }
 }
 
@@ -2641,6 +2656,21 @@ mod tests {
             PathBuf::from("/tmp/plugin-data"),
             PathBuf::from("/tmp/logs"),
         )
+    }
+
+    #[test]
+    fn install_state_follows_enabled_flag() {
+        // 升级已启用的插件：状态必须可直接 `start`，不能再落回 `disabled`
+        assert_eq!(state_after_install(true, false), PluginState::Stopped);
+        assert_eq!(
+            state_after_install(true, true),
+            PluginState::PendingApproval
+        );
+        assert_eq!(state_after_install(false, false), PluginState::Disabled);
+        assert_eq!(
+            state_after_install(false, true),
+            PluginState::PendingApproval
+        );
     }
 
     #[test]
