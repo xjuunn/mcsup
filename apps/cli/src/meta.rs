@@ -1356,7 +1356,10 @@ pub(crate) fn plugin_target_arg() -> &'static str {
 
 #[must_use]
 pub(crate) fn plugin_key_arg() -> &'static str {
-    t("配置键", "config key")
+    t(
+        "配置键，支持 a.b.c 嵌套路径",
+        "config key; dotted paths like a.b.c are supported",
+    )
 }
 
 #[must_use]

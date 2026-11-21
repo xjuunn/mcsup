@@ -2197,6 +2197,10 @@ mcsup __plugin-host --data-dir <path> [--idle-timeout <secs>]   # 隐藏
 - `--no-setup` 跳过安装向导：不授权、不补配置、不自动启动（脚本与旧版行为）。
 - 非交互缺必填参数：退出码 2，stderr 说明缺什么；配置必填项缺失时以
   `missing` 字段返回并在下一轮 `config set` 后补上。
+- `config set` / `config get` 的 `<key>` 支持点号路径（`qq.appId`）：写入
+  按深度合并只改目标叶子，读取定位到对应值；单段键仍按顶层写入。
+  同组必填字段（如 `qq.appId` 与 `qq.clientSecret`）必须**一次写完**：单写
+  一个会因缺另一个被整份校验拒绝。点号路径适合在必填项已齐后修单个值。
 
 ## 18.2 输出示例
 

@@ -1340,7 +1340,7 @@ fn config_cmd(action: &PluginConfigAction, printer: Printer) -> Result<()> {
             let revision = config.get("revision").and_then(Value::as_u64).unwrap_or(0);
             let values = config.get("values").cloned().unwrap_or_else(|| json!({}));
             if let Some(key) = key {
-                let value = values.get(key).cloned().ok_or_else(|| {
+                let value = value_at(&values, key).cloned().ok_or_else(|| {
                     AppDiagnostic::not_found(
                         format!("插件 {id} 的配置里没有键 {key}"),
                         Some(format!("运行 `mcsup plugin config get {id}` 查看已有键")),
@@ -1397,7 +1397,19 @@ fn config_cmd(action: &PluginConfigAction, printer: Printer) -> Result<()> {
             let id = parse_id(id)?;
             let value = config_value(value.as_deref(), *secret)?;
             let service = open()?;
-            let config = service.config_set(&id, &json!({ key.clone(): value }))?;
+            // 点号路径走深度合并，只改目标叶子；单段键沿用顶层写入。
+            // 否则 `config set <id> qq.appId 1` 会被当成字面键 `qq.appId`，
+            // schema 直接报 unknown field。
+            let config = if key.contains('.') {
+                let mut patch = Map::new();
+                set_path(&mut patch, key, value);
+                match service.config_merge(&id, &Value::Object(patch)) {
+                    Ok(config) => config,
+                    Err(err) => return Err(hint_required_siblings(err, &id, key, printer)),
+                }
+            } else {
+                service.config_set(&id, &json!({ key.clone(): value }))?
+            };
             let revision = config.get("revision").and_then(Value::as_u64).unwrap_or(0);
             printer.print_outcome(
                 &crate::i18n::pick(
@@ -1409,6 +1421,35 @@ fn config_cmd(action: &PluginConfigAction, printer: Printer) -> Result<()> {
             )
         }
     }
+}
+
+/// 整份配置校验拒绝「单写一个必填字段」时，给出可操作的提示
+///
+/// `qq.appId` 与 `qq.clientSecret` 这类同组必填字段，单独写一个必然缺另一个，
+/// 校验会整份拒绝。真正要做的是把这一组一次性写入。
+fn hint_required_siblings(
+    err: mcsup::service::PluginError,
+    id: &PluginId,
+    key: &str,
+    printer: Printer,
+) -> anyhow::Error {
+    let text = err.to_string();
+    if text.contains("required field is missing") {
+        let group = key.split('.').next().unwrap_or(key);
+        printer.print_section(&crate::i18n::pick(
+            printer.lang(),
+            format!(
+                "提示：{group} 下还有必填字段没填，单独写 {key} 会被整份校验拒绝；\
+                 把这一组一次写完即可，例如 `mcsup plugin config set {id} {group} '{{\"…\":\"…\"}}'`"
+            ),
+            format!(
+                "hint: `{group}` still has required fields missing, so writing {key} alone is \
+                 rejected; write the whole group in one call, e.g. \
+                 `mcsup plugin config set {id} {group} '{{\"…\":\"…\"}}'`"
+            ),
+        ));
+    }
+    err.into()
 }
 
 /// 解析 `config set` 的值
