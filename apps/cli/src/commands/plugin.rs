@@ -15,7 +15,7 @@ use comfy_table::Table;
 use mcsup::domain::plugin::PluginId;
 use mcsup::domain::plugin::capability::Capability;
 use mcsup::domain::plugin::descriptor::Descriptor;
-use mcsup::domain::plugin::descriptor::{ResolvedSetupField, SetupKind};
+use mcsup::domain::plugin::descriptor::{ChoicesSource, ResolvedSetupField, SetupKind};
 use mcsup::domain::plugin::manifest::Manifest;
 use mcsup::domain::plugin::revocation::RevocationList;
 use mcsup::domain::server::artifact::{Checksum, ChecksumAlgorithm};
@@ -335,6 +335,17 @@ fn run_setup(
         start: setup.start,
         ..SetupReport::default()
     };
+    // 只有声明了 `choicesFrom` 的字段才读服务器列表；非交互模式完全不碰。
+    let servers = if interactive
+        && setup
+            .fields
+            .iter()
+            .any(|field| field.choices_from.is_some())
+    {
+        super::server_ops::server_names()
+    } else {
+        Vec::new()
+    };
 
     for field in fields_to_ask(setup, &values, fresh) {
         let existing = value_at(&values, &field.path).cloned();
@@ -350,7 +361,21 @@ fn run_setup(
             .as_ref()
             .is_some_and(|value| !value_is_empty(value));
         let value = loop {
-            let Some(value) = prompt_setup_field(field, printer, existing.as_ref())? else {
+            let Some(value) = prompt_setup_field(field, printer, existing.as_ref(), &servers)?
+            else {
+                // 必填项没有现有值可沿用：留空就是没填，必须重问，不能记一笔
+                // `missing` 就滑过去（那等于回车跳过必填）。
+                if field.required && !kept {
+                    printer.print_section(&crate::i18n::pick(
+                        lang,
+                        format!("{} 为必填项，不能留空，请重新输入", field.label),
+                        format!(
+                            "{} is required and cannot be blank; please try again",
+                            field.label
+                        ),
+                    ));
+                    continue;
+                }
                 break None;
             };
             if field.required && value_is_empty(&value) {
@@ -408,108 +433,194 @@ fn fields_to_ask<'a>(
 ///
 /// 已有值不预填成输入默认值：否则一个回车就把旧值当成新输入提交，用户
 /// 也分不清「默认值」与「上次填的值」。改为在帮助行标注「已设置，留空保持
-/// 不变」。
+/// 不变」。声明了 `choicesFrom` 的字段由宿主枚举候选（如已注册服务器），
+/// 渲染成单选 / 多选，当前值即使不在候选里也会追加，保证看得见。
 fn prompt_setup_field(
     field: &ResolvedSetupField,
     printer: Printer,
     existing: Option<&Value>,
+    servers: &[String],
 ) -> Result<Option<Value>> {
     let lang = printer.lang();
+    let offered = setup_options(field, servers);
+    let select = !offered.is_empty();
     let keeps = existing.is_some_and(|value| !value_is_empty(value));
-    let help = setup_help(field, keeps && is_free_form(&field.kind), lang);
-    // 已有值时不预填；否则只把 schema 默认值作为提示
+    let help = setup_help(field, keeps && !select, select, lang);
     let default_text = if keeps {
         String::new()
     } else {
         setup_default_text(field)
     };
-    let value = match &field.kind {
+    match &field.kind {
         SetupKind::Boolean => {
             let default = existing
                 .and_then(Value::as_bool)
                 .or_else(|| field.default.as_ref().and_then(Value::as_bool))
                 .unwrap_or(false);
-            json!(crate::prompts::select_bool_with_help(
+            Ok(Some(json!(crate::prompts::select_bool_with_help(
                 lang,
                 &field.label,
                 default,
                 &help
-            )?)
+            )?)))
         }
-        SetupKind::Text { choices } if !choices.is_empty() => {
-            let default = existing
-                .and_then(Value::as_str)
-                .or_else(|| field.default.as_ref().and_then(Value::as_str));
-            let picked =
-                crate::prompts::select_choice(lang, &field.label, choices, default, &help)?;
-            json!(picked)
-        }
-        SetupKind::Text { .. } => {
-            let input = if field.secret {
-                crate::prompts::input_secret(lang, &field.label, &help)?
-            } else {
-                crate::prompts::input_text(lang, &field.label, &default_text, &help)?
-            };
-            if input.is_empty() {
-                return Ok(None);
-            }
-            json!(input)
-        }
+        SetupKind::Text { .. } if select => select_one(field, lang, existing, offered, &help),
+        SetupKind::Text { .. } => prompt_text(field, lang, &default_text, &help),
         SetupKind::Integer => {
             let input = crate::prompts::input_text(lang, &field.label, &default_text, &help)?;
             if input.trim().is_empty() {
                 return Ok(None);
             }
             // 解析失败也交给 schema 复校验，统一走「重输」分支
-            match input.trim().parse::<i64>() {
+            Ok(Some(match input.trim().parse::<i64>() {
                 Ok(number) => json!(number),
                 Err(_) => json!(input.trim()),
-            }
+            }))
         }
         SetupKind::Number => {
             let input = crate::prompts::input_text(lang, &field.label, &default_text, &help)?;
             if input.trim().is_empty() {
                 return Ok(None);
             }
-            match input.trim().parse::<f64>() {
+            Ok(Some(match input.trim().parse::<f64>() {
                 Ok(number) => json!(number),
                 Err(_) => json!(input.trim()),
+            }))
+        }
+        SetupKind::StringList { .. } if select => {
+            select_list(field, lang, existing, offered, &help)
+        }
+        SetupKind::StringList { .. } => prompt_list(field, lang, &default_text, &help),
+    }
+}
+
+/// 字段的可选项：声明 `choicesFrom` 用宿主动态列表，否则用静态 `choices`
+///
+/// 动态来源没有可选项时退回静态声明（通常为空 → 自由输入），这样装机时
+/// 还没有任何服务器也不会把安装卡死。
+fn setup_options<'a>(field: &'a ResolvedSetupField, servers: &'a [String]) -> &'a [String] {
+    match (&field.kind, field.choices_from) {
+        (
+            SetupKind::Text { choices } | SetupKind::StringList { choices },
+            Some(ChoicesSource::Servers),
+        ) => {
+            if servers.is_empty() {
+                choices
+            } else {
+                servers
             }
         }
-        SetupKind::StringList { choices } if !choices.is_empty() => {
-            let current = existing
+        (SetupKind::Text { choices } | SetupKind::StringList { choices }, None) => choices,
+        _ => &[],
+    }
+}
+
+/// 单选：候选 + 当前值（即使已不在候选里）＋ schema 默认值定位光标
+fn select_one(
+    field: &ResolvedSetupField,
+    lang: crate::locale::Lang,
+    existing: Option<&Value>,
+    offered: &[String],
+    help: &str,
+) -> Result<Option<Value>> {
+    let current = existing
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(ToOwned::to_owned);
+    let mut options = offered.to_vec();
+    if let Some(value) = current.as_ref()
+        && !options.contains(value)
+    {
+        options.push(value.clone());
+    }
+    let cursor = match current {
+        Some(value) => Some(value),
+        None => field
+            .default
+            .as_ref()
+            .and_then(Value::as_str)
+            .filter(|default| options.iter().any(|option| option.as_str() == *default))
+            .map(ToOwned::to_owned),
+    };
+    let picked =
+        crate::prompts::select_choice(lang, &field.label, &options, cursor.as_deref(), help)?;
+    Ok(Some(json!(picked)))
+}
+
+/// 多选：候选 + 当前值（即使已不在候选里）
+fn select_list(
+    field: &ResolvedSetupField,
+    lang: crate::locale::Lang,
+    existing: Option<&Value>,
+    offered: &[String],
+    help: &str,
+) -> Result<Option<Value>> {
+    let current = existing
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+                .collect::<Vec<_>>()
+        })
+        .or_else(|| {
+            field
+                .default
+                .as_ref()
                 .and_then(Value::as_array)
-                .or_else(|| field.default.as_ref().and_then(Value::as_array))
                 .map(|items| {
                     items
                         .iter()
                         .filter_map(|item| item.as_str().map(ToOwned::to_owned))
                         .collect::<Vec<_>>()
                 })
-                .unwrap_or_default();
-            let picked = crate::prompts::select_many(
-                lang,
-                &field.label,
-                &help,
-                &choices_with_current(choices, &current),
-                &current,
-                field.required,
-            )?;
-            if picked.is_empty() {
-                return Ok(None);
-            }
-            json!(picked)
-        }
-        SetupKind::StringList { .. } => {
-            let input = crate::prompts::input_text(lang, &field.label, &default_text, &help)?;
-            let items = split_list(&input);
-            if items.is_empty() {
-                return Ok(None);
-            }
-            json!(items)
-        }
+        })
+        .unwrap_or_default();
+    let picked = crate::prompts::select_many(
+        lang,
+        &field.label,
+        help,
+        &choices_with_current(offered, &current),
+        &current,
+        field.required,
+    )?;
+    if picked.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(json!(picked)))
+}
+
+/// 自由文本；留空表示跳过（必填项由调用方重问）
+fn prompt_text(
+    field: &ResolvedSetupField,
+    lang: crate::locale::Lang,
+    default_text: &str,
+    help: &str,
+) -> Result<Option<Value>> {
+    let input = if field.secret {
+        crate::prompts::input_secret(lang, &field.label, help)?
+    } else {
+        crate::prompts::input_text(lang, &field.label, default_text, help)?
     };
-    Ok(Some(value))
+    if input.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(json!(input)))
+}
+
+/// 逗号分隔的列表输入
+fn prompt_list(
+    field: &ResolvedSetupField,
+    lang: crate::locale::Lang,
+    default_text: &str,
+    help: &str,
+) -> Result<Option<Value>> {
+    let input = crate::prompts::input_text(lang, &field.label, default_text, help)?;
+    let items = split_list(&input);
+    if items.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(json!(items)))
 }
 
 /// 多选选项 = 声明值 + 当前值里未声明的项
@@ -526,22 +637,18 @@ fn choices_with_current(choices: &[String], current: &[String]) -> Vec<String> {
     offered
 }
 
-/// 自由输入（相对于选择器 / 多选框）的字段：留空才有「保持原值」语义
-fn is_free_form(kind: &SetupKind) -> bool {
-    match kind {
-        SetupKind::Text { choices } | SetupKind::StringList { choices } => choices.is_empty(),
-        SetupKind::Integer | SetupKind::Number => true,
-        SetupKind::Boolean => false,
-    }
-}
-
 /// 帮助行：描述 + 多选操作提示 + 已有值提示
-fn setup_help(field: &ResolvedSetupField, keeps: bool, lang: crate::locale::Lang) -> String {
+fn setup_help(
+    field: &ResolvedSetupField,
+    keeps: bool,
+    select: bool,
+    lang: crate::locale::Lang,
+) -> String {
     let mut parts = Vec::new();
     if let Some(description) = field.description.as_ref().filter(|text| !text.is_empty()) {
         parts.push(description.clone());
     }
-    if matches!(&field.kind, SetupKind::StringList { choices } if !choices.is_empty()) {
+    if select && matches!(field.kind, SetupKind::StringList { .. }) {
         parts.push(
             crate::i18n::pick(lang, "空格切换、回车确认", "space toggles, enter confirms").clone(),
         );
@@ -1975,6 +2082,27 @@ mod tests {
         assert_eq!(choices_with_current(&choices, &choices), choices);
     }
 
+    /// `choicesFrom` 没有可选项时退回自由输入，不能把安装卡死
+    #[test]
+    fn dynamic_options_fall_back_when_host_has_none() {
+        let field = ResolvedSetupField {
+            path: "qq.server".to_owned(),
+            label: "入站服务器".to_owned(),
+            description: None,
+            required: true,
+            secret: false,
+            default: None,
+            choices_from: Some(ChoicesSource::Servers),
+            kind: SetupKind::Text {
+                choices: Vec::new(),
+            },
+            schema: json!({ "type": "string" }),
+        };
+        let servers = vec!["survival".to_owned()];
+        assert_eq!(setup_options(&field, &servers), &servers[..]);
+        assert!(setup_options(&field, &[]).is_empty());
+    }
+
     fn report(start: bool, missing: &[&str]) -> SetupReport {
         SetupReport {
             configured: Vec::new(),
@@ -2013,6 +2141,7 @@ mod tests {
             required: true,
             secret: false,
             default: None,
+            choices_from: None,
             kind: SetupKind::Text {
                 choices: Vec::new(),
             },

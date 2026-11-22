@@ -37,6 +37,23 @@ pub(crate) fn open_registry() -> Result<Arc<ServerRegistry>> {
     bootstrap::open_registry_with_remotes()
 }
 
+/// 已注册服务器名，用于安装向导的动态选项
+///
+/// 读不到列表（未初始化、远端不可达）时返回空：向导会退回手动输入，
+/// 而不是让整个安装失败。
+#[must_use]
+pub(crate) fn server_names() -> Vec<String> {
+    open_registry()
+        .and_then(|reg| reg.list().map_err(anyhow::Error::from))
+        .map(|servers| {
+            servers
+                .iter()
+                .map(|srv| srv.meta.name.as_str().to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// 缺省工作区选择器：flag > `MCSUP_WORKSPACE` 环境变量 > 当前工作区
 ///
 /// 环境变量在入口统一解析成显式选择器传给 service，service 只认一种口径。

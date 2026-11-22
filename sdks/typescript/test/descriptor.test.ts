@@ -90,6 +90,18 @@ describe("descriptor", () => {
     });
   });
 
+  it("setup 透传 choicesFrom 动态选项来源", () => {
+    const def = {
+      ...chatBridge.definition,
+      setup: {
+        fields: [{ path: "qq.server", required: true, choicesFrom: "servers" }],
+      },
+    } as typeof chatBridge.definition;
+    expect(buildDescriptor(def).setup).toEqual({
+      fields: [{ path: "qq.server", required: true, choicesFrom: "servers" }],
+    });
+  });
+
   it("op 元数据与 display 缺省", () => {
     const d = buildDescriptor(chatBridge.definition);
     const send = d.ops.find((op) => op.id === "send");

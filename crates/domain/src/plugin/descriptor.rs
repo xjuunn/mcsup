@@ -362,6 +362,13 @@ pub struct SetupField {
     /// 列表字段的可选值；声明后向导渲染成多选框
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub choices: Option<Vec<String>>,
+    /// 选项由宿主动态提供（如已注册服务器）；与 `choices` 互斥
+    #[serde(
+        default,
+        rename = "choicesFrom",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub choices_from: Option<ChoicesSource>,
     /// 覆盖 schema 的 `x-mcsup-label`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
@@ -397,10 +404,23 @@ pub struct ResolvedSetupField {
     pub secret: bool,
     /// 默认值（声明优先，其次 schema）
     pub default: Option<serde_json::Value>,
+    /// 选项由宿主动态提供；`None` 表示用 `kind` 里的静态选项
+    pub choices_from: Option<ChoicesSource>,
     /// 输入形态
     pub kind: SetupKind,
     /// 该路径的 schema，用于逐项复校验
     pub schema: serde_json::Value,
+}
+
+/// setup 字段的动态选项来源
+///
+/// 有些字段的可选值装机器才知道（例如已注册的服务器名）。声明来源后宿主
+/// 在提问时自行枚举，插件不必也不能写死一份会过期的 `choices`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChoicesSource {
+    /// 已注册的服务器名
+    Servers,
 }
 
 /// setup 字段的输入形态
@@ -742,6 +762,38 @@ fn resolve_setup(
     })
 }
 
+/// 校验 `choicesFrom`：与 `choices` 互斥、只能用于字符串字段、不能叠加静态选项
+fn check_choices_source(
+    field: &SetupField,
+    path: &str,
+    kind: &SetupKind,
+) -> Result<(), DescriptorError> {
+    if field.choices_from.is_none() {
+        return Ok(());
+    }
+    let reject = |reason: &str| {
+        Err(DescriptorError::InvalidSetupChoicesFrom {
+            path: path.to_owned(),
+            reason: reason.to_owned(),
+        })
+    };
+    if field.choices.is_some() {
+        return reject("`choices` and `choicesFrom` are mutually exclusive");
+    }
+    if field.secret {
+        return reject("secret fields cannot take options from the host");
+    }
+    match kind {
+        SetupKind::Text { choices } | SetupKind::StringList { choices } if choices.is_empty() => {
+            Ok(())
+        }
+        SetupKind::Text { .. } | SetupKind::StringList { .. } => {
+            reject("field already declares fixed choices")
+        }
+        _ => reject("only string or string-list fields can take options from the host"),
+    }
+}
+
 /// 校验单个 setup 字段，返回可直接展示与提问的解析结果
 fn resolve_setup_field(
     field: &SetupField,
@@ -786,6 +838,7 @@ fn resolve_setup_field(
         }
         (kind, None) => kind,
     };
+    check_choices_source(field, path, &kind)?;
     let label = field
         .label
         .clone()
@@ -832,6 +885,7 @@ fn resolve_setup_field(
         required: field.required,
         secret: field.secret,
         default,
+        choices_from: field.choices_from,
         kind,
         schema: schema.clone(),
     })
@@ -1485,6 +1539,14 @@ pub enum DescriptorError {
         /// 原因
         reason: String,
     },
+    /// `choicesFrom` 声明非法
+    #[error("invalid choicesFrom for setup path {path}: {reason}")]
+    InvalidSetupChoicesFrom {
+        /// 路径
+        path: String,
+        /// 原因
+        reason: String,
+    },
 }
 
 #[cfg(test)]
@@ -1660,6 +1722,76 @@ mod tests {
             parse(value),
             Err(DescriptorError::InvalidSetupChoices { .. })
         ));
+    }
+
+    #[test]
+    fn setup_choices_from_servers_is_resolved() {
+        let mut value = with_config(json!({
+            "server": { "type": "string" },
+            "servers": { "type": "array", "items": { "type": "string" } }
+        }));
+        value["setup"] = json!({
+            "fields": [
+                { "path": "server", "required": true, "choicesFrom": "servers" },
+                { "path": "servers", "choicesFrom": "servers" }
+            ]
+        });
+        let descriptor = parse(value).expect("valid");
+        let setup = descriptor.setup.expect("setup");
+        // 单选：仍然是字符串字段，选项由宿主枚举
+        assert_eq!(
+            setup.fields[0].kind,
+            SetupKind::Text {
+                choices: Vec::new()
+            }
+        );
+        assert_eq!(setup.fields[0].choices_from, Some(ChoicesSource::Servers));
+        // 多选：列表字段同样可以取宿主动态选项
+        assert_eq!(
+            setup.fields[1].kind,
+            SetupKind::StringList {
+                choices: Vec::new()
+            }
+        );
+        assert_eq!(setup.fields[1].choices_from, Some(ChoicesSource::Servers));
+    }
+
+    #[test]
+    fn setup_choices_from_rejects_conflicts() {
+        // 与静态 choices 互斥
+        let mut value = with_config(json!({
+            "servers": { "type": "array", "items": { "type": "string" }, "enum": ["a"] }
+        }));
+        value["setup"] = json!({
+            "fields": [{ "path": "servers", "choices": ["a"], "choicesFrom": "servers" }]
+        });
+        assert!(matches!(
+            parse(value),
+            Err(DescriptorError::InvalidSetupChoicesFrom { .. })
+        ));
+
+        // 只能用于字符串 / 字符串列表
+        let mut value = with_config(json!({ "count": { "type": "integer" } }));
+        value["setup"] = json!({ "fields": [{ "path": "count", "choicesFrom": "servers" }] });
+        assert!(matches!(
+            parse(value),
+            Err(DescriptorError::InvalidSetupChoicesFrom { .. })
+        ));
+
+        // secret 字段不接受宿主选项
+        let mut value = with_config(json!({ "token": { "type": "string" } }));
+        value["setup"] = json!({
+            "fields": [{ "path": "token", "secret": true, "choicesFrom": "servers" }]
+        });
+        assert!(matches!(
+            parse(value),
+            Err(DescriptorError::InvalidSetupChoicesFrom { .. })
+        ));
+
+        // 未知来源被拒绝
+        let mut value = with_config(json!({ "server": { "type": "string" } }));
+        value["setup"] = json!({ "fields": [{ "path": "server", "choicesFrom": "worlds" }] });
+        assert!(parse(value).is_err());
     }
 
     #[test]

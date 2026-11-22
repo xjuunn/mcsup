@@ -10,7 +10,10 @@ use crate::output::Printer;
 use anyhow::{Context, Result};
 use inquire::autocompletion::Replacement;
 use inquire::validator::{ErrorMessage, Validation};
-use inquire::{Autocomplete, Confirm, CustomUserError, MultiSelect, Password, Select, Text};
+use inquire::{
+    Autocomplete, Confirm, CustomUserError, MultiSelect, Password, PasswordDisplayMode, Select,
+    Text,
+};
 use mcsup::domain::workspace::WorkspaceName;
 use mcsup::port::RemoteName;
 use mcsup::service::{MARKER_FILE, NOISE_ENTRIES, absolute_path};
@@ -565,7 +568,11 @@ pub(crate) fn select_many(
 /// 读取终端输入失败时返回底层错误
 pub(crate) fn input_secret(lang: Lang, label: &str, help: &str) -> Result<String> {
     crate::input::discard_pending_input();
-    let mut prompt = Password::new(label).without_confirmation();
+    let mut prompt = Password::new(label)
+        .without_confirmation()
+        // inquire 默认 Hidden：一个字符都不显示，用户会以为键盘没反应。
+        // Masked 让每输入一个字符显示一个 `*`，长度可见但内容不可见。
+        .with_display_mode(PasswordDisplayMode::Masked);
     if !help.is_empty() {
         prompt = prompt.with_help_message(help);
     }

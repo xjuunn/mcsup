@@ -92,6 +92,11 @@ export interface SetupFieldSpec {
   readonly default?: unknown;
   /** 列表字段的可选值；声明后向导渲染成多选框（仅数组字符串字段） */
   readonly choices?: readonly string[];
+  /**
+   * 选项由宿主枚举（`servers`：已注册的服务器名）；字符串字段渲染成单选，
+   * 字符串列表渲染成多选。与 `choices` 互斥；宿主没有可选项时退回自由输入。
+   */
+  readonly choicesFrom?: "servers";
 }
 
 /** 安装向导：声明一次「装完即用」需要问哪些值 */
