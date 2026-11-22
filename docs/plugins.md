@@ -2255,6 +2255,11 @@ mcsup __plugin-host --data-dir <path> [--idle-timeout <secs>]   # 隐藏
   （descriptor `bind.servers`）：启动前先起插件，停机后停止已无绑定服务器在
   跑的插件。插件启停失败只告警，不影响服务器本身；kit、远端 agent 与插件
   自触发的服务器启停不参与该编排。
+- 控制台 `stop`、游戏内 `/stop`、崩溃退出都不经过 CLI，因此常驻
+  `__plugin-host` 每秒检查一次绑定服务器的实时状态：绑定集合全部停下（连续
+  两轮确认，且此前确实见过其中一台在跑）后由宿主自行停止插件，效果与
+  `server stop` 的编排一致。插件刚拉起、服务器还没进入 Starting 的启动窗口
+  不算停机。
 - 绑定插件的生命周期归服务器，手动命令不能绕开：绑定的服务器全部处于停止
   状态时，`plugin install` / `update` / `setup` / `start` / `restart` 不会把
   插件拉起来，还会顺手收掉残留的运行进程，并提示「运行 `mcsup server start

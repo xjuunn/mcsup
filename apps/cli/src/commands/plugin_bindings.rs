@@ -9,12 +9,22 @@ use crate::commands::plugin_host;
 use crate::output::Printer;
 use mcsup::bootstrap::Mcsup;
 use mcsup::domain::plugin::PluginId;
+use mcsup::plugin::PluginHost;
+use mcsup::port::plugin::PluginSupervisor;
 use mcsup::service::{PluginBindings, PluginService, ServerLifecycleService};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// 停止插件的宽限：网络类插件需要时间收尾
 const STOP_GRACE: Duration = Duration::from_secs(10);
+
+/// 常驻宿主检查绑定服务器的间隔
+///
+/// 与 `console_events` 的 200 ms 轮询不同，这里只探 supervisor 状态；1 秒足以
+/// 让「服务器停了、桥还挂着」的窗口短到用户感知不到，又不会为每台服务器每秒
+/// 发多次 IPC。
+const WATCH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// 手动启动前对绑定插件的门禁
 ///
@@ -216,5 +226,196 @@ impl BoundPlugins {
             Ok(()) => printer.print_note(&format!("已停止插件 {id}（绑定的服务器都已停止）")),
             Err(err) => printer.print_warning(&format!("停止插件 {id} 失败：{err}")),
         }
+    }
+}
+
+/// 常驻宿主的绑定看门狗：绑定服务器全停后收掉插件
+///
+/// `server start/stop/restart` 的编排只在 CLI 命令里执行；控制台 `stop`、游戏
+/// 内 `/stop`、服务端崩溃退出都不经过 CLI，插件宿主是唯一常驻的观察者。不补
+/// 这一步，桥就会在服务器停掉后一直空转（见 §18.1）。
+///
+/// 线程持有宿主的弱引用：宿主关停即自行退出，不在 `Drop` 里等待。
+pub(crate) fn spawn_watch(
+    host: &Arc<PluginHost>,
+    plugins: PluginService,
+    lifecycle: ServerLifecycleService,
+) {
+    let weak = Arc::downgrade(host);
+    std::thread::spawn(move || {
+        let mut watch = IdleWatch::default();
+        loop {
+            std::thread::sleep(WATCH_INTERVAL);
+            let Some(host) = weak.upgrade() else {
+                return;
+            };
+            if host.is_shutting_down() {
+                return;
+            }
+            let Ok(bindings) = plugins.bindings() else {
+                // 读不出绑定清单是瞬时故障：保留观察状态，下一轮再试
+                continue;
+            };
+            let alive = alive_bound(&lifecycle, &bindings);
+            for id in watch.next(&bindings, &alive) {
+                stop_if_running(host.as_ref(), &id);
+            }
+        }
+    });
+}
+
+/// 「绑定服务器全停」的连续观察
+///
+/// 两道闸：
+///
+/// 1. 必须在更早的轮次里真的见过它绑定的服务器在运行（`armed`）：`server
+///    start` 先拉插件再拉服务器，启动窗口里「插件在跑、服务器还是 stopped」
+///    不是停机；
+/// 2. 同一结论要连续两轮（`idle`），避开状态探测的抖动。
+#[derive(Debug, Default)]
+struct IdleWatch {
+    /// 见过绑定服务器运行的插件
+    armed: BTreeSet<PluginId>,
+    /// 上一轮所有绑定服务器都没在运行的插件
+    idle: BTreeSet<PluginId>,
+}
+
+impl IdleWatch {
+    /// 本轮应当停止的插件；同时滚动观察状态
+    fn next(&mut self, bindings: &PluginBindings, alive: &BTreeSet<String>) -> Vec<PluginId> {
+        // 插件被卸载后不会再来：清掉残留的 id，长驻宿主的观察集合不无限增长
+        self.armed
+            .retain(|id| bindings.active.iter().any(|binding| &binding.id == id));
+        let mut idle = BTreeSet::new();
+        for binding in &bindings.active {
+            if binding.servers.iter().any(|name| alive.contains(name)) {
+                self.armed.insert(binding.id.clone());
+            } else if self.armed.contains(&binding.id) {
+                idle.insert(binding.id.clone());
+            }
+        }
+        let stop = idle.intersection(&self.idle).cloned().collect::<Vec<_>>();
+        self.idle = idle;
+        stop
+    }
+}
+
+/// 绑定集合里当前在运行的服务器
+///
+/// 一次批量探测取全部状态；探测失败按「仍在运行」处理，宁可晚一点收桥，也不
+/// 在服务器还活着时停掉插件。已注销的绑定服务器不在结果里，按停止处理。
+fn alive_bound(lifecycle: &ServerLifecycleService, bindings: &PluginBindings) -> BTreeSet<String> {
+    let names = bindings
+        .active
+        .iter()
+        .flat_map(|binding| binding.servers.iter().cloned())
+        .collect::<HashSet<_>>();
+    if names.is_empty() {
+        return BTreeSet::new();
+    }
+    let Ok(statuses) = lifecycle.statuses_for(&names) else {
+        return names.into_iter().collect();
+    };
+    statuses
+        .into_iter()
+        .filter_map(|(name, result)| match result {
+            Ok(Some(status)) if !status.status.is_alive() => None,
+            Ok(None) => None,
+            // 单台探测报错：按仍在运行处理，不误收
+            Ok(Some(_)) | Err(_) => Some(name),
+        })
+        .collect()
+}
+
+/// 只在插件确实有会话时下发 stop；状态读不出来就等下一轮
+fn stop_if_running(host: &dyn PluginSupervisor, id: &PluginId) {
+    let running = host.status(id).is_ok_and(|status| status.session.is_some());
+    if !running {
+        return;
+    }
+    if let Err(err) = host.stop(id, STOP_GRACE) {
+        tracing::warn!(plugin = %id, error = %err, "stop plugin after its bound servers exited");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, reason = "测试夹具，失败直接 panic 才有用")]
+
+    use super::*;
+    use mcsup::service::PluginBinding;
+
+    fn binding(id: &str, servers: &[&str]) -> PluginBinding {
+        PluginBinding {
+            id: PluginId::parse(id).expect("id"),
+            servers: servers.iter().map(|name| (*name).to_owned()).collect(),
+        }
+    }
+
+    fn watch(bindings: Vec<PluginBinding>) -> (IdleWatch, PluginBindings) {
+        (
+            IdleWatch::default(),
+            PluginBindings {
+                active: bindings,
+                skipped: Vec::new(),
+            },
+        )
+    }
+
+    fn names(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    /// 先见过服务器在跑，再连续两轮全停才收；单轮抖动不动手
+    #[test]
+    fn stops_after_seeing_the_server_alive_and_two_idle_rounds() {
+        let (mut watch, bindings) = watch(vec![binding("chat-bridge", &["test1"])]);
+        assert!(watch.next(&bindings, &names(&["test1"])).is_empty());
+        assert!(watch.next(&bindings, &names(&["test1"])).is_empty());
+        // 服务器刚进入终态：第一轮只记下空闲
+        assert!(watch.next(&bindings, &names(&[])).is_empty());
+        // 第二轮仍然是全停 → 收插件
+        assert_eq!(
+            watch.next(&bindings, &names(&[])),
+            vec![PluginId::parse("chat-bridge").expect("id")]
+        );
+        // 状态保持空闲时每轮都会返回：调用方按「是否真有会话」幂等，瞬时
+        // stop 失败下一轮还会重试
+        assert_eq!(watch.next(&bindings, &names(&[])).len(), 1);
+    }
+
+    /// 从没见过服务器在跑（`server start` 的启动窗口）不算停机
+    #[test]
+    fn never_stops_a_plugin_that_has_not_served_a_live_server() {
+        let (mut watch, bindings) = watch(vec![binding("chat-bridge", &["test1"])]);
+        for _ in 0..4 {
+            assert!(watch.next(&bindings, &names(&[])).is_empty());
+        }
+    }
+
+    /// 多服务器绑定：任一台还在跑就不收
+    #[test]
+    fn keeps_the_plugin_while_any_bound_server_runs() {
+        let (mut watch, bindings) = watch(vec![binding("chat-bridge", &["test1", "test2"])]);
+        assert!(watch.next(&bindings, &names(&["test2"])).is_empty());
+        assert!(
+            watch
+                .next(&bindings, &names(&["test1", "test2"]))
+                .is_empty()
+        );
+        for _ in 0..3 {
+            assert!(watch.next(&bindings, &names(&["test2"])).is_empty());
+        }
+    }
+
+    /// 服务器又起来了：连续空闲被打断，重新计数
+    #[test]
+    fn a_returning_server_resets_the_idle_streak() {
+        let (mut watch, bindings) = watch(vec![binding("chat-bridge", &["test1"])]);
+        assert!(watch.next(&bindings, &names(&["test1"])).is_empty());
+        assert!(watch.next(&bindings, &names(&[])).is_empty());
+        assert!(watch.next(&bindings, &names(&["test1"])).is_empty());
+        assert!(watch.next(&bindings, &names(&[])).is_empty());
+        assert_eq!(watch.next(&bindings, &names(&[])).len(), 1);
     }
 }

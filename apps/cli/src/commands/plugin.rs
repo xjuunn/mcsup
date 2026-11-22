@@ -6,7 +6,7 @@
 
 use crate::bootstrap;
 use crate::cli::{PluginAction, PluginConfigAction, PluginRevocationAction};
-use crate::commands::plugin_bindings::{BoundPlugins, StartGate};
+use crate::commands::plugin_bindings::{BoundPlugins, StartGate, spawn_watch};
 use crate::commands::plugin_host;
 use crate::config;
 use crate::diagnostic::AppDiagnostic;
@@ -103,6 +103,9 @@ pub(crate) fn run_host(data_dir: Option<PathBuf>, idle_timeout: u64) -> Result<(
     })?;
     host.spawn_idle_reaper();
     host.spawn_console_events();
+    // 控制台 / 游戏内的 stop 不经过 CLI 编排：由常驻宿主补上「服务器全停 →
+    // 收插件」，否则桥会在服务器停掉后一直空转
+    spawn_watch(&host, mcsup.plugins.clone(), mcsup.lifecycle.clone());
     let control = Arc::new(mcsup::plugin::HostControl::new(
         Arc::clone(&host) as Arc<dyn mcsup::port::plugin::PluginSupervisor>,
         Arc::clone(&mcsup.plugin_store),
