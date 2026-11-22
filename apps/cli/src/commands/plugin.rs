@@ -446,7 +446,7 @@ fn prompt_setup_field(
     let offered = setup_options(field, servers);
     let select = !offered.is_empty();
     let keeps = existing.is_some_and(|value| !value_is_empty(value));
-    let help = setup_help(field, keeps && !select, select, lang);
+    // 提问下面不再渲染任何提示行：字段含义由 label 表达，向导保持一行一问。
     let default_text = if keeps {
         String::new()
     } else {
@@ -462,13 +462,13 @@ fn prompt_setup_field(
                 lang,
                 &field.label,
                 default,
-                &help
+                ""
             )?)))
         }
-        SetupKind::Text { .. } if select => select_one(field, lang, existing, offered, &help),
-        SetupKind::Text { .. } => prompt_text(field, lang, &default_text, &help),
+        SetupKind::Text { .. } if select => select_one(field, lang, existing, offered, ""),
+        SetupKind::Text { .. } => prompt_text(field, lang, &default_text, ""),
         SetupKind::Integer => {
-            let input = crate::prompts::input_text(lang, &field.label, &default_text, &help)?;
+            let input = crate::prompts::input_text(lang, &field.label, &default_text, "")?;
             if input.trim().is_empty() {
                 return Ok(None);
             }
@@ -479,7 +479,7 @@ fn prompt_setup_field(
             }))
         }
         SetupKind::Number => {
-            let input = crate::prompts::input_text(lang, &field.label, &default_text, &help)?;
+            let input = crate::prompts::input_text(lang, &field.label, &default_text, "")?;
             if input.trim().is_empty() {
                 return Ok(None);
             }
@@ -488,10 +488,8 @@ fn prompt_setup_field(
                 Err(_) => json!(input.trim()),
             }))
         }
-        SetupKind::StringList { .. } if select => {
-            select_list(field, lang, existing, offered, &help)
-        }
-        SetupKind::StringList { .. } => prompt_list(field, lang, &default_text, &help),
+        SetupKind::StringList { .. } if select => select_list(field, lang, existing, offered, ""),
+        SetupKind::StringList { .. } => prompt_list(field, lang, &default_text, ""),
     }
 }
 
@@ -636,35 +634,6 @@ fn choices_with_current(choices: &[String], current: &[String]) -> Vec<String> {
         }
     }
     offered
-}
-
-/// 帮助行：描述 + 多选操作提示 + 已有值提示
-fn setup_help(
-    field: &ResolvedSetupField,
-    keeps: bool,
-    select: bool,
-    lang: crate::locale::Lang,
-) -> String {
-    let mut parts = Vec::new();
-    if let Some(description) = field.description.as_ref().filter(|text| !text.is_empty()) {
-        parts.push(description.clone());
-    }
-    if select && matches!(field.kind, SetupKind::StringList { .. }) {
-        parts.push(
-            crate::i18n::pick(lang, "空格切换、回车确认", "space toggles, enter confirms").clone(),
-        );
-    }
-    if keeps {
-        parts.push(
-            crate::i18n::pick(
-                lang,
-                "已设置；留空保持不变",
-                "already set; leave blank to keep it",
-            )
-            .clone(),
-        );
-    }
-    parts.join("；")
 }
 
 /// schema 默认值渲染成输入框提示文本
