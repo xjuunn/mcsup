@@ -51,6 +51,9 @@ struct Shared {
     view: Mutex<View>,
     pid: u32,
     log: Arc<Mutex<BufWriter<std::fs::File>>>,
+    /// 服务端进程树的 Job Object（Windows）；只靠 Drop 生效，不读字段
+    #[allow(dead_code)]
+    job: Option<crate::job::JobObject>,
 }
 
 /// 锁中毒不丢数据：本进程内锁内容总是自洽的
@@ -356,6 +359,16 @@ where
             return Err(1);
         }
     };
+    // 服务端进程树挂进 kill-on-close 的 Job Object：supervisor 若被外部结束，
+    // 内核随句柄回收一并终止 JVM，不留锁住 world/session.lock 的孤儿进程。
+    // 失败只记录，不影响本次启动（没有 Job 只是回到旧行为）。
+    let job = match crate::job::JobObject::assign(&child) {
+        Ok(job) => Some(job),
+        Err(err) => {
+            supervisor_note(&format!("assign job object failed: {err}"));
+            None
+        }
+    };
     let pid = child.id();
     if let Err(err) = std::fs::write(endpoint::pid_path(server_dir), pid.to_string()) {
         supervisor_note(&format!("write pid file failed: {err}"));
@@ -377,6 +390,7 @@ where
         }),
         pid,
         log,
+        job,
     });
 
     if let Some(stdout) = stdout {

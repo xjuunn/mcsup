@@ -2042,6 +2042,7 @@ dependencies = [
  "signal-hook",
  "tempfile",
  "tracing",
+ "win32job",
 ]
 
 [[package]]
