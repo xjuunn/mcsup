@@ -93,17 +93,21 @@ impl EventBus {
         let at = event_at(&event).unwrap_or(&at).to_owned();
         let server = event_server(&event).map(ToOwned::to_owned);
         let data = event_payload(&event);
-        let Ok(mut entries) = self.entries.lock() else {
-            return;
+        let targets: Vec<Arc<dyn EventDelivery>> = {
+            let Ok(mut entries) = self.entries.lock() else {
+                return;
+            };
+            entries.retain(|entry| entry.target.strong_count() > 0);
+            entries
+                .iter()
+                .filter(|entry| entry.subscriptions.contains(&kind))
+                .filter_map(|entry| entry.target.upgrade())
+                .collect()
         };
-        entries.retain(|entry| entry.target.strong_count() > 0);
-        for entry in entries.iter() {
-            if !entry.subscriptions.contains(&kind) {
-                continue;
-            }
-            if let Some(target) = entry.target.upgrade() {
-                target.deliver(kind, &at, server.as_deref(), data.clone());
-            }
+        // 投递不持有订阅表锁：一个慢插件（写超时前最多阻塞 10 s）不能
+        // 把其他订阅者、订阅/退订一起冻住。
+        for target in targets {
+            target.deliver(kind, &at, server.as_deref(), data.clone());
         }
     }
 

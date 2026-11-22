@@ -50,7 +50,7 @@
 - 事件链路：常驻宿主跟随 `console.log`，发布 `console:line` 与解析出的
   `chat:message` / `player:joined` / `player:left`。
 - 安装与升级：按 id 安装锁；升级先停进程、保留 `enabled` 与仍声明的授权、
-  默认保留 2 个版本（`--prune` 只留当前）；`update --to` 切换到已安装的
+  默认保留 2 个版本（`--prune` 清得更旧，但始终留下 `previous_version`）；`update --to` 切换到已安装的
   版本（`PluginService::activate_version`）。
 - op 执行约束：宿主按 descriptor 校验输入 schema，超时取 descriptor 声明的
   `timeout_ms`；授权判定收敛到 `PluginRecord::grant_capability` /
@@ -168,7 +168,7 @@
 | Builder | `query` / `action` / `stream` / `op` / `lineFilter`，产物是内核可接受的片段 |
 | Hooks | `useConsoleTail` / `useRetry` / `useKvCache` / `useEvents`，签名 `useX(ctx, options)` |
 | 类型安全 | 能力驱动 `ctx`（未声明即编译期不存在）、zod v4 唯一 schema 层、输出 schema 双向校验、`PluginError` 统一错误 |
-| 协议 | 帧编解码、深度与 1 MiB 限制、握手、调用、流（seq / done / cancel）、config、ping/pong、shutdown、退出码 0/1/2/3/4 |
+| 协议 | 帧编解码、深度与 24 MiB 限制、握手、调用、流（seq / done / cancel）、config、ping/pong、shutdown、退出码 0/1/2/3/4 |
 | 构建 | `mcsup-plugin build`：tsc → `--mcsup-dump-descriptor` → 打包 + 平台启动器 |
 | 测试 | 101 用例：协议、descriptor 归一化与校验、Builder 类型、Hooks、MockHost、真实进程、`sdks/conformance`（schema 12 条 + frames 6 条 + cases 13 条） |
 | 门禁 | `scripts/check-sdk.sh`（已接入 `scripts/check.sh` 的 `sdk` 步骤；含 `npm run conformance` 与契约「生成一致」） |

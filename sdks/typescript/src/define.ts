@@ -70,6 +70,27 @@ export type EventHandler<C extends readonly Capability[], Cfg extends SchemaLike
   meta: EventMeta,
 ) => void | Promise<void>;
 
+/** 契约调用的元信息（宿主投递 `contract.call` 时带上，plugins.md §6.4） */
+export interface ContractCallMeta {
+  /** 发起方插件 id */
+  readonly caller: string;
+  /** 调用链令牌；根调用没有，嵌套调用必须原样带回 */
+  readonly trace?: string;
+  /** 广播调用的目标提供方（单播时省略） */
+  readonly target?: string;
+}
+
+/**
+ * 契约处理函数。
+ *
+ * 只在本插件 `provides` 里声明过的契约才会被分派到这里；宿主负责能力门、
+ * 循环与深度判定。
+ */
+export type ContractHandler<
+  C extends readonly Capability[] = readonly Capability[],
+  Cfg extends SchemaLike = z.ZodType,
+> = (input: unknown, ctx: PluginContext<C, Cfg>, call: ContractCallMeta) => unknown | Promise<unknown>;
+
 /** 事件订阅声明：`kind` 或 `{kind, handler}` */
 export type Subscription<
   C extends readonly Capability[] = readonly Capability[],
@@ -148,6 +169,8 @@ export interface PluginDefinition<
   readonly net?: { readonly allow: readonly string[] };
   readonly provides?: readonly string[];
   readonly consumes?: readonly string[];
+  /** 本插件提供的契约处理函数；键必须出现在 `provides` 中 */
+  readonly contracts?: Readonly<Record<string, ContractHandler<C, Cfg>>>;
   readonly publisher?: { readonly name: string; readonly url?: string };
   /** 配置 schema；热更新用同一 schema 校验 */
   readonly config: Cfg;
@@ -196,6 +219,14 @@ export function definePlugin<const C extends readonly Capability[], Id extends s
   }
   if (def.net?.allow !== undefined && !(def.capabilities as readonly string[]).includes("net:outbound")) {
     throw new Error("net.allow requires the net:outbound capability");
+  }
+  if (def.contracts !== undefined) {
+    const provided = new Set(def.provides ?? []);
+    for (const name of Object.keys(def.contracts)) {
+      if (!provided.has(name)) {
+        throw new Error(`contract handler ${name} must be declared in provides`);
+      }
+    }
   }
   for (const group of [def.queries, def.actions, def.streams] as const) {
     if (group === undefined) {

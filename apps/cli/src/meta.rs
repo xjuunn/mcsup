@@ -1331,7 +1331,10 @@ pub(crate) fn plugin_keep_secrets_arg() -> &'static str {
 
 #[must_use]
 pub(crate) fn plugin_grace_arg() -> &'static str {
-    t("优雅退出等待秒数", "graceful shutdown timeout in seconds")
+    t(
+        "优雅退出等待秒数（最大 3600，超过按用法错误拒绝）",
+        "graceful shutdown timeout in seconds (max 3600; larger values are rejected as a usage error)",
+    )
 }
 
 #[must_use]

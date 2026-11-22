@@ -21,7 +21,7 @@ use domain::plugin::event::Subscription;
 use domain::plugin::state::{PluginEvent, PluginState};
 use port::plugin::{
     AuditEvent, AuditResult, AuditSink, HostError, PluginConfigStore, PluginRecord,
-    PluginRuntimeStatus, PluginStore, PluginSupervisor, SessionInfo, StreamSink,
+    PluginRevocations, PluginRuntimeStatus, PluginStore, PluginSupervisor, SessionInfo, StreamSink,
 };
 use protocol::plugin::{ConfigValues, WelcomeLimits};
 use serde_json::Value;
@@ -84,6 +84,13 @@ pub struct PluginHost {
     sessions: Mutex<HashMap<PluginId, Arc<SessionInner>>>,
     starting: Mutex<HashSet<PluginId>>,
     crashes: Mutex<HashMap<PluginId, Crashes>>,
+    /// 正在退避等待自动重启的插件
+    ///
+    /// `stop` 与手动 `start` 会把它摘掉，退避线程醒来看到「已不在表里」就
+    /// 放弃重启；否则一次用户停机之后插件还会被旧线程悄悄拉起。
+    pending_restarts: Mutex<HashSet<PluginId>>,
+    /// 撤销列表；`None` 表示本次装配没有接入（测试与内嵌场景）
+    revocations: Mutex<Option<Arc<dyn PluginRevocations>>>,
     shutting_down: AtomicBool,
     /// 空闲停止阈值；同 [`Self::heartbeat`]，只能经锁改写
     idle_after: Mutex<Duration>,
@@ -143,6 +150,8 @@ impl PluginHost {
             sessions: Mutex::new(HashMap::new()),
             starting: Mutex::new(HashSet::new()),
             crashes: Mutex::new(HashMap::new()),
+            pending_restarts: Mutex::new(HashSet::new()),
+            revocations: Mutex::new(None),
             shutting_down: AtomicBool::new(false),
             idle_after: Mutex::new(IDLE_STOP_AFTER),
             heartbeat: Mutex::new(Heartbeat::default()),
@@ -176,6 +185,23 @@ impl PluginHost {
             .heartbeat
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// 接入撤销列表（组合根注入）
+    ///
+    /// 启动前查询，命中即拒绝；列表本身读不出来只记审计、不阻断已安装
+    /// 插件（`docs/plugins.md` §16.4）。与 [`Self::with_heartbeat`] 同理，
+    /// 经锁写入以避开 `Arc` 的共享限制。
+    #[must_use]
+    pub fn with_revocations(self: Arc<Self>, revocations: Arc<dyn PluginRevocations>) -> Arc<Self> {
+        {
+            let mut slot = self
+                .revocations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *slot = Some(revocations);
+        }
+        self
     }
 
     /// 心跳节奏（测试断言覆盖值是否生效）
@@ -391,6 +417,16 @@ impl PluginHost {
 
     #[allow(clippy::too_many_lines)] // 取记录、建端点、拉进程、握手是一段不可拆的序列
     fn start_session(&self, id: &PluginId) -> Result<Arc<SessionInner>, HostError> {
+        // 先看会话表：崩溃退避线程可能和手动 `start` 同时走到这里，
+        // 只有这一处检查能在拉起第二个进程之前拦住它。
+        if let Some(session) = self.session_of(id) {
+            return Ok(session);
+        }
+        // 手动 `start` 接管时取消退避期的自动重启：退避线程醒来看到自己
+        // 已不在表里就直接退出，不会在已有会话之外再拉一个进程。
+        if let Ok(mut pending) = self.pending_restarts.lock() {
+            pending.remove(id);
+        }
         if self.shutting_down.load(Ordering::SeqCst) {
             return Err(HostError::new(
                 port::plugin::ErrorCode::Unavailable,
@@ -438,6 +474,7 @@ impl PluginHost {
                 "plugin {id} is not enabled; run `mcsup plugin enable {id}`"
             )));
         }
+        self.reject_if_revoked(&record)?;
         // 判定收敛在领域层：从离线状态出发，`StartRequested` 只允许
         // `stopped` / `failed`。`pending_approval` 与 `disabled` 会被拒绝。
         let from = offline_state(&record);
@@ -522,6 +559,16 @@ impl PluginHost {
         match outcome {
             Ok(HandshakeOutcome::Accepted(session)) => {
                 session.attach_process(process);
+                // 握手期间宿主可能开始关停：此时不能再把会话登记进表
+                // （`shutdown_all` 已经取走了快照），直接收掉本次刚拉起的进程。
+                if self.shutting_down.load(Ordering::SeqCst) {
+                    session.kill();
+                    drop(guard);
+                    return Err(HostError::new(
+                        port::plugin::ErrorCode::Unavailable,
+                        "plugin host is shutting down",
+                    ));
+                }
                 session.start();
                 {
                     let mut map = self
@@ -603,24 +650,36 @@ impl PluginHost {
                     return;
                 };
                 if session.is_alive() {
+                    // 进程已退出但读端还没报错：立刻关会话，不等心跳超时
+                    // （默认 15 s × 3 次，退避重启会迟到一个数量级）。
+                    if let Some(reason) = session.reap_exited() {
+                        session.close(&reason);
+                    }
                     continue;
                 }
-                drop(session);
-                host.on_session_exit(&id);
+                host.on_session_exit(&id, &session);
                 return;
             }
         });
     }
 
-    fn on_session_exit(&self, id: &PluginId) {
+    fn on_session_exit(&self, id: &PluginId, session: &Arc<SessionInner>) {
         let (stopped_by_user, close_reason) = {
             let Ok(mut map) = self.sessions.lock() else {
                 return;
             };
-            match map.remove(id) {
-                Some(session) => (session.is_stopping(), session.close_reason()),
-                None => (false, None),
+            match map.get(id) {
+                // 已由新会话接管：旧监管线程既不能删新会话，也不能替它
+                // 退订事件或触发重启。
+                Some(existing) if !Arc::ptr_eq(existing, session) => return,
+                Some(_) => {
+                    map.remove(id);
+                }
+                None => {}
             }
+            // 用会话自己的停机标记：它可能已经被 `reap_idle` / `stop`
+            // 从表里摘掉，但仍然是一次主动停机，不能当崩溃重启。
+            (session.is_stopping(), session.close_reason())
         };
         self.bus.unsubscribe(id);
         if self.shutting_down.load(Ordering::SeqCst) {
@@ -665,6 +724,15 @@ impl PluginHost {
             return;
         }
         let delay = Duration::from_secs(BACKOFF_SECS[(attempts - 1).min(BACKOFF_SECS.len() - 1)]);
+        // 手动 `start` 可能已经抢先拉起新会话，此时不应再退避重启。
+        if self.session_of(id).is_some() {
+            return;
+        }
+        // 登记「等待重启」：`stop` 与手动 `start` 会把它摘掉，本线程醒来
+        // 看到自己已不在表里就放弃，避免用户停机后插件被旧线程拉起来。
+        if let Ok(mut pending) = self.pending_restarts.lock() {
+            pending.insert(id.clone());
+        }
         record_state(
             self.store.as_ref(),
             id,
@@ -683,7 +751,12 @@ impl PluginHost {
             )),
         });
         std::thread::sleep(delay);
-        if self.shutting_down.load(Ordering::SeqCst) {
+        // 被 `stop` / 手动 `start` 取消后不再拉起进程；状态由取消方负责。
+        let still_pending = self
+            .pending_restarts
+            .lock()
+            .is_ok_and(|mut pending| pending.remove(id));
+        if !still_pending || self.shutting_down.load(Ordering::SeqCst) {
             return;
         }
         // 重启失败交给下一次 `start`，不在这里递归重试：超过上限时状态已是
@@ -692,6 +765,41 @@ impl PluginHost {
             let reason = format!("automatic restart failed: {}", err.message);
             record_state(self.store.as_ref(), id, PluginState::Failed, Some(&reason));
         }
+    }
+
+    /// 撤销列表命中即拒绝启动
+    ///
+    /// 列表读不出来只记审计、不阻断（已安装插件的可用性优先，
+    /// `docs/plugins.md` §16.4）；命中才拒绝，并把原因带给调用方。
+    fn reject_if_revoked(&self, record: &PluginRecord) -> Result<(), HostError> {
+        let Some(revocations) = self
+            .revocations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        else {
+            return Ok(());
+        };
+        let list = match revocations.load() {
+            Ok(list) => list,
+            Err(err) => {
+                self.audit.record(&AuditEvent {
+                    at: now_secs(),
+                    plugin: record.id.to_string(),
+                    action: "revocation:read".to_owned(),
+                    capability: None,
+                    result: AuditResult::Failed,
+                    detail: Some(err.message.clone()),
+                });
+                return Ok(());
+            }
+        };
+        let Some(entry) = list.hit(record.id.as_str(), &record.version) else {
+            return Ok(());
+        };
+        Err(HostError::denied(
+            domain::plugin::revocation::revoked_message(entry, &record.version),
+        ))
     }
 
     fn record(&self, id: &PluginId) -> Result<PluginRecord, HostError> {
@@ -761,8 +869,26 @@ impl PluginSupervisor for PluginHost {
     }
 
     fn stop(&self, id: &PluginId, grace: Duration) -> Result<(), HostError> {
+        // 崩溃退避期没有会话，但有一个待执行的重启。取消它，否则 `stop`
+        // 返回成功之后插件还是会被退避线程拉起来。
+        let cancelled = self
+            .pending_restarts
+            .lock()
+            .is_ok_and(|mut pending| pending.remove(id));
         let Some(session) = self.session_of(id) else {
-            return Err(HostError::conflict(format!("plugin {id} is not running")));
+            if !cancelled {
+                return Err(HostError::conflict(format!("plugin {id} is not running")));
+            }
+            record_state(self.store.as_ref(), id, PluginState::Stopped, None);
+            self.audit.record(&AuditEvent {
+                at: now_secs(),
+                plugin: id.to_string(),
+                action: "lifecycle:stop".to_owned(),
+                capability: None,
+                result: AuditResult::Allowed,
+                detail: Some("cancelled a pending restart during crash backoff".to_owned()),
+            });
+            return Ok(());
         };
         // 不在这里摘除会话：监管线程按 `stopping` 标记判定这是用户停机，
         // 先摘掉会让它看到「表里没有」而当作崩溃自动重启。

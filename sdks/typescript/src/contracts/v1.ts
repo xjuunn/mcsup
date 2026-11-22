@@ -13,7 +13,7 @@ export const PROTOCOL_VERSION = 1;
 export const PLUGIN_API_VERSION = 1;
 
 /** 单帧字节上限 */
-export const MAX_FRAME_BYTES = 1048576;
+export const MAX_FRAME_BYTES = 25165824;
 
 /** JSON 嵌套深度上限 */
 export const MAX_JSON_DEPTH = 32;

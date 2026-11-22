@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { MAX_JSON_DEPTH, PROTOCOL_VERSION, ProtocolError, encodeFrame, parseFrame, wireError } from "../src/protocol.js";
+import { MAX_FRAME_BYTES, MAX_JSON_DEPTH, PROTOCOL_VERSION, ProtocolError, encodeFrame, parseFrame, wireError } from "../src/protocol.js";
 
 describe("协议信封", () => {
   it("编码带版本与换行", () => {
@@ -19,8 +19,8 @@ describe("协议信封", () => {
     expect(() => parseFrame('{"v":1}')).toThrow(/missing type/);
   });
 
-  it("超过 1 MiB 拒绝", () => {
-    const huge = `{"v":1,"type":"ping","n":1,"pad":"${"x".repeat(1024 * 1024)}"}`;
+  it("超过 MAX_FRAME_BYTES 拒绝", () => {
+    const huge = `{"v":1,"type":"ping","n":1,"pad":"${"x".repeat(MAX_FRAME_BYTES)}"}`;
     expect(() => parseFrame(huge)).toThrow(/size limit/);
   });
 
@@ -49,7 +49,7 @@ describe("协议信封", () => {
         session_id: "s",
         host_version: "0",
         granted: [],
-        limits: { inflight: 8, frame_bytes: 1048576, event_queue: 1024, log_lines_per_sec: 200 },
+        limits: { inflight: 8, frame_bytes: 25165824, event_queue: 1024, log_lines_per_sec: 200 },
         config: { revision: 1, values: {} },
         scope: { kind: "machine" },
         ...over,

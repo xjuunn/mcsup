@@ -231,7 +231,7 @@ fn pre_loop(selected: Mode) -> io::Result<Option<(BufReader<Stream>, Stream)>> {
         std::thread::sleep(Duration::from_secs(60));
         return Ok(None);
     }
-    // oversize：握手后发 1 MiB + 1 字节超限帧，宿主必须按协议错误终止。
+    // oversize：握手后发 MAX_FRAME_BYTES + 1 字节超限帧，宿主必须按协议错误终止。
     // 超限帧会被宿主断开；继续读只会得到 EOF，直接退出。
     if selected == Mode::Oversize {
         let payload = vec![b'a'; protocol::plugin::MAX_FRAME_BYTES + 1];
@@ -348,7 +348,7 @@ fn handle_call(
 ) -> io::Result<u64> {
     let op = call.op.as_deref().unwrap_or_default();
     match op {
-        "fail" => {
+        "fail" | "stream_fail" => {
             let error =
                 WireError::from_code(PluginErrorCode::InvalidInput, "fixture refused the op");
             let result = ResultFrame::error(call.id, error);

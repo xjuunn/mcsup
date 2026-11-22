@@ -22,6 +22,64 @@
 //! 任何行为，可以逐文件推进、每批都能单独过门禁。
 
 use std::path::Path;
+use std::time::Duration;
+
+/// 跨进程文件锁（内核锁）
+///
+/// 用于把「同一个插件 id 的安装 / 版本切换 / 卸载」串行化。必须是**操作系统
+/// 文件锁**（Unix `flock` / Windows `LockFileEx`），不是「文件存在即持锁」：
+/// 存在性判定在持有者崩溃后只能靠时间戳回收，而「判定残留 → 删文件 → 重建」
+/// 这段窗口里，两个进程可能各自认为拿到了锁。内核锁挂在文件句柄上，进程一死
+/// 就自动释放。
+///
+/// 锁文件**永不删除**：删掉会让等待者在新旧 inode 上各持一把锁，互斥当场
+/// 失效。文件里只写持有者 pid，纯排障用。
+#[derive(Debug)]
+pub(crate) struct FileLock {
+    /// 锁句柄：关闭（含进程崩溃）即释放；字段只为保活
+    _file: std::fs::File,
+}
+
+impl FileLock {
+    /// 抢锁；`timeout` 内拿不到返回 [`std::io::ErrorKind::WouldBlock`]
+    ///
+    /// # Errors
+    ///
+    /// 打不开锁文件（权限、父目录不存在）、超时未拿到锁
+    pub(crate) fn acquire(path: &Path, timeout: Duration) -> std::io::Result<Self> {
+        use std::io::Write as _;
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        let deadline = std::time::Instant::now() + timeout;
+        let mut delay = Duration::from_millis(2);
+        loop {
+            match file.try_lock() {
+                Ok(()) => {
+                    // 内容只是排障线索，写失败不影响持锁
+                    let _ = file.set_len(0);
+                    let _ = writeln!(&file, "pid={}", std::process::id());
+                    return Ok(Self { _file: file });
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            format!("lock busy: waited {timeout:?}, another process holds it"),
+                        ));
+                    }
+                    std::thread::sleep(delay);
+                    delay = (delay * 2).min(Duration::from_millis(50));
+                }
+                Err(std::fs::TryLockError::Error(err)) => return Err(err),
+            }
+        }
+    }
+}
 
 /// 目录删除；目录被占用时补一句可操作提示（Windows `os error 32`）
 ///

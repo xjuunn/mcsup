@@ -10,6 +10,8 @@
 
 import { z } from "./zod.js";
 
+import type { McsupFormat } from "./validate.js";
+
 /**
  * 一个字段。
  *
@@ -64,7 +66,7 @@ export interface FieldOptions {
   /** schema 描述，写入 JSON Schema 的 `description` */
   readonly describe?: string;
   /** 展示格式；标准 JSON Schema 格式请用 `s.datetime` / `s.uuid` / `s.url` */
-  readonly format?: "plain" | "minecraft-text" | "markdown-sanitized" | "datetime" | "duration" | "bytes";
+  readonly format?: McsupFormat;
 }
 
 export interface StringOptions extends FieldOptions {

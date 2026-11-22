@@ -28,7 +28,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Default)]
 struct MemoryStore {
@@ -181,6 +181,7 @@ fn write_fixture_descriptor(artifact_dir: &Path, id: &PluginId) {
             op("stream", "stream", "read"),
             op("stream_gap", "stream", "read"),
             op("fail", "action", "mutating"),
+            op("stream_fail", "stream", "read"),
             op("mute_pong", "action", "mutating"),
             op("call_contract", "action", "mutating"),
         ],
@@ -420,6 +421,152 @@ fn proto_str_004_stream_seq_gap_terminates_the_stream() {
         err.message
     );
     host.stop(&id, Duration::from_secs(2)).expect("stop");
+}
+
+/// 流式调用命中 `Result` 错误：错误必须交给消费者，不能退化成通道断开
+///
+/// 回归：宿主曾在 `Frame::Result` 命中 `Pending::Stream` 时丢掉该帧，
+/// 调用方只能等到超时后看到 `unavailable`，无法得知插件拒绝的原因。
+#[test]
+fn proto_str_005_stream_error_result_is_forwarded_to_the_consumer() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data_dir = dir.path().to_path_buf();
+    let id = fixture_id();
+    let artifact = install_fixture(&data_dir, &id);
+    let store = Arc::new(MemoryStore::default());
+    store
+        .put(&record(&id, artifact, env!("CARGO_PKG_VERSION")))
+        .expect("put record");
+    let host = host(&data_dir, &store);
+
+    host.start(&id).expect("start fixture");
+    let mut sink = CollectSink::default();
+    let err = host
+        .stream(&id, "stream_fail", json!({}), &mut sink)
+        .expect_err("plugin-side failure must surface");
+    assert_eq!(err.code, PluginErrorCode::InvalidInput, "{}", err.message);
+    assert!(
+        err.message.contains("fixture refused"),
+        "error must carry the plugin's reason, got: {}",
+        err.message
+    );
+    assert!(sink.chunks.is_empty(), "no chunk may be delivered");
+
+    host.stop(&id, Duration::from_secs(2)).expect("stop");
+}
+
+/// 终止插件进程（模拟崩溃，不经过 `stop`）
+#[cfg(windows)]
+fn kill_process(pid: u32) {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// 终止插件进程（模拟崩溃，不经过 `stop`）
+#[cfg(unix)]
+fn kill_process(pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .arg("-9")
+        .arg(pid.to_string())
+        .status();
+}
+
+/// 崩溃退避期 `stop` 必须取消待执行的重启
+///
+/// 回归：退避线程按固定时长睡到点就重启，`stop` 因为没有会话返回
+/// `not running`，随后插件又被拉起来——用户明确停机的意图被覆盖。
+#[test]
+fn host_prc_012_stop_cancels_restart_during_crash_backoff() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data_dir = dir.path().to_path_buf();
+    let id = fixture_id();
+    let artifact = install_fixture(&data_dir, &id);
+    let store = Arc::new(MemoryStore::default());
+    store
+        .put(&record(&id, artifact, env!("CARGO_PKG_VERSION")))
+        .expect("put record");
+    let host = host(&data_dir, &store);
+
+    let info = host.start(&id).expect("start fixture");
+    kill_process(info.pid);
+
+    // 崩溃后进入 1 s 退避：记录写明「restarting in」，且会话表里没有会话。
+    // 状态不能用来判断：离线态一律折叠成 `Stopped`（`offline_state`），
+    // 退避窗口只能靠 `last_error` 认出来。
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = host.status(&id).expect("status");
+        let backing_off = status
+            .last_error
+            .as_deref()
+            .is_some_and(|err| err.contains("restarting in"));
+        if backing_off && status.session.is_none() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "plugin did not enter crash backoff in time: {status:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    host.stop(&id, Duration::from_secs(1))
+        .expect("stop during backoff must cancel the pending restart");
+    std::thread::sleep(Duration::from_millis(1600));
+    let status = host.status(&id).expect("status after stop");
+    assert_eq!(status.state, PluginState::Stopped);
+    assert_eq!(host.session_count(), 0, "no process may be restarted");
+}
+
+/// 撤销列表命中时拒绝启动，且不拉起进程
+#[test]
+fn host_prc_013_revoked_version_is_rejected_before_spawn() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data_dir = dir.path().to_path_buf();
+    let id = fixture_id();
+    let artifact = install_fixture(&data_dir, &id);
+    let store = Arc::new(MemoryStore::default());
+    store
+        .put(&record(&id, artifact, env!("CARGO_PKG_VERSION")))
+        .expect("put record");
+    let list = domain::plugin::revocation::RevocationList {
+        schema: domain::plugin::revocation::REVOCATION_SCHEMA,
+        updated_at: 0,
+        entries: vec![domain::plugin::revocation::RevocationEntry {
+            id: id.to_string(),
+            versions: vec![env!("CARGO_PKG_VERSION").to_owned()],
+            reason: Some("security advisory".to_owned()),
+        }],
+    };
+    let revocations = Arc::new(StaticRevocations { list });
+    let host = host(&data_dir, &store).with_revocations(revocations);
+
+    let err = host.start(&id).expect_err("revoked version must not start");
+    assert_eq!(err.code, PluginErrorCode::Denied, "{}", err.message);
+    assert!(
+        err.message.contains("revoked"),
+        "error must explain the revocation, got: {}",
+        err.message
+    );
+    assert_eq!(host.session_count(), 0, "no process may be spawned");
+}
+
+/// 固定内容的撤销列表
+struct StaticRevocations {
+    list: domain::plugin::revocation::RevocationList,
+}
+
+impl port::plugin::PluginRevocations for StaticRevocations {
+    fn load(&self) -> Result<domain::plugin::revocation::RevocationList, HostError> {
+        Ok(self.list.clone())
+    }
+
+    fn store(&self, _list: &domain::plugin::revocation::RevocationList) -> Result<(), HostError> {
+        Ok(())
+    }
 }
 
 /// 回归：`stop` 之后不得被监管线程当作崩溃自动重启

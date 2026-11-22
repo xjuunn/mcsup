@@ -22,7 +22,16 @@ pub const PLUGIN_PROTOCOL_VERSION: u32 = 1;
 pub const PLUGIN_CONTROL_VERSION: u32 = 1;
 
 /// 单帧字节上限
-pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+///
+/// 由「最大内联载荷」推出，不是随手取的值：能力层的 `files:read` 允许
+/// 单文件 16 MiB（`port::plugin::MAX_FILE_BYTES`，写入同理），线上以
+/// base64 传输，膨胀到 `ceil(16 MiB / 3) * 4 ≈ 21.3 MiB`，再加 JSON 字段
+/// 与转义开销。上限低于它，读一个几 MiB 的 jar 就会被对端判成「单帧超限」
+/// 并断开整条连接——调用本身完全合法，却把会话写死。
+///
+/// 两个方向都受这个上限约束（见 [`write_frame`]）：任一侧都不会写出对端
+/// 必然拒绝的帧。
+pub const MAX_FRAME_BYTES: usize = 24 * 1024 * 1024;
 
 /// 单帧 JSON 嵌套深度上限
 pub const MAX_JSON_DEPTH: usize = 32;
@@ -623,15 +632,24 @@ pub enum FrameError {
 
 /// 写出一帧（JSON + 换行 + flush）
 ///
+/// 先序列化到内存再比较 [`MAX_FRAME_BYTES`]：直接往管道里写，超限的行会
+/// 先「写成功」再由对端的行读端拒绝，会话断在一个调用方无从判断的位置。
+///
 /// # Errors
 ///
-/// 序列化或写入失败时返回 [`FrameError`]
+/// 序列化失败、单帧超限或写入失败时返回 [`FrameError`]
 pub fn write_frame<W: Write>(writer: &mut W, frame: &Frame) -> Result<(), FrameError> {
     let value = frame_to_value(frame)?;
-    serde_json::to_writer(&mut *writer, &value).map_err(|err| FrameError::Invalid {
+    let mut line = serde_json::to_vec(&value).map_err(|err| FrameError::Invalid {
         reason: err.to_string(),
     })?;
-    writer.write_all(b"\n")?;
+    if line.len() > MAX_FRAME_BYTES {
+        return Err(FrameError::TooLarge {
+            limit: MAX_FRAME_BYTES,
+        });
+    }
+    line.push(b'\n');
+    writer.write_all(&line)?;
     writer.flush()?;
     Ok(())
 }

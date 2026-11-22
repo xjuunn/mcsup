@@ -279,6 +279,14 @@ export class Session<C extends readonly Capability[], Cfg extends SchemaLike = S
           }
         },
       },
+      contractCaller: async (contract, input, options) => {
+        await this.acquireHostCall();
+        try {
+          return await channel.callContract(contract, input, options);
+        } finally {
+          this.releaseHostCall();
+        }
+      },
       config: () => this.configValues,
       sessionId: "",
       limits: { ...DEFAULT_LIMITS },
@@ -753,8 +761,7 @@ export class Session<C extends readonly Capability[], Cfg extends SchemaLike = S
       return;
     }
     if (frame.op === "contract.call") {
-      // v1 简单处理：未声明契约时明确拒绝，不假装成功
-      this.replyError(frame.id, new PluginError("unsupported", "contract.call is not supported by this plugin"));
+      await this.dispatchContract(frame);
       return;
     }
     const op = this.ops.get(frame.op);
@@ -797,6 +804,60 @@ export class Session<C extends readonly Capability[], Cfg extends SchemaLike = S
         return;
       }
       this.channel.send(result);
+    } catch (err) {
+      this.replyError(frame.id, toPluginError(err));
+    } finally {
+      this.inflight.delete(frame.id);
+      this.notifyInflightIfIdle();
+    }
+  }
+
+  /**
+   * 分派宿主投递的 `contract.call`（plugins.md §6.4 / §12.4）。
+   *
+   * 输入：`{contract, caller, trace?, input}`；输出原样回 result。
+   */
+  private async dispatchContract(frame: CallFrame): Promise<void> {
+    const payload = frame.input;
+    if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+      this.replyError(frame.id, PluginError.invalidInput("contract.call input must be an object"));
+      return;
+    }
+    const record = payload as Record<string, unknown>;
+    const contract = record["contract"];
+    const caller = record["caller"];
+    const trace = record["trace"];
+    if (typeof contract !== "string" || contract === "") {
+      this.replyError(frame.id, PluginError.invalidInput("contract.call requires contract"));
+      return;
+    }
+    if (typeof caller !== "string" || caller === "") {
+      this.replyError(frame.id, PluginError.invalidInput("contract.call requires caller"));
+      return;
+    }
+    if (trace !== undefined && typeof trace !== "string") {
+      this.replyError(frame.id, PluginError.invalidInput("contract.call trace must be a string"));
+      return;
+    }
+    const handler = this.def.contracts?.[contract];
+    if (handler === undefined) {
+      this.replyError(frame.id, PluginError.notFound(`contract ${contract} is not provided by this plugin`));
+      return;
+    }
+    const controller = new AbortController();
+    this.inflight.set(frame.id, controller);
+    try {
+      const output = await raceAbort(
+        Promise.resolve(
+          handler(
+            record["input"],
+            this.ctx,
+            trace === undefined ? { caller } : { caller, trace },
+          ),
+        ),
+        controller.signal,
+      );
+      this.channel.send({ type: "result", id: frame.id, ok: true, output: output ?? null });
     } catch (err) {
       this.replyError(frame.id, toPluginError(err));
     } finally {

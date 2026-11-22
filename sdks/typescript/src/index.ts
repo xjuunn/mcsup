@@ -13,6 +13,8 @@ export { definePlugin } from "./define.js";
 export type {
   BindSpec,
   Capability,
+  ContractCallMeta,
+  ContractHandler,
   DefinedPlugin,
   EventHandler,
   OpSpec,
@@ -44,12 +46,16 @@ export { z } from "./zod.js";
 export type {
   BackupClient,
   ConsoleClient,
+  ConsoleLineEntry,
   ConsolePage,
   ConsoleReadClient,
   ConsoleWriteClient,
   ContentClient,
+  ContentInstallResult,
   ContentItem,
   ContentKind,
+  ContractCallOptions,
+  ContractClient,
   EventMeta,
   EventsClient,
   FileEntry,
@@ -72,6 +78,9 @@ export type {
   SnapshotView,
   StopOutcome,
 } from "./ctx.js";
+
+// 展示格式与标准 JSON Schema 格式的单表来源
+export type { JsonSchemaFormat, McsupFormat } from "./validate.js";
 
 // Builder（次版本可选 API）
 export {

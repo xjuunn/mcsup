@@ -12,9 +12,9 @@ use mcsup::domain::plugin::PluginId;
 use mcsup::plugin::PluginHost;
 use mcsup::port::plugin::PluginSupervisor;
 use mcsup::service::{PluginBindings, PluginService, ServerLifecycleService};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// 停止插件的宽限：网络类插件需要时间收尾
 const STOP_GRACE: Duration = Duration::from_secs(10);
@@ -25,6 +25,14 @@ const STOP_GRACE: Duration = Duration::from_secs(10);
 /// 让「服务器停了、桥还挂着」的窗口短到用户感知不到，又不会为每台服务器每秒
 /// 发多次 IPC。
 const WATCH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 新会话的启动宽限
+///
+/// `server start` 先拉插件再拉服务器，中间那几秒「插件在跑、服务器还没进
+/// `starting`」与「服务器已经停了」在探测结果里长得一模一样。会话身份能区分
+/// 大部分情况（见 [`IdleWatch`]），但插件也可能是上一次启动留下的；宽限就是
+/// 给这段窗口的余量。宽限过后服务器仍没起来，仍旧收掉：不留空转的桥。
+const STARTUP_GRACE: Duration = Duration::from_secs(90);
 
 /// 手动启动前对绑定插件的门禁
 ///
@@ -257,7 +265,8 @@ pub(crate) fn spawn_watch(
                 continue;
             };
             let alive = alive_bound(&lifecycle, &bindings);
-            for id in watch.next(&bindings, &alive) {
+            let sessions = running_sessions(host.as_ref(), &bindings);
+            for id in watch.next(&bindings, &alive, &sessions) {
                 stop_if_running(host.as_ref(), &id);
             }
         }
@@ -266,38 +275,106 @@ pub(crate) fn spawn_watch(
 
 /// 「绑定服务器全停」的连续观察
 ///
-/// 两道闸：
+/// 观察单位是 `(插件, 会话)`，不是插件 id：
 ///
-/// 1. 必须在更早的轮次里真的见过它绑定的服务器在运行（`armed`）：`server
-///    start` 先拉插件再拉服务器，启动窗口里「插件在跑、服务器还是 stopped」
-///    不是停机；
-/// 2. 同一结论要连续两轮（`idle`），避开状态探测的抖动。
-#[derive(Debug, Default)]
+/// 1. `server stop` 收掉插件、`server start` 再拉起一个新进程，中间那一秒里
+///    「插件在跑、服务器还没起来」和「服务器已经停了」在探测结果里完全一样。
+///    只有会话身份能把两者分开——旧会话的观察不能替新会话背书；
+/// 2. 必须在更早的轮次里真的见过它绑定的服务器在运行（`armed`），否则一次
+///    启动窗口就会被当成停机；
+/// 3. 同一结论要连续两轮（`idle`），避开状态探测的抖动；
+/// 4. 没见过服务器在跑的会话先给启动宽限（`grace`），宽限过后仍然全停就收，
+///    不让桥空转。
+#[derive(Debug)]
 struct IdleWatch {
-    /// 见过绑定服务器运行的插件
-    armed: BTreeSet<PluginId>,
-    /// 上一轮所有绑定服务器都没在运行的插件
-    idle: BTreeSet<PluginId>,
+    /// 见过绑定服务器运行的插件 → 当时的会话
+    armed: BTreeMap<PluginId, String>,
+    /// 上一轮所有绑定服务器都没在运行的插件 → 当时的会话
+    idle: BTreeMap<PluginId, String>,
+    /// 会话第一次被判全停的时刻，用于启动宽限
+    off_since: BTreeMap<PluginId, Instant>,
+    /// 启动宽限
+    grace: Duration,
+}
+
+impl Default for IdleWatch {
+    fn default() -> Self {
+        Self {
+            armed: BTreeMap::new(),
+            idle: BTreeMap::new(),
+            off_since: BTreeMap::new(),
+            grace: STARTUP_GRACE,
+        }
+    }
 }
 
 impl IdleWatch {
     /// 本轮应当停止的插件；同时滚动观察状态
-    fn next(&mut self, bindings: &PluginBindings, alive: &BTreeSet<String>) -> Vec<PluginId> {
+    ///
+    /// `sessions` 是这批插件当前的活跃会话（`插件 → 会话 id`）；没有会话的插件
+    /// 没有可停的东西，观察一并清零。
+    fn next(
+        &mut self,
+        bindings: &PluginBindings,
+        alive: &BTreeSet<String>,
+        sessions: &BTreeMap<PluginId, String>,
+    ) -> Vec<PluginId> {
         // 插件被卸载后不会再来：清掉残留的 id，长驻宿主的观察集合不无限增长
         self.armed
-            .retain(|id| bindings.active.iter().any(|binding| &binding.id == id));
-        let mut idle = BTreeSet::new();
+            .retain(|id, _| bindings.active.iter().any(|binding| &binding.id == id));
+        self.off_since
+            .retain(|id, _| bindings.active.iter().any(|binding| &binding.id == id));
+        let mut idle = BTreeMap::new();
         for binding in &bindings.active {
+            let Some(session) = sessions.get(&binding.id) else {
+                self.armed.remove(&binding.id);
+                self.off_since.remove(&binding.id);
+                continue;
+            };
             if binding.servers.iter().any(|name| alive.contains(name)) {
-                self.armed.insert(binding.id.clone());
-            } else if self.armed.contains(&binding.id) {
-                idle.insert(binding.id.clone());
+                self.armed.insert(binding.id.clone(), session.clone());
+                self.off_since.remove(&binding.id);
+                continue;
             }
+            if self.armed.get(&binding.id) == Some(session) {
+                self.off_since.remove(&binding.id);
+            } else {
+                // 这个会话还没服务过任何绑定服务器：可能是启动窗口
+                let since = *self
+                    .off_since
+                    .entry(binding.id.clone())
+                    .or_insert_with(Instant::now);
+                if since.elapsed() < self.grace {
+                    continue;
+                }
+            }
+            idle.insert(binding.id.clone(), session.clone());
         }
-        let stop = idle.intersection(&self.idle).cloned().collect::<Vec<_>>();
+        let stop = idle
+            .iter()
+            .filter(|(id, session)| self.idle.get(*id) == Some(*session))
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
         self.idle = idle;
         stop
     }
+}
+
+/// 这批插件当前的活跃会话
+///
+/// 状态读不出来按「没有会话」处理：下一轮再试，不在崩溃退避期误判。
+fn running_sessions(
+    host: &dyn PluginSupervisor,
+    bindings: &PluginBindings,
+) -> BTreeMap<PluginId, String> {
+    bindings
+        .active
+        .iter()
+        .filter_map(|binding| {
+            let session = host.status(&binding.id).ok()?.session?;
+            Some((binding.id.clone(), session.session_id))
+        })
+        .collect()
 }
 
 /// 绑定集合里当前在运行的服务器
@@ -366,45 +443,66 @@ mod tests {
         names.iter().map(|name| (*name).to_owned()).collect()
     }
 
+    /// 活跃会话：`(插件, 会话 id)` 对
+    fn sessions(pairs: &[(&str, &str)]) -> BTreeMap<PluginId, String> {
+        pairs
+            .iter()
+            .map(|(id, session)| (PluginId::parse(id).expect("id"), (*session).to_owned()))
+            .collect()
+    }
+
     /// 先见过服务器在跑，再连续两轮全停才收；单轮抖动不动手
     #[test]
     fn stops_after_seeing_the_server_alive_and_two_idle_rounds() {
         let (mut watch, bindings) = watch(vec![binding("chat-bridge", &["test1"])]);
-        assert!(watch.next(&bindings, &names(&["test1"])).is_empty());
-        assert!(watch.next(&bindings, &names(&["test1"])).is_empty());
+        let live = sessions(&[("chat-bridge", "s1")]);
+        assert!(watch.next(&bindings, &names(&["test1"]), &live).is_empty());
+        assert!(watch.next(&bindings, &names(&["test1"]), &live).is_empty());
         // 服务器刚进入终态：第一轮只记下空闲
-        assert!(watch.next(&bindings, &names(&[])).is_empty());
+        assert!(watch.next(&bindings, &names(&[]), &live).is_empty());
         // 第二轮仍然是全停 → 收插件
         assert_eq!(
-            watch.next(&bindings, &names(&[])),
+            watch.next(&bindings, &names(&[]), &live),
             vec![PluginId::parse("chat-bridge").expect("id")]
         );
         // 状态保持空闲时每轮都会返回：调用方按「是否真有会话」幂等，瞬时
         // stop 失败下一轮还会重试
-        assert_eq!(watch.next(&bindings, &names(&[])).len(), 1);
+        assert_eq!(watch.next(&bindings, &names(&[]), &live).len(), 1);
     }
 
     /// 从没见过服务器在跑（`server start` 的启动窗口）不算停机
     #[test]
     fn never_stops_a_plugin_that_has_not_served_a_live_server() {
         let (mut watch, bindings) = watch(vec![binding("chat-bridge", &["test1"])]);
+        let live = sessions(&[("chat-bridge", "s1")]);
         for _ in 0..4 {
-            assert!(watch.next(&bindings, &names(&[])).is_empty());
+            assert!(watch.next(&bindings, &names(&[]), &live).is_empty());
         }
+    }
+
+    /// 宽限过后服务器仍没起来：照样收掉，不留空转的桥
+    #[test]
+    fn stops_an_unserved_plugin_once_the_startup_grace_expires() {
+        let (mut watch, bindings) = watch(vec![binding("chat-bridge", &["test1"])]);
+        watch.grace = Duration::ZERO;
+        let live = sessions(&[("chat-bridge", "s1")]);
+        assert!(watch.next(&bindings, &names(&[]), &live).is_empty());
+        assert_eq!(watch.next(&bindings, &names(&[]), &live).len(), 1);
     }
 
     /// 多服务器绑定：任一台还在跑就不收
     #[test]
     fn keeps_the_plugin_while_any_bound_server_runs() {
         let (mut watch, bindings) = watch(vec![binding("chat-bridge", &["test1", "test2"])]);
-        assert!(watch.next(&bindings, &names(&["test2"])).is_empty());
+        let live = sessions(&[("chat-bridge", "s1")]);
+        assert!(watch.next(&bindings, &names(&["test2"]), &live).is_empty());
         assert!(
             watch
-                .next(&bindings, &names(&["test1", "test2"]))
+                .next(&bindings, &names(&["test1", "test2"]), &live)
                 .is_empty()
         );
         for _ in 0..3 {
-            assert!(watch.next(&bindings, &names(&["test2"])).is_empty());
+            assert!(watch.next(&bindings, &names(&["test2"]), &live).is_empty());
         }
     }
 
@@ -412,10 +510,42 @@ mod tests {
     #[test]
     fn a_returning_server_resets_the_idle_streak() {
         let (mut watch, bindings) = watch(vec![binding("chat-bridge", &["test1"])]);
-        assert!(watch.next(&bindings, &names(&["test1"])).is_empty());
-        assert!(watch.next(&bindings, &names(&[])).is_empty());
-        assert!(watch.next(&bindings, &names(&["test1"])).is_empty());
-        assert!(watch.next(&bindings, &names(&[])).is_empty());
-        assert_eq!(watch.next(&bindings, &names(&[])).len(), 1);
+        let live = sessions(&[("chat-bridge", "s1")]);
+        assert!(watch.next(&bindings, &names(&["test1"]), &live).is_empty());
+        assert!(watch.next(&bindings, &names(&[]), &live).is_empty());
+        assert!(watch.next(&bindings, &names(&["test1"]), &live).is_empty());
+        assert!(watch.next(&bindings, &names(&[]), &live).is_empty());
+        assert_eq!(watch.next(&bindings, &names(&[]), &live).len(), 1);
+    }
+
+    /// `server stop` 收掉插件后 `server start` 拉起的新会话不能被旧观察误杀
+    ///
+    /// 回归：观察集合只记插件 id 时，停机留下的「已武装」会替新会话背书，
+    /// `server start` 拉起的插件在服务器进入 `starting` 之前就被收掉。
+    #[test]
+    fn a_new_session_after_stop_is_not_killed_by_the_previous_observation() {
+        let (mut watch, bindings) = watch(vec![binding("chat-bridge", &["test1"])]);
+        let first = sessions(&[("chat-bridge", "s1")]);
+        assert!(watch.next(&bindings, &names(&["test1"]), &first).is_empty());
+        assert!(watch.next(&bindings, &names(&[]), &first).is_empty());
+        assert_eq!(watch.next(&bindings, &names(&[]), &first).len(), 1);
+
+        // 插件收掉：没有会话，观察清零
+        assert!(
+            watch
+                .next(&bindings, &names(&[]), &sessions(&[]))
+                .is_empty()
+        );
+        // 服务器启动前插件已被拉起：新会话处在启动宽限里，不能收
+        let second = sessions(&[("chat-bridge", "s2")]);
+        assert!(watch.next(&bindings, &names(&[]), &second).is_empty());
+        // 服务器起来了：新会话被武装
+        assert!(
+            watch
+                .next(&bindings, &names(&["test1"]), &second)
+                .is_empty()
+        );
+        assert!(watch.next(&bindings, &names(&[]), &second).is_empty());
+        assert_eq!(watch.next(&bindings, &names(&[]), &second).len(), 1);
     }
 }

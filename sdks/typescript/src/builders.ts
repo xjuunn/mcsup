@@ -100,13 +100,29 @@ abstract class BaseOpBuilder<K extends OpKind> {
     return this;
   }
 
-  /** 游标分页描述（plugins.md §11.4） */
-  public pagination(p: { readonly cursorField: string; readonly limitField: string; readonly defaultLimit?: number; readonly maxLimit?: number }): this {
+  /** 游标分页描述（plugins.md §11.4）；宿主要求四个字段齐全 */
+  public pagination(p: {
+    readonly cursorField: string;
+    readonly limitField: string;
+    readonly defaultLimit?: number;
+    readonly maxLimit?: number;
+  }): this {
+    const defaultLimit = p.defaultLimit ?? 50;
+    const maxLimit = p.maxLimit ?? 200;
+    if (!Number.isInteger(defaultLimit) || defaultLimit <= 0) {
+      throw new Error("op pagination defaultLimit must be a positive integer");
+    }
+    if (!Number.isInteger(maxLimit) || maxLimit <= 0 || maxLimit > 1_000) {
+      throw new Error("op pagination maxLimit must be an integer in 1..=1000");
+    }
+    if (defaultLimit > maxLimit) {
+      throw new Error("op pagination defaultLimit must not exceed maxLimit");
+    }
     this.draft.pagination = {
       cursor_field: p.cursorField,
       limit_field: p.limitField,
-      default_limit: p.defaultLimit,
-      max_limit: p.maxLimit,
+      default_limit: defaultLimit,
+      max_limit: maxLimit,
     };
     return this;
   }

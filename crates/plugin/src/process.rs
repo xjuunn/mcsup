@@ -246,16 +246,26 @@ impl SpawnedPlugin {
             .open(&plan.log_file)
         {
             Ok(file) => Some(Arc::new(Mutex::new(file))),
-            Err(_) => None,
+            Err(err) => {
+                // 日志打不开也必须把 stdout/stderr 读走：否则管道写满后
+                // 插件会卡死在 `write`，表现成「启动后无响应」。
+                tracing::warn!(
+                    plugin = %plan.prefix,
+                    file = %plan.log_file.display(),
+                    error = %err,
+                    "plugin log unavailable; output will be discarded"
+                );
+                None
+            }
         };
-        if let Some(writer) = &writer {
+        {
             let redact = plan.redact.clone();
             let prefix = plan.prefix.clone();
             if let Some(stdout) = child.stdout.take() {
                 collect(stdout, writer.clone(), prefix.clone(), redact.clone());
             }
             if let Some(stderr) = child.stderr.take() {
-                collect(stderr, writer.clone(), prefix, redact);
+                collect(stderr, writer, prefix, redact);
             }
         }
         Ok(Self {
@@ -327,7 +337,7 @@ impl Drop for SpawnedPlugin {
 
 fn collect<R: Read + Send + 'static>(
     reader: R,
-    writer: Arc<Mutex<std::fs::File>>,
+    writer: Option<Arc<Mutex<std::fs::File>>>,
     prefix: String,
     redact: Vec<String>,
 ) {
@@ -337,28 +347,72 @@ fn collect<R: Read + Send + 'static>(
         let mut line = Vec::new();
         loop {
             line.clear();
-            match reader.read_until(b'\n', &mut line) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
+            let Ok((total, truncated)) = read_log_line(&mut reader, &mut line) else {
+                break;
+            };
+            if total == 0 {
+                break;
             }
-            let truncated = line.len() > MAX_LOG_LINE_BYTES;
-            let body = &line[..line.len().min(MAX_LOG_LINE_BYTES)];
-            let text = String::from_utf8_lossy(body);
+            let text = String::from_utf8_lossy(&line);
             let text = redact_values(text.trim_end_matches(['\r', '\n']), &redact);
             if !limiter.allow() {
                 continue;
             }
             let suffix = if truncated { " [truncated]" } else { "" };
+            let Some(writer) = &writer else {
+                continue;
+            };
             if let Ok(mut file) = writer.lock() {
                 let _ = writeln!(file, "[{prefix}] {text}{suffix}");
             }
         }
         if let Some(dropped) = limiter.dropped_summary()
+            && let Some(writer) = &writer
             && let Ok(mut file) = writer.lock()
         {
             let _ = writeln!(file, "[{prefix}] dropped {dropped} lines");
         }
     });
+}
+
+/// 读一行并限制保留的字节数
+///
+/// `read_until` 没有上限：插件输出一个不含换行的巨大块就能把宿主内存吃光。
+/// 这里只保留 `MAX_LOG_LINE_BYTES`，超出部分继续消费到换行（最多再丢
+/// `MAX_LOG_LINE_BYTES`，避免一行流把日志采集线程永远占住）。
+fn read_log_line<R: BufRead>(reader: &mut R, line: &mut Vec<u8>) -> std::io::Result<(usize, bool)> {
+    let mut total = 0_usize;
+    let mut truncated = false;
+    let mut drain_budget = MAX_LOG_LINE_BYTES;
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return Ok((total, truncated));
+        }
+        let newline = buffer.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(buffer.len(), |index| index + 1);
+        let chunk = &buffer[..take];
+        if line.len() < MAX_LOG_LINE_BYTES {
+            let keep = chunk.len().min(MAX_LOG_LINE_BYTES - line.len());
+            line.extend_from_slice(&chunk[..keep]);
+            if keep < chunk.len() {
+                truncated = true;
+            }
+        } else {
+            truncated = true;
+            drain_budget = drain_budget.saturating_sub(chunk.len());
+            if drain_budget == 0 {
+                reader.consume(take);
+                return Ok((total + take, true));
+            }
+        }
+        total += take;
+        let done = newline.is_some();
+        reader.consume(take);
+        if done {
+            return Ok((total, truncated));
+        }
+    }
 }
 
 fn redact_values(text: &str, redact: &[String]) -> String {

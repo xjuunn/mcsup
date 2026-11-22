@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { action, definePlugin, query, stream, z } from "../src/index.js";
+import { MAX_FRAME_BYTES } from "../src/protocol.js";
 import { createMockHost } from "../src/testing.js";
 
 function pluginWith(spec: Parameters<typeof definePlugin>[0]) {
@@ -8,7 +9,7 @@ function pluginWith(spec: Parameters<typeof definePlugin>[0]) {
 }
 
 describe("限额（§9.2 / §5.4）", () => {
-  it("非流式输出超过 1 MiB → limit_exceeded", async () => {
+  it("非流式输出超过 MAX_FRAME_BYTES → limit_exceeded", async () => {
     const plugin = pluginWith({
       id: "big",
       title: "big",
@@ -19,7 +20,7 @@ describe("限额（§9.2 / §5.4）", () => {
       queries: {
         huge: query("huge")
           .output(z.object({ text: z.string() }))
-          .run(() => ({ text: "x".repeat(2 * 1024 * 1024) })),
+          .run(() => ({ text: "x".repeat(MAX_FRAME_BYTES + 1024) })),
       },
     });
     const host = createMockHost(plugin);

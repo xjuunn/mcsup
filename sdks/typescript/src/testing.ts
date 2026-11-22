@@ -48,6 +48,13 @@ export interface MockHostOptions {
   readonly reject?: { readonly code: RejectCode; readonly message: string };
   /** 宿主对能力调用的处理 */
   readonly handle?: (call: { readonly capability: string; readonly method: string; readonly input: unknown }) => unknown;
+  /** 宿主对契约调用的路由；省略时返回 null */
+  readonly handleContract?: (call: {
+    readonly contract: string;
+    readonly input: unknown;
+    readonly target?: string;
+    readonly trace?: string;
+  }) => unknown;
 }
 
 /** 断言失败 */
@@ -291,6 +298,17 @@ export class MockHost<C extends readonly Capability[], Cfg extends SchemaLike = 
       async call(capability, method, input) {
         if (host.options.handle !== undefined) {
           return await host.options.handle({ capability, method, input });
+        }
+        return null;
+      },
+      async callContract(contract, input, options) {
+        if (host.options.handleContract !== undefined) {
+          return await host.options.handleContract({
+            contract,
+            input,
+            target: options?.target,
+            trace: options?.trace,
+          });
         }
         return null;
       },

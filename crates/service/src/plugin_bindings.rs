@@ -129,6 +129,10 @@ impl PluginService {
     /// 只收集「可以启动」的插件：禁用、拉黑、隔离与待授权的插件不会随服务器
     /// 自动启停，待授权的记入 `skipped` 便于提示。
     ///
+    /// 例外是「待授权但**已经在跑**」：`plugin revoke` 会把记录打到
+    /// `needs_approval`，进程却还活着。这类必须留在 `active` 里，否则绑定
+    /// 的服务器全停之后没有任何路径会去收掉它，桥进程继续占端口。
+    ///
     /// # Errors
     ///
     /// 插件记录列表读取失败时返回 [`PluginError`]
@@ -138,7 +142,7 @@ impl PluginService {
             if !record.enabled || record.blocked || record.quarantined {
                 continue;
             }
-            if record.needs_approval() {
+            if record.needs_approval() && !self.is_running(&record.id) {
                 out.skipped.push((record.id, "needs approval".to_owned()));
                 continue;
             }

@@ -152,6 +152,35 @@ export class Connection {
     input: unknown,
     timeoutMs: number = DEFAULT_CALL_TIMEOUT_MS,
   ): Promise<unknown> {
+    return await this.invoke({ type: "call", capability, method, input }, timeoutMs, `${capability}.${method}`);
+  }
+
+  /**
+   * 调用另一个插件提供的契约（plugins.md §6.4）
+   *
+   * @throws {PluginError} code=timeout / unavailable
+   */
+  public async callContract(
+    contract: string,
+    input: unknown,
+    options: { readonly target?: string; readonly trace?: string; readonly timeoutMs?: number } = {},
+  ): Promise<unknown> {
+    const frame: CallPayload = {
+      type: "call",
+      contract,
+      input,
+      ...(options.target === undefined ? {} : { target: options.target }),
+      ...(options.trace === undefined ? {} : { trace: options.trace }),
+    };
+    return await this.invoke(
+      frame,
+      options.timeoutMs ?? DEFAULT_CALL_TIMEOUT_MS,
+      `contract ${contract}`,
+    );
+  }
+
+  /** 分配 id、登记超时并等待 result 帧 */
+  private async invoke(frame: CallPayload, timeoutMs: number, label: string): Promise<unknown> {
     if (this.closedReason !== undefined) {
       throw new PluginError("unavailable", this.closedReason);
     }
@@ -160,10 +189,10 @@ export class Connection {
     return await new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new PluginError("timeout", `${capability}.${method} timed out after ${timeoutMs} ms`));
+        reject(new PluginError("timeout", `${label} timed out after ${timeoutMs} ms`));
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
-      void this.send({ type: "call", id, capability, method, input });
+      void this.send({ ...frame, id });
     });
   }
 
@@ -264,6 +293,9 @@ interface PendingCall {
   readonly timer: NodeJS.Timeout;
 }
 
+/** 发送前的 call 帧：id 由 `invoke` 分配 */
+type CallPayload = Omit<Extract<OutboundFrame, { type: "call" }>, "id">;
+
 /** 等 promise 结束，最多 `ms` 毫秒；超时按完成处理（调用方只关心不再等待） */
 async function withDeadline(promise: Promise<unknown>, ms: number): Promise<void> {
   await new Promise<void>((resolve) => {
@@ -297,6 +329,12 @@ export interface FrameChannel {
   /** 发送一帧；返回 promise 表示已处理写背压 */
   send(frame: OutboundFrame): void | Promise<void>;
   call(capability: string, method: string, input: unknown, timeoutMs?: number): Promise<unknown>;
+  /** 调用另一个插件提供的契约 */
+  callContract(
+    contract: string,
+    input: unknown,
+    options?: { readonly target?: string; readonly trace?: string; readonly timeoutMs?: number },
+  ): Promise<unknown>;
   /** 关闭通道；返回 promise 表示已 flush */
   close(): void | Promise<void>;
 }
@@ -339,6 +377,14 @@ export class SocketChannel implements FrameChannel {
 
   public async call(capability: string, method: string, input: unknown, timeoutMs?: number): Promise<unknown> {
     return await this.connection.call(capability, method, input, timeoutMs);
+  }
+
+  public async callContract(
+    contract: string,
+    input: unknown,
+    options?: { readonly target?: string; readonly trace?: string; readonly timeoutMs?: number },
+  ): Promise<unknown> {
+    return await this.connection.callContract(contract, input, options);
   }
 
   public async close(): Promise<void> {

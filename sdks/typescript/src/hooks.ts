@@ -85,7 +85,7 @@ export interface ConsoleTail {
   stop(server?: string): void;
   /** 当前游标（无订阅时为 null） */
   cursor(server: string): number | null;
-  /** 已丢弃的行数（宿主侧环形缓冲溢出） */
+  /** 已丢弃的行数；宿主不再上报该值，恒为 0（保留仅为兼容） */
   dropped(server: string): number;
 }
 
@@ -123,16 +123,17 @@ export function useConsoleTail(
     state.running = true;
     try {
       const page = await consoleRead.tail(state.server, state.cursor, batch);
-      for (const text of page.lines) {
+      for (const line of page.lines) {
         if (state.stopped) {
           // 游标尚未推进：下次订阅会重放整页（至少一次），而不是丢行
           return;
         }
-        await state.handler({ text, server: state.server, at: Date.now() }, state.server);
+        await state.handler({ text: line.text, server: state.server, at: Date.now() }, state.server);
       }
       // 整页处理完才提交游标；handler 抛错时保持原游标，重试不会跳过剩余行
-      state.cursor = page.cursor;
-      state.dropped = page.dropped;
+      state.cursor = page.next;
+      // 宿主在线上不再报告环形缓冲丢弃数；保留该访问器只为兼容旧调用
+      state.dropped = 0;
       state.backoff = interval;
     } catch (err) {
       if (state.stopped) {

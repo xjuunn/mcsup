@@ -26,7 +26,7 @@ interface StreamOpShape {
 
 /** 流式泵选项；测试可缩短空闲窗口 */
 export interface PumpStreamOptions {
-  /** 单帧字节上限，默认协议上限 1 MiB */
+  /** 单帧字节上限，默认协议上限（`MAX_FRAME_BYTES`） */
   readonly frameBytes?: number;
   /** 空闲超时毫秒，默认 60 s */
   readonly idleMs?: number;
@@ -67,7 +67,20 @@ export async function pumpStream(
   }
   let seq = 0;
   let total = 0;
+  let dataChunks = 0;
+  let pending: unknown | undefined;
   let idleTimedOut = false;
+  /** 发送一个分块帧；帧超限时返回 false（调用方负责回错误） */
+  const emit = async (chunk: unknown, done: boolean): Promise<boolean> => {
+    const frame: OutboundFrame = { type: "stream", id: callId, seq, chunk, done };
+    if (frameBytes(frame) > frameLimit || total > MAX_STREAM_BYTES) {
+      return false;
+    }
+    // 等写背压，避免生产者把大流堆进内存
+    await channel.send(frame);
+    seq += 1;
+    return true;
+  };
   try {
     for (;;) {
       let next: IteratorResult<unknown>;
@@ -100,29 +113,25 @@ export async function pumpStream(
         });
         return;
       }
-      const chunkBytes = frameBytes(checked.data);
-      total += chunkBytes;
-      const frame: OutboundFrame = { type: "stream", id: callId, seq, chunk: checked.data, done: false };
-      if (frameBytes(frame) > frameLimit || total > MAX_STREAM_BYTES) {
-        await channel.send({
-          type: "result",
-          id: callId,
-          ok: false,
-          error: {
-            code: "limit_exceeded",
-            category: "usage",
-            retryable: false,
-            message: `stream op ${op.id} exceeds the stream limit (${total} bytes)`,
-          },
-        });
+      if (pending !== undefined && !(await emit(pending, false))) {
+        await sendLimitError(channel, callId, op.id, total);
         return;
       }
-      // 等写背压，避免生产者把大流堆进内存
-      await channel.send(frame);
-      seq += 1;
+      pending = checked.data;
+      total += frameBytes(checked.data);
+      dataChunks += 1;
+      if (total > MAX_STREAM_BYTES) {
+        await sendLimitError(channel, callId, op.id, total);
+        return;
+      }
     }
-    await channel.send({ type: "stream", id: callId, seq, chunk: {}, done: true });
-    await channel.send({ type: "result", id: callId, ok: true, output: { completed: true, chunks: seq } });
+    // 最后一个真实分块带 done:true；空流也必须显式收尾（§6.5）
+    const last = pending === undefined ? {} : pending;
+    if (!(await emit(last, true))) {
+      await sendLimitError(channel, callId, op.id, total);
+      return;
+    }
+    await channel.send({ type: "result", id: callId, ok: true, output: { completed: true, chunks: dataChunks } });
   } catch (err) {
     const error = toPluginError(err);
     await channel.send({
@@ -144,6 +153,28 @@ export async function pumpStream(
       }
     }
   }
+}
+
+/** 流超限统一错误帧 */
+function sendLimitError(
+  channel: FrameChannel,
+  callId: number,
+  opId: string,
+  total: number,
+): Promise<void> {
+  return Promise.resolve(
+    channel.send({
+      type: "result",
+      id: callId,
+      ok: false,
+      error: {
+        code: "limit_exceeded",
+        category: "usage",
+        retryable: false,
+        message: `stream op ${opId} exceeds the stream limit (${total} bytes)`,
+      },
+    }),
+  );
 }
 
 /** 把操作与取消信号竞速：取消时立即以 `cancelled` 拒绝 */

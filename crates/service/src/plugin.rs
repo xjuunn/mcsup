@@ -51,63 +51,17 @@ use thiserror::Error;
 /// 清理安装临时目录时使用的固定前缀
 const TEMP_PREFIX: &str = ".install-";
 
-/// 安装锁视为崩溃残留的阈值
+/// 安装临时目录的年龄阈值：超过即视为崩溃残留
 ///
-/// 正常安装（含下载）远小于此值；超时的锁文件会被下一次安装抢走。
-const INSTALL_LOCK_STALE: Duration = Duration::from_secs(3600);
+/// 正常安装（含下载）远小于此值。残留目录只在同一个 `plugins_root` 下才有
+/// 意义，所以按年龄而不是 pid 判定——pid 会被复用，判断不了任何事。
+const STALE_TEMP_AGE: Duration = Duration::from_secs(3600);
 
-/// 按 id 的安装锁
+/// 抢安装锁的最长等待时间
 ///
-/// `create_new` 抢锁，丢弃时删除。锁文件带 pid 与时间戳用于诊断；持有进程
-/// 崩溃后文件残留，下一次安装按时间戳判断并接管。
-struct InstallLock {
-    path: PathBuf,
-}
-
-impl InstallLock {
-    fn acquire(root: &Path, id: &PluginId) -> Result<Self, PluginError> {
-        let path = root.join(format!(".{id}.install.lock"));
-        for attempt in 0..2 {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(mut file) => {
-                    use std::io::Write as _;
-                    let _ = writeln!(file, "pid={} at={}", std::process::id(), now_secs());
-                    return Ok(Self { path });
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // 时钟漂移导致 modified 读不出来时按残留处理：宁可多抢，
-                    // 也不把用户锁死在永远装不上的状态。
-                    let stale = std::fs::metadata(&path)
-                        .and_then(|meta| meta.modified())
-                        .map_or(true, |at| {
-                            at.elapsed().map_or(true, |age| age >= INSTALL_LOCK_STALE)
-                        });
-                    if !stale || attempt == 1 {
-                        return Err(PluginError::Conflict(format!(
-                            "another install for {id} is in progress"
-                        )));
-                    }
-                    let _ = std::fs::remove_file(&path);
-                }
-                Err(err) => return Err(PluginError::Fs(FsError::io(&path, err))),
-            }
-        }
-        // 循环两次，每次每个分支都 return；这里只是让类型检查器满意
-        Err(PluginError::Conflict(format!(
-            "another install for {id} is in progress"
-        )))
-    }
-}
-
-impl Drop for InstallLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
+/// 真正的并发安装应当等待而不是立刻失败（用户双击了两次），但等太久只会让
+/// 第二个进程挂在那里；30 秒足够覆盖下载之外的全部安装步骤。
+const INSTALL_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 插件业务失败
 #[derive(Debug, Error)]
@@ -391,6 +345,9 @@ impl PluginService {
         offset: Option<u64>,
         max: usize,
     ) -> Result<Value, PluginError> {
+        // 日志文件不存在在底层按「空窗口」处理，于是 `plugin logs <未安装 id>`
+        // 会静默成功、`--follow` 永远空转。先确认插件存在。
+        self.record(id)?;
         Ok(self.supervisor()?.logs(id, offset, max)?)
     }
 
@@ -404,6 +361,83 @@ impl PluginService {
     #[must_use]
     pub fn plugin_data(&self) -> &Path {
         &self.plugin_data
+    }
+
+    /// 插件进程此刻是否在运行
+    ///
+    /// 宿主不可达时按「没在跑」处理：判定只用于决定要不要先停，猜错的方向
+    /// 只能是多停一次，不会把进程留在那里。
+    #[must_use]
+    pub fn is_running(&self, id: &PluginId) -> bool {
+        self.supervisor
+            .as_ref()
+            .and_then(|supervisor| supervisor.status(id).ok())
+            .is_some_and(|status| status.session.is_some())
+    }
+
+    /// 抢某个插件 id 的安装 / 切换 / 卸载锁
+    ///
+    /// 三条路径都要持有：它们都在改 `plugins/<id>/` 与记录，彼此并发会互相
+    /// 删目录、覆盖记录。锁是内核文件锁，进程崩溃即释放，不需要清理。
+    fn plugin_lock(&self, id: &PluginId) -> Result<crate::fs::FileLock, PluginError> {
+        std::fs::create_dir_all(&self.plugins_root)?;
+        let path = self.plugins_root.join(format!(".{id}.install.lock"));
+        crate::fs::FileLock::acquire(&path, INSTALL_LOCK_TIMEOUT).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                PluginError::Conflict(format!("another install for {id} is in progress"))
+            } else {
+                PluginError::Fs(FsError::io(&path, err))
+            }
+        })
+    }
+
+    /// 建一个只属于本次调用的临时解包目录
+    ///
+    /// 名字带 pid 与自增序号：同一 pid 同一秒的两次安装（`install` 与
+    /// `verify` 并发）不能撞到同一个目录，否则会互相 `remove_dir_all`。
+    fn temp_dir(&self, tag: &str) -> Result<TempDir, PluginError> {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        std::fs::create_dir_all(&self.plugins_root)?;
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = self.plugins_root.join(format!(
+            "{TEMP_PREFIX}{tag}-{}-{}-{seq}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&path)?;
+        Ok(TempDir { path })
+    }
+
+    /// 清掉上次崩溃留下的临时解包目录
+    ///
+    /// 崩溃路径不会执行 `Drop`，残留目录能长到下载上限那么大。年龄从**目录名**
+    /// 里取（尾部就是创建时刻 `…-<pid>-<secs>-<seq>`），不用 mtime：解包过程
+    /// 会不断刷新 mtime，崩溃残留的 mtime 也可能因为时钟漂移看起来在未来。
+    /// 认不出创建时刻的目录一律不动——宁可留一个目录，也不误删正在解包的。
+    fn sweep_stale_temp_dirs(&self) {
+        let Ok(entries) = std::fs::read_dir(&self.plugins_root) else {
+            return;
+        };
+        let now = now_secs();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if !name.starts_with(TEMP_PREFIX) || !entry.path().is_dir() {
+                continue;
+            }
+            let Some(created) = name
+                .rsplit('-')
+                .nth(1)
+                .and_then(|secs| secs.parse::<i64>().ok())
+            else {
+                continue;
+            };
+            if now.saturating_sub(created) >= i64::try_from(STALE_TEMP_AGE.as_secs()).unwrap_or(0) {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
     }
 
     /// 全部记录，按 id 升序
@@ -794,7 +828,9 @@ impl PluginService {
     /// 原子移动到 `plugins/<id>/<version>` → 写记录。安装期间不启动进程。
     ///
     /// 升级已存在的插件时：进程先停；`enabled` 与仍声明且已确认的授权保留；
-    /// 默认保留上一版本（共 2 个），`prune` 只保留当前版本。
+    /// 始终保留当前版本与回滚目标（`previous_version`），`prune` 只清理更旧
+    /// 的目录——回滚目标任何情况下都不能删。新版本起不来时自动切回旧版本并
+    /// 重新拉起。
     ///
     /// # Errors
     ///
@@ -806,23 +842,49 @@ impl PluginService {
         expected_sha256: Option<&Checksum>,
         prune: bool,
     ) -> Result<InstallOutcome, PluginError> {
+        self.install_checked(origin, expected_sha256, prune, None)
+    }
+
+    /// 按来源升级：产物声明的 id 必须仍是 `expected`
+    ///
+    /// `plugin update` 不带 `--to` 时按记录里的来源重新拉取。本地来源被手工
+    /// 换成别的插件、git 仓库换了 id 之后，装进来的就是**另一个**插件；不校验
+    /// 的话命令会以「已切换 <另一个 id>」成功退出，被请求的插件却一点没变。
+    ///
+    /// # Errors
+    ///
+    /// 同 [`Self::install`]；另外来源里的 id 与 `expected` 不一致时返回
+    /// [`PluginError::Usage`]
+    pub fn install_as(
+        &self,
+        expected: &PluginId,
+        origin: &ArtifactOrigin,
+        prune: bool,
+    ) -> Result<InstallOutcome, PluginError> {
+        self.install_checked(origin, None, prune, Some(expected))
+    }
+
+    fn install_checked(
+        &self,
+        origin: &ArtifactOrigin,
+        expected_sha256: Option<&Checksum>,
+        prune: bool,
+        expected_id: Option<&PluginId>,
+    ) -> Result<InstallOutcome, PluginError> {
         let source = self.source.as_ref().ok_or_else(|| {
             PluginError::Usage("no plugin artifact source is configured".to_owned())
         })?;
         let source = Arc::clone(source);
-        std::fs::create_dir_all(&self.plugins_root)?;
-        let temp = self.plugins_root.join(format!(
-            "{TEMP_PREFIX}{}-{}",
-            std::process::id(),
-            now_secs()
-        ));
-        let _ = std::fs::remove_dir_all(&temp);
-        std::fs::create_dir_all(&temp)?;
-        let result = self.install_into(origin, expected_sha256, &source, &temp, prune);
-        if result.is_err() {
-            let _ = std::fs::remove_dir_all(&temp);
-        }
-        result
+        self.sweep_stale_temp_dirs();
+        let temp = self.temp_dir("fetch")?;
+        self.install_into(
+            origin,
+            expected_sha256,
+            &source,
+            temp.path(),
+            prune,
+            expected_id,
+        )
     }
 
     /// 拉取并校验产物，但不安装
@@ -840,27 +902,19 @@ impl PluginService {
         let source = self.source.as_ref().ok_or_else(|| {
             PluginError::Usage("no plugin artifact source is configured".to_owned())
         })?;
-        std::fs::create_dir_all(&self.plugins_root)?;
-        let temp = self.plugins_root.join(format!(
-            "{TEMP_PREFIX}verify-{}-{}",
-            std::process::id(),
-            now_secs()
-        ));
-        let _ = std::fs::remove_dir_all(&temp);
-        std::fs::create_dir_all(&temp)?;
-        let result = source
-            .fetch(origin, &temp)
+        self.sweep_stale_temp_dirs();
+        let temp = self.temp_dir("verify")?;
+        let artifact = source
+            .fetch(origin, temp.path())
             .and_then(|fetched| match &self.verifier {
                 Some(verifier) => verifier.verify(&fetched, None),
                 None => Ok(fetched),
-            });
-        match result {
-            Ok(artifact) => Ok(FetchedPluginArtifact { artifact, temp }),
-            Err(err) => {
-                let _ = std::fs::remove_dir_all(&temp);
-                Err(PluginError::from(err))
-            }
-        }
+            })
+            .map_err(PluginError::from)?;
+        Ok(FetchedPluginArtifact {
+            artifact,
+            _temp: temp,
+        })
     }
 
     // 安装流水线单函数承载：fetch → 校验 → 加锁 → rename → 登记 → prune →
@@ -873,6 +927,7 @@ impl PluginService {
         source: &Arc<dyn ArtifactSource>,
         temp: &Path,
         prune: bool,
+        expected_id: Option<&PluginId>,
     ) -> Result<InstallOutcome, PluginError> {
         let fetched = source.fetch(origin, temp)?;
         let artifact = if let Some(verifier) = &self.verifier {
@@ -902,39 +957,64 @@ impl PluginService {
             .map_err(|err| PluginError::Usage(format!("entry check failed: {err}")))?;
         let id = manifest.id.clone();
         let version = manifest.raw.version.clone();
-        // 按 id 加锁：两个并发 install 拉到一半互相看到对方的半成品，或者把
-        // 记录互相覆盖，都比直接失败更糟。锁在临时目录之外，不随清理消失。
-        let _lock = InstallLock::acquire(&self.plugins_root, &id)?;
+        if let Some(expected) = expected_id
+            && manifest.id != *expected
+        {
+            return Err(PluginError::Usage(format!(
+                "the source provides plugin {}, not {expected}; nothing was installed",
+                manifest.id
+            )));
+        }
         if manifest.scope == PluginScope::Server {
+            // 记录里的 `server` 字段目前没有写入路径（CLI 没有 `--server`），
+            // 装了也无法绑定。提示必须说实话，否则用户会去找一个不存在的开关。
             return Err(PluginError::Usage(
-                "server-scoped plugins require `--server <name>`".to_owned(),
+                "server-scoped plugins are not supported yet; publish a machine-scoped plugin"
+                    .to_owned(),
             ));
         }
-        let previous = self.store.get(&id).ok();
-        // 升级时进程必须先停：旧进程还在用旧产物目录，rename 后它写的是
-        // 已被移走的目录。旧状态走一次 UpdateStarted 迁移，留下审计痕迹。
-        let was_running = previous.is_some()
-            && self
-                .supervisor
-                .as_ref()
-                .and_then(|supervisor| supervisor.status(&id).ok())
-                .is_some_and(|status| status.session.is_some());
-        if was_running && let Some(supervisor) = &self.supervisor {
-            supervisor.stop(&id, Duration::from_secs(10))?;
-        }
+        // 按 id 加锁：并发 install / update / remove 会互相删目录、覆盖记录。
+        // 抢锁放在解包与 manifest 校验之后——那些步骤不碰 `plugins/<id>/`，
+        // 没必要串行（下载可能要几分钟）。
+        let _lock = self.plugin_lock(&id)?;
+        // 只有 `NotFound` 才等于「没装过」。记录损坏 / IO 错误降级成全新安装
+        // 会清零 `enabled`、授权与 `previous_version`，还会顺手删掉旧版本目录。
+        let previous = match self.store.get(&id) {
+            Ok(record) => Some(record),
+            Err(RepositoryError::NotFound(_)) => None,
+            Err(err) => return Err(PluginError::from_repo(err, &id)),
+        };
+        // 判重放在停机之前：同版本重装是必然失败的请求，不能先把正在运行的
+        // 进程停掉再告诉用户「已安装」——插件会一直停在那里，用户还得手动
+        // 拉起来。
         let target = self.plugins_root.join(id.as_str()).join(&version);
         if target.exists() {
             return Err(PluginError::AlreadyExists(format!(
                 "{id} {version} is already installed"
             )));
         }
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
+        // 升级时进程必须先停：旧进程还在用旧产物目录，rename 后它写的是
+        // 已被移走的目录。旧状态走一次 UpdateStarted 迁移，留下审计痕迹。
+        let was_running = previous.is_some() && self.is_running(&id);
+        if was_running && let Some(supervisor) = &self.supervisor {
+            supervisor.stop(&id, Duration::from_secs(10))?;
+        }
+        // 停机之后任何失败都必须把旧版本拉回来（`docs/plugins.md` §15.6）：
+        // rename 在 Windows 上会因目录被占用失败，记录写失败也可能是
+        // `db/.lock` 超时。失败后撒手不管，插件就静悄悄停在那里了。
+        if let Some(parent) = target.parent()
+            && let Err(err) = std::fs::create_dir_all(parent)
+        {
+            self.recover_aborted_install(&id, &target, was_running);
+            return Err(err.into());
         }
         // 同文件系统内 rename 才是原子的：临时目录建在 `plugins_root` 下。
-        std::fs::rename(&artifact.root, &target)
-            .map_err(|err| PluginError::Fs(FsError::io(&artifact.root, err)))?;
+        if let Err(err) = std::fs::rename(&artifact.root, &target) {
+            self.recover_aborted_install(&id, &target, was_running);
+            return Err(PluginError::Fs(FsError::io(&artifact.root, err)));
+        }
         let _ = std::fs::remove_dir_all(temp);
+
         // 升级：只保留新版本仍声明、且此前已确认的能力；低风险照常自动通过。
         let mut approved: BTreeSet<Capability> = manifest
             .capabilities
@@ -958,10 +1038,16 @@ impl PluginService {
             .collect();
         let now = now_secs();
         // 升级保留启用状态；scope 变了则视为新插件，回默认关闭。
-        let enabled = previous
-            .as_ref()
-            .filter(|old| old.scope == manifest.scope)
-            .is_some_and(|old| old.enabled);
+        //
+        // 新版本引入待授权能力时必须落 `enabled = false`：`docs/plugins.md`
+        // 要求 `pending_approval` 与 `enabled` 互斥，否则授权之后
+        // `PendingApproval` 只能迁到 `Disabled`，插件卡在「已启用但既不能
+        // `start` 也不能 `enable`」的死角里。
+        let enabled = pending.is_empty()
+            && previous
+                .as_ref()
+                .filter(|old| old.scope == manifest.scope)
+                .is_some_and(|old| old.enabled);
         let record = PluginRecord {
             id: id.clone(),
             version: version.clone(),
@@ -971,7 +1057,7 @@ impl PluginService {
             enabled,
             approved,
             manifest: manifest.raw.clone(),
-            artifact_dir: target,
+            artifact_dir: target.clone(),
             installed_at: now,
             updated_at: now,
             last_state: state_after_install(enabled, !pending.is_empty()),
@@ -985,10 +1071,26 @@ impl PluginService {
             blocked: previous.as_ref().is_some_and(|old| old.blocked),
             quarantined: previous.as_ref().is_some_and(|old| old.quarantined),
         };
-        self.store.put(&record)?;
-        // 版本保留：默认留当前 + 上一版本；`--prune` 只留当前。
+        if let Err(err) = self.store.put(&record) {
+            // 记录没写进去：新版本目录成了无主孤儿（再次安装会 `AlreadyExists`），
+            // 旧版本记录与目录都还在，把进程拉回旧版本即可。
+            self.recover_aborted_install(&id, &target, was_running);
+            return Err(err.into());
+        }
+        // 升级自运行状态：恢复运行。启动（含握手）成功之前不动旧版本目
+        // 录——「旧版本已删、新版本起不来」是必须避免的状态
+        // （`docs/plugins.md` §15.6）。
+        if was_running
+            && record.enabled
+            && let Err(err) = self.start(&id)
+        {
+            self.restore_after_failed_start(&id, previous.as_ref(), &version, &err)?;
+            return Err(err);
+        }
+        // 版本保留：始终保留当前版本与回滚目标（`previous_version`）。`--prune`
+        // 只清理更旧的目录，不再把回滚目标一起删掉。
         let mut keep = vec![version.as_str()];
-        if !prune && let Some(old) = &previous {
+        if let Some(old) = &previous {
             keep.push(old.version.as_str());
         }
         self.prune_versions(&id, &keep)?;
@@ -998,14 +1100,111 @@ impl PluginService {
             action: "install".to_owned(),
             capability: None,
             result: AuditResult::Allowed,
-            detail: Some(format!("version {version}")),
+            detail: Some(if prune {
+                format!("version {version} (pruned older versions)")
+            } else {
+                format!("version {version}")
+            }),
         });
-        // 升级自运行状态：恢复运行。启动失败向上传播——升级没完成，调用方
-        // 看到 `Failed` 记录，产物仍是新版本（自动回滚属后续闭环节点）。
-        if was_running && record.enabled {
-            self.start(&id)?;
-        }
         Ok(InstallOutcome { record, pending })
+    }
+
+    /// 停机之后、新版本接管之前失败：删掉半成品目录，把旧版本重新拉起来
+    ///
+    /// 记录此时还指向旧版本（`store.put` 没成功），旧产物目录也还在盘上，
+    /// 所以恢复只是「删孤儿 + 启动」。启动失败只记日志：调用方要看到的是
+    /// 原始错误，不能被第二个错误盖掉。
+    fn recover_aborted_install(&self, id: &PluginId, target: &Path, was_running: bool) {
+        if target.is_dir() {
+            let _ = std::fs::remove_dir_all(target);
+        }
+        if !was_running {
+            return;
+        }
+        if let Err(err) = self.start(id) {
+            tracing::warn!(plugin = %id, error = %err, "previous version failed to restart");
+        }
+    }
+
+    /// 新版本起不来：把记录切回旧版本并重新拉起
+    ///
+    /// 产物目录此时还完好在盘上（清理在启动成功之后），所以回滚只是把记录写
+    /// 回旧版本再启动。`[禁止]` 让用户停在「旧版本已删、新版本起不来」的状
+    /// 态里手工恢复（`docs/plugins.md` §15.6）。
+    fn restore_after_failed_start(
+        &self,
+        id: &PluginId,
+        previous: Option<&PluginRecord>,
+        failed_version: &str,
+        cause: &PluginError,
+    ) -> Result<(), PluginError> {
+        let reason = format!("version {failed_version} failed to start: {cause}");
+        let Some(old) = previous else {
+            // 全新安装：没有可回滚的版本，只留一条失败记录
+            let mut record = self.record(id)?;
+            record.last_state = PluginState::Failed;
+            record.last_error = Some(reason.clone());
+            record.updated_at = now_secs();
+            self.store.put(&record)?;
+            self.audit.record(&AuditEvent {
+                at: now_secs(),
+                plugin: id.to_string(),
+                action: "install:failed".to_owned(),
+                capability: None,
+                result: AuditResult::Failed,
+                detail: Some(reason),
+            });
+            return Ok(());
+        };
+        let mut restored = old.clone();
+        restored.last_state = PluginState::Failed;
+        restored.last_error = Some(reason.clone());
+        restored.updated_at = now_secs();
+        self.store.put(&restored)?;
+        self.audit.record(&AuditEvent {
+            at: now_secs(),
+            plugin: id.to_string(),
+            action: "install:rollback".to_owned(),
+            capability: None,
+            result: AuditResult::Failed,
+            detail: Some(format!("{reason}; restored version {}", restored.version)),
+        });
+        // 旧版本重新拉起；起不来时保留失败记录，由调用方看到首个错误
+        if let Err(err) = self.start(id) {
+            tracing::warn!(plugin = %id, error = %err, "restored version failed to start");
+        }
+        Ok(())
+    }
+
+    /// 已安装的版本（按目录枚举，不信任记录）
+    ///
+    /// 记录只记当前版本与回滚目标，盘上还可能留着更旧的目录。`update --to`
+    /// 要回答「到底能切到哪些版本」，只能看目录；不是 `SemVer` 的目录名（残留、
+    /// 手工改名）不列出来。
+    ///
+    /// # Errors
+    ///
+    /// 目录读取失败时返回 [`PluginError`]
+    pub fn installed_versions(&self, id: &PluginId) -> Result<Vec<String>, PluginError> {
+        let root = self.plugins_root.join(id.as_str());
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            return Ok(Vec::new());
+        };
+        let mut versions = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|err| PluginError::Fs(FsError::io(&root, err)))?;
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if domain::plugin::manifest::semver_is_valid(&name) {
+                versions.push(name);
+            }
+        }
+        versions.sort_by_key(|version| version_key(version));
+        Ok(versions)
     }
 
     /// 清理同 id 的旧版本目录，只保留 `keep` 里的版本
@@ -1046,8 +1245,116 @@ impl PluginService {
         version: &str,
         prune: bool,
     ) -> Result<PluginRecord, PluginError> {
+        // 版本号会拼进路径：先按 SemVer 校验，`--to ../../..` 这类输入既不是
+        // 合法版本，也不该被当成目录名。
+        let version = version.trim();
+        if !domain::plugin::manifest::semver_is_valid(version) {
+            return Err(PluginError::Usage(format!(
+                "`{version}` is not a SemVer version"
+            )));
+        }
         let mut record = self.record(id)?;
+        let current = record.version.clone();
+        if current == version {
+            // 目标就是当前版本：写 `previous_version = 当前` 会把真正的回滚
+            // 目标覆盖成同一个版本，`plugin rollback` 之后什么也没退。直接
+            // 拒绝，顺带省掉一次无意义的停机 / 重启。
+            return Err(PluginError::Conflict(format!(
+                "{id} is already on version {version}"
+            )));
+        }
+        let InstalledVersion {
+            manifest,
+            artifact,
+            sha256,
+        } = self.inspect_installed_version(id, version)?;
+        let was_running = self.is_running(id);
+        // 切换在改 `plugins/<id>/` 与记录，必须和 install / remove 串行。
+        // 抢锁放在校验之后：校验只读，没必要串行。
+        let _lock = self.plugin_lock(id)?;
+        if was_running && let Some(supervisor) = &self.supervisor {
+            supervisor.stop(id, Duration::from_secs(10))?;
+        }
+        // 授权重算：新版本仍声明且已确认的保留，低风险自动通过。
+        let mut approved: BTreeSet<Capability> = manifest
+            .capabilities
+            .iter()
+            .copied()
+            .filter(|cap| cap.default_policy() == capability::DefaultPolicy::Allow)
+            .collect();
+        approved.extend(
+            record
+                .approved
+                .iter()
+                .copied()
+                .filter(|cap| manifest.capabilities.contains(cap)),
+        );
+        let pending: BTreeSet<Capability> = manifest
+            .capabilities
+            .iter()
+            .copied()
+            .filter(|cap| !approved.contains(cap))
+            .collect();
+        // 待授权能力与 `enabled` 互斥（同 `install_into`）；随后 `last_state`
+        // 按「是否启用 + 是否待授权」重算。原来无条件写 `Stopped` 会让
+        // 已停用的插件切版本后既 `enable` 不了（`stopped + Enabled` 非法）
+        // 又能绕过待审批门禁。
+        let enabled = pending.is_empty() && record.enabled;
+        // 回滚用：切换前的记录（版本、产物目录、授权都指回旧版本）
+        let original = record.clone();
+        version.clone_into(&mut record.version);
+        record.previous_version = Some(current.clone());
+        record.api = manifest.raw.api;
+        record.manifest = manifest.raw.clone();
+        record.artifact_dir = artifact;
+        record.sha256 = Some(sha256);
+        record.approved = approved;
+        record.enabled = enabled;
+        record.last_state = state_after_install(enabled, !pending.is_empty());
+        record.last_error = None;
+        record.updated_at = now_secs();
+        self.store.put(&record)?;
+        // 启动成功之前不清理任何版本目录：切换失败必须还能切回去
+        if was_running
+            && record.enabled
+            && let Err(err) = self.start(id)
+        {
+            self.restore_after_failed_start(id, Some(&original), version, &err)?;
+            return Err(err);
+        }
+        if prune {
+            // 回滚目标是切换前的版本，任何情况下都不能删
+            self.prune_versions(id, &[version, current.as_str()])?;
+        }
+        self.audit.record(&AuditEvent {
+            at: now_secs(),
+            plugin: id.to_string(),
+            action: "activate".to_owned(),
+            capability: None,
+            result: AuditResult::Allowed,
+            detail: Some(format!("version {}", record.version)),
+        });
+        Ok(record)
+    }
+
+    /// 校验盘上某个已安装版本可用：目录存在、摘要可重算、manifest 与入口合法
+    fn inspect_installed_version(
+        &self,
+        id: &PluginId,
+        version: &str,
+    ) -> Result<InstalledVersion, PluginError> {
         let artifact = self.plugins_root.join(id.as_str()).join(version);
+        if !artifact.is_dir() {
+            let installed = self.installed_versions(id).unwrap_or_default();
+            return Err(PluginError::Conflict(format!(
+                "version {version} of {id} is not installed; installed: {}",
+                if installed.is_empty() {
+                    "none".to_owned()
+                } else {
+                    installed.join(", ")
+                }
+            )));
+        }
         let verifier = self.verifier.as_ref().ok_or_else(|| {
             PluginError::Usage("no plugin artifact verifier is configured".to_owned())
         })?;
@@ -1071,90 +1378,29 @@ impl PluginService {
             .entry
             .check_entry_file(&artifact, &domain::plugin::platform_key())
             .map_err(|err| PluginError::Usage(format!("entry check failed: {err}")))?;
-        let was_running = self
-            .supervisor
-            .as_ref()
-            .and_then(|supervisor| supervisor.status(id).ok())
-            .is_some_and(|status| status.session.is_some());
-        if was_running && let Some(supervisor) = &self.supervisor {
-            supervisor.stop(id, Duration::from_secs(10))?;
-        }
-        // 授权重算：新版本仍声明且已确认的保留，低风险自动通过。
-        let mut approved: BTreeSet<Capability> = manifest
-            .capabilities
-            .iter()
-            .copied()
-            .filter(|cap| cap.default_policy() == capability::DefaultPolicy::Allow)
-            .collect();
-        approved.extend(
-            record
-                .approved
-                .iter()
-                .copied()
-                .filter(|cap| manifest.capabilities.contains(cap)),
-        );
-        let current = record.version.clone();
-        version.clone_into(&mut record.version);
-        record.previous_version = Some(current);
-        record.api = manifest.raw.api;
-        record.manifest = manifest.raw.clone();
-        record.artifact_dir = artifact;
-        record.sha256 = Some(checked.sha256);
-        record.approved = approved;
-        record.last_state = PluginState::Stopped;
-        record.last_error = None;
-        record.updated_at = now_secs();
-        self.store.put(&record)?;
-        self.audit.record(&AuditEvent {
-            at: now_secs(),
-            plugin: id.to_string(),
-            action: "activate".to_owned(),
-            capability: None,
-            result: AuditResult::Allowed,
-            detail: Some(format!("version {}", record.version)),
-        });
-        if prune {
-            self.prune_versions(id, &[version])?;
-        }
-        if was_running && record.enabled {
-            self.start(id)?;
-        }
-        Ok(record)
+        Ok(InstalledVersion {
+            manifest,
+            artifact,
+            sha256: checked.sha256,
+        })
     }
 
     /// 回滚到上一版本
+    ///
+    /// 与 [`Self::activate_version`] 是同一条路径：版本号、`artifact_dir`、
+    /// manifest 入口与授权必须一起切——宿主按记录里的 manifest 找入口文件、
+    /// 按 `approved` 算授权，只改版本号等于让宿主用新版本的入口跑旧产物。
     ///
     /// # Errors
     ///
     /// 没有上一版本、上一版本产物缺失时返回 [`PluginError`]
     pub fn rollback(&self, id: &PluginId) -> Result<PluginRecord, PluginError> {
-        let mut record = self.record(id)?;
+        let record = self.record(id)?;
         let previous = record
             .previous_version
             .clone()
             .ok_or_else(|| PluginError::Conflict(format!("plugin {id} has no previous version")))?;
-        let artifact = self.plugins_root.join(id.as_str()).join(&previous);
-        if !artifact.is_dir() {
-            return Err(PluginError::Conflict(format!(
-                "artifact for {id} {previous} is missing"
-            )));
-        }
-        let was_running = self
-            .supervisor
-            .as_ref()
-            .and_then(|supervisor| supervisor.status(id).ok())
-            .is_some_and(|status| status.session.is_some());
-        if was_running && let Some(supervisor) = &self.supervisor {
-            supervisor.stop(id, Duration::from_secs(10))?;
-        }
-        let current = record.version.clone();
-        record.previous_version = Some(current);
-        record.version = previous;
-        record.artifact_dir = artifact;
-        record.last_state = PluginState::Stopped;
-        record.last_error = None;
-        record.updated_at = now_secs();
-        self.store.put(&record)?;
+        let record = self.activate_version(id, &previous, false)?;
         self.audit.record(&AuditEvent {
             at: now_secs(),
             plugin: id.to_string(),
@@ -1163,9 +1409,6 @@ impl PluginService {
             result: AuditResult::Allowed,
             detail: Some(format!("active version {}", record.version)),
         });
-        if was_running && record.enabled {
-            self.start(id)?;
-        }
         Ok(record)
     }
 
@@ -1196,10 +1439,7 @@ impl PluginService {
         keep_secrets: bool,
     ) -> Result<(), PluginError> {
         let record = self.record(id)?;
-        if let Some(supervisor) = &self.supervisor
-            && let Ok(status) = supervisor.status(id)
-            && status.session.is_some()
-        {
+        if self.is_running(id) {
             return Err(PluginError::Conflict(format!(
                 "plugin {id} is running; run `mcsup plugin disable {id}` first"
             )));
@@ -1209,7 +1449,12 @@ impl PluginService {
                 "plugin {id} is enabled; run `mcsup plugin disable {id}` first"
             )));
         }
-        self.store.remove(id)?;
+        // 卸载在删 `plugins/<id>/` 与记录，必须和 install / update 串行。
+        let _lock = self.plugin_lock(id)?;
+        // 先删产物 / 数据 / 密钥，最后删记录。反过来一旦删除失败，记录已经
+        // 没了而产物还在盘上：再装同版本永远 `AlreadyExists`、再 `remove` 又是
+        // `NotFound`，只能手工删目录；密钥残留还会让重装的同名插件继承上一份
+        // 凭据（`docs/plugins.md` §15.5）。保留记录才能重试。
         let artifact = self.plugins_root.join(id.as_str());
         if artifact.exists() {
             std::fs::remove_dir_all(&artifact)?;
@@ -1226,6 +1471,7 @@ impl PluginService {
         } else if !keep_secrets {
             remove_secrets(&self.plugin_data, id)?;
         }
+        self.store.remove(id)?;
         self.audit.record(&AuditEvent {
             at: now_secs(),
             plugin: id.to_string(),
@@ -1517,19 +1763,45 @@ fn pending_capabilities(record: &PluginRecord) -> String {
         .join(", ")
 }
 
+/// 盘上某个已安装版本的校验结果
+#[derive(Debug)]
+struct InstalledVersion {
+    /// 解析通过的 manifest
+    manifest: domain::plugin::manifest::ValidatedManifest,
+    /// 产物目录
+    artifact: PathBuf,
+    /// 目录树摘要
+    sha256: String,
+}
+
+/// 本次调用的临时解包目录：丢弃即删除
+///
+/// 只覆盖「正常返回」路径；`Drop` 走不到时（崩溃、断电）由
+/// [`PluginService::sweep_stale_temp_dirs`] 按年龄兜底。
+#[derive(Debug)]
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 /// `fetch_artifact` 的返回值：持有临时解包目录，丢弃时一并删除
 #[derive(Debug)]
 pub struct FetchedPluginArtifact {
     /// 已校验的产物
     pub artifact: PluginArtifact,
-    /// 解包所在的临时目录
-    temp: PathBuf,
-}
-
-impl Drop for FetchedPluginArtifact {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.temp);
-    }
+    /// 解包所在的临时目录（`Drop` 时删除）
+    _temp: TempDir,
 }
 
 fn check_source_checksum(expected: Option<&Checksum>, actual: &str) -> Result<(), PluginError> {
@@ -1548,8 +1820,12 @@ fn origin_text(origin: &ArtifactOrigin) -> String {
     match origin {
         ArtifactOrigin::Local(path) => format!("local:{}", path.display()),
         ArtifactOrigin::Url(url) => format!("url:{url}"),
+        // 用 `|` 而不是 `@` 分隔：`git@github.com:org/repo` 与
+        // `https://user@host/repo` 这类 URL 本身就含 `@`，按第一个 `@` 拆
+        // 出来的「rev」是 URL 的碎片，`--ref` 校验必然拒绝它，于是 SSH 装的
+        // 插件永远 `update` 不了。`|` 在 URL 与 rev 的字符集里都不出现。
         ArtifactOrigin::Git { url, rev } => match rev {
-            Some(rev) => format!("git:{url}@{rev}"),
+            Some(rev) => format!("git:{url}|{rev}"),
             None => format!("git:{url}"),
         },
     }
@@ -1561,6 +1837,25 @@ fn now_secs() -> i64 {
         .map_or(0, |duration| {
             i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
         })
+}
+
+/// 版本排序键：按 `major.minor.patch` 数值比较，其余部分退回字符串
+///
+/// 直接按字符串排会把 `0.10.0` 排到 `0.9.0` 前面。预发布/构建元数据只影响
+/// 同核心版本内部的相对顺序，按原文比较即可。
+fn version_key(version: &str) -> (u64, u64, u64, String) {
+    let core = version
+        .split(['-', '+'])
+        .next()
+        .unwrap_or(version)
+        .to_owned();
+    let mut parts = core.split('.').map(|part| part.parse::<u64>().unwrap_or(0));
+    (
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        version.to_owned(),
+    )
 }
 
 // ---------------------------------------------------------------- 宿主能力
@@ -1784,39 +2079,36 @@ impl ConsoleIo for HostApiImpl {
                 other => HostError::internal(format!("read server {server}: {other}")),
             })?;
         let path = console_log_path(&registered.dir);
-        let text = match std::fs::read(&path) {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(err) => return Err(HostError::internal(format!("read console log: {err}"))),
-        };
+        // 只读一页所需的窗口：`max_lines` 行长上限之和，再夹到日志尾部读取
+        // 的总上限。整文件读在繁忙服务器上会把宿主内存打满（一行不换行就
+        // 能写到几百 MB），而调用方要的只是最后几百行。
+        let want = max_lines
+            .saturating_mul(MAX_CONSOLE_LINE_BYTES)
+            .min(domain::limits::MAX_LOG_TAIL_BYTES);
         // 游标是字节偏移：单调递增、可跨进程复用，且无需额外状态文件。
-        let start = cursor.unwrap_or(u64::MAX);
-        let mut lines = Vec::new();
-        let mut offset = 0_u64;
-        for line in text.split_inclusive('\n') {
-            let end = offset + line.len() as u64;
-            if start == u64::MAX {
-                // `None`：从尾部开始，保留最后 `max_lines` 行
-                lines.push(ConsoleLine {
-                    cursor: end,
-                    text: line.trim_end_matches(['\r', '\n']).to_owned(),
-                });
-                if lines.len() > max_lines {
-                    lines.remove(0);
-                }
-            } else if end > start {
-                lines.push(ConsoleLine {
-                    cursor: end,
-                    text: line.trim_end_matches(['\r', '\n']).to_owned(),
-                });
-                if lines.len() >= max_lines {
-                    break;
-                }
-            }
-            offset = end;
+        let window = match cursor {
+            Some(start) => domain::log::Window::from(&path, start, want),
+            None => domain::log::Window::tail(&path, want),
         }
-        let next = lines.last().map_or(start.min(offset), |line| line.cursor);
-        Ok(ConsolePage { lines, next })
+        .map_err(|err| HostError::internal(format!("read console log: {err}")))?;
+        let mut lines = window.lines();
+        // 从文件中间起读时首行是半行；整行都不完整（超长行没有换行）时保留
+        // 截断内容，不能因为「半行」把它丢光。
+        if cursor.is_none() && window.truncated() && lines.len() > 1 {
+            lines.remove(0);
+        }
+        if lines.len() > max_lines {
+            let excess = lines.len() - max_lines;
+            lines.drain(..excess);
+        }
+        let next = lines.last().map_or_else(|| window.end(), |(_, end)| *end);
+        Ok(ConsolePage {
+            lines: lines
+                .into_iter()
+                .map(|(text, cursor)| ConsoleLine { cursor, text })
+                .collect(),
+            next,
+        })
     }
 
     fn send_line(&self, server: &ServerName, line: &str) -> Result<(), HostError> {

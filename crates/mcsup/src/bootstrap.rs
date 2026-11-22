@@ -112,6 +112,8 @@ pub struct Mcsup {
     pub plugin_config_store: Arc<dyn port::plugin::PluginConfigStore>,
     /// 插件审计出口
     pub plugin_audit: Arc<dyn port::plugin::AuditSink>,
+    /// 插件撤销列表：安装判定与 `__plugin-host` 启动判定共用同一份数据
+    pub plugin_revocations: Arc<dyn port::plugin::PluginRevocations>,
     /// 下载器（HTTP 传输 + 断点续传）：远端安装核心时由 agent 侧复用
     ///
     /// 与各 service 内部持有的是同一个实例；单独暴露是因为远端安装（
@@ -209,6 +211,7 @@ impl Mcsup {
             Arc::clone(&self.plugin_audit),
             env!("CARGO_PKG_VERSION"),
         )
+        .with_revocations(Arc::clone(&self.plugin_revocations))
     }
 }
 
@@ -669,6 +672,12 @@ impl McsupBuilder {
         let plugin_config_store: Arc<dyn port::plugin::PluginConfigStore> =
             Arc::new(PluginConfigFileStore::new(plugin_data.clone()));
         let plugins_root = data_dir.join("plugins");
+        // 撤销列表由 service（安装判定）与 `__plugin-host`（启动判定）共用：
+        // 两处必须查同一份文件，各建一个实例会让判定与展示出现分歧。
+        let plugin_revocations: Arc<dyn port::plugin::PluginRevocations> =
+            Arc::new(provider::plugin_revoke_file::FileRevocations::new(
+                plugins_root.join(provider::plugin_revoke::REVOCATION_FILE),
+            ));
         let plugin_api = Arc::new(service::HostApiImpl::new(service::HostApiDeps {
             registry: Arc::clone(&registry),
             lifecycle: Arc::new(lifecycle.clone()),
@@ -691,11 +700,7 @@ impl McsupBuilder {
             plugin_data,
             plugin_logs,
         )
-        .with_revocations(Arc::new(
-            provider::plugin_revoke_file::FileRevocations::new(
-                plugins_root.join(provider::plugin_revoke::REVOCATION_FILE),
-            ),
-        ));
+        .with_revocations(Arc::clone(&plugin_revocations));
 
         let mcsup = Mcsup {
             workspaces,
@@ -713,6 +718,7 @@ impl McsupBuilder {
             plugin_store,
             plugin_config_store,
             plugin_audit,
+            plugin_revocations,
             downloader,
             store,
             external_supervisor,

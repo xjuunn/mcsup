@@ -8,6 +8,33 @@
 import type { OpenCapabilityName } from "./contracts/v1.js";
 import { PluginError } from "./errors.js";
 import type { InferSchema, SchemaLike } from "./schema.js";
+import {
+  decodeBackupCreate,
+  decodeBackupList,
+  decodeBackupVerify,
+  decodeConsolePage,
+  decodeContentInstall,
+  decodeContentList,
+  decodeDeleted,
+  decodeFileList,
+  decodeFileRead,
+  decodeFileWrite,
+  decodeJavaInstall,
+  decodeJavaList,
+  decodeKvGet,
+  decodeKvList,
+  decodeNetResponse,
+  decodeRemoved,
+  decodeRemovedCount,
+  decodeSecretGet,
+  decodeServerList,
+  decodeServerProperties,
+  decodeServerStatus,
+  decodeServerVersion,
+  decodeStopOutcome,
+  encodeBase64,
+  expectAck,
+} from "./wire.js";
 
 /** 能力名，与内核的 `Capability` 同义；直接指向生成契约以保持依赖单向 */
 type Capability = OpenCapabilityName;
@@ -20,6 +47,20 @@ export interface CapabilityCaller {
   readonly call: (capability: string, method: string, input: unknown, timeoutMs?: number) => Promise<unknown>;
 }
 
+/** 出站契约调用选项（plugins.md §6.4 / §12.4） */
+export interface ContractCallOptions {
+  /** 单播目标插件 id；广播时省略 */
+  readonly target?: string;
+  /** 嵌套调用必须原样带回宿主分配的 trace */
+  readonly trace?: string;
+  readonly timeoutMs?: number;
+}
+
+/** 插件间契约客户端 */
+export interface ContractClient {
+  call(contract: string, input: unknown, options?: ContractCallOptions): Promise<unknown>;
+}
+
 // ---------------------------------------------------------------------------
 // 服务器只读
 // ---------------------------------------------------------------------------
@@ -27,20 +68,28 @@ export interface CapabilityCaller {
 export interface ServerSummary {
   readonly name: string;
   readonly status: string;
-  readonly port?: number;
+  /** 已安装的版本；未安装为 null */
+  readonly version: string | null;
 }
 
 export interface ServerStatusView {
-  readonly state: string;
-  readonly pid?: number;
-  readonly uptime_secs?: number;
-  readonly players?: number;
+  readonly status: string;
+  readonly version: string | null;
+  readonly players: number | null;
+  readonly uptimeSecs: number | null;
+}
+
+/** 控制台一行的游标与文本 */
+export interface ConsoleLineEntry {
+  readonly cursor: number;
+  readonly text: string;
 }
 
 export interface ConsolePage {
-  readonly cursor: number;
-  readonly lines: readonly string[];
-  readonly dropped: number;
+  /** 本页行；每行带自己的游标 */
+  readonly lines: readonly ConsoleLineEntry[];
+  /** 下一页应传入的游标 */
+  readonly next: number;
 }
 
 export interface ConsoleClient {
@@ -141,7 +190,10 @@ export interface FilesWriteClient {
 // 生命周期
 // ---------------------------------------------------------------------------
 
-export type StopOutcome = { readonly outcome: "stopped"; readonly elapsedMs: number } | { readonly outcome: "already_stopped" };
+export type StopOutcome =
+  | { readonly outcome: "stopped"; readonly elapsedMs: number }
+  | { readonly outcome: "already_stopped" }
+  | { readonly outcome: "timed_out"; readonly waitedMs: number };
 
 export interface LifecycleClient {
   start(server: ServerName): Promise<void>;
@@ -155,7 +207,8 @@ export interface LifecycleClient {
 
 export interface SnapshotView {
   readonly id: string;
-  readonly createdAt: string;
+  /** 创建时间（Unix 秒） */
+  readonly createdAt: number;
   readonly addedBytes: number;
 }
 
@@ -181,9 +234,17 @@ export interface ContentItem {
   readonly identity?: unknown;
 }
 
+export interface ContentInstallResult {
+  readonly file: string;
+  readonly size: number;
+  readonly project: string;
+  /** 宿主选定的版本号；无法确定时为 null */
+  readonly version: string | null;
+}
+
 export interface ContentClient {
   list(server: ServerName, opts?: { readonly kind?: ContentKind; readonly identify?: boolean }): Promise<readonly ContentItem[]>;
-  install(server: ServerName, project: string, opts?: { readonly version?: string; readonly kind?: ContentKind }): Promise<{ readonly file: string; readonly size: number; readonly project: string; readonly version: string }>;
+  install(server: ServerName, project: string, opts?: { readonly version?: string; readonly kind?: ContentKind }): Promise<ContentInstallResult>;
   remove(server: ServerName, selector: string, kind?: ContentKind): Promise<number>;
 }
 
@@ -198,8 +259,10 @@ export interface JavaRuntime {
   readonly version: string;
   readonly vendor: string;
   readonly managed: boolean;
-  readonly createdAt: string;
-  readonly updatedAt: string;
+  /** 创建时间（Unix 秒） */
+  readonly createdAt: number;
+  /** 更新时间（Unix 秒） */
+  readonly updatedAt: number;
 }
 
 export interface JavaClient {
@@ -285,6 +348,8 @@ export type CtxFor<C extends readonly Capability[], Cfg extends SchemaLike = Sch
   [K in keyof CtxMembers as K extends C[number] ? K : never]: CtxMembers[K];
 } & {
   readonly log: LogClient;
+  /** 插件间契约调用；声明 `consumes` 后由宿主路由 */
+  readonly contract: ContractClient;
   readonly config: InferSchema<Cfg>;
   readonly sessionId: string;
   readonly limits: LimitsView;
@@ -294,6 +359,8 @@ export type CtxFor<C extends readonly Capability[], Cfg extends SchemaLike = Sch
 /** 运行期构造上下文所需的环境（welcome 后会被改写） */
 export interface CtxEnvironment {
   readonly caller: CapabilityCaller;
+  /** 出站契约调用；与能力调用共用 inflight 限额 */
+  readonly contractCaller: (contract: string, input: unknown, options?: ContractCallOptions) => Promise<unknown>;
   readonly config: () => unknown;
   sessionId: string;
   limits: LimitsView;
@@ -336,37 +403,9 @@ export class EventBus {
   }
 }
 
-/** 编解码用的共享编码器：避免每次调用新建实例 */
-const textEncoder = new TextEncoder();
-
-function asBytes(value: string | Uint8Array): Uint8Array {
-  return typeof value === "string" ? textEncoder.encode(value) : value;
-}
-
-function b64(bytes: Uint8Array): string {
-  return Buffer.from(bytes).toString("base64");
-}
-
-function unb64(text: string): Uint8Array {
-  return new Uint8Array(Buffer.from(text, "base64"));
-}
-
 // ---------------------------------------------------------------------------
-// 宿主返回的线上形状（snake_case，§9 的能力方法返回值）
+// 构造
 // ---------------------------------------------------------------------------
-
-interface KvGetOut { readonly value: string | null }
-interface KvListOut { readonly keys: readonly string[] }
-interface SecretGetOut { readonly value: string | null }
-interface FileReadOut { readonly path: string; readonly size: number; readonly data: string }
-interface FileListOut { readonly entries: readonly { readonly path: string; readonly is_dir: boolean; readonly size: number }[] }
-interface NetOut { readonly status: number; readonly headers: Readonly<Record<string, string>>; readonly body: string; readonly body_len: number }
-interface ConsoleTailOut { readonly cursor: number; readonly lines: readonly string[]; readonly dropped: number }
-interface BackupListOut { readonly snapshots: readonly { readonly id: string; readonly created_at: string; readonly added_bytes: number }[] }
-interface BackupCreateOut { readonly snapshot: { readonly id: string; readonly created_at: string; readonly added_bytes: number } }
-interface ContentListOut { readonly items: readonly { readonly file: string; readonly size: number; readonly identity?: unknown }[] }
-interface JavaListOut { readonly runtimes: readonly { readonly id: string; readonly path: string; readonly major: number; readonly version: string; readonly vendor: string; readonly managed: boolean; readonly created_at: string; readonly updated_at: string }[] }
-interface JavaInstallOut { readonly runtime: JavaListOut["runtimes"][number] }
 
 /**
  * 构造上下文。
@@ -387,165 +426,160 @@ export function createCtx<C extends readonly Capability[], Cfg extends SchemaLik
 
   if (has("server:read")) {
     const servers: ConsoleClient = {
-      list: async () => (await call("server:read", "list", {})) as readonly ServerSummary[],
-      status: async (server) => (await call("server:read", "status", { server })) as ServerStatusView,
-      version: async (server) => (await call("server:read", "version", { server })) as string | null,
-      properties: async (server) => (await call("server:read", "properties", { server })) as Readonly<Record<string, string>>,
+      list: async () => decodeServerList(await call("server:read", "list", {})),
+      status: async (server) => decodeServerStatus(await call("server:read", "status", { server })),
+      version: async (server) => decodeServerVersion(await call("server:read", "version", { server })),
+      properties: async (server) =>
+        decodeServerProperties(await call("server:read", "properties", { server })),
     };
     members["server:read"] = { servers };
   }
   if (has("console:read")) {
     const consoleRead: ConsoleReadClient = {
-      tail: async (server, cursor = null, maxLines = 200) => {
-        const out = (await call("console:read", "tail", { server, cursor, max_lines: maxLines })) as ConsoleTailOut;
-        return { cursor: out.cursor, lines: out.lines, dropped: out.dropped };
-      },
+      tail: async (server, cursor = null, maxLines = 200) =>
+        decodeConsolePage(
+          await call("console:read", "tail", { server, cursor, max_lines: maxLines }),
+        ),
     };
     members["console:read"] = consoleRead;
   }
   if (has("console:write")) {
     const consoleWrite: ConsoleWriteClient = {
       sendLine: async (server, line) => {
-        await call("console:write", "send_line", { server, line });
+        expectAck(await call("console:write", "send_line", { server, line }), "console:write.send_line");
       },
     };
     members["console:write"] = consoleWrite;
   }
   if (has("storage:kv")) {
     const kv: KvClient = {
-      get: async (key) => {
-        const out = (await call("storage:kv", "get", { key })) as KvGetOut;
-        return out.value === null ? null : unb64(out.value);
-      },
+      get: async (key) => decodeKvGet(await call("storage:kv", "get", { key })),
       set: async (key, value) => {
-        await call("storage:kv", "set", { key, value: b64(asBytes(value)) });
+        expectAck(
+          await call("storage:kv", "set", { key, value: encodeBase64(value) }),
+          "storage:kv.set",
+        );
       },
-      delete: async (key) => (await call("storage:kv", "delete", { key })) as boolean,
-      list: async (prefix = "") => {
-        const out = (await call("storage:kv", "list", { prefix })) as KvListOut;
-        return out.keys;
-      },
+      delete: async (key) => decodeDeleted(await call("storage:kv", "delete", { key }), "storage:kv.delete"),
+      list: async (prefix = "") => decodeKvList(await call("storage:kv", "list", { prefix })),
     };
     members["storage:kv"] = kv;
   }
   if (has("secret:rw")) {
     const secrets: SecretClient = {
-      get: async (key) => ((await call("secret:rw", "get", { key })) as SecretGetOut).value,
+      get: async (key) => decodeSecretGet(await call("secret:rw", "get", { key })),
       set: async (key, value) => {
-        await call("secret:rw", "set", { key, value });
+        // 线上是 base64，和 KV 一致；UTF-8 文本先编码
+        expectAck(
+          await call("secret:rw", "set", { key, value: encodeBase64(value) }),
+          "secret:rw.set",
+        );
       },
-      delete: async (key) => (await call("secret:rw", "delete", { key })) as boolean,
+      delete: async (key) => decodeDeleted(await call("secret:rw", "delete", { key }), "secret:rw.delete"),
     };
     members["secret:rw"] = secrets;
   }
   if (has("net:outbound")) {
     const net: NetClient = {
-      request: async (req) => {
-        const out = (await call("net:outbound", "request", {
-          method: req.method ?? "GET",
-          url: req.url,
-          headers: req.headers ?? {},
-          body: req.body === undefined || req.body === null ? null : b64(asBytes(req.body)),
-          timeout_ms: req.timeoutMs,
-        })) as NetOut;
-        return { status: out.status, headers: out.headers, body: unb64(out.body), bodyLen: out.body_len };
-      },
+      request: async (req) =>
+        decodeNetResponse(
+          await call("net:outbound", "request", {
+            method: req.method ?? "GET",
+            url: req.url,
+            headers: req.headers ?? {},
+            body: req.body === undefined || req.body === null ? null : encodeBase64(req.body),
+            timeout_ms: req.timeoutMs,
+          }),
+        ),
     };
     members["net:outbound"] = net;
   }
   if (has("files:read")) {
     const filesRead: FilesReadClient = {
-      read: async (server, path) => {
-        const out = (await call("files:read", "read", { server, path })) as FileReadOut;
-        return { path: out.path, size: out.size, data: unb64(out.data) };
-      },
-      list: async (server, path) => {
-        const out = (await call("files:read", "list", { server, path })) as FileListOut;
-        return out.entries.map((e) => ({ path: e.path, isDir: e.is_dir, size: e.size }));
-      },
+      read: async (server, path) => decodeFileRead(await call("files:read", "read", { server, path })),
+      list: async (server, path) => decodeFileList(await call("files:read", "list", { server, path })),
     };
     members["files:read"] = filesRead;
   }
   if (has("files:write")) {
     const filesWrite: FilesWriteClient = {
       write: async (server, path, data, overwrite = false) =>
-        (await call("files:write", "write", { server, path, data: b64(asBytes(data)), overwrite })) as { ok: true; size: number },
-      remove: async (server, path) => (await call("files:write", "remove", { server, path })) as boolean,
+        decodeFileWrite(
+          await call("files:write", "write", {
+            server,
+            path,
+            data: encodeBase64(data),
+            overwrite,
+          }),
+        ),
+      remove: async (server, path) =>
+        decodeRemoved(await call("files:write", "remove", { server, path }), "files:write.remove"),
     };
     members["files:write"] = filesWrite;
   }
   if (has("server:lifecycle")) {
     const lifecycle: LifecycleClient = {
       start: async (server) => {
-        await call("server:lifecycle", "start", { server });
+        expectAck(await call("server:lifecycle", "start", { server }), "server:lifecycle.start");
       },
       stop: async (server, graceSecs) =>
-        (await call("server:lifecycle", "stop", { server, grace_secs: graceSecs })) as StopOutcome,
+        decodeStopOutcome(
+          await call("server:lifecycle", "stop", { server, grace_secs: graceSecs }),
+        ),
       restart: async (server, graceSecs) => {
-        await call("server:lifecycle", "restart", { server, grace_secs: graceSecs });
+        expectAck(
+          await call("server:lifecycle", "restart", { server, grace_secs: graceSecs }),
+          "server:lifecycle.restart",
+        );
       },
     };
     members["server:lifecycle"] = lifecycle;
   }
   if (has("backup")) {
-    const mapSnapshot = (s: { id: string; created_at: string; added_bytes: number }): SnapshotView => ({
-      id: s.id,
-      createdAt: s.created_at,
-      addedBytes: s.added_bytes,
-    });
     const backup: BackupClient = {
-      create: async (server, label) => {
-        const out = (await call("backup", "create", { server, label })) as BackupCreateOut;
-        return mapSnapshot(out.snapshot);
-      },
-      list: async (server) => {
-        const out = (await call("backup", "list", { server })) as BackupListOut;
-        return out.snapshots.map(mapSnapshot);
-      },
+      create: async (server, label) => decodeBackupCreate(await call("backup", "create", { server, label })),
+      list: async (server) => decodeBackupList(await call("backup", "list", { server })),
       restore: async (server, snapshot) => {
-        await call("backup", "restore", { server, snapshot });
+        expectAck(await call("backup", "restore", { server, snapshot }), "backup.restore");
       },
-      verify: async (server, snapshot) => ((await call("backup", "verify", { server, snapshot })) as { healthy: boolean }).healthy,
-      prune: async (server, keep) => ((await call("backup", "prune", { server, keep })) as { removed: number }).removed,
-      delete: async (server, snapshot) => ((await call("backup", "delete", { server, snapshot })) as { deleted: boolean }).deleted,
+      verify: async (server, snapshot) =>
+        decodeBackupVerify(await call("backup", "verify", { server, snapshot })),
+      prune: async (server, keep) =>
+        decodeRemovedCount(await call("backup", "prune", { server, keep }), "backup.prune"),
+      delete: async (server, snapshot) =>
+        decodeDeleted(await call("backup", "delete", { server, snapshot }), "backup.delete"),
     };
     members["backup"] = backup;
   }
   if (has("content")) {
     const content: ContentClient = {
-      list: async (server, opts) => {
-        const out = (await call("content", "list", { server, kind: opts?.kind, identify: opts?.identify })) as ContentListOut;
-        return out.items;
-      },
+      list: async (server, opts) =>
+        decodeContentList(
+          await call("content", "list", { server, kind: opts?.kind, identify: opts?.identify }),
+        ),
       install: async (server, project, opts) =>
-        (await call("content", "install", { server, project, version: opts?.version, kind: opts?.kind })) as {
-          file: string;
-          size: number;
-          project: string;
-          version: string;
-        },
-      remove: async (server, selector, kind) => ((await call("content", "remove", { server, selector, kind })) as { removed: number }).removed,
+        decodeContentInstall(
+          await call("content", "install", {
+            server,
+            project,
+            version: opts?.version,
+            kind: opts?.kind,
+          }),
+        ),
+      remove: async (server, selector, kind) =>
+        decodeRemovedCount(
+          await call("content", "remove", { server, selector, kind }),
+          "content.remove",
+        ),
     };
     members["content"] = content;
   }
   if (has("java")) {
-    const mapRuntime = (r: JavaListOut["runtimes"][number]): JavaRuntime => ({
-      id: r.id,
-      path: r.path,
-      major: r.major,
-      version: r.version,
-      vendor: r.vendor,
-      managed: r.managed,
-      createdAt: r.created_at,
-      updatedAt: r.updated_at,
-    });
     const java: JavaClient = {
-      list: async () => {
-        const out = (await call("java", "list", {})) as JavaListOut;
-        return out.runtimes.map(mapRuntime);
-      },
-      install: async (major) => mapRuntime(((await call("java", "install", { major })) as JavaInstallOut).runtime),
-      remove: async (path) => ((await call("java", "remove", { path })) as { removed: boolean }).removed,
+      list: async () => decodeJavaList(await call("java", "list", {})),
+      install: async (major) => decodeJavaInstall(await call("java", "install", { major })),
+      remove: async (path) =>
+        decodeRemoved(await call("java", "remove", { path }), "java.remove"),
     };
     members["java"] = java;
   }
@@ -571,8 +605,13 @@ export function createCtx<C extends readonly Capability[], Cfg extends SchemaLik
     },
   };
 
+  const contract: ContractClient = {
+    call: async (name, input, options) => await env.contractCaller(name, input, options),
+  };
+
   const ctx = {
     ...members,
+    contract,
     log,
     get config(): unknown {
       return env.config();

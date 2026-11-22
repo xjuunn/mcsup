@@ -234,14 +234,14 @@ describe("能力客户端", () => {
     const host = createMockHost(reader, {
       handle: ({ capability, method }) => {
         if (capability === "console:read" && method === "tail") {
-          return { cursor: 9, lines: ["hello"], dropped: 0 };
+          return { lines: [{ cursor: 9, text: "hello" }], next: 9 };
         }
         throw new Error("unexpected");
       },
     });
     await host.start();
     const page = await host.ctx["console:read"].tail("survival");
-    expect(page).toEqual({ cursor: 9, lines: ["hello"], dropped: 0 });
+    expect(page).toEqual({ lines: [{ cursor: 9, text: "hello" }], next: 9 });
     await host.shutdown();
   });
 });
@@ -321,7 +321,7 @@ describe("并发限额（§5.4）", () => {
           peak = Math.max(peak, concurrent);
           await gate.promise;
           concurrent -= 1;
-          return [];
+          return { servers: [] };
         }
         throw new Error(`unexpected ${capability}.${method}`);
       },
@@ -436,6 +436,9 @@ describe("流式空闲超时（§5.4）", () => {
         frames.push(frame);
       },
       async call() {
+        return null;
+      },
+      async callContract() {
         return null;
       },
       close() {},

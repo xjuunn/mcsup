@@ -695,10 +695,12 @@ fn set_path_at(map: &mut Map<String, Value>, segments: &[&str], value: Value) {
     }
 }
 
-/// 启用并启动；已在运行时重启以加载新配置
+/// 启用并保证在跑
 ///
-/// 升级已启用的插件时 `enable` 会因「已启用」报冲突，所以先看标志位：
-/// 只有未启用才需要补一次 `enable`。
+/// 升级路径里服务层已经在新版本启动成功之后才算成功（`install_into` /
+/// `activate_version` 都是这个次序），这里再 `restart` 会多出一整轮停机与
+/// 重启审计事件——对启动慢的桥是实打实的额外中断。所以只在**没有会话**时
+/// 启动。
 fn activate(service: &PluginService, id: &PluginId) -> Result<()> {
     let enabled = service
         .list()?
@@ -708,9 +710,7 @@ fn activate(service: &PluginService, id: &PluginId) -> Result<()> {
         service.enable(id)?;
     }
     plugin_host::ensure()?;
-    if service.status(id)?.session.is_some() {
-        service.restart(id, Duration::from_secs(10))?;
-    } else {
+    if service.status(id)?.session.is_none() {
         service.start(id)?;
     }
     Ok(())
@@ -979,7 +979,7 @@ fn resolve_origin(
         return Ok(ArtifactOrigin::Url(url));
     }
     if let Some(path) = from {
-        return Ok(ArtifactOrigin::Local(path));
+        return Ok(ArtifactOrigin::Local(absolute_local(path)?));
     }
     let Some(raw) = source else {
         return Err(AppDiagnostic::usage("缺少插件来源", None).into());
@@ -987,8 +987,22 @@ fn resolve_origin(
     if raw.starts_with("http://") || raw.starts_with("https://") {
         Ok(ArtifactOrigin::Url(raw))
     } else {
-        Ok(ArtifactOrigin::Local(PathBuf::from(raw)))
+        Ok(ArtifactOrigin::Local(absolute_local(PathBuf::from(raw))?))
     }
+}
+
+/// 本地来源一律规范成绝对路径
+///
+/// 安装记录里存的是 `local:<path>`。相对路径会在**执行 `plugin update` 时的
+/// 工作目录**下解析——同一个插件在别的目录里 `update` 会指向完全不同的位置，
+/// 甚至恰好指向另一个插件。规范成绝对路径后记录与工作目录无关。
+fn absolute_local(path: PathBuf) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    let cwd = std::env::current_dir()
+        .map_err(|err| AppDiagnostic::usage(format!("无法确定当前工作目录: {err}"), None))?;
+    Ok(cwd.join(path))
 }
 
 fn update(
@@ -1204,7 +1218,10 @@ fn origin_from_source(source: Option<&str>) -> Option<ArtifactOrigin> {
         return Some(ArtifactOrigin::Url(url.to_owned()));
     }
     if let Some(rest) = source.strip_prefix("git:") {
-        let (url, rev) = match rest.split_once('@') {
+        // `|` 分隔（不是 `@`）：`git@github.com:org/repo` 这类 URL 本身含
+        // `@`，按第一个 `@` 拆出来的「rev」是 URL 碎片，必然被 `--ref` 校验
+        // 拒绝，SSH 装的插件就永远升级不了。
+        let (url, rev) = match rest.rsplit_once('|') {
             Some((url, rev)) => (url.to_owned(), Some(rev.to_owned())),
             None => (rest.to_owned(), None),
         };
@@ -1226,7 +1243,7 @@ fn upgrade_from_source(
             None,
         )
     })?;
-    let outcome = service.install(&origin, None, prune)?;
+    let outcome = service.install_as(id, &origin, prune)?;
     Ok((outcome.record.id, outcome.record.version))
 }
 
@@ -1320,7 +1337,25 @@ fn start(id: &str, printer: Printer) -> Result<()> {
 fn stop(id: &str, grace: u64, printer: Printer) -> Result<()> {
     let id = parse_id(id)?;
     let service = open()?;
-    service.stop(&id, Duration::from_secs(grace.min(300)))?;
+    // 上限用领域常量（与 `server stop` 同一份）：静默夹紧会让用户以为
+    // 「`--grace 600`」真的生效了，实际只等了别的值。
+    let max = mcsup::domain::limits::MAX_STOP_GRACE.as_secs();
+    if grace > max {
+        return Err(AppDiagnostic::usage(
+            crate::i18n::pick(
+                printer.lang(),
+                format!("--grace 最大 {max}s，收到 {grace}"),
+                format!("--grace must be at most {max}s, got {grace}"),
+            ),
+            Some(crate::i18n::pick(
+                printer.lang(),
+                "默认 10s",
+                "the default is 10s",
+            )),
+        )
+        .into());
+    }
+    service.stop(&id, Duration::from_secs(grace))?;
     printer.print_outcome(
         &crate::i18n::pick(
             printer.lang(),
@@ -2010,11 +2045,21 @@ fn revoked_finding(service: &PluginService, record: &PluginRecord, skip: bool) -
 
 fn verify(target: &str, printer: Printer) -> Result<()> {
     let service = open()?;
-    let expected = sha256_hint(target);
-    // 压缩包 / 目录：重新走一遍来源校验；插件 id：按安装记录找到产物目录。
+    // 压缩包 / 目录：重跑来源校验，摘要取自旁路 `.sha256`。插件 id：按安装
+    // 记录找到产物目录，摘要必须取自**记录**——旁路文件里是压缩包摘要，与
+    // 解包目录树摘要不是一回事，混用会拿错误的期望值去比对，或者干脆不比对
+    // 就报「校验通过」，放行被改过的产物。
     let (target_path, id, recheck) = if let Ok(id) = PluginId::parse(target) {
         let record = service.record(&id)?;
-        (record.artifact_dir, Some(record.id), false)
+        let expected = record
+            .sha256
+            .as_deref()
+            .map(|hex| Checksum::new(ChecksumAlgorithm::Sha256, hex));
+        let verifier = mcsup::provider::plugin::PluginArtifactVerifier::new();
+        let artifact = verifier
+            .verify_installed(&record.artifact_dir, expected.as_ref())
+            .map_err(anyhow::Error::from)?;
+        return report_verified(&artifact, Some(record.id), printer);
     } else {
         let path = PathBuf::from(target);
         if !path.exists() {
@@ -2024,6 +2069,7 @@ fn verify(target: &str, printer: Printer) -> Result<()> {
         }
         (path.clone(), None, path.is_file())
     };
+    let expected = sha256_hint(target);
     let verifier = mcsup::provider::plugin::PluginArtifactVerifier::new();
     let artifact = if recheck {
         // 未安装的文件：先解包并计算来源摘要，再与旁路 `.sha256` 比对。
@@ -2038,6 +2084,14 @@ fn verify(target: &str, printer: Printer) -> Result<()> {
             .verify_installed(&target_path, expected.as_ref())
             .map_err(anyhow::Error::from)?
     };
+    report_verified(&artifact, id, printer)
+}
+
+fn report_verified(
+    artifact: &mcsup::port::plugin::PluginArtifact,
+    id: Option<PluginId>,
+    printer: Printer,
+) -> Result<()> {
     let manifest = Manifest::from_json(
         &serde_json::to_vec(&artifact.manifest).map_err(|err| anyhow!("{err}"))?,
     )
@@ -2324,5 +2378,31 @@ mod tests {
         odd.insert("qq".to_owned(), json!("not-an-object"));
         set_path(&mut odd, "qq.groups", json!(["g"]));
         assert_eq!(odd["qq"], json!({ "groups": ["g"] }));
+    }
+
+    /// git 来源用 `|` 分隔：SSH 形式的 URL 自带 `@`，按 `@` 拆会把 URL 拆坏
+    #[test]
+    fn git_source_round_trips_urls_that_contain_at_signs() {
+        assert!(matches!(
+            origin_from_source(Some("git:git@github.com:org/repo|v1.0.0")),
+            Some(ArtifactOrigin::Git { url, rev: Some(rev) })
+                if url == "git@github.com:org/repo" && rev == "v1.0.0"
+        ));
+        assert!(matches!(
+            origin_from_source(Some("git:https://user@host/org/repo")),
+            Some(ArtifactOrigin::Git { url, rev: None })
+                if url == "https://user@host/org/repo"
+        ));
+    }
+
+    /// 本地来源规范成绝对路径：`plugin update` 不该依赖当前工作目录
+    #[test]
+    fn relative_local_sources_become_absolute() {
+        let relative = absolute_local(PathBuf::from("plugins").join("demo")).expect("absolute");
+        assert!(relative.is_absolute(), "{relative:?}");
+        assert!(relative.ends_with(Path::new("plugins").join("demo")));
+
+        let base = std::env::temp_dir();
+        assert_eq!(absolute_local(base.clone()).expect("absolute"), base);
     }
 }

@@ -24,9 +24,12 @@ import { toZod, type SchemaLike } from "./schema.js";
 import {
   DEFAULT_OP_TIMEOUT_MS,
   DescriptorError,
+  MCSup_FORMATS,
   MAX_DESCRIPTOR_BYTES,
   OP_ID_PATTERN,
   inferDisplay,
+  isJsonSchemaFormat,
+  isMcsupFormat,
   schemaShape,
   shapeHint,
   validateDescriptorSize,
@@ -152,38 +155,6 @@ const META_KEY_MAP: Record<string, string> = {
   placeholder: "x-mcsup-placeholder",
 };
 
-const FORMATS = new Set(["plain", "minecraft-text", "markdown-sanitized", "datetime", "duration", "bytes"]);
-
-/**
- * 标准 JSON Schema `format` 取值。
- *
- * zod 的 `.datetime()` / `.uuid()` / `.url()` 会生成标准 `format`，不能把它
- * 当成 `.meta({ format })` 的自定义展示格式；否则合法 schema 会在构建期被
- * `FORMATS` 拒绝。`duration` 同时出现在两边，按自定义展示格式处理，保持
- * `.meta({ format: "duration" })` 的既有语义。
- */
-const JSON_SCHEMA_FORMATS = new Set([
-  "date-time",
-  "date",
-  "time",
-  "duration",
-  "email",
-  "idn-email",
-  "hostname",
-  "idn-hostname",
-  "ipv4",
-  "ipv6",
-  "uri",
-  "uri-reference",
-  "iri",
-  "iri-reference",
-  "uuid",
-  "uri-template",
-  "json-pointer",
-  "relative-json-pointer",
-  "regex",
-]);
-
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
 function isJsonObject(value: JsonValue): value is { [key: string]: JsonValue } {
@@ -297,17 +268,17 @@ function applyMetaKeys(value: JsonValue, onOutput: boolean, path: string): JsonV
         throw new DescriptorError(`${path}.x-mcsup-format`, "must be a string");
       }
       // 自定义展示格式优先；其余标准 JSON Schema 格式原样保留
-      if (FORMATS.has(item)) {
+      if (isMcsupFormat(item)) {
         out["x-mcsup-format"] = item;
         continue;
       }
-      if (JSON_SCHEMA_FORMATS.has(item)) {
+      if (isJsonSchemaFormat(item)) {
         out["format"] = item;
         continue;
       }
       throw new DescriptorError(
         `${path}.x-mcsup-format`,
-        `must be one of ${[...FORMATS].join(", ")} or a standard JSON Schema format`,
+        `must be one of ${MCSup_FORMATS.join(", ")} or a standard JSON Schema format`,
       );
     }
     const mapped = META_KEY_MAP[key];
@@ -433,6 +404,39 @@ export interface DescriptorOp {
   readonly output: JsonValue;
   readonly timeout_ms: number;
   readonly pagination?: JsonValue;
+}
+
+/** 分页声明归一化：四个字段都必须写进 descriptor（宿主反序列化无默认值） */
+function normalizePagination(path: string, value: unknown): JsonValue {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new DescriptorError(`${path}.pagination`, "must be an object");
+  }
+  const record = value as Record<string, unknown>;
+  const text = (snake: string, camel: string): string => {
+    const raw = record[snake] ?? record[camel];
+    if (typeof raw !== "string" || raw.trim() === "") {
+      throw new DescriptorError(`${path}.pagination.${snake}`, "must be a non-empty string");
+    }
+    return raw;
+  };
+  const count = (snake: string, camel: string): number => {
+    const raw = record[snake] ?? record[camel];
+    if (typeof raw !== "number" || !Number.isInteger(raw)) {
+      throw new DescriptorError(`${path}.pagination.${snake}`, "must be an integer");
+    }
+    return raw;
+  };
+  const cursorField = text("cursor_field", "cursorField");
+  const limitField = text("limit_field", "limitField");
+  const defaultLimit = count("default_limit", "defaultLimit");
+  const maxLimit = count("max_limit", "maxLimit");
+  if (defaultLimit <= 0 || maxLimit <= 0 || maxLimit > 1_000 || defaultLimit > maxLimit) {
+    throw new DescriptorError(
+      `${path}.pagination`,
+      `limits must satisfy 1 <= default_limit <= max_limit <= 1000 (got ${defaultLimit}..${maxLimit})`,
+    );
+  }
+  return sortKeys({ cursor_field: cursorField, limit_field: limitField, default_limit: defaultLimit, max_limit: maxLimit });
 }
 
 function schemaName(opId: string, direction: "in" | "out"): string {
@@ -569,7 +573,7 @@ export function buildDescriptor<
       (entry as { description?: string }).description = op.description;
     }
     if (op.pagination !== undefined) {
-      (entry as { pagination?: JsonValue }).pagination = sortKeys(op.pagination as JsonValue);
+      (entry as { pagination?: JsonValue }).pagination = normalizePagination(path, op.pagination);
     }
     ops.push(entry);
   }

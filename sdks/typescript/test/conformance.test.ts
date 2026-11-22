@@ -41,7 +41,17 @@ function loadCase(testCase: RegisteredCase): { input: BehaviorInput; expect: Rec
 
 /** 与本文件 fixtures 对应的会话（`counter` 计数在测试间会累加，用例以相对值断言） */
 async function startBridge(granted?: readonly string[]) {
-  const host = createMockHost(chatBridge, { config: { token: "t" }, granted });
+  const host = createMockHost(chatBridge, {
+    config: { token: "t" },
+    granted,
+    // 宿主会确认写入类能力；reentrant 用例会 set 一次 KV
+    handle: ({ capability, method }) => {
+      if (capability === "storage:kv" && method === "set") {
+        return { ok: true };
+      }
+      return null;
+    },
+  });
   await host.start();
   return host;
 }
@@ -79,10 +89,14 @@ describe("conformance cases", () => {
         const host = await startBridge();
         const result = await host.callOp(input.op ?? "", input.input ?? {});
         expect(result.ok).toBe(true);
-        const chunks = host.frames.filter((f) => f.type === "stream").map((f) => (f as { chunk: unknown }).chunk);
-        const doneAt = chunks.findIndex((c) => JSON.stringify(c) === "{}");
-        expect(doneAt).toBeGreaterThan(0);
-        expect(chunks.slice(0, doneAt)).toEqual(expected["chunks"]);
+        const streams = host.frames.filter(
+          (f): f is Extract<(typeof host.frames)[number], { type: "stream" }> => f.type === "stream",
+        );
+        // 最后一个真实分块带 done:true；不再额外发 chunk:{} 收尾（§6.5）
+        expect(streams.map((f) => f.chunk)).toEqual(expected["chunks"]);
+        expect(streams.map((f) => f.seq)).toEqual(streams.map((_f, index) => index));
+        expect(streams.at(-1)?.done).toBe(true);
+        expect(streams.slice(0, -1).every((f) => !f.done)).toBe(true);
         expect(expected["done"]).toBe(true);
         await host.shutdown();
         return;

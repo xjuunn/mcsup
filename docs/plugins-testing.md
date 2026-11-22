@@ -168,7 +168,7 @@ TypeScript 侧用 `test("PROTO-FRM-004 ...")`，由报告器解析前缀。
 | H8 契约闭集 | `DOM-CON-004` `INST-PKG-006` | 未知契约安装失败 |
 | H9 descriptor 构建时生成 | `SDK-GEN-002` `SDK-GEN-003` | 运行时无生成路径；`--dump` 不连接宿主 |
 | H10 宿主校验输入 | `API-SRV-002` `PROTO-CALL-002` | 非法输入在宿主侧被拒，插件 handler 未被调用 |
-| H11 单帧 1 MiB | `HOST-LIM-001` `PROTO-FRM-006` | 1 MiB 通过，1 MiB + 1 字节拒绝 |
+| H11 单帧 24 MiB | `HOST-LIM-001` `PROTO-FRM-006` | 24 MiB 通过，24 MiB + 1 字节拒绝 |
 | H12 禁止热替换 | `HOST-PRC-012` `INST-UPG-004` | 升级先停进程，不原地替换运行中的文件 |
 | H13 升级重置授权 | `INST-UPG-003` | 新增能力 → `pending_approval` |
 | H14 单实例 | `HOST-PRC-004` `PLAT-004` | 同 `(id, scope, server)` 第二个实例被拒 |
@@ -198,7 +198,7 @@ TypeScript 侧用 `test("PROTO-FRM-004 ...")`，由报告器解析前缀。
 | 5.6 崩溃退避 | `HOST-RST-001..008` | 1/2/4/8/16 s；第 5 次 `failed` |
 | 6.3 握手顺序 | `PROTO-HSK-001..012` | 先 `hello` 后 `welcome`；越界能力不授予 |
 | 6.4 错误码 | `PROTO-CALL-005` | 11 个错误码的 `code/category/retryable` 映射 |
-| 6.1 解码上限 | `PROTO-FRM-006` `PROTO-FRM-012` | 1 MiB 与深度 32 在反序列化前被拒 |
+| 6.1 解码上限 | `PROTO-FRM-006` `PROTO-FRM-012` | 24 MiB 与深度 32 在反序列化前被拒 |
 | 6.5 流缺口 | `PROTO-STR-004` | `seq` 跳号即终止 |
 | 6.6 配置回滚 | `PROTO-CFG-003` | 插件回错后恢复旧 revision |
 | 6.9 控制通道 | `PROTO-CTL-001..010` | CLI / server / agent 共用同一帧集 |
@@ -362,7 +362,7 @@ java -jar conformance.jar --cases ../conformance/cases.json
 | `reject-api` | `hello.api=2` | `PROTO-HSK-006` |
 | `deny-token` | 发送错误令牌 | `PROTO-HSK-005` |
 | `unknown-frame` | 握手后发未知 `type`，继续工作 | `PROTO-FRM-010` |
-| `oversize` | 发 1 MiB + 1 字节帧 | `HOST-LIM-001` |
+| `oversize` | 发 24 MiB + 1 字节帧 | `HOST-LIM-001` |
 | `crash-start` | 握手前退出码 1 | `HOST-PRC-008` |
 | `crash-after` | 握手成功后立即崩溃 | `HOST-RST-001` |
 | `ignore-ping` | 不回复 `ping` | `HOST-HB-002` |
@@ -544,7 +544,7 @@ java -jar conformance.jar --cases ../conformance/cases.json
 | `PROTO-FRM-003` | 未知 `type` | 忽略，连接保持 |
 | `PROTO-FRM-004` | `v=2` | `unsupported_version`，关闭 |
 | `PROTO-FRM-005` | 非法 JSON | `invalid_frame` |
-| `PROTO-FRM-006` | 1 MiB + 1 字节 | `frame_too_large` |
+| `PROTO-FRM-006` | 24 MiB + 1 字节 | `frame_too_large` |
 | `PROTO-FRM-007` | CRLF 行尾 | 解析成功 |
 | `PROTO-FRM-008` | 空行 | `invalid_frame` |
 | `PROTO-FRM-009` | 重复键 | `invalid_frame` |
@@ -554,7 +554,7 @@ java -jar conformance.jar --cases ../conformance/cases.json
 | `PROTO-FRM-013` | `id` 超出 u64 | `invalid_frame` |
 | `PROTO-FRM-014` | 顶层不是对象 | `invalid_frame` |
 | `PROTO-FRM-015` | 缺 `type` | `invalid_frame` |
-| `PROTO-FRM-016` | 1 MiB - 1 字节 | 解析成功 |
+| `PROTO-FRM-016` | 24 MiB - 1 字节 | 解析成功 |
 | `PROTO-FRM-017` | `NaN` / `Infinity` | `invalid_frame` |
 | `PROTO-FRM-018` | 未知嵌套字段 | 忽略 |
 | `PROTO-FRM-019` | 读到 EOF | `unexpected_eof` |
@@ -731,7 +731,7 @@ panic，只能返回错误。
 
 | ID | 场景 | 期望 |
 | --- | --- | --- |
-| `HOST-LIM-001` | 1 MiB + 1 | 终止会话 |
+| `HOST-LIM-001` | 24 MiB + 1 | 终止会话 |
 | `HOST-LIM-002` | 出站 inflight 8 | 第 9 个排队 |
 | `HOST-LIM-003` | 队列 32 | 第 33 个 `limit_exceeded` |
 | `HOST-LIM-004` | 事件队列 1024 | 丢最旧 |
@@ -1062,8 +1062,10 @@ panic，只能返回错误。
 | `INST-UPG-006` | 降级且能力减少 | 直接生效 |
 | `INST-UPG-007` | 卸载 | 保留数据、删除密钥；`--keep-secrets` 保留密钥 |
 | `INST-UPG-008` | `--purge` | 数据、日志、授权删除 |
-| `INST-UPG-009` | `--prune` | 旧版本清理 |
+| `INST-UPG-009` | `--prune` | 更旧版本清理；当前与回滚目标保留 |
 | `INST-UPG-010` | 并发升级 | 第二个拒绝 |
+| `INST-UPG-011` | `update --to <当前版本>` | 拒绝，不改 `previous_version` |
+| `INST-UPG-012` | 崩溃残留临时目录 | 超过一小时后下次安装清理 |
 
 ## 11.6 安全（`SEC-*`）
 

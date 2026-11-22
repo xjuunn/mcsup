@@ -231,20 +231,19 @@ describe("descriptor", () => {
     }
   });
 
-  it("zod 标准 format 仍受 descriptor 子集校验", () => {
-    // email 不在契约允许的 format 集合里，构建期仍要明确拒绝
-    expect(() =>
-      buildDescriptor(
-        definePlugin({
-          id: "mail",
-          title: "mail",
-          version: "1.0.0",
-          license: "MIT",
-          capabilities: ["server:read"],
-          config: z.object({ mail: z.email() }),
-        }).definition,
-      ),
-    ).toThrow(/format/);
+  it("标准 JSON Schema format 不被误判为自定义展示格式", () => {
+    const descriptor = buildDescriptor(
+      definePlugin({
+        id: "mail",
+        title: "mail",
+        version: "1.0.0",
+        license: "MIT",
+        capabilities: ["server:read"],
+        config: z.object({ mail: z.email() }),
+      }).definition,
+    );
+    expect(JSON.stringify(descriptor.schemas["config"])).toContain('"format":"email"');
+    expect(JSON.stringify(descriptor.schemas["config"])).not.toContain("x-mcsup-format");
   });
 
   it("两次构建逐字节一致", () => {

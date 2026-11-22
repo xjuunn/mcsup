@@ -372,7 +372,52 @@ function repeatedTupleMarker(value: unknown): boolean {
 // schema 层：子集与限值（§11.5 / §11.7 第 5 条）
 // ---------------------------------------------------------------------------
 
-/** 禁止出现的键：组合、条件、元组、模式属性 */
+/** 自定义展示格式（`x-mcsup-format`，plugins.md §11.6） */
+export const MCSup_FORMATS = [
+  "plain",
+  "minecraft-text",
+  "markdown-sanitized",
+  "datetime",
+  "duration",
+  "bytes",
+] as const;
+
+/** 自定义展示格式 */
+export type McsupFormat = (typeof MCSup_FORMATS)[number];
+
+/**
+ * 标准 JSON Schema `format` 取值（plugins.md §11.6）。
+ *
+ * 与 `x-mcsup-format` 分开：标准格式原样保留在 `format`，展示格式才写进
+ * `x-mcsup-format`。宿主只拒绝显式禁止的自定义格式，这里按契约文档拒绝
+ * 无法识别的标准值，避免产物在不同语言间漂移。
+ */
+export const JSON_SCHEMA_FORMATS = [
+  "date-time",
+  "date",
+  "time",
+  "duration",
+  "email",
+  "idn-email",
+  "hostname",
+  "idn-hostname",
+  "ipv4",
+  "ipv6",
+  "uri",
+  "uri-reference",
+  "iri",
+  "iri-reference",
+  "uuid",
+  "uri-template",
+  "json-pointer",
+  "relative-json-pointer",
+  "regex",
+] as const;
+
+/** 标准 JSON Schema 格式 */
+export type JsonSchemaFormat = (typeof JSON_SCHEMA_FORMATS)[number];
+
+/** 禁止出现的键：与宿主 `validate_node` 的拒绝表保持一致 */
 const FORBIDDEN_KEYS: Readonly<Record<string, string>> = {
   oneOf: "union (oneOf) is not allowed; use a flat object with optional fields",
   anyOf: "union (anyOf) is not allowed; use a flat object with optional fields",
@@ -383,51 +428,28 @@ const FORBIDDEN_KEYS: Readonly<Record<string, string>> = {
   not: "`not` is not allowed",
   patternProperties: "patternProperties is not allowed; use a flat object",
   prefixItems: "tuples (prefixItems) are not allowed; use an array with a single item schema",
-  contains: "`contains` is not allowed",
-  unevaluatedProperties: "unevaluatedProperties is not allowed",
-  unevaluatedItems: "unevaluatedItems is not allowed",
-  dependentRequired: "dependentRequired is not allowed",
-  dependentSchemas: "dependentSchemas is not allowed",
-  propertyNames: "propertyNames is not allowed; use a flat object",
+  $ref: "references must be inlined before validation",
   $defs: "normalized schemas must not contain $defs",
   definitions: "normalized schemas must not contain definitions",
+  transform: "transform is not allowed; do the conversion in the handler",
+  refine: "refine is not allowed; validate inside the handler",
 };
-
-/** 允许出现的键（其余一律拒绝，防止语言特有的扩展悄悄流入） */
-const ALLOWED_KEYS = new Set([
-  "type",
-  "properties",
-  "required",
-  "additionalProperties",
-  "items",
-  "enum",
-  "const",
-  "default",
-  "minimum",
-  "maximum",
-  "exclusiveMinimum",
-  "exclusiveMaximum",
-  "minLength",
-  "maxLength",
-  "pattern",
-  "minItems",
-  "maxItems",
-  "format",
-  "title",
-  "description",
-  "examples",
-  "x-mcsup-secret",
-  "x-mcsup-label",
-  "x-mcsup-format",
-  "x-mcsup-unit",
-  "x-mcsup-placeholder",
-]);
 
 /** 允许的 `type` 取值 */
 const ALLOWED_TYPES = new Set(["string", "number", "integer", "boolean", "object", "array"]);
 
 /** 允许的 `format` 取值 */
-const ALLOWED_FORMATS = new Set(["date-time", "duration", "uri", "uuid"]);
+const ALLOWED_FORMATS = new Set<string>(JSON_SCHEMA_FORMATS);
+
+/** 是否是可识别的标准 JSON Schema 格式 */
+export function isJsonSchemaFormat(value: string): value is JsonSchemaFormat {
+  return ALLOWED_FORMATS.has(value);
+}
+
+/** 是否是可识别的自定义展示格式 */
+export function isMcsupFormat(value: string): value is McsupFormat {
+  return (MCSup_FORMATS as readonly string[]).includes(value);
+}
 
 /** 子 schema 的键与路径片段（决定路径如何拼接） */
 function childEntries(record: Record<string, unknown>): readonly [string, unknown][] {
@@ -492,11 +514,6 @@ function walk(path: string, schema: unknown, depth: number, stats: SchemaStats):
       fail(`${path}.${key}`, reason);
     }
   }
-  for (const key of Object.keys(record)) {
-    if (!ALLOWED_KEYS.has(key) && !Object.prototype.hasOwnProperty.call(FORBIDDEN_KEYS, key)) {
-      fail(`${path}.${key}`, "is not part of the supported schema subset");
-    }
-  }
   const type = record["type"];
   if (type !== undefined) {
     if (typeof type !== "string") {
@@ -509,9 +526,21 @@ function walk(path: string, schema: unknown, depth: number, stats: SchemaStats):
       fail(`${path}.type`, `${type} is not supported`);
     }
   }
+  const displayFormat = record["x-mcsup-format"];
+  if (displayFormat !== undefined) {
+    if (typeof displayFormat !== "string" || !isMcsupFormat(displayFormat)) {
+      fail(
+        `${path}.x-mcsup-format`,
+        `${String(displayFormat)} is not one of ${MCSup_FORMATS.join(", ")}`,
+      );
+    }
+    if (type !== "string") {
+      fail(`${path}.x-mcsup-format`, "requires a string schema");
+    }
+  }
   const format = record["format"];
   if (format !== undefined && (typeof format !== "string" || !ALLOWED_FORMATS.has(format))) {
-    fail(`${path}.format`, `${String(format)} is not one of ${[...ALLOWED_FORMATS].join(", ")}`);
+    fail(`${path}.format`, `${String(format)} is not one of ${JSON_SCHEMA_FORMATS.join(", ")}`);
   }
   const maxLength = record["maxLength"];
   if (maxLength !== undefined) {

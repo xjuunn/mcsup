@@ -51,6 +51,12 @@ pub const TOKEN_FILE: &str = "control-token";
 /// 控制连接的读写超时
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// `logs` 单次返回的行数上限
+///
+/// CLI 的 `--tail` 已夹到同一区间；这里再夹一次是因为控制通道对端不可信：
+/// 手工构造一帧 `max: 18446744073709551615` 就能让宿主按行数分配。
+const MAX_LOG_PAGE_LINES: usize = 5000;
+
 /// 服务端启动失败
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -887,30 +893,43 @@ impl ControlHandler for HostControl {
     }
 
     fn logs(&self, id: &PluginId, offset: Option<u64>, max: usize) -> Result<Value, HostError> {
-        if max == 0 || max > 5000 {
-            return Err(HostError::limit_exceeded("max must be 1..=5000"));
+        if max == 0 || max > MAX_LOG_PAGE_LINES {
+            return Err(HostError::limit_exceeded(format!(
+                "max must be 1..={MAX_LOG_PAGE_LINES}"
+            )));
         }
         let path = self.log_dir.join(format!("{id}.log"));
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Vec::new(),
-            Err(err) => return Err(HostError::internal(format!("read plugin log: {err}"))),
-        };
-        let start = usize::try_from(offset.unwrap_or(0))
-            .unwrap_or(usize::MAX)
-            .min(bytes.len());
-        let slice = &bytes[start..];
-        let text = String::from_utf8_lossy(slice);
-        let mut lines: Vec<&str> = text.lines().collect();
-        if lines.len() > max {
-            let keep = lines.len() - max;
-            lines.drain(..keep);
+        // 只读一页所需的窗口：`max` 行 × 单行上限，再夹到读取总上限。
+        // 整文件读在 `--follow` 下是每 500 ms 一次的全量重读，日志涨到
+        // 几百 MB 时既拖慢调用又可能把宿主内存打满。
+        let want = max
+            .saturating_mul(crate::process::MAX_LOG_LINE_BYTES)
+            .min(domain::limits::MAX_LOG_TAIL_BYTES);
+        let window = match offset {
+            Some(start) => domain::log::Window::from(&path, start, want),
+            None => domain::log::Window::tail(&path, want),
         }
-        let next = start + text.rfind('\n').map_or(text.len(), |index| index + 1);
+        .map_err(|err| HostError::internal(format!("read plugin log: {err}")))?;
+        let mut lines = window.lines();
+        if lines.len() > max {
+            match offset {
+                // 首次调用要的是尾部：保留最后 `max` 行
+                None => {
+                    let excess = lines.len() - max;
+                    lines.drain(..excess);
+                }
+                // 跟进模式保留**最前** `max` 行，游标落在最后一行末尾，
+                // 下一拍从那里续读。留尾部会让中间的行永久丢失。
+                Some(_) => lines.truncate(max),
+            }
+        }
+        let next = lines
+            .last()
+            .map_or_else(|| window.end(), |(_, cursor)| *cursor);
         Ok(json!({
-            "lines": lines,
+            "lines": lines.into_iter().map(|(text, _)| text).collect::<Vec<_>>(),
             "next": next,
-            "size": bytes.len(),
+            "size": window.file_len(),
         }))
     }
 
@@ -1473,6 +1492,25 @@ mod tests {
         )
     }
 
+    fn handler_with_log_dir(dir: PathBuf) -> HostControl {
+        HostControl::new(
+            Arc::new(FakeSupervisor),
+            Arc::new(MemoryStore::default()),
+            Arc::new(StubConfig),
+            dir,
+            Arc::new(port::plugin::NoopAuditSink),
+        )
+    }
+
+    fn page_lines(payload: &Value) -> Vec<&str> {
+        payload["lines"]
+            .as_array()
+            .expect("lines")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect()
+    }
+
     #[test]
     fn dispatch_rejects_unknown_methods() {
         let err = dispatch(&handler(), "nope", &json!({})).expect_err("unknown");
@@ -1516,5 +1554,46 @@ mod tests {
     #[test]
     fn control_version_is_stable() {
         assert_eq!(PLUGIN_CONTROL_VERSION, 1);
+    }
+
+    /// 首次调用要尾部：`next` 与 `size` 都指向文件末尾
+    #[test]
+    fn logs_tail_returns_the_last_lines_with_a_cursor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("demo.log"), "one\ntwo\nthree\n").expect("write");
+        let control = handler_with_log_dir(dir.path().to_path_buf());
+        let id = PluginId::parse("demo").expect("id");
+        let payload = control.logs(&id, None, 2).expect("logs");
+        assert_eq!(page_lines(&payload), vec!["two", "three"]);
+        assert_eq!(payload["next"].as_u64(), Some(14));
+        assert_eq!(payload["size"].as_u64(), Some(14));
+    }
+
+    /// 跟进模式保留**最前**一页并推进游标：截断尾部会让中间的行永久丢失
+    #[test]
+    fn logs_follow_advances_the_cursor_without_dropping_lines() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("demo.log"), "a\nb\nc\nd\n").expect("write");
+        let control = handler_with_log_dir(dir.path().to_path_buf());
+        let id = PluginId::parse("demo").expect("id");
+        let first = control.logs(&id, Some(0), 2).expect("first page");
+        assert_eq!(page_lines(&first), vec!["a", "b"]);
+        assert_eq!(first["next"].as_u64(), Some(4));
+        let second = control
+            .logs(&id, Some(first["next"].as_u64().expect("next")), 2)
+            .expect("second page");
+        assert_eq!(page_lines(&second), vec!["c", "d"]);
+        assert_eq!(second["next"].as_u64(), Some(8));
+    }
+
+    /// `max` 来自控制通道对端，不能按它分配
+    #[test]
+    fn logs_rejects_an_out_of_range_page_size() {
+        let control = handler();
+        let id = PluginId::parse("demo").expect("id");
+        for max in [0, MAX_LOG_PAGE_LINES + 1] {
+            let err = control.logs(&id, None, max).expect_err("out of range");
+            assert_eq!(err.code, port::plugin::ErrorCode::LimitExceeded);
+        }
     }
 }

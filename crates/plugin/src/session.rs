@@ -20,14 +20,15 @@ use port::plugin::{
 };
 use port::plugin::{MAX_STREAM_BYTES, category_of};
 use protocol::plugin::{
-    Call, Cancel, ConfigFrame, ConfigValues, Frame, Hello, Reject, RejectCode, ResultFrame,
-    StreamFrame, Welcome, WelcomeLimits, WelcomeScope, WireError, read_frame, write_frame,
+    Call, Cancel, ConfigFrame, ConfigValues, Frame, FrameError, Hello, Reject, RejectCode,
+    ResultFrame, StreamFrame, Welcome, WelcomeLimits, WelcomeScope, WireError, read_frame,
+    write_frame,
 };
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
 use std::io::BufReader;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,22 @@ use crate::conn::Connection;
 
 /// 配置变更等待插件确认的上限
 const CONFIG_APPLY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 向插件写一帧的上限
+///
+/// Windows 命名管道不支持写超时（`interprocess` 返回 `Unsupported`），所以
+/// 超时不能依赖 socket 选项：写操作跑在独立线程里，调用方等确认。
+/// 插件不读数据时，超时即关闭会话并杀进程，绝不把宿主锁死。
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 写线程队列深度
+///
+/// 每个调用方都在等自己的确认，所以队列只是短时缓冲：允许事件突发，
+/// 但写端真的堵住时不能无限堆内存。
+const WRITE_QUEUE_DEPTH: usize = 256;
+
+/// 流帧通道深度；插件超出即视为背压失控，直接断流
+const STREAM_QUEUE_DEPTH: usize = 64;
 
 /// 心跳超时检查的轮询间隔
 const HEARTBEAT_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -92,14 +109,30 @@ pub(crate) fn handshake(
     mut writer: Connection,
     cfg: SessionConfig,
 ) -> Result<HandshakeOutcome, HostError> {
-    writer
-        .set_read_timeout(Some(cfg.handshake_timeout))
-        .map_err(|err| HostError::internal(format!("set handshake timeout: {err}")))?;
+    // Unix / TCP 支持真正的读超时；Windows 命名管道返回 `Unsupported`，
+    // 所以截止时间由下面的短线程兜底，不能只依赖 socket 选项。
+    let _ = writer.set_read_timeout(Some(cfg.handshake_timeout));
     let read_half = writer
         .try_clone()
         .map_err(|err| HostError::internal(format!("clone plugin connection: {err}")))?;
     let mut reader = BufReader::new(read_half);
-    let frame = match read_frame(&mut reader) {
+    let (frame_tx, frame_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = read_frame(&mut reader);
+        // 把 reader 原样送回：BufReader 里可能已经缓了后续帧，不能丢。
+        let _ = frame_tx.send((reader, result));
+    });
+    let Ok((reader, frame)) = frame_rx.recv_timeout(cfg.handshake_timeout) else {
+        writer.shutdown();
+        return Err(HostError::new(
+            port::plugin::ErrorCode::Crashed,
+            format!(
+                "handshake failed: plugin sent no hello within {} s",
+                cfg.handshake_timeout.as_secs()
+            ),
+        ));
+    };
+    let frame = match frame {
         Ok(frame) => frame,
         Err(err) => {
             return Err(HostError::new(
@@ -229,6 +262,10 @@ pub(crate) fn handshake(
         ));
     }
     let _ = writer.set_read_timeout(None);
+    // 写端交给独立线程：调用方只等确认，阻塞写永远不会拖住宿主线程。
+    let closer = writer.try_clone().ok();
+    let (job_tx, job_rx) = mpsc::sync_channel::<WriteJob>(WRITE_QUEUE_DEPTH);
+    std::thread::spawn(move || writer_loop(&mut writer, &job_rx));
     let seq = AtomicU64::new(0);
     let info = SessionInfo {
         session_id,
@@ -242,7 +279,8 @@ pub(crate) fn handshake(
         subscriptions: requested_subs,
         grants: Mutex::new(info.granted.clone()),
         reader: Mutex::new(Some(reader)),
-        writer: Mutex::new(writer),
+        writer_tx: Mutex::new(Some(job_tx)),
+        closer: Mutex::new(closer),
         pending: Mutex::new(HashMap::new()),
         next_id: AtomicU64::new(1),
         seq,
@@ -291,7 +329,67 @@ fn now_secs() -> i64 {
 
 enum Pending {
     Result(Sender<ResultFrame>),
-    Stream(Sender<StreamFrame>),
+    Stream(SyncSender<StreamEvent>),
+}
+
+/// 流式调用从插件收到的事件
+///
+/// 错误走单独的分支，不能把 `Result` 帧丢给流消费者——否则通道断开，
+/// 调用方只能看到「会话结束」这种不可诊断的 `unavailable`。
+enum StreamEvent {
+    Chunk(StreamFrame),
+    Failed(ResultFrame),
+}
+
+/// 交给写线程的一帧；`ack` 让调用方拿到「真的写出去了」或具体错误
+struct WriteJob {
+    frame: Frame,
+    ack: Sender<Result<(), String>>,
+}
+
+/// 写线程：独占写端，串行化所有帧
+///
+/// 队列关闭（会话结束）或写失败即退出。阻塞在 `write` 里时由 `kill` 进程
+/// 解除：对端句柄关闭后写返回错误。
+///
+/// 结果帧超限时改发错误帧（[`oversize_replacement`]）：能力层的输出——
+/// 文件内容、HTTP 响应体——本来就可能有几 MiB，是合法调用，不该让会话陪葬。
+fn writer_loop(writer: &mut Connection, jobs: &Receiver<WriteJob>) {
+    while let Ok(job) = jobs.recv() {
+        let result = match write_frame(writer, &job.frame) {
+            Ok(()) => Ok(()),
+            Err(FrameError::TooLarge { limit }) => match oversize_replacement(&job.frame, limit) {
+                Some(replacement) => write_frame(writer, &replacement),
+                None => Err(FrameError::TooLarge { limit }),
+            }
+            .map_err(|err| err.to_string()),
+            Err(err) => Err(err.to_string()),
+        };
+        let failed = result.is_err();
+        let _ = job.ack.send(result);
+        if failed {
+            break;
+        }
+    }
+    writer.shutdown();
+}
+
+/// 超限结果帧的错误替身
+///
+/// 只有 `result` 帧能这样替换：它的载荷是宿主自己去取的（文件、网络），
+/// 超限是「这次取多了」，换成 `limit_exceeded` 让插件知道该怎么改。流与
+/// 事件帧的载荷由插件自己切分，超限说明对端用错了协议，交给写失败路径。
+fn oversize_replacement(frame: &Frame, limit: usize) -> Option<Frame> {
+    let Frame::Result(result) = frame else {
+        return None;
+    };
+    Some(Frame::Result(ResultFrame::error(
+        result.id,
+        WireError::from_code(
+            port::plugin::ErrorCode::LimitExceeded,
+            format!("response exceeds the {limit} byte frame limit"),
+        ),
+    )))
 }
 
 /// 会话内部状态
@@ -303,8 +401,10 @@ pub(crate) struct SessionInner {
     grants: Mutex<BTreeSet<Capability>>,
     /// 读半端：由读线程独占；`None` 表示读线程已取走
     reader: Mutex<Option<BufReader<Connection>>>,
-    /// 写半端：调用、事件与心跳共用，单独加锁避免与读线程互等
-    writer: Mutex<Connection>,
+    /// 写线程的队列；`None` 表示会话已关闭
+    writer_tx: Mutex<Option<SyncSender<WriteJob>>>,
+    /// 写端克隆：仅用于关闭时打断阻塞的读/写（Unix/TCP 生效）
+    closer: Mutex<Option<Connection>>,
     pending: Mutex<HashMap<u64, Pending>>,
     next_id: AtomicU64,
     seq: AtomicU64,
@@ -379,6 +479,20 @@ impl SessionInner {
         self.alive.load(Ordering::SeqCst)
     }
 
+    /// 主动探测子进程是否已退出
+    ///
+    /// 命名管道的读端在 Windows 上可能长时间没有响应，只靠心跳（默认最长
+    /// 45 s）判定崩溃会让退避重启迟到一个数量级。监管线程每拍问一次进程
+    /// 状态，退出即立刻关会话。
+    pub(crate) fn reap_exited(&self) -> Option<String> {
+        let mut slot = self.process.lock().ok()?;
+        let process = slot.as_mut()?;
+        match process.try_wait() {
+            Ok(Some(status)) => Some(format!("plugin process exited ({status})")),
+            _ => None,
+        }
+    }
+
     /// 关闭原因（`close` 第一次调用时写入）
     pub(crate) fn close_reason(&self) -> Option<String> {
         self.close_reason.lock().ok().and_then(|slot| slot.clone())
@@ -409,24 +523,68 @@ impl SessionInner {
     }
 
     /// 发送一帧；失败即关闭会话
+    ///
+    /// 写操作在独立线程里执行，这里只等确认：插件不读数据时会在
+    /// [`WRITE_TIMEOUT`] 后关闭会话并杀进程，不会永久阻塞调用方。
     fn send(&self, frame: &Frame) -> Result<(), HostError> {
-        let result = {
-            let mut writer = self
-                .writer
-                .lock()
-                .map_err(|_| HostError::internal("session lock poisoned"))?;
-            write_frame(&mut *writer, frame)
+        let queue = self
+            .writer_tx
+            .lock()
+            .map_err(|_| HostError::internal("session write lock poisoned"))?
+            .clone();
+        let Some(queue) = queue else {
+            return Err(self.closed_error());
         };
-        match result {
-            Ok(()) => Ok(()),
-            Err(err) => {
+        let (ack_tx, ack_rx) = mpsc::channel();
+        match queue.try_send(WriteJob {
+            frame: frame.clone(),
+            ack: ack_tx,
+        }) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                let reason = format!(
+                    "write queue is full ({WRITE_QUEUE_DEPTH} frames); plugin is not reading its input"
+                );
+                self.close(&reason);
+                return Err(HostError::new(port::plugin::ErrorCode::Crashed, reason));
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.close("writer thread stopped");
+                return Err(self.closed_error());
+            }
+        }
+        match ack_rx.recv_timeout(WRITE_TIMEOUT) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => {
                 self.close(&format!("write failed: {err}"));
                 Err(HostError::new(
                     port::plugin::ErrorCode::Crashed,
                     format!("plugin connection closed: {err}"),
                 ))
             }
+            Err(RecvTimeoutError::Timeout) => {
+                let reason = format!(
+                    "write timed out after {} s (plugin is not reading its input)",
+                    WRITE_TIMEOUT.as_secs()
+                );
+                self.close(&reason);
+                Err(HostError::new(port::plugin::ErrorCode::Crashed, reason))
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                self.close("writer thread stopped");
+                Err(self.closed_error())
+            }
         }
+    }
+
+    fn closed_error(&self) -> HostError {
+        let reason = self
+            .close_reason()
+            .unwrap_or_else(|| "unknown reason".to_owned());
+        HostError::new(
+            port::plugin::ErrorCode::Unavailable,
+            format!("plugin session is closed: {reason}"),
+        )
     }
 
     /// 调用插件 op
@@ -494,7 +652,7 @@ impl SessionInner {
     ) -> Result<(), HostError> {
         self.touch();
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let (tx, rx): (Sender<StreamFrame>, Receiver<StreamFrame>) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel::<StreamEvent>(STREAM_QUEUE_DEPTH);
         self.register(id, Pending::Stream(tx))?;
         if let Err(err) = self.send(&Frame::Call(Call::op(id, op, input))) {
             self.remove_pending(id);
@@ -515,7 +673,13 @@ impl SessionInner {
             }
             let wait = (deadline - now).min(Duration::from_secs(60));
             match rx.recv_timeout(wait) {
-                Ok(frame) => {
+                Ok(StreamEvent::Failed(result)) => {
+                    return Err(wire_to_host(
+                        result.error,
+                        "plugin reported a stream failure",
+                    ));
+                }
+                Ok(StreamEvent::Chunk(frame)) => {
                     if frame.seq != expected_seq {
                         self.cancel(id, "protocol");
                         return Err(HostError::new(
@@ -665,24 +829,47 @@ impl SessionInner {
                     .lock()
                     .ok()
                     .and_then(|mut map| map.remove(&result.id));
-                if let Some(Pending::Result(tx)) = pending {
-                    let _ = tx.send(result);
+                match pending {
+                    Some(Pending::Result(tx)) => {
+                        let _ = tx.send(result);
+                    }
+                    // 流式调用用 `result` 报错：把它原样交给消费者，
+                    // 不能丢帧断通道（否则只能看到 unavailable）。
+                    Some(Pending::Stream(tx)) => {
+                        let _ = tx.try_send(StreamEvent::Failed(result));
+                    }
+                    None => {}
                 }
             }
             Frame::Stream(stream) => {
                 let done = stream.done;
                 let id = stream.id;
+                let mut overflow = false;
                 let failed = {
                     let Ok(map) = self.pending.lock() else {
                         return;
                     };
                     match map.get(&id) {
-                        Some(Pending::Stream(tx)) => tx.send(stream).is_err(),
+                        Some(Pending::Stream(tx)) => {
+                            match tx.try_send(StreamEvent::Chunk(stream)) {
+                                Ok(()) => false,
+                                Err(TrySendError::Full(_)) => {
+                                    overflow = true;
+                                    true
+                                }
+                                Err(TrySendError::Disconnected(_)) => true,
+                            }
+                        }
                         _ => false,
                     }
                 };
                 if done || failed {
                     self.remove_pending(id);
+                }
+                if overflow {
+                    // 消费者是本进程代码；队列打满说明插件在刷帧，不能为了
+                    // 一个坏流把读线程（连带 pong）卡死。
+                    self.close(&format!("stream {id} exceeded the host queue limit"));
                 }
             }
             Frame::Pong(n) => {
@@ -854,7 +1041,7 @@ impl SessionInner {
         self.close("killed");
     }
 
-    fn close(&self, reason: &str) {
+    pub(crate) fn close(&self, reason: &str) {
         // 只记录第一次关闭原因：后续调用（如监管线程的 `killed`）不该覆盖
         // 真正触发关闭的事件
         if let Ok(mut slot) = self.close_reason.lock()
@@ -863,8 +1050,18 @@ impl SessionInner {
             *slot = Some(reason.to_owned());
         }
         if self.alive.swap(false, Ordering::SeqCst) {
-            if let Ok(writer) = self.writer.lock() {
-                writer.shutdown();
+            // 先杀进程：阻塞在管道读写里的线程会因对端关闭立即返回。
+            // 顺序不能反，否则写线程可能还握着一个永久阻塞的写。
+            if let Ok(mut process) = self.process.lock()
+                && let Some(process) = process.as_mut()
+            {
+                process.kill();
+            }
+            if let Ok(mut slot) = self.writer_tx.lock() {
+                *slot = None;
+            }
+            if let Some(closer) = self.closer.lock().ok().and_then(|mut slot| slot.take()) {
+                closer.shutdown();
             }
             let pending = self
                 .pending
@@ -872,20 +1069,26 @@ impl SessionInner {
                 .map(|mut map| std::mem::take(&mut *map))
                 .unwrap_or_default();
             for (_, pending) in pending {
-                if let Pending::Result(tx) = pending {
-                    let _ = tx.send(ResultFrame::error(
-                        0,
-                        WireError::from_code(
-                            port::plugin::ErrorCode::Crashed,
-                            format!("plugin session closed: {reason}"),
-                        ),
-                    ));
+                match pending {
+                    Pending::Result(tx) => {
+                        let _ = tx.send(ResultFrame::error(
+                            0,
+                            WireError::from_code(
+                                port::plugin::ErrorCode::Crashed,
+                                format!("plugin session closed: {reason}"),
+                            ),
+                        ));
+                    }
+                    Pending::Stream(tx) => {
+                        let _ = tx.try_send(StreamEvent::Failed(ResultFrame::error(
+                            0,
+                            WireError::from_code(
+                                port::plugin::ErrorCode::Crashed,
+                                format!("plugin session closed: {reason}"),
+                            ),
+                        )));
+                    }
                 }
-            }
-            if let Ok(mut process) = self.process.lock()
-                && let Some(process) = process.as_mut()
-            {
-                process.kill();
             }
         }
     }

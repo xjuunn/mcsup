@@ -116,7 +116,7 @@ MCSUP 里同时存在三种容易混淆的「插件」：
 | H8 | 契约集合闭合。`[禁止]` 插件自定义契约、通用 workflow 引擎、动态 RPC |
 | H9 | descriptor 必须构建时生成。`[禁止]` 运行时生成、手写与代码并存 |
 | H10 | 运行时输入校验由宿主完成。插件 SDK 不重复实现 schema 校验 |
-| H11 | 单帧上限 1 MiB；超限即协议错误并终止会话 |
+| H11 | 单帧上限 24 MiB；超限即协议错误并终止会话（`result` 帧超限改回 `limit_exceeded`） |
 | H12 | `[禁止]` 热替换。升级、改配置、改授权一律经明确状态迁移 |
 | H13 | 升级若新增能力，授权状态回到 `PendingApproval`，不沿用旧授权 |
 | H14 | 一台机器同一插件同一作用域只有一个运行实例；`[禁止]` 多实例并存 |
@@ -446,7 +446,7 @@ Unix socket 权限 `0600`；Windows 管道使用当前用户 DACL。`[禁止]` �
 
 | 项 | 默认 | 上限 | 超出行为 |
 | --- | --- | --- | --- |
-| 单帧字节 | 1 MiB | 1 MiB | 协议错误，终止会话 |
+| 单帧字节 | 24 MiB | 24 MiB | 协议错误，终止会话 |
 | 单帧 JSON 嵌套深度 | 32 | 32 | 协议错误，终止会话 |
 | 出站 inflight（宿主→插件） | 8 | 32 | 排队；队列满返回 `limit_exceeded` |
 | 插件→宿主 inflight | 8 | 32 | 同上 |
@@ -522,8 +522,14 @@ Unix socket 权限 `0600`；Windows 管道使用当前用户 DACL。`[禁止]` �
 未知字段必须忽略；未知 `type` 必须忽略并记一行日志（不能断开）。版本不匹配
 必须断开，不做猜测兼容。
 
-解码前先做两项检查，避免解析器被构造输入拖垮：单行字节数 ≤ 1 MiB，JSON 嵌套
+解码前先做两项检查，避免解析器被构造输入拖垮：单行字节数 ≤ 24 MiB，JSON 嵌套
 深度 ≤ 32。任一超出即按协议错误终止会话，不进入反序列化。
+
+24 MiB 不是随手取的数：`files:read` / `files:write` 允许单文件 16 MiB 内联
+传输，base64 后膨胀到 `ceil(16 MiB / 3) * 4 ≈ 21.3 MiB`，再加 JSON 字段与
+转义开销。上限低于它，读一个几 MiB 的 jar 就会被判成「单帧超限」并断开整条
+连接——调用本身完全合法。写出侧同样按此上限检查（[`write_frame`]），任一侧
+都不会写出对端必然拒绝的帧。
 
 ## 6.2 帧类型
 
@@ -555,7 +561,7 @@ Unix socket 权限 `0600`；Windows 管道使用当前用户 DACL。`[禁止]` �
 ```json
 {"v":1,"type":"welcome","session_id":"s-7f3a9c","host_version":"0.1.0",
  "granted":["console:read"],
- "limits":{"inflight":8,"frame_bytes":1048576,"event_queue":1024,"log_lines_per_sec":200},
+ "limits":{"inflight":8,"frame_bytes":25165824,"event_queue":1024,"log_lines_per_sec":200},
  "config":{"revision":3,"values":{"token":"***","channels":["global"]}},
  "scope":{"kind":"machine"}}
 ```
@@ -1976,12 +1982,18 @@ Windows 还需拒绝保留名（`CON`、`NUL` 等）与尾随点 / 空格。
 
 关键约束：
 
-- 临时目录与目标同一文件系统，移动是原子的。
+- 临时目录与目标同一文件系统，移动是原子的。临时目录名带 pid 与自增序号
+  （`.install-<tag>-<pid>-<secs>-<seq>`），崩溃残留按名字里的创建时刻超过
+  一小时后在下一次安装时清理。
 - 安装期间不启动插件进程。
 - 任一步失败清理临时目录，已安装版本不受影响。
-- 同一 `id` 的安装串行化（按 `id` 加锁），避免并发写坏记录。
-- 已运行旧版本时，安装新版本不自动重启；由 `plugin update` 或显式 `restart`
-  完成切换。
+- 同一 `id` 的安装串行化（`plugins/.<id>.install.lock`，内核文件锁），避免并发
+  写坏记录。抢锁在 manifest / descriptor 校验之后——那些步骤只读，不必串行。
+- 待确认能力与 `enabled` 互斥：`pending` 非空时记录强制 `enabled=false`，升级
+  不会带着未审批的能力去启动（`pending_approval` 只能迁到 `disabled`）。
+- 已运行旧版本时，升级先停旧进程，等新版本启动（含握手）成功后由服务层重新
+  拉起；失败自动切回旧版本并重新启动。CLI 的 `plugin install` / `plugin update`
+  因此不会再多重启一次。
 
 ## 15.5 授权展示
 
@@ -2025,7 +2037,7 @@ Windows 还需拒绝保留名（`CON`、`NUL` 等）与尾随点 / 空格。
 | 卸载 | 必须 `disabled` 且进程退出；默认保留 `plugin-data/<id>/`，但删除 `secrets.json`（凭据不随同名插件重装继承） |
 | 保留密钥 | `--keep-secrets` 保留密钥，用于重装后继续使用同一凭据 |
 | 彻底删除 | `--purge` 同时删数据、日志、授权、审计引用标记 |
-| 版本保留 | 默认保留 2 个版本；`--prune` 清理更旧的 |
+| 版本保留 | 始终保留当前版本与回滚目标（`previous_version`）；`--prune` 只清理更旧的目录 |
 
 升级失败（校验、启动、握手、配置）必须自动回滚到旧版本，并把失败原因写入
 记录。`[禁止]` 让用户在「旧版本已删、新版本起不来」的状态里手工恢复。
@@ -2190,10 +2202,14 @@ Windows 还需拒绝保留名（`CON`、`NUL` 等）与尾随点 / 空格。
 | --- | --- | --- |
 | `run/plugin-host.lock` | 机器 | 宿主进程 |
 | `db/.lock` | 写事务 | 任意写记录的进程 |
-| `plugins/<id>/.install.lock` | 单插件 | 安装 / 升级 / 卸载 |
+| `plugins/.<id>.install.lock` | 单插件 | 安装 / 升级 / 卸载 |
 
 锁由内核持有（`flock` / Windows 文件锁），进程退出自动释放。`[禁止]`
 用「文件存在即加锁」的实现，崩溃后会留下永久锁。
+
+锁文件落在插件 id 目录**之外**（`plugins/.<id>.install.lock`）并且永不删除：
+放在 `plugins/<id>/` 里会被 `plugin remove` 连同产物一起删掉，而删锁文件会让
+等待者在旧 inode 上继续等、新来者在新 inode 上立刻拿到锁，互斥当场失效。
 
 ---
 
@@ -2239,6 +2255,10 @@ mcsup __plugin-host --data-dir <path> [--idle-timeout <secs>]   # 隐藏
 - `--output json` 时 stdout 只含一行 JSON；进度与提示走 stderr。
 - `--yes` 跳过确认式提问，不跳过必填参数补参；安装向导里视为同意能力授权。
 - `--no-setup` 跳过安装向导：不授权、不补配置、不自动启动（脚本与旧版行为）。
+- `plugin stop --grace` 上限 3600 秒（与 `server stop` 共用领域常量）：超限按用法
+  错误拒绝，不静默夹紧——夹紧会让用户以为 `--grace 600` 真的生效了。
+- `plugin update` 不带 `--to` 时按记录里的来源重新拉取，产物 id 必须仍是同一个；
+  本地来源在安装时已规范成绝对路径，`update` 不依赖当前工作目录。
 - 非交互缺必填参数：退出码 2，stderr 说明缺什么；配置必填项缺失时以
   `missing` 字段返回并在下一轮 `config set` 后补上。
 - `config set` / `config get` 的 `<key>` 支持点号路径（`qq.appId`）：写入
@@ -2678,7 +2698,7 @@ M0 ─→ M1 ─→ M2 ─→ M3 ─→ M4
 | `DESCRIPTOR_SCHEMA_VERSION` | 1 | `domain::plugin` |
 | `PLUGIN_PROTOCOL_VERSION` | 1 | `protocol::plugin` |
 | `PLUGIN_CONTROL_VERSION` | 1 | `protocol::plugin` |
-| 单帧上限 | 1 MiB | `protocol::plugin` |
+| 单帧上限 | 24 MiB | `protocol::plugin` |
 | 握手超时 | 10 s | `plugin` |
 | 心跳 | 15 s × 3 | `plugin` |
 | 非 resident 空闲回收 | 120 s | `plugin` |

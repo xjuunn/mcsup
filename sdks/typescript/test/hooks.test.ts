@@ -16,12 +16,24 @@ const reader = definePlugin({
 
 async function makeCtx() {
   const store = new Map<string, Uint8Array>();
-  const consolePages: Array<{ cursor: number; lines: string[] }> = [{ cursor: 2, lines: ["a", "b"] }];
+  interface Page {
+    readonly next: number;
+    readonly lines: ReadonlyArray<{ readonly cursor: number; readonly text: string }>;
+  }
+  const consolePages: Page[] = [
+    {
+      next: 2,
+      lines: [
+        { cursor: 1, text: "a" },
+        { cursor: 2, text: "b" },
+      ],
+    },
+  ];
   const host = createMockHost(reader, {
     handle: ({ capability, method, input }) => {
       if (capability === "console:read") {
-        const page = consolePages.shift() ?? { cursor: 2, lines: [] };
-        return { cursor: page.cursor, lines: page.lines, dropped: 0 };
+        const page = consolePages.shift() ?? { next: 2, lines: [] };
+        return { lines: page.lines, next: page.next };
       }
       if (capability === "storage:kv") {
         const key = (input as { key: string }).key;
@@ -31,10 +43,10 @@ async function makeCtx() {
         }
         if (method === "set") {
           store.set(key, Buffer.from((input as { value: string }).value, "base64"));
-          return {};
+          return { ok: true };
         }
         if (method === "delete") {
-          return store.delete(key);
+          return { deleted: store.delete(key) };
         }
       }
       throw new PluginError("denied", `${capability}.${method}`);
@@ -70,10 +82,41 @@ describe("useConsoleTail", () => {
   });
 
   it("handler 抛错时不推进游标，重试重放整页而不是跳过剩余行", async () => {
-    const pages = new Map<number | null, { cursor: number; lines: string[] }>([
-      [null, { cursor: 2, lines: ["a", "b"] }],
-      [0, { cursor: 2, lines: ["a", "b"] }],
-      [2, { cursor: 4, lines: ["c", "d"] }],
+    interface Page {
+      readonly next: number;
+      readonly lines: ReadonlyArray<{ readonly cursor: number; readonly text: string }>;
+    }
+    const pages = new Map<number | null, Page>([
+      [
+        null,
+        {
+          next: 2,
+          lines: [
+            { cursor: 1, text: "a" },
+            { cursor: 2, text: "b" },
+          ],
+        },
+      ],
+      [
+        0,
+        {
+          next: 2,
+          lines: [
+            { cursor: 1, text: "a" },
+            { cursor: 2, text: "b" },
+          ],
+        },
+      ],
+      [
+        2,
+        {
+          next: 4,
+          lines: [
+            { cursor: 3, text: "c" },
+            { cursor: 4, text: "d" },
+          ],
+        },
+      ],
     ]);
     const host = createMockHost(reader, {
       handle: ({ capability, input }) => {
@@ -81,7 +124,8 @@ describe("useConsoleTail", () => {
           throw new PluginError("denied", capability);
         }
         const cursor = (input as { cursor: number | null }).cursor;
-        return { ...(pages.get(cursor) ?? { cursor: 4, lines: [] }), dropped: 0 };
+        const page = pages.get(cursor) ?? { next: 4, lines: [] };
+        return { lines: page.lines, next: page.next };
       },
     });
     await host.start();
