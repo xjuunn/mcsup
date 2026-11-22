@@ -251,9 +251,12 @@ pub(crate) fn stop(name: &str, grace: u64, force: bool, printer: Printer) -> Res
             )));
         }
     };
-    // 停机成功（或本来就停着）之后再收插件：超时中止的服务器还在跑，不动它
+    // 停机成功（或本来就停着）之后再收插件：超时中止的服务器还在跑，不动它。
+    // 先回显服务器结果，让「停了什么」按发生顺序呈现；即使 stdout 已断，
+    // 也仍要把插件收掉，所以打印失败先存着、收完插件再抛出。
+    let echo = printer.print_outcome(&human, &payload);
     plugins.stop_unused(name, printer);
-    printer.print_outcome(&human, &payload)
+    echo
 }
 
 /// `server restart`：先停（超时中止），再走与 start 相同的启动路径
