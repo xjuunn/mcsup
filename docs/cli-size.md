@@ -14,6 +14,40 @@
 gzip 是统一压缩口径下的下载体积参考，不是 GitHub Release ZIP 的实测值。
 原始 EXE 从约 4.99 MiB 降至 3.90 MiB；其他平台需由各自构建测量。
 
+## 当前体积（发布前复测）
+
+上面那张表是「移除 SQLite」那一次的对照记录，**不是当前值**。发布前用同一条
+命令复测，CLI 已经翻倍：
+
+| 口径 | 2026-10-25 | 当前 | 变化 |
+| --- | ---: | ---: | ---: |
+| `target/release/mcsup.exe` | 4,088,320 | 8,332,800 | +103.8% |
+| 仅 EXE 的 gzip（.NET `Optimal`） | 2,010,288 | 3,876,645 | +92.8% |
+
+Rust 1.98.1、本机 Windows x86_64 MSVC，`cargo build --release --locked -p cli`。
+
+增长来自那之后新接进 CLI 的子系统，不是某一次改动的回退。`apps/cli` 对门面的
+feature 从
+
+```
+service, file, java, provider, storage, runtime, bootstrap
+```
+
+变成
+
+```
+service, backup, file, java, modkit, provider, storage, runtime,
+bootstrap, backend, transport, auth, remote
+```
+
+其中 `remote` 连带 `plugin`、`protocol`、`transport`（rustls + ring 的 TLS、
+agent、mirror）以及 `service` 侧的远端编排。这是「CLI 里同时有 `mcsup remote`
+与 `mcsup plugin` 命令族」的必然代价，不是可以顺手砍掉的冗余。
+
+`[待办]` 下载体积已从约 1.9 MiB 涨到约 3.7 MiB（gzip）。若要压回去，方向是把
+`remote` / `plugin` 从默认二进制里拆成可选 feature 或独立子命令二进制；这会
+改变「装一个 mcsup 什么都能干」的现状，属于需要单独决策的架构变更，本次未动。
+
 ## 元数据改成 JSON 文件
 
 元数据存在 `{data_dir}/mcsup/db/` 下的 `workspaces/`、`servers/`、`java/`
