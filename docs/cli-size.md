@@ -21,8 +21,8 @@ gzip 是统一压缩口径下的下载体积参考，不是 GitHub Release ZIP �
 
 | 口径 | 2026-10-25 | 当前 | 变化 |
 | --- | ---: | ---: | ---: |
-| `target/release/mcsup.exe` | 4,088,320 | 8,332,800 | +103.8% |
-| 仅 EXE 的 gzip（.NET `Optimal`） | 2,010,288 | 3,876,645 | +92.8% |
+| `target/release/mcsup.exe` | 4,088,320 | 8,333,312 | +103.8% |
+| 仅 EXE 的 gzip（.NET `Optimal`） | 2,010,288 | 3,877,991 | +92.9% |
 
 Rust 1.98.1、本机 Windows x86_64 MSVC，`cargo build --release --locked -p cli`。
 
