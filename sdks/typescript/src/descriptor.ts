@@ -11,6 +11,7 @@ import { z } from "./zod.js";
 import { PLUGIN_API_VERSION } from "./protocol.js";
 import {
   subscriptionKinds,
+  type BindSpec,
   type Capability,
   type OpKind,
   type OpRisk,
@@ -409,12 +410,14 @@ export function jsonSchemaOf(schema: z.ZodType, onOutput: boolean, path = "schem
 
 /** descriptor 结构（plugins.md §11.1） */
 export interface Descriptor {
-  readonly schema: 1 | 2;
+  readonly schema: 1 | 2 | 3;
   readonly plugin_id: string;
   readonly api: number;
   readonly config: JsonValue;
   /** schema 2 起可用：安装向导 */
   readonly setup?: JsonValue;
+  /** schema 3 起可用：服务器绑定 */
+  readonly bind?: JsonValue;
   readonly ops: readonly DescriptorOp[];
   readonly schemas: Record<string, JsonValue>;
 }
@@ -479,6 +482,35 @@ function buildSetup(setup: SetupSpec): JsonValue {
   return sortKeys(result);
 }
 
+/** 单次绑定可声明的路径上限，与宿主 `MAX_BIND_PATHS` 一致 */
+const MAX_BIND_PATHS = 8;
+
+/**
+ * 服务器绑定归一化：路径去空白后写入，顺序按声明保留。
+ *
+ * 空路径、重复路径与超限在构建期拒绝，错误信息指向声明处，
+ * 不必等安装到宿主才发现。
+ */
+function buildBind(bind: BindSpec): JsonValue {
+  const servers: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of bind.servers) {
+    const path = raw.trim();
+    if (path === "") {
+      throw new DescriptorError("bind.servers", "paths must not be empty");
+    }
+    if (servers.length >= MAX_BIND_PATHS) {
+      throw new DescriptorError("bind.servers", `declares more than ${MAX_BIND_PATHS} paths`);
+    }
+    if (seen.has(path)) {
+      throw new DescriptorError("bind.servers", `duplicate path ${path}`);
+    }
+    seen.add(path);
+    servers.push(path);
+  }
+  return sortKeys({ servers });
+}
+
 /**
  * 从定义生成 descriptor。
  *
@@ -494,6 +526,7 @@ export function buildDescriptor<
 >(def: PluginDefinition<C, Id, Cfg>): Descriptor {
   const resolved = collectOps(def);
   const setup = def.setup === undefined ? undefined : buildSetup(def.setup);
+  const bind = def.bind === undefined ? undefined : buildBind(def.bind);
   const kinds = opKinds(resolved);
   const ops: DescriptorOp[] = [];
   const schemas: Record<string, JsonValue> = {
@@ -543,8 +576,10 @@ export function buildDescriptor<
   if (ops.length > 64) {
     throw new DescriptorError("ops", `${ops.length} ops declared, limit is 64`);
   }
+  // 版本号只升不降：声明了 bind 就是 3，否则有 setup 是 2，其余仍是 1
+  const schema: 1 | 2 | 3 = bind !== undefined ? 3 : setup === undefined ? 1 : 2;
   const descriptor: Descriptor = {
-    schema: setup === undefined ? 1 : 2,
+    schema,
     plugin_id: def.id,
     api: PLUGIN_API_VERSION,
     config: { $ref: "#/schemas/config" },
@@ -553,6 +588,9 @@ export function buildDescriptor<
   };
   if (setup !== undefined) {
     (descriptor as { setup?: JsonValue }).setup = setup;
+  }
+  if (bind !== undefined) {
+    (descriptor as { bind?: JsonValue }).bind = bind;
   }
   validateDescriptorSize("descriptor", serializeNormalized(descriptor));
   return descriptor;

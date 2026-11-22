@@ -6,6 +6,7 @@
 
 use crate::bootstrap;
 use crate::cli::{PluginAction, PluginConfigAction, PluginRevocationAction};
+use crate::commands::plugin_host;
 use crate::config;
 use crate::diagnostic::AppDiagnostic;
 use crate::output::{OutputFormat, Printer};
@@ -135,34 +136,6 @@ fn json_printer(printer: Printer, json: bool) -> Printer {
     } else {
         printer
     }
-}
-
-/// 宿主不在时拉起 `__plugin-host` 并等待可连接
-fn ensure_host() -> Result<()> {
-    let data_dir = config::platform_data_dir();
-    let client = mcsup::plugin::ControlClient::new(&data_dir);
-    if client.is_available() {
-        return Ok(());
-    }
-    let exe = std::env::current_exe().context("定位 mcsup 可执行文件")?;
-    std::process::Command::new(exe)
-        .arg("__plugin-host")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .context("拉起插件宿主")?;
-    for _ in 0..100 {
-        if client.is_available() {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    Err(AppDiagnostic::failure(
-        "插件宿主未能在 10 秒内就绪",
-        Some("查看 `mcsup plugin doctor` 或宿主日志".to_owned()),
-    )
-    .into())
 }
 
 fn list(printer: Printer, json: bool) -> Result<()> {
@@ -724,7 +697,7 @@ fn activate(service: &PluginService, id: &PluginId) -> Result<()> {
     if !enabled {
         service.enable(id)?;
     }
-    ensure_host()?;
+    plugin_host::ensure()?;
     if service.status(id)?.session.is_some() {
         service.restart(id, Duration::from_secs(10))?;
     } else {
@@ -1102,7 +1075,7 @@ fn setup(id: &str, printer: Printer) -> Result<()> {
     let (granted, remaining, report) =
         approve_and_configure(&service, &id, &pending, true, true, printer)?;
     let restarted = if was_running && remaining.is_empty() && report.missing.is_empty() {
-        let outcome = ensure_host().and_then(|()| {
+        let outcome = plugin_host::ensure().and_then(|()| {
             service
                 .restart(&id, Duration::from_secs(10))
                 .map_err(anyhow::Error::from)
@@ -1231,7 +1204,7 @@ fn set_enabled(id: &str, enable: bool, printer: Printer) -> Result<()> {
 
 fn start(id: &str, printer: Printer) -> Result<()> {
     let id = parse_id(id)?;
-    ensure_host()?;
+    plugin_host::ensure()?;
     let service = open()?;
     let info = service.start(&id)?;
     printer.print_outcome(
@@ -1267,7 +1240,7 @@ fn stop(id: &str, grace: u64, printer: Printer) -> Result<()> {
 
 fn restart(id: &str, printer: Printer) -> Result<()> {
     let id = parse_id(id)?;
-    ensure_host()?;
+    plugin_host::ensure()?;
     let service = open()?;
     let info = service.restart(&id, Duration::from_secs(10))?;
     printer.print_outcome(
@@ -1423,7 +1396,7 @@ fn call(
     let printer = json_printer(printer, json);
     let id = parse_id(id)?;
     let input = read_input(input)?;
-    ensure_host()?;
+    plugin_host::ensure()?;
     let service = open()?;
     // 风险确认：mutating / destructive 的 op 在动手前问一次。`--yes` 跳过
     // 提问；JSON 模式没有交互终端，直接执行（调用方是脚本，结果可读回）。
@@ -1885,7 +1858,7 @@ fn revoke(id: &str, capability: &str, printer: Printer) -> Result<()> {
 
 fn logs(id: &str, follow: bool, tail: usize, printer: Printer) -> Result<()> {
     let id = parse_id(id)?;
-    ensure_host()?;
+    plugin_host::ensure()?;
     let service = open()?;
     let mut offset: Option<u64> = None;
     loop {
@@ -2084,7 +2057,7 @@ fn doctor(printer: Printer, json: bool) -> Result<()> {
     for record in &records {
         findings.extend(scan_record(&service, record, revocation_error.is_some()));
     }
-    let host = mcsup::plugin::ControlClient::new(&config::platform_data_dir()).is_available();
+    let host = plugin_host::available();
     if !host {
         findings.push(json!({
             "level": "info",

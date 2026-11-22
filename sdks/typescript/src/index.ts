@@ -11,6 +11,7 @@
 
 export { definePlugin } from "./define.js";
 export type {
+  BindSpec,
   Capability,
   DefinedPlugin,
   EventHandler,

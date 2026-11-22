@@ -3,6 +3,7 @@
 //! 只做参数解析、进度回显与结果渲染；判定与编排在 `service::ServerLifecycleService`，
 //! supervisor 行为在 `runtime`（经 `port::SupervisorPort` 注入）。
 
+use super::plugin_bindings::BoundPlugins;
 use crate::bootstrap;
 use crate::diagnostic::AppDiagnostic;
 use crate::input;
@@ -18,11 +19,14 @@ use mcsup::service::{LifecycleError, ServerLifecycleService, StartOptions};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// 装配生命周期服务：经库侧组合根（`mcsup::bootstrap`）统一装配，
-/// CLI 不再手工拼注册表 + Java + supervisor
+/// 装配完整组合根：启停要同时操作生命周期与插件，整条命令只打开一次
+fn open() -> Result<mcsup::bootstrap::Mcsup> {
+    bootstrap::open_mcsup_with_remotes()
+}
+
+/// 只取生命周期服务（status / console / send / logs 等不涉及插件编排）
 pub(crate) fn lifecycle_service() -> Result<Arc<ServerLifecycleService>> {
-    let mcsup = bootstrap::open_mcsup_with_remotes()?;
-    Ok(Arc::new(mcsup.lifecycle.clone()))
+    Ok(Arc::new(open()?.lifecycle.clone()))
 }
 
 /// 单阶段回显：进度在结果返回前收掉，错误路径不留悬空 spinner
@@ -133,9 +137,13 @@ pub(crate) async fn start(
     skip_mod_check: bool,
     printer: Printer,
 ) -> Result<()> {
-    let service = lifecycle_service()?;
+    let mcsup = open()?;
+    let service = mcsup.lifecycle.clone();
+    let plugins = BoundPlugins::new(&mcsup);
     let supervisor_exe = std::env::current_exe().context("定位 mcsup 可执行文件")?;
-    let outcome = run_start(
+    // 先起插件再起服务器：玩家一进服，桥就已经在收消息
+    let started = plugins.start_bound(name, printer);
+    let outcome = match run_start(
         &service,
         name,
         accept_eula,
@@ -143,7 +151,15 @@ pub(crate) async fn start(
         &supervisor_exe,
         printer,
     )
-    .await?;
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            // 服务器没起来：本次刚拉起的插件收回去，避免空跑
+            plugins.rollback(name, &started, printer);
+            return Err(err);
+        }
+    };
     let payload = StartJson {
         name,
         supervisor_pid: outcome.supervisor_pid,
@@ -182,7 +198,9 @@ fn stop_spec(grace: u64, force: bool, lang: crate::locale::Lang) -> Result<StopS
 
 /// `server stop`：优雅停机（`--grace` 到期且 `--force` 时强杀）
 pub(crate) fn stop(name: &str, grace: u64, force: bool, printer: Printer) -> Result<()> {
-    let service = lifecycle_service()?;
+    let mcsup = open()?;
+    let service = mcsup.lifecycle.clone();
+    let plugins = BoundPlugins::new(&mcsup);
     let spec = stop_spec(grace, force, printer.lang())?;
     let outcome = with_spinner(
         printer,
@@ -233,6 +251,8 @@ pub(crate) fn stop(name: &str, grace: u64, force: bool, printer: Printer) -> Res
             )));
         }
     };
+    // 停机成功（或本来就停着）之后再收插件：超时中止的服务器还在跑，不动它
+    plugins.stop_unused(name, printer);
     printer.print_outcome(&human, &payload)
 }
 
@@ -245,7 +265,9 @@ pub(crate) async fn restart(
     force: bool,
     printer: Printer,
 ) -> Result<()> {
-    let service = lifecycle_service()?;
+    let mcsup = open()?;
+    let service = mcsup.lifecycle.clone();
+    let plugins = BoundPlugins::new(&mcsup);
     let supervisor_exe = std::env::current_exe().context("定位 mcsup 可执行文件")?;
 
     let spec = stop_spec(grace, force, printer.lang())?;
@@ -275,7 +297,10 @@ pub(crate) async fn restart(
         }
     }
 
-    let outcome = run_start(
+    // 重启按「停 + 起」处理：先收掉该收的插件，再在启动前重新拉起
+    plugins.stop_unused(name, printer);
+    let started = plugins.start_bound(name, printer);
+    let outcome = match run_start(
         &service,
         name,
         accept_eula,
@@ -283,7 +308,14 @@ pub(crate) async fn restart(
         &supervisor_exe,
         printer,
     )
-    .await?;
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            plugins.rollback(name, &started, printer);
+            return Err(err);
+        }
+    };
     let payload = StartJson {
         name,
         supervisor_pid: outcome.supervisor_pid,

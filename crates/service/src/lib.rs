@@ -17,6 +17,7 @@ mod origin;
 mod platform_config;
 mod platform_doctor;
 mod plugin;
+mod plugin_bindings;
 mod props;
 mod registry;
 mod settings;
@@ -78,6 +79,7 @@ pub use plugin::{
     PluginError, PluginService, StartOutcome, UnavailableBackup, UnavailableContent,
     UnavailableFiles, UnavailableJava, UnavailableLifecycle,
 };
+pub use plugin_bindings::{PluginBinding, PluginBindings};
 /// Java 源聚合端口（定义在 `port`，此处转出便于既有调用方）
 pub use port::JavaSourceRegistryPort;
 use port::{

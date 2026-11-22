@@ -1,0 +1,200 @@
+//! 插件 ↔ 服务器绑定
+//!
+//! descriptor 的 `bind.servers` 声明「去哪些配置路径读服务器名」；这里把它与
+//! 插件当前配置合起来，回答两个问题：
+//!
+//! - 某台服务器启动时，哪些插件应当先起来；
+//! - 某台服务器停止后，哪些插件已经没有任何服务器可以服务、该收掉。
+//!
+//! 只有纯判定，不含副作用：启停动作由调用方（CLI 组合根）执行。service 层
+//! 不知道插件宿主是否可达，也不该替调用方决定失败时是回滚还是继续。
+
+use crate::plugin::{PluginError, PluginService};
+use domain::plugin::PluginId;
+use std::collections::BTreeSet;
+
+/// 一个插件绑定的服务器集合（可多台，任一台在跑就应保持运行）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginBinding {
+    /// 插件 id
+    pub id: PluginId,
+    /// 绑定的服务器名
+    pub servers: BTreeSet<String>,
+}
+
+impl PluginBinding {
+    /// 是否绑定到某台服务器
+    #[must_use]
+    pub fn is_bound_to(&self, server: &str) -> bool {
+        self.servers.contains(server)
+    }
+}
+
+/// 所有启用插件的绑定清单
+///
+/// `skipped` 记录算不出绑定的插件（descriptor 或配置坏了）：它们不能参与
+/// 服务器启停编排，但也不该让整台服务器起不来，调用方可以据此告警。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PluginBindings {
+    /// 绑定非空的插件
+    pub active: Vec<PluginBinding>,
+    /// 跳过计算的插件及原因
+    pub skipped: Vec<(PluginId, String)>,
+}
+
+impl PluginBindings {
+    /// 绑定到某台服务器的插件
+    pub fn bound_to<'a>(&'a self, server: &'a str) -> impl Iterator<Item = &'a PluginBinding> {
+        self.active.iter().filter(move |b| b.is_bound_to(server))
+    }
+
+    /// 某台服务器停止后应当停止的插件
+    ///
+    /// 条件：绑定了 `stopped`，且绑定的其它服务器都没有在运行。`running` 里
+    /// 出现 `stopped` 也不影响判定——调用方在停机后采样，顺序不该改变结论。
+    #[must_use]
+    pub fn stop_candidates(&self, stopped: &str, running: &BTreeSet<String>) -> Vec<PluginId> {
+        self.active
+            .iter()
+            .filter(|binding| binding.is_bound_to(stopped))
+            .filter(|binding| {
+                binding
+                    .servers
+                    .iter()
+                    .all(|name| name == stopped || !running.contains(name))
+            })
+            .map(|binding| binding.id.clone())
+            .collect()
+    }
+}
+
+impl PluginService {
+    /// 插件绑定到哪些服务器
+    ///
+    /// 服务器级插件（manifest `scope: server`）天然只绑定它自己的服务器；
+    /// 机器级插件按 descriptor 的 `bind.servers` 路径从配置里读。
+    ///
+    /// # Errors
+    ///
+    /// 记录不存在、descriptor 非法或配置读取失败时返回 [`PluginError`]
+    pub fn bound_servers(&self, id: &PluginId) -> Result<BTreeSet<String>, PluginError> {
+        let record = self.record(id)?;
+        if let Some(server) = &record.server {
+            return Ok(BTreeSet::from([server.to_string()]));
+        }
+        let descriptor = self.descriptor(id)?;
+        let config = self.config_get(id)?;
+        let values = config.get("values").cloned().unwrap_or_default();
+        Ok(descriptor.bound_servers(&values))
+    }
+
+    /// 所有启用插件的绑定清单
+    ///
+    /// 只收集「可以启动」的插件：禁用、拉黑、隔离与待授权的插件不会随服务器
+    /// 自动启停，待授权的记入 `skipped` 便于提示。
+    ///
+    /// # Errors
+    ///
+    /// 插件记录列表读取失败时返回 [`PluginError`]
+    pub fn bindings(&self) -> Result<PluginBindings, PluginError> {
+        let mut out = PluginBindings::default();
+        for record in self.list()? {
+            if !record.enabled || record.blocked || record.quarantined {
+                continue;
+            }
+            if record.needs_approval() {
+                out.skipped.push((record.id, "needs approval".to_owned()));
+                continue;
+            }
+            match self.bound_servers(&record.id) {
+                Ok(servers) if !servers.is_empty() => out.active.push(PluginBinding {
+                    id: record.id,
+                    servers,
+                }),
+                Ok(_) => {}
+                Err(err) => out.skipped.push((record.id, err.to_string())),
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn binding(id: &str, servers: &[&str]) -> PluginBinding {
+        PluginBinding {
+            id: PluginId::parse(id).expect("id"),
+            servers: servers.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    fn id(raw: &str) -> PluginId {
+        PluginId::parse(raw).expect("id")
+    }
+
+    #[test]
+    fn single_server_binding_stops_when_that_server_stops() {
+        let bindings = PluginBindings {
+            active: vec![binding("chat-bridge", &["test1"])],
+            skipped: Vec::new(),
+        };
+        assert_eq!(
+            bindings.stop_candidates("test1", &BTreeSet::new()),
+            vec![id("chat-bridge")]
+        );
+        // 没绑定这台服务器的插件不受影响
+        assert!(
+            bindings
+                .stop_candidates("other", &BTreeSet::new())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn multi_server_binding_survives_while_any_bound_server_runs() {
+        let bindings = PluginBindings {
+            active: vec![binding("chat-bridge", &["test1", "test2"])],
+            skipped: Vec::new(),
+        };
+        let running: BTreeSet<String> = ["test2".to_owned()].into();
+        assert!(bindings.stop_candidates("test1", &running).is_empty());
+
+        // 最后一台也停了才收插件
+        assert_eq!(
+            bindings.stop_candidates("test2", &BTreeSet::new()),
+            vec![id("chat-bridge")]
+        );
+    }
+
+    #[test]
+    fn stopped_server_in_the_running_set_does_not_keep_the_plugin() {
+        let bindings = PluginBindings {
+            active: vec![binding("chat-bridge", &["test1", "test2"])],
+            skipped: Vec::new(),
+        };
+        let running: BTreeSet<String> = ["test1".to_owned(), "test2".to_owned()].into();
+        assert!(bindings.stop_candidates("test1", &running).is_empty());
+        // 只剩 stopped 自己在 running 里：绑定集合里没有别的活服务器 → 停
+        let only_stopped: BTreeSet<String> = ["test1".to_owned()].into();
+        assert_eq!(bindings.stop_candidates("test1", &only_stopped).len(), 1);
+    }
+
+    #[test]
+    fn bound_to_filters_by_server() {
+        let bindings = PluginBindings {
+            active: vec![
+                binding("chat-bridge", &["test1"]),
+                binding("other", &["test2"]),
+            ],
+            skipped: Vec::new(),
+        };
+        let ids = bindings
+            .bound_to("test1")
+            .map(|b| b.id.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["chat-bridge"]);
+    }
+}

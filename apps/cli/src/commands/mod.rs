@@ -9,6 +9,8 @@ mod mod_review;
 mod modpack;
 mod origin;
 mod plugin;
+mod plugin_bindings;
+mod plugin_host;
 mod props;
 mod remote;
 mod server_mod;

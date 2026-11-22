@@ -67,6 +67,9 @@ pub const MAX_SETUP_CHOICES: usize = 32;
 /// setup 单个可选值的长度上限（字符）
 pub const MAX_SETUP_CHOICE_CHARS: usize = 64;
 
+/// `bind.servers` 可声明的路径数上限
+pub const MAX_BIND_PATHS: usize = 8;
+
 /// op 种类
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OpKind {
@@ -380,6 +383,28 @@ pub struct SetupField {
     pub default: Option<serde_json::Value>,
 }
 
+/// 插件与服务器的绑定声明（schema 3 起可用）
+///
+/// 列出的配置路径值就是服务器名（字符串，或字符串数组，如多服务器场景）。
+/// 宿主据此让插件跟随服务器生命周期：绑定的服务器启动前先启动插件，
+/// 最后一个绑定的服务器停止后再停止插件。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Bind {
+    /// 指向服务器名的配置路径（点号分隔）
+    #[serde(default)]
+    pub servers: Vec<String>,
+}
+
+/// [`Descriptor::resolve_config_setup_and_bind`] 的产物
+///
+/// 三元组单独起名：返回类型直接展开会让签名难读，也让 clippy 报「类型过于复杂」。
+type ResolvedConfigSetupBind = (
+    Option<serde_json::Value>,
+    Option<ResolvedSetup>,
+    Vec<String>,
+);
+
 /// 校验通过的 setup
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedSetup {
@@ -497,6 +522,9 @@ pub struct Descriptor {
     /// 安装向导（schema 2 起可用）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup: Option<Setup>,
+    /// 服务器绑定（schema 3 起可用）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind: Option<Bind>,
     /// op 列表
     #[serde(default)]
     pub ops: Vec<Op>,
@@ -527,11 +555,44 @@ pub struct ValidatedDescriptor {
     pub config: Option<serde_json::Value>,
     /// 安装向导（已解析类型与默认值）
     pub setup: Option<ResolvedSetup>,
+    /// 绑定服务器名的配置路径（已校验为字符串或字符串数组叶子）
+    pub server_paths: Vec<String>,
     /// 按 id 排序的 op
     pub ops: Vec<ResolvedOp>,
 }
 
 impl ValidatedDescriptor {
+    /// 从配置值中解析绑定到哪些服务器
+    ///
+    /// 路径在配置里缺失、类型不对或值为空时跳过该路径；结果去重并保持有序。
+    /// 这里不判定「服务器是否已注册」：注册表属于宿主，descriptor 只声明
+    /// 去哪里读服务器名。
+    #[must_use]
+    pub fn bound_servers(&self, config: &serde_json::Value) -> BTreeSet<String> {
+        let mut names = BTreeSet::new();
+        for path in &self.server_paths {
+            let mut node = Some(config);
+            for segment in path.split('.') {
+                node = node.and_then(|value| value.get(segment));
+            }
+            let Some(node) = node else {
+                continue;
+            };
+            match node {
+                serde_json::Value::String(name) => insert_server_name(&mut names, name),
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        if let Some(name) = item.as_str() {
+                            insert_server_name(&mut names, name);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        names
+    }
+
     /// 按 id 查 op
     #[must_use]
     pub fn op(&self, id: &str) -> Option<&ResolvedOp> {
@@ -651,19 +712,18 @@ impl Descriptor {
         for entry in &resolved {
             validate_display_shape(entry)?;
         }
-        let (config, setup) = self.resolve_config_and_setup()?;
+        let (config, setup, server_paths) = self.resolve_config_setup_and_bind()?;
         Ok(ValidatedDescriptor {
             raw: self,
             config,
             setup,
+            server_paths,
             ops: resolved,
         })
     }
 
-    /// 归一化 config schema，并据它校验 setup 的每个字段路径
-    fn resolve_config_and_setup(
-        &self,
-    ) -> Result<(Option<serde_json::Value>, Option<ResolvedSetup>), DescriptorError> {
+    /// 归一化 config schema，并据它校验 setup 字段路径与 bind 服务器路径
+    fn resolve_config_setup_and_bind(&self) -> Result<ResolvedConfigSetupBind, DescriptorError> {
         let config = match &self.config {
             Some(schema) => {
                 let inlined = self.inline_refs(schema)?;
@@ -684,7 +744,19 @@ impl Descriptor {
             }
             None => None,
         };
-        Ok((config, setup))
+        let server_paths = match &self.bind {
+            Some(bind) => {
+                if self.schema < 3 {
+                    return Err(DescriptorError::BindRequiresSchema { found: self.schema });
+                }
+                let Some(config) = &config else {
+                    return Err(DescriptorError::BindWithoutConfig);
+                };
+                resolve_bind(bind, config)?
+            }
+            None => Vec::new(),
+        };
+        Ok((config, setup, server_paths))
     }
 
     fn inline_refs(
@@ -760,6 +832,70 @@ fn resolve_setup(
         start: setup.start,
         fields,
     })
+}
+
+/// 解析 `bind`：每条路径必须是 config schema 里指向服务器名的叶子
+///
+/// 只接受 `string` 与 `string[]`：服务器名是标量，多服务器场景用列表。
+/// 路径与 setup 共用长度 / 分段上限，避免插件声明一串不可读的路径。
+fn resolve_bind(bind: &Bind, config: &serde_json::Value) -> Result<Vec<String>, DescriptorError> {
+    if bind.servers.len() > MAX_BIND_PATHS {
+        return Err(DescriptorError::BindTooManyPaths {
+            count: bind.servers.len(),
+            limit: MAX_BIND_PATHS,
+        });
+    }
+    let mut seen = BTreeSet::new();
+    let mut paths = Vec::with_capacity(bind.servers.len());
+    for raw in &bind.servers {
+        let path = raw.trim();
+        if path.is_empty() || path.chars().count() > MAX_SETUP_PATH_CHARS {
+            return Err(DescriptorError::InvalidBindPath {
+                path: raw.clone(),
+                reason: format!("each path must be 1..={MAX_SETUP_PATH_CHARS} characters"),
+            });
+        }
+        if path.split('.').any(str::is_empty) {
+            return Err(DescriptorError::InvalidBindPath {
+                path: path.to_owned(),
+                reason: "path segments must not be empty".to_owned(),
+            });
+        }
+        if !seen.insert(path.to_owned()) {
+            return Err(DescriptorError::DuplicateBindPath {
+                path: path.to_owned(),
+            });
+        }
+        let segments = path.split('.').collect::<Vec<_>>();
+        let schema = resolve_config_path(config, &segments).ok_or_else(|| {
+            DescriptorError::UnknownBindPath {
+                path: path.to_owned(),
+            }
+        })?;
+        if !is_server_name_leaf(schema) {
+            return Err(DescriptorError::InvalidBindPath {
+                path: path.to_owned(),
+                reason: "bind path must point to a string or an array of strings".to_owned(),
+            });
+        }
+        paths.push(path.to_owned());
+    }
+    Ok(paths)
+}
+
+/// `bind` 路径是否描述服务器名：`string` 或 `string[]`
+fn is_server_name_leaf(schema: &serde_json::Value) -> bool {
+    match schema.get("type").and_then(serde_json::Value::as_str) {
+        Some("string") => true,
+        Some("array") => {
+            schema
+                .get("items")
+                .and_then(|items| items.get("type"))
+                .and_then(serde_json::Value::as_str)
+                == Some("string")
+        }
+        _ => false,
+    }
 }
 
 /// 校验 `choicesFrom`：与 `choices` 互斥、只能用于字符串字段、不能叠加静态选项
@@ -933,6 +1069,14 @@ fn resolve_config_path<'a>(
         node = node.get("properties")?.as_object()?.get(*segment)?;
     }
     Some(node)
+}
+
+/// 服务器名去空白后非空才收进集合
+fn insert_server_name(names: &mut BTreeSet<String>, name: &str) {
+    let name = name.trim();
+    if !name.is_empty() {
+        names.insert(name.to_owned());
+    }
 }
 
 fn op_id_is_valid(id: &str) -> bool {
@@ -1459,6 +1603,43 @@ pub enum DescriptorError {
     /// 声明了 setup 但没有 config schema
     #[error("setup requires a config schema")]
     SetupWithoutConfig,
+    /// bind 需要 schema 3
+    #[error("bind requires descriptor schema 3 or newer, found {found}")]
+    BindRequiresSchema {
+        /// 声明值
+        found: u32,
+    },
+    /// 声明了 bind 但没有 config schema
+    #[error("bind requires a config schema")]
+    BindWithoutConfig,
+    /// bind 路径过多
+    #[error("bind declares {count} server paths, limit is {limit}")]
+    BindTooManyPaths {
+        /// 实际数量
+        count: usize,
+        /// 上限
+        limit: usize,
+    },
+    /// bind 路径非法
+    #[error("invalid bind path: {path} ({reason})")]
+    InvalidBindPath {
+        /// 路径
+        path: String,
+        /// 原因
+        reason: String,
+    },
+    /// bind 路径重复
+    #[error("duplicate bind path: {path}")]
+    DuplicateBindPath {
+        /// 路径
+        path: String,
+    },
+    /// bind 路径不在 config schema 中
+    #[error("bind path does not exist in config schema: {path}")]
+    UnknownBindPath {
+        /// 路径
+        path: String,
+    },
     /// setup 字段过多
     #[error("setup declares {count} fields, limit is {limit}")]
     SetupTooManyFields {
@@ -2110,5 +2291,96 @@ mod tests {
         }
         assert!(check_asset_names([Path::new("bin/demo")]).is_ok());
         assert!(check_asset_names([Path::new("README.md")]).is_ok());
+    }
+
+    #[test]
+    fn bind_resolves_server_name_paths_and_reads_config() {
+        let mut value = with_config(json!({
+            "server": { "type": "string" },
+            "extraServers": { "type": "array", "items": { "type": "string" } },
+            "nested": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "primary": { "type": "string" }
+                }
+            }
+        }));
+        value["schema"] = json!(3);
+        value["bind"] = json!({ "servers": ["server", "extraServers", "nested.primary"] });
+        let descriptor = parse(value).expect("valid bind");
+        assert_eq!(
+            descriptor.server_paths,
+            vec!["server", "extraServers", "nested.primary"]
+        );
+
+        // 标量、列表、嵌套路径都参与；空值、类型不符与缺失路径被忽略
+        let config = json!({
+            "server": "  survival ",
+            "extraServers": ["creative", "", "  survival  ", 7],
+            "nested": { "primary": "skyblock" }
+        });
+        let bound = descriptor.bound_servers(&config);
+        assert_eq!(
+            bound.into_iter().collect::<Vec<_>>(),
+            vec!["creative", "skyblock", "survival"]
+        );
+
+        let empty = descriptor.bound_servers(&json!({
+            "server": "",
+            "extraServers": [],
+            "nested": {}
+        }));
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn bind_rejects_bad_paths_and_old_schema() {
+        // schema 2 不认识 bind
+        let mut value = with_config(json!({ "server": { "type": "string" } }));
+        value["bind"] = json!({ "servers": ["server"] });
+        assert!(matches!(
+            parse(value),
+            Err(DescriptorError::BindRequiresSchema { .. })
+        ));
+
+        // 路径必须存在于 config schema
+        let mut value = with_config(json!({ "server": { "type": "string" } }));
+        value["schema"] = json!(3);
+        value["bind"] = json!({ "servers": ["missing"] });
+        assert!(matches!(
+            parse(value),
+            Err(DescriptorError::UnknownBindPath { .. })
+        ));
+
+        // 只接受字符串或字符串数组
+        let mut value = with_config(json!({ "retries": { "type": "integer" } }));
+        value["schema"] = json!(3);
+        value["bind"] = json!({ "servers": ["retries"] });
+        assert!(matches!(
+            parse(value),
+            Err(DescriptorError::InvalidBindPath { .. })
+        ));
+
+        // 重复路径
+        let mut value = with_config(json!({ "server": { "type": "string" } }));
+        value["schema"] = json!(3);
+        value["bind"] = json!({ "servers": ["server", " server "] });
+        assert!(matches!(
+            parse(value),
+            Err(DescriptorError::DuplicateBindPath { .. })
+        ));
+
+        // 路径条数上限
+        let mut value = with_config(json!({ "server": { "type": "string" } }));
+        value["schema"] = json!(3);
+        let many = (0..=MAX_BIND_PATHS)
+            .map(|_| "server".to_owned())
+            .collect::<Vec<_>>();
+        value["bind"] = json!({ "servers": many });
+        assert!(matches!(
+            parse(value),
+            Err(DescriptorError::BindTooManyPaths { .. })
+        ));
     }
 }

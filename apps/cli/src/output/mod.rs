@@ -115,6 +115,13 @@ impl Printer {
         }
     }
 
+    /// 一行普通提示，仅人类模式：编排类副作用不产出 JSON 数据
+    pub(crate) fn print_note(self, text: &str) {
+        if self.format == OutputFormat::Human {
+            print_line(text);
+        }
+    }
+
     /// 当前是否可提问：JSON 输出下交互会卡住脚本，管道输入下提问必然失败
     ///
     /// 所有 inquire 调用前统一问这一个口径，禁止在命令里各自判 TTY。

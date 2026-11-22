@@ -102,6 +102,26 @@ describe("descriptor", () => {
     });
   });
 
+  it("bind 生成 schema 3 与服务器路径", () => {
+    const def = {
+      ...chatBridge.definition,
+      bind: { servers: ["qq.server", "extra"] },
+    } as typeof chatBridge.definition;
+    const d = buildDescriptor(def);
+    expect(d.schema).toBe(3);
+    expect(d.bind).toEqual({ servers: ["qq.server", "extra"] });
+  });
+
+  it("bind 拒绝空路径、重复与超限", () => {
+    const withBind = (servers: string[]) =>
+      ({ ...chatBridge.definition, bind: { servers } }) as typeof chatBridge.definition;
+    expect(() => buildDescriptor(withBind([" "]))).toThrow(/must not be empty/);
+    expect(() => buildDescriptor(withBind(["a", " a "]))).toThrow(/duplicate/);
+    expect(() => buildDescriptor(withBind(Array.from({ length: 9 }, (_, i) => `s${i}`)))).toThrow(
+      /more than 8/,
+    );
+  });
+
   it("op 元数据与 display 缺省", () => {
     const d = buildDescriptor(chatBridge.definition);
     const send = d.ops.find((op) => op.id === "send");

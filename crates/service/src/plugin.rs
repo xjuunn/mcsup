@@ -188,6 +188,10 @@ pub enum StartOutcome {
 }
 
 /// 插件业务服务
+///
+/// 所有字段都是 `Arc` / `PathBuf`，克隆只共享同一份存储与宿主连接：让同时
+/// 需要生命周期与插件的命令拿一份就走，不必层层传引用。
+#[derive(Clone)]
 pub struct PluginService {
     store: Arc<dyn PluginStore>,
     supervisor: Option<Arc<dyn PluginSupervisor>>,

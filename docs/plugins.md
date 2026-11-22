@@ -1186,7 +1186,7 @@ descriptor 由 SDK 在构建时生成，与二进制一起打包。宿主只读�
 
 ```json
 {
-  "schema": 2,
+  "schema": 3,
   "plugin_id": "chat-bridge",
   "api": 1,
   "config": { "$ref": "#/schemas/config" },
@@ -1199,6 +1199,7 @@ descriptor 由 SDK 在构建时生成，与二进制一起打包。宿主只读�
       { "path": "qq.groups" }
     ]
   },
+  "bind": { "servers": ["qq.server"] },
   "ops": [
     {
       "id": "history",
@@ -1458,6 +1459,29 @@ JSON Schema 没有「密钥」「单位」的标准表达，统一用 `x-mcsup-`
 - `--no-setup` 跳过整个向导（不授权、不补配置、不启动），与旧版行为一致；
 - 非交互（`--json` / 非 TTY）不提问：只有 `--yes` 才授予能力，缺失必填项
   以 `missing` 返回，提示用 `mcsup plugin config set` 补齐。
+
+## 11.9 服务器绑定 `bind`
+
+`schema: 3` 起 descriptor 可声明可选 `bind`，把插件关联到一台或多台服务器。
+宿主据此让插件跟随服务器启停（`server start / stop / restart`）：
+
+- 启动服务器前先拉起绑定到它的插件，玩家进服时桥已经在收消息；
+- 服务器停下后，停止已经没有任何绑定服务器在运行的插件；
+- 插件绑定多台服务器时，任意一台在跑就保持运行，最后一台停下才停止。
+
+| 字段 | 必填 | 约束 |
+| --- | --- | --- |
+| `bind.servers` | 否 | 配置路径数组，≤ 8 项；每项 1–128 字符，点号分隔且分段非空，不得重复 |
+| `bind.servers[]` | 是 | 必须命中 config schema 的叶子，且类型是 `string` 或 `string[]` |
+
+路径的值就是服务器名（`string[]` 用于多服务器场景）。运行时从插件当前配置
+读取：路径缺失、类型不符或值为空时忽略该路径，结果 trim 后去重并保持有序。
+`bind` 本身不做「服务器是否已注册」的判断——注册表属于宿主。
+
+绑定不改变手动操作：`mcsup plugin start / stop` 仍可独立启停插件。插件启动
+失败只告警、不阻止服务器启动；服务器启动失败时，本次刚由 `start` 拉起的插件
+会被回滚（仅当它已没有绑定服务器在运行）。kit、远端 agent 与插件自身触发的
+服务器启停不参与该编排——插件宿主是本地进程。
 
 # 12. 契约与组合
 
@@ -2227,6 +2251,10 @@ mcsup __plugin-host --data-dir <path> [--idle-timeout <secs>]   # 隐藏
   写文件再传是最稳的：
   `mcsup plugin config set chat-bridge platforms --file platforms.json`。
   文件不是合法 JSON 时以用法错误 2 退出，不写配置。
+- `server start` / `stop` / `restart` 会顺带编排绑定到该服务器的插件
+  （descriptor `bind.servers`）：启动前先起插件，停机后停止已无绑定服务器在
+  跑的插件。插件启停失败只告警，不影响服务器本身；kit、远端 agent 与插件
+  自触发的服务器启停不参与该编排。
 
 ## 18.2 输出示例
 

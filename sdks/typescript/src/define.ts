@@ -107,6 +107,18 @@ export interface SetupSpec {
   readonly fields: readonly SetupFieldSpec[];
 }
 
+/**
+ * 服务器绑定：列出的配置路径，其值就是服务器名。
+ *
+ * 宿主据此让插件跟随服务器生命周期：绑定的服务器启动前先启动插件，
+ * 绑定的服务器全部停止后再停止插件。值是字符串或字符串数组，
+ * 路径必须指向 config schema 中的叶子字段。
+ */
+export interface BindSpec {
+  /** 指向服务器名的配置路径，点号分隔（如 `qq.server`） */
+  readonly servers: readonly string[];
+}
+
 /** 插件定义（`definePlugin` 的参数） */
 export interface PluginDefinition<
   C extends readonly Capability[] = readonly Capability[],
@@ -141,6 +153,8 @@ export interface PluginDefinition<
   readonly config: Cfg;
   /** 安装向导；声明后宿主在安装时补齐配置并自动启动 */
   readonly setup?: SetupSpec;
+  /** 服务器绑定；声明后宿主让插件跟随所绑定服务器的启停（schema 3） */
+  readonly bind?: BindSpec;
   readonly queries?: Readonly<Record<string, OpSpec>>;
   readonly actions?: Readonly<Record<string, OpSpec>>;
   readonly streams?: Readonly<Record<string, OpSpec>>;
