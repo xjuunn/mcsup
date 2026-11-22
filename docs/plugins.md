@@ -2296,6 +2296,10 @@ mcsup __plugin-host --data-dir <path> [--idle-timeout <secs>]   # 隐藏
   服务器启动时再自动拉起。没有绑定、绑定服务器至少一台在跑，或读不出绑定
   清单（descriptor / 配置损坏）时放行；读不出时放行是为了不让诊断失败挡住
   用户。
+- 本机状态先于绑定门禁：插件被拉黑、隔离、停用或还有待授权能力时，
+  `plugin start` / `restart` 直接报出真实原因与应执行的命令
+  （`unblock` / `release` / `enable` / `setup`），不再被「绑定的服务器都没
+  在运行」盖成一次 exit 0 的「已跳过启动」。
 
 ## 18.2 输出示例
 

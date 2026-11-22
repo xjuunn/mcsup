@@ -784,6 +784,49 @@ fn print_gate_note(printer: Printer, id: &PluginId, servers: &[String], zh: &str
     ));
 }
 
+/// 本机门禁：拉黑 / 隔离 / 停用 / 待授权时给出可操作的错误
+///
+/// 与宿主 `PluginHost::start` 的判定同源，但必须在绑定门禁**之前**先判一次：
+/// 「绑定的服务器都没在运行」是成功返回（exit 0），会把真实原因盖掉，用户只
+/// 看到「已跳过启动」，永远不知道该去 `unblock` / `release` / `enable`。
+fn reject_unstartable(service: &PluginService, id: &PluginId, printer: Printer) -> Result<()> {
+    let record = service.record(id)?;
+    let lang = printer.lang();
+    let (message, help) = if record.blocked {
+        (
+            format!("插件 {id} 已被本机拉黑，不会启动"),
+            format!("`mcsup plugin unblock {id}`"),
+        )
+    } else if record.quarantined {
+        (
+            format!("插件 {id} 已隔离，不会启动"),
+            format!("`mcsup plugin release {id}`"),
+        )
+    } else if !record.enabled {
+        (
+            format!("插件 {id} 已停用，不会启动"),
+            format!("`mcsup plugin enable {id}`"),
+        )
+    } else if record.needs_approval() {
+        (
+            format!("插件 {id} 还有待授权能力，不会启动"),
+            format!("`mcsup plugin setup {id}`"),
+        )
+    } else {
+        return Ok(());
+    };
+    let en_message = format!("plugin {id} cannot start: {help}");
+    Err(AppDiagnostic::conflict(
+        crate::i18n::pick(lang, message, en_message),
+        Some(crate::i18n::pick(
+            lang,
+            format!("先运行 {help}"),
+            format!("run {help} first"),
+        )),
+    )
+    .into())
+}
+
 /// 权限齐备才启动；缺权限、绑定服务器停着或启动失败都只提示，不视为安装 / 升级失败
 fn start_if_ready(
     bound: &BoundPlugins,
@@ -1294,6 +1337,9 @@ fn set_enabled(id: &str, enable: bool, printer: Printer) -> Result<()> {
 fn start(id: &str, printer: Printer) -> Result<()> {
     let id = parse_id(id)?;
     let (service, bound) = open_bound()?;
+    // 本机状态先判：拉黑 / 隔离 / 停用的插件根本不该启动，别让绑定门禁的
+    // 「已跳过启动」把它盖成一次成功
+    reject_unstartable(&service, &id, printer)?;
     // 绑定服务器都没在跑：不拉起（并收掉残留），启动服务器时会自动起
     if let StartGate::AllStopped { servers } = bound.enforce_gate(&id, printer) {
         print_gate_note(
@@ -1369,6 +1415,8 @@ fn stop(id: &str, grace: u64, printer: Printer) -> Result<()> {
 fn restart(id: &str, printer: Printer) -> Result<()> {
     let id = parse_id(id)?;
     let (service, bound) = open_bound()?;
+    // 同 `start`：本机状态先判，避免被「已跳过重启」盖成成功
+    reject_unstartable(&service, &id, printer)?;
     // 绑定服务器都没在跑：不重启（并收掉残留），等服务器启动时再拉起
     if let StartGate::AllStopped { servers } = bound.enforce_gate(&id, printer) {
         print_gate_note(

@@ -1671,6 +1671,71 @@ fn plugin_config_and_block_flags_are_visible_and_enforced() {
     assert_eq!(rows[0]["quarantined"], false);
 }
 
+/// 本机门禁先于绑定门禁：拉黑 / 隔离 / 停用时 `start` 必须报出真实原因，
+/// 不能被「绑定的服务器都没在运行」盖成一次 exit 0 的成功
+#[test]
+fn plugin_start_reports_local_block_reason_instead_of_skipping() {
+    let home = temp_home();
+    let artifact = home.path().join("gate-plugin");
+    write_plugin_artifact(&artifact);
+    let out = run(
+        home.path(),
+        &[
+            "--output",
+            "json",
+            "plugin",
+            "install",
+            "--from",
+            artifact.to_str().expect("utf-8 path"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    // 停用
+    let out = run(home.path(), &["plugin", "disable", "demo"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let out = run(home.path(), &["plugin", "start", "demo"]);
+    assert_ne!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("plugin enable demo"),
+        "{}",
+        stderr(&out)
+    );
+
+    // 拉黑（顺带停用）
+    let out = run(home.path(), &["plugin", "block", "demo"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let out = run(home.path(), &["plugin", "start", "demo"]);
+    assert_ne!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("plugin unblock demo"),
+        "{}",
+        stderr(&out)
+    );
+
+    // 隔离
+    let out = run(home.path(), &["plugin", "unblock", "demo"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let out = run(home.path(), &["plugin", "quarantine", "demo"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let out = run(home.path(), &["plugin", "start", "demo"]);
+    assert_ne!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("plugin release demo"),
+        "{}",
+        stderr(&out)
+    );
+
+    // `restart` 同一口径
+    let out = run(home.path(), &["plugin", "restart", "demo"]);
+    assert_ne!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("plugin release demo"),
+        "{}",
+        stderr(&out)
+    );
+}
+
 /// 用 `--file` 写 `demo.tags`，返回（退出码，写后读回的值）。
 fn set_tags_from_file(home: &Path, file: &str) -> (Option<i32>, serde_json::Value) {
     let set = run(

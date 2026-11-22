@@ -168,3 +168,6 @@
 - 插件启动失败的原因文本补上 NTSTATUS 符号名与成因（`STATUS_DLL_INIT_FAILED`、
   `STATUS_DLL_NOT_FOUND`、`STATUS_INVALID_IMAGE_FORMAT`、`STATUS_STACK_BUFFER_OVERRUN`
   等），不再只有一串十六进制退出码。
+- `plugin start` / `plugin restart` 先判本机状态：插件被拉黑、隔离、停用或还有
+  待授权能力时直接报出真实原因与应执行的命令，不再被「绑定的服务器都没在运行」
+  盖成一次 exit 0 的「已跳过启动」。
