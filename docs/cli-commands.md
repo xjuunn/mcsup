@@ -12,7 +12,9 @@
 - **服务属性统一 `server set`**：JVM 绑定、内存、自启等一律
   `mcsup server set <name> <key> <value>`，不为一类属性单开子命令；
   TTY 下缺 key / value 交互补齐。
-- **机器级命令**：`java`（本机 JVM 运行时）、`remote`（远端接入与管理）。
+- **机器级命令**：`java`（本机 JVM 运行时）、`remote`（远端接入与管理）、
+  `plugin`（插件安装、授权与启停；命令族与安装向导契约见 `docs/plugins.md`
+  §18，不在本文重复）。
 - **平台级命令直接动作**：`doctor` / `config` / `update` 等；工作目录经
   `workspace` 子命令管理。
 - **服务器只能建在已注册工作目录下**：`--workspace <名>` 按名选择，
@@ -63,7 +65,8 @@ restart / status / console / send / logs / props / set / remove / version`、
 `server backup create / list / restore / delete / verify / prune`、
 `server mod list / add / remove / update / outdated`、
 `workspace init / use / remove`、`java install / uninstall`、
-`config set / unset`。
+`config set / unset`、`plugin install / update / setup / remove / enable /
+disable / start / stop / restart`。
 
 `remote` 已全部接入（无参数局域网发现除外，显式报「尚未实现」）。`update`
 （自升级）仍未实现，入口直接返回「尚未实现」。

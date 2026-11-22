@@ -35,6 +35,25 @@
 - `RetentionInput`：保留策略的冲突判定进领域层。
 - `BackupErrorKind::RestoreCancelled`：恢复过程可被协作取消。
 - `CredentialError::LockBusy`：凭证库并发访问不再互相覆盖。
+- 插件系统：常驻宿主进程按需拉起插件子进程，走带帧的 JSON 管道协议
+  （`welcome` / `call` / `result` / `event` / `chunk` / `shutdown`），`op` 输入
+  按 descriptor 的 schema 校验、超时取 descriptor 声明的 `timeout_ms`。能力
+  授权、撤销列表、审计三件套决定插件能做什么；中高风险能力未确认时记录落
+  `pending_approval` 且 `enabled=false`。
+- `service::plugin` 与 CLI 的 `plugin` 子命令族：安装 / 升级 / 版本切换 / 回滚 /
+  卸载 / 启停 / 状态 / 日志 / 调用 / 配置 / 授权 / 封禁 / 隔离 / `verify` /
+  `doctor` / `revocations`。安装来源覆盖本地目录、URL 与 git（tag / SHA），
+  摘要不匹配即拒绝。
+- descriptor `schema 3` 的 `bind.servers`：插件声明从哪些配置路径读服务器名，
+  服务器 `start` / `stop` / `restart` 时先启停插件，多台服务器中任一在运行就
+  保持插件；没有服务器使用时由常驻看门狗收掉，控制台内、游戏内与崩溃停止
+  都走同一条收尾路径。
+- TypeScript 插件 SDK（`sdks/typescript`，包名 `mcsup-plugin`）：握手、op 调用、
+  流式返回、事件订阅、配置与密钥、`ctx.contract.call` 与严格帧解码层，附
+  conformance 用例与宿主实现互校。
+- `docs/plugins.md`：插件契约主文档（manifest / descriptor、能力风险与授权、
+  帧协议与限额、安装流水线与回滚、CLI 契约）；`docs/plugins-testing.md` 给出
+  可映射到测试的用例编号。
 
 ### 变更
 
@@ -105,3 +124,39 @@
   同时已知大小且低于分段阈值的小文件不再先发 HEAD 探测。
 - 整合包布置按体积降序下载（大文件优先，LPT 调度）：改掉此前按清单原始顺序
   下载时大文件拖尾、在途连接数一路衰减导致的「越下越慢」，同时缩短整批完成时间。
+- 插件写路径改独立写线程 + `ack` 确认：Windows 命名管道不支持写超时，原先一次
+  阻塞写会把整个会话卡死。
+- 插件帧上限 1 MiB → 24 MiB，且先序列化再判超限：原来超限时半帧已经写出，对端
+  只能看到损坏的帧；`result` 帧超限改发 `limit_exceeded` 错误帧。
+- 插件安装 / 版本切换 / 卸载改用内核文件锁（`plugins/.<id>.install.lock`）：原先
+  「文件存在即加锁」，崩溃后最长锁死一小时，且 `update --to` 与 `remove` 根本
+  不吃锁，可与安装并发互相删目录。锁文件永不删除——删掉会让等待者与新来者各持
+  一把锁。
+- 插件升级：启动（含握手）成功前不再动旧版本目录，失败自动切回旧版本并重新拉起；
+  `--prune` 只清更旧目录，始终保留回滚目标；停机后的非启动类失败也会删掉孤儿
+  目录并恢复旧进程。
+- 插件版本切换不再无条件写 `stopped`：已停用的插件切版本后既 `enable` 不了、又能
+  绕过待审批门禁；现在按 `enabled` 与待授权能力重算，且拒绝切到当前版本（否则会
+  覆盖真正的回滚目标）。
+- 插件记录读取只把 `NotFound` 当「没装过」：记录损坏 / IO 错误原先降级成全新安装，
+  会清零授权、停掉运行中的进程并删掉旧版本目录。
+- 插件卸载改为先删产物 / 数据 / 密钥、最后删记录：反序时一次删除失败就留下无法
+  清理的孤儿（重装同版本永远 `AlreadyExists`，密钥残留还会被重装的同名插件继承）。
+- `plugin verify <id>` 改用安装记录的目录树摘要比对：原先拿旁路 `.sha256` 比目录树，
+  被改过的产物也报「校验通过」。
+- 插件 `update` 按记录来源升级时校验产物 id，本地来源规范成绝对路径；git 来源的
+  记录格式改 `git:<url>|<rev>`（原 `@` 会把 `git@host:org/repo` 这类 URL 拆坏，
+  SSH 装的插件永远升级不了）。
+- `plugin logs` 对不存在的插件不再静默成功（`--follow` 原本永久空转）；`plugin
+  stop --grace` 超 3600 秒按用法错误拒绝，不再静默夹紧到 300 秒。
+- 崩溃残留的安装临时目录按名字里的创建时刻清理（超过一小时），解包期间的目录
+  不会被误删。
+- 插件宿主看门狗以 `(插件 id, session_id)` 为观察单位，撤销判定下沉到宿主内部：
+  插件崩溃重启、配置热更后不再漏判；控制台内与游戏内停机也会收掉绑定插件。
+- `plugin update` / `plugin install` 不再重复重启插件：服务层已在新版本启动成功后
+  才算成功，CLI 只在没有会话时补启动。
+- TypeScript 插件 SDK 严格解码每个帧字段并补齐 `console:read.tail`、KV / secret、
+  `server:lifecycle.stop` 三态、backup / content / java 包装、分页四键与
+  `ctx.contract.call`；成功流不再多发空的 `chunk` 结束帧。
+- `url` 升到 2.5.9（2.5.8 的 `Url::origin()` 在嵌套 `blob:` URL 上栈溢出，
+  RUSTSEC-2026-0592）。
