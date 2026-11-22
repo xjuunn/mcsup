@@ -1479,6 +1479,71 @@ fn plugin_install_local_artifact_then_list_ops_and_verify() {
     assert_eq!(verified["sha256"].as_str().map(str::len), Some(64));
 }
 
+/// `plugin setup` 重跑已安装插件的向导：非交互模式只报缺失项，不改配置、
+/// 不重启（原本没在运行）
+#[test]
+fn plugin_setup_reports_missing_required_fields() {
+    let home = temp_home();
+    let artifact = home.path().join("setup-plugin");
+    write_plugin_artifact_with_setup(&artifact);
+
+    let out = run(
+        home.path(),
+        &[
+            "--output",
+            "json",
+            "plugin",
+            "install",
+            "--from",
+            artifact.to_str().expect("utf-8 path"),
+            "--no-setup",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    let out = run(
+        home.path(),
+        &["--output", "json", "plugin", "setup", "demo", "--yes"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("setup 输出对象");
+    assert_eq!(report["id"], "demo");
+    assert_eq!(report["missing"][0], "token", "{report}");
+    assert_eq!(report["configured"].as_array().map(Vec::len), Some(0));
+    assert_eq!(report["restarted"], false);
+
+    // 必填项没人回答时不应写入任何值
+    let out = run(home.path(), &["plugin", "config", "get", "demo", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let config: serde_json::Value = serde_json::from_slice(&out.stdout).expect("config 输出对象");
+    // 必填项没人回答时不应写入任何值（schema 默认值 `interval` 由读取时填充）
+    assert!(config["values"].get("token").is_none(), "{config}");
+}
+
+/// 没声明 `setup` 的插件运行 `plugin setup`：用法错误，退出 2
+#[test]
+fn plugin_setup_without_setup_fields_exits_2() {
+    let home = temp_home();
+    let artifact = home.path().join("no-setup-plugin");
+    write_plugin_artifact(&artifact);
+    let out = run(
+        home.path(),
+        &[
+            "--output",
+            "json",
+            "plugin",
+            "install",
+            "--from",
+            artifact.to_str().expect("utf-8 path"),
+            "--no-setup",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let out = run(home.path(), &["plugin", "setup", "demo"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(out.stdout.is_empty(), "失败不得输出数据");
+}
+
 /// `verify` 指向本地目录：复查摘要与 manifest / descriptor
 #[test]
 fn plugin_verify_local_directory_reports_digest() {
@@ -1726,4 +1791,23 @@ fn write_plugin_artifact(root: &Path) {
         std::fs::set_permissions(root.join(entry_rel), std::fs::Permissions::from_mode(0o755))
             .expect("chmod entry");
     }
+}
+
+/// 在基础产物上加 `setup` 声明：必填的密钥字段 `token`
+///
+/// 直接重写 descriptor，避免给共享 fixture 带 setup、影响其它只测安装的用例。
+fn write_plugin_artifact_with_setup(root: &Path) {
+    write_plugin_artifact(root);
+    std::fs::write(
+        root.join("descriptor.json"),
+        r#"{"schema":2,"plugin_id":"demo","api":1,
+            "config":{"type":"object","additionalProperties":false,
+                      "properties":{
+                        "interval":{"type":"integer","minimum":5,"default":60},
+                        "token":{"type":"string","x-mcsup-secret":true}}},
+            "setup":{"start":true,"fields":[{"path":"token","required":true,"secret":true}]},
+            "ops":[{"id":"ping","kind":"query","title":"Ping","risk":"read",
+                    "input":{"type":"object"},"output":{"type":"object"}}]}"#,
+    )
+    .expect("write descriptor with setup");
 }

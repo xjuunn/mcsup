@@ -50,6 +50,7 @@ pub(crate) fn run(action: PluginAction, printer: Printer) -> Result<()> {
             yes,
             no_setup,
         } => update(&id, to, prune, yes, !no_setup, printer),
+        PluginAction::Setup { id } => setup(&id, printer),
         PluginAction::Remove {
             id,
             purge,
@@ -1096,6 +1097,86 @@ fn update(
             "configured": report.configured,
             "missing": report.missing,
             "started": started,
+        }),
+    )
+}
+
+/// 已安装插件重跑安装向导
+///
+/// 与 `install` 的区别：产物已就位，只确认待授权能力并按 `setup` 声明逐项
+/// 询问配置。启用状态沿用原样（未启用的不会被顺手拉起），只在原本运行中
+/// 时重启一次，让新配置生效。装载了 `choicesFrom` 的字段同样走服务器枚举。
+fn setup(id: &str, printer: Printer) -> Result<()> {
+    let id = parse_id(id)?;
+    let service = open()?;
+    let record = service.record(&id)?;
+    let lang = printer.lang();
+    let declares_setup = service
+        .descriptor(&id)
+        .is_ok_and(|descriptor| descriptor.setup.is_some());
+    if !declares_setup {
+        return Err(AppDiagnostic::usage(
+            crate::i18n::pick(
+                lang,
+                format!("{id} 没有声明安装向导配置，无需运行 setup"),
+                format!("{id} declares no setup fields, nothing to configure"),
+            ),
+            None,
+        )
+        .into());
+    }
+    // 只在原本运行中时重启：`setup` 是改配置，不是改变启用状态。
+    let was_running = service
+        .status(&id)
+        .is_ok_and(|status| status.session.is_some());
+    let pending = pending_of(&record);
+    let (granted, remaining, report) =
+        approve_and_configure(&service, &id, &pending, true, true, printer)?;
+    let restarted = if was_running && remaining.is_empty() && report.missing.is_empty() {
+        let outcome = ensure_host().and_then(|()| {
+            service
+                .restart(&id, Duration::from_secs(10))
+                .map_err(anyhow::Error::from)
+        });
+        match outcome {
+            Ok(_) => true,
+            Err(err) => {
+                printer.print_section(&crate::i18n::pick(
+                    lang,
+                    format!(
+                        "配置已保存，但重启失败：{err:#}\n运行 `mcsup plugin logs {id}` 查看原因"
+                    ),
+                    format!(
+                        "configuration saved, but restart failed: {err:#}\nrun `mcsup plugin logs {id}` for details"
+                    ),
+                ));
+                false
+            }
+        }
+    } else {
+        false
+    };
+    print_missing(printer, &id, &report.missing);
+
+    printer.print_outcome(
+        &crate::i18n::pick(
+            lang,
+            format!(
+                "已更新 {id} 的配置{}",
+                if restarted { "（已重启）" } else { "" }
+            ),
+            format!(
+                "updated the configuration of {id}{}",
+                if restarted { " (restarted)" } else { "" }
+            ),
+        ),
+        &json!({
+            "id": id.to_string(),
+            "granted": granted.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "pending": remaining.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "configured": report.configured,
+            "missing": report.missing,
+            "restarted": restarted,
         }),
     )
 }

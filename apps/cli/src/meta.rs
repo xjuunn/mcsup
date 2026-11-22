@@ -1083,6 +1083,14 @@ pub(crate) fn plugin_update() -> &'static str {
 }
 
 #[must_use]
+pub(crate) fn plugin_setup() -> &'static str {
+    t(
+        "重跑安装向导：重新确认能力、按插件声明逐项询问配置",
+        "re-run the setup wizard: re-confirm capabilities and walk the declared fields",
+    )
+}
+
+#[must_use]
 pub(crate) fn plugin_remove() -> &'static str {
     t("卸载插件", "uninstall a plugin")
 }

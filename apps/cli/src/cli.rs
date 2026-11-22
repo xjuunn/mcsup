@@ -1092,6 +1092,9 @@ pub(crate) enum PluginAction {
         #[arg(long = "no-setup", help = crate::meta::plugin_update_no_setup_arg())]
         no_setup: bool,
     },
+    /// 重跑安装向导（按 descriptor 逐项询问配置）
+    #[command(about = crate::meta::plugin_setup())]
+    Setup { id: String },
     /// 卸载插件
     #[command(about = crate::meta::plugin_remove())]
     #[command(visible_alias = "rm")]

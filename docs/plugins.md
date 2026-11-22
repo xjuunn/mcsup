@@ -1986,6 +1986,8 @@ Windows 还需拒绝保留名（`CON`、`NUL` 等）与尾随点 / 空格。
 - 必填项没有旧值可沿用时不能回车跳过：提示后重新提问，直到填写或取消。
 - 布尔字段用「是 / 否」选择器，初始光标由当前值 / schema 默认值决定；
   密钥字段每输入一个字符显示一个 `*`（只暴露长度），内容不写进审计日志。
+- 已安装插件要重跑向导时用 `mcsup plugin setup <id>`：不必卸载重装，同样
+  逐项询问（现有值留空即沿用），沿用原启用状态，只在原本运行中时重启一次。
 
 ## 15.6 升级、回滚、卸载
 
@@ -2178,6 +2180,7 @@ mcsup plugin list [--json]
 mcsup plugin install <source> [--from|--url|--git] [--ref <tag|sha>] [--sha256 <hex>]
                               [--yes] [--no-setup] [--json]
 mcsup plugin update <id> [--to <version>] [--prune] [--yes] [--no-setup]
+mcsup plugin setup <id>                  # 已安装插件重跑安装向导（沿用现有值）
 mcsup plugin remove <id> [--purge] [--keep-secrets] [--yes]
 mcsup plugin enable <id>
 mcsup plugin disable <id> [--yes]
