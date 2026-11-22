@@ -6,6 +6,7 @@
 
 use crate::bootstrap;
 use crate::cli::{PluginAction, PluginConfigAction, PluginRevocationAction};
+use crate::commands::plugin_bindings::{BoundPlugins, StartGate};
 use crate::commands::plugin_host;
 use crate::config;
 use crate::diagnostic::AppDiagnostic;
@@ -116,6 +117,12 @@ pub(crate) fn run_host(data_dir: Option<PathBuf>, idle_timeout: u64) -> Result<(
 
 fn open() -> Result<PluginService> {
     Ok(bootstrap::open_mcsup()?.plugins)
+}
+
+/// 插件服务 + 服务器绑定编排：安装 / 启动前要看绑定服务器是否在跑
+fn open_bound() -> Result<(PluginService, BoundPlugins)> {
+    let mcsup = bootstrap::open_mcsup()?;
+    Ok((mcsup.plugins.clone(), BoundPlugins::new(&mcsup)))
 }
 
 fn parse_id(raw: &str) -> Result<PluginId> {
@@ -736,13 +743,47 @@ fn approve_and_configure(
     Ok((granted, remaining, report))
 }
 
+/// 门禁挡住启动时仍保证插件是「已启用」的期望状态
+///
+/// 绑定插件的运行与否由服务器决定：手动安装 / 启动被挡下时，插件应保持启用
+/// 但进程不跑，这样之后 `server start` 的编排才会把它算进来（那份清单只收
+/// 已启用插件）。启用失败只告警，用户仍可手动处理。
+fn ensure_enabled(service: &PluginService, id: &PluginId, printer: Printer) {
+    let already = service.list().is_ok_and(|records| {
+        records
+            .iter()
+            .any(|record| &record.id == id && record.enabled)
+    });
+    if !already && let Err(err) = service.enable(id) {
+        printer.print_warning(&format!("启用插件 {id} 失败：{err}"));
+    }
+}
+
 /// 权限齐备且必填配置无缺口时才允许自动启动
 fn should_start(report: &SetupReport, remaining: &[Capability]) -> bool {
     report.start && remaining.is_empty() && report.missing.is_empty()
 }
 
-/// 权限齐备才启动；缺权限或启动失败都只提示，不视为安装 / 升级失败
+/// 绑定服务器都没在跑时的统一提示（启动 / 重启被跳过）
+fn print_gate_note(printer: Printer, id: &PluginId, servers: &[String], zh: &str, en: &str) {
+    let lang = printer.lang();
+    let first = servers.first().map_or("", String::as_str);
+    let zh_list = servers.join("、");
+    let en_list = servers.join(", ");
+    printer.print_section(&crate::i18n::pick(
+        lang,
+        format!(
+            "{id}：绑定的服务器（{zh_list}）都没在运行，{zh}；运行 `mcsup server start {first}` 会自动拉起"
+        ),
+        format!(
+            "{id}: bound servers ({en_list}) are not running, so {en}; `mcsup server start {first}` starts it automatically"
+        ),
+    ));
+}
+
+/// 权限齐备才启动；缺权限、绑定服务器停着或启动失败都只提示，不视为安装 / 升级失败
 fn start_if_ready(
+    bound: &BoundPlugins,
     service: &PluginService,
     id: &PluginId,
     remaining: &[Capability],
@@ -750,6 +791,11 @@ fn start_if_ready(
     failure_zh: &str,
     failure_en: &str,
 ) -> bool {
+    if let StartGate::AllStopped { servers } = bound.enforce_gate(id, printer) {
+        ensure_enabled(service, id, printer);
+        print_gate_note(printer, id, &servers, "已跳过启动", "the start was skipped");
+        return false;
+    }
     if !remaining.is_empty() {
         printer.print_section(&crate::i18n::pick(
             printer.lang(),
@@ -807,7 +853,7 @@ fn install(
 ) -> Result<()> {
     let origin = resolve_origin(source, from, url, git, reference)?;
     let expected = sha256.map(|hex| Checksum::new(ChecksumAlgorithm::Sha256, hex));
-    let service = open()?;
+    let (service, bound) = open_bound()?;
     // 安装前确认（docs §15.5）：`--yes` 或非交互模式直接执行。待确认能力
     // 在安装后展示，grant 仍需显式确认，这里只确认「装」这个动作本身。
     if printer.is_human() && !yes {
@@ -850,6 +896,7 @@ fn install(
     // 「装完不启动」行为。必填配置仍缺失时也不启动，避免带着坏配置反复崩溃。
     let started = if should_start(&report, &remaining) {
         start_if_ready(
+            &bound,
             &service,
             &record.id,
             &remaining,
@@ -858,6 +905,9 @@ fn install(
             "configuration saved, but start failed",
         )
     } else {
+        // 升级时 service 会恢复「原本在跑」的状态；绑定服务器都停着的话
+        // 这里把它收掉，别留下空转的桥。
+        bound.enforce_gate(&record.id, printer);
         false
     };
     print_missing(printer, &record.id, &report.missing);
@@ -947,7 +997,7 @@ fn update(
     printer: Printer,
 ) -> Result<()> {
     let id = parse_id(id)?;
-    let service = open()?;
+    let (service, bound) = open_bound()?;
     let spinner_text = if to.is_some() {
         "正在切换插件版本…"
     } else {
@@ -1006,6 +1056,7 @@ fn update(
     // 必填配置仍缺失时同样跳过重启，先让用户补齐再手动启动。
     let started = if record.enabled && remaining.is_empty() && report.missing.is_empty() {
         start_if_ready(
+            &bound,
             &service,
             &updated_id,
             &remaining,
@@ -1014,6 +1065,8 @@ fn update(
             "updated, but restart failed",
         )
     } else {
+        // 升级可能把「原本在跑」的进程恢复起来；绑定服务器停着就收掉
+        bound.enforce_gate(&updated_id, printer);
         false
     };
     print_missing(printer, &updated_id, &report.missing);
@@ -1050,7 +1103,7 @@ fn update(
 /// 时重启一次，让新配置生效。装载了 `choicesFrom` 的字段同样走服务器枚举。
 fn setup(id: &str, printer: Printer) -> Result<()> {
     let id = parse_id(id)?;
-    let service = open()?;
+    let (service, bound) = open_bound()?;
     let record = service.record(&id)?;
     let lang = printer.lang();
     let declares_setup = service
@@ -1074,7 +1127,23 @@ fn setup(id: &str, printer: Printer) -> Result<()> {
     let pending = pending_of(&record);
     let (granted, remaining, report) =
         approve_and_configure(&service, &id, &pending, true, true, printer)?;
-    let restarted = if was_running && remaining.is_empty() && report.missing.is_empty() {
+    // 配置改完后才判定：绑定服务器都停着时收掉残留进程并跳过重启，避免
+    // 用户在向导里改配置的这段时间桥还在空转。
+    let gate = bound.enforce_gate(&id, printer);
+    if was_running && let StartGate::AllStopped { servers } = &gate {
+        print_gate_note(
+            printer,
+            &id,
+            servers,
+            "已跳过重启",
+            "the restart was skipped",
+        );
+    }
+    let restarted = if was_running
+        && !gate.is_blocked()
+        && remaining.is_empty()
+        && report.missing.is_empty()
+    {
         let outcome = plugin_host::ensure().and_then(|()| {
             service
                 .restart(&id, Duration::from_secs(10))
@@ -1204,8 +1273,29 @@ fn set_enabled(id: &str, enable: bool, printer: Printer) -> Result<()> {
 
 fn start(id: &str, printer: Printer) -> Result<()> {
     let id = parse_id(id)?;
+    let (service, bound) = open_bound()?;
+    // 绑定服务器都没在跑：不拉起（并收掉残留），启动服务器时会自动起
+    if let StartGate::AllStopped { servers } = bound.enforce_gate(&id, printer) {
+        print_gate_note(
+            printer,
+            &id,
+            &servers,
+            "已跳过启动",
+            "the start was skipped",
+        );
+        if !printer.is_human() {
+            printer.print_outcome(
+                "",
+                &json!({
+                    "id": id.to_string(),
+                    "started": false,
+                    "bound_servers": servers,
+                }),
+            )?;
+        }
+        return Ok(());
+    }
     plugin_host::ensure()?;
-    let service = open()?;
     let info = service.start(&id)?;
     printer.print_outcome(
         &crate::i18n::pick(
@@ -1240,8 +1330,29 @@ fn stop(id: &str, grace: u64, printer: Printer) -> Result<()> {
 
 fn restart(id: &str, printer: Printer) -> Result<()> {
     let id = parse_id(id)?;
+    let (service, bound) = open_bound()?;
+    // 绑定服务器都没在跑：不重启（并收掉残留），等服务器启动时再拉起
+    if let StartGate::AllStopped { servers } = bound.enforce_gate(&id, printer) {
+        print_gate_note(
+            printer,
+            &id,
+            &servers,
+            "已跳过重启",
+            "the restart was skipped",
+        );
+        if !printer.is_human() {
+            printer.print_outcome(
+                "",
+                &json!({
+                    "id": id.to_string(),
+                    "restarted": false,
+                    "bound_servers": servers,
+                }),
+            )?;
+        }
+        return Ok(());
+    }
     plugin_host::ensure()?;
-    let service = open()?;
     let info = service.restart(&id, Duration::from_secs(10))?;
     printer.print_outcome(
         &crate::i18n::pick(

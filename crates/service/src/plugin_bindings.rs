@@ -48,6 +48,21 @@ impl PluginBindings {
         self.active.iter().filter(move |b| b.is_bound_to(server))
     }
 
+    /// 插件绑定的服务器：一台都没在运行则返回它们，否则 `None`
+    ///
+    /// 用于「手动启动前」的门禁：绑定插件的生命周期归服务器，绑定的服务器都
+    /// 停着时不该被 `plugin start` / `plugin install` 拉起来。判定只看传入的
+    /// 清单；调用方用 [`PluginService::binding_of`] 构造单插件清单，因此不受
+    /// 「已启用」状态影响。
+    #[must_use]
+    pub fn idle_servers(&self, id: &PluginId, running: &BTreeSet<String>) -> Option<Vec<String>> {
+        let binding = self.active.iter().find(|binding| &binding.id == id)?;
+        if binding.servers.iter().any(|name| running.contains(name)) {
+            return None;
+        }
+        Some(binding.servers.iter().cloned().collect())
+    }
+
     /// 某台服务器停止后应当停止的插件
     ///
     /// 条件：绑定了 `stopped`，且绑定的其它服务器都没有在运行。`running` 里
@@ -69,6 +84,27 @@ impl PluginBindings {
 }
 
 impl PluginService {
+    /// 单个插件的绑定清单，**不看启用 / 待授权状态**
+    ///
+    /// 手动启动路径（`plugin install` / `start` 等）会先把未启用的插件启用再
+    /// 拉起，所以门禁不能只读 [`Self::bindings`]：那份清单故意排除了未启用
+    /// 的插件，会让全新安装的插件在「绑定服务器已停」时漏过门禁。
+    ///
+    /// # Errors
+    ///
+    /// 记录不存在、descriptor 非法或配置读取失败时返回 [`PluginError`]
+    pub fn binding_of(&self, id: &PluginId) -> Result<PluginBindings, PluginError> {
+        let servers = self.bound_servers(id)?;
+        let mut out = PluginBindings::default();
+        if !servers.is_empty() {
+            out.active.push(PluginBinding {
+                id: id.clone(),
+                servers,
+            });
+        }
+        Ok(out)
+    }
+
     /// 插件绑定到哪些服务器
     ///
     /// 服务器级插件（manifest `scope: server`）天然只绑定它自己的服务器；
@@ -196,5 +232,23 @@ mod tests {
             .map(|b| b.id.to_string())
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["chat-bridge"]);
+    }
+
+    #[test]
+    fn idle_servers_reports_bindings_without_a_running_server() {
+        let bindings = PluginBindings {
+            active: vec![binding("chat-bridge", &["test1", "test2"])],
+            skipped: Vec::new(),
+        };
+        // 两台都没在跑：插件不该被手动拉起
+        assert_eq!(
+            bindings.idle_servers(&id("chat-bridge"), &BTreeSet::new()),
+            Some(vec!["test1".to_owned(), "test2".to_owned()])
+        );
+        // 任一台在跑就允许启动
+        let running: BTreeSet<String> = ["test2".to_owned()].into();
+        assert_eq!(bindings.idle_servers(&id("chat-bridge"), &running), None);
+        // 没有绑定的插件不受服务器生命周期约束
+        assert_eq!(bindings.idle_servers(&id("other"), &BTreeSet::new()), None);
     }
 }

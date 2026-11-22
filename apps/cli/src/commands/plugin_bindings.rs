@@ -16,6 +16,24 @@ use std::time::Duration;
 /// 停止插件的宽限：网络类插件需要时间收尾
 const STOP_GRACE: Duration = Duration::from_secs(10);
 
+/// 手动启动前对绑定插件的门禁
+///
+/// 绑定插件的生命周期归服务器：`plugin start` / `plugin install` 这类命令
+/// 不能把绑定的服务器都停着的插件拉起来，否则服务器没跑、桥却空转。
+pub(crate) enum StartGate {
+    /// 没有绑定，或至少有一台绑定服务器在运行
+    Allowed,
+    /// 有绑定，但绑定服务器一台都没在运行
+    AllStopped { servers: Vec<String> },
+}
+
+impl StartGate {
+    /// 是不是「绑定服务器都停着」
+    pub(crate) fn is_blocked(&self) -> bool {
+        matches!(self, Self::AllStopped { .. })
+    }
+}
+
 /// 与一组插件绑定的服务器生命周期联动
 ///
 /// 由 `server start / stop / restart` 在组合根处创建。绑定关系每次调用都
@@ -105,6 +123,39 @@ impl BoundPlugins {
         }
     }
 
+    /// 启动门禁：判定插件是否该运行，并收掉「绑定服务器都停着却还在跑」的残留
+    ///
+    /// 绑定关系按插件单独读取（[`PluginService::binding_of`]），不受启用状态
+    /// 影响：全新安装的插件在向导结束前还没启用，但门禁仍要看得出它绑定到
+    /// 哪台服务器。读不出绑定清单时放行：宁可让用户手动启动，也不因为一次
+    /// 诊断失败挡住他。
+    pub(crate) fn enforce_gate(&self, id: &PluginId, printer: Printer) -> StartGate {
+        let bindings = match self.plugins.binding_of(id) {
+            Ok(bindings) => bindings,
+            // 插件根本不存在：让后续命令自己报 NotFound，不额外吓人
+            Err(mcsup::service::PluginError::NotFound(_)) => return StartGate::Allowed,
+            Err(err) => {
+                printer.print_warning(&format!(
+                    "读取插件 {id} 的服务器绑定失败，跳过启停门禁：{err}"
+                ));
+                return StartGate::Allowed;
+            }
+        };
+        let bound = bindings
+            .active
+            .first()
+            .map(|binding| binding.servers.clone())
+            .unwrap_or_default();
+        let Some(servers) = bindings.idle_servers(id, &self.alive_servers(&bound)) else {
+            return StartGate::Allowed;
+        };
+        // 残留进程（例如升级时 service 恢复了运行状态）也要对齐：不留空转的桥
+        if self.is_running(id) {
+            self.stop_one(id, printer);
+        }
+        StartGate::AllStopped { servers }
+    }
+
     /// 读取绑定清单；读不出来只告警，返回 `None` 让调用方跳过编排
     ///
     /// `skipped` 里的插件（待授权、descriptor 或配置损坏）不参与编排，
@@ -129,20 +180,29 @@ impl BoundPlugins {
     /// 查询失败按「仍在运行」处理：宁可让插件多跑一会儿，也不在服务器还活着
     /// 时把它的桥收掉。
     fn running_servers(&self, bindings: &PluginBindings, exclude: &str) -> BTreeSet<String> {
-        let mut names = BTreeSet::new();
-        for binding in &bindings.active {
-            for name in &binding.servers {
-                if name != exclude {
-                    names.insert(name.clone());
-                }
-            }
-        }
-        names.retain(|name| match self.lifecycle.status(name) {
-            Ok(Some(status)) => status.status.is_alive(),
-            Ok(None) => false,
-            Err(_) => true,
-        });
+        let names = bindings
+            .active
+            .iter()
+            .flat_map(|binding| binding.servers.iter())
+            .filter(|name| name.as_str() != exclude)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        self.alive_servers(&names)
+    }
+
+    /// 从候选服务器里筛出真正在运行的
+    ///
+    /// 查询失败同样按「仍在运行」处理，避免把还活着的服务器的桥收掉。
+    fn alive_servers(&self, names: &BTreeSet<String>) -> BTreeSet<String> {
         names
+            .iter()
+            .filter(|name| match self.lifecycle.status(name) {
+                Ok(Some(status)) => status.status.is_alive(),
+                Ok(None) => false,
+                Err(_) => true,
+            })
+            .cloned()
+            .collect()
     }
 
     fn is_running(&self, id: &PluginId) -> bool {
