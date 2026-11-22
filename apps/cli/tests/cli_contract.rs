@@ -1671,6 +1671,82 @@ fn plugin_config_and_block_flags_are_visible_and_enforced() {
     assert_eq!(rows[0]["quarantined"], false);
 }
 
+/// 用 `--file` 写 `demo.tags`，返回（退出码，写后读回的值）。
+fn set_tags_from_file(home: &Path, file: &str) -> (Option<i32>, serde_json::Value) {
+    let set = run(
+        home,
+        &[
+            "--output", "json", "plugin", "config", "set", "demo", "tags", "--file", file,
+        ],
+    );
+    let get = run(
+        home,
+        &[
+            "--output", "json", "plugin", "config", "get", "demo", "tags",
+        ],
+    );
+    let value = serde_json::from_slice::<serde_json::Value>(&get.stdout)
+        .map_or(serde_json::Value::Null, |value| value["value"].clone());
+    (set.status.code(), value)
+}
+
+/// `config set --file`：Windows PowerShell 会把 JSON 数组的内层引号吃掉
+/// （`["log"]` 传进去变成 `[log]`），从文件读值是跨 shell 都可靠的入口。
+#[test]
+fn plugin_config_set_reads_json_from_file() {
+    let home = temp_home();
+    let artifact = home.path().join("array-plugin");
+    write_plugin_artifact_with_array(&artifact);
+    let out = run(
+        home.path(),
+        &[
+            "--output",
+            "json",
+            "plugin",
+            "install",
+            "--from",
+            artifact.to_str().expect("utf-8 path"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    let path = home.path().join("tags.json");
+    let file = path.to_str().expect("utf-8 path").to_owned();
+    std::fs::write(&path, r#"["a","b"]"#).expect("write json");
+
+    let (code, value) = set_tags_from_file(home.path(), file.as_str());
+    assert_eq!(code, Some(0));
+    assert_eq!(value, serde_json::json!(["a", "b"]));
+
+    // 记事本 / PowerShell 5.1 存的 UTF-8 带 BOM，也要能读
+    std::fs::write(&path, "\u{feff}[\"c\"]").expect("write bom json");
+    let (code, value) = set_tags_from_file(home.path(), file.as_str());
+    assert_eq!(code, Some(0));
+    assert_eq!(value, serde_json::json!(["c"]));
+
+    // 文件里不是合法 JSON：用法错误 2，且不覆盖已有值
+    std::fs::write(&path, "[a,b]").expect("write bad json");
+    let (code, value) = set_tags_from_file(home.path(), file.as_str());
+    assert_eq!(code, Some(2));
+    assert_eq!(value, serde_json::json!(["c"]));
+
+    // 与位置参数互斥：clap 直接拒绝
+    let out = run(
+        home.path(),
+        &[
+            "plugin",
+            "config",
+            "set",
+            "demo",
+            "tags",
+            "x",
+            "--file",
+            file.as_str(),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+}
+
 /// `plugin revocations`：导入 → 查看 → 撤销命中阻止启用
 #[test]
 fn plugin_revocations_import_and_block_enable() {
@@ -1791,6 +1867,23 @@ fn write_plugin_artifact(root: &Path) {
         std::fs::set_permissions(root.join(entry_rel), std::fs::Permissions::from_mode(0o755))
             .expect("chmod entry");
     }
+}
+
+/// 在基础产物上加数组字段 `tags`：`--file` 用例需要真正写入数组。
+fn write_plugin_artifact_with_array(root: &Path) {
+    write_plugin_artifact(root);
+    std::fs::write(
+        root.join("descriptor.json"),
+        r#"{"schema":1,"plugin_id":"demo","api":1,
+            "config":{"type":"object","additionalProperties":false,
+                      "properties":{
+                        "interval":{"type":"integer","minimum":5,"default":60},
+                        "tags":{"type":"array","items":{"type":"string"},"default":[]},
+                        "token":{"type":"string","x-mcsup-secret":true}}},
+            "ops":[{"id":"ping","kind":"query","title":"Ping","risk":"read",
+                    "input":{"type":"object"},"output":{"type":"object"}}]}"#,
+    )
+    .expect("write descriptor with array");
 }
 
 /// 在基础产物上加 `setup` 声明：必填的密钥字段 `token`

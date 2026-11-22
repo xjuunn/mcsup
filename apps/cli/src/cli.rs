@@ -1247,6 +1247,13 @@ pub(crate) enum PluginConfigAction {
         key: String,
         #[arg(help = crate::meta::plugin_value_arg())]
         value: Option<String>,
+        #[arg(
+            long,
+            value_name = "PATH",
+            conflicts_with_all = ["value", "secret"],
+            help = crate::meta::plugin_file_arg()
+        )]
+        file: Option<PathBuf>,
         #[arg(long, help = crate::meta::plugin_secret_arg())]
         secret: bool,
     },

@@ -1563,10 +1563,11 @@ fn config_cmd(action: &PluginConfigAction, printer: Printer) -> Result<()> {
             id,
             key,
             value,
+            file,
             secret,
         } => {
             let id = parse_id(id)?;
-            let value = config_value(value.as_deref(), *secret)?;
+            let value = config_value(value.as_deref(), file.as_deref(), *secret)?;
             let service = open()?;
             // 点号路径走深度合并，只改目标叶子；单段键沿用顶层写入。
             // 否则 `config set <id> qq.appId 1` 会被当成字面键 `qq.appId`，
@@ -1625,10 +1626,11 @@ fn hint_required_siblings(
 
 /// 解析 `config set` 的值
 ///
+/// `--file` 时按严格 JSON 解析，报错直接抛给用户（文件里写错比静默存成字符串好）；
 /// `--secret` 时一律按字符串处理（从 stdin 读时只去掉行尾换行），避免把密钥
 /// 当作 JSON 解析失败后打出一段无意义提示。普通值先按 JSON 解析，失败才按
 /// 字符串，保证整数 / 布尔 / 数组可以直接写。
-fn config_value(raw: Option<&str>, secret: bool) -> Result<Value> {
+fn config_value(raw: Option<&str>, file: Option<&Path>, secret: bool) -> Result<Value> {
     if secret {
         let text = if let Some(text) = raw {
             text.to_owned()
@@ -1643,8 +1645,23 @@ fn config_value(raw: Option<&str>, secret: bool) -> Result<Value> {
             text.trim_end_matches(['\r', '\n']).to_owned(),
         ));
     }
+    if let Some(path) = file {
+        let text = std::fs::read_to_string(path).map_err(|err| {
+            AppDiagnostic::usage(format!("读取 {} 失败：{err}", path.display()), None)
+        })?;
+        // Windows 记事本 / PowerShell 5.1 的 UTF-8 会带 BOM，serde_json 认不出来
+        let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+        let value = serde_json::from_str(text).map_err(|err| {
+            AppDiagnostic::usage(format!("{} 不是合法的 JSON：{err}", path.display()), None)
+        })?;
+        return Ok(value);
+    }
     let Some(raw) = raw else {
-        return Err(AppDiagnostic::usage("缺少配置值；或用 --secret 从 stdin 读取", None).into());
+        return Err(AppDiagnostic::usage(
+            "缺少配置值；或用 --secret 从 stdin 读取，或用 --file 从文件读取 JSON",
+            None,
+        )
+        .into());
     };
     Ok(serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_owned())))
 }

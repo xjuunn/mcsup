@@ -1376,6 +1376,14 @@ pub(crate) fn plugin_value_arg() -> &'static str {
 }
 
 #[must_use]
+pub(crate) fn plugin_file_arg() -> &'static str {
+    t(
+        "从文件读取 JSON 值；数组和对象在 PowerShell 下会丢掉内层引号，用这个",
+        "read the value as JSON from a file; use this for arrays and objects in PowerShell",
+    )
+}
+
+#[must_use]
 pub(crate) fn plugin_secret_arg() -> &'static str {
     t("按密钥处理（输入不回显）", "treat as a secret (no echo)")
 }

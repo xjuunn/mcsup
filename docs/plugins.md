@@ -2193,7 +2193,7 @@ mcsup plugin status <id> [--json]
 mcsup plugin ops <id> [--json]
 mcsup plugin call <id> <op> [--input <json|@file|->] [--json] [--stream]
 mcsup plugin config get <id> [key] [--json]
-mcsup plugin config set <id> <key> [value] [--secret]
+mcsup plugin config set <id> <key> [value] [--secret | --file <path>]
 mcsup plugin grant <id> <capability>
 mcsup plugin revoke <id> <capability>
 mcsup plugin block <id>
@@ -2221,6 +2221,12 @@ mcsup __plugin-host --data-dir <path> [--idle-timeout <secs>]   # 隐藏
   按深度合并只改目标叶子，读取定位到对应值；单段键仍按顶层写入。
   同组必填字段（如 `qq.appId` 与 `qq.clientSecret`）必须**一次写完**：单写
   一个会因缺另一个被整份校验拒绝。点号路径适合在必填项已齐后修单个值。
+- `config set --file <path>` 从文件读 JSON 值（自动剥掉 UTF-8 BOM），与位置
+  参数、`--secret` 互斥。数组与对象在 Windows PowerShell 5.1 下送不到程序里
+  （`["log"]` 会被拆成 `[log]`，`--%`、`cmd /c`、`Start-Process` 都不行），
+  写文件再传是最稳的：
+  `mcsup plugin config set chat-bridge platforms --file platforms.json`。
+  文件不是合法 JSON 时以用法错误 2 退出，不写配置。
 
 ## 18.2 输出示例
 
