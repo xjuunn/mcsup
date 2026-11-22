@@ -35,13 +35,19 @@ pub(crate) fn ensure() -> Result<()> {
         return Ok(());
     }
     let exe = std::env::current_exe().context("定位 mcsup 可执行文件")?;
-    std::process::Command::new(exe)
+    let mut command = std::process::Command::new(exe);
+    command
         .arg("__plugin-host")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .context("拉起插件宿主")?;
+        .stderr(std::process::Stdio::null());
+    // 宿主是常驻进程，不能挂在拉起它的这个 CLI 进程的终端上。终端销毁
+    //（包括无窗口的伪控制台）后，宿主手里会留一个死掉的控制台句柄，之后
+    // 它再拉起 `cmd.exe`（`.cmd` 入口）就会在控制台初始化阶段失败，退出码
+    // `0xC0000142`（`STATUS_DLL_INIT_FAILED`），且一行输出都没有。与远端
+    // agent 同一口径：脱离终端 + 独立进程组。
+    crate::daemon::detach(&mut command);
+    command.spawn().context("拉起插件宿主")?;
     let attempts = READY_TIMEOUT.as_millis() / READY_POLL.as_millis();
     for _ in 0..attempts {
         if client.is_available() {

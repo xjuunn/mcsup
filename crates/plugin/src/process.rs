@@ -158,6 +158,46 @@ fn command_line(program: &Path, args: &[String]) -> (PathBuf, Vec<String>) {
     (program.to_path_buf(), args.to_vec())
 }
 
+/// 让插件进程拿到自己的控制台（Windows）
+///
+/// Windows 的控制台是继承来的：进程被谁拉起，就继承谁的控制台。宿主是常驻
+/// 进程，拉起它的 CLI 可能早就退出，无窗口的伪控制台随之销毁，宿主手里就
+/// 留着一个已经死掉的控制台句柄。此时再创建控制台程序（`.cmd` 入口要经
+/// `cmd.exe`），子进程会在控制台初始化阶段直接失败，退出码 `0xC0000142`
+/// （`STATUS_DLL_INIT_FAILED`），而且一行输出都没有——排查起来极难对上号。
+///
+/// `CREATE_NO_WINDOW` 给子进程一个属于自己、且没有窗口的控制台：既不再依赖
+/// 宿主从上一代继承来的状态，也不会弹出黑窗。原生可执行文件入口同样安全，
+/// 它们的 stdin / stdout / stderr 本来就走 NUL 与管道。
+#[cfg(windows)]
+fn own_console(command: &mut Command) {
+    use std::os::windows::process::CommandExt as _;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn own_console(_command: &mut Command) {}
+
+/// 常见 NTSTATUS 退出码 → 符号名与成因
+///
+/// 插件启动即死时 `ExitStatus` 只给一串十六进制；这些码的成因高度固定，
+/// 补上名字就能省掉一次现场排查。
+#[must_use]
+pub(crate) fn hint_for_code(code: i32) -> Option<&'static str> {
+    let hint = match code.cast_unsigned() {
+        0xC000_0005 => "STATUS_ACCESS_VIOLATION：进程启动即崩溃",
+        0xC000_001D => "STATUS_ILLEGAL_INSTRUCTION：指令集不受支持",
+        0xC000_007B => "STATUS_INVALID_IMAGE_FORMAT：可执行文件架构或位数不对",
+        0xC000_0135 => "STATUS_DLL_NOT_FOUND：缺依赖 DLL",
+        0xC000_0139 => "STATUS_ENTRYPOINT_NOT_FOUND：依赖 DLL 版本不匹配",
+        0xC000_0142 => "STATUS_DLL_INIT_FAILED：进程初始化失败（控制台/桌面堆不可用）",
+        0xC000_0409 => "STATUS_STACK_BUFFER_OVERRUN：进程主动中止（abort）",
+        _ => return None,
+    };
+    Some(hint)
+}
+
 fn check_executable(path: &Path) -> Result<(), HostError> {
     let metadata = std::fs::metadata(path).map_err(|err| {
         HostError::not_found(format!(
@@ -215,20 +255,21 @@ impl SpawnedPlugin {
             })?;
         }
         let (program, args) = command_line(&plan.program, &plan.args);
-        let mut child = Command::new(&program)
+        let mut command = Command::new(&program);
+        command
             .args(&args)
             .current_dir(&plan.cwd)
             .envs(plan.env.iter().map(|(key, value)| (key, value)))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|err| {
-                HostError::new(
-                    port::plugin::ErrorCode::Crashed,
-                    format!("failed to spawn {}: {err}", plan.program.display()),
-                )
-            })?;
+            .stderr(Stdio::piped());
+        own_console(&mut command);
+        let mut child = command.spawn().map_err(|err| {
+            HostError::new(
+                port::plugin::ErrorCode::Crashed,
+                format!("failed to spawn {}: {err}", plan.program.display()),
+            )
+        })?;
         let pid = child.id();
         // 进程树清理是安全兜底：Job Object 建不出来时插件仍可运行，降级为
         // 只杀直接子进程（与 Unix 平台行为一致）。
@@ -644,6 +685,42 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(text.contains("hello-from-plugin"), "log: {text}");
+    }
+
+    /// 同一个宿主进程里连续拉起插件：Windows 上第二次可能因为「继承来的
+    /// 控制台已经死掉」而 `0xC0000142`，这里逐次断言能正常退出。
+    #[cfg(windows)]
+    #[test]
+    fn script_plugin_spawns_repeatedly_from_one_host() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("run.cmd");
+        std::fs::write(&script, "@echo off\r\nexit /b 0\r\n").expect("script");
+        for attempt in 0..3 {
+            let mut plan = plan();
+            plan.program = script.clone();
+            plan.cwd = dir.path().to_path_buf();
+            plan.log_file = dir.path().join("plugin.log");
+            let mut spawned = SpawnedPlugin::spawn(&plan)
+                .unwrap_or_else(|err| panic!("spawn #{attempt} failed: {err}"));
+            assert!(
+                spawned.wait_timeout(Duration::from_secs(10)),
+                "spawn #{attempt} did not exit"
+            );
+        }
+    }
+
+    #[test]
+    fn known_exit_codes_carry_a_hint() {
+        assert!(
+            hint_for_code(0xC000_0142_u32.cast_signed())
+                .is_some_and(|hint| hint.contains("STATUS_DLL_INIT_FAILED"))
+        );
+        assert!(
+            hint_for_code(0xC000_0135_u32.cast_signed())
+                .is_some_and(|hint| hint.contains("STATUS_DLL_NOT_FOUND"))
+        );
+        assert_eq!(hint_for_code(0), None);
+        assert_eq!(hint_for_code(1), None);
     }
 
     #[test]

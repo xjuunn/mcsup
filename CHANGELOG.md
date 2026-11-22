@@ -160,3 +160,11 @@
   `ctx.contract.call`；成功流不再多发空的 `chunk` 结束帧。
 - `url` 升到 2.5.9（2.5.8 的 `Url::origin()` 在嵌套 `blob:` URL 上栈溢出，
   RUSTSEC-2026-0592）。
+- 插件宿主不再继承拉起它的那个 CLI 的控制台（Windows 上脱离终端 + 新进程组），
+  插件进程也自取一个无窗口控制台（`CREATE_NO_WINDOW`）。控制台是继承来的：
+  拉起宿主的终端（含无窗口的伪控制台）销毁后，常驻宿主手里留着一个死掉的
+  控制台句柄，此后它再拉起 `cmd.exe`（`.cmd` 入口）会在控制台初始化阶段直接
+  失败，退出码 `0xC0000142`（`STATUS_DLL_INIT_FAILED`），且插件日志一行都不长。
+- 插件启动失败的原因文本补上 NTSTATUS 符号名与成因（`STATUS_DLL_INIT_FAILED`、
+  `STATUS_DLL_NOT_FOUND`、`STATUS_INVALID_IMAGE_FORMAT`、`STATUS_STACK_BUFFER_OVERRUN`
+  等），不再只有一串十六进制退出码。

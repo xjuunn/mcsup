@@ -521,12 +521,19 @@ impl PluginHost {
                 // 死亡（缺文件、权限不足、启动 panic），而 kill() 会把真实
                 // 退出状态覆盖成我们自己发的 SIGKILL。
                 let before = process.try_wait().ok().flatten();
+                let describe = |status: std::process::ExitStatus| match status
+                    .code()
+                    .and_then(crate::process::hint_for_code)
+                {
+                    Some(hint) => format!("{status}, {hint}"),
+                    None => status.to_string(),
+                };
                 let exit = if let Some(status) = before {
-                    format!("exited on its own ({status})")
+                    format!("exited on its own ({})", describe(status))
                 } else {
                     process.kill();
                     match process.try_wait().ok().flatten() {
-                        Some(status) => format!("was still running, killed ({status})"),
+                        Some(status) => format!("was still running, killed ({})", describe(status)),
                         None => "was still running, killed".to_owned(),
                     }
                 };
