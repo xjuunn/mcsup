@@ -746,6 +746,13 @@ fn proto_ctl_001_control_channel_lists_calls_and_shuts_down() {
     let serve = std::thread::spawn(move || server.serve(control));
 
     let client = ControlClient::new(&data_dir);
+    // 构建标识要能取回，且与本进程是同一份构建：CLI 靠它判断宿主是否过期
+    let identity = client.identify().expect("control identity");
+    assert_eq!(identity.version(), env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        identity.staleness(&plugin::BuildFingerprint::current()),
+        plugin::HostStaleness::Current
+    );
     let list = client.list().expect("list");
     let items = list["items"].as_array().expect("items array");
     assert_eq!(items.len(), 1);

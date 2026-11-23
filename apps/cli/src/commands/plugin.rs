@@ -735,7 +735,7 @@ fn set_path_at(map: &mut Map<String, Value>, segments: &[&str], value: Value) {
 /// `activate_version` 都是这个次序），这里再 `restart` 会多出一整轮停机与
 /// 重启审计事件——对启动慢的桥是实打实的额外中断。所以只在**没有会话**时
 /// 启动。
-fn activate(service: &PluginService, id: &PluginId) -> Result<()> {
+fn activate(service: &PluginService, id: &PluginId, printer: Printer) -> Result<()> {
     let enabled = service
         .list()?
         .iter()
@@ -743,7 +743,7 @@ fn activate(service: &PluginService, id: &PluginId) -> Result<()> {
     if !enabled {
         service.enable(id)?;
     }
-    plugin_host::ensure()?;
+    plugin_host::ensure(printer)?;
     if service.status(id)?.session.is_none() {
         service.start(id)?;
     }
@@ -888,7 +888,7 @@ fn start_if_ready(
         ));
         return false;
     }
-    match activate(service, id) {
+    match activate(service, id, printer) {
         Ok(()) => true,
         Err(err) => {
             printer.print_section(&crate::i18n::pick(
@@ -1238,7 +1238,7 @@ fn setup(id: &str, printer: Printer) -> Result<()> {
         && remaining.is_empty()
         && report.missing.is_empty()
     {
-        let outcome = plugin_host::ensure().and_then(|()| {
+        let outcome = plugin_host::ensure(printer).and_then(|()| {
             service
                 .restart(&id, Duration::from_secs(10))
                 .map_err(anyhow::Error::from)
@@ -1395,7 +1395,7 @@ fn start(id: &str, printer: Printer) -> Result<()> {
         }
         return Ok(());
     }
-    plugin_host::ensure()?;
+    plugin_host::ensure(printer)?;
     let info = service.start(&id)?;
     printer.print_outcome(
         &crate::i18n::pick(
@@ -1472,7 +1472,7 @@ fn restart(id: &str, printer: Printer) -> Result<()> {
         }
         return Ok(());
     }
-    plugin_host::ensure()?;
+    plugin_host::ensure(printer)?;
     let info = service.restart(&id, Duration::from_secs(10))?;
     printer.print_outcome(
         &crate::i18n::pick(
@@ -1627,7 +1627,7 @@ fn call(
     let printer = json_printer(printer, json);
     let id = parse_id(id, printer.lang())?;
     let input = read_input(input)?;
-    plugin_host::ensure()?;
+    plugin_host::ensure(printer)?;
     let service = open()?;
     // 风险确认：mutating / destructive 的 op 在动手前问一次。`--yes` 跳过
     // 提问；JSON 模式没有交互终端，直接执行（调用方是脚本，结果可读回）。
@@ -2089,7 +2089,7 @@ fn revoke(id: &str, capability: &str, printer: Printer) -> Result<()> {
 
 fn logs(id: &str, follow: bool, tail: usize, printer: Printer) -> Result<()> {
     let id = parse_id(id, printer.lang())?;
-    plugin_host::ensure()?;
+    plugin_host::ensure(printer)?;
     let service = open()?;
     let mut offset: Option<u64> = None;
     loop {
