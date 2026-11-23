@@ -1714,6 +1714,144 @@ fn plugin_config_and_block_flags_are_visible_and_enforced() {
     assert_eq!(rows[0]["quarantined"], false);
 }
 
+/// 卸载默认连配置与数据一起删：重装后读到的是 schema 默认值，不是上一份配置
+///
+/// 用「重装后读配置」而不是直接看目录，是为了不把数据目录布局写进 CLI 契约。
+#[test]
+fn plugin_remove_deletes_configuration_and_data() {
+    let home = temp_home();
+    let artifact = home.path().join("remove-plugin");
+    write_plugin_artifact(&artifact);
+    let from = artifact.to_str().expect("utf-8 path");
+    let out = run(
+        home.path(),
+        &["--output", "json", "plugin", "install", "--from", from],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let out = run(
+        home.path(),
+        &[
+            "--output", "json", "plugin", "config", "set", "demo", "interval", "30",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    let out = run(
+        home.path(),
+        &["--output", "json", "plugin", "remove", "demo", "--yes"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let removed: serde_json::Value = serde_json::from_slice(&out.stdout).expect("remove 输出对象");
+    assert_eq!(removed["data_kept"], false);
+    assert_eq!(removed["secrets_kept"], false);
+
+    let out = run(home.path(), &["--output", "json", "plugin", "list"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let rows: serde_json::Value = serde_json::from_slice(&out.stdout).expect("list 输出数组");
+    assert_eq!(rows.as_array().map(Vec::len), Some(0), "{rows}");
+
+    let out = run(
+        home.path(),
+        &["--output", "json", "plugin", "install", "--from", from],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let out = run(
+        home.path(),
+        &["--output", "json", "plugin", "config", "get", "demo"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let config: serde_json::Value = serde_json::from_slice(&out.stdout).expect("config 输出对象");
+    assert_eq!(config["revision"], 0, "{config}");
+    assert_eq!(config["values"]["interval"], 60, "{config}");
+}
+
+/// `--keep-data` 保留配置与键值：重装后沿用上一份配置
+#[test]
+fn plugin_remove_keep_data_preserves_configuration() {
+    let home = temp_home();
+    let artifact = home.path().join("keep-plugin");
+    write_plugin_artifact(&artifact);
+    let from = artifact.to_str().expect("utf-8 path");
+    let out = run(
+        home.path(),
+        &["--output", "json", "plugin", "install", "--from", from],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let out = run(
+        home.path(),
+        &[
+            "--output", "json", "plugin", "config", "set", "demo", "interval", "30",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    let out = run(
+        home.path(),
+        &[
+            "--output",
+            "json",
+            "plugin",
+            "remove",
+            "demo",
+            "--keep-data",
+            "--yes",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let removed: serde_json::Value = serde_json::from_slice(&out.stdout).expect("remove 输出对象");
+    assert_eq!(removed["data_kept"], true);
+
+    let out = run(
+        home.path(),
+        &["--output", "json", "plugin", "install", "--from", from],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let out = run(
+        home.path(),
+        &["--output", "json", "plugin", "config", "get", "demo"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let config: serde_json::Value = serde_json::from_slice(&out.stdout).expect("config 输出对象");
+    assert_eq!(config["revision"], 1, "{config}");
+    assert_eq!(config["values"]["interval"], 30, "{config}");
+}
+
+/// 无法弹出确认框（stdin 不是 TTY）又没有 `--yes`：拒绝卸载，插件原样还在
+///
+/// 卸载会删掉配置与数据，不能因为「没人回答」就默认执行。
+#[test]
+fn plugin_remove_without_yes_and_without_a_terminal_exits_2() {
+    let home = temp_home();
+    let artifact = home.path().join("no-yes-plugin");
+    write_plugin_artifact(&artifact);
+    let out = run(
+        home.path(),
+        &[
+            "--output",
+            "json",
+            "plugin",
+            "install",
+            "--from",
+            artifact.to_str().expect("utf-8 path"),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    let out = run(home.path(), &["plugin", "remove", "demo", "--lang", "en"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(stderr(&out).contains("requires --yes"), "{}", stderr(&out));
+    assert!(out.stdout.is_empty(), "失败不得输出数据");
+
+    let out = run(home.path(), &["--output", "json", "plugin", "list"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let rows: serde_json::Value = serde_json::from_slice(&out.stdout).expect("list 输出数组");
+    assert_eq!(
+        rows.as_array().map(Vec::len),
+        Some(1),
+        "插件不能被删：{rows}"
+    );
+}
+
 /// 本机门禁先于绑定门禁：拉黑 / 隔离 / 停用时 `start` 必须报出真实原因，
 /// 不能被「绑定的服务器都没在运行」盖成一次 exit 0 的成功
 #[test]

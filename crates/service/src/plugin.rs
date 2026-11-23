@@ -1444,30 +1444,26 @@ impl PluginService {
 
     /// 卸载：要求已停用且进程退出
     ///
-    /// `purge` 同时删除 `plugin-data/<id>` 与日志。默认保留数据，但**删除密钥**：
-    /// 卸载后同名插件（可能是别人发布的同名包）不该继承上一份凭据。需要重装
-    /// 后继续用时走 [`Self::remove_with`] 的 `keep_secrets`。
+    /// 默认连 `plugin-data/<id>/` 与日志一起删：卸载的语义是「这台机器上不再
+    /// 有这个名字」，留下配置与键值只会在重装时变成「上一份数据还在」的意外
+    /// 状态（配置指向的服务器、扫到的会话都过期了）。要重装后接着用时走
+    /// [`Self::remove_with`] 的 [`RemoveData::Keep`]。
     ///
     /// # Errors
     ///
     /// 仍启用或进程仍在运行时返回 [`PluginError::Conflict`]
-    pub fn remove(&self, id: &PluginId, purge: bool) -> Result<(), PluginError> {
-        self.remove_with(id, purge, false)
+    pub fn remove(&self, id: &PluginId) -> Result<(), PluginError> {
+        self.remove_with(id, RemoveData::Delete)
     }
 
-    /// 卸载，并显式指定是否保留密钥
+    /// 卸载，并显式指定数据目录的去留
     ///
-    /// `keep_secrets` 只影响默认路径；`purge` 仍会删掉整个数据目录。
+    /// 产物、记录、锁永远删；`data` 只决定 `plugin-data/<id>/` 与日志。
     ///
     /// # Errors
     ///
     /// 仍启用或进程仍在运行时返回 [`PluginError::Conflict`]
-    pub fn remove_with(
-        &self,
-        id: &PluginId,
-        purge: bool,
-        keep_secrets: bool,
-    ) -> Result<(), PluginError> {
+    pub fn remove_with(&self, id: &PluginId, data: RemoveData) -> Result<(), PluginError> {
         let record = self.record(id)?;
         if self.is_running(id) {
             return Err(PluginError::Conflict(format!(
@@ -1489,16 +1485,16 @@ impl PluginService {
         if artifact.exists() {
             std::fs::remove_dir_all(&artifact)?;
         }
-        if purge {
-            let data = self.plugin_data.join(id.as_str());
-            if data.exists() {
-                std::fs::remove_dir_all(&data)?;
+        if data.deletes_data() {
+            let dir = self.plugin_data.join(id.as_str());
+            if dir.exists() {
+                std::fs::remove_dir_all(&dir)?;
             }
             let log = self.log_root.join(format!("{id}.log"));
             if log.exists() {
                 std::fs::remove_file(&log)?;
             }
-        } else if !keep_secrets {
+        } else if !data.keeps_secrets() {
             remove_secrets(&self.plugin_data, id)?;
         }
         self.store.remove(id)?;
@@ -1508,7 +1504,7 @@ impl PluginService {
             action: "remove".to_owned(),
             capability: None,
             result: AuditResult::Allowed,
-            detail: Some(format!("purge={purge} keep_secrets={keep_secrets}")),
+            detail: Some(format!("data={data:?}")),
         });
         Ok(())
     }
@@ -1520,6 +1516,40 @@ impl PluginService {
                     .to_owned(),
             )
         })
+    }
+}
+
+/// 卸载时 `plugin-data/<id>/` 与日志的去留
+///
+/// 用枚举而不是两个独立布尔，是为了让「保留目录、却删掉目录里的密钥」这类
+/// 组合显式表达出来：密钥本来就在数据目录里，`keep_secrets` 只有在保留目录时
+/// 才说得通。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RemoveData {
+    /// 连数据目录与日志一起删（默认）
+    #[default]
+    Delete,
+    /// 保留数据目录与日志，只删产物与记录
+    Keep {
+        /// 是否连 `secrets.json` 一起留
+        ///
+        /// 默认 `false`：凭据不随同名插件重装继承。要重装后继续用同一凭据才
+        /// 置 `true`。
+        secrets: bool,
+    },
+}
+
+impl RemoveData {
+    /// 是否连 `plugin-data/<id>/` 与日志一起删
+    #[must_use]
+    pub const fn deletes_data(self) -> bool {
+        matches!(self, Self::Delete)
+    }
+
+    /// 是否保留 `secrets.json`
+    #[must_use]
+    pub const fn keeps_secrets(self) -> bool {
+        matches!(self, Self::Keep { secrets: true })
     }
 }
 
@@ -3066,7 +3096,7 @@ mod tests {
         let service = service(store);
         let id = PluginId::parse("demo").expect("id");
         assert_eq!(
-            service.remove(&id, false).expect_err("enabled").category(),
+            service.remove(&id).expect_err("enabled").category(),
             ErrorCategory::Conflict
         );
     }
@@ -3619,20 +3649,20 @@ mod tests {
         );
     }
 
-    /// 卸载的三种落点：默认删密钥、`keep_secrets` 保留、`purge` 全删
+    /// 卸载的三种落点：默认连数据一起删、`Keep` 保留目录但删密钥、`Keep { secrets: true }` 全留
     ///
-    /// 密钥是凭据：卸载后同名插件重装时不该继承。所以默认路径就要删掉
-    /// `secrets.json`，而键值 / 配置仍按「默认保留数据」的约定留着。
+    /// 密钥是凭据：同名插件（可能是别人发布的同名包）重装后不该继承。所以
+    /// 保留数据目录时，`secrets.json` 仍默认删掉。
     #[test]
-    fn remove_handles_secrets_by_mode() {
-        // (purge, keep_secrets, secrets_left, data_left)
+    fn remove_handles_data_by_mode() {
+        // (mode, secrets_left, data_left)
         let cases = [
-            (false, false, false, true),
-            (false, true, true, true),
-            (true, false, false, false),
+            (RemoveData::Delete, false, false),
+            (RemoveData::Keep { secrets: false }, false, true),
+            (RemoveData::Keep { secrets: true }, true, true),
         ];
-        for (purge, keep_secrets, secrets_left, data_left) in cases {
-            let label = format!("purge={purge} keep_secrets={keep_secrets}");
+        for (mode, secrets_left, data_left) in cases {
+            let label = format!("{mode:?}");
             let dir = tempfile::tempdir().expect("tempdir");
             let plugins_root = dir.path().join("plugins");
             let plugin_data = dir.path().join("plugin-data");
@@ -3662,9 +3692,7 @@ mod tests {
                 plugin_data.clone(),
                 log_root.clone(),
             );
-            service
-                .remove_with(&id, purge, keep_secrets)
-                .expect("remove");
+            service.remove_with(&id, mode).expect("remove");
 
             assert_eq!(
                 plugin_data.join("demo/secrets.json").exists(),
@@ -3675,6 +3703,11 @@ mod tests {
                 plugin_data.join("demo/kv/k.json").exists(),
                 data_left,
                 "{label}: kv"
+            );
+            assert_eq!(
+                plugin_data.join("demo").exists(),
+                data_left,
+                "{label}: data dir"
             );
             assert!(
                 !plugins_root.join("demo").exists(),

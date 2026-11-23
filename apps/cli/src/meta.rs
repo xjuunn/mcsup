@@ -1317,15 +1317,18 @@ pub(crate) fn plugin_update_no_setup_arg() -> &'static str {
 }
 
 #[must_use]
-pub(crate) fn plugin_purge_arg() -> &'static str {
-    t("同时删除插件数据", "also delete plugin data")
+pub(crate) fn plugin_keep_data_arg() -> &'static str {
+    t(
+        "保留插件数据（配置与键值，默认随卸载删除）",
+        "keep plugin data (configuration and key-values; deleted by default)",
+    )
 }
 
 #[must_use]
 pub(crate) fn plugin_keep_secrets_arg() -> &'static str {
     t(
-        "卸载时保留密钥文件（默认删除）",
-        "keep the secrets file on removal (deleted by default)",
+        "保留密钥文件（默认删除），隐含 --keep-data",
+        "keep the secrets file and the data directory (secrets are deleted by default)",
     )
 }
 

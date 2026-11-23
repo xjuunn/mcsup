@@ -1096,13 +1096,17 @@ pub(crate) enum PluginAction {
     #[command(about = crate::meta::plugin_setup())]
     Setup { id: String },
     /// 卸载插件
+    ///
+    /// 默认连配置与数据一起删；交互下先问一次（默认不删），无法弹出确认框时
+    /// 必须显式 `--yes`。
     #[command(about = crate::meta::plugin_remove())]
     #[command(visible_alias = "rm")]
     Remove {
         id: String,
-        #[arg(long, help = crate::meta::plugin_purge_arg())]
-        purge: bool,
-        /// 保留密钥文件（重装后继续使用同一凭据）
+        /// 保留插件数据（配置、键值与日志），只删产物与记录
+        #[arg(long, help = crate::meta::plugin_keep_data_arg())]
+        keep_data: bool,
+        /// 保留密钥文件（重装后继续使用同一凭据），隐含 `--keep-data`
         #[arg(long, help = crate::meta::plugin_keep_secrets_arg())]
         keep_secrets: bool,
     },

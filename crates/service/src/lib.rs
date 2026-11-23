@@ -76,7 +76,7 @@ pub use platform_config::{
 pub use platform_doctor::{PlatformCheck, PlatformDoctor, PlatformFinding, PlatformReport};
 pub use plugin::{
     FetchedPluginArtifact, HostApiDeps, HostApiImpl, InstallOutcome as PluginInstallOutcome,
-    PluginError, PluginService, StartOutcome, UnavailableBackup, UnavailableContent,
+    PluginError, PluginService, RemoveData, StartOutcome, UnavailableBackup, UnavailableContent,
     UnavailableFiles, UnavailableJava, UnavailableLifecycle,
 };
 pub use plugin_bindings::{PluginBinding, PluginBindings};

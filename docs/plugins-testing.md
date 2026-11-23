@@ -175,7 +175,7 @@ TypeScript 侧用 `test("PROTO-FRM-004 ...")`，由报告器解析前缀。
 | H15 统一 op 表 | `CLI-CMD-010` `WEB-REST-006` | CLI / REST / MCP 对同一 op 的输入输出一致 |
 | H16 日志不走协议 | `HOST-LOG-001` `HOST-LOG-005` | stdout 混入 JSON 不会产生帧 |
 | H17 密钥只写不读 | `API-SEC-002` `CLI-OUT-006` | 读取返回 `***`；审计无明文 |
-| H18 卸载保留数据 | `INST-UPG-008` `CLI-CMD-016` | 默认保留数据、删除密钥；`--keep-secrets` 保留密钥；`--purge` 全删 |
+| H18 卸载清数据 | `INST-UPG-007` `INST-UPG-008` `CLI-CMD-016` `CLI-CMD-027` | 默认连数据与日志一起删；`--keep-data` 保留目录但删密钥；`--keep-secrets` 连密钥一起留；无法确认时缺 `--yes` 拒绝 |
 | H19 版本独立 | `PROTO-VER-001` `SDK-GEN-008` | 四个版本常量可独立递增，互不牵连 |
 | H20 进度回显 | `CLI-UI-002` `CLI-UI-004` | 长步骤有 spinner；JSON 模式无进度 |
 | H21 插件不写前端 | `DOM-DES-018` `WEB-RENDER-001` | 产物含 `.html/.css/.js` 被拒 |
@@ -622,7 +622,7 @@ panic，只能返回错误。
 | `PROTO-CFG-004` | 乱序 revision | 丢弃过期帧 |
 | `PROTO-CFG-005` | 含密钥 | `config get` 返回 `***` |
 | `PROTO-CFG-006` | `starting` 期间变更 | 排队到 `welcome` 后 |
-| `PROTO-CFG-007` | `config.json` 落盘 | `0600`，`--purge` 时删除 |
+| `PROTO-CFG-007` | `config.json` 落盘 | `0600`，卸载（默认）时随目录删除 |
 
 ## 7.6 控制通道（`PROTO-CTL`）
 
@@ -1061,8 +1061,8 @@ panic，只能返回错误。
 | `INST-UPG-004` | 运行中升级 | 先停进程 |
 | `INST-UPG-005` | 启动失败 | 自动回滚 |
 | `INST-UPG-006` | 降级且能力减少 | 直接生效 |
-| `INST-UPG-007` | 卸载 | 保留数据、删除密钥；`--keep-secrets` 保留密钥 |
-| `INST-UPG-008` | `--purge` | 数据、日志、授权删除 |
+| `INST-UPG-007` | 卸载 | `--keep-data` 保留目录但删密钥；`--keep-secrets` 保留密钥 |
+| `INST-UPG-008` | 默认卸载 | 数据目录、日志与记录一起删除 |
 | `INST-UPG-009` | `--prune` | 更旧版本清理；当前与回滚目标保留 |
 | `INST-UPG-010` | 并发升级 | 第二个拒绝 |
 | `INST-UPG-011` | `update --to <当前版本>` | 拒绝，不改 `previous_version` |
@@ -1141,7 +1141,8 @@ panic，只能返回错误。
   `encrypted_secrets_are_bound_to_the_plugin`）；密钥本身的密封 / 打开在
   `crates/auth/src/machine_key.rs` 单测。
 - `SEC-KEY-006` / `007`：`crates/service/src/plugin.rs` 单测
-  `remove_handles_secrets_by_mode`（默认 / `keep_secrets` / `purge` 三种落点）。
+  `remove_handles_data_by_mode`（`Delete` / `Keep` / `Keep { secrets: true }`
+  三种落点）。
 - 机器密钥只存系统钥匙串；不可用时退化为 `0600` 明文，`plugin doctor`
   报告降级。退化路径没有「加密生效」的假象，因此不按 `SEC-KEY-001` 判通过。
 
@@ -1182,7 +1183,7 @@ panic，只能返回错误。
 | `CLI-CMD-013` | `config get/set` | 密钥打码 |
 | `CLI-CMD-014` | `grant/revoke` | 即时生效 |
 | `CLI-CMD-015` | `logs --follow` | 游标续读 |
-| `CLI-CMD-016` | `remove` | 保留数据、删除密钥；`--keep-secrets` 保留密钥；`--purge` 全删 |
+| `CLI-CMD-016` | `remove` | 默认删配置与数据；`--keep-data` 保留；`--keep-secrets` 连密钥保留 |
 | `CLI-CMD-017` | `update --to` | 切换版本 |
 | `CLI-CMD-018` | `rollback` | 切回上一版本 |
 | `CLI-CMD-019` | `verify` | 摘要与元数据复查 |
@@ -1190,6 +1191,7 @@ panic，只能返回错误。
 | `CLI-CMD-021` | `block` / `unblock` | 立即停止并禁用；解除后不自动启用 |
 | `CLI-CMD-022` | `quarantine` / `release` | 产物保留，启动被拒绝 |
 | `CLI-CMD-023` | `config set --secret` | 值从 stdin 读取，回显与输出均不含明文 |
+| `CLI-CMD-027` | `remove` 确认 | 启用中问「禁用并移除」、已停用问「移除」，默认答「否」；无 TTY 又无 `--yes` 退出 2 且插件不动 |
 
 ## 12.2 输出（`CLI-OUT`）
 
