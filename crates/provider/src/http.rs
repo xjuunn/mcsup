@@ -33,7 +33,7 @@ const USER_AGENT: &str = concat!("mcsup/", env!("CARGO_PKG_VERSION"));
 /// Cargo.toml 注释），provider 由本 crate 显式提供：进程内首次构造
 /// reqwest Client 前装一次；宿主已装过自己的 provider 时（try 语义）
 /// 尊重宿主选择，不覆盖。
-fn install_crypto_provider() {
+pub(crate) fn install_crypto_provider() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();

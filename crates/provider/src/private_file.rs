@@ -45,7 +45,11 @@ pub(crate) fn check_permissions(
 /// # Errors
 ///
 /// 不会返回错误。
+// 保持与 Unix 分支同签名是为了让调用方只有一份写法：这个 `Result` 在非 Unix
+// 上确实恒为 `Ok`，clippy 因此会报 `unnecessary_wraps`——只在非 Unix 分支上
+// 放行，Unix 分支（CI 走的那条）仍照常受检。
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 pub(crate) fn check_permissions(
     _path: &Path,
     _metadata: &std::fs::Metadata,

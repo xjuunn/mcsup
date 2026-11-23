@@ -222,6 +222,34 @@ build/
 Windows 上宿主经 `cmd.exe /C` 执行 `bin/run.cmd`。宿主拉起时追加
 `--endpoint ...` 并注入 `MCSUP_PLUGIN_TOKEN`。
 
+## 发布
+
+```sh
+npx mcsup-plugin publish            # 构建 + 推到 origin/dist
+```
+
+用户装这条命令打出的链接即可，不需要 npm / 构建步骤：
+
+```sh
+mcsup plugin install https://github.com/<owner>/<repo>/tree/dist
+```
+
+`publish` 做三件事：跑一次 `build`，用临时索引把产物写成**只含产物**的一次提交
+（`read-tree --empty` → `add --all --force` → `write-tree` → `commit-tree`），
+再 `push` 到 `<remote>/<branch>`。
+
+- 不切分支、不动工作区与暂存区：索引与工作树由 `GIT_INDEX_FILE` /
+  `GIT_WORK_TREE` 指到 `<out>`，`GIT_DIR` 显式解析成绝对路径。正在写代码时
+  也能随时发布，`dist` 分支只放产物，源码留在默认分支。
+- `--branch`（默认 `dist`）、`--remote`（默认 `origin`）、`--message`
+  （默认 `release: <id> <version>`）、`--no-build`（只发已有产物）、
+  `--dry-run`（只造提交、不推送）。
+- 单个产物受 `docs/plugins.md` §15.2 的 128 MiB 归档上限约束：GitHub 归档就是
+  仓库内容本身，产物太大时改用 `--url` / `--from` 分发。
+- 仓库里不要提交符号链接：GitHub 归档会原样保留它们，安装时会被
+  `symbolic link in artifact` 拒绝。`build` 已经把依赖展开成实体文件，所以把
+  `build/` 直接发布出去是安全的。
+
 ## 测试
 
 ```sh

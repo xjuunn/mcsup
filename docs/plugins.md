@@ -238,7 +238,7 @@ SDK README 必须显式区分，避免作者把宿主 crate 写进插件依赖�
 | `KvStore` | 插件键值 | `storage` |
 | `NetProxy` | 宿主代发的出站请求（可选路径） | `provider` |
 | `PluginStore` | 安装记录、当前版本、授权状态 | `storage` |
-| `ArtifactSource` | git / url 解析到产物字节 | `provider` |
+| `ArtifactSource` | GitHub / url 解析到产物字节 | `provider` |
 | `ArtifactVerifier` | 来源摘要与解包目录复查 | `plugin` |
 | `AuditSink` | 审计记录 | `storage` |
 | `PluginSupervisor` | 启停 / 状态 / 控制通道客户端 | `plugin` |
@@ -1120,7 +1120,7 @@ Java 能力的帧方法：
 | `ServerRead` / `ConsoleIo` / `ServerLifecycle` / `BackupOps` / `ContentOps` / `JavaOps` | `service::plugin::HostApiImpl` | 复用现有 service，不复制业务逻辑 |
 | `FileOps` | `service::plugin::HostApiImpl` + `domain::path` 的路径校验 | service 内部经 `crate::fs` 入口 |
 | `KvStore` / `SecretStore` / `PluginStore` / `AuditSink` | `storage` | 一条记录一个 JSON；审计用追加 JSONL |
-| `ArtifactSource` | `provider` | git / url 解析与下载 |
+| `ArtifactSource` | `provider` | GitHub / url 解析与下载 |
 | `ArtifactVerifier` / `PluginSupervisor` | `plugin` | 摘要、进程、端点、帧 |
 | `NetProxy` | `provider` | 复用现有 HTTP 栈与代理配置 |
 
@@ -1954,17 +1954,32 @@ SDK 主版本 == plugin API 主版本
 | --- | --- | --- |
 | 本地产物 | `--from ./x.zip` | 直接读文件 |
 | URL | `--url https://.../x.zip` | 下载；`--sha256` 或同名 `.sha256` |
-| Git | `--git <url> --ref <tag\|sha>` | 解析到 commit，再取该 commit 声明的产物 |
+| GitHub 仓库 | `install https://github.com/<owner>/<repo>` | 解析引用到 commit，再下载该 commit 的仓库归档 |
 
-Git 解析步骤（不执行任何代码）：
+GitHub 归档解析步骤（不执行任何代码）：
 
-1. `git ls-remote` 或托管方 API 把 `--ref` 解析成 commit SHA。
-2. 读取该 commit 的 `mcsup-plugin.json`（索引）或 Release 元数据。
-3. 索引给出各平台产物的 URL、`sha256`、`size`。
-4. 下载、校验、解包、登记。
+1. 把 `<owner>/<repo>` 与可选引用（`--ref`，或链接里的 `/tree/<ref>`）解析成
+   一个不可变的 commit SHA。引用本身就是完整 SHA 时跳过这一步。
+2. 下载 `https://codeload.github.com/<owner>/<repo>/zip/<SHA>`。
+3. 解包（归档顶层是 `<repo>-<SHA>/`，安装器会自动下钻一层）。
+4. 校验 `manifest.json` / `descriptor.json`，登记。
 
-`--ref` 必须是 tag 或完整 SHA；`[禁止]` 默认跟随分支头，避免同一命令装到
-不同内容。索引缺失时可直接用 `--url` 指向产物。
+安装**不构建**：仓库内容必须是成品产物，`manifest.json` 必须在仓库根或唯一一层
+子目录里。作者把产物提交进默认分支时，用户装裸链接；把产物提交进独立的
+`dist` 分支时，用户装 `https://github.com/<owner>/<repo>/tree/dist`。
+
+解析引用优先问 `api.github.com`（未鉴权 60 次/小时）；不可达或被限流时回退到
+`github.com/<owner>/<repo>/commits/<ref>.atom`（同主机、无速率限制）。两条都
+失败才报 `unavailable`。私有仓库两条路都拿不到内容，请改用 `--from` 安装本地
+构建。
+
+`--ref` 只配 GitHub 链接：`[禁止]` 与 `--url` / `--from` 一起用。引用可以是
+分支、tag 或 commit；缺省即默认分支。想钉死版本请显式 `--ref <tag|sha>`，
+因为 `update` 会按记录的引用重新解析最新提交。
+
+`--sha256` 比对的是**归档字节**的摘要，而 GitHub 重新打包同一 commit 时字节
+可能变化（压缩实现、时间戳），所以它主要用于 `--url`。要固定内容请改用
+commit（`--ref <sha>`）或 `--from`。
 
 ## 15.2 产物
 
@@ -1997,6 +2012,11 @@ peer）整棵 vendor 进 `<out>/node_modules`（`sdks/typescript` 的
 `node_modules` 也不照抄：那是它装过的依赖，由 SDK 按 `package.json` 重新解析
 并铺到产物顶层，照抄会把整棵开发依赖（`typescript`、`vitest`）塞进产物。
 
+**GitHub 归档会原样保留仓库里的符号链接。** 也就是说仓库里提交了符号链接
+（常见于 `node_modules/.bin/*`、`file:` 依赖、指向仓库外的相对链接）时，装出来
+的归档会被 `symbolic link in artifact` 拒绝。发布前请用 `mcsup-plugin build`
+产出实体文件，不要把 `node_modules` 直接提交进仓库。
+
 压缩格式：zip（默认）或 tar.zst。限制：
 
 | 项 | 上限 |
@@ -2009,6 +2029,9 @@ peer）整棵 vendor 进 `<out>/node_modules`（`sdks/typescript` 的
 
 解包必须防 Zip Slip：拒绝绝对路径、`..`、符号链接、硬链接、设备文件。
 Windows 还需拒绝保留名（`CON`、`NUL` 等）与尾随点 / 空格。
+
+GitHub 归档额外多一层 `<repo>-<SHA>/` 顶层目录；128 MiB 的压缩包上限也适用，
+产物里塞了大体积资源时请改用 `--from` / `--url` 分发。
 
 ## 15.3 签名（暂不实现）
 
@@ -2146,7 +2169,8 @@ Windows 还需拒绝保留名（`CON`、`NUL` 等）与尾随点 / 空格。
 5. 摘要与安装记录一致。
 6. 二进制平台覆盖与 manifest 一致。
 7. descriptor 中不得出现 `x-mcsup-*` 以外的扩展键（未知扩展忽略但记录）。
-8. 包内不得包含 `.git`、`node_modules`、构建缓存。
+8. 包内不得包含 `.git` 与构建缓存；`node_modules` 只允许 `mcsup-plugin build`
+   vendor 出来的实体文件（符号链接一律拒绝，见 §15.2）。
 
 人工审核（市场来源）：
 
@@ -2291,7 +2315,7 @@ Windows 还需拒绝保留名（`CON`、`NUL` 等）与尾随点 / 空格。
 
 ```
 mcsup plugin list [--json]
-mcsup plugin install <source> [--from|--url|--git] [--ref <tag|sha>] [--sha256 <hex>]
+mcsup plugin install <source> [--from|--url] [--ref <tag|sha|branch>] [--sha256 <hex>]
                               [--yes] [--no-setup] [--json]
 mcsup plugin update <id> [--to <version>] [--prune] [--yes] [--no-setup]
 mcsup plugin setup <id>                  # 已安装插件重跑安装向导（沿用现有值）
@@ -2322,7 +2346,7 @@ mcsup __plugin-host --data-dir <path> [--idle-timeout <secs>]   # 隐藏
 
 约定：
 
-- `install` 的 `<source>` 可省略，由 `--from` / `--url` / `--git` 指定；三者互斥。
+- `install` 的 `<source>` 可省略，由 `--from` / `--url` 指定；三者互斥。
 - `call` 的 `--input` 缺省为 `{}`；`-` 表示从 stdin 读 JSON。
 - `--output json` 时 stdout 只含一行 JSON；进度与提示走 stderr。
 - `--yes` 跳过确认式提问，不跳过必填参数补参；安装向导里视为同意能力授权。
@@ -2336,7 +2360,10 @@ mcsup __plugin-host --data-dir <path> [--idle-timeout <secs>]   # 隐藏
 - `plugin stop --grace` 上限 3600 秒（与 `server stop` 共用领域常量）：超限按用法
   错误拒绝，不静默夹紧——夹紧会让用户以为 `--grace 600` 真的生效了。
 - `plugin update` 不带 `--to` 时按记录里的来源重新拉取，产物 id 必须仍是同一个；
-  本地来源在安装时已规范成绝对路径，`update` 不依赖当前工作目录。
+  本地来源在安装时已规范成绝对路径，`update` 不依赖当前工作目录。GitHub 来源
+  记录的是**引用**（分支 / tag / commit）而不是解析出来的 commit，所以裸链接
+  装上的插件 `update` 会跟到默认分支的最新提交，`.../tree/dist` 装上的会跟到
+  `dist` 分支最新提交；想钉死版本用 `--ref <tag|sha>`。
 - 非交互缺必填参数：退出码 2，stderr 说明缺什么；配置必填项缺失时以
   `missing` 字段返回并在下一轮 `config set` 后补上。
 - `config set` / `config get` 的 `<key>` 支持点号路径（`qq.appId`）：写入
@@ -2387,14 +2414,9 @@ $ mcsup plugin call watchdog health --json
 ```
 
 ```
-$ mcsup plugin install --git https://github.com/example/chat-bridge --ref v0.3.1
-正在解析来源…
-  已解析 commit 3f9c2a1
-正在下载产物…
-  12.4 MiB / 12.4 MiB
-正在校验…
-  摘要匹配
-正在安装…
+$ mcsup plugin install https://github.com/example/chat-bridge
+确认安装插件（来源：https://github.com/example/chat-bridge）？[Y/n] y
+正在安装插件…
 插件申请以下权限：
   - events          接收服务器事件
   - console:read    读取控制台输出
@@ -2648,7 +2670,7 @@ ClientSecret: ••••••••
 - `crates/plugin`：进程、端点、握手、心跳、帧循环、退避、空闲回收；
 - `service::plugin::HostApiImpl` 实现 `ServerRead` / `ConsoleIo`；
 - `storage` 实现 `PluginStore` / `KvStore` / `AuditSink`；
-- `provider` 实现 `ArtifactSource`（url / from；git 解析可先只支持 GitHub）；
+- `provider` 实现 `ArtifactSource`（`--from` / `--url` / GitHub 仓库归档）；
 - CLI：`list` / `install` / `enable` / `disable` / `status` / `call` / `logs`；
 - 能力：`events` / `storage:kv` / `server:read` / `console:read`；
 - 补 `domain` 的 `ChatMessage` / `PlayerJoined` / `PlayerLeft` 与聊天解析器；
@@ -2945,36 +2967,40 @@ export default definePlugin({
 descriptor、把运行时依赖 vendor 进产物（§15.2「产物必须自带运行时依赖」、
 符号链接展开成实体文件）、打包 zip。作者不接触端点、帧、路由与界面。
 
-# 附录 E：Git 来源索引
+# 附录 E：GitHub 仓库归档
 
-仓库根目录或 Release 附带的 `mcsup-plugin.json`：
+GitHub 来源**不需要**任何索引文件。仓库内容就是产物：
 
-```json
-{
-  "schema": 1,
-  "id": "chat-bridge",
-  "version": "0.3.1",
-  "api": 1,
-  "artifacts": [
-    {
-      "platform": "darwin-arm64",
-      "url": "https://github.com/example/chat-bridge/releases/download/v0.3.1/chat-bridge-0.3.1-darwin-arm64.zip",
-      "sha256": "9f2c...",
-      "size": 13002342
-    },
-    {
-      "platform": "linux-x64",
-      "url": "https://github.com/example/chat-bridge/releases/download/v0.3.1/chat-bridge-0.3.1-linux-x64.zip",
-      "sha256": "ab41...",
-      "size": 12888111
-    }
-  ]
-}
+```
+<repo root>/
+├── manifest.json          # 必需，或唯一一层子目录里的 manifest.json
+├── descriptor.json        # 必需
+├── dist/                  # Node / TS 插件：编译产物
+└── node_modules/          # Node / TS 插件：运行时依赖，必须自备
 ```
 
-- `id` / `version` / `api` 必须与包内 manifest 一致，否则拒绝。
-- 当前平台没有产物 → `unsupported`，不尝试兼容其它平台。
-- 索引本身也随 commit 固定；`[禁止]` 安装时读取分支头的可变索引。
+两种发布姿势：
+
+| 姿势 | 作者 | 用户命令 |
+| --- | --- | --- |
+| 默认分支携带产物 | 把 `mcsup-plugin build --out .` 的产物提交进默认分支 | `install https://github.com/<owner>/<repo>` |
+| 独立 `dist` 分支 | 产物提交进 `dist` 分支，代码留在默认分支 | `install https://github.com/<owner>/<repo>/tree/dist` |
+
+`mcsup-plugin publish` 封装第二种：构建后把产物写成一次提交推到 `dist` 分支，
+不碰工作区，也不需要用户手工切分支。
+
+规则：
+
+- `manifest.json` 必须在归档的解包根或唯一一层子目录里（GitHub 归档自带一层
+  `<repo>-<SHA>/`，安装器会自动下钻）。缺失 → `invalid input`。
+- 归档里的符号链接会被原样保留，安装时直接拒绝（`symbolic link in artifact`）。
+  不要把 `node_modules` 直接提交进仓库——那是整棵链接树；用
+  `mcsup-plugin build` 产出实体文件。
+- 压缩包 128 MiB 上限适用于 GitHub 归档本身。产物里带大体积资源时改用
+  `--url` / `--from`。
+- 私有仓库拿不到内容（`codeload` 返回 404，两条解析路都失败），报
+  `unavailable` 并提示改用 `--from` 安装本地构建。
+- `[禁止]` 假设作者有构建步骤：安装流水线**不执行**仓库里的任何代码。
 
 # 附录 F：实现顺序清单
 
