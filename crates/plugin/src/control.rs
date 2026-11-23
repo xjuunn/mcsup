@@ -11,6 +11,7 @@
 //! 然后调用 `reload`；`[禁止]` 由宿主代为下载或解包。
 
 use crate::conn::Connection;
+use crate::host_identity::BuildFingerprint;
 use domain::plugin::PluginId;
 use domain::plugin::capability::Capability;
 use domain::plugin::state::PluginState;
@@ -598,6 +599,7 @@ fn dispatch(handler: &dyn ControlHandler, method: &str, input: &Value) -> Result
         }
         "reload" => handler.reload(),
         "shutdown" => handler.shutdown(),
+        "identity" => handler.identity(),
         other => Err(HostError::invalid_input(format!(
             "unknown control method `{other}`"
         ))),
@@ -733,6 +735,18 @@ pub trait ControlHandler: Send + Sync {
     ///
     /// 当前实现恒成功
     fn shutdown(&self) -> Result<Value, HostError>;
+    /// 宿主自身的构建标识
+    ///
+    /// 命令行据此判断「监听端点的那一方是不是当前这个可执行文件」。默认实现
+    /// 报告此刻磁盘上的自己；常驻宿主必须覆盖成**启动时的快照**，否则二进制
+    /// 被替换之后，旧进程会照着新文件回答，判定就永远是一致的。
+    ///
+    /// # Errors
+    ///
+    /// 当前实现恒成功
+    fn identity(&self) -> Result<Value, HostError> {
+        Ok(BuildFingerprint::current().to_json())
+    }
 }
 
 /// 基于宿主持久化能力的控制实现
@@ -742,6 +756,8 @@ pub struct HostControl {
     config: Arc<dyn ConfigOps>,
     log_dir: PathBuf,
     audit: Arc<dyn AuditSink>,
+    /// 启动时抓取的构建标识
+    identity: BuildFingerprint,
 }
 
 impl std::fmt::Debug for HostControl {
@@ -768,6 +784,9 @@ impl HostControl {
             config,
             log_dir,
             audit,
+            // 快照必须在这里取：之后磁盘上的二进制被替换，本进程报告的仍是
+            // 「我启动时是什么」，这正是判定「宿主过期」所需的基准。
+            identity: BuildFingerprint::current(),
         }
     }
 }
@@ -1015,6 +1034,10 @@ impl ControlHandler for HostControl {
     fn shutdown(&self) -> Result<Value, HostError> {
         Ok(json!({ "shutting_down": true }))
     }
+
+    fn identity(&self) -> Result<Value, HostError> {
+        Ok(self.identity.to_json())
+    }
 }
 
 fn now_secs() -> i64 {
@@ -1184,6 +1207,19 @@ impl ControlClient {
     /// 宿主不可达时返回 `unavailable`
     pub fn shutdown(&self) -> Result<Value, HostError> {
         self.request("shutdown", json!({}))
+    }
+
+    /// 读取宿主的构建标识
+    ///
+    /// 连得上不代表跑的是当前构建：宿主是常驻进程，二进制被替换不会换掉已经
+    /// 在跑的那一个。调用方拿它与 [`BuildFingerprint::current`] 比较。
+    ///
+    /// # Errors
+    ///
+    /// 宿主不可达，或宿主构建早于本方法（回 `unknown control method`）时
+    /// 返回错误
+    pub fn identify(&self) -> Result<BuildFingerprint, HostError> {
+        BuildFingerprint::from_json(&self.request("identity", json!({}))?)
     }
 }
 
@@ -1521,6 +1557,18 @@ mod tests {
     fn dispatch_requires_id_for_status() {
         let err = dispatch(&handler(), "status", &json!({})).expect_err("missing id");
         assert_eq!(err.code, port::plugin::ErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn dispatch_identity_reports_the_host_build() {
+        let payload = dispatch(&handler(), "identity", &json!({})).expect("identity");
+        let host = BuildFingerprint::from_json(&payload).expect("parse identity");
+        assert_eq!(host.version(), env!("CARGO_PKG_VERSION"));
+        // 构造 `HostControl` 与断言取的是同一个可执行文件
+        assert_eq!(
+            host.staleness(&BuildFingerprint::current()),
+            crate::host_identity::HostStaleness::Current
+        );
     }
 
     #[test]

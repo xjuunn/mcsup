@@ -22,6 +22,7 @@ pub mod contract;
 pub mod control;
 pub mod event;
 pub mod host;
+pub mod host_identity;
 #[cfg(windows)]
 mod job;
 pub mod process;
@@ -34,4 +35,5 @@ pub use api::{DispatchContext, HostServices, dispatch};
 pub use control::{ControlClient, ControlServer, HostControl};
 pub use event::{EventBus, EventDelivery, EventSinkAdapter};
 pub use host::PluginHost;
+pub use host_identity::{BuildFingerprint, HostStaleness};
 pub use session::Heartbeat;

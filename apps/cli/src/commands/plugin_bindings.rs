@@ -89,7 +89,7 @@ impl BoundPlugins {
             if self.is_running(&id) {
                 continue;
             }
-            let result = plugin_host::ensure().and_then(|()| {
+            let result = plugin_host::ensure(printer).and_then(|()| {
                 self.plugins
                     .start(&id)
                     .map(|_| ())
@@ -233,6 +233,38 @@ impl BoundPlugins {
         match self.plugins.stop(id, STOP_GRACE) {
             Ok(()) => printer.print_note(&format!("已停止插件 {id}（绑定的服务器都已停止）")),
             Err(err) => printer.print_warning(&format!("停止插件 {id} 失败：{err}")),
+        }
+    }
+}
+
+/// 宿主被换成当前构建之后，按启动门禁恢复它原本在跑的插件
+///
+/// 换宿主是升级的必要动作，但插件是被换宿主牵连停掉的，用户没要求停。恢复
+/// 必须重新过一遍门禁：绑定服务器都已经停了的插件不该借着这次重启被拉起来，
+/// 否则服务器没跑、桥却空转——与 `plugin start` 同一口径。
+pub(crate) fn restore_after_restart(ids: &[PluginId], printer: Printer) {
+    if ids.is_empty() {
+        return;
+    }
+    let mcsup = match crate::bootstrap::open_mcsup() {
+        Ok(mcsup) => mcsup,
+        Err(err) => {
+            printer.print_warning(&format!("读取插件绑定失败，未恢复插件：{err}"));
+            return;
+        }
+    };
+    let bound = BoundPlugins::new(&mcsup);
+    for id in ids {
+        if let StartGate::AllStopped { servers } = bound.enforce_gate(id, printer) {
+            printer.print_note(&format!(
+                "插件 {id} 未恢复：绑定的服务器都已停止（{}）",
+                servers.join("、")
+            ));
+            continue;
+        }
+        match mcsup.plugins.start(id) {
+            Ok(info) => printer.print_note(&format!("已恢复插件 {id}（pid {}）", info.pid)),
+            Err(err) => printer.print_warning(&format!("恢复插件 {id} 失败：{err}")),
         }
     }
 }

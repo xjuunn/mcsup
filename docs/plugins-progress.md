@@ -108,6 +108,21 @@
 - 卸载默认删除 `secrets.json`，`--keep-secrets` 保留，`--purge` 全删。
 - 日志对已知密钥值精确打码（UTF-8、≥ 8 字节、≤ 64 条）。
 
+### 宿主构建自愈
+
+- 控制通道新增 `identity` 方法：`HostControl` 在构造时抓一份
+  `BuildFingerprint`（版本 / 可执行文件路径 / 大小 / mtime），之后恒定报告这份
+  快照。`ControlClient::identify()` 取回并还原。
+- `BuildFingerprint::staleness` 是纯函数判定，输出 `Current` /
+  `VersionMismatch` / `DifferentExe` / `BinaryReplaced`；任一侧缺元数据时判
+  `Current`（宁可不换宿主，也不误杀）。
+- `plugin_host::ensure()` 连上宿主后先比对构建标识：一致的直接返回，不一致的
+  先记下运行中的插件、`shutdown` 旧宿主、等端点真正放开、拉起当前构建，再按
+  §11.9 的绑定门禁恢复插件。认不出 `identity`（早于本机制的宿主）按旧构建处理。
+- 端到端验收：中止 `server stop` 之外的停机路径（`kill` java 进程）后 4 秒内
+  插件被收掉，确认「服务器停了插件不停」的现场成因是 11-20 起、早于看门狗
+  提交的旧宿主进程。
+
 ## 与设计文档的偏差
 
 以下偏差来自本仓库当前形态，不是实现缺失：
