@@ -264,7 +264,7 @@ pub const PLUGIN_CONTROL_VERSION: u32 = 1;
 // domain::plugin
 pub const PLUGIN_API_VERSION: u32 = 1;
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
-pub const DESCRIPTOR_SCHEMA_VERSION: u32 = 1;
+pub const DESCRIPTOR_SCHEMA_VERSION: u32 = 3;   // 2 起 setup，3 起 bind
 ```
 
 `[禁止]` 把插件帧塞进现有的 `Request` / `Response`：那两者是「一连接一请求」
@@ -1115,7 +1115,7 @@ Java 能力的帧方法：
 
 | 字段 | 类型 | 必填 | 约束 |
 | --- | --- | --- | --- |
-| `schema` | u32 | 是 | 必须是 `MANIFEST_SCHEMA_VERSION`（1） |
+| `schema` | u32 | 是 | `1..=MANIFEST_SCHEMA_VERSION`（当前 1）；宿主接受更旧的产物，新增字段必须能按默认值退化（见 14.3） |
 | `id` | string | 是 | `^[a-z][a-z0-9-]{1,63}$`，全局唯一，非保留名 |
 | `name` | string | 是 | ≤ 64 字符 |
 | `description` | string | 否 | ≤ 512 字符 |
@@ -1198,6 +1198,11 @@ Java 能力的帧方法：
 
 descriptor 由 SDK 在构建时生成，与二进制一起打包。宿主只读它，不执行插件
 代码就能知道界面与输入输出形状。
+
+校验时机：安装时按 11.2–11.7 完整校验一次；启动插件前再校验一次（同一份
+产物不重复解析，按「路径 + 大小 + mtime」缓存结果），不合规在启动这一步就
+报可读错误，而不是等每个 op 调用各自失败。运行期的输入校验与超时判定都取自
+这同一份已校验结果。
 
 ```json
 {
@@ -1824,6 +1829,14 @@ SDK 主版本 == plugin API 主版本
 - `protocol` 在 0.x 阶段每次发版可能破坏；市场开放前插件帧集必须冻结到
   `PLUGIN_PROTOCOL_VERSION = 1` 的稳定语义。
 - 宿主对 `api` 只做相等校验，不做范围兼容。
+- manifest 与 descriptor 的 `schema` 是**范围**校验（`1..=当前版本`）：
+  只增字段时升 `schema`，旧产物继续装得上。新增字段必须能按默认值退化
+  （缺省即「未声明」），做不到的变更只能升 `api` 主版本。
+- 未知顶层字段一律拒绝：新字段配旧宿主必须**明确失败**，不许被静默忽略。
+  两条合起来的意思是「新宿主认旧产物，旧宿主拒新产物」。
+- 收紧 descriptor / manifest 校验规则视同破坏性变更：已装的旧产物会在启动
+  或调用时才暴露。规则收紧必须同时接受旧产物（例如按 `schema` 分档），
+  否则作为 `api` 主版本变更处理。
 
 ## 14.4 生成管线
 
@@ -1853,6 +1866,9 @@ SDK 主版本 == plugin API 主版本
   `result` 的成败两种形态各取一次采样，字段集合取并集，只出现一次的字段记为
   可省略。`crates/protocol/src/plugin/contracts.rs` 的漂移测试对同一份采样做
   断言，字段改名或增删会先让 `cargo test` 失败。
+- 协议版本与限额常量（帧限额、descriptor / schema 限额）同样由该模块生成，
+  SDK 侧不手抄第二份：改 `domain::plugin` 的数字会让 `scripts/check-sdk.sh`
+  的逐字节比对失败，而不是等装到宿主才发现「构建期放行、安装期被拒」。
 - 插件二进制的 `--mcsup-dump-descriptor` 是 descriptor 的唯一来源：
   `mcsup-plugin build` 先构建，再运行该标志取 JSON，最后打包。
 - `--mcsup-dump-descriptor` 与 `--mcsup-dump-manifest` 是保留标志，宿主永不传入。
@@ -2731,7 +2747,7 @@ M0 ─→ M1 ─→ M2 ─→ M3 ─→ M4
 | --- | --- | --- |
 | `PLUGIN_API_VERSION` | 1 | `domain::plugin` |
 | `MANIFEST_SCHEMA_VERSION` | 1 | `domain::plugin` |
-| `DESCRIPTOR_SCHEMA_VERSION` | 1 | `domain::plugin` |
+| `DESCRIPTOR_SCHEMA_VERSION` | 3（接受更旧的 1 / 2） | `domain::plugin` |
 | `PLUGIN_PROTOCOL_VERSION` | 1 | `protocol::plugin` |
 | `PLUGIN_CONTROL_VERSION` | 1 | `protocol::plugin` |
 | 单帧上限 | 24 MiB | `protocol::plugin` |

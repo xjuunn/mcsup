@@ -89,6 +89,29 @@
 
 ### 修复
 
+- manifest 的 `schema` 改为范围校验（`1..=MANIFEST_SCHEMA_VERSION`），与
+  descriptor 一致。此前是相等校验：宿主把 `MANIFEST_SCHEMA_VERSION` 升到 2、
+  新增一个字段，所有 `schema: 1` 的已发布插件会被新宿主一并拒装。现在旧产物
+  继续装得上，新增字段按默认值退化成「未声明」。`UnsupportedSchema` 的错误
+  文案同时改为 `host supports 1..=N`。
+- descriptor 的校验只在必要时做一次：按「路径 + 大小 + mtime」缓存校验结果，
+  调用入口不再每次 `call` / `stream` 都重新读盘并解析一份 ≤256 KiB 的 JSON；
+  启动插件前先校验一次，产物不合法在启动这一步报可读错误，而不是拉起进程后
+  每个 op 各自 `internal` 失败一次。产物被换掉（升级换版本目录、原地重写）时
+  指纹变化，缓存自动失效。
+- TypeScript SDK 的 descriptor / schema 限值改由生成契约提供：`MAX_SCHEMA_DEPTH`
+  等 12 个常量随 `contracts/v1.ts` 从 `domain::plugin::descriptor` 生成，
+  `src/validate.ts` 不再手抄一份。此前宿主改一个限值，SDK 会在构建期放行、
+  等安装期才被拒。
+- `docs/sdk-design.md` 的示例按真实 API 改正：Builder 片段回填到
+  `queries` / `actions` / `streams`（不是不存在的 `ops`）、`ctx.sessionId`
+  取代不存在的 `ctx.state`、`ctx.log.info(...)` 取代 `ctx.log(...)`、
+  生命周期键 `onStart` 取代 `start`、`ctx["console:read"]` 取代 `ctx.console`。
+  改正后的片段已按 SDK 类型实测通过。
+- `docs/plugins.md` 的常量表按实现更新：`DESCRIPTOR_SCHEMA_VERSION` 早已因
+  `setup`（2）与 `bind`（3）升到 3，文档仍写 1；manifest 的 `schema` 行改写成
+  范围语义；§14.3 补「schema 范围接受 + 未知顶层字段拒绝 + 收紧校验视同破坏性
+  变更」三条演进规则。
 - TypeScript SDK 的构建产物自带运行时依赖：`mcsup-plugin build` 把生产依赖整棵
   vendor 进 `<out>/node_modules`——`dependencies` 声明的包、`mcsup-plugin` 自身、
   能解析到的 `peerDependencies`（如 `zod`）及其传递依赖，`devDependencies` 不进

@@ -1387,8 +1387,8 @@ pub enum DescriptorError {
         /// 上限
         limit: usize,
     },
-    /// schema 版本不匹配
-    #[error("unsupported descriptor schema {found}, host supports {supported}")]
+    /// schema 版本不在支持范围内
+    #[error("unsupported descriptor schema {found}, host supports 1..={supported}")]
     UnsupportedSchema {
         /// 声明值
         found: u32,

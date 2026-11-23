@@ -27,6 +27,42 @@ export const DEFAULT_EVENT_QUEUE = 1024;
 /** 日志限速缺省值（行/秒） */
 export const DEFAULT_LOG_LINES_PER_SEC = 200;
 
+/** schema 嵌套深度上限 */
+export const MAX_SCHEMA_DEPTH = 6;
+
+/** 单对象属性数上限 */
+export const MAX_SCHEMA_PROPERTIES = 64;
+
+/** enum 取值数上限 */
+export const MAX_ENUM_VALUES = 100;
+
+/** 单个 schema 节点数上限 */
+export const MAX_SCHEMA_NODES = 512;
+
+/** 单个 schema 序列化字节上限 */
+export const MAX_SCHEMA_BYTES = 65536;
+
+/** 整个 descriptor 字节上限 */
+export const MAX_DESCRIPTOR_BYTES = 262144;
+
+/** 单字符串 `maxLength` 上限 */
+export const MAX_STRING_LENGTH = 8192;
+
+/** op 超时下限（毫秒） */
+export const MIN_OP_TIMEOUT_MS = 1000;
+
+/** op 超时上限（毫秒） */
+export const MAX_OP_TIMEOUT_MS = 300000;
+
+/** op 超时缺省值（毫秒） */
+export const DEFAULT_OP_TIMEOUT_MS = 30000;
+
+/** op 标题字符上限 */
+export const MAX_OP_TITLE_CHARS = 64;
+
+/** op 描述字符上限 */
+export const MAX_OP_DESCRIPTION_CHARS = 512;
+
 // ---------------------------------------------------------------------------
 // 退出码（plugins.md §6.7）
 // ---------------------------------------------------------------------------

@@ -174,7 +174,8 @@
 | 构建 | `mcsup-plugin build`：tsc → `--mcsup-dump-descriptor` → 依赖 vendor 进 `<out>/node_modules` → 打包 + 平台启动器 |
 | 测试 | 235 用例：协议、descriptor 归一化与校验、Builder 类型、Hooks、MockHost、真实进程、依赖 vendor、`sdks/conformance`（schema 12 条 + frames 6 条 + cases 13 条） |
 | 门禁 | `scripts/check-sdk.sh`（已接入 `scripts/check.sh` 的 `sdk` 步骤；含 `npm run conformance` 与契约「生成一致」） |
-| 契约 | `contracts/v1.ts` 由 `protocol::plugin::contracts` 生成，禁止手写；`src/protocol.ts` 只留编解码并从生成物重导出 |
+| 旧产物兼容 | manifest / descriptor 的 `schema` 都按 `1..=当前版本` 接受，新增字段靠升版本 + 默认值退化；descriptor 安装时完整校验一次、启动插件前再校验一次（按「路径 + 大小 + mtime」缓存，产物不变不重新解析），运行期输入校验与超时取同一份结果 |
+| 契约 | `contracts/v1.ts` 由 `protocol::plugin::contracts` 生成，禁止手写；`src/protocol.ts` 只留编解码并从生成物重导出；协议版本与限额常量（帧限额 + descriptor / schema 限额）同样出自生成物，`src/validate.ts` 不再手抄数字 |
 
 行为差异（相对宿主侧文档，已在此记录）：
 

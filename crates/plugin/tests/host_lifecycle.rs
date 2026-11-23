@@ -689,6 +689,40 @@ fn cap_gate_006_blocked_and_quarantined_plugins_are_rejected_before_spawn() {
     assert_eq!(host.session_count(), 0);
 }
 
+/// descriptor 不合法必须在拉起进程之前就失败
+///
+/// 校验规则随宿主版本收紧：产物装得进、但新规则不认时，报错落在启动这一步
+/// （可读、一次），而不是拉起进程后每个 op 各自 `internal` 失败一次。
+#[test]
+fn plugin_invalid_descriptor_is_rejected_before_spawn() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data_dir = dir.path().to_path_buf();
+    let id = fixture_id();
+    let artifact = install_fixture(&data_dir, &id);
+    std::fs::write(
+        artifact.join("descriptor.json"),
+        br#"{"schema":99,"plugin_id":"fixture","api":1,"ops":[]}"#,
+    )
+    .expect("write invalid descriptor");
+    let store = Arc::new(MemoryStore::default());
+    store
+        .put(&record(&id, artifact, env!("CARGO_PKG_VERSION")))
+        .expect("put record");
+    let host = host(&data_dir, &store);
+
+    let err = host
+        .start(&id)
+        .expect_err("invalid descriptor must not start");
+    assert_eq!(err.code, PluginErrorCode::Internal);
+    assert!(
+        err.message
+            .contains("unsupported descriptor schema 99, host supports 1..="),
+        "{}",
+        err.message
+    );
+    assert_eq!(host.session_count(), 0, "no process may be spawned");
+}
+
 #[test]
 fn proto_ctl_001_control_channel_lists_calls_and_shuts_down() {
     let dir = tempfile::tempdir().expect("tempdir");

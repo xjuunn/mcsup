@@ -20,6 +20,11 @@ use crate::plugin::{
 };
 use domain::plugin::PLUGIN_API_VERSION;
 use domain::plugin::capability::Capability;
+use domain::plugin::descriptor::{
+    DEFAULT_OP_TIMEOUT_MS, MAX_DESCRIPTOR_BYTES, MAX_ENUM_VALUES, MAX_OP_DESCRIPTION_CHARS,
+    MAX_OP_TIMEOUT_MS, MAX_OP_TITLE_CHARS, MAX_SCHEMA_BYTES, MAX_SCHEMA_DEPTH, MAX_SCHEMA_NODES,
+    MAX_SCHEMA_PROPERTIES, MAX_STRING_LENGTH, MIN_OP_TIMEOUT_MS,
+};
 use domain::plugin::error::PluginErrorCode;
 use domain::plugin::event::Subscription;
 use domain::plugin::exit_code;
@@ -474,9 +479,12 @@ fn section(out: &mut String, title: &str) {
 }
 
 /// 版本与限额
+///
+/// descriptor 的限值也在这里生成：SDK 要在构建期用同一组数字提前拒绝超限的
+/// 产物，手抄一份就会出现「构建期通过、安装期被拒」的错位报错。
 fn render_constants(out: &mut String) {
     section(out, "版本与限额");
-    let constants = [
+    let mut constants = vec![
         (
             "PROTOCOL_VERSION",
             "插件协议版本（帧信封 `v`）",
@@ -513,9 +521,77 @@ fn render_constants(out: &mut String) {
             i64::from(crate::plugin::DEFAULT_LOG_LINES_PER_SEC),
         ),
     ];
+    constants.extend(
+        descriptor_constants()
+            .map(|(name, doc, value)| (name, doc, i64::try_from(value).unwrap_or(i64::MAX))),
+    );
     for (name, doc, value) in constants {
         let _ = writeln!(out, "/** {doc} */\nexport const {name} = {value};\n");
     }
+}
+
+/// descriptor / schema 限值（`plugins.md` §11.2 / §11.5）
+///
+/// 这是构建期校验的唯一来源：SDK 侧不再手抄同一组数字。
+fn descriptor_constants() -> [(&'static str, &'static str, u64); 12] {
+    [
+        (
+            "MAX_SCHEMA_DEPTH",
+            "schema 嵌套深度上限",
+            MAX_SCHEMA_DEPTH as u64,
+        ),
+        (
+            "MAX_SCHEMA_PROPERTIES",
+            "单对象属性数上限",
+            MAX_SCHEMA_PROPERTIES as u64,
+        ),
+        ("MAX_ENUM_VALUES", "enum 取值数上限", MAX_ENUM_VALUES as u64),
+        (
+            "MAX_SCHEMA_NODES",
+            "单个 schema 节点数上限",
+            MAX_SCHEMA_NODES as u64,
+        ),
+        (
+            "MAX_SCHEMA_BYTES",
+            "单个 schema 序列化字节上限",
+            MAX_SCHEMA_BYTES as u64,
+        ),
+        (
+            "MAX_DESCRIPTOR_BYTES",
+            "整个 descriptor 字节上限",
+            MAX_DESCRIPTOR_BYTES as u64,
+        ),
+        (
+            "MAX_STRING_LENGTH",
+            "单字符串 `maxLength` 上限",
+            MAX_STRING_LENGTH,
+        ),
+        (
+            "MIN_OP_TIMEOUT_MS",
+            "op 超时下限（毫秒）",
+            MIN_OP_TIMEOUT_MS,
+        ),
+        (
+            "MAX_OP_TIMEOUT_MS",
+            "op 超时上限（毫秒）",
+            MAX_OP_TIMEOUT_MS,
+        ),
+        (
+            "DEFAULT_OP_TIMEOUT_MS",
+            "op 超时缺省值（毫秒）",
+            DEFAULT_OP_TIMEOUT_MS,
+        ),
+        (
+            "MAX_OP_TITLE_CHARS",
+            "op 标题字符上限",
+            MAX_OP_TITLE_CHARS as u64,
+        ),
+        (
+            "MAX_OP_DESCRIPTION_CHARS",
+            "op 描述字符上限",
+            MAX_OP_DESCRIPTION_CHARS as u64,
+        ),
+    ]
 }
 
 /// 退出码

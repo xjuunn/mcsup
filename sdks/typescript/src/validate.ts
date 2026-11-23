@@ -9,6 +9,20 @@
  * 便于插件作者定位到具体的 schema 位置。
  */
 
+import {
+  DEFAULT_OP_TIMEOUT_MS,
+  MAX_DESCRIPTOR_BYTES,
+  MAX_ENUM_VALUES,
+  MAX_OP_DESCRIPTION_CHARS,
+  MAX_OP_TIMEOUT_MS,
+  MAX_OP_TITLE_CHARS,
+  MAX_SCHEMA_BYTES,
+  MAX_SCHEMA_DEPTH,
+  MAX_SCHEMA_NODES,
+  MAX_SCHEMA_PROPERTIES,
+  MAX_STRING_LENGTH,
+  MIN_OP_TIMEOUT_MS,
+} from "./protocol.js";
 import { z } from "./zod.js";
 
 // ---------------------------------------------------------------------------
@@ -32,23 +46,30 @@ function fail(path: string, message: string): never {
 }
 
 // ---------------------------------------------------------------------------
-// 限值（§11.5）
+// 限值（§11.2 / §11.5）
 // ---------------------------------------------------------------------------
+//
+// 数字全部来自 `./contracts/v1.js`（由 `protocol::plugin::contracts` 生成，
+// 源头是 `domain::plugin::descriptor` 的常量）。这里不再手抄第二份：宿主改
+// 一个限值时 SDK 跟着变，不会出现「构建期通过、安装期被拒」的错位报错。
+//
+// 对外仍然从本模块导出，调用方（descriptor / runtime / 测试）不必关心它
+// 实际生成在哪。
 
-/** schema 深度上限 */
-export const MAX_SCHEMA_DEPTH = 6;
-/** 单对象属性数上限 */
-export const MAX_OBJECT_PROPERTIES = 64;
-/** `enum` 取值数上限 */
-export const MAX_ENUM_VALUES = 100;
-/** schema 节点总数上限 */
-export const MAX_SCHEMA_NODES = 512;
-/** 单字符串 `maxLength` 上限 */
-export const MAX_STRING_LENGTH = 8192;
-/** 单个 schema 序列化字节上限 */
-export const MAX_SCHEMA_BYTES = 64 * 1024;
-/** 整个 descriptor 字节上限 */
-export const MAX_DESCRIPTOR_BYTES = 256 * 1024;
+export {
+  DEFAULT_OP_TIMEOUT_MS,
+  MAX_DESCRIPTOR_BYTES,
+  MAX_ENUM_VALUES,
+  MAX_OP_DESCRIPTION_CHARS,
+  MAX_OP_TIMEOUT_MS,
+  MAX_OP_TITLE_CHARS,
+  MAX_SCHEMA_BYTES,
+  MAX_SCHEMA_DEPTH,
+  MAX_SCHEMA_NODES,
+  MAX_SCHEMA_PROPERTIES,
+  MAX_STRING_LENGTH,
+  MIN_OP_TIMEOUT_MS,
+};
 
 // ---------------------------------------------------------------------------
 // 结构层：op 字段（§11.2）
@@ -56,17 +77,6 @@ export const MAX_DESCRIPTOR_BYTES = 256 * 1024;
 
 /** op id：`^[a-z][a-z0-9_]{0,63}$` */
 export const OP_ID_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
-
-/** `title` 字符上限 */
-export const MAX_OP_TITLE = 64;
-/** `description` 字符上限 */
-export const MAX_OP_DESCRIPTION = 512;
-/** `timeout_ms` 下界 */
-export const MIN_OP_TIMEOUT_MS = 1000;
-/** `timeout_ms` 上界 */
-export const MAX_OP_TIMEOUT_MS = 300_000;
-/** `timeout_ms` 缺省 */
-export const DEFAULT_OP_TIMEOUT_MS = 30_000;
 
 const OP_KINDS = new Set(["query", "action", "stream"]);
 const OP_RISKS = new Set(["read", "mutating", "destructive"]);
@@ -85,11 +95,11 @@ export function validateOpFields(
   if (op.title.trim() === "") {
     fail(`${path}.title`, "is required");
   }
-  if ([...op.title].length > MAX_OP_TITLE) {
-    fail(`${path}.title`, `is ${[...op.title].length} chars, limit is ${MAX_OP_TITLE}`);
+  if ([...op.title].length > MAX_OP_TITLE_CHARS) {
+    fail(`${path}.title`, `is ${[...op.title].length} chars, limit is ${MAX_OP_TITLE_CHARS}`);
   }
-  if (op.description !== undefined && [...op.description].length > MAX_OP_DESCRIPTION) {
-    fail(`${path}.description`, `is ${[...op.description].length} chars, limit is ${MAX_OP_DESCRIPTION}`);
+  if (op.description !== undefined && [...op.description].length > MAX_OP_DESCRIPTION_CHARS) {
+    fail(`${path}.description`, `is ${[...op.description].length} chars, limit is ${MAX_OP_DESCRIPTION_CHARS}`);
   }
   if (!OP_RISKS.has(op.risk)) {
     fail(`${path}.risk`, `must be one of ${[...OP_RISKS].join(", ")}`);
@@ -571,8 +581,8 @@ function walk(path: string, schema: unknown, depth: number, stats: SchemaStats):
       fail(`${path}.properties`, "must be an object");
     }
     const count = Object.keys(props as Record<string, unknown>).length;
-    if (count > MAX_OBJECT_PROPERTIES) {
-      fail(`${path}.properties`, `has ${count} properties, limit is ${MAX_OBJECT_PROPERTIES}`);
+    if (count > MAX_SCHEMA_PROPERTIES) {
+      fail(`${path}.properties`, `has ${count} properties, limit is ${MAX_SCHEMA_PROPERTIES}`);
     }
     if (type === undefined) {
       fail(path, "an object with properties must declare type: object");

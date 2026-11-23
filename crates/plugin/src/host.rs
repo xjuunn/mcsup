@@ -17,6 +17,7 @@ use crate::rfc3339;
 use crate::session::{self, HandshakeOutcome, Heartbeat, SessionConfig, SessionInner};
 use domain::plugin::PluginId;
 use domain::plugin::capability::Capability;
+use domain::plugin::descriptor::{Descriptor, ValidatedDescriptor};
 use domain::plugin::event::Subscription;
 use domain::plugin::state::{PluginEvent, PluginState};
 use port::plugin::{
@@ -30,7 +31,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// 握手超时：插件必须在 10 s 内连接并发出 `hello`
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -70,6 +71,63 @@ impl Crashes {
     }
 }
 
+/// descriptor 校验结果的进程内缓存
+///
+/// 输入校验与超时判定都在调用入口，而 descriptor 是安装产物：每次 `call` /
+/// `stream` 都重新读盘并校验一份 ≤256 KiB 的 JSON，既浪费又把「宿主收紧了
+/// 校验规则」放大成「每个 op 各失败一次」。
+///
+/// 指纹用「路径 + 大小 + mtime」：升级会换成新的版本目录（路径变），原地
+/// 重写同一文件（测试构造、手工修复）则大小或 mtime 变。产物本身不可变，
+/// 所以不做内容哈希。
+#[derive(Default)]
+struct DescriptorCache {
+    entries: Mutex<HashMap<PathBuf, CachedDescriptor>>,
+}
+
+struct CachedDescriptor {
+    len: u64,
+    modified: Option<SystemTime>,
+    validated: Arc<ValidatedDescriptor>,
+}
+
+impl DescriptorCache {
+    /// 取校验通过的 descriptor；首次或产物变化时才真正解析
+    fn validated(&self, record: &PluginRecord) -> Result<Arc<ValidatedDescriptor>, HostError> {
+        let path = record.artifact_dir.join("descriptor.json");
+        let meta = std::fs::metadata(&path).map_err(|err| {
+            HostError::internal(format!("read descriptor for {}: {err}", record.id))
+        })?;
+        let len = meta.len();
+        let modified = meta.modified().ok();
+        if let Ok(entries) = self.entries.lock()
+            && let Some(hit) = entries.get(&path)
+            && hit.len == len
+            && hit.modified == modified
+        {
+            return Ok(Arc::clone(&hit.validated));
+        }
+        let bytes = std::fs::read(&path).map_err(|err| {
+            HostError::internal(format!("read descriptor for {}: {err}", record.id))
+        })?;
+        let validated = Descriptor::from_json(&bytes, &record.id).map_err(|err| {
+            HostError::internal(format!("invalid descriptor for {}: {err}", record.id))
+        })?;
+        let validated = Arc::new(validated);
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.insert(
+                path,
+                CachedDescriptor {
+                    len,
+                    modified,
+                    validated: Arc::clone(&validated),
+                },
+            );
+        }
+        Ok(validated)
+    }
+}
+
 /// 插件宿主
 pub struct PluginHost {
     data_dir: PathBuf,
@@ -84,6 +142,8 @@ pub struct PluginHost {
     sessions: Mutex<HashMap<PluginId, Arc<SessionInner>>>,
     starting: Mutex<HashSet<PluginId>>,
     crashes: Mutex<HashMap<PluginId, Crashes>>,
+    /// 已校验的 descriptor，按产物指纹缓存
+    descriptors: DescriptorCache,
     /// 正在退避等待自动重启的插件
     ///
     /// `stop` 与手动 `start` 会把它摘掉，退避线程醒来看到「已不在表里」就
@@ -150,6 +210,7 @@ impl PluginHost {
             sessions: Mutex::new(HashMap::new()),
             starting: Mutex::new(HashSet::new()),
             crashes: Mutex::new(HashMap::new()),
+            descriptors: DescriptorCache::default(),
             pending_restarts: Mutex::new(HashSet::new()),
             revocations: Mutex::new(None),
             shutting_down: AtomicBool::new(false),
@@ -475,6 +536,10 @@ impl PluginHost {
             )));
         }
         self.reject_if_revoked(&record)?;
+        // descriptor 是安装产物，但校验规则随宿主版本收紧：启动前校验一次，
+        // 让不兼容的产物变成可读的启动失败，而不是拉起进程后每个 op 各自
+        // internal 失败一次。产物没变时这一步命中缓存，不读盘也不重新解析。
+        self.descriptors.validated(&record)?;
         // 判定收敛在领域层：从离线状态出发，`StartRequested` 只允许
         // `stopped` / `failed`。`pending_approval` 与 `disabled` 会被拒绝。
         let from = offline_state(&record);
@@ -829,7 +894,13 @@ impl PluginHost {
         input: &Value,
         allow_stream: bool,
     ) -> Result<Duration, HostError> {
-        op_constraints(&self.record(id)?, op, input, allow_stream)
+        op_constraints(
+            &self.descriptors,
+            &self.record(id)?,
+            op,
+            input,
+            allow_stream,
+        )
     }
 
     /// 握手时下发的配置：明文，插件需要用它工作
@@ -996,20 +1067,16 @@ impl PluginSupervisor for PluginHost {
 /// op 的执行约束：输入 schema 校验 + descriptor 声明的超时
 ///
 /// 判定收敛在执行入口：无论调用方走直连还是控制通道，输入合法性判定与
-/// 超时都以已安装的 descriptor 为准，不信任调用方自带的数值。
+/// 超时都以已安装的 descriptor 为准，不信任调用方自带的数值。descriptor 经
+/// [`DescriptorCache`] 只校验一次。
 fn op_constraints(
+    descriptors: &DescriptorCache,
     record: &PluginRecord,
     op: &str,
     input: &Value,
     allow_stream: bool,
 ) -> Result<Duration, HostError> {
-    let path = record.artifact_dir.join("descriptor.json");
-    let bytes = std::fs::read(&path)
-        .map_err(|err| HostError::internal(format!("read descriptor for {}: {err}", record.id)))?;
-    let descriptor = domain::plugin::descriptor::Descriptor::from_json(&bytes, &record.id)
-        .map_err(|err| {
-            HostError::internal(format!("invalid descriptor for {}: {err}", record.id))
-        })?;
+    let descriptor = descriptors.validated(record)?;
     let resolved = descriptor.op(op).ok_or_else(|| {
         HostError::not_found(format!("op {op} is not declared by plugin {}", record.id))
     })?;
@@ -1097,8 +1164,8 @@ fn plugin_log_tail(log_dir: &Path, id: &PluginId) -> String {
 }
 
 pub(crate) fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| {
             i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
         })
@@ -1194,12 +1261,13 @@ mod tests {
         .expect("write descriptor");
         let mut record = sample_record();
         record.artifact_dir = dir.path().to_path_buf();
+        let cache = DescriptorCache::default();
 
         let input = serde_json::json!({ "name": "Steve" });
-        let timeout = op_constraints(&record, "greet", &input, false).expect("valid");
+        let timeout = op_constraints(&cache, &record, "greet", &input, false).expect("valid");
         assert_eq!(timeout, Duration::from_millis(2_500));
 
-        let default = op_constraints(&record, "follow", &serde_json::json!({}), true)
+        let default = op_constraints(&cache, &record, "follow", &serde_json::json!({}), true)
             .expect("stream without declared timeout");
         assert_eq!(
             default,
@@ -1207,20 +1275,21 @@ mod tests {
         );
 
         // 缺必填字段
-        let err =
-            op_constraints(&record, "greet", &serde_json::json!({}), false).expect_err("required");
+        let err = op_constraints(&cache, &record, "greet", &serde_json::json!({}), false)
+            .expect_err("required");
         assert_eq!(err.code, port::plugin::ErrorCode::InvalidInput);
 
         // 未声明的 op
-        let err =
-            op_constraints(&record, "nope", &serde_json::json!({}), false).expect_err("unknown op");
+        let err = op_constraints(&cache, &record, "nope", &serde_json::json!({}), false)
+            .expect_err("unknown op");
         assert_eq!(err.code, port::plugin::ErrorCode::NotFound);
 
         // kind 与入口不匹配
-        let err = op_constraints(&record, "follow", &serde_json::json!({}), false)
+        let err = op_constraints(&cache, &record, "follow", &serde_json::json!({}), false)
             .expect_err("stream via call");
         assert_eq!(err.code, port::plugin::ErrorCode::InvalidInput);
-        let err = op_constraints(&record, "greet", &input, true).expect_err("action via stream");
+        let err =
+            op_constraints(&cache, &record, "greet", &input, true).expect_err("action via stream");
         assert_eq!(err.code, port::plugin::ErrorCode::InvalidInput);
     }
 
@@ -1229,9 +1298,53 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut record = sample_record();
         record.artifact_dir = dir.path().to_path_buf();
-        let err =
-            op_constraints(&record, "greet", &serde_json::json!({}), false).expect_err("missing");
+        let cache = DescriptorCache::default();
+        let err = op_constraints(&cache, &record, "greet", &serde_json::json!({}), false)
+            .expect_err("missing");
         assert_eq!(err.code, port::plugin::ErrorCode::Internal);
+    }
+
+    /// descriptor 只读一次盘、只校验一次；产物被换掉时立即失效
+    #[test]
+    fn descriptor_cache_reuses_until_the_artifact_changes() {
+        fn op(id: &str) -> String {
+            format!(
+                r#"{{"id":"{id}","kind":"query","title":"{id}","risk":"read","input":{{"type":"object"}},"output":{{"type":"object"}}}}"#
+            )
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("descriptor.json");
+        let write = |ops: &[String]| {
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"schema":1,"plugin_id":"demo","api":1,"ops":[{}]}}"#,
+                    ops.join(",")
+                ),
+            )
+            .expect("write descriptor");
+        };
+        write(&[op("greet")]);
+        let mut record = sample_record();
+        record.artifact_dir = dir.path().to_path_buf();
+        let cache = DescriptorCache::default();
+
+        let first = cache.validated(&record).expect("valid");
+        let again = cache.validated(&record).expect("cached");
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "unchanged artifact must hit the cache"
+        );
+
+        // 同一路径换掉内容：指纹变化后必须重新解析，不能继续用旧结果
+        write(&[op("greet"), op("extra")]);
+        let replaced = cache.validated(&record).expect("valid");
+        assert!(!Arc::ptr_eq(&first, &replaced));
+        assert!(
+            replaced.op("extra").is_some(),
+            "must see the replaced op table"
+        );
     }
 
     fn sample_record() -> PluginRecord {

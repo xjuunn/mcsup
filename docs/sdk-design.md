@@ -135,7 +135,8 @@ ops 与生命周期，形态与 `plugins.md` 附录 D 一致。特性：
 const statusOp = op("status")
   .kind("query")
   .title("运行状态")
-  .run((input, ctx) => ctx.state.summary());
+  .output(s.object({ session: s.string() }))
+  .run((_input, ctx) => ({ session: ctx.sessionId }));
 
 const filter = lineFilter()
   .stripAnsi()
@@ -144,7 +145,7 @@ const filter = lineFilter()
 
 export default definePlugin({
   // ...
-  ops: { status: statusOp },     // 片段回填
+  queries: { status: statusOp },   // 片段回填进 queries / actions / streams
 });
 ```
 
@@ -169,9 +170,9 @@ function useConsoleTail(ctx: Ctx, opts: { since: "tail" }) {
 
 export default definePlugin({
   // ...
-  start(ctx) {
+  onStart(ctx) {
     const tail = useConsoleTail(ctx, { since: "tail" });
-    tail.subscribe((line, server) => ctx.log(`[${server}] ${line.text}`));
+    tail.subscribe((line, server) => ctx.log.info(`[${server}] ${line.text}`));
   },
 });
 ```
@@ -229,7 +230,8 @@ export default chatBridgePreset({
 ## 6.1 能力驱动的 Ctx
 
 `Ctx` 的形状由 `capabilities` 字面量数组推导：未声明 `console:read` 时
-`ctx.console` 不存在（编译期报错），声明了 `storage:kv` 时 `ctx.kv` 才出现。
+`ctx["console:read"]` 不存在（编译期报错），声明了 `storage:kv` 时
+`ctx["storage:kv"]` 才出现（属性名就是能力名，见 `plugins.md` 附录 D）。
 越权调用在编译期失败，而不是等宿主拒绝。第三方 Hook 的 `ctx` 参数同样受此
 约束，非官方 hook 无法要求未声明的能力。
 

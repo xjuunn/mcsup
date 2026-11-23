@@ -18,6 +18,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+/// manifest schema 是否在宿主支持范围内
+///
+/// 范围（`1..=supported`）而不是相等：新增字段时旧产物必须仍能装上，
+/// 见 `validate` 的注释。单独成函数是为了能被测试直接钉住——`validate` 里的
+/// 最大值今天就是 1，相等与范围没有可见差别，写错了也测不出来。
+#[must_use]
+fn manifest_schema_supported(found: u32, supported: u32) -> bool {
+    (1..=supported).contains(&found)
+}
+
 /// manifest 顶层允许的字段
 const TOP_LEVEL_FIELDS: &[&str] = &[
     "schema",
@@ -359,7 +369,11 @@ impl Manifest {
     /// 同 [`Self::from_json`]
     #[allow(clippy::too_many_lines)] // 字段逐项校验就是这份顺序清单本身
     pub fn validate(self) -> Result<ValidatedManifest, ManifestError> {
-        if self.schema != MANIFEST_SCHEMA_VERSION {
+        // 接受更旧的 1..=N，与 descriptor 一致：manifest schema 只增字段时
+        // 旧产物必须仍能装上（`plugins.md` §1 的可扩展目标）。写成相等校验
+        // 会让「加一个 manifest 字段」变成「所有已发布插件都被新宿主拒绝」，
+        // 所以新增字段必须能按默认值退化，否则只能升 API 主版本。
+        if !manifest_schema_supported(self.schema, MANIFEST_SCHEMA_VERSION) {
             return Err(ManifestError::UnsupportedSchema {
                 found: self.schema,
                 supported: MANIFEST_SCHEMA_VERSION,
@@ -669,8 +683,8 @@ pub enum ManifestError {
         /// 原始值
         raw: String,
     },
-    /// manifest schema 不匹配
-    #[error("unsupported manifest schema {found}, host supports {supported}")]
+    /// manifest schema 不在支持范围内
+    #[error("unsupported manifest schema {found}, host supports 1..={supported}")]
     UnsupportedSchema {
         /// 插件声明
         found: u32,
@@ -923,6 +937,34 @@ mod tests {
             Manifest::from_value(&api),
             Err(ManifestError::UnsupportedApi { .. })
         ));
+    }
+
+    /// manifest schema 是**范围**接受，不是相等校验
+    ///
+    /// 现在上限是 1，可接受范围就是 `1..=1`；把 `MANIFEST_SCHEMA_VERSION` 升到
+    /// 2 时这条用例必须补「schema 1 仍然通过」，否则「加一个 manifest 字段」
+    /// 会连带拒绝所有已发布插件（见 `plugins.md` §1 的可扩展目标）。
+    #[test]
+    fn manifest_schema_is_accepted_as_a_range() {
+        // 直接钉住范围语义：宿主支持到 3 时，1 与 2 都必须通过
+        assert!(manifest_schema_supported(1, 3));
+        assert!(manifest_schema_supported(2, 3));
+        assert!(manifest_schema_supported(3, 3));
+        assert!(!manifest_schema_supported(0, 3));
+        assert!(!manifest_schema_supported(4, 3));
+
+        // 真实入口：当前上限下，越界仍被拒
+        assert!(Manifest::from_value(&minimal()).is_ok());
+        for schema in [0, MANIFEST_SCHEMA_VERSION + 1] {
+            let value = with(minimal(), "schema", json!(schema));
+            assert!(
+                matches!(
+                    Manifest::from_value(&value),
+                    Err(ManifestError::UnsupportedSchema { .. })
+                ),
+                "schema {schema} must be rejected"
+            );
+        }
     }
 
     #[test]
