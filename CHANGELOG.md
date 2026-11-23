@@ -122,6 +122,11 @@
 
 ### 修复
 
+- 插件配置的「默认值打底」会给非必填对象凭空造出片段：`qq` / `telegram` 这类
+  可选平台的子字段有默认值，于是 `config get` 与写配置的校验都会带上一个缺
+  凭据的片段，任何 `config set` 都被 `config.qq.appId: required field is missing`
+  拒绝——只用 Telegram 的插件因此装不上。现在 `defaults()` 只展开父级
+  `required` 列出的对象与显式声明了 `default` 的对象，可选片段保持缺席。
 - 安装记录的来源文本「写得进去、读不出来」：provider 曾写
   `git:<url>@<commit>`，CLI 却按 `git:<url>|<rev>` 解析，于是所有 git 来源的
   `plugin update` 都报 `git sources require --ref`。格式定义收口到

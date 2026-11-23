@@ -233,7 +233,9 @@ fn join(path: &str, field: &str) -> String {
 /// schema 声明的默认值（递归取对象属性）
 ///
 /// 只取 `default`，不臆造类型默认值：没写默认就是「未设置」，由调用方决定
-/// 是否必填。返回对象；schema 顶层不是对象时返回空对象。
+/// 是否必填。可选对象（父级 `required` 未列出）即使子属性有默认值也不凭空
+/// 出现——`default` 是字段级注解，不表示父对象存在。必填对象与显式声明了
+/// `default` 的对象才展开。返回对象；schema 顶层不是对象时返回空对象。
 #[must_use]
 pub fn defaults(schema: &Value) -> Value {
     let mut object = Map::new();
@@ -241,7 +243,9 @@ pub fn defaults(schema: &Value) -> Value {
         for (name, child) in properties {
             if let Some(default) = child.get("default") {
                 object.insert(name.clone(), default.clone());
-            } else if child.get("type").and_then(Value::as_str) == Some("object") {
+            } else if child.get("type").and_then(Value::as_str) == Some("object")
+                && is_required(schema, name)
+            {
                 let nested = defaults(child);
                 if nested.as_object().is_some_and(|map| !map.is_empty()) {
                     object.insert(name.clone(), nested);
@@ -250,6 +254,13 @@ pub fn defaults(schema: &Value) -> Value {
         }
     }
     Value::Object(object)
+}
+
+fn is_required(schema: &Value, name: &str) -> bool {
+    schema
+        .get("required")
+        .and_then(Value::as_array)
+        .is_some_and(|required| required.iter().any(|item| item.as_str() == Some(name)))
 }
 
 /// 把 schema 标记为密钥的字段替换成 `***`
@@ -429,9 +440,55 @@ mod tests {
                 }
             }
         });
+        // 可选对象不因为子属性有默认值而出现：`nested` 不在 `required` 里。
+        assert_eq!(defaults(&schema), json!({ "interval_secs": 60 }));
+    }
+
+    #[test]
+    fn optional_objects_with_defaulted_children_are_not_invented() {
+        // 回归：可选平台片段（如 qq / telegram）的子字段有默认值，但凭据必填。
+        // 默认值打底不该造出一个缺凭据的片段，否则写任何配置都会被它拒绝。
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "platforms": { "type": "array", "items": { "type": "string" } },
+                "qq": {
+                    "type": "object",
+                    "required": ["appId", "clientSecret"],
+                    "properties": {
+                        "appId": { "type": "string" },
+                        "clientSecret": { "type": "string" },
+                        "sandbox": { "type": "boolean", "default": false }
+                    }
+                }
+            }
+        });
+        assert_eq!(defaults(&schema), json!({}));
+        // 写配置时「默认值 + 本次补丁」能通过校验：补丁只写 telegram 系字段。
+        let merged = json!({ "platforms": ["telegram"] });
+        validate_instance(&schema, &merged, "config").expect("optional qq must stay absent");
+    }
+
+    #[test]
+    fn required_objects_and_explicit_defaults_are_expanded() {
+        let schema = json!({
+            "type": "object",
+            "required": ["inner"],
+            "properties": {
+                "inner": {
+                    "type": "object",
+                    "properties": { "enabled": { "type": "boolean", "default": true } }
+                },
+                "preset": {
+                    "type": "object",
+                    "default": { "mode": "fast" },
+                    "properties": { "mode": { "type": "string" } }
+                }
+            }
+        });
         assert_eq!(
             defaults(&schema),
-            json!({ "interval_secs": 60, "nested": { "enabled": true } })
+            json!({ "inner": { "enabled": true }, "preset": { "mode": "fast" } })
         );
     }
 }

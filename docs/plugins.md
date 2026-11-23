@@ -1404,6 +1404,11 @@ output`。返回 `undefined` 按 `{}` 回传。作者一旦声明了 `output`，
 | `minItems` / `maxItems` | 数组约束 | 即时校验 |
 | `format: date-time / duration / uri / uuid` | 标准注解 | 对应控件 |
 
+`default` 是**字段级**注解：非必填对象（父级 `required` 未列出）的子字段即使写了
+默认值，也不会让该对象自动出现。宿主用「默认值打底」读取配置时，未设置的平台
+片段（如没启用 `qq` 时的 `qq`）保持缺席；一旦片段出现（用户写入或声明了
+`default`），它的必填子字段就必须齐全。
+
 | 禁止 | 原因 |
 | --- | --- |
 | `oneOf` / `anyOf` / `allOf` | 组合爆炸：语言 × 方向 × 渲染器 |
@@ -2380,6 +2385,9 @@ mcsup __plugin-host --data-dir <path> [--idle-timeout <secs>]   # 隐藏
   按深度合并只改目标叶子，读取定位到对应值；单段键仍按顶层写入。
   同组必填字段（如 `qq.appId` 与 `qq.clientSecret`）必须**一次写完**：单写
   一个会因缺另一个被整份校验拒绝。点号路径适合在必填项已齐后修单个值。
+- `config get` 返回「schema 默认值打底 + 已存值」的视图：可选对象片段（父级
+  `required` 未列出）不会因子字段有默认值而出现，没启用的平台片段保持缺席；
+  写入校验同样以这份视图为底，所以没填凭据的平台不会阻塞其它配置。
 - `config set --file <path>` 从文件读 JSON 值（自动剥掉 UTF-8 BOM），与位置
   参数、`--secret` 互斥。数组与对象在 Windows PowerShell 5.1 下送不到程序里
   （`["log"]` 会被拆成 `[log]`，`--%`、`cmd /c`、`Start-Process` 都不行），
