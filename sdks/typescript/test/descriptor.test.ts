@@ -102,6 +102,47 @@ describe("descriptor", () => {
     });
   });
 
+  it("setup 字段条件生成 schema 4 与 when 块", () => {
+    const def = {
+      ...chatBridge.definition,
+      setup: {
+        fields: [
+          { path: "platforms", required: true, choices: ["qq", "telegram"] },
+          { path: "qq.appId", required: true, when: { path: "platforms", includes: "qq" } },
+        ],
+      },
+    } as typeof chatBridge.definition;
+    const d = buildDescriptor(def);
+    expect(d.schema).toBe(4);
+    expect(d.setup).toEqual({
+      fields: [
+        { path: "platforms", required: true, choices: ["qq", "telegram"] },
+        { path: "qq.appId", required: true, when: { path: "platforms", includes: "qq" } },
+      ],
+    });
+  });
+
+  it("when 只接受 includes / equals 之一", () => {
+    const withWhen = (when: unknown) =>
+      ({
+        ...chatBridge.definition,
+        setup: { fields: [{ path: "platforms" }, { path: "token", when }] },
+      }) as typeof chatBridge.definition;
+    expect(() => buildDescriptor(withWhen({ path: "platforms" }))).toThrow(/includes or equals/);
+    expect(() =>
+      buildDescriptor(withWhen({ path: "platforms", includes: "qq", equals: true })),
+    ).toThrow(/both/);
+    expect(() => buildDescriptor(withWhen({ path: " ", includes: "qq" }))).toThrow(
+      /non-empty string/,
+    );
+    expect(buildDescriptor(withWhen({ path: "platforms", equals: true })).setup).toEqual({
+      fields: [
+        { path: "platforms" },
+        { path: "token", when: { path: "platforms", equals: true } },
+      ],
+    });
+  });
+
   it("bind 生成 schema 3 与服务器路径", () => {
     const def = {
       ...chatBridge.definition,

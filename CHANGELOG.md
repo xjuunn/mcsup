@@ -54,6 +54,13 @@
   服务器 `start` / `stop` / `restart` 时先启停插件，多台服务器中任一在运行就
   保持插件；没有服务器使用时由常驻看门狗收掉，控制台内、游戏内与崩溃停止
   都走同一条收尾路径。
+- descriptor `schema 4` 的 `setup.fields[].when`：安装向导可按已填答案条件提问，
+  `path` + `includes`（字符串列表包含）或 `equals`（值相等）二选一，只能依赖
+  排在前面的 setup 字段。用于「选了哪个平台才问谁的凭据」：没选 `qq` 就不问
+  QQ AppID/ClientSecret，条件不成立的字段既不提问也不计入 `missing`。
+  `DESCRIPTOR_SCHEMA_VERSION` 随之升到 4（仍接受 1 / 2 / 3 的旧产物）。
+  TypeScript SDK 同步支持 `SetupFieldSpec.when`，在构建期校验 `path` 非空、
+  `includes` / `equals` 只能声明其一。
 - TypeScript 插件 SDK（`sdks/typescript`，包名 `mcsup-plugin`）：握手、op 调用、
   流式返回、事件订阅、配置与密钥、`ctx.contract.call` 与严格帧解码层，附
   conformance 用例与宿主实现互校。

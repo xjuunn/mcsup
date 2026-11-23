@@ -154,6 +154,24 @@ export interface SetupFieldSpec {
    * 字符串列表渲染成多选。与 `choices` 互斥；宿主没有可选项时退回自由输入。
    */
   readonly choicesFrom?: "servers";
+  /**
+   * 提问条件：只在条件成立时才问这个字段（schema 4 起可用）。
+   *
+   * 典型用法是「选了哪个平台才问谁的凭据」：`path` 指向排在前面的 setup
+   * 字段（如 `platforms`），`includes` 判列表包含、`equals` 判值相等，
+   * 两者只能声明其一。宿主没收集到依赖值时视为不成立，字段会被跳过。
+   */
+  readonly when?: SetupWhenSpec;
+}
+
+/** setup 字段的提问条件 */
+export interface SetupWhenSpec {
+  /** 依赖的配置路径；必须是本字段之前声明过的 setup 字段 */
+  readonly path: string;
+  /** 该路径的值（字符串列表）包含此项时提问 */
+  readonly includes?: string;
+  /** 该路径的值等于此项时提问；与 `includes` 互斥 */
+  readonly equals?: unknown;
 }
 
 /** 安装向导：声明一次「装完即用」需要问哪些值 */

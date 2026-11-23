@@ -381,6 +381,26 @@ pub struct SetupField {
     /// 提示默认值；省略时取 schema 的 `default`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<serde_json::Value>,
+    /// 提问条件；省略表示总是问，声明后只在条件成立时问
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<SetupWhen>,
+}
+
+/// setup 字段的提问条件（schema 4 起可用）
+///
+/// 用来表达「选了哪个平台才问谁的凭据」这类分支：宿主先问 `path` 指向的
+/// 字段（它必须排在本字段前面），再据已收集的答案决定是否问本字段。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetupWhen {
+    /// 依赖的配置路径；须是本字段之前声明过的 setup 字段
+    pub path: String,
+    /// 该路径的值（字符串列表）包含此项时提问
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub includes: Option<String>,
+    /// 该路径的值等于此项时提问；与 `includes` 互斥
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub equals: Option<serde_json::Value>,
 }
 
 /// 插件与服务器的绑定声明（schema 3 起可用）
@@ -431,10 +451,60 @@ pub struct ResolvedSetupField {
     pub default: Option<serde_json::Value>,
     /// 选项由宿主动态提供；`None` 表示用 `kind` 里的静态选项
     pub choices_from: Option<ChoicesSource>,
+    /// 提问条件；`None` 表示总是问
+    pub when: Option<ResolvedSetupWhen>,
     /// 输入形态
     pub kind: SetupKind,
     /// 该路径的 schema，用于逐项复校验
     pub schema: serde_json::Value,
+}
+
+/// 校验通过的提问条件
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSetupWhen {
+    /// 依赖的配置路径（已去空白）
+    pub path: String,
+    /// 列表包含该项时提问
+    pub includes: Option<String>,
+    /// 值等于该项时提问
+    pub equals: Option<serde_json::Value>,
+}
+
+impl ResolvedSetupWhen {
+    /// 用已收集的配置值判定条件是否成立
+    ///
+    /// 路径缺失、类型不符一律视为不成立（宁可不问，也不拿错值去问）。
+    #[must_use]
+    pub fn is_satisfied(&self, values: &serde_json::Value) -> bool {
+        let Some(value) = value_at_path(values, &self.path) else {
+            return false;
+        };
+        match (&self.includes, &self.equals) {
+            (Some(item), None) => match value {
+                serde_json::Value::Array(items) => items
+                    .iter()
+                    .any(|value| value.as_str() == Some(item.as_str())),
+                serde_json::Value::String(text) => text == item,
+                _ => false,
+            },
+            (None, Some(expected)) => value == expected,
+            // 构造期已拒绝，这里只是兜底
+            _ => false,
+        }
+    }
+}
+
+/// 按点号路径取值（`qq.appId`）；缺失返回 `None`
+#[must_use]
+pub fn value_at_path<'a>(
+    values: &'a serde_json::Value,
+    path: &str,
+) -> Option<&'a serde_json::Value> {
+    let mut node = values;
+    for segment in path.split('.') {
+        node = node.get(segment)?;
+    }
+    Some(node)
 }
 
 /// setup 字段的动态选项来源
@@ -737,6 +807,11 @@ impl Descriptor {
                 if self.schema < 2 {
                     return Err(DescriptorError::SetupRequiresSchema { found: self.schema });
                 }
+                if self.schema < 4 && setup.fields.iter().any(|field| field.when.is_some()) {
+                    return Err(DescriptorError::SetupConditionRequiresSchema {
+                        found: self.schema,
+                    });
+                }
                 let Some(config) = &config else {
                     return Err(DescriptorError::SetupWithoutConfig);
                 };
@@ -827,6 +902,10 @@ fn resolve_setup(
             });
         }
         fields.push(resolve_setup_field(field, path, config)?);
+    }
+    // 第二遍才校验条件：它只能引用排在前面、已经解析过的字段
+    for index in 0..fields.len() {
+        check_setup_when(&fields, index)?;
     }
     Ok(ResolvedSetup {
         start: setup.start,
@@ -1022,9 +1101,74 @@ fn resolve_setup_field(
         secret: field.secret,
         default,
         choices_from: field.choices_from,
+        when: field.when.as_ref().map(|when| ResolvedSetupWhen {
+            path: when.path.trim().to_owned(),
+            includes: when.includes.clone(),
+            equals: when.equals.clone(),
+        }),
         kind,
         schema: schema.clone(),
     })
+}
+
+/// 校验第 `index` 个字段的提问条件
+///
+/// 条件只能引用排在它前面的 setup 字段：向导是单向逐项问的，引用后面的
+/// 字段等于「还没问就先判定」，永远不成立。
+fn check_setup_when(fields: &[ResolvedSetupField], index: usize) -> Result<(), DescriptorError> {
+    let field = &fields[index];
+    let Some(when) = &field.when else {
+        return Ok(());
+    };
+    let path = when.path.as_str();
+    if path.is_empty()
+        || path.chars().count() > MAX_SETUP_PATH_CHARS
+        || path.split('.').any(str::is_empty)
+    {
+        return Err(DescriptorError::InvalidSetupCondition {
+            path: field.path.clone(),
+            reason: format!("when.path `{path}` is not a dotted config path"),
+        });
+    }
+    let Some(target) = fields[..index].iter().find(|prev| prev.path == path) else {
+        return Err(DescriptorError::SetupConditionUnknownPath {
+            path: field.path.clone(),
+            condition: path.to_owned(),
+        });
+    };
+    match (&when.includes, &when.equals) {
+        (Some(item), None) => {
+            if item.trim().is_empty() || item.chars().count() > MAX_SETUP_CHOICE_CHARS {
+                return Err(DescriptorError::InvalidSetupCondition {
+                    path: field.path.clone(),
+                    reason: "when.includes must be 1..=64 characters".to_owned(),
+                });
+            }
+            if !matches!(target.kind, SetupKind::StringList { .. }) {
+                return Err(DescriptorError::InvalidSetupCondition {
+                    path: field.path.clone(),
+                    reason: format!(
+                        "when.includes requires a string list field, {path} is not one"
+                    ),
+                });
+            }
+        }
+        (None, Some(expected)) => {
+            if let Err(err) = schema::validate_instance(&target.schema, expected, path) {
+                return Err(DescriptorError::InvalidSetupCondition {
+                    path: field.path.clone(),
+                    reason: format!("when.equals does not match {path} schema: {err}"),
+                });
+            }
+        }
+        _ => {
+            return Err(DescriptorError::InvalidSetupCondition {
+                path: field.path.clone(),
+                reason: "when must declare exactly one of includes / equals".to_owned(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// 校验列表字段的可选值：非空、去重、长度受限
@@ -1603,6 +1747,28 @@ pub enum DescriptorError {
     /// 声明了 setup 但没有 config schema
     #[error("setup requires a config schema")]
     SetupWithoutConfig,
+    /// setup 字段条件需要 schema 4
+    #[error("setup field conditions require descriptor schema 4 or newer, found {found}")]
+    SetupConditionRequiresSchema {
+        /// 声明值
+        found: u32,
+    },
+    /// `when` 声明非法
+    #[error("invalid condition for setup path {path}: {reason}")]
+    InvalidSetupCondition {
+        /// 路径
+        path: String,
+        /// 原因
+        reason: String,
+    },
+    /// `when.path` 不是更早的 setup 字段
+    #[error("setup path {path} depends on {condition}, which is not an earlier setup field")]
+    SetupConditionUnknownPath {
+        /// 路径
+        path: String,
+        /// 依赖路径
+        condition: String,
+    },
     /// bind 需要 schema 3
     #[error("bind requires descriptor schema 3 or newer, found {found}")]
     BindRequiresSchema {
@@ -1935,6 +2101,133 @@ mod tests {
             }
         );
         assert_eq!(setup.fields[1].choices_from, Some(ChoicesSource::Servers));
+    }
+
+    /// setup 字段条件：只在被依赖的字段选了对应值时提问
+    #[test]
+    fn setup_when_conditions_resolve_against_earlier_fields() {
+        let mut value = with_config(json!({
+            "platforms": { "type": "array", "items": { "type": "string" } },
+            "inbound": { "type": "boolean" },
+            "qq": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": { "appId": { "type": "string" } }
+            }
+        }));
+        value["schema"] = json!(4);
+        value["setup"] = json!({
+            "fields": [
+                { "path": "platforms", "required": true, "choices": ["qq", "telegram"] },
+                { "path": "inbound" },
+                { "path": "qq.appId", "required": true, "when": { "path": "platforms", "includes": "qq" } }
+            ]
+        });
+        let descriptor = parse(value).expect("valid condition");
+        let setup = descriptor.setup.expect("setup");
+        let when = setup.fields[2].when.clone().expect("when resolved");
+        assert_eq!(when.path, "platforms");
+        assert!(when.is_satisfied(&json!({ "platforms": ["qq", "log"] })));
+        assert!(!when.is_satisfied(&json!({ "platforms": ["telegram"] })));
+        // 值还没收集到：宁可不问
+        assert!(!when.is_satisfied(&json!({})));
+
+        // equals 形态：布尔字段
+        let mut value = with_config(json!({
+            "inbound": { "type": "boolean" },
+            "token": { "type": "string" }
+        }));
+        value["schema"] = json!(4);
+        value["setup"] = json!({
+            "fields": [
+                { "path": "inbound", "default": true },
+                { "path": "token", "when": { "path": "inbound", "equals": true } }
+            ]
+        });
+        let descriptor = parse(value).expect("valid equals");
+        let setup = descriptor.setup.expect("setup");
+        let when = setup.fields[1].when.clone().expect("when");
+        assert!(when.is_satisfied(&json!({ "inbound": true })));
+        assert!(!when.is_satisfied(&json!({ "inbound": false })));
+    }
+
+    #[test]
+    fn setup_when_rejects_bad_declarations() {
+        let config = json!({
+            "platforms": { "type": "array", "items": { "type": "string" } },
+            "token": { "type": "string" }
+        });
+
+        // schema 3 还不认识 when：老宿主读不了，必须显式要求 4
+        let mut value = with_config(config.clone());
+        value["setup"] = json!({
+            "fields": [
+                { "path": "platforms" },
+                { "path": "token", "when": { "path": "platforms", "includes": "qq" } }
+            ]
+        });
+        assert!(matches!(
+            parse(value),
+            Err(DescriptorError::SetupConditionRequiresSchema { found: 2 })
+        ));
+
+        // 引用后面的字段：单向向导里永远不成立
+        let mut value = with_config(config.clone());
+        value["schema"] = json!(4);
+        value["setup"] = json!({
+            "fields": [
+                { "path": "token", "when": { "path": "platforms", "includes": "qq" } },
+                { "path": "platforms" }
+            ]
+        });
+        assert!(matches!(
+            parse(value),
+            Err(DescriptorError::SetupConditionUnknownPath { .. })
+        ));
+
+        // includes 只能依赖字符串列表字段
+        let mut value = with_config(config.clone());
+        value["schema"] = json!(4);
+        value["setup"] = json!({
+            "fields": [
+                { "path": "token" },
+                { "path": "platforms", "when": { "path": "token", "includes": "qq" } }
+            ]
+        });
+        assert!(matches!(
+            parse(value),
+            Err(DescriptorError::InvalidSetupCondition { .. })
+        ));
+
+        // includes 与 equals 互斥，且必须声明其一
+        for when in [
+            json!({ "path": "platforms" }),
+            json!({ "path": "platforms", "includes": "qq", "equals": ["qq"] }),
+        ] {
+            let mut value = with_config(config.clone());
+            value["schema"] = json!(4);
+            value["setup"] = json!({
+                "fields": [{ "path": "platforms" }, { "path": "token", "when": when }]
+            });
+            assert!(matches!(
+                parse(value),
+                Err(DescriptorError::InvalidSetupCondition { .. })
+            ));
+        }
+
+        // equals 的值必须符合被依赖字段的 schema
+        let mut value = with_config(config);
+        value["schema"] = json!(4);
+        value["setup"] = json!({
+            "fields": [
+                { "path": "platforms" },
+                { "path": "token", "when": { "path": "platforms", "equals": "qq" } }
+            ]
+        });
+        assert!(matches!(
+            parse(value),
+            Err(DescriptorError::InvalidSetupCondition { .. })
+        ));
     }
 
     #[test]

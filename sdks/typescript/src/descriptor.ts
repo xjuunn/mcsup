@@ -19,6 +19,7 @@ import {
   type PluginDefinition,
   type ResolvedOp,
   type SetupSpec,
+  type SetupWhenSpec,
 } from "./define.js";
 import { toZod, type SchemaLike } from "./schema.js";
 import {
@@ -381,7 +382,7 @@ export function jsonSchemaOf(schema: z.ZodType, onOutput: boolean, path = "schem
 
 /** descriptor 结构（plugins.md §11.1） */
 export interface Descriptor {
-  readonly schema: 1 | 2 | 3;
+  readonly schema: 1 | 2 | 3 | 4;
   readonly plugin_id: string;
   readonly api: number;
   readonly config: JsonValue;
@@ -477,6 +478,9 @@ function buildSetup(setup: SetupSpec): JsonValue {
     if (field.choicesFrom !== undefined) {
       entry["choicesFrom"] = field.choicesFrom;
     }
+    if (field.when !== undefined) {
+      entry["when"] = normalizeSetupWhen(`setup.fields.${field.path}`, field.when);
+    }
     return sortKeys(entry);
   });
   const result: Record<string, JsonValue> = { fields };
@@ -484,6 +488,35 @@ function buildSetup(setup: SetupSpec): JsonValue {
     result["start"] = setup.start;
   }
   return sortKeys(result);
+}
+
+/**
+ * 提问条件归一化
+ *
+ * 只保留声明过的键；`path` 必填、`includes` / `equals` 二选一，写错在构建期
+ * 就报错，不必等安装到宿主才发现（宿主也会复校验）。
+ */
+function normalizeSetupWhen(path: string, when: SetupWhenSpec): JsonValue {
+  if (typeof when.path !== "string" || when.path.trim() === "") {
+    throw new DescriptorError(`${path}.when.path`, "must be a non-empty string");
+  }
+  if (when.includes === undefined && when.equals === undefined) {
+    throw new DescriptorError(`${path}.when`, "must declare either includes or equals");
+  }
+  if (when.includes !== undefined && when.equals !== undefined) {
+    throw new DescriptorError(`${path}.when`, "cannot declare both includes and equals");
+  }
+  const entry: Record<string, JsonValue> = { path: when.path };
+  if (when.includes !== undefined) {
+    if (typeof when.includes !== "string" || when.includes.trim() === "") {
+      throw new DescriptorError(`${path}.when.includes`, "must be a non-empty string");
+    }
+    entry["includes"] = when.includes;
+  }
+  if (when.equals !== undefined) {
+    entry["equals"] = when.equals as JsonValue;
+  }
+  return sortKeys(entry);
 }
 
 /** 单次绑定可声明的路径上限，与宿主 `MAX_BIND_PATHS` 一致 */
@@ -580,8 +613,10 @@ export function buildDescriptor<
   if (ops.length > 64) {
     throw new DescriptorError("ops", `${ops.length} ops declared, limit is 64`);
   }
-  // 版本号只升不降：声明了 bind 就是 3，否则有 setup 是 2，其余仍是 1
-  const schema: 1 | 2 | 3 = bind !== undefined ? 3 : setup === undefined ? 1 : 2;
+  // 版本号只升不降：setup 字段条件要求 4，bind 是 3，setup 是 2，其余仍是 1
+  const hasSetupWhen =
+    def.setup !== undefined && def.setup.fields.some((field) => field.when !== undefined);
+  const schema: 1 | 2 | 3 | 4 = hasSetupWhen ? 4 : bind !== undefined ? 3 : setup === undefined ? 1 : 2;
   const descriptor: Descriptor = {
     schema,
     plugin_id: def.id,

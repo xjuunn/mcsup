@@ -264,7 +264,7 @@ pub const PLUGIN_CONTROL_VERSION: u32 = 1;
 // domain::plugin
 pub const PLUGIN_API_VERSION: u32 = 1;
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
-pub const DESCRIPTOR_SCHEMA_VERSION: u32 = 3;   // 2 起 setup，3 起 bind
+pub const DESCRIPTOR_SCHEMA_VERSION: u32 = 4;   // 2 起 setup，3 起 bind，4 起 setup.when
 ```
 
 `[禁止]` 把插件帧塞进现有的 `Request` / `Response`：那两者是「一连接一请求」
@@ -1469,6 +1469,9 @@ JSON Schema 没有「密钥」「单位」的标准表达，统一用 `x-mcsup-`
 询问配置，写完后按 `start` 启用并启动，做到「装完即用」。`schema: 1` 的
 旧产物没有该块，宿主仍按旧流程处理。
 
+`schema: 4` 起字段可声明 `when` 条件：只有条件成立时才问这一项，用来表达
+「选了哪个平台才问谁的凭据」这类分支，避免问用户用不着的配置。
+
 | 字段 | 必填 | 约束 |
 | --- | --- | --- |
 | `setup.start` | 否 | 布尔，默认 `true`；配置写完后是否自动启用并启动 |
@@ -1481,12 +1484,16 @@ JSON Schema 没有「密钥」「单位」的标准表达，统一用 `x-mcsup-`
 | `fields[].default` | 否 | 提示默认值，必须符合该字段 schema；省略时取 schema 的 `default` |
 | `fields[].choices` | 否 | 数组，≤ 32 项、每项 1–64 字符且不重复；仅用于字符串列表字段，声明后渲染成多选框 |
 | `fields[].choicesFrom` | 否 | `servers`：选项由宿主枚举已注册服务器名。字符串字段渲染成单选，字符串列表渲染成多选；与 `choices` 互斥，不能用于 `secret` 或非字符串字段 |
+| `fields[].when` | 否 | 提问条件（`schema: 4` 起）：`path` + `includes` 或 `equals` 二选一。`path` 必须是**本字段之前**声明过的 setup 字段；`includes` 判字符串列表包含（被依赖字段必须是字符串列表），`equals` 判值相等（值须符合被依赖字段的 schema）。条件不成立时既不提问也不计入 `missing`；依赖值还没收集到时视为不成立 |
 
 宿主行为：
 
 - 安装 / 升级后先列出待确认能力并**一次确认**（默认授予，`--yes` 视为同意）；
-- 安装视为全新安装：**总是**逐项询问全部 `setup.fields`；因此重装也能核对并
-  更新 AppID 等必填项；
+- 安装视为全新安装：**总是**逐项询问全部**条件成立**的 `setup.fields`；因此
+  重装也能核对并更新 AppID 等必填项；
+- 声明了 `when` 的字段只在条件成立时提问，条件依赖本次已填的答案（不是只看
+  旧配置）：例如平台里没选 `qq`，`qq.appId` / `qq.clientSecret` 一个都不问，
+  也不会把「缺 QQ 凭据」算进 `missing`；
 - 已有值**不预填**到输入框（避免把旧值当成新输入一把回车提交）：留空即沿用，
   字符串列表会预勾选当前值；
 - 每个提问只显示 label 与控件，不额外渲染描述或操作提示行；
@@ -2106,6 +2113,9 @@ GitHub 归档额外多一层 `<repo>-<SHA>/` 顶层目录；128 MiB 的压缩包
 - 低风险能力在安装阶段已自动通过，不会出现在清单里。
 - 随后按 descriptor 的 `setup.fields` 逐项询问配置；安装时询问全部字段，
   升级只补仍缺失的项。
+- 声明了 `when` 条件的字段只在条件成立时提问（`schema: 4` 起）：条件看本次
+  已填的答案，不成立的字段既不问也不计入 `missing`。例如平台里没选 `qq`，
+  就不会问 `qq.appId` / `qq.clientSecret`。
 - 已有值**不预填**到输入框：自由输入字段留空即沿用，界面不另加提示行。
   避免一个回车把旧值当成新输入提交。
 - 每个提问只显示 label 与控件；descriptor 的 `description` 不再渲染成帮助行。
@@ -2801,7 +2811,7 @@ M0 ─→ M1 ─→ M2 ─→ M3 ─→ M4
 | --- | --- | --- |
 | `PLUGIN_API_VERSION` | 1 | `domain::plugin` |
 | `MANIFEST_SCHEMA_VERSION` | 1 | `domain::plugin` |
-| `DESCRIPTOR_SCHEMA_VERSION` | 3（接受更旧的 1 / 2） | `domain::plugin` |
+| `DESCRIPTOR_SCHEMA_VERSION` | 4（接受更旧的 1 / 2 / 3） | `domain::plugin` |
 | `PLUGIN_PROTOCOL_VERSION` | 1 | `protocol::plugin` |
 | `PLUGIN_CONTROL_VERSION` | 1 | `protocol::plugin` |
 | 单帧上限 | 24 MiB | `protocol::plugin` |

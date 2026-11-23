@@ -75,13 +75,24 @@ describe("mcsup-plugin build 的依赖 vendor", () => {
     expect(fs.existsSync(path.join(modules, "mcsup-plugin", "node_modules"))).toBe(false);
   });
 
-  it("符号链接展开成实体文件（宿主拒绝符号链接产物）", () => {
+  it("符号链接展开成实体文件（宿主拒绝符号链接产物）", (ctx) => {
     const { cwd, out } = fakeProject();
     roots.push(path.resolve(cwd, ".."));
     const target = path.join(cwd, "node_modules", "zod", "linked.js");
     fs.writeFileSync(target, "export const linked = 1;\n", "utf8");
     const link = path.join(cwd, "node_modules", "mcsup-plugin", "aliased.js");
-    fs.symlinkSync(target, link);
+    try {
+      fs.symlinkSync(target, link);
+    } catch (error) {
+      // Windows 没有开发者模式 / 管理员权限时建文件符号链接直接 EPERM。
+      // 这是环境不支持，不是 vendor 实现的问题：跳过而不是把整道门禁判红。
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "EPERM" || code === "EACCES" || code === "ENOSYS") {
+        ctx.skip(`当前环境建不了符号链接（${code}），跳过符号链接展开用例`);
+        return;
+      }
+      throw error;
+    }
 
     vendorRuntimeDependencies(cwd, out);
 

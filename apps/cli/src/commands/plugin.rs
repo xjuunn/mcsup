@@ -365,9 +365,15 @@ fn run_setup(
         Vec::new()
     };
 
-    for field in fields_to_ask(setup, &values, fresh) {
-        let existing = value_at(&values, &field.path).cloned();
-        let missing = value_missing(&values, &field.path);
+    // 已收集的答案：旧配置 + 本次刚填的值。条件字段靠它判定要不要问，
+    // 所以每问完一项都要回填，不能只看初始配置。
+    let mut answered = values.clone();
+    for field in &setup.fields {
+        if !should_ask(field, &answered, fresh) {
+            continue;
+        }
+        let existing = value_at(&answered, &field.path).cloned();
+        let missing = value_missing(&answered, &field.path);
         if !interactive {
             if field.required && missing {
                 report.missing.push(field.path.clone());
@@ -421,6 +427,7 @@ fn run_setup(
             }
         };
         if let Some(value) = value {
+            set_value_path(&mut answered, &field.path, value.clone());
             set_path(&mut patch, &field.path, value);
             report.configured.push(field.path.clone());
         } else if field.required && missing {
@@ -434,17 +441,16 @@ fn run_setup(
     Ok(report)
 }
 
-/// 安装（`fresh`）问全部字段，升级只问仍为空的字段
-fn fields_to_ask<'a>(
-    setup: &'a mcsup::domain::plugin::descriptor::ResolvedSetup,
-    values: &Value,
-    fresh: bool,
-) -> Vec<&'a ResolvedSetupField> {
-    setup
-        .fields
-        .iter()
-        .filter(|field| fresh || value_missing(values, &field.path))
-        .collect()
+/// 该字段这次要不要问：条件成立（未声明条件视为成立），且全新安装或仍为空
+///
+/// 条件由插件的 `setup.fields[].when` 声明，例如「没选 qq 就不问 QQ 凭据」。
+/// 条件不成立的字段既不问，也不计入 `missing`：它不是「没填」，而是用不着。
+fn should_ask(field: &ResolvedSetupField, values: &Value, fresh: bool) -> bool {
+    let active = field
+        .when
+        .as_ref()
+        .is_none_or(|when| when.is_satisfied(values));
+    active && (fresh || value_missing(values, &field.path))
 }
 
 /// 询问单个字段；返回 `None` 表示留空跳过或沿用已有值
@@ -707,6 +713,16 @@ fn value_at<'a>(values: &'a Value, path: &str) -> Option<&'a Value> {
 fn set_path(map: &mut Map<String, Value>, path: &str, value: Value) {
     let segments = path.split('.').collect::<Vec<_>>();
     set_path_at(map, &segments, value);
+}
+
+/// 把单个答案写回整棵配置树（条件判定用）
+fn set_value_path(values: &mut Value, path: &str, value: Value) {
+    if !values.is_object() {
+        *values = Value::Object(Map::new());
+    }
+    if let Value::Object(map) = values {
+        set_path(map, path, value);
+    }
 }
 
 fn set_path_at(map: &mut Map<String, Value>, segments: &[&str], value: Value) {
@@ -2490,6 +2506,7 @@ fn artifact_root(record: &PluginRecord) -> &Path {
 mod tests {
     use super::*;
     use mcsup::domain::plugin::descriptor::ResolvedSetup;
+    use mcsup::domain::plugin::descriptor::ResolvedSetupWhen;
     use serde_json::json;
 
     /// 多选框不能吞掉配置里已有、但插件没声明的值
@@ -2516,6 +2533,7 @@ mod tests {
             secret: false,
             default: None,
             choices_from: Some(ChoicesSource::Servers),
+            when: None,
             kind: SetupKind::Text {
                 choices: Vec::new(),
             },
@@ -2554,10 +2572,11 @@ mod tests {
         assert_eq!(value_at(&values, "qq.appId"), Some(&json!("a")));
     }
 
-    /// 重装已有配置的插件时仍必须询问 `AppID` / `ClientSecret` 等必填项
+    /// 重装已有配置的插件时仍必须询问 `AppID` / `ClientSecret` 等必填项，
+    /// 但条件不成立的字段（没选 qq 时的 QQ 凭据）不问也不记缺失
     #[test]
     fn fresh_install_asks_every_field_even_when_configured() {
-        let field = |path: &str| ResolvedSetupField {
+        let field = |path: &str, when: Option<ResolvedSetupWhen>| ResolvedSetupField {
             path: path.to_owned(),
             label: path.to_owned(),
             description: None,
@@ -2565,6 +2584,7 @@ mod tests {
             secret: false,
             default: None,
             choices_from: None,
+            when,
             kind: SetupKind::Text {
                 choices: Vec::new(),
             },
@@ -2572,14 +2592,42 @@ mod tests {
         };
         let setup = ResolvedSetup {
             start: true,
-            fields: vec![field("qq.appId"), field("qq.groups")],
+            fields: vec![field("qq.appId", None), field("qq.groups", None)],
         };
         let values = json!({ "qq": { "appId": "a", "groups": [] } });
 
-        assert_eq!(fields_to_ask(&setup, &values, true).len(), 2);
-        let update = fields_to_ask(&setup, &values, false);
-        assert_eq!(update.len(), 1);
-        assert_eq!(update[0].path, "qq.groups");
+        let asked = |fields: &[ResolvedSetupField], values: &Value, fresh: bool| {
+            fields
+                .iter()
+                .filter(|field| should_ask(field, values, fresh))
+                .map(|field| field.path.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(asked(&setup.fields, &values, true).len(), 2);
+        assert_eq!(
+            asked(&setup.fields, &values, false),
+            vec!["qq.groups".to_owned()]
+        );
+
+        // 没选 qq：QQ 凭据既不该问，也不该算「缺配置」
+        let gated = vec![
+            field("platforms", None),
+            field(
+                "qq.appId",
+                Some(ResolvedSetupWhen {
+                    path: "platforms".to_owned(),
+                    includes: Some("qq".to_owned()),
+                    equals: None,
+                }),
+            ),
+        ];
+        let telegram_only = json!({ "platforms": ["telegram"] });
+        assert_eq!(
+            asked(&gated, &telegram_only, true),
+            vec!["platforms".to_owned()]
+        );
+        let with_qq = json!({ "platforms": ["qq", "telegram"] });
+        assert_eq!(asked(&gated, &with_qq, true).len(), 2);
     }
 
     #[test]
