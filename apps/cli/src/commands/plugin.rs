@@ -20,6 +20,7 @@ use mcsup::domain::plugin::descriptor::Descriptor;
 use mcsup::domain::plugin::descriptor::{ChoicesSource, ResolvedSetupField, SetupKind};
 use mcsup::domain::plugin::manifest::Manifest;
 use mcsup::domain::plugin::revocation::RevocationList;
+use mcsup::domain::plugin::source::PluginSource;
 use mcsup::domain::server::artifact::{Checksum, ChecksumAlgorithm};
 use mcsup::port::plugin::ArtifactVerifier as _;
 use mcsup::port::plugin::{ArtifactOrigin, PluginRecord, SecretProtection, StreamSink};
@@ -37,13 +38,12 @@ pub(crate) fn run(action: PluginAction, printer: Printer) -> Result<()> {
             source,
             from,
             url,
-            git,
             reference,
             sha256,
             yes,
             no_setup,
         } => install(
-            source, from, url, git, reference, sha256, yes, !no_setup, printer,
+            source, from, url, reference, sha256, yes, !no_setup, printer,
         ),
         PluginAction::Update {
             id,
@@ -927,27 +927,19 @@ fn install(
     source: Option<String>,
     from: Option<PathBuf>,
     url: Option<String>,
-    git: Option<String>,
     reference: Option<String>,
     sha256: Option<String>,
     yes: bool,
     setup: bool,
     printer: Printer,
 ) -> Result<()> {
-    let origin = resolve_origin(source, from, url, git, reference)?;
+    let origin = resolve_origin(source, from, url, reference)?;
     let expected = sha256.map(|hex| Checksum::new(ChecksumAlgorithm::Sha256, hex));
     let (service, bound) = open_bound()?;
     // 安装前确认（docs §15.5）：`--yes` 或非交互模式直接执行。待确认能力
     // 在安装后展示，grant 仍需显式确认，这里只确认「装」这个动作本身。
     if printer.is_human() && !yes {
-        let origin_text = match &origin {
-            ArtifactOrigin::Local(path) => path.display().to_string(),
-            ArtifactOrigin::Url(url) => url.clone(),
-            ArtifactOrigin::Git { url, rev } => match rev {
-                Some(rev) => format!("git {url}@{rev}"),
-                None => format!("git {url}"),
-            },
-        };
+        let origin_text = describe_origin(&origin);
         let confirmed = crate::prompts::confirm_or_yes(
             printer,
             &crate::i18n::pick(
@@ -1027,47 +1019,80 @@ fn resolve_origin(
     source: Option<String>,
     from: Option<PathBuf>,
     url: Option<String>,
-    git: Option<String>,
     reference: Option<String>,
 ) -> Result<ArtifactOrigin> {
-    let supplied = [
-        source.is_some(),
-        from.is_some(),
-        url.is_some(),
-        git.is_some(),
-    ]
-    .into_iter()
-    .filter(|given| *given)
-    .count();
+    let supplied = [source.is_some(), from.is_some(), url.is_some()]
+        .into_iter()
+        .filter(|given| *given)
+        .count();
     if supplied != 1 {
         return Err(AppDiagnostic::usage(
-            "必须且只能给出一个来源：<source> / --from / --url / --git",
+            "必须且只能给出一个来源：<source> / --from / --url",
             None,
         )
         .into());
     }
-    if let Some(git) = git {
-        return Ok(ArtifactOrigin::Git {
-            url: git,
-            rev: reference,
-        });
-    }
-    if reference.is_some() {
-        return Err(AppDiagnostic::usage("--ref 只能与 --git 一起使用", None).into());
-    }
     if let Some(url) = url {
+        reject_ref_outside_github(reference.as_deref())?;
         return Ok(ArtifactOrigin::Url(url));
     }
     if let Some(path) = from {
+        reject_ref_outside_github(reference.as_deref())?;
         return Ok(ArtifactOrigin::Local(absolute_local(path)?));
     }
     let Some(raw) = source else {
         return Err(AppDiagnostic::usage("缺少插件来源", None).into());
     };
-    if raw.starts_with("http://") || raw.starts_with("https://") {
-        Ok(ArtifactOrigin::Url(raw))
-    } else {
-        Ok(ArtifactOrigin::Local(absolute_local(PathBuf::from(raw))?))
+    let parsed = PluginSource::parse_input(&raw)
+        .map_err(|err| AppDiagnostic::usage(err.to_string(), None))?;
+    match parsed {
+        PluginSource::Github { owner, repo, rev } => {
+            let rev = match (rev, reference) {
+                (Some(_), Some(_)) => {
+                    return Err(AppDiagnostic::usage(
+                        "链接里已经带了版本（/tree/<ref>）；不要再给 --ref",
+                        None,
+                    )
+                    .into());
+                }
+                (Some(rev), None) => Some(rev),
+                (None, explicit) => explicit,
+            };
+            Ok(ArtifactOrigin::Github { owner, repo, rev })
+        }
+        other => {
+            reject_ref_outside_github(reference.as_deref())?;
+            origin_of(other)
+        }
+    }
+}
+
+/// `--ref` 只配 GitHub 仓库链接：`--url` / `--from` 没有「版本」这回事
+fn reject_ref_outside_github(reference: Option<&str>) -> Result<()> {
+    if reference.is_some() {
+        return Err(AppDiagnostic::usage("--ref 只能与 GitHub 仓库链接一起使用", None).into());
+    }
+    Ok(())
+}
+
+/// 把领域来源转成端口来源；本地来源补成绝对路径
+fn origin_of(source: PluginSource) -> Result<ArtifactOrigin> {
+    Ok(match source {
+        PluginSource::Local(path) => ArtifactOrigin::Local(absolute_local(PathBuf::from(path))?),
+        PluginSource::Url(url) => ArtifactOrigin::Url(url),
+        PluginSource::Github { owner, repo, rev } => ArtifactOrigin::Github { owner, repo, rev },
+    })
+}
+
+/// 面向人的来源描述（确认提示用）
+fn describe_origin(origin: &ArtifactOrigin) -> String {
+    match origin {
+        ArtifactOrigin::Local(path) => path.display().to_string(),
+        ArtifactOrigin::Url(url) => url.clone(),
+        ArtifactOrigin::Github { owner, repo, rev } => match rev {
+            Some(rev) => format!("https://github.com/{owner}/{repo} ({rev})"),
+            None => format!("https://github.com/{owner}/{repo}"),
+        },
     }
 }
 
@@ -1290,24 +1315,12 @@ fn setup(id: &str, printer: Printer) -> Result<()> {
 }
 
 fn origin_from_source(source: Option<&str>) -> Option<ArtifactOrigin> {
-    let source = source?;
-    if let Some(path) = source.strip_prefix("local:") {
-        return Some(ArtifactOrigin::Local(PathBuf::from(path)));
-    }
-    if let Some(url) = source.strip_prefix("url:") {
-        return Some(ArtifactOrigin::Url(url.to_owned()));
-    }
-    if let Some(rest) = source.strip_prefix("git:") {
-        // `|` 分隔（不是 `@`）：`git@github.com:org/repo` 这类 URL 本身含
-        // `@`，按第一个 `@` 拆出来的「rev」是 URL 碎片，必然被 `--ref` 校验
-        // 拒绝，SSH 装的插件就永远升级不了。
-        let (url, rev) = match rest.rsplit_once('|') {
-            Some((url, rev)) => (url.to_owned(), Some(rev.to_owned())),
-            None => (rest.to_owned(), None),
-        };
-        return Some(ArtifactOrigin::Git { url, rev });
-    }
-    None
+    let parsed = PluginSource::parse_record(source?).ok()?;
+    Some(match parsed {
+        PluginSource::Local(path) => ArtifactOrigin::Local(PathBuf::from(path)),
+        PluginSource::Url(url) => ArtifactOrigin::Url(url),
+        PluginSource::Github { owner, repo, rev } => ArtifactOrigin::Github { owner, repo, rev },
+    })
 }
 
 /// 按记录里的安装来源重新拉取并升级
@@ -1317,12 +1330,22 @@ fn upgrade_from_source(
     prune: bool,
 ) -> Result<(PluginId, String)> {
     let record = service.record(id)?;
-    let origin = origin_from_source(record.source.as_deref()).ok_or_else(|| {
-        AppDiagnostic::usage(
-            format!("插件 {id} 没有可复用的安装来源；用 `mcsup plugin install <source>` 升级"),
+    let Some(origin) = origin_from_source(record.source.as_deref()) else {
+        // 记录里存的来源读不出来时，把原因带出去：旧版 `git:` 来源需要
+        // 用户换 GitHub 链接重装，只说「没有来源」会让他无从下手。
+        let detail = match record.source.as_deref().map(PluginSource::parse_record) {
+            Some(Err(err)) => format!("：{err}"),
+            _ => String::new(),
+        };
+        return Err(AppDiagnostic::usage(
+            format!(
+                "插件 {id} 没有可复用的安装来源{detail}；\
+                 用 `mcsup plugin install <source>` 升级"
+            ),
             None,
         )
-    })?;
+        .into());
+    };
     let outcome = service.install_as(id, &origin, prune)?;
     Ok((outcome.record.id, outcome.record.version))
 }
@@ -2572,19 +2595,78 @@ mod tests {
         assert_eq!(odd["qq"], json!({ "groups": ["g"] }));
     }
 
-    /// git 来源用 `|` 分隔：SSH 形式的 URL 自带 `@`，按 `@` 拆会把 URL 拆坏
+    /// 旧版 `git:` 记录：GitHub 裸仓库映射成 GitHub 来源，其它一律读不出来
+    ///
+    /// `|` 与 `@` 两种旧分隔都要认（provider 曾写 `@`，service 曾写 `|`）。
     #[test]
-    fn git_source_round_trips_urls_that_contain_at_signs() {
+    fn legacy_git_records_become_github_sources() {
         assert!(matches!(
             origin_from_source(Some("git:git@github.com:org/repo|v1.0.0")),
-            Some(ArtifactOrigin::Git { url, rev: Some(rev) })
-                if url == "git@github.com:org/repo" && rev == "v1.0.0"
+            Some(ArtifactOrigin::Github { owner, repo, rev: Some(rev) })
+                if owner == "org" && repo == "repo" && rev == "v1.0.0"
         ));
         assert!(matches!(
-            origin_from_source(Some("git:https://user@host/org/repo")),
-            Some(ArtifactOrigin::Git { url, rev: None })
-                if url == "https://user@host/org/repo"
+            origin_from_source(Some("git:https://github.com/org/repo")),
+            Some(ArtifactOrigin::Github { rev: None, .. })
         ));
+        // 非 GitHub 的旧 git 来源已不再支持：读不出来，由 update 报错提示重装
+        assert!(origin_from_source(Some("git:https://user@host/org/repo")).is_none());
+    }
+
+    /// 安装记录里存引用而不是 commit：`update` 才跟得动 `dist` 分支
+    #[test]
+    fn recorded_sources_round_trip_their_ref() {
+        for text in [
+            "local:/opt/plugins/demo",
+            "url:https://example.com/plugin.zip",
+            "github:org/repo",
+            "github:org/repo@dist",
+        ] {
+            let origin = origin_from_source(Some(text)).expect(text);
+            assert_eq!(origin.record_text(), text);
+        }
+    }
+
+    /// `--ref` 只配 GitHub 仓库链接：直链与本地路径都没有「版本」这回事
+    #[test]
+    fn ref_is_only_accepted_with_a_github_link() {
+        let err = resolve_origin(
+            Some("https://example.com/plugin.zip".to_owned()),
+            None,
+            None,
+            Some("v1".to_owned()),
+        )
+        .expect_err("url with ref");
+        assert!(err.to_string().contains("--ref"), "{err}");
+
+        let origin = resolve_origin(
+            Some("https://github.com/org/repo".to_owned()),
+            None,
+            None,
+            Some("v1".to_owned()),
+        )
+        .expect("github with ref");
+        assert_eq!(
+            origin,
+            ArtifactOrigin::Github {
+                owner: "org".to_owned(),
+                repo: "repo".to_owned(),
+                rev: Some("v1".to_owned()),
+            }
+        );
+    }
+
+    /// 链接里带 `/tree/<ref>` 与显式 `--ref` 是矛盾指令
+    #[test]
+    fn tree_link_conflicts_with_explicit_ref() {
+        let err = resolve_origin(
+            Some("https://github.com/org/repo/tree/dist".to_owned()),
+            None,
+            None,
+            Some("v1".to_owned()),
+        )
+        .expect_err("both refs");
+        assert!(err.to_string().contains("--ref"), "{err}");
     }
 
     /// 本地来源规范成绝对路径：`plugin update` 不该依赖当前工作目录

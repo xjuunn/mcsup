@@ -1171,7 +1171,7 @@ panic，只能返回错误。
 | `CLI-CMD-001` | `list` 空 | 表头 + 「无插件」 |
 | `CLI-CMD-002` | `install --from` | 安装并展示能力 |
 | `CLI-CMD-003` | `install --url` | 下载、校验、安装 |
-| `CLI-CMD-004` | `install --git` | 解析 commit 并安装 |
+| `CLI-CMD-004` | `install https://github.com/<o>/<r>` | 解析引用到 commit，下载仓库归档并安装 |
 | `CLI-CMD-005` | 非法来源组合 | 退出 2，说明互斥 |
 | `CLI-CMD-006` | `enable` | 状态 `stopped`，`enabled=true` |
 | `CLI-CMD-007` | `disable` | 状态 `disabled` |

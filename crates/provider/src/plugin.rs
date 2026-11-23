@@ -1,4 +1,4 @@
-//! 插件产物来源：本地目录 / 压缩包 / URL + 摘要校验
+//! 插件产物来源：本地目录 / 压缩包 / URL / GitHub 仓库归档 + 摘要校验
 //!
 //! 安装流水线的第一步与第二步在这里实现：把来源解析成解包后的目录，做
 //! 归档层面的安全检查（Zip Slip、符号链接、大小与数量上限），并计算摘要。
@@ -61,8 +61,8 @@ impl ArtifactSource for PluginArtifactSource {
         }
         std::fs::create_dir_all(&root)
             .map_err(|err| HostError::internal(format!("create unpack dir: {err}")))?;
-        // git 来源额外要求包内 manifest 与索引声明一致，先记下期望值。
-        let mut git_expectation = None;
+        // 只有 GitHub 来源能给出比请求更精确的定位（这里存的是请求本身，
+        // 见下方 `Github` 分支的注释）。
         let mut resolved_source = None;
         let sha256 = match origin {
             ArtifactOrigin::Local(path) => {
@@ -83,46 +83,29 @@ impl ArtifactSource for PluginArtifactSource {
                 let _ = std::fs::remove_file(&archive);
                 sha
             }
-            ArtifactOrigin::Git { url, rev } => {
-                let source = crate::plugin_git::resolve(url, rev.as_deref(), dest_root)?;
+            ArtifactOrigin::Github { owner, repo, rev } => {
+                let archive_source = crate::plugin_github::resolve(owner, repo, rev.as_deref())?;
                 let archive = dest_root.join("package.zip");
-                download(&source.artifact_url, &archive)?;
-                let size = std::fs::metadata(&archive)
-                    .map_err(|err| HostError::internal(format!("stat artifact: {err}")))?
-                    .len();
-                if let Some(expected) = source.size
-                    && size != expected
-                {
-                    return Err(HostError::invalid_input(format!(
-                        "artifact size mismatch: index declares {expected} bytes, got {size}"
-                    )));
-                }
+                download(&archive_source.url, &archive)?;
                 let sha = digest_file(&archive)?;
-                if sha != source.sha256 {
-                    return Err(HostError::invalid_input(format!(
-                        "artifact sha256 mismatch: index declares {}, got {sha}",
-                        source.sha256
-                    )));
-                }
                 extract_archive(&archive, &root)?;
                 let _ = std::fs::remove_file(&archive);
-                // 安装记录要固定到 commit，而不是可移动的 tag。
-                resolved_source = Some(format!("git:{url}@{}", source.commit));
-                git_expectation = Some((source.id, source.version, source.api));
+                // 记录存用户请求的引用（分支 / tag），不存解析出来的 commit：
+                // 存 commit 会丢掉分支名，作者把产物放 `dist` 分支时 `update`
+                // 就跟不动了。要钉死版本应当用 `--ref <tag|sha>`。
+                resolved_source = Some(
+                    domain::plugin::source::PluginSource::Github {
+                        owner: owner.clone(),
+                        repo: repo.clone(),
+                        rev: rev.clone(),
+                    }
+                    .to_string(),
+                );
                 sha
             }
         };
         let root = unwrap_single_dir(root)?;
         let (manifest, descriptor) = read_metadata(&root)?;
-        if let Some((id, version, api)) = git_expectation
-            && (manifest.id != id || manifest.version != version || manifest.api != api)
-        {
-            return Err(HostError::invalid_input(format!(
-                "git index declares {id} {version} (api {api}), \
-                 package contains {} {} (api {})",
-                manifest.id, manifest.version, manifest.api
-            )));
-        }
         Ok(PluginArtifact {
             root,
             manifest,
@@ -201,6 +184,9 @@ fn check_checksum(expected: Option<&Checksum>, actual: &str) -> Result<(), HostE
 }
 
 fn http_client() -> Result<reqwest::blocking::Client, HostError> {
+    // `rustls-no-provider` 下必须先装 crypto provider，否则 reqwest 内部
+    // 线程直接 panic（`--url` / GitHub 归档两条路都走这里）。
+    crate::http::install_crypto_provider();
     reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()

@@ -981,13 +981,57 @@ pub enum ArtifactOrigin {
     Local(PathBuf),
     /// 远程压缩包
     Url(String),
-    /// git 仓库，可固定 revision
-    Git {
-        /// 仓库地址
-        url: String,
-        /// 分支 / tag / commit
+    /// GitHub 仓库归档
+    ///
+    /// 安装器解析 `rev`（缺省为默认分支）对应的 commit，再下载
+    /// `codeload.github.com/<owner>/<repo>/zip/<commit>`。不要求本机有 git，
+    /// 也不执行仓库里的任何代码。
+    Github {
+        /// 仓库所有者
+        owner: String,
+        /// 仓库名
+        repo: String,
+        /// 分支 / tag / commit；`None` 表示默认分支
         rev: Option<String>,
     },
+}
+
+impl From<domain::plugin::source::PluginSource> for ArtifactOrigin {
+    fn from(source: domain::plugin::source::PluginSource) -> Self {
+        use domain::plugin::source::PluginSource;
+        match source {
+            PluginSource::Local(path) => Self::Local(PathBuf::from(path)),
+            PluginSource::Url(url) => Self::Url(url),
+            PluginSource::Github { owner, repo, rev } => Self::Github { owner, repo, rev },
+        }
+    }
+}
+
+impl From<&ArtifactOrigin> for domain::plugin::source::PluginSource {
+    fn from(origin: &ArtifactOrigin) -> Self {
+        use domain::plugin::source::PluginSource;
+        match origin {
+            ArtifactOrigin::Local(path) => Self::Local(path.display().to_string()),
+            ArtifactOrigin::Url(url) => Self::Url(url.clone()),
+            ArtifactOrigin::Github { owner, repo, rev } => PluginSource::Github {
+                owner: owner.clone(),
+                repo: repo.clone(),
+                rev: rev.clone(),
+            },
+        }
+    }
+}
+
+impl ArtifactOrigin {
+    /// 写进安装记录的来源文本
+    ///
+    /// 与 [`domain::plugin::source::PluginSource`] 的 `Display` 同一份定义：
+    /// 写入与读取分家时，一条记录会写得进去、读不出来（旧版 `git:` 记录就是
+    /// 写 `@` 读 `|`，导致 `plugin update` 永远失败）。
+    #[must_use]
+    pub fn record_text(&self) -> String {
+        domain::plugin::source::PluginSource::from(self).to_string()
+    }
 }
 
 /// 校验通过的插件产物
@@ -1003,9 +1047,9 @@ pub struct PluginArtifact {
     pub sha256: String,
     /// 解析后的来源描述
     ///
-    /// 只有在来源内部能解析出比请求更精确的定位时才填写：git 来源在这里
-    /// 带上解析到的 commit，安装记录据此固定「装的是哪个提交」。本地目录与
-    /// URL 没有更精确的定位，保持 `None`，由调用方按请求参数记录。
+    /// 只有在来源内部能解析出比请求更精确的定位时才填写：安装记录据此固定
+    /// 「装的是哪个提交」。本地目录与 URL 没有更精确的定位，保持 `None`，由
+    /// 调用方按请求参数记录（见 [`ArtifactOrigin::record_text`]）。
     pub resolved_source: Option<String>,
 }
 

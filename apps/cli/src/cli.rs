@@ -1055,19 +1055,17 @@ pub(crate) enum PluginAction {
         #[arg(long, help = crate::meta::plugin_json_arg())]
         json: bool,
     },
-    /// 安装插件（本地目录 / zip / URL / git）
+    /// 安装插件（本地目录 / zip / URL / GitHub 仓库）
     #[command(about = crate::meta::plugin_install())]
     #[command(visible_alias = "in")]
     Install {
-        /// 本地路径或 URL（省略时由 --from / --url / --git 指定）
+        /// 本地路径、压缩包 URL 或 GitHub 仓库链接
         #[arg(help = crate::meta::plugin_source_arg())]
         source: Option<String>,
         #[arg(long = "from", value_name = "PATH", help = crate::meta::plugin_from_arg())]
         from: Option<PathBuf>,
         #[arg(long, value_name = "URL", help = crate::meta::plugin_url_arg())]
         url: Option<String>,
-        #[arg(long, value_name = "URL", help = crate::meta::plugin_git_arg())]
-        git: Option<String>,
         #[arg(long = "ref", value_name = "REV", help = crate::meta::plugin_ref_arg())]
         reference: Option<String>,
         #[arg(long, value_name = "HEX", help = crate::meta::plugin_sha256_arg())]

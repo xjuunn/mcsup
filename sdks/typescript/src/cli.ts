@@ -1,5 +1,5 @@
 /**
- * mcsup-plugin：插件构建工具
+ * mcsup-plugin：插件构建与发布工具
  *
  * `mcsup-plugin build` 的执行顺序：
  *   1. tsc 把插件源码编译到 dist
@@ -16,11 +16,24 @@
  *   <out>/bin/entry.mjs（固定名：插件入口的薄包装，负责自动 run）
  *
  * 作者只需 `export default definePlugin({...})`，不必写 `run()` 样板。
+ *
+ * `mcsup-plugin publish` 把产物发布成用户能直接装的 GitHub 来源
+ * （plugins.md §15.1 / 附录 E）：
+ *   1. 跑一次 `build`（`--no-build` 跳过）；
+ *   2. 用临时索引把 `<out>` 写成**只含产物**的一次提交；
+ *   3. 把该提交推到 `<remote>` 的 `<branch>`（默认 `origin` / `dist`）。
+ *
+ * 全程用 git 底层命令（`read-tree` / `add` / `write-tree` / `commit-tree` /
+ * `push`），并靠 `GIT_INDEX_FILE` + `GIT_WORK_TREE` 把索引与工作树指到产物
+ * 目录：作者的工作区、暂存区与当前分支都不受影响，不必手工切 `dist` 分支。
+ * `dist` 分支只放产物，源码留在默认分支，用户装
+ * `https://github.com/<owner>/<repo>/tree/dist` 即可。
  */
 
 import { createRequire } from "node:module";
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -34,19 +47,51 @@ interface BuildOptions {
   readonly manifest: string;
 }
 
+interface PublishOptions extends BuildOptions {
+  readonly branch: string;
+  readonly remote: string;
+  readonly message?: string;
+  readonly skipBuild: boolean;
+  readonly dryRun: boolean;
+}
+
 /** 启动器固定名：与插件 id 无关，manifest 里的路径不随 id 变化 */
 const ENTRY_WRAPPER = "entry.mjs";
+
+/**
+ * 会被父进程（pre-commit 钩子、IDE 里的 git 操作）泄漏进来的变量。
+ *
+ * 它们会越过 `cwd` 把命令作用到别的仓库上，必须先清掉再盖上我们自己的
+ * `GIT_DIR` / `GIT_INDEX_FILE` / `GIT_WORK_TREE`。
+ */
+const GIT_ISOLATION = [
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_INDEX_FILE",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_COMMON_DIR",
+  "GIT_NAMESPACE",
+] as const;
 
 const HELP = `mcsup-plugin <command> [options]
 
 Commands:
   build        编译插件并生成 manifest / descriptor
+  publish      构建产物并推送到 GitHub 的 dist 分支（用户可直接安装）
 
 Build options:
   --out <dir>        产物目录，默认 ./build
   --entry <file>     插件入口源码（相对 cwd），默认 src/index.ts
   --descriptor <f>   descriptor 输出名，默认 descriptor.json
   --manifest <f>     manifest 输出名，默认 manifest.json
+
+Publish options（另含全部 build 选项）:
+  --branch <name>    发布分支，默认 dist
+  --remote <name>    git remote，默认 origin
+  --message <text>   提交信息，默认 "release: <id> <version>"
+  --no-build         跳过构建，只发布 <out> 里已有的产物
+  --dry-run          只生成提交，不推送
 `;
 
 function fail(message: string): never {
@@ -60,11 +105,15 @@ export function main(argv: readonly string[]): void {
     process.stdout.write(HELP);
     process.exit(0);
   }
-  if (command !== "build") {
-    fail(`unknown command ${command}`);
+  if (command === "build") {
+    build(parseBuildArgs(argv.slice(3)));
+    return;
   }
-  const options = parseBuildArgs(argv.slice(3));
-  build(options);
+  if (command === "publish") {
+    publish(parsePublishArgs(argv.slice(3)));
+    return;
+  }
+  fail(`unknown command ${command}`);
 }
 
 function parseBuildArgs(args: readonly string[]): BuildOptions {
@@ -105,6 +154,62 @@ function parseBuildArgs(args: readonly string[]): BuildOptions {
   return options;
 }
 
+function parsePublishArgs(args: readonly string[]): PublishOptions {
+  const cwd = process.cwd();
+  let outDir = path.resolve(cwd, "build");
+  let entry = "src/index.ts";
+  let descriptor = "descriptor.json";
+  let manifest = "manifest.json";
+  let branch = "dist";
+  let remote = "origin";
+  let message: string | undefined;
+  let skipBuild = false;
+  let dryRun = false;
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    const value = (): string => {
+      const next = args[i + 1];
+      if (next === undefined) {
+        fail(`${arg} requires a value`);
+      }
+      i += 1;
+      return next;
+    };
+    switch (arg) {
+      case "--out":
+        outDir = path.resolve(cwd, value());
+        break;
+      case "--entry":
+        entry = value();
+        break;
+      case "--descriptor":
+        descriptor = value();
+        break;
+      case "--manifest":
+        manifest = value();
+        break;
+      case "--branch":
+        branch = value();
+        break;
+      case "--remote":
+        remote = value();
+        break;
+      case "--message":
+        message = value();
+        break;
+      case "--no-build":
+        skipBuild = true;
+        break;
+      case "--dry-run":
+        dryRun = true;
+        break;
+      default:
+        fail(`unknown publish option ${arg}`);
+    }
+  }
+  return { cwd, outDir, entry, descriptor, manifest, branch, remote, message, skipBuild, dryRun };
+}
+
 function build(options: BuildOptions): void {
   const tsconfig = findTsconfig(options.cwd);
   process.stderr.write(`[build] 编译 ${tsconfig} ...\n`);
@@ -140,6 +245,204 @@ function build(options: BuildOptions): void {
   writeJson(path.join(options.outDir, options.descriptor), descriptor);
 
   process.stderr.write(`[build] 完成：${options.outDir}\n`);
+}
+
+/**
+ * 发布：把 `<out>` 写成一次只含产物的提交，推到 `<remote>/<branch>`。
+ *
+ * 关键点：不切分支、不动工作区、不动暂存区。git 的索引与工作树分别由
+ * `GIT_INDEX_FILE` / `GIT_WORK_TREE` 指过去，`GIT_DIR` 显式解析成绝对路径
+ * （`<out>` 可能根本不在仓库目录里）。所以作者可以随时跑，正在写代码也不怕。
+ */
+function publish(options: PublishOptions): void {
+  if (!isValidBranchName(options.branch)) {
+    fail(`invalid branch name ${options.branch}`);
+  }
+  if (!options.skipBuild) {
+    build(options);
+  }
+  const manifestPath = path.join(options.outDir, options.manifest);
+  if (!fs.existsSync(manifestPath)) {
+    fail(`no ${options.manifest} in ${options.outDir}; run \`mcsup-plugin build\` first`);
+  }
+  const id = readManifestField(manifestPath, "id");
+  const version = readManifestField(manifestPath, "version");
+  const message = options.message ?? publishCommitMessage(id, version);
+
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), "mcsup-plugin-publish-"));
+  try {
+    const gitDir = runGit(cleanEnv(), options.cwd, ["rev-parse", "--absolute-git-dir"]).trim();
+    const env = cleanEnv();
+    env.GIT_DIR = gitDir;
+    env.GIT_INDEX_FILE = path.join(work, "index");
+    env.GIT_WORK_TREE = options.outDir;
+    // 空索引起步：产物分支只放产物，不带工程源码，也不受当前暂存区影响
+    runGit(env, options.cwd, ["read-tree", "--empty"]);
+    // 工作树是产物目录，`add .` 因此写到以产物为根的路径（没有 build/ 前缀）
+    runGit(env, options.outDir, ["add", "--all", "--force", "."]);
+    const tree = runGit(env, options.cwd, ["write-tree"]).trim();
+    const parent =
+      revParse(env, options.cwd, `refs/heads/${options.branch}`) ??
+      revParse(env, options.cwd, `refs/remotes/${options.remote}/${options.branch}`);
+    const commitArgs = ["commit-tree", tree, "-m", message];
+    if (parent !== undefined) {
+      commitArgs.push("-p", parent);
+    }
+    const commit = runGit(env, options.cwd, commitArgs).trim();
+    if (options.dryRun) {
+      process.stderr.write(
+        `[publish] 预演：${options.branch} 会指向 ${shortId(commit)}（未推送）\n`,
+      );
+      printInstallHint(env, options);
+      return;
+    }
+    runGit(env, options.cwd, ["push", "--quiet", options.remote, `${commit}:refs/heads/${options.branch}`]);
+    process.stderr.write(
+      `[publish] 已推送到 ${options.remote}/${options.branch}（${shortId(commit)}）\n`,
+    );
+    printInstallHint(env, options);
+  } finally {
+    fs.rmSync(work, { recursive: true, force: true });
+  }
+}
+
+/** 提交信息；manifest 缺字段时退化成只有插件名 */
+export function publishCommitMessage(
+  id: string | undefined,
+  version: string | undefined,
+): string {
+  if (id === undefined) {
+    return version === undefined ? "release: plugin" : `release: plugin ${version}`;
+  }
+  return version === undefined ? `release: ${id}` : `release: ${id} ${version}`;
+}
+
+/**
+ * 分支名是否可安全交给 `git push <commit>:refs/heads/<branch>`。
+ *
+ * 只做保守的字符集与形态检查：拒绝空格、`..`、结尾的 `/`、`.lock` 与以 `-`
+ * 开头的形态，避免把引用名交给 git 自己报一堆难懂的错。
+ */
+export function isValidBranchName(branch: string): boolean {
+  return (
+    /^[A-Za-z0-9_][A-Za-z0-9._/-]*$/u.test(branch) &&
+    !branch.includes("..") &&
+    !branch.includes("//") &&
+    !branch.endsWith("/") &&
+    !branch.endsWith(".lock")
+  );
+}
+
+/**
+ * 从 remote 地址里取 GitHub 的 `owner/repo`。
+ *
+ * 支持 `https://github.com/o/r(.git)`、`git@github.com:o/r(.git)` 与
+ * `ssh://git@github.com/o/r(.git)`。其它 host 返回 `undefined`。
+ */
+export function parseGithubRemote(
+  url: string,
+): { readonly owner: string; readonly repo: string } | undefined {
+  const match = /^(?:[a-z][a-z0-9+.-]*:\/\/)?(?:[^@/\s]+@)?github\.com[/:](.+)$/iu.exec(
+    url.trim(),
+  );
+  const rest = match?.[1];
+  if (rest === undefined) {
+    return undefined;
+  }
+  const [owner, repoWithSuffix] = rest.split("/");
+  const repo = repoWithSuffix?.replace(/\.git$/iu, "");
+  if (owner === undefined || owner === "" || repo === undefined || repo === "") {
+    return undefined;
+  }
+  return { owner, repo };
+}
+
+/** 读 manifest 的字符串字段；非字符串或缺失时返回 `undefined` */
+function readManifestField(file: string, field: string): string | undefined {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch (err) {
+    fail(`cannot read ${file}: ${String(err)}`);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    fail(`invalid ${file}: ${String(err)}`);
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    return undefined;
+  }
+  const value = (parsed as Record<string, unknown>)[field];
+  return typeof value === "string" ? value : undefined;
+}
+
+/** 打印用户可直接复制的安装命令 */
+function printInstallHint(env: NodeJS.ProcessEnv, options: PublishOptions): void {
+  const url = gitTry(env, options.cwd, ["remote", "get-url", options.remote])?.trim();
+  const repo = url === undefined || url === "" ? undefined : parseGithubRemote(url);
+  const target =
+    repo === undefined
+      ? `https://github.com/<owner>/<repo>/tree/${options.branch}`
+      : `https://github.com/${repo.owner}/${repo.repo}/tree/${options.branch}`;
+  process.stderr.write(`[publish] 安装：mcsup plugin install ${target}\n`);
+}
+
+function shortId(commit: string): string {
+  return commit.slice(0, 7);
+}
+
+/** 复制一份环境变量并清掉会指向别的仓库的 `GIT_*` */
+function cleanEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const name of GIT_ISOLATION) {
+    delete env[name];
+  }
+  return env;
+}
+
+/** 跑 git，失败时把 stderr 的第一行当作错误原因 */
+function runGit(env: NodeJS.ProcessEnv, cwd: string, args: readonly string[]): string {
+  try {
+    return execFileSync("git", [...args], {
+      cwd,
+      env,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (err) {
+    fail(`git ${args.join(" ")} failed: ${gitDetail(err)}`);
+  }
+}
+
+/** 跑 git，失败时返回 `undefined`（用于「可能不存在」的查询） */
+function gitTry(env: NodeJS.ProcessEnv, cwd: string, args: readonly string[]): string | undefined {
+  try {
+    return execFileSync("git", [...args], {
+      cwd,
+      env,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+function revParse(env: NodeJS.ProcessEnv, cwd: string, ref: string): string | undefined {
+  const value = gitTry(env, cwd, ["rev-parse", "--verify", "--quiet", ref])?.trim();
+  return value === undefined || value === "" ? undefined : value;
+}
+
+function gitDetail(err: unknown): string {
+  const stderr = (err as { stderr?: string | Buffer }).stderr;
+  const text = typeof stderr === "string" ? stderr : stderr?.toString("utf8") ?? String(err);
+  const line = text
+    .split(/\r?\n/u)
+    .map((entry) => entry.trim())
+    .find((entry) => entry !== "");
+  return line ?? String(err);
 }
 
 /**

@@ -1877,18 +1877,9 @@ fn check_source_checksum(expected: Option<&Checksum>, actual: &str) -> Result<()
 }
 
 fn origin_text(origin: &ArtifactOrigin) -> String {
-    match origin {
-        ArtifactOrigin::Local(path) => format!("local:{}", path.display()),
-        ArtifactOrigin::Url(url) => format!("url:{url}"),
-        // 用 `|` 而不是 `@` 分隔：`git@github.com:org/repo` 与
-        // `https://user@host/repo` 这类 URL 本身就含 `@`，按第一个 `@` 拆
-        // 出来的「rev」是 URL 的碎片，`--ref` 校验必然拒绝它，于是 SSH 装的
-        // 插件永远 `update` 不了。`|` 在 URL 与 rev 的字符集里都不出现。
-        ArtifactOrigin::Git { url, rev } => match rev {
-            Some(rev) => format!("git:{url}|{rev}"),
-            None => format!("git:{url}"),
-        },
-    }
+    // 记录文本的格式只由 domain 的 `PluginSource` 定义：写入与读取共用一份，
+    // 避免再次出现「写得进去、读不出来」（旧版 `git:` 记录写 `@` 读 `|`）。
+    origin.record_text()
 }
 
 fn now_secs() -> i64 {
@@ -2903,6 +2894,34 @@ mod tests {
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
+
+    /// 安装记录里的来源文本与 domain 的解析必须成对
+    ///
+    /// 旧版 provider 写 `git:<url>@<commit>`、CLI 读 `git:<url>|<rev>`，写进去
+    /// 的记录永远读不出来，`plugin update` 因此对 git 来源彻底失效。这里锁住
+    /// 「写出来的文本能被 `PluginSource::parse_record` 原样读回」。
+    #[test]
+    fn recorded_source_text_round_trips_through_the_domain_parser() {
+        use domain::plugin::source::PluginSource;
+        for origin in [
+            ArtifactOrigin::Local(PathBuf::from("/opt/plugins/demo")),
+            ArtifactOrigin::Url("https://example.com/plugin.zip".to_owned()),
+            ArtifactOrigin::Github {
+                owner: "octocat".to_owned(),
+                repo: "Hello-World".to_owned(),
+                rev: None,
+            },
+            ArtifactOrigin::Github {
+                owner: "octocat".to_owned(),
+                repo: "Hello-World".to_owned(),
+                rev: Some("dist".to_owned()),
+            },
+        ] {
+            let text = origin_text(&origin);
+            let parsed = PluginSource::parse_record(&text).expect(&text);
+            assert_eq!(ArtifactOrigin::from(parsed), origin, "{text}");
+        }
+    }
 
     #[derive(Default)]
     struct MemoryStore {

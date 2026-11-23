@@ -20,6 +20,7 @@ pub mod event;
 pub mod manifest;
 pub mod revocation;
 pub mod schema;
+pub mod source;
 pub mod state;
 
 use std::fmt;
@@ -38,9 +39,9 @@ pub const DESCRIPTOR_SCHEMA_VERSION: u32 = 3;
 
 /// 当前平台标识：`darwin-arm64` / `linux-x64` / `win32-x64`
 ///
-/// manifest 的 `entry.platforms` 键与 Git 来源索引的 `platform` 字段共用这一
-/// 套命名。安装（`provider`）与运行（`plugin`）都要选平台产物，放在领域层
-/// 才能保证两边不会在新增平台时分叉。
+/// manifest 的 `entry.platforms` 键与 SDK 构建产物的平台目录共用这一套命名。
+/// 安装（`provider`）与运行（`plugin`）都要选平台产物，放在领域层才能保证
+/// 两边不会在新增平台时分叉。
 #[must_use]
 pub fn platform_key() -> String {
     let os = match std::env::consts::OS {

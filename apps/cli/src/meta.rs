@@ -1069,8 +1069,8 @@ pub(crate) fn plugin_list() -> &'static str {
 #[must_use]
 pub(crate) fn plugin_install() -> &'static str {
     t(
-        "安装插件（本地目录 / zip / URL / git）",
-        "install a plugin (local directory / zip / URL / git)",
+        "安装插件（本地目录 / zip / URL / GitHub 仓库）",
+        "install a plugin (local directory / zip / URL / GitHub repository)",
     )
 }
 
@@ -1252,8 +1252,8 @@ pub(crate) fn plugin_json_arg() -> &'static str {
 #[must_use]
 pub(crate) fn plugin_source_arg() -> &'static str {
     t(
-        "本地路径或 URL（省略时由 --from / --url / --git 指定）",
-        "local path or URL (omit when using --from / --url / --git)",
+        "本地路径、压缩包 URL 或 GitHub 仓库链接（省略时由 --from / --url 指定）",
+        "local path, archive URL or GitHub repository link (omit when using --from / --url)",
     )
 }
 
@@ -1268,13 +1268,11 @@ pub(crate) fn plugin_url_arg() -> &'static str {
 }
 
 #[must_use]
-pub(crate) fn plugin_git_arg() -> &'static str {
-    t("从 git 仓库安装", "install from a git repository")
-}
-
-#[must_use]
 pub(crate) fn plugin_ref_arg() -> &'static str {
-    t("git 版本 / 分支", "git revision / branch")
+    t(
+        "GitHub 仓库的分支 / tag / commit（缺省为默认分支）",
+        "branch / tag / commit of the GitHub repository (default: the default branch)",
+    )
 }
 
 #[must_use]

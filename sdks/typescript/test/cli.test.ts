@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
-import { entryWrapperSource, platformEntries } from "../src/cli.js";
+import { entryWrapperSource, isValidBranchName, parseGithubRemote, platformEntries, publishCommitMessage } from "../src/cli.js";
 
 describe("平台启动器（§10.1）", () => {
   it("平台键与宿主 platform_key() 一致", () => {
@@ -44,5 +44,54 @@ describe("平台启动器（§10.1）", () => {
     expect(source).toContain('await import("../dist/index.js")');
     expect(source).toContain("mod.default ?? mod.plugin");
     expect(source).toContain("process.exitCode = await run(plugin)");
+  });
+});
+
+describe("发布到 GitHub（§15.1 / 附录 E）", () => {
+  it("提交信息带上插件 id 与版本", () => {
+    expect(publishCommitMessage("chat-bridge", "0.3.1")).toBe("release: chat-bridge 0.3.1");
+    expect(publishCommitMessage("chat-bridge", undefined)).toBe("release: chat-bridge");
+    expect(publishCommitMessage(undefined, "0.3.1")).toBe("release: plugin 0.3.1");
+    expect(publishCommitMessage(undefined, undefined)).toBe("release: plugin");
+  });
+
+  it("分支名拒绝注入与非法引用形态", () => {
+    for (const ok of ["dist", "release/0.3.1", "v0.3.1", "a_b-c.d"]) {
+      expect(isValidBranchName(ok), ok).toBe(true);
+    }
+    for (const bad of [
+      "",
+      "-x",
+      "a..b",
+      "a//b",
+      "dist/",
+      "dist.lock",
+      "a b",
+      "refs/heads/x;rm",
+      ".hidden",
+    ]) {
+      expect(isValidBranchName(bad), bad).toBe(false);
+    }
+  });
+
+  it("从 remote 地址解析出 owner/repo", () => {
+    expect(parseGithubRemote("https://github.com/example/chat-bridge.git")).toEqual({
+      owner: "example",
+      repo: "chat-bridge",
+    });
+    expect(parseGithubRemote("https://github.com/example/chat-bridge")).toEqual({
+      owner: "example",
+      repo: "chat-bridge",
+    });
+    expect(parseGithubRemote("git@github.com:example/chat-bridge.git")).toEqual({
+      owner: "example",
+      repo: "chat-bridge",
+    });
+    expect(parseGithubRemote("ssh://git@github.com/example/chat-bridge.git")).toEqual({
+      owner: "example",
+      repo: "chat-bridge",
+    });
+    expect(parseGithubRemote("https://gitlab.com/example/chat-bridge")).toBeUndefined();
+    expect(parseGithubRemote("https://github.com/example")).toBeUndefined();
   });
 });

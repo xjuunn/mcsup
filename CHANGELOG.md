@@ -42,8 +42,14 @@
   `pending_approval` 且 `enabled=false`。
 - `service::plugin` 与 CLI 的 `plugin` 子命令族：安装 / 升级 / 版本切换 / 回滚 /
   卸载 / 启停 / 状态 / 日志 / 调用 / 配置 / 授权 / 封禁 / 隔离 / `verify` /
-  `doctor` / `revocations`。安装来源覆盖本地目录、URL 与 git（tag / SHA），
-  摘要不匹配即拒绝。
+  `doctor` / `revocations`。安装来源覆盖本地目录、URL 与 GitHub 仓库归档
+  （裸链接直装），摘要不匹配即拒绝。
+- `mcsup-plugin publish`（TypeScript SDK）：一条命令把产物发布成用户可直接装
+  的 GitHub 来源。构建后用临时索引（`GIT_INDEX_FILE` / `GIT_WORK_TREE` /
+  `GIT_DIR`）把 `<out>` 写成只含产物的一次提交，再推到 `origin/dist`，不切
+  分支、不动工作区与暂存区；`--branch` / `--remote` / `--message` /
+  `--no-build` / `--dry-run`。用户装
+  `mcsup plugin install https://github.com/<owner>/<repo>/tree/dist` 即可。
 - descriptor `schema 3` 的 `bind.servers`：插件声明从哪些配置路径读服务器名，
   服务器 `start` / `stop` / `restart` 时先启停插件，多台服务器中任一在运行就
   保持插件；没有服务器使用时由常驻看门狗收掉，控制台内、游戏内与崩溃停止
@@ -59,6 +65,15 @@
 
 ### 变更
 
+- 插件安装的 GitHub 来源改为**仓库归档直装**，`--git` 与仓库根的
+  `mcsup-plugin.json` 索引一并移除：用户粘一个裸链接
+  （`https://github.com/<owner>/<repo>`，可带 `/tree/<ref>` 指定产物分支）即可，
+  安装器把引用解析成 commit（`api.github.com` 优先，`commits/<ref>.atom` 兜底）
+  后下载 `codeload.github.com/.../zip/<commit>`，不再要求本机装 git，作者也不
+  必维护索引与 Release 资产——产物提交进仓库就是发布。`--ref` 现在只配 GitHub
+  链接，作用是钉住分支 / tag / commit。
+- 安装记录里的 GitHub 来源存**用户请求的引用**而不是解析出来的 commit：存
+  commit 会丢掉分支名，作者把产物放 `dist` 分支时 `update` 就跟不动了。
 - `plugin remove` 默认连配置与数据一起删：产物、记录、日志与
   `plugin-data/<id>/`（配置、密钥、键值）同时消失，卸载不再在盘上留一份过期
   配置。要重装后接着用同一份配置与键值走 `--keep-data`，`--keep-secrets` 连
@@ -99,6 +114,16 @@
 - `apps/agent` 补齐参数解析测试。
 
 ### 修复
+
+- 安装记录的来源文本「写得进去、读不出来」：provider 曾写
+  `git:<url>@<commit>`，CLI 却按 `git:<url>|<rev>` 解析，于是所有 git 来源的
+  `plugin update` 都报 `git sources require --ref`。格式定义收口到
+  `domain::plugin::source::PluginSource` 的 `Display` / `parse_record`，写入与
+  读取共用同一份代码；旧记录仍能识别（GitHub 裸仓库映射成 GitHub 来源，其余
+  报「旧 git 来源不再支持，请重装」）。
+- 插件下载的阻塞 HTTP 客户端没装 rustls crypto provider：`rustls-no-provider`
+  下 reqwest 会在内部线程直接 panic（`No rustls crypto provider is configured`）。
+  `--url` 与 GitHub 归档两条路都走这段代码，现在统一在构造客户端前装一次。
 
 - 插件宿主跟随当前构建：`ensure()` 连上宿主后先做一次 `identity` 控制握手，把
   宿主启动时记下的构建标识（版本 / 可执行文件路径 / 大小 / mtime）与当前可执行

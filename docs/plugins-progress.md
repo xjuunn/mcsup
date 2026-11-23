@@ -44,9 +44,10 @@
   错误统一按 `invalid_input` 报出。
 - `service::plugin::HostApiImpl`：`ServerRead` / `ConsoleIo`。
 - `storage`：`PluginStore` / `KvStore` / `SecretStore` / `AuditSink`。
-- `provider`：`ArtifactSource`（`from` / `url` / `git` tag / SHA，git 来源经
-  `mcsup-plugin.json` 索引解析，安装记录固定到 commit）、
-  `ArtifactVerifier`（摘要校验）。
+- `provider`：`ArtifactSource`（`from` / `url` / GitHub 仓库归档，安装记录存
+  用户请求的引用原样）、`ArtifactVerifier`（摘要校验）。GitHub 来源把引用解析
+  成 commit（`api.github.com` 优先、`commits/<ref>.atom` 兜底）后下载
+  `codeload.github.com/.../zip/<sha>`，不要求本机有 git，也不读取任何索引文件。
 - 事件链路：常驻宿主跟随 `console.log`，发布 `console:line` 与解析出的
   `chat:message` / `player:joined` / `player:left`。
 - 安装与升级：按 id 安装锁；升级先停进程、保留 `enabled` 与仍声明的授权、
