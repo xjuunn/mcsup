@@ -1305,6 +1305,13 @@ descriptor 由 SDK 在构建时生成，与二进制一起打包。宿主只读�
 | `timeout_ms` | 否 | 1000..=300000，默认 30000 |
 | `pagination` | 否 | 列表类 query 必填 |
 
+`output` 在 descriptor 里恒为必填，但作者**不必**声明：SDK 未拿到
+`.output()` 时落一个空 object（`{"type":"object","additionalProperties":false}`），
+并记下「作者没声明」。这种情况下运行期**不校验**返回值——空 object 占位不是
+作者的意图，拿它去校验只会把正常返回判成 `internal: … returned an invalid
+output`。返回 `undefined` 按 `{}` 回传。作者一旦声明了 `output`，返回值与
+分块两侧都照常校验。
+
 ## 11.3 六种展示类型
 
 | `display.type` | 渲染 | 适用 | 额外字段 |
@@ -1933,9 +1940,25 @@ chat-bridge-0.3.1/
 │   ├── darwin-arm64/chat-bridge
 │   ├── linux-x64/chat-bridge
 │   └── win32-x64/chat-bridge.exe
+├── dist/                    # Node / TS 插件：编译产物
+├── node_modules/            # Node / TS 插件：运行时依赖，必须自备
 ├── LICENSE
 └── README.md                # 可选
 ```
+
+**产物必须自带运行时依赖。** 插件装到 `{data_dir}/mcsup/plugins/<id>/<version>/`
+之后，作者的工程目录不在旁边，`node_modules` 解析不到任何东西：进程会以
+`ERR_MODULE_NOT_FOUND` 直接退出，宿主只看到握手超时。TS SDK 的
+`mcsup-plugin build` 因此把生产依赖（含 `mcsup-plugin` 自身与 `zod` 这类
+peer）整棵 vendor 进 `<out>/node_modules`（`sdks/typescript` 的
+`vendorRuntimeDependencies`），而不只写 `package.json`。
+
+**产物里不得有符号链接。** 安装与 `plugin verify` 逐文件检查，遇到符号链接
+直接拒绝（`symbolic link in artifact: …`）：链接可以指到产物外，等于绕过
+「不可变产物目录」这层约束。npm 装出来的 `node_modules/.bin/*` 与
+`file:` 依赖都是链接，所以 vendor 时必须展开成实体文件。依赖包自己的
+`node_modules` 也不照抄：那是它装过的依赖，由 SDK 按 `package.json` 重新解析
+并铺到产物顶层，照抄会把整棵开发依赖（`typescript`、`vitest`）塞进产物。
 
 压缩格式：zip（默认）或 tar.zst。限制：
 
@@ -2794,6 +2817,13 @@ fn main() -> mcsup_plugin_sdk::Exit {
 ```ts
 import { action, definePlugin, query, s } from "mcsup-plugin";
 
+// config schema 先提出来：Builder 要用同一个对象绑 `.config(config)`，
+// `run` 里的 `ctx.config` 才有推导类型
+const config = s.object({
+  token: s.string({ min: 1, secret: true, label: "Bot Token" }),
+  channels: s.array(s.string(), { label: "频道" }),
+});
+
 export default definePlugin({
   id: "chat-bridge",
   title: "聊天桥",
@@ -2804,14 +2834,12 @@ export default definePlugin({
   capabilities: ["console:read", "console:write", "events"],
   subscriptions: ["chat:message"],
 
-  config: s.object({
-    token: s.string({ min: 1, secret: true, label: "Bot Token" }),
-    channels: s.array(s.string(), { label: "频道" }),
-  }),
+  config,
 
   queries: {
     history: query("history")
       .title("聊天记录")
+      .config(config)
       .input(s.object({
         channel: s.string(),
         cursor: s.optional(s.integer()),
@@ -2865,8 +2893,9 @@ export default definePlugin({
 两者可混用。启动样板也不需要写：`mcsup-plugin build` 生成 `bin/entry.mjs`，导入
 默认导出后调用 `run()`。
 
-`mcsup-plugin build` 做三件事：`tsc` 编译、运行 `--mcsup-dump-descriptor` 取
-descriptor、打包 zip。作者不接触端点、帧、路由与界面。
+`mcsup-plugin build` 做四件事：`tsc` 编译、运行 `--mcsup-dump-descriptor` 取
+descriptor、把运行时依赖 vendor 进产物（§15.2「产物必须自带运行时依赖」、
+符号链接展开成实体文件）、打包 zip。作者不接触端点、帧、路由与界面。
 
 # 附录 E：Git 来源索引
 

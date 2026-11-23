@@ -123,6 +123,12 @@ function build(options: BuildOptions): void {
   }
   const wrapper = writeEntryWrapper(options);
 
+  // 必须在 dump 之前 vendor：启动器 `import "mcsup-plugin"`，装到宿主之后
+  // 作者的 node_modules 不在旁边，只有产物自带的这一份能解析。
+  process.stderr.write(`[build] vendor 运行时依赖 ...\n`);
+  const vendored = vendorRuntimeDependencies(options.cwd, options.outDir);
+  process.stderr.write(`[build] 依赖：${vendored.join(", ") || "（无）"}\n`);
+
   // dump 也走启动器：导入插件模块再走 run() 的 dump 分支，
   // 与真实启动同一条路径，避免两处入口行为分叉
   const manifest = dumpManifest(options, wrapper);
@@ -134,6 +140,142 @@ function build(options: BuildOptions): void {
   writeJson(path.join(options.outDir, options.descriptor), descriptor);
 
   process.stderr.write(`[build] 完成：${options.outDir}\n`);
+}
+
+/**
+ * 把运行时依赖整棵拷进 `<out>/node_modules`。
+ *
+ * 为什么必须做：`bin/entry.mjs` 与编译产物都 `import "mcsup-plugin"`（还有
+ * 作者自己声明的依赖、以及 zod 这个 peer）。产物装到宿主目录后，作者的工程
+ * 目录不在旁边，`node_modules` 又不在产物里，进程会以
+ * `ERR_MODULE_NOT_FOUND` 直接退出，宿主只能报 `handshake_timeout`。
+ *
+ * 只拷生产依赖（`dependencies` + 可解析的 `peerDependencies`），不碰
+ * `devDependencies`；`dereference` 把符号链接展开成实体文件——宿主的产物校验
+ * 会拒绝符号链接（`docs/plugins.md` §10.3）。
+ *
+ * @returns 已 vendor 的包名（按发现顺序）
+ */
+export function vendorRuntimeDependencies(cwd: string, outDir: string): readonly string[] {
+  const root = path.join(outDir, "node_modules");
+  fs.rmSync(root, { recursive: true, force: true });
+  const project = readPackageJson(path.join(cwd, "package.json"), "工程 package.json");
+  const queue: Array<{ readonly name: string; readonly from: string; readonly required: boolean }> = [];
+  for (const name of Object.keys(dependencyFields(project, "dependencies"))) {
+    queue.push({ name, from: cwd, required: true });
+  }
+  // 启动器固定 import 本包名，作者把它写进 devDependencies 也要带上
+  queue.push({ name: SDK_PACKAGE, from: cwd, required: true });
+  for (const name of Object.keys(dependencyFields(project, "peerDependencies"))) {
+    queue.push({ name, from: cwd, required: false });
+  }
+
+  const vendored: string[] = [];
+  const seen = new Set<string>();
+  for (let item = queue.shift(); item !== undefined; item = queue.shift()) {
+    if (seen.has(item.name)) {
+      continue;
+    }
+    const source = resolvePackageDir(item.from, item.name);
+    if (source === undefined) {
+      if (item.required) {
+        fail(`dependency ${item.name} is not installed; run npm install`);
+      }
+      continue;
+    }
+    seen.add(item.name);
+    const target = path.join(root, ...item.name.split("/"));
+    try {
+      copyTree(source, target);
+    } catch (err) {
+      fail(`failed to vendor ${item.name}: ${String(err)}`);
+    }
+    vendored.push(item.name);
+    const pkg = readPackageJson(path.join(source, "package.json"), `${item.name} package.json`);
+    for (const name of Object.keys(dependencyFields(pkg, "dependencies"))) {
+      queue.push({ name, from: source, required: true });
+    }
+    for (const name of Object.keys(dependencyFields(pkg, "peerDependencies"))) {
+      queue.push({ name, from: source, required: false });
+    }
+  }
+  return vendored;
+}
+
+/** 启动器固定依赖的 SDK 包名 */
+const SDK_PACKAGE = "mcsup-plugin";
+
+/**
+ * 递归拷贝目录树，跟随符号链接。
+ *
+ * 不用 `fs.cpSync({dereference:true})`：Node 24 上它对文件符号链接不生效
+ * （实测仍拷成链接），而宿主的产物校验会拒绝符号链接（`docs/plugins.md`
+ * §10.3）。目录按真实路径去重，避免符号链接成环时无限递归。
+ *
+ * 包内的 `node_modules` 一律跳过：那是这个包装过的依赖，由队列按
+ * `package.json` 重新解析并铺到顶层——照抄会把整棵开发依赖
+ * （typescript / vitest）塞进产物，`file:` 装的 SDK 尤其明显。
+ */
+function copyTree(source: string, target: string, seen: Set<string> = new Set()): void {
+  const info = fs.statSync(source);
+  if (!info.isDirectory()) {
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.copyFileSync(source, target);
+    return;
+  }
+  const real = fs.realpathSync(source);
+  if (seen.has(real)) {
+    return;
+  }
+  seen.add(real);
+  fs.mkdirSync(target, { recursive: true });
+  for (const entry of fs.readdirSync(source)) {
+    if (entry === "node_modules") {
+      continue;
+    }
+    copyTree(path.join(source, entry), path.join(target, entry), seen);
+  }
+}
+
+/** 读取 package.json；缺失或损坏时给出可读的错误 */
+function readPackageJson(file: string, label: string): Record<string, unknown> {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch {
+    fail(`${label} not found: ${file}`);
+  }
+  try {
+    return JSON.parse(raw) as Record<string, unknown>;
+  } catch (err) {
+    fail(`invalid ${label}: ${String(err)}`);
+  }
+}
+
+/** 取 `dependencies` / `peerDependencies` 的键集合；缺失时为空 */
+function dependencyFields(pkg: Record<string, unknown>, field: string): Record<string, string> {
+  const value = pkg[field];
+  if (typeof value !== "object" || value === null) {
+    return {};
+  }
+  return value as Record<string, string>;
+}
+
+/** 从 `from` 起向上找 `node_modules/<name>/package.json`（兼容嵌套安装） */
+function resolvePackageDir(from: string, name: string): string | undefined {
+  const segments = name.split("/");
+  let dir = path.resolve(from);
+  for (;;) {
+    const candidate = path.join(dir, "node_modules", ...segments);
+    if (fs.existsSync(path.join(candidate, "package.json"))) {
+      return candidate;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) {
+      return undefined;
+    }
+    dir = parent;
+  }
 }
 
 /**

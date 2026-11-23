@@ -1431,6 +1431,49 @@ fn plugin_invalid_id_exits_2() {
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
 }
 
+/// 非法 id / 能力名：退出 2，且文案只出一种语言
+///
+/// 以前中英两行说同一件事：领域错误是英文，入口又拼了一行中文，用户看到的是
+/// 两条重复信息，且 `--lang` 只影响其中一行。
+#[test]
+fn plugin_parse_errors_exit_2_with_one_language() {
+    let home = temp_home();
+
+    let zh = run_with_env(
+        home.path(),
+        &["plugin", "grant", "demo", "nope:cap", "--lang", "zh"],
+        &[],
+    );
+    assert_eq!(zh.status.code(), Some(2), "{}", stderr(&zh));
+    let text = stderr(&zh);
+    assert!(text.contains("能力名非法: nope:cap"), "{text}");
+    assert!(
+        !text.contains("unknown capability"),
+        "中文模式不该出现英文：{text}"
+    );
+
+    let en = run_with_env(
+        home.path(),
+        &["plugin", "grant", "demo", "nope:cap", "--lang", "en"],
+        &[],
+    );
+    assert_eq!(en.status.code(), Some(2), "{}", stderr(&en));
+    let text = stderr(&en);
+    assert!(text.contains("unknown capability: nope:cap"), "{text}");
+    assert!(!text.contains("能力名非法"), "英文模式不该出现中文：{text}");
+
+    // 保留名与格式错误给出不同提示，仍是一行一种语言
+    let reserved = run_with_env(
+        home.path(),
+        &["plugin", "status", "core", "--lang", "en"],
+        &[],
+    );
+    assert_eq!(reserved.status.code(), Some(2), "{}", stderr(&reserved));
+    let text = stderr(&reserved);
+    assert!(text.contains("reserved by the platform"), "{text}");
+    assert!(!text.contains("保留名"), "英文模式不该出现中文：{text}");
+}
+
 /// 本地目录安装 → 列表 → ops → 校验摘要。全程不联网、不拉起宿主。
 #[test]
 fn plugin_install_local_artifact_then_list_ops_and_verify() {

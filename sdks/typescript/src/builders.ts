@@ -24,6 +24,10 @@ interface Draft {
   display?: unknown;
   input: SchemaLike;
   output: SchemaLike;
+  /** 是否显式声明过 output；未声明时运行期不校验返回值 */
+  outputDeclared?: boolean;
+  /** `.config()` 绑定的 config schema（与 definition.config 同一对象） */
+  config?: SchemaLike;
   timeoutMs?: number;
   pagination?: unknown;
   run?: unknown;
@@ -33,12 +37,14 @@ interface Draft {
 const InputKey: unique symbol = Symbol("input");
 const OutputKey: unique symbol = Symbol("output");
 const CapKey: unique symbol = Symbol("capabilities");
+const ConfigKey: unique symbol = Symbol("config");
 
 type WithInput<B, S extends SchemaLike> = B & { readonly [InputKey]: S };
 type WithOutput<B, S extends SchemaLike> = B & { readonly [OutputKey]: S };
 type InputOf<B> = B extends { readonly [InputKey]: infer S extends SchemaLike } ? S : SchemaLike;
 type OutputOf<B> = B extends { readonly [OutputKey]: infer S extends SchemaLike } ? S : SchemaLike;
 type CapOf<B> = B extends { readonly [CapKey]: infer C extends readonly Capability[] } ? C : readonly Capability[];
+type CfgOf<B> = B extends { readonly [ConfigKey]: infer S extends SchemaLike } ? S : SchemaLike;
 
 abstract class BaseOpBuilder<K extends OpKind> {
   protected readonly draft: Draft;
@@ -79,7 +85,20 @@ abstract class BaseOpBuilder<K extends OpKind> {
   /** 输出 schema（字段 DSL 或 zod） */
   public output<S extends SchemaLike>(schema: S): this & { readonly [OutputKey]: S } {
     this.draft.output = schema;
+    this.draft.outputDeclared = true;
     return this as unknown as this & { readonly [OutputKey]: S };
+  }
+
+  /**
+   * 绑定 config schema，`run` 里的 `ctx.config` 才有推导类型。
+   *
+   * 必须传 `definePlugin` 的 `config` 的**同一个对象**：`definePlugin` 会在
+   * 装配时校验这个恒等关系（类型推导依赖它）。省略时不推导，`ctx.config`
+   * 为 `unknown`。
+   */
+  public config<S extends SchemaLike>(schema: S): this & { readonly [ConfigKey]: S } {
+    this.draft.config = schema;
+    return this as unknown as this & { readonly [ConfigKey]: S };
   }
 
   /**
@@ -141,14 +160,14 @@ export class QueryBuilder extends BaseOpBuilder<"query"> {
   /** 处理函数：输入已校验，返回值需与 output schema 一致 */
   public run<B extends this>(
     this: B,
-    fn: (input: InferSchema<InputOf<B>>, ctx: PluginContext<CapOf<B>>) => Promise<InferSchema<OutputOf<B>>> | InferSchema<OutputOf<B>>,
-  ): OpSpec<InputOf<B>, OutputOf<B>> {
+    fn: (input: InferSchema<InputOf<B>>, ctx: PluginContext<CapOf<B>, CfgOf<B>>) => Promise<InferSchema<OutputOf<B>>> | InferSchema<OutputOf<B>>,
+  ): OpSpec<InputOf<B>, OutputOf<B>, CfgOf<B>> {
     this.draft.run = fn;
     return this.build();
   }
 
-  public build<B extends this>(this: B): OpSpec<InputOf<B>, OutputOf<B>> {
-    return finalize(this.draft) as unknown as OpSpec<InputOf<B>, OutputOf<B>>;
+  public build<B extends this>(this: B): OpSpec<InputOf<B>, OutputOf<B>, CfgOf<B>> {
+    return finalize(this.draft) as unknown as OpSpec<InputOf<B>, OutputOf<B>, CfgOf<B>>;
   }
 }
 
@@ -164,14 +183,14 @@ export class ActionBuilder extends BaseOpBuilder<"action"> {
 
   public run<B extends this>(
     this: B,
-    fn: (input: InferSchema<InputOf<B>>, ctx: PluginContext<CapOf<B>>) => Promise<InferSchema<OutputOf<B>>> | InferSchema<OutputOf<B>>,
-  ): OpSpec<InputOf<B>, OutputOf<B>> {
+    fn: (input: InferSchema<InputOf<B>>, ctx: PluginContext<CapOf<B>, CfgOf<B>>) => Promise<InferSchema<OutputOf<B>>> | InferSchema<OutputOf<B>>,
+  ): OpSpec<InputOf<B>, OutputOf<B>, CfgOf<B>> {
     this.draft.run = fn;
     return this.build();
   }
 
-  public build<B extends this>(this: B): OpSpec<InputOf<B>, OutputOf<B>> {
-    return finalize(this.draft) as unknown as OpSpec<InputOf<B>, OutputOf<B>>;
+  public build<B extends this>(this: B): OpSpec<InputOf<B>, OutputOf<B>, CfgOf<B>> {
+    return finalize(this.draft) as unknown as OpSpec<InputOf<B>, OutputOf<B>, CfgOf<B>>;
   }
 }
 
@@ -188,14 +207,14 @@ export class StreamBuilder extends BaseOpBuilder<"stream"> {
   /** 处理函数返回同步或异步分块迭代器；SDK 负责 stream 帧与 seq */
   public run<B extends this>(
     this: B,
-    fn: (input: InferSchema<InputOf<B>>, ctx: PluginContext<CapOf<B>>) => StreamChunks<InferSchema<OutputOf<B>>>,
-  ): OpSpec<InputOf<B>, OutputOf<B>> {
+    fn: (input: InferSchema<InputOf<B>>, ctx: PluginContext<CapOf<B>, CfgOf<B>>) => StreamChunks<InferSchema<OutputOf<B>>>,
+  ): OpSpec<InputOf<B>, OutputOf<B>, CfgOf<B>> {
     this.draft.run = fn;
     return this.build();
   }
 
-  public build<B extends this>(this: B): OpSpec<InputOf<B>, OutputOf<B>> {
-    return finalize(this.draft) as unknown as OpSpec<InputOf<B>, OutputOf<B>>;
+  public build<B extends this>(this: B): OpSpec<InputOf<B>, OutputOf<B>, CfgOf<B>> {
+    return finalize(this.draft) as unknown as OpSpec<InputOf<B>, OutputOf<B>, CfgOf<B>>;
   }
 }
 
@@ -249,6 +268,8 @@ function finalize(draft: Draft): OpSpec {
     display: draft.display,
     input: draft.input,
     output: draft.output,
+    outputDeclared: draft.outputDeclared === true,
+    config: draft.config,
     timeoutMs: draft.timeoutMs,
     pagination: draft.pagination,
     run: draft.run,

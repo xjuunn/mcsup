@@ -988,10 +988,27 @@ impl PluginService {
         // 进程停掉再告诉用户「已安装」——插件会一直停在那里，用户还得手动
         // 拉起来。
         let target = self.plugins_root.join(id.as_str()).join(&version);
+        // 同版本判重只对「记录正在用的那一版」成立。目录存在但记录不指向它，
+        // 说明上一次升级在这个版本上失败过（`restore_after_failed_start` 把记录
+        // 切回旧版本，新版本目录留在盘上）：不清掉的话这一版再也装不回来——
+        // `install` 报 already exists，`rollback` 又没有回滚目标。
         if target.exists() {
-            return Err(PluginError::AlreadyExists(format!(
-                "{id} {version} is already installed"
-            )));
+            let active = previous
+                .as_ref()
+                .is_some_and(|record| record.version == version);
+            if active {
+                return Err(PluginError::AlreadyExists(format!(
+                    "{id} {version} is already installed"
+                )));
+            }
+            if let Err(err) = std::fs::remove_dir_all(&target) {
+                return Err(PluginError::Fs(FsError::io(&target, err)));
+            }
+            tracing::warn!(
+                plugin = %id,
+                version = %version,
+                "removed a version directory that no record references"
+            );
         }
         // 升级时进程必须先停：旧进程还在用旧产物目录，rename 后它写的是
         // 已被移走的目录。旧状态走一次 UpdateStarted 迁移，留下审计痕迹。
@@ -1169,6 +1186,19 @@ impl PluginService {
             result: AuditResult::Failed,
             detail: Some(format!("{reason}; restored version {}", restored.version)),
         });
+        // 失败版本的目录此刻没人引用（记录已切回旧版本）：留在盘上会让这一版
+        // 永远装不回来，`install` 只会报 already exists。
+        let failed_dir = self.plugins_root.join(id.as_str()).join(failed_version);
+        if failed_dir.is_dir()
+            && let Err(err) = std::fs::remove_dir_all(&failed_dir)
+        {
+            tracing::warn!(
+                plugin = %id,
+                version = %failed_version,
+                error = %err,
+                "failed to remove the version directory that could not start"
+            );
+        }
         // 旧版本重新拉起；起不来时保留失败记录，由调用方看到首个错误
         if let Err(err) = self.start(id) {
             tracing::warn!(plugin = %id, error = %err, "restored version failed to start");

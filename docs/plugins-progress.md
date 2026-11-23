@@ -51,7 +51,9 @@
   `chat:message` / `player:joined` / `player:left`。
 - 安装与升级：按 id 安装锁；升级先停进程、保留 `enabled` 与仍声明的授权、
   默认保留 2 个版本（`--prune` 清得更旧，但始终留下 `previous_version`）；`update --to` 切换到已安装的
-  版本（`PluginService::activate_version`）。
+  版本（`PluginService::activate_version`）。失败路径不留孤儿目录：记录不指向
+  的版本目录在重装时先删再装，新版本起不来时回滚记录并删掉该版本目录。
+  回归用例在 `crates/service/tests/plugin_install_recovery.rs`。
 - op 执行约束：宿主按 descriptor 校验输入 schema，超时取 descriptor 声明的
   `timeout_ms`；授权判定收敛到 `PluginRecord::grant_capability` /
   `revoke_capability` 与 `PluginState::after_grant` / `after_revoke`。
@@ -167,10 +169,10 @@
 | 单一内核 | `definePlugin({...})`，manifest / descriptor 由同一份定义生成 |
 | Builder | `query` / `action` / `stream` / `op` / `lineFilter`，产物是内核可接受的片段 |
 | Hooks | `useConsoleTail` / `useRetry` / `useKvCache` / `useEvents`，签名 `useX(ctx, options)` |
-| 类型安全 | 能力驱动 `ctx`（未声明即编译期不存在）、zod v4 唯一 schema 层、输出 schema 双向校验、`PluginError` 统一错误 |
+| 类型安全 | 能力驱动 `ctx`（未声明即编译期不存在）、config 推导 `ctx.config`（Builder 用 `.config(schema)` 绑定）、zod v4 唯一 schema 层、声明了 `output` 才校验返回值、`PluginError` 统一错误 |
 | 协议 | 帧编解码、深度与 24 MiB 限制、握手、调用、流（seq / done / cancel）、config、ping/pong、shutdown、退出码 0/1/2/3/4 |
-| 构建 | `mcsup-plugin build`：tsc → `--mcsup-dump-descriptor` → 打包 + 平台启动器 |
-| 测试 | 101 用例：协议、descriptor 归一化与校验、Builder 类型、Hooks、MockHost、真实进程、`sdks/conformance`（schema 12 条 + frames 6 条 + cases 13 条） |
+| 构建 | `mcsup-plugin build`：tsc → `--mcsup-dump-descriptor` → 依赖 vendor 进 `<out>/node_modules` → 打包 + 平台启动器 |
+| 测试 | 235 用例：协议、descriptor 归一化与校验、Builder 类型、Hooks、MockHost、真实进程、依赖 vendor、`sdks/conformance`（schema 12 条 + frames 6 条 + cases 13 条） |
 | 门禁 | `scripts/check-sdk.sh`（已接入 `scripts/check.sh` 的 `sdk` 步骤；含 `npm run conformance` 与契约「生成一致」） |
 | 契约 | `contracts/v1.ts` 由 `protocol::plugin::contracts` 生成，禁止手写；`src/protocol.ts` 只留编解码并从生成物重导出 |
 
@@ -179,7 +181,13 @@
 - 声明的能力若未被授予，运行期访问 `ctx.<能力>` 抛 `denied`，而不是返回
   `undefined`；`Hook` 同样报 `denied`。
 - Builder 的 `.capabilities([...])` 决定 op 处理函数里 `ctx` 的类型；省略时
-  `ctx` 为完整能力集合。
+  `ctx` 为完整能力集合。能力收窄只作用于回调形参，不进入片段类型（片段要能被
+  任意能力集合的 `definePlugin` 接受）。
+- Builder 的 `.config(schema)` 让片段的 `ctx.config` 有推导类型；必须传
+  `definePlugin` 的同一个 schema 对象，绑错在装配期抛错。原生对象写法不需要它。
+- 未声明 `.output()` 的 op：descriptor 仍落空 object 占位（§11.2 要求必填），
+  运行期不校验返回值，返回 `undefined` 回 `{}`。声明了 `output` 就照常校验
+  返回值与流分块。
 - `contract.call` 在 v1 返回 `unsupported`，SDK 不内置契约路由。
 - descriptor 生成期执行 §11.2–§11.5 全量校验（子集、限值、display 形状与
   引用、默认推断、op 字段约束），错误带字段路径；宿主安装期可复用同一套

@@ -97,4 +97,71 @@ describe("类型安全", () => {
     });
     expect(plugin.definition.id).toBe("dsl-config");
   });
+
+  it("原生对象写法的 op 也拿到 ctx.config 的推导类型", () => {
+    const plugin = definePlugin({
+      id: "raw-config",
+      title: "原生对象",
+      version: "1.0.0",
+      license: "MIT",
+      capabilities: ["server:read"],
+      config: s.object({ greeting: s.string({ default: "hi" }) }),
+      queries: {
+        raw: {
+          kind: "query",
+          input: s.object({}),
+          output: s.object({ text: s.string() }),
+          run: (_input, ctx) => {
+            const greeting: string = ctx.config.greeting;
+            // @ts-expect-error greeting 推导为 string
+            const wrong: number = ctx.config.greeting;
+            return { text: `${greeting}${wrong}` };
+          },
+        },
+      },
+    });
+    expect(plugin.definition.id).toBe("raw-config");
+  });
+
+  it("Builder 的 .config(cfg) 让 run 里的 ctx.config 有类型", () => {
+    const config = s.object({ greeting: s.string({ default: "hi" }) });
+    const plugin = definePlugin({
+      id: "builder-config",
+      title: "Builder 配置",
+      version: "1.0.0",
+      license: "MIT",
+      capabilities: ["server:read"],
+      config,
+      queries: {
+        ping: query("ping")
+          .config(config)
+          .output(s.object({ greeting: s.string() }))
+          .run((_input, ctx) => {
+            const greeting: string = ctx.config.greeting;
+            // @ts-expect-error greeting 推导为 string
+            const wrong: number = ctx.config.greeting;
+            return { greeting: `${greeting}${wrong}` };
+          }),
+      },
+    });
+    expect(plugin.definition.id).toBe("builder-config");
+  });
+
+  it(".config() 传错 schema 对象在装配时报错", () => {
+    const config = s.object({ greeting: s.string() });
+    const other = s.object({ greeting: s.string() });
+    expect(() =>
+      definePlugin({
+        id: "wrong-config",
+        title: "错配置",
+        version: "1.0.0",
+        license: "MIT",
+        capabilities: [],
+        config,
+        queries: {
+          ping: query("ping").config(other).output(s.object({})).run(() => ({})),
+        },
+      }),
+    ).toThrow(/\.config\(\) must be the same schema object/);
+  });
 });

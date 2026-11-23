@@ -233,6 +233,35 @@ export default chatBridgePreset({
 越权调用在编译期失败，而不是等宿主拒绝。第三方 Hook 的 `ctx` 参数同样受此
 约束，非官方 hook 无法要求未声明的能力。
 
+`ctx.config` 同理：类型来自 `definePlugin` 的 `config` schema（DSL 或 zod），
+`run` 里不需要任何标注。Builder 片段在定义处拿不到 `definePlugin` 的参数，
+因此要用 `.config(config)` 把**同一个 schema 对象**绑到片段上：
+
+```ts
+const config = s.object({ greeting: s.string({ default: "hi" }) });
+
+export default definePlugin({
+  config,
+  queries: {
+    ping: query("ping")
+      .config(config)                                   // 绑定：ctx.config 有类型
+      .output(s.object({ text: s.string() }))
+      .run((_input, ctx) => ({ text: ctx.config.greeting })),
+  },
+});
+```
+
+- 漏绑 `.config()` 时 `ctx.config` 是 `unknown`：取字段那行会报 `TS18046`，
+  提示就是回去补 `.config(config)`。SDK 不会猜一个错的类型。
+- 绑了**别的**对象时 `definePlugin` 在装配期抛错
+  （`op <id>: .config() must be the same schema object as definition.config`）：
+  类型推导依赖这个恒等关系，结构相同不能蒙过去。
+
+`[规范]` 能力收窄只作用于 Builder 回调的**形参**，不进入片段类型。片段要能被
+任意能力集合的 `definePlugin` 接受；若片段带具体能力集的 `PluginContext`，
+不同能力集合的 `ctx` 属性集不相交，片段回填进 `queries` / `actions` 会直接
+赋值失败。能力越权的编译期检查因此落在「写回调时」这一处，正是它该生效的地方。
+
 ## 6.2 内核唯一 schema 层，DSL 是归约适配器
 
 - config 与 op 的输入输出只声明一遍，同时得到：编译期类型、运行时校验、
@@ -252,6 +281,11 @@ export default chatBridgePreset({
 
 op 输出类型从 `run` 的返回值与 output schema 双向校验；能用推导的不给作者
 留手写标注位。SDK 公开面里不出现要求作者写 `any` / 断言的位置。
+
+校验强度跟着**声明**走：作者写了 `.output(...)` 才校验返回值与流分块；没写时
+descriptor 落一个空 object 占位（`plugins.md` §11.2 要求该字段必填），但运行期
+不拿它去校验——空 object 占位不是作者的意图，拿它校验只会把正常返回判成
+`internal: … returned an invalid output`。返回 `undefined` 按 `{}` 回传。
 
 ## 6.4 统一错误类型
 

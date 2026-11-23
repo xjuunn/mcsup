@@ -629,6 +629,8 @@ export function collectOps<
       display: spec.display,
       input: toZod(spec.input),
       output: toZod(spec.output),
+      // 原生对象写法必然显式写了 output；Builder 只有调过 `.output()` 才算声明
+      outputDeclared: spec.outputDeclared !== false,
       timeoutMs: spec.timeoutMs,
       pagination: spec.pagination,
       run: spec.run,

@@ -22,6 +22,13 @@ export const STREAM_IDLE_TIMEOUT_MS = 60_000;
 interface StreamOpShape {
   readonly id: string;
   readonly output: z.ZodType;
+  /**
+   * 作者是否显式声明过 output。
+   *
+   * 未声明（Builder 没调 `.output()`）时分块原样发出，不做校验——空 object
+   * 占位 schema 会把每一个分块都判成非法。
+   */
+  readonly outputDeclared?: boolean;
 }
 
 /** 流式泵选项；测试可缩短空闲窗口 */
@@ -98,7 +105,10 @@ export async function pumpStream(
       if (next.done === true) {
         break;
       }
-      const checked = op.output.safeParse(next.value);
+      const checked =
+        op.outputDeclared === false
+          ? { success: true as const, data: next.value }
+          : op.output.safeParse(next.value);
       if (!checked.success) {
         await channel.send({
           type: "result",

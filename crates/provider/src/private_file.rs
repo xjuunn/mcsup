@@ -4,7 +4,6 @@
 //! 「撤销列表」或「密钥」，等于绕开整条判定链。检查按「权限位比要求更宽就
 //! 拒绝」做，不静默收紧——静默改权限会让用户看不到自己配错了。
 
-#[cfg(unix)]
 use port::plugin::HostError;
 use std::path::Path;
 
@@ -41,8 +40,16 @@ pub(crate) fn check_permissions(
 
 /// 非 Unix：无 mode 位，放行
 ///
+/// 返回 `Result` 而不是 `()`：调用方统一用 `?` 传播，不必按平台分叉写法。
+///
 /// # Errors
 ///
 /// 不会返回错误。
 #[cfg(not(unix))]
-pub(crate) fn check_permissions(_path: &Path, _metadata: &std::fs::Metadata, _is_dir: bool) {}
+pub(crate) fn check_permissions(
+    _path: &Path,
+    _metadata: &std::fs::Metadata,
+    _is_dir: bool,
+) -> Result<(), HostError> {
+    Ok(())
+}

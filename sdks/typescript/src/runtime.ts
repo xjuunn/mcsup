@@ -787,7 +787,12 @@ export class Session<C extends readonly Capability[], Cfg extends SchemaLike = S
         return;
       }
       const output = await this.runOnce(op, parsed.data, controller.signal);
-      const checked = op.output.safeParse(output);
+      // 未声明 output 的 op 不校验：`output` 只是 descriptor 要求的空 object 占位，
+      // 校验只会把正常返回值判成 internal 错误。`undefined` 按 `{}` 回传。
+      const checked =
+        op.outputDeclared === false
+          ? { success: true as const, data: output === undefined ? {} : output }
+          : op.output.safeParse(output);
       if (!checked.success) {
         this.replyError(
           frame.id,

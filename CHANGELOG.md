@@ -54,6 +54,8 @@
 - `docs/plugins.md`：插件契约主文档（manifest / descriptor、能力风险与授权、
   帧协议与限额、安装流水线与回滚、CLI 契约）；`docs/plugins-testing.md` 给出
   可映射到测试的用例编号。
+- TypeScript SDK 的 `Builder.config(schema)`：把 config schema 绑到 op 片段上，
+  `run` 里的 `ctx.config` 才有推导类型（`docs/sdk-design.md` §6.1）。
 
 ### 变更
 
@@ -87,6 +89,30 @@
 
 ### 修复
 
+- TypeScript SDK 的构建产物自带运行时依赖：`mcsup-plugin build` 把生产依赖整棵
+  vendor 进 `<out>/node_modules`——`dependencies` 声明的包、`mcsup-plugin` 自身、
+  能解析到的 `peerDependencies`（如 `zod`）及其传递依赖，`devDependencies` 不进
+  产物。此前产物只有 `dist/` 与启动器，装到宿主目录后 `import "mcsup-plugin"`
+  解析不到任何东西，进程以 `ERR_MODULE_NOT_FOUND` 退出，宿主只看到
+  `handshake_timeout`。拷入时把符号链接展开成实体文件（`fs.cpSync` 的
+  `dereference` 在 Node 24 上对文件链接不生效），宿主的产物校验会拒绝链接。
+- TypeScript SDK 的 `ctx.config` 不再丢类型：op 片段按 `config` schema 推导
+  `ctx.config`，Builder 用 `.config(schema)` 绑定（必须是 `definePlugin` 的同一个
+  schema 对象，绑错在装配时报错）。此前 `config` 已声明、`run` 里 `ctx.config`
+  仍是 `unknown`（`TS18046`），只能手写断言。
+- 未声明 `.output()` 的 op 不再必然运行期失败：descriptor 仍落空 object 占位
+  （`docs/plugins.md` §11.2 要求该字段必填），但运行期跳过输出校验，返回
+  `undefined` 回 `{}`；流式 op 的分块校验同此。此前任何返回对象都被判成
+  `internal: op … returned an invalid output: ✖ Unrecognized key`。
+- 插件安装失败不再留下无人引用的版本目录：目录存在但记录不指向该版本时（上次
+  升级在该版本上启动失败）先删再装，同一版本不再永远报 already exists；
+  `restore_after_failed_start` 回滚后也删掉起不来的版本目录，`update` 不再留下
+  「装着装不回来、回滚又没目标」的版本。
+- `plugin grant` / `plugin revoke` / `plugin status` 等命令的 id 与能力名解析
+  错误不再中英各来一行：文案随 `--lang` 只出一种语言，可用能力清单与保留名提示
+  同样本地化，退出码仍是 2。
+- 撤销列表的权限检查结果不再被丢弃：`load_revocation_list` 把
+  `check_permissions` 的错误传播出去，权限过宽的撤销列表不再照常加载。
 - 批量下载的进度记账改为按单文件高水位：分段重试退款、换源或「分段回退单流」
   从 0 重来时，重传的字节不再重复计入，进度条不再显示超过总量的数字
   （实测 `88.93 MiB/88.41 MiB`），速度也不会虚高。单文件以清单声明大小封顶。

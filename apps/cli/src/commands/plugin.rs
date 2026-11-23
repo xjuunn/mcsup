@@ -128,15 +128,49 @@ fn open_bound() -> Result<(PluginService, BoundPlugins)> {
     Ok((mcsup.plugins.clone(), BoundPlugins::new(&mcsup)))
 }
 
-fn parse_id(raw: &str) -> Result<PluginId> {
+fn parse_id(raw: &str, lang: crate::locale::Lang) -> Result<PluginId> {
     PluginId::parse(raw).map_err(|err| {
-        AppDiagnostic::usage(format!("插件 id 非法: {raw}"), Some(err.to_string())).into()
+        // 单行、随 `--lang` 切换：不留「中文 + 英文」两行说同一件事。领域
+        // 错误只用来区分「格式不符」与「保留名」，文案由这里按语言给。
+        AppDiagnostic::usage(
+            crate::i18n::pick(
+                lang,
+                format!("插件 id 非法: {raw}"),
+                format!("invalid plugin id: {raw}"),
+            ),
+            Some(match err.reason {
+                mcsup::domain::plugin::IdReject::Format => crate::i18n::pick(
+                    lang,
+                    "id 只允许小写字母、数字与连字符，首字符必须是字母，长度 2..=64",
+                    "ids match ^[a-z][a-z0-9-]{1,63}$: lowercase letters, digits and dashes only",
+                ),
+                mcsup::domain::plugin::IdReject::Reserved => crate::i18n::pick(
+                    lang,
+                    format!("{raw} 是平台保留名（mcsup / core / mod）"),
+                    format!("{raw} is reserved by the platform (mcsup / core / mod)"),
+                ),
+            }),
+        )
+        .into()
     })
 }
 
-fn parse_capability(raw: &str) -> Result<Capability> {
-    Capability::parse(raw).map_err(|err| {
-        AppDiagnostic::usage(format!("能力名非法: {raw}"), Some(err.to_string())).into()
+fn parse_capability(raw: &str, lang: crate::locale::Lang) -> Result<Capability> {
+    Capability::parse(raw).map_err(|_| {
+        let available = Capability::ALL.map(Capability::as_str).join(" / ");
+        AppDiagnostic::usage(
+            crate::i18n::pick(
+                lang,
+                format!("能力名非法: {raw}"),
+                format!("unknown capability: {raw}"),
+            ),
+            Some(crate::i18n::pick(
+                lang,
+                format!("可用能力：{available}"),
+                format!("available capabilities: {available}"),
+            )),
+        )
+        .into()
     })
 }
 
@@ -1056,7 +1090,7 @@ fn update(
     setup: bool,
     printer: Printer,
 ) -> Result<()> {
-    let id = parse_id(id)?;
+    let id = parse_id(id, printer.lang())?;
     let (service, bound) = open_bound()?;
     let spinner_text = if to.is_some() {
         "正在切换插件版本…"
@@ -1162,7 +1196,7 @@ fn update(
 /// 询问配置。启用状态沿用原样（未启用的不会被顺手拉起），只在原本运行中
 /// 时重启一次，让新配置生效。装载了 `choicesFrom` 的字段同样走服务器枚举。
 fn setup(id: &str, printer: Printer) -> Result<()> {
-    let id = parse_id(id)?;
+    let id = parse_id(id, printer.lang())?;
     let (service, bound) = open_bound()?;
     let record = service.record(&id)?;
     let lang = printer.lang();
@@ -1291,7 +1325,7 @@ fn upgrade_from_source(
 }
 
 fn remove(id: &str, purge: bool, keep_secrets: bool, printer: Printer) -> Result<()> {
-    let id = parse_id(id)?;
+    let id = parse_id(id, printer.lang())?;
     let service = open()?;
     service.remove_with(&id, purge, keep_secrets)?;
     printer.print_outcome(
@@ -1313,7 +1347,7 @@ fn remove(id: &str, purge: bool, keep_secrets: bool, printer: Printer) -> Result
 }
 
 fn set_enabled(id: &str, enable: bool, printer: Printer) -> Result<()> {
-    let id = parse_id(id)?;
+    let id = parse_id(id, printer.lang())?;
     let service = open()?;
     let record = if enable {
         service.enable(&id)?
@@ -1335,7 +1369,7 @@ fn set_enabled(id: &str, enable: bool, printer: Printer) -> Result<()> {
 }
 
 fn start(id: &str, printer: Printer) -> Result<()> {
-    let id = parse_id(id)?;
+    let id = parse_id(id, printer.lang())?;
     let (service, bound) = open_bound()?;
     // 本机状态先判：拉黑 / 隔离 / 停用的插件根本不该启动，别让绑定门禁的
     // 「已跳过启动」把它盖成一次成功
@@ -1381,7 +1415,7 @@ fn start(id: &str, printer: Printer) -> Result<()> {
 }
 
 fn stop(id: &str, grace: u64, printer: Printer) -> Result<()> {
-    let id = parse_id(id)?;
+    let id = parse_id(id, printer.lang())?;
     let service = open()?;
     // 上限用领域常量（与 `server stop` 同一份）：静默夹紧会让用户以为
     // 「`--grace 600`」真的生效了，实际只等了别的值。
@@ -1413,7 +1447,7 @@ fn stop(id: &str, grace: u64, printer: Printer) -> Result<()> {
 }
 
 fn restart(id: &str, printer: Printer) -> Result<()> {
-    let id = parse_id(id)?;
+    let id = parse_id(id, printer.lang())?;
     let (service, bound) = open_bound()?;
     // 同 `start`：本机状态先判，避免被「已跳过重启」盖成成功
     reject_unstartable(&service, &id, printer)?;
@@ -1452,7 +1486,7 @@ fn restart(id: &str, printer: Printer) -> Result<()> {
 
 fn status(id: &str, printer: Printer, json: bool) -> Result<()> {
     let printer = json_printer(printer, json);
-    let id = parse_id(id)?;
+    let id = parse_id(id, printer.lang())?;
     let service = open()?;
     let record = service.record(&id)?;
     let status = service.status(&id)?;
@@ -1518,7 +1552,7 @@ fn status(id: &str, printer: Printer, json: bool) -> Result<()> {
 
 fn ops(id: &str, printer: Printer, json: bool) -> Result<()> {
     let printer = json_printer(printer, json);
-    let id = parse_id(id)?;
+    let id = parse_id(id, printer.lang())?;
     let service = open()?;
     let descriptor = service.descriptor(&id)?;
     if printer.is_human() {
@@ -1591,7 +1625,7 @@ fn call(
     json: bool,
 ) -> Result<()> {
     let printer = json_printer(printer, json);
-    let id = parse_id(id)?;
+    let id = parse_id(id, printer.lang())?;
     let input = read_input(input)?;
     plugin_host::ensure()?;
     let service = open()?;
@@ -1675,7 +1709,7 @@ fn config_cmd(action: &PluginConfigAction, printer: Printer) -> Result<()> {
     match action {
         PluginConfigAction::Get { id, key, json } => {
             let printer = json_printer(printer, *json);
-            let id = parse_id(id)?;
+            let id = parse_id(id, printer.lang())?;
             let service = open()?;
             let config = service.config_get(&id)?;
             let revision = config.get("revision").and_then(Value::as_u64).unwrap_or(0);
@@ -1736,7 +1770,7 @@ fn config_cmd(action: &PluginConfigAction, printer: Printer) -> Result<()> {
             file,
             secret,
         } => {
-            let id = parse_id(id)?;
+            let id = parse_id(id, printer.lang())?;
             let value = config_value(value.as_deref(), file.as_deref(), *secret)?;
             let service = open()?;
             // 点号路径走深度合并，只改目标叶子；单段键沿用顶层写入。
@@ -1845,7 +1879,7 @@ enum FlagAction {
 }
 
 fn set_flag(raw: &str, action: FlagAction, printer: Printer) -> Result<()> {
-    let id = parse_id(raw)?;
+    let id = parse_id(raw, printer.lang())?;
     let service = open()?;
     let record = match action {
         FlagAction::Block => service.block(&id)?,
@@ -2016,8 +2050,8 @@ fn flag_text(record: &PluginRecord) -> &'static str {
 }
 
 fn grant(id: &str, capability: &str, printer: Printer) -> Result<()> {
-    let id = parse_id(id)?;
-    let capability = parse_capability(capability)?;
+    let id = parse_id(id, printer.lang())?;
+    let capability = parse_capability(capability, printer.lang())?;
     let service = open()?;
     let record = service.grant(&id, capability)?;
     printer.print_outcome(
@@ -2035,8 +2069,8 @@ fn grant(id: &str, capability: &str, printer: Printer) -> Result<()> {
 }
 
 fn revoke(id: &str, capability: &str, printer: Printer) -> Result<()> {
-    let id = parse_id(id)?;
-    let capability = parse_capability(capability)?;
+    let id = parse_id(id, printer.lang())?;
+    let capability = parse_capability(capability, printer.lang())?;
     let service = open()?;
     let record = service.revoke(&id, capability)?;
     printer.print_outcome(
@@ -2054,7 +2088,7 @@ fn revoke(id: &str, capability: &str, printer: Printer) -> Result<()> {
 }
 
 fn logs(id: &str, follow: bool, tail: usize, printer: Printer) -> Result<()> {
-    let id = parse_id(id)?;
+    let id = parse_id(id, printer.lang())?;
     plugin_host::ensure()?;
     let service = open()?;
     let mut offset: Option<u64> = None;
@@ -2172,7 +2206,7 @@ fn sha256_hint(target: &str) -> Option<Checksum> {
 }
 
 fn rollback(id: &str, printer: Printer) -> Result<()> {
-    let id = parse_id(id)?;
+    let id = parse_id(id, printer.lang())?;
     let service = open()?;
     let record = service.rollback(&id)?;
     printer.print_outcome(

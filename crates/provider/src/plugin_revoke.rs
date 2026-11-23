@@ -48,7 +48,8 @@ pub fn load_revocation_list(path: &Path) -> Result<Option<RevocationList>, HostE
             path.display()
         )));
     }
-    private_file::check_permissions(path, &metadata, false);
+    // 权限过宽必须拒绝：同机其他用户能改撤销列表，等于绕开整条判定链
+    private_file::check_permissions(path, &metadata, false)?;
     let file = std::fs::File::open(path).map_err(|err| {
         HostError::internal(format!("open revocation list {}: {err}", path.display()))
     })?;

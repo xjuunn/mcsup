@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { definePlugin, query, z } from "../src/index.js";
+import { action, definePlugin, query, z } from "../src/index.js";
 import { type FrameChannel } from "../src/connection.js";
 import { pumpStream } from "../src/stream.js";
 import { run } from "../src/runtime.js";
@@ -37,6 +37,68 @@ describe("内核定义", () => {
         config: z.object({}),
       }),
     ).toThrow(/net:outbound/);
+  });
+});
+
+describe("未声明 output 的 op", () => {
+  const base = {
+    id: "no-output",
+    title: "无输出",
+    version: "1.0.0",
+    license: "MIT",
+    capabilities: [],
+    config: z.object({}),
+  } as const;
+
+  it("返回值原样回传，不被空 object 占位 schema 判成非法", async () => {
+    const plugin = definePlugin({
+      ...base,
+      actions: {
+        shout: action("shout")
+          .input(z.object({ text: z.string() }))
+          .run((input) => ({ done: input.text.toUpperCase() })),
+      },
+    });
+    const host = createMockHost(plugin);
+    await host.start();
+    expect(await host.callOp("shout", { text: "hi" })).toEqual({ ok: true, output: { done: "HI" } });
+    await host.shutdown();
+  });
+
+  it("返回 undefined 时回 {}", async () => {
+    const plugin = definePlugin({
+      ...base,
+      actions: {
+        touch: action("touch")
+          .input(z.object({}))
+          .run(() => undefined),
+      },
+    });
+    const host = createMockHost(plugin);
+    await host.start();
+    expect(await host.callOp("touch", {})).toEqual({ ok: true, output: {} });
+    await host.shutdown();
+  });
+
+  it("显式声明 output 时仍然双向校验", async () => {
+    const plugin = definePlugin({
+      ...base,
+      queries: {
+        ping: query("ping")
+          .input(z.object({}))
+          .output(z.object({ ok: z.boolean() }))
+          .run(() => ({ ok: "not-bool" }) as unknown as { ok: boolean }),
+      },
+    });
+    const host = createMockHost(plugin);
+    await host.start();
+    const result = await host.callOp("ping", {});
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.code).toBe("internal");
+      expect(result.error.message).toMatch(/invalid output/);
+    }
+    await host.shutdown();
   });
 });
 

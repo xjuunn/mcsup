@@ -35,11 +35,16 @@ export type OpKind = "query" | "action" | "stream";
 /** 风险等级（plugins.md §8.3） */
 export type OpRisk = "read" | "mutating" | "destructive";
 
-/** 允许 Builder / 原生对象两种写法的结构子集 */
-export type OpSpecLike = Partial<ResolvedOp>;
-
-/** op 处理函数签名 */
-export type OpRun = (input: unknown, ctx: PluginContext) => unknown;
+/**
+ * 松散的 op 形态：Builder 产物与原生对象的公共部分。
+ *
+ * `input` / `output` 在归约前可以是字段 DSL 也可以是 zod（`SchemaLike`），
+ * `ResolvedOp` 才是归约后只有 zod 的形态。
+ */
+export type OpSpecLike = Partial<Omit<ResolvedOp, "input" | "output">> & {
+  readonly input?: SchemaLike;
+  readonly output?: SchemaLike;
+};
 
 /** 归约后的 op 描述（内核内部表示） */
 export interface ResolvedOp {
@@ -51,16 +56,47 @@ export interface ResolvedOp {
   readonly display?: unknown;
   readonly input: z.ZodType;
   readonly output: z.ZodType;
+  /**
+   * 作者是否显式声明过 output。
+   *
+   * 未声明时 `output` 只是 descriptor 要求的空 object 占位，返回值不值得校验：
+   * 校验只会把「没有输出」的 op 判成 internal 错误（`plugins.md` §11.3
+   * 的 `form` 输出可为空 object）。
+   */
+  readonly outputDeclared: boolean;
   readonly timeoutMs?: number;
   readonly pagination?: unknown;
-  readonly run?: OpRun;
+  /**
+   * 处理函数。
+   *
+   * 每个 op 的 `ctx` 类型都不同（能力集合、config schema），归约后无法用一个
+   * 具体类型表达：`ctx: never` 让任意实现都能赋值，调用点自行断言成实际形状。
+   */
+  readonly run?: (input: unknown, ctx: never) => unknown;
 }
 
-/** op 片段：原生对象或 Builder 产物（`OpSpecLike` 加必填 schema） */
-export type OpSpec<I extends SchemaLike = SchemaLike, O extends SchemaLike = SchemaLike> = OpSpecLike & {
+/**
+ * op 片段：原生对象或 Builder 产物（`OpSpecLike` 加必填 schema）。
+ *
+ * `Cfg` 决定 `run` 里 `ctx.config` 的类型：
+ *
+ * - 原生对象写法由 `definePlugin` 的 `config` 推导；
+ * - Builder 写法由 `.config()` 绑定（不绑定则为 `unknown`）。
+ *
+ * 能力集合不在这一层收窄：`.capabilities()` 收窄的是**回调形参**的类型，
+ * 产物要能被 `PluginDefinition` 里任意能力集合的 op 接受。
+ */
+export type OpSpec<
+  I extends SchemaLike = SchemaLike,
+  O extends SchemaLike = SchemaLike,
+  Cfg extends SchemaLike = SchemaLike,
+> = Omit<OpSpecLike, "run" | "input" | "output"> & {
   readonly input: I;
   readonly output: O;
   readonly kind: OpKind;
+  /** Builder 绑定的 config schema；必须与 `definePlugin` 的 `config` 是同一对象 */
+  readonly config?: SchemaLike;
+  run?(input: unknown, ctx: PluginContext<readonly Capability[], Cfg>): unknown;
 };
 
 /** 事件处理函数 */
@@ -178,9 +214,9 @@ export interface PluginDefinition<
   readonly setup?: SetupSpec;
   /** 服务器绑定；声明后宿主让插件跟随所绑定服务器的启停（schema 3） */
   readonly bind?: BindSpec;
-  readonly queries?: Readonly<Record<string, OpSpec>>;
-  readonly actions?: Readonly<Record<string, OpSpec>>;
-  readonly streams?: Readonly<Record<string, OpSpec>>;
+  readonly queries?: Readonly<Record<string, OpSpec<SchemaLike, SchemaLike, NoInfer<Cfg>>>>;
+  readonly actions?: Readonly<Record<string, OpSpec<SchemaLike, SchemaLike, NoInfer<Cfg>>>>;
+  readonly streams?: Readonly<Record<string, OpSpec<SchemaLike, SchemaLike, NoInfer<Cfg>>>>;
   /** 握手完成、配置就绪后调用 */
   readonly onStart?: (ctx: PluginContext<C, Cfg>) => void | Promise<void>;
   /** 收到 shutdown 时调用；超时由宿主裁定 */
@@ -235,6 +271,11 @@ export function definePlugin<const C extends readonly Capability[], Id extends s
     for (const [id, spec] of Object.entries(group)) {
       if (spec === undefined) {
         throw new Error(`op ${id} is undefined`);
+      }
+      // `.config()` 绑定的 schema 必须与插件 config 是同一个对象：类型推导
+      // 依赖这个恒等关系，传错的话 `ctx.config` 的类型是假的。
+      if (spec.config !== undefined && spec.config !== def.config) {
+        throw new Error(`op ${id}: .config() must be the same schema object as definition.config`);
       }
     }
   }

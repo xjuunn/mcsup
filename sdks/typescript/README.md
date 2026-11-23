@@ -78,6 +78,10 @@ Builder（`query` / `action` / `stream` / `op` / `lineFilter`）、Hooks
 （`useConsoleTail` / `useRetry` / `useKvCache` / `useEvents`）与预设属次版本
 可选 API，用法见 `docs/sdk-design.md` §4。
 
+op 的 `.output()` 可以不写：descriptor 里仍会落一个空 object 占位
+（`docs/plugins.md` §11.2 要求该字段必填），但运行期不校验返回值，返回
+`undefined` 按 `{}` 回传。写了 `.output()` 就按它校验返回值与流分块。
+
 内部实现（`Session`、`ExitCode`、descriptor 校验常量、订阅归约函数）不从包入口
 导出；测试需要时从具体模块导入。
 
@@ -144,6 +148,24 @@ onStart(ctx) {
 },
 ```
 
+Builder 写法的片段看不到 `definePlugin` 的参数，要用 `.config(config)` 绑**同一个
+schema 对象**，`ctx.config` 才有类型；漏绑时它是 `unknown`（取字段会报
+`TS18046`），绑错对象会在 `definePlugin` 装配时抛错：
+
+```ts
+const config = s.object({ greeting: s.string({ default: "hi" }) });
+
+export default definePlugin({
+  config,
+  queries: {
+    ping: query("ping")
+      .config(config)
+      .output(s.object({ text: s.string() }))
+      .run((_input, ctx) => ({ text: ctx.config.greeting })),
+  },
+});
+```
+
 Builder 写法用 `.capabilities([...])` 收紧处理函数里的 `ctx`：
 
 ```ts
@@ -177,8 +199,24 @@ build/
 ├── descriptor.json    # plugins.md §11（归一化后，紧凑 JSON + 换行）
 ├── bin/entry.mjs      # 固定名入口包装：导入默认导出并调用 run()
 ├── bin/run.sh         # 平台启动器（Windows 为 bin/run.cmd）
-└── dist/...           # tsc 编译产物
+├── dist/...           # tsc 编译产物
+└── node_modules/...   # 运行时依赖，构建时 vendor 进产物
 ```
+
+**产物自带依赖。** 插件装到宿主目录后，作者的工程目录不在旁边，`node_modules`
+解析不到任何东西，进程会以 `ERR_MODULE_NOT_FOUND` 退出（宿主只看到握手超时）。
+所以 `build` 会把这个工程的生产依赖整棵拷进 `build/node_modules`：`dependencies`
+里声明的包、`mcsup-plugin` 自身、以及能解析到的 `peerDependencies`（如 `zod`），
+连同它们的传递依赖；`devDependencies`（`typescript`、`vitest`）不进产物。
+
+**产物不得有符号链接。** 安装与 `plugin verify` 遇到链接直接拒绝
+（`symbolic link in artifact: …`）。npm 装出来的 `node_modules/.bin/*` 与
+`file:` 依赖都是链接，vendor 时会展开成实体文件，构建后不必手工改动。
+
+依赖包自己的 `node_modules` 不照抄（那是它装过的依赖，已由上面那条链路铺到
+产物顶层）。产物仍要满足 `docs/plugins.md` §15.2 的限值——解包 ≤ 512 MiB、
+≤ 5000 个文件、路径深度 ≤ 8 层——依赖树越深越容易撞上深限，撞上时安装报
+`limit_exceeded: artifact path depth exceeds 8`。
 
 `manifest.entry.cmd` 指向 `bin/run.sh`，`platforms` 给出各平台启动器；
 Windows 上宿主经 `cmd.exe /C` 执行 `bin/run.cmd`。宿主拉起时追加

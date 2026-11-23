@@ -47,7 +47,10 @@ impl JobObject {
     }
 
     /// 其他平台无 Job Object 语义，交由进程组 / init 回收
+    ///
+    /// 返回 `io::Result` 是为了与 Windows 版签名一致：调用点不必按平台分叉。
     #[cfg(not(windows))]
+    #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn assign(_child: &Child) -> io::Result<Self> {
         Ok(Self {})
     }
