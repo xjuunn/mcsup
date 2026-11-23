@@ -1346,7 +1346,7 @@ fn remove(id: &str, keep_data: bool, keep_secrets: bool, printer: Printer) -> Re
     } else {
         RemoveData::Delete
     };
-    if !confirm_remove(&record, data, printer)? {
+    if !confirm_remove(&record, printer)? {
         return Ok(());
     }
     // 启用中的插件要走「禁用并移除」：`disable` 顺带停掉进程，否则 service 会
@@ -1408,37 +1408,22 @@ fn remove(id: &str, keep_data: bool, keep_secrets: bool, printer: Printer) -> Re
     )
 }
 
-/// 卸载前的确认：启用中问「禁用并移除」，已停用问「移除」，默认不执行
+/// 卸载前的确认：启用中问「是否禁用并移除」，已停用问「是否移除」，默认不执行
 ///
-/// 返回 `false` 表示用户选择不删；无法交互又没有 `--yes` 时按用法错误拒绝。
-fn confirm_remove(record: &PluginRecord, data: RemoveData, printer: Printer) -> Result<bool> {
+/// 提示只问「做什么」，不括注「连同配置与数据」：那是 `--keep-data` 的差别，
+/// 归帮助与结果输出说明，塞进确认框只会让一句话变长。返回 `false` 表示用户
+/// 选择不删；无法交互又没有 `--yes` 时按用法错误拒绝。
+fn confirm_remove(record: &PluginRecord, printer: Printer) -> Result<bool> {
     let id = &record.id;
     let lang = printer.lang();
-    let what = crate::i18n::pick(
-        lang,
-        if data.deletes_data() {
-            "连同配置与数据"
-        } else {
-            "保留配置与数据"
-        },
-        if data.deletes_data() {
-            "along with its configuration and data"
-        } else {
-            "keeping its configuration and data"
-        },
-    );
     let message = if record.enabled {
         crate::i18n::pick(
             lang,
-            format!("{id} 已启用：禁用并移除它（{what}）？"),
-            format!("{id} is enabled: disable and remove it ({what})?"),
+            format!("是否禁用并移除 {id}？"),
+            format!("disable and remove {id}?"),
         )
     } else {
-        crate::i18n::pick(
-            lang,
-            format!("移除 {id}（{what}）？"),
-            format!("remove {id} ({what})?"),
-        )
+        crate::i18n::pick(lang, format!("是否移除 {id}？"), format!("remove {id}?"))
     };
     if printer.is_interactive() {
         let confirmed = crate::prompts::confirm_or_yes(printer, &message, false)?;
