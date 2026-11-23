@@ -123,7 +123,7 @@ MCSUP 里同时存在三种容易混淆的「插件」：
 | H15 | CLI / Web / MCP / REST 的 op 调用必须走同一张 op 表与同一条能力门 |
 | H16 | 插件日志只走 stdout / stderr；`[禁止]` 把日志写进协议端点 |
 | H17 | 密钥只写不读。读取接口返回 `***`，日志与审计不得出现明文 |
-| H18 | 卸载默认保留插件数据；删除数据必须显式 `--purge` |
+| H18 | 卸载默认连同配置与数据一起删；保留数据必须显式 `--keep-data` |
 | H19 | 协议版本、API 版本、manifest schema、descriptor schema 各自独立递增 |
 | H20 | 所有耗时步骤必须有进度回显；JSON 模式下 stdout 只含数据 |
 | H21 | `[禁止]` 插件写前端资源。界面只能由 descriptor 投影生成 |
@@ -2103,9 +2103,10 @@ Windows 还需拒绝保留名（`CON`、`NUL` 等）与尾随点 / 空格。
 | 升级 | 新版本并存；切换 `active_version` 后重启；保留上一版本用于回滚 |
 | 回滚 | `plugin rollback <id>` 切回上一版本并重启；不重新确认未变化的授权 |
 | 降级 | 允许，但若目标版本能力更少，直接生效；更多则 `pending_approval` |
-| 卸载 | 必须 `disabled` 且进程退出；默认保留 `plugin-data/<id>/`，但删除 `secrets.json`（凭据不随同名插件重装继承） |
-| 保留密钥 | `--keep-secrets` 保留密钥，用于重装后继续使用同一凭据 |
-| 彻底删除 | `--purge` 同时删数据、日志、授权、审计引用标记 |
+| 卸载 | 必须先停用且进程退出：启用中的卸载由 CLI 先 `disable` 再卸（一遍操作，不用手动两步）；默认连 `plugin-data/<id>/`（配置、密钥、键值）与日志一起删 |
+| 保留数据 | `--keep-data` 保留 `plugin-data/<id>/` 与日志，只删产物与记录；其中 `secrets.json` 仍默认删除——凭据不随同名插件重装继承 |
+| 保留密钥 | `--keep-secrets` 保留密钥（隐含 `--keep-data`），用于重装后继续使用同一凭据 |
+| 确认 | 交互下问一次（启用中问「禁用并移除」，已停用问「移除」），默认答「否」；无法弹出确认框（管道 / JSON）时必须显式 `--yes`，不因「没人回答」而当同意 |
 | 版本保留 | 始终保留当前版本与回滚目标（`previous_version`）；`--prune` 只清理更旧的目录 |
 
 升级失败（校验、启动、握手、配置）必须自动回滚到旧版本，并把失败原因写入
@@ -2173,7 +2174,8 @@ Windows 还需拒绝保留名（`CON`、`NUL` 等）与尾随点 / 空格。
   打码表（只收 UTF-8、长度 ≥ 8 字节、最多 64 条）。过短的值会在日志里命中
   无关文本，替换后日志不可读，反而掩盖问题；`[禁止]` 把密钥写入审计、错误
   消息、URL。
-- 卸载默认删除密钥，`--keep-secrets` 可保留（用于重装）。
+- 卸载默认删除密钥；`--keep-data` 保留配置与键值（重装后接着用），
+  `--keep-secrets` 连密钥一起留。
 
 ## 16.4 撤销与举报
 
@@ -2226,10 +2228,11 @@ Windows 还需拒绝保留名（`CON`、`NUL` 等）与尾随点 / 空格。
 - `plugins/<id>/<version>/` 安装后不可变；升级新增目录，不原地覆盖。
 - 当前版本记录在 `db/plugins/<id>.json` 的 `active_version`，不另设指针文件，
   避免双真相源。
-- `plugin-data/<id>/` 是插件唯一可写目录；宿主不清理，除非 `--purge`。
-  例外是 `secrets.json`：卸载默认删除，`--keep-secrets` 才保留。
+- `plugin-data/<id>/` 是插件唯一可写目录；宿主只在卸载时清理——默认连同
+  目录与日志一起删，`--keep-data` 保留。例外是 `secrets.json`：保留目录时
+  仍默认删除，`--keep-secrets` 才留。
 - `plugin-data/<id>/config.json` 与 `secrets.json` 同为 `0600`：配置可能含
-  `x-mcsup-secret` 字段，读取接口必须打码，`--purge` 时随目录删除。
+  `x-mcsup-secret` 字段，读取接口必须打码，卸载删目录时随目录删除。
 - 审计用 JSONL 而不是「一条记录一个 JSON」：记录不可变、写入高频、按时间
   追加；这是对既有存储约定的有意例外，必须在实现中注释原因。
 - 所有写入先写临时文件再原子重命名；跨进程写用 `db/.lock`。
@@ -2292,7 +2295,7 @@ mcsup plugin install <source> [--from|--url|--git] [--ref <tag|sha>] [--sha256 <
                               [--yes] [--no-setup] [--json]
 mcsup plugin update <id> [--to <version>] [--prune] [--yes] [--no-setup]
 mcsup plugin setup <id>                  # 已安装插件重跑安装向导（沿用现有值）
-mcsup plugin remove <id> [--purge] [--keep-secrets] [--yes]
+mcsup plugin remove <id> [--keep-data [--keep-secrets]] [--yes]
 mcsup plugin enable <id>
 mcsup plugin disable <id> [--yes]
 mcsup plugin start <id>
@@ -2323,6 +2326,12 @@ mcsup __plugin-host --data-dir <path> [--idle-timeout <secs>]   # 隐藏
 - `call` 的 `--input` 缺省为 `{}`；`-` 表示从 stdin 读 JSON。
 - `--output json` 时 stdout 只含一行 JSON；进度与提示走 stderr。
 - `--yes` 跳过确认式提问，不跳过必填参数补参；安装向导里视为同意能力授权。
+- `plugin remove` 默认连配置与数据一起删；交互下先问一次（默认「否」），无法
+  弹出确认框（管道 / `--output json`）时必须显式 `--yes`，否则退出码 2——
+  删除不可恢复，不能因为「没人回答」就当同意。
+- `install` / `update` 完成时不解释「绑定的服务器都没在运行」：绑定插件的生命
+  周期归服务器，装完不启动、等 `server start` 拉起是常态；显式 `plugin start`
+  / `restart` 仍会说明为什么没起来。
 - `--no-setup` 跳过安装向导：不授权、不补配置、不自动启动（脚本与旧版行为）。
 - `plugin stop --grace` 上限 3600 秒（与 `server stop` 共用领域常量）：超限按用法
   错误拒绝，不静默夹紧——夹紧会让用户以为 `--grace 600` 真的生效了。
@@ -2351,11 +2360,13 @@ mcsup __plugin-host --data-dir <path> [--idle-timeout <secs>]   # 隐藏
   不算停机。
 - 绑定插件的生命周期归服务器，手动命令不能绕开：绑定的服务器全部处于停止
   状态时，`plugin install` / `update` / `setup` / `start` / `restart` 不会把
-  插件拉起来，还会顺手收掉残留的运行进程，并提示「运行 `mcsup server start
-  <name>` 会自动拉起」。安装被挡下时插件仍保持「已启用」但进程不跑，等
-  服务器启动时再自动拉起。没有绑定、绑定服务器至少一台在跑，或读不出绑定
-  清单（descriptor / 配置损坏）时放行；读不出时放行是为了不让诊断失败挡住
-  用户。
+  插件拉起来，还会顺手收掉残留的运行进程。被挡下时插件仍保持「已启用」但
+  进程不跑，等服务器启动时再自动拉起。没有绑定、绑定服务器至少一台在跑，或
+  读不出绑定清单（descriptor / 配置损坏）时放行；读不出时放行是为了不让诊断
+  失败挡住用户。
+- 「运行 `mcsup server start <name>` 会自动拉起」这句只在显式 `plugin start`
+  / `plugin restart` / `plugin setup` 被挡下时提示：那是用户主动要它跑。安装
+  与升级不解释——装完不启动是绑定插件的常态，说一遍反而像出了问题。
 - 本机状态先于绑定门禁：插件被拉黑、隔离、停用或还有待授权能力时，
   `plugin start` / `restart` 直接报出真实原因与应执行的命令
   （`unblock` / `release` / `enable` / `setup`），不再被「绑定的服务器都没
@@ -2447,7 +2458,7 @@ ClientSecret: ••••••••
 | 事件 | 字段 |
 | --- | --- |
 | `plugin.install` | id, version, source, sha256, actor |
-| `plugin.remove` | id, purge, actor |
+| `plugin.remove` | id, data（`delete` / `keep`）, actor |
 | `plugin.enable` / `disable` | id, actor |
 | `plugin.start` / `stop` / `restart` | id, reason, actor |
 | `plugin.crash` | id, exit_code, restarts, last_lines |
@@ -2565,7 +2576,7 @@ ClientSecret: ••••••••
 | 契约深度 | 第 5 层被拒 |
 | 安装不执行代码 | 用带陷阱的产物（含 `preinstall` 脚本）验证未被运行 |
 | 路径逃逸 | 含 `../`、符号链接的产物被拒 |
-| 卸载保留数据 | `plugin-data` 仍在；`--purge` 后消失 |
+| 卸载清数据 | 默认 `plugin-data` 与日志消失；`--keep-data` 后仍在 |
 
 ## 20.3 testkit
 

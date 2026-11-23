@@ -23,7 +23,7 @@ use mcsup::domain::plugin::revocation::RevocationList;
 use mcsup::domain::server::artifact::{Checksum, ChecksumAlgorithm};
 use mcsup::port::plugin::ArtifactVerifier as _;
 use mcsup::port::plugin::{ArtifactOrigin, PluginRecord, SecretProtection, StreamSink};
-use mcsup::service::PluginService;
+use mcsup::service::{PluginService, RemoveData};
 use serde_json::{Map, Value, json};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -55,9 +55,9 @@ pub(crate) fn run(action: PluginAction, printer: Printer) -> Result<()> {
         PluginAction::Setup { id } => setup(&id, printer),
         PluginAction::Remove {
             id,
-            purge,
+            keep_data,
             keep_secrets,
-        } => remove(&id, purge, keep_secrets, printer),
+        } => remove(&id, keep_data, keep_secrets, printer),
         PluginAction::Enable { id } => set_enabled(&id, true, printer),
         PluginAction::Disable { id } => set_enabled(&id, false, printer),
         PluginAction::Start { id } => start(&id, printer),
@@ -862,6 +862,10 @@ fn reject_unstartable(service: &PluginService, id: &PluginId, printer: Printer) 
 }
 
 /// 权限齐备才启动；缺权限、绑定服务器停着或启动失败都只提示，不视为安装 / 升级失败
+///
+/// 绑定服务器都停着时不解释——绑定插件的生命周期本来归服务器，装完不启动、等
+/// `server start` 拉起是常态，说一句「已跳过启动」反而像出了问题。显式的
+/// `plugin start` / `restart` / `setup` 仍会说明原因。
 fn start_if_ready(
     bound: &BoundPlugins,
     service: &PluginService,
@@ -871,9 +875,8 @@ fn start_if_ready(
     failure_zh: &str,
     failure_en: &str,
 ) -> bool {
-    if let StartGate::AllStopped { servers } = bound.enforce_gate(id, printer) {
+    if let StartGate::AllStopped { .. } = bound.enforce_gate(id, printer) {
         ensure_enabled(service, id, printer);
-        print_gate_note(printer, id, &servers, "已跳过启动", "the start was skipped");
         return false;
     }
     if !remaining.is_empty() {
@@ -1324,26 +1327,148 @@ fn upgrade_from_source(
     Ok((outcome.record.id, outcome.record.version))
 }
 
-fn remove(id: &str, purge: bool, keep_secrets: bool, printer: Printer) -> Result<()> {
+/// 卸载：默认连配置与数据一起删
+///
+/// 「卸载」在这台机器上意味着「不再有这个名字」，所以产物、记录、日志与
+/// `plugin-data/<id>/`（配置、密钥、键值）一起消失；要重装后接着用同一份配置
+/// 与键值走 `--keep-data`。删除不可恢复，因此先问一次（默认不删）；无法弹出
+/// 确认框时（管道 / JSON）必须显式 `--yes`，不能因为「没人回答」就当同意。
+fn remove(id: &str, keep_data: bool, keep_secrets: bool, printer: Printer) -> Result<()> {
     let id = parse_id(id, printer.lang())?;
     let service = open()?;
-    service.remove_with(&id, purge, keep_secrets)?;
+    let record = service.record(&id)?;
+    // 密钥就在数据目录里：要求保留密钥却删掉整个目录是矛盾指令，按用户意图
+    // 当作「保留数据」处理，方向安全（多留不删）。
+    let data = if keep_data || keep_secrets {
+        RemoveData::Keep {
+            secrets: keep_secrets,
+        }
+    } else {
+        RemoveData::Delete
+    };
+    if !confirm_remove(&record, data, printer)? {
+        return Ok(());
+    }
+    // 启用中的插件要走「禁用并移除」：`disable` 顺带停掉进程，否则 service 会
+    // 以「还在跑」拒绝。已停用但残留会话（升级时恢复起来的）也要收掉。
+    let was_enabled = record.enabled;
+    let had_session = service
+        .status(&id)
+        .is_ok_and(|status| status.session.is_some());
+    if was_enabled || had_session {
+        service.disable(&id)?;
+    }
+    service.remove_with(&id, data)?;
+    let data_kept = !data.deletes_data();
     printer.print_outcome(
         &crate::i18n::pick(
             printer.lang(),
             format!(
-                "已卸载 {id}{}{}",
-                if purge { "（含数据）" } else { "" },
-                if keep_secrets { "，保留密钥" } else { "" }
+                "{}{}{}",
+                if was_enabled || had_session {
+                    "已停用并卸载 "
+                } else {
+                    "已卸载 "
+                },
+                id,
+                if data_kept {
+                    if data.keeps_secrets() {
+                        "（保留配置、数据与密钥）"
+                    } else {
+                        "（保留配置与数据）"
+                    }
+                } else {
+                    "（含配置与数据）"
+                }
             ),
             format!(
-                "removed {id}{}{}",
-                if purge { " (with data)" } else { "" },
-                if keep_secrets { ", secrets kept" } else { "" }
+                "{} {id}{}",
+                if was_enabled || had_session {
+                    "disabled and removed"
+                } else {
+                    "removed"
+                },
+                if data_kept {
+                    if data.keeps_secrets() {
+                        " (configuration, data and secrets kept)"
+                    } else {
+                        " (configuration and data kept)"
+                    }
+                } else {
+                    " (with configuration and data)"
+                }
             ),
         ),
-        &json!({ "id": id.to_string(), "purge": purge, "keep_secrets": keep_secrets }),
+        &json!({
+            "id": id.to_string(),
+            "disabled": was_enabled || had_session,
+            "data_kept": data_kept,
+            "secrets_kept": data.keeps_secrets(),
+        }),
     )
+}
+
+/// 卸载前的确认：启用中问「禁用并移除」，已停用问「移除」，默认不执行
+///
+/// 返回 `false` 表示用户选择不删；无法交互又没有 `--yes` 时按用法错误拒绝。
+fn confirm_remove(record: &PluginRecord, data: RemoveData, printer: Printer) -> Result<bool> {
+    let id = &record.id;
+    let lang = printer.lang();
+    let what = crate::i18n::pick(
+        lang,
+        if data.deletes_data() {
+            "连同配置与数据"
+        } else {
+            "保留配置与数据"
+        },
+        if data.deletes_data() {
+            "along with its configuration and data"
+        } else {
+            "keeping its configuration and data"
+        },
+    );
+    let message = if record.enabled {
+        crate::i18n::pick(
+            lang,
+            format!("{id} 已启用：禁用并移除它（{what}）？"),
+            format!("{id} is enabled: disable and remove it ({what})?"),
+        )
+    } else {
+        crate::i18n::pick(
+            lang,
+            format!("移除 {id}（{what}）？"),
+            format!("remove {id} ({what})?"),
+        )
+    };
+    if printer.is_interactive() {
+        let confirmed = crate::prompts::confirm_or_yes(printer, &message, false)?;
+        if !confirmed {
+            printer.print_section(&crate::i18n::pick(
+                lang,
+                format!("已取消移除 {id}"),
+                format!("removal of {id} cancelled"),
+            ));
+        }
+        return Ok(confirmed);
+    }
+    if printer.assumes_yes() {
+        return Ok(true);
+    }
+    Err(AppDiagnostic::usage(
+        crate::i18n::pick(
+            lang,
+            format!("非交互模式下卸载插件需要 --yes（会删除配置与数据）：`mcsup plugin remove {id} --yes`"),
+            format!(
+                "removing a plugin without a terminal requires --yes (it deletes configuration and data): `mcsup plugin remove {id} --yes`"
+            ),
+        ),
+        Some(crate::i18n::pick(
+            lang,
+            "先停掉管道或用 `--yes` 明确同意",
+            "stop piping, or pass `--yes` to agree explicitly",
+        )),
+    )
+    .into())
 }
 
 fn set_enabled(id: &str, enable: bool, printer: Printer) -> Result<()> {
