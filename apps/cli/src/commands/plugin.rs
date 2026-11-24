@@ -349,6 +349,9 @@ fn run_setup(
     let record = service.record(id)?;
     let current = service.config_get(id)?;
     let values = current.get("values").cloned().unwrap_or_else(|| json!({}));
+    // 交互式 hook 除了自己的字段，还可能带出服务端顺带返回的值（如扫码登录
+    // 给的 API 基址）。它们同样在 config schema 里声明，只是不需要提问。
+    let fillable = fillable_values(&setup.fields, descriptor.config.as_ref());
     let interactive = printer.is_interactive();
     let lang = printer.lang();
     let mut patch = Map::new();
@@ -395,13 +398,8 @@ fn run_setup(
         // 同时产出多个配置项（如 token 与服务端给的基址），因此返回值是
         // 路径 → 值的映射，不是单个字符串。
         if field.interactive {
-            let filled = prompt_interactive_field(
-                &record,
-                field,
-                printer,
-                existing.as_ref(),
-                &setup.fields,
-            )?;
+            let filled =
+                prompt_interactive_field(&record, field, printer, existing.as_ref(), &fillable)?;
             let Some(filled) = filled else {
                 if field.required && missing {
                     report.missing.push(field.path.clone());
@@ -478,7 +476,9 @@ fn run_setup(
 ///
 /// 宿主只负责开临时文件、继承终端与回读结果，平台流程（二维码、设备授权）
 /// 全在插件里。一次登录可能同时产出多个配置项，hook 用 JSON 对象回传
-/// 路径 → 值；宿主逐项按声明字段的 schema 复校验后再落盘。
+/// 路径 → 值；宿主逐项按 config schema 复校验后再落盘。可回填的范围是交互式
+/// 字段，加上 config schema 里**未作为 setup 字段提问**的字符串叶子：服务端
+/// 顺带给出的值（如登录响应的 API 基址）不需要单独提问，也不该让用户手填。
 ///
 /// 已有值默认保持，用户主动确认后才重新授权；hook 失败时让用户选择重试、
 /// 手工粘贴或跳过，不把一次扫码失败变成安装失败。
@@ -487,7 +487,7 @@ fn prompt_interactive_field(
     field: &ResolvedSetupField,
     printer: Printer,
     existing: Option<&Value>,
-    fields: &[ResolvedSetupField],
+    fillable: &FillableFields,
 ) -> Result<Option<BTreeMap<String, String>>> {
     let lang = printer.lang();
     let keeps = existing.is_some_and(|value| !value_is_empty(value));
@@ -505,12 +505,8 @@ fn prompt_interactive_field(
             return Ok(None);
         }
     }
-    // 告诉插件本次可以回填哪些交互式字段；旧插件忽略这个变量
-    let interactive_paths = fields
-        .iter()
-        .filter(|item| item.interactive)
-        .map(|item| item.path.clone())
-        .collect::<Vec<_>>();
+    // 告诉插件本次可以回填哪些路径；旧插件忽略这个变量
+    let interactive_paths = fillable_paths(fillable);
     let mut manual = false;
     loop {
         let attempt = if manual {
@@ -534,7 +530,7 @@ fn prompt_interactive_field(
             run_setup_hook(record, field, &interactive_paths, printer)
         };
         match attempt {
-            Ok(values) => match validate_interactive_values(fields, field, &values) {
+            Ok(values) => match validate_interactive_values(fillable, field, &values) {
                 Ok(()) => return Ok(Some(values)),
                 Err(reason) => printer.print_section(&reason),
             },
@@ -566,12 +562,78 @@ fn prompt_interactive_field(
     }
 }
 
+/// 一次登录可回填的配置路径 → 该路径的 schema
+///
+/// 来源是 config schema 里的字符串叶子：这既是声明，也是逐项复校验所需的
+/// 约束。字符串以外的类型不可能由登录脚本产出，不在范围内。
+type FillableFields = BTreeMap<String, Value>;
+
+/// 收集本次允许回填的配置路径
+///
+/// 两种来源：
+/// - 交互式字段自己，由 hook 负责取值；
+/// - config schema 里**没有**作为 setup 字段提问的字符串叶子，例如扫码登录
+///   顺带返回的服务端基址。它们是能自动获取的值，不该再让用户手填。
+///
+/// 声明成普通 setup 字段的路径不在此列：那是要用户确认的配置项，插件不能
+/// 借一次登录把别的提问静默跳过。
+fn fillable_values(fields: &[ResolvedSetupField], config: Option<&Value>) -> FillableFields {
+    let asked = fields
+        .iter()
+        .filter(|field| !field.interactive)
+        .map(|field| field.path.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut paths = FillableFields::new();
+    if let Some(config) = config {
+        collect_string_leaves(config, &mut Vec::new(), &asked, &mut paths);
+    }
+    // 交互式字段即使在 config schema 里没被识别出来，也要交给插件自己处理
+    for field in fields.iter().filter(|field| field.interactive) {
+        paths
+            .entry(field.path.clone())
+            .or_insert_with(|| field.schema.clone());
+    }
+    paths
+}
+
+fn collect_string_leaves(
+    schema: &Value,
+    prefix: &mut Vec<String>,
+    asked: &BTreeSet<&str>,
+    out: &mut FillableFields,
+) {
+    if schema.get("type").and_then(Value::as_str) == Some("string") {
+        if !prefix.is_empty() {
+            let path = prefix.join(".");
+            if !asked.contains(path.as_str()) {
+                out.insert(path, schema.clone());
+            }
+        }
+        return;
+    }
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return;
+    };
+    for (key, child) in properties {
+        prefix.push(key.clone());
+        collect_string_leaves(child, prefix, asked, out);
+        prefix.pop();
+    }
+}
+
+/// 告诉插件本次可以回填哪些路径（按字典序，便于日志与诊断）
+fn fillable_paths(fillable: &FillableFields) -> Vec<String> {
+    fillable.keys().cloned().collect()
+}
+
 /// 校验一次登录回填的全部字段
 ///
-/// 只接受安装向导里声明过的字符串字段：路径写错或类型不符说明插件与
-/// descriptor 漂移，宁可报错重试，也不把未声明的键写进配置。
+/// 只接受本次允许回填的路径（交互式字段与未作为提问项的 config 字符串
+/// 叶子）：路径写错或类型不符说明插件与 descriptor 漂移，宁可报错重试，
+/// 也不把未声明、或绕过其他提问的键写进配置。顺带返回的值（如 API 基址）
+/// 同样按各自 schema 复校验，通过后直接写入，不再提问。
 fn validate_interactive_values(
-    fields: &[ResolvedSetupField],
+    fillable: &FillableFields,
     trigger: &ResolvedSetupField,
     values: &BTreeMap<String, String>,
 ) -> std::result::Result<(), String> {
@@ -579,17 +641,14 @@ fn validate_interactive_values(
         return Err(format!("登录结果没有返回 {}", trigger.path));
     }
     for (path, text) in values {
-        let Some(target) = fields.iter().find(|item| &item.path == path) else {
-            return Err(format!("登录结果包含未声明的字段 {path}"));
+        let Some(schema) = fillable.get(path) else {
+            return Err(format!("登录结果包含不允许回填的配置路径 {path}"));
         };
-        if !matches!(&target.kind, SetupKind::Text { .. }) {
-            return Err(format!("{path} 不是字符串字段，不能由登录结果回填"));
-        }
         if text.trim().is_empty() {
             return Err(format!("{path} 为空"));
         }
         mcsup::domain::plugin::schema::validate_instance(
-            &target.schema,
+            schema,
             &Value::String(text.clone()),
             path,
         )
@@ -758,15 +817,19 @@ impl<'a> SetupUi<'a> {
                     str::to_owned,
                 );
                 self.printer.print_section(&label);
-                self.printer.print_note(&format!("  {content}"));
-                if std::io::stdout().is_terminal()
-                    && let Some(qr) = crate::qr::render_centered(
+                let rendered = std::io::stdout().is_terminal().then(|| {
+                    crate::qr::render_centered(
                         content,
                         crossterm::terminal::size().map_or(80, |(width, _)| usize::from(width)),
                     )
-                {
-                    print!("{qr}");
-                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                });
+                match rendered.flatten() {
+                    Some(qr) => {
+                        print!("{qr}");
+                        let _ = std::io::Write::flush(&mut std::io::stdout());
+                    }
+                    // 画不出来（终端太窄或内容超出 QR 上限）时兜底给可点开的链接
+                    None => self.printer.print_note(&format!("  {content}")),
                 }
             }
             Some("status") => {
@@ -3024,10 +3087,8 @@ mod tests {
         assert!(parse_setup_payload("   ", "weixin.botToken").is_err());
     }
 
-    /// 回填值必须命中声明过的字符串字段，并按各自 schema 复校验
-    #[test]
-    fn interactive_values_must_match_declared_fields() {
-        let field = |path: &str, schema: Value| ResolvedSetupField {
+    fn setup_field(path: &str, schema: Value) -> ResolvedSetupField {
+        ResolvedSetupField {
             path: path.to_owned(),
             label: path.to_owned(),
             description: None,
@@ -3041,36 +3102,98 @@ mod tests {
                 choices: Vec::new(),
             },
             schema,
-        };
+        }
+    }
+
+    fn interactive_field(path: &str, schema: Value) -> ResolvedSetupField {
+        let mut field = setup_field(path, schema);
+        field.interactive = true;
+        field
+    }
+
+    fn weixin_config() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "weixin": {
+                    "type": "object",
+                    "properties": {
+                        "botToken": { "type": "string" },
+                        "apiBase": { "type": "string", "maxLength": 20 },
+                        "inbound": { "type": "boolean" }
+                    }
+                }
+            }
+        })
+    }
+
+    /// 可回填的是交互式字段与不提问的字符串叶子；普通 setup 字段不能绕过提问
+    #[test]
+    fn fillable_paths_cover_only_values_that_are_not_asked() {
+        let config = weixin_config();
+        let trigger = interactive_field("weixin.botToken", json!({ "type": "string" }));
+        let fillable = fillable_values(std::slice::from_ref(&trigger), Some(&config));
+        assert!(fillable.contains_key("weixin.botToken"));
+        assert!(fillable.contains_key("weixin.apiBase"));
+        assert!(
+            !fillable.contains_key("weixin.inbound"),
+            "布尔不是字符串叶子"
+        );
+        assert!(fillable_paths(&fillable).contains(&"weixin.apiBase".to_owned()));
+
+        // 一旦 apiBase 作为普通 setup 字段提问，hook 就不能再静默跳过它
         let fields = vec![
-            field("weixin.botToken", json!({ "type": "string" })),
-            field(
+            trigger,
+            setup_field(
                 "weixin.apiBase",
                 json!({ "type": "string", "maxLength": 20 }),
             ),
         ];
-        let trigger = &fields[0];
+        let asked = fillable_values(&fields, Some(&config));
+        assert!(!asked.contains_key("weixin.apiBase"));
+    }
+
+    /// 回填值必须命中允许回填的字符串叶子，并按各自 schema 复校验
+    #[test]
+    fn interactive_values_must_match_config_string_leaves() {
+        let config = weixin_config();
+        let trigger = interactive_field("weixin.botToken", json!({ "type": "string" }));
+        let fillable = fillable_values(std::slice::from_ref(&trigger), Some(&config));
+
         validate_interactive_values(
-            &fields,
-            trigger,
+            &fillable,
+            &trigger,
             &BTreeMap::from([
                 ("weixin.botToken".to_owned(), "tok".to_owned()),
                 ("weixin.apiBase".to_owned(), "https://a".to_owned()),
             ]),
         )
-        .expect("declared fields pass");
+        .expect("config string leaves pass");
         assert!(
             validate_interactive_values(
-                &fields,
-                trigger,
+                &fillable,
+                &trigger,
                 &BTreeMap::from([("unknown".to_owned(), "x".to_owned())]),
             )
-            .is_err()
+            .is_err(),
+            "未声明的路径必须拒绝"
         );
         assert!(
             validate_interactive_values(
-                &fields,
-                trigger,
+                &fillable,
+                &trigger,
+                &BTreeMap::from([
+                    ("weixin.botToken".to_owned(), "tok".to_owned()),
+                    ("weixin.inbound".to_owned(), "true".to_owned()),
+                ]),
+            )
+            .is_err(),
+            "非字符串字段不能被登录结果回填"
+        );
+        assert!(
+            validate_interactive_values(
+                &fillable,
+                &trigger,
                 &BTreeMap::from([
                     ("weixin.botToken".to_owned(), "tok".to_owned()),
                     (
@@ -3079,7 +3202,8 @@ mod tests {
                     ),
                 ]),
             )
-            .is_err()
+            .is_err(),
+            "超过 maxLength 必须拒绝"
         );
     }
 
