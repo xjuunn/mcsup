@@ -382,7 +382,7 @@ export function jsonSchemaOf(schema: z.ZodType, onOutput: boolean, path = "schem
 
 /** descriptor 结构（plugins.md §11.1） */
 export interface Descriptor {
-  readonly schema: 1 | 2 | 3 | 4;
+  readonly schema: 1 | 2 | 3 | 4 | 5;
   readonly plugin_id: string;
   readonly api: number;
   readonly config: JsonValue;
@@ -481,13 +481,50 @@ function buildSetup(setup: SetupSpec): JsonValue {
     if (field.when !== undefined) {
       entry["when"] = normalizeSetupWhen(`setup.fields.${field.path}`, field.when);
     }
+    if (field.interactive !== undefined) {
+      entry["interactive"] = field.interactive;
+    }
     return sortKeys(entry);
   });
+  checkSetupHandlers(setup);
   const result: Record<string, JsonValue> = { fields };
   if (setup.start !== undefined) {
     result["start"] = setup.start;
   }
   return sortKeys(result);
+}
+
+/**
+ * 校验交互式字段与处理函数一一对应
+ *
+ * 声明了 `interactive` 却没有 handler，宿主执行时必然失败；handler 挂在
+ * 非交互字段上则是死代码。两种都在构建期报错，不必等安装到宿主才发现。
+ */
+function checkSetupHandlers(setup: SetupSpec): void {
+  const handlers = setup.interactive ?? {};
+  for (const path of Object.keys(handlers)) {
+    const field = setup.fields.find((item) => item.path === path);
+    if (field === undefined) {
+      throw new DescriptorError(`setup.interactive.${path}`, "does not match a declared setup field");
+    }
+    if (field.interactive !== true) {
+      throw new DescriptorError(
+        `setup.interactive.${path}`,
+        "field does not declare interactive: true",
+      );
+    }
+    if (typeof handlers[path] !== "function") {
+      throw new DescriptorError(`setup.interactive.${path}`, "must be a function");
+    }
+  }
+  for (const field of setup.fields) {
+    if (field.interactive === true && handlers[field.path] === undefined) {
+      throw new DescriptorError(
+        `setup.fields.${field.path}`,
+        "interactive field has no handler in setup.interactive",
+      );
+    }
+  }
 }
 
 /**
@@ -613,10 +650,20 @@ export function buildDescriptor<
   if (ops.length > 64) {
     throw new DescriptorError("ops", `${ops.length} ops declared, limit is 64`);
   }
-  // 版本号只升不降：setup 字段条件要求 4，bind 是 3，setup 是 2，其余仍是 1
+  // 版本号只升不降：交互式字段要求 5，setup 字段条件要求 4，bind 是 3，setup 是 2，其余仍是 1
   const hasSetupWhen =
     def.setup !== undefined && def.setup.fields.some((field) => field.when !== undefined);
-  const schema: 1 | 2 | 3 | 4 = hasSetupWhen ? 4 : bind !== undefined ? 3 : setup === undefined ? 1 : 2;
+  const hasInteractive =
+    def.setup !== undefined && def.setup.fields.some((field) => field.interactive === true);
+  const schema: 1 | 2 | 3 | 4 | 5 = hasInteractive
+    ? 5
+    : hasSetupWhen
+      ? 4
+      : bind !== undefined
+        ? 3
+        : setup === undefined
+          ? 1
+          : 2;
   const descriptor: Descriptor = {
     schema,
     plugin_id: def.id,

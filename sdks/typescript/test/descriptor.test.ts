@@ -122,6 +122,49 @@ describe("descriptor", () => {
     });
   });
 
+  it("交互式字段生成 schema 5 并保留 interactive 标记", () => {
+    const def = {
+      ...chatBridge.definition,
+      setup: {
+        fields: [{ path: "token", required: true, secret: true, interactive: true }],
+        interactive: { token: () => "from-hook" },
+      },
+    } as typeof chatBridge.definition;
+    const d = buildDescriptor(def);
+    expect(d.schema).toBe(5);
+    expect(d.setup).toEqual({
+      fields: [{ path: "token", required: true, secret: true, interactive: true }],
+    });
+  });
+
+  it("交互式字段必须与 handler 一一对应", () => {
+    const missing = {
+      ...chatBridge.definition,
+      setup: {
+        fields: [{ path: "token", secret: true, interactive: true }],
+      },
+    } as typeof chatBridge.definition;
+    expect(() => buildDescriptor(missing)).toThrow(/no handler in setup\.interactive/);
+
+    const orphan = {
+      ...chatBridge.definition,
+      setup: {
+        fields: [{ path: "token", secret: true }],
+        interactive: { token: () => "x" },
+      },
+    } as typeof chatBridge.definition;
+    expect(() => buildDescriptor(orphan)).toThrow(/does not declare interactive/);
+
+    const unknown = {
+      ...chatBridge.definition,
+      setup: {
+        fields: [{ path: "token", secret: true, interactive: true }],
+        interactive: { token: () => "x", other: () => "y" },
+      },
+    } as typeof chatBridge.definition;
+    expect(() => buildDescriptor(unknown)).toThrow(/does not match a declared setup field/);
+  });
+
   it("when 只接受 includes / equals 之一", () => {
     const withWhen = (when: unknown) =>
       ({

@@ -71,13 +71,6 @@ impl SpawnPlan {
         scope: domain::plugin::PluginScope,
         server: Option<&str>,
     ) -> Result<Self, HostError> {
-        let platform = platform_key();
-        let cmd = entry
-            .platforms
-            .get(&platform)
-            .map_or(entry.cmd.as_str(), String::as_str);
-        let program = artifact_dir.join(cmd);
-        check_executable(&program)?;
         let mut args = vec!["--endpoint".to_owned(), endpoint.to_owned()];
         if let Some(server) = server {
             args.push("--server".to_owned());
@@ -85,6 +78,7 @@ impl SpawnPlan {
         }
         args.push("--log-level".to_owned());
         args.push("info".to_owned());
+        let (program, args) = entry_command(artifact_dir, entry, &args)?;
         Ok(Self {
             program,
             cwd: artifact_dir.to_path_buf(),
@@ -126,6 +120,34 @@ impl SpawnPlan {
 #[must_use]
 pub fn platform_key() -> String {
     domain::plugin::platform_key()
+}
+
+/// 解析产物入口并展开为实际执行命令
+///
+/// 按当前平台选择 `entry.platforms` 里的入口（缺失时退回 `entry.cmd`），
+/// 拼成 `artifact_dir` 下的绝对路径后再交给内部的命令展开逻辑：Windows 上的
+/// `.cmd` / `.bat` 入口会自动改走 `COMSPEC /C`。
+///
+/// 交互式 setup 字段由宿主以同样方式直接拉起插件，因此这里和
+/// [`SpawnPlan::new`] 共用同一份入口解析，避免两处对「什么是入口」给出不同
+/// 答案。
+///
+/// # Errors
+///
+/// 入口文件不存在、不是普通文件或没有可执行位时返回 [`HostError`]
+pub fn entry_command(
+    artifact_dir: &Path,
+    entry: &EntrySpec,
+    args: &[String],
+) -> Result<(PathBuf, Vec<String>), HostError> {
+    let platform = platform_key();
+    let cmd = entry
+        .platforms
+        .get(&platform)
+        .map_or(entry.cmd.as_str(), String::as_str);
+    let program = artifact_dir.join(cmd);
+    check_executable(&program)?;
+    Ok(command_line(&program, args))
 }
 
 /// 脚本型入口：Windows 上必须经 `cmd.exe /C` 启动，`CreateProcess` 不能直接
@@ -517,6 +539,36 @@ mod tests {
         let key = platform_key();
         assert!(key.contains('-'), "{key}");
         assert!(!key.contains('_'), "{key}");
+    }
+
+    #[test]
+    fn entry_command_resolves_platform_specific_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("run.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").expect("write entry");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod entry");
+        }
+        let entry = EntrySpec {
+            kind: "process".to_owned(),
+            cmd: "./bin/run.sh".to_owned(),
+            platforms: BTreeMap::from([(platform_key(), "run.sh".to_owned())]),
+        };
+        let (program, args) =
+            entry_command(dir.path(), &entry, &["--x".to_owned()]).expect("resolve");
+        assert_eq!(program, script);
+        assert_eq!(args, ["--x"]);
+
+        // 入口不存在时必须是「找不到」，不能静默拉起一个空路径
+        let missing = EntrySpec {
+            kind: "process".to_owned(),
+            cmd: "./bin/missing.sh".to_owned(),
+            platforms: BTreeMap::new(),
+        };
+        assert!(entry_command(dir.path(), &missing, &[]).is_err());
     }
 
     #[test]

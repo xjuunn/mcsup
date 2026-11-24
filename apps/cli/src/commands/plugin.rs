@@ -26,7 +26,8 @@ use mcsup::port::plugin::ArtifactVerifier as _;
 use mcsup::port::plugin::{ArtifactOrigin, PluginRecord, SecretProtection, StreamSink};
 use mcsup::service::{PluginService, RemoveData};
 use serde_json::{Map, Value, json};
-use std::io::Read;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -332,6 +333,7 @@ fn approve_pending(
 ///
 /// `fresh` 为真（全新安装）时询问全部字段：已有值作为输入默认值，密钥留空
 /// 表示保持原值；升级只补仍为空的字段，避免每次升级重问一遍。
+#[allow(clippy::too_many_lines)] // 条件、交互式与普通输入共享同一段提问序列
 fn run_setup(
     service: &PluginService,
     id: &PluginId,
@@ -344,6 +346,7 @@ fn run_setup(
     let Some(setup) = descriptor.setup.as_ref() else {
         return Ok(SetupReport::default());
     };
+    let record = service.record(id)?;
     let current = service.config_get(id)?;
     let values = current.get("values").cloned().unwrap_or_else(|| json!({}));
     let interactive = printer.is_interactive();
@@ -368,8 +371,11 @@ fn run_setup(
     // 已收集的答案：旧配置 + 本次刚填的值。条件字段靠它判定要不要问，
     // 所以每问完一项都要回填，不能只看初始配置。
     let mut answered = values.clone();
+    // 本次向导已经拿到的路径：交互式 hook 可能一次回填多个字段，后面的
+    // 同名项即使 `fresh` 也不再重复提问。
+    let mut answered_now = BTreeSet::new();
     for field in &setup.fields {
-        if !should_ask(field, &answered, fresh) {
+        if !should_ask(field, &answered, fresh, &answered_now) {
             continue;
         }
         let existing = value_at(&answered, &field.path).cloned();
@@ -384,6 +390,33 @@ fn run_setup(
         let kept = existing
             .as_ref()
             .is_some_and(|value| !value_is_empty(value));
+        // 交互式字段由插件自己的 setup hook 取值：宿主继承终端拉起插件，
+        // 插件负责扫码 / 设备授权，结果经 0600 临时文件回传。一次登录可能
+        // 同时产出多个配置项（如 token 与服务端给的基址），因此返回值是
+        // 路径 → 值的映射，不是单个字符串。
+        if field.interactive {
+            let filled = prompt_interactive_field(
+                &record,
+                field,
+                printer,
+                existing.as_ref(),
+                &setup.fields,
+            )?;
+            let Some(filled) = filled else {
+                if field.required && missing {
+                    report.missing.push(field.path.clone());
+                }
+                continue;
+            };
+            for (path, secret) in filled {
+                let value = Value::String(secret);
+                set_value_path(&mut answered, &path, value.clone());
+                set_path(&mut patch, &path, value);
+                report.configured.push(path.clone());
+                answered_now.insert(path);
+            }
+            continue;
+        }
         let value = loop {
             let Some(value) = prompt_setup_field(field, printer, existing.as_ref(), &servers)?
             else {
@@ -441,11 +474,329 @@ fn run_setup(
     Ok(report)
 }
 
-/// 该字段这次要不要问：条件成立（未声明条件视为成立），且全新安装或仍为空
+/// 交互式 setup 字段：拉起插件自身的 setup hook（schema 5）
+///
+/// 宿主只负责开临时文件、继承终端与回读结果，平台流程（二维码、设备授权）
+/// 全在插件里。一次登录可能同时产出多个配置项，hook 用 JSON 对象回传
+/// 路径 → 值；宿主逐项按声明字段的 schema 复校验后再落盘。
+///
+/// 已有值默认保持，用户主动确认后才重新授权；hook 失败时让用户选择重试、
+/// 手工粘贴或跳过，不把一次扫码失败变成安装失败。
+fn prompt_interactive_field(
+    record: &PluginRecord,
+    field: &ResolvedSetupField,
+    printer: Printer,
+    existing: Option<&Value>,
+    fields: &[ResolvedSetupField],
+) -> Result<Option<BTreeMap<String, String>>> {
+    let lang = printer.lang();
+    let keeps = existing.is_some_and(|value| !value_is_empty(value));
+    if keeps {
+        let again = crate::prompts::confirm_or_yes(
+            printer,
+            &crate::i18n::pick(
+                lang,
+                format!("{} 已设置，要重新授权吗？", field.label),
+                format!("{} is already set; authorize again?", field.label),
+            ),
+            false,
+        )?;
+        if !again {
+            return Ok(None);
+        }
+    }
+    // 告诉插件本次可以回填哪些交互式字段；旧插件忽略这个变量
+    let interactive_paths = fields
+        .iter()
+        .filter(|item| item.interactive)
+        .map(|item| item.path.clone())
+        .collect::<Vec<_>>();
+    let mut manual = false;
+    loop {
+        let attempt = if manual {
+            let text = crate::prompts::input_secret(lang, &field.label, "")?;
+            let text = text.trim().to_owned();
+            if text.is_empty() {
+                printer.print_section(&crate::i18n::pick(
+                    lang,
+                    "不能为空，请重新输入",
+                    "cannot be blank; please try again",
+                ));
+                continue;
+            }
+            Ok(BTreeMap::from([(field.path.clone(), text)]))
+        } else {
+            printer.print_section(&crate::i18n::pick(
+                lang,
+                format!("正在启动插件完成 {} 登录…", field.label),
+                format!("starting the plugin to complete {} login…", field.label),
+            ));
+            run_setup_hook(record, field, &interactive_paths, printer)
+        };
+        match attempt {
+            Ok(values) => match validate_interactive_values(fields, field, &values) {
+                Ok(()) => return Ok(Some(values)),
+                Err(reason) => printer.print_section(&reason),
+            },
+            Err(err) => printer.print_section(&crate::i18n::pick(
+                lang,
+                format!("登录失败：{err}"),
+                format!("login failed: {err}"),
+            )),
+        }
+        let options = vec![
+            crate::i18n::pick(lang, "重试", "retry"),
+            crate::i18n::pick(lang, "手工粘贴", "paste manually"),
+            crate::i18n::pick(lang, "跳过", "skip"),
+        ];
+        let picked = crate::prompts::select_choice(
+            lang,
+            &crate::i18n::pick(lang, "接下来怎么做？", "what next?"),
+            &options,
+            None,
+            "",
+        )?;
+        if picked == options[0] {
+            manual = false;
+        } else if picked == options[1] {
+            manual = true;
+        } else {
+            return Ok(None);
+        }
+    }
+}
+
+/// 校验一次登录回填的全部字段
+///
+/// 只接受安装向导里声明过的字符串字段：路径写错或类型不符说明插件与
+/// descriptor 漂移，宁可报错重试，也不把未声明的键写进配置。
+fn validate_interactive_values(
+    fields: &[ResolvedSetupField],
+    trigger: &ResolvedSetupField,
+    values: &BTreeMap<String, String>,
+) -> std::result::Result<(), String> {
+    if !values.contains_key(&trigger.path) {
+        return Err(format!("登录结果没有返回 {}", trigger.path));
+    }
+    for (path, text) in values {
+        let Some(target) = fields.iter().find(|item| &item.path == path) else {
+            return Err(format!("登录结果包含未声明的字段 {path}"));
+        };
+        if !matches!(&target.kind, SetupKind::Text { .. }) {
+            return Err(format!("{path} 不是字符串字段，不能由登录结果回填"));
+        }
+        if text.trim().is_empty() {
+            return Err(format!("{path} 为空"));
+        }
+        mcsup::domain::plugin::schema::validate_instance(
+            &target.schema,
+            &Value::String(text.clone()),
+            path,
+        )
+        .map_err(|err| format!("{path} 无效：{err}"))?;
+    }
+    Ok(())
+}
+
+/// 解析密钥文件内容：JSON 对象表示一次回填多个字段，其余按单个字符串
+fn parse_setup_payload(text: &str, trigger: &str) -> Result<BTreeMap<String, String>> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("plugin setup hook returned an empty value"));
+    }
+    if trimmed.starts_with('{') {
+        let parsed: Value =
+            serde_json::from_str(trimmed).context("plugin setup hook returned invalid JSON")?;
+        let Value::Object(map) = parsed else {
+            return Err(anyhow!("plugin setup hook returned a non-object payload"));
+        };
+        let mut values = BTreeMap::new();
+        for (path, value) in map {
+            let Value::String(text) = value else {
+                return Err(anyhow!("plugin setup hook returned a non-string value"));
+            };
+            let text = text.trim();
+            if text.is_empty() {
+                return Err(anyhow!("plugin setup hook returned an empty value"));
+            }
+            values.insert(path, text.to_owned());
+        }
+        if !values.contains_key(trigger) {
+            return Err(anyhow!(
+                "plugin setup hook did not return the requested field {trigger}"
+            ));
+        }
+        return Ok(values);
+    }
+    Ok(BTreeMap::from([(trigger.to_owned(), trimmed.to_owned())]))
+}
+
+/// 执行插件的 setup hook：继承终端，密钥经 0600 临时文件回传
+///
+/// 临时目录与密钥文件用完即删；插件只拿到路径，密钥不进 argv、不经过 shell。
+/// 二维码这类需要排版的输出走独立的 UI 文件：宿主边等边渲染，插件不必自己
+/// 处理终端编码与宽度。
+fn run_setup_hook(
+    record: &PluginRecord,
+    field: &ResolvedSetupField,
+    interactive_paths: &[String],
+    printer: Printer,
+) -> Result<BTreeMap<String, String>> {
+    let dir = tempfile::Builder::new()
+        .prefix("mcsup-setup-")
+        .tempdir()
+        .context("create setup temp dir")?;
+    let secret_file = dir.path().join("secret");
+    let ui_file = dir.path().join("ui");
+    let (program, args) =
+        mcsup::plugin::process::entry_command(&record.artifact_dir, &record.manifest.entry, &[])
+            .map_err(|err| anyhow!("{err}"))?;
+    let fields = serde_json::to_string(interactive_paths)
+        .context("serialize interactive setup field list")?;
+    let mut child = std::process::Command::new(&program)
+        .args(&args)
+        .current_dir(&record.artifact_dir)
+        .env("MCSUP_SETUP_FIELD", &field.path)
+        .env("MCSUP_SETUP_SECRET_FILE", &secret_file)
+        .env("MCSUP_SETUP_UI_FILE", &ui_file)
+        .env("MCSUP_SETUP_FIELDS", fields)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("run plugin setup hook {}", program.display()))?;
+    let mut ui = SetupUi::new(&ui_file, printer);
+    let status = loop {
+        ui.drain();
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("wait for plugin setup hook {}", program.display()))?
+        {
+            break status;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    // 子进程退出前写入的最后一屏内容也要显示
+    ui.drain();
+    if !status.success() {
+        let code = status
+            .code()
+            .map_or_else(|| status.to_string(), |code| code.to_string());
+        return Err(anyhow!("plugin setup hook exited with {code}"));
+    }
+    let text = std::fs::read_to_string(&secret_file)
+        .with_context(|| format!("read {}", secret_file.display()))?;
+    parse_setup_payload(&text, &field.path)
+}
+
+/// 交互式 setup 的界面事件读取器
+///
+/// 插件按行追加 JSON：`{"type":"qr","content":"…"}` 由宿主编码并居中渲染，
+/// `{"type":"status","text":"…"}` 原样作为进度行。未知事件与坏行忽略，
+/// 不能因为一行排版内容让登录失败。
+struct SetupUi<'a> {
+    path: &'a Path,
+    offset: usize,
+    pending: Vec<u8>,
+    printer: Printer,
+}
+
+impl<'a> SetupUi<'a> {
+    fn new(path: &'a Path, printer: Printer) -> Self {
+        Self {
+            path,
+            offset: 0,
+            pending: Vec::new(),
+            printer,
+        }
+    }
+
+    /// 读取并渲染尚未处理的事件；文件还没创建时静默跳过
+    fn drain(&mut self) {
+        let Ok(bytes) = std::fs::read(self.path) else {
+            return;
+        };
+        if bytes.len() <= self.offset {
+            return;
+        }
+        self.pending.extend_from_slice(&bytes[self.offset..]);
+        self.offset = bytes.len();
+        while let Some(end) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let line = self.pending.drain(..=end).collect::<Vec<_>>();
+            let Ok(text) = std::str::from_utf8(&line) else {
+                continue;
+            };
+            self.render(text.trim());
+        }
+    }
+
+    #[allow(clippy::print_stdout)]
+    fn render(&self, line: &str) {
+        if line.is_empty() {
+            return;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            return;
+        };
+        match event.get("type").and_then(Value::as_str) {
+            Some("qr") => {
+                let Some(content) = event.get("content").and_then(Value::as_str) else {
+                    return;
+                };
+                let content = content.trim();
+                if content.is_empty() {
+                    return;
+                }
+                let label = event.get("label").and_then(Value::as_str).map_or_else(
+                    || {
+                        crate::i18n::pick(
+                            self.printer.lang(),
+                            "用手机扫描二维码：",
+                            "scan the QR code:",
+                        )
+                    },
+                    str::to_owned,
+                );
+                self.printer.print_section(&label);
+                self.printer.print_note(&format!("  {content}"));
+                if std::io::stdout().is_terminal()
+                    && let Some(qr) = crate::qr::render_centered(
+                        content,
+                        crossterm::terminal::size().map_or(80, |(width, _)| usize::from(width)),
+                    )
+                {
+                    print!("{qr}");
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                }
+            }
+            Some("status") => {
+                if let Some(text) = event.get("text").and_then(Value::as_str)
+                    && !text.trim().is_empty()
+                {
+                    self.printer.print_note(text.trim());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 该字段这次要不要问：条件成立（未声明条件视为成立），且没有被本次向导的
+/// 交互式 hook 顺带回填，且全新安装或仍为空
 ///
 /// 条件由插件的 `setup.fields[].when` 声明，例如「没选 qq 就不问 QQ 凭据」。
 /// 条件不成立的字段既不问，也不计入 `missing`：它不是「没填」，而是用不着。
-fn should_ask(field: &ResolvedSetupField, values: &Value, fresh: bool) -> bool {
+/// `answered_now` 记录本次已由 hook 填好的路径：一次扫码可能同时给出 token 与
+/// 服务端基址，后面的同名项即使 `fresh` 也不能再问一遍。
+fn should_ask(
+    field: &ResolvedSetupField,
+    values: &Value,
+    fresh: bool,
+    answered_now: &BTreeSet<String>,
+) -> bool {
+    if answered_now.contains(&field.path) {
+        return false;
+    }
     let active = field
         .when
         .as_ref()
@@ -2531,6 +2882,7 @@ mod tests {
             description: None,
             required: true,
             secret: false,
+            interactive: false,
             default: None,
             choices_from: Some(ChoicesSource::Servers),
             when: None,
@@ -2582,6 +2934,7 @@ mod tests {
             description: None,
             required: true,
             secret: false,
+            interactive: false,
             default: None,
             choices_from: None,
             when,
@@ -2597,15 +2950,28 @@ mod tests {
         let values = json!({ "qq": { "appId": "a", "groups": [] } });
 
         let asked = |fields: &[ResolvedSetupField], values: &Value, fresh: bool| {
+            let answered_now = BTreeSet::new();
             fields
                 .iter()
-                .filter(|field| should_ask(field, values, fresh))
+                .filter(|field| should_ask(field, values, fresh, &answered_now))
                 .map(|field| field.path.clone())
                 .collect::<Vec<_>>()
         };
         assert_eq!(asked(&setup.fields, &values, true).len(), 2);
         assert_eq!(
             asked(&setup.fields, &values, false),
+            vec!["qq.groups".to_owned()]
+        );
+
+        // 交互式 hook 刚填过的路径，后续不再重复提问
+        let answered_now = BTreeSet::from(["qq.appId".to_owned()]);
+        assert_eq!(
+            setup
+                .fields
+                .iter()
+                .filter(|field| should_ask(field, &values, true, &answered_now))
+                .map(|field| field.path.clone())
+                .collect::<Vec<_>>(),
             vec!["qq.groups".to_owned()]
         );
 
@@ -2628,6 +2994,93 @@ mod tests {
         );
         let with_qq = json!({ "platforms": ["qq", "telegram"] });
         assert_eq!(asked(&gated, &with_qq, true).len(), 2);
+    }
+
+    /// 多值回传：普通字符串保持旧协议，JSON 对象一次填多个字段
+    #[test]
+    fn setup_payload_accepts_single_and_multi_values() {
+        assert_eq!(
+            parse_setup_payload("  token-1 \n", "weixin.botToken").expect("single"),
+            BTreeMap::from([("weixin.botToken".to_owned(), "token-1".to_owned())])
+        );
+        assert_eq!(
+            parse_setup_payload(
+                r#"{"weixin.botToken":" t ","weixin.apiBase":"https://api.example.com"}"#,
+                "weixin.botToken",
+            )
+            .expect("multi"),
+            BTreeMap::from([
+                ("weixin.botToken".to_owned(), "t".to_owned()),
+                (
+                    "weixin.apiBase".to_owned(),
+                    "https://api.example.com".to_owned(),
+                ),
+            ])
+        );
+        // 没有当前字段、空值、非字符串都不能当成一次成功的登录
+        assert!(parse_setup_payload(r#"{"weixin.apiBase":"x"}"#, "weixin.botToken").is_err());
+        assert!(parse_setup_payload(r#"{"weixin.botToken":""}"#, "weixin.botToken").is_err());
+        assert!(parse_setup_payload(r#"{"weixin.botToken":1}"#, "weixin.botToken").is_err());
+        assert!(parse_setup_payload("   ", "weixin.botToken").is_err());
+    }
+
+    /// 回填值必须命中声明过的字符串字段，并按各自 schema 复校验
+    #[test]
+    fn interactive_values_must_match_declared_fields() {
+        let field = |path: &str, schema: Value| ResolvedSetupField {
+            path: path.to_owned(),
+            label: path.to_owned(),
+            description: None,
+            required: false,
+            secret: false,
+            interactive: false,
+            default: None,
+            choices_from: None,
+            when: None,
+            kind: SetupKind::Text {
+                choices: Vec::new(),
+            },
+            schema,
+        };
+        let fields = vec![
+            field("weixin.botToken", json!({ "type": "string" })),
+            field(
+                "weixin.apiBase",
+                json!({ "type": "string", "maxLength": 20 }),
+            ),
+        ];
+        let trigger = &fields[0];
+        validate_interactive_values(
+            &fields,
+            trigger,
+            &BTreeMap::from([
+                ("weixin.botToken".to_owned(), "tok".to_owned()),
+                ("weixin.apiBase".to_owned(), "https://a".to_owned()),
+            ]),
+        )
+        .expect("declared fields pass");
+        assert!(
+            validate_interactive_values(
+                &fields,
+                trigger,
+                &BTreeMap::from([("unknown".to_owned(), "x".to_owned())]),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_interactive_values(
+                &fields,
+                trigger,
+                &BTreeMap::from([
+                    ("weixin.botToken".to_owned(), "tok".to_owned()),
+                    (
+                        "weixin.apiBase".to_owned(),
+                        "https://api.example.com/long/base".to_owned()
+                    ),
+                ]),
+            )
+            .is_err()
+        );
     }
 
     #[test]
