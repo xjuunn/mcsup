@@ -141,6 +141,7 @@ pub fn sample_frames(full: bool) -> Vec<Frame> {
         Frame::Welcome(Welcome {
             session_id: "session".to_owned(),
             host_version: "0.1.0".to_owned(),
+            locale: "en".to_owned(),
             granted: vec!["server:read".to_owned()],
             limits: WelcomeLimits::default(),
             config: ConfigValues::default(),

@@ -48,6 +48,15 @@ impl Lang {
     pub(crate) const fn is_zh(self) -> bool {
         matches!(self, Self::Zh)
     }
+
+    /// 下发给插件 / 子进程的语言标签
+    #[must_use]
+    pub(crate) const fn tag(self) -> &'static str {
+        match self {
+            Self::Zh => "zh",
+            Self::En => "en",
+        }
+    }
 }
 
 /// `--lang` 的取值

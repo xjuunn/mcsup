@@ -579,7 +579,7 @@ Windows 的控制台是**继承**来的：宿主是常驻进程，若它继承�
 
 ```json
 {"v":1,"type":"welcome","session_id":"s-7f3a9c","host_version":"0.1.0",
- "granted":["console:read"],
+ "locale":"zh","granted":["console:read"],
  "limits":{"inflight":8,"frame_bytes":25165824,"event_queue":1024,"log_lines_per_sec":200},
  "config":{"revision":3,"values":{"token":"***","channels":["global"]}},
  "scope":{"kind":"machine"}}
@@ -1544,6 +1544,9 @@ JSON Schema 没有「密钥」「单位」的标准表达，统一用 `x-mcsup-`
 - 用户拒绝授权或必填项未填时，安装仍然成功，但跳过启动并在结果里报告
   `pending` / `missing`；
 - `--no-setup` 跳过整个向导（不授权、不补配置、不启动），与旧版行为一致；
+- 向导被 `Ctrl+C` / `Esc` 取消等价于没安装：全新安装删除记录与产物、保留
+  `plugin-data`（不含密钥）；升级恢复安装前的记录与运行状态。用户取消不是
+  错误，不打印提示，退出码 130；
 - 非交互（`--json` / 非 TTY）不提问：只有 `--yes` 才授予能力，缺失必填项
   以 `missing` 返回，提示用 `mcsup plugin config set` 补齐。
 
@@ -1865,7 +1868,9 @@ TypeScript：
 | `s` | 字段 DSL：`plugins.md` §11.5 子集，内部归约为 zod |
 | `z` | 重新导出的 zod（peer），超出子集的逃生口 |
 | `run(plugin)` | 连接、握手、帧循环、退出；构建产物自动调用 |
-| `PluginContext` | 能力客户端 |
+| `PluginContext` | 能力客户端；另有 `locale` / `hostVersion` / `storage`（声明 `storage:kv` 时） |
+| `pickLocale` | 按 `ctx.locale` 二选一的多语言辅助 |
+| `kvJson` / `kvText` / `kvCounter` / `kvCursor` / `kvTtlCache` | 显式接 `KvClient` 的持久化工具；`ctx.storage` 是其便捷门面 |
 | `PluginError` | 带 `code` / `retryable` 的错误 |
 | `testing.createMockHost()` | 内存双工 |
 | `utils` | 纯函数工具（文本 / 时间 / 重试 / Minecraft 命令转义 / KV 包装），不含第三方平台客户端 |
@@ -2167,6 +2172,9 @@ GitHub 归档额外多一层 `<repo>-<SHA>/` 顶层目录；128 MiB 的压缩包
   密钥字段每输入一个字符显示一个 `*`（只暴露长度），内容不写进审计日志。
 - 已安装插件要重跑向导时用 `mcsup plugin setup <id>`：不必卸载重装，同样
   逐项询问（现有值留空即沿用），沿用原启用状态，只在原本运行中时重启一次。
+- 向导中途取消（`Ctrl+C` / `Esc`）等价于没有安装：全新安装删除记录与产物，
+  `plugin-data`（不含密钥）与日志保留；升级恢复安装前记录并重启原本在跑的
+  旧版本。取消不打印错误提示，退出码 130。
 
 ## 15.6 升级、回滚、卸载
 

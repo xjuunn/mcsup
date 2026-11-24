@@ -70,7 +70,8 @@ config: s.object({
 | `s` | 字段 DSL（上方） |
 | `z` | 重新导出的 zod（peer dependency，逃生口） |
 | `run(plugin)` | 连接宿主、握手、分派、退出（构建产物已自动调用） |
-| `PluginContext` | 能力客户端，形状由 `capabilities` 推导 |
+| `PluginContext` | 能力客户端，形状由 `capabilities` 推导；含 `locale` / `hostVersion` |
+| `pickLocale` | 按 `ctx.locale` 二选一的多语言辅助 |
 | `PluginError` | 带 `code` / `category` / `retryable` 的错误 |
 | `mcsup-plugin/testing` 的 `createMockHost()` | 内存双工宿主，不开 socket |
 
@@ -95,7 +96,7 @@ import {
   sanitizeChat, stripColorCodes, buildCommand, isPlayerName,  // Minecraft
   withRetry, pLimit, mapLimit, buildUrl,                     // 网络与重试
   chunk, clamp, truncate, unique, sleep, randomId, nowIso,    // 通用
-  kvJson, kvCounter, kvCursor, kvTtlCache,                    // 状态存储
+  kvJson, kvText, kvCounter, kvCursor, kvTtlCache,            // 状态存储
 } from "mcsup-plugin";
 ```
 
@@ -104,7 +105,7 @@ import {
 | 通用 | `sleep` `clamp` `chunk` `unique` `truncate`（按码点）`randomId` `nowIso` |
 | 网络与重试 | `withRetry`（指数退避 + 抖动，只重试 retryable 错误）`pLimit` `mapLimit` `buildUrl` |
 | Minecraft | `stripColorCodes` `legacyColorCodes` `sanitizeChat`（去控制字符、折叠换行、限长）`isPlayerName` `buildCommand`（参数转义） |
-| 状态存储 | `kvJson` `kvCounter` `kvCursor`（只前进）`kvTtlCache`（TTL + 读穿） |
+| 状态存储 | `kvJson` `kvText` `kvCounter` `kvCursor`（只前进）`kvTtlCache`（TTL + 读穿） |
 
 示例：
 
@@ -120,6 +121,21 @@ await withRetry(() => ctx["net:outbound"].request({ url }), { attempts: 3 });
 
 `utils` 属于次版本可选 API；纯函数不接 `ctx`，状态工具显式传入
 `ctx["storage:kv"]`，能力未授予时会在取 client 处直接 `denied`。
+
+声明 `storage:kv` 后还可用便捷门面 `ctx.storage`，无需自己接 client：
+
+```ts
+const json = ctx.storage.json<{ last: string }>("state:"); // JSON
+const hits = ctx.storage.counter("stats:");                // 原子计数
+const cursor = ctx.storage.cursor("shop:seq");             // 只前进
+const cache = ctx.storage.cache("remote:");                // TTL + 读穿
+```
+
+宿主语言直接读 `ctx.locale`（`zh` / `en`），二选一用 `pickLocale`：
+
+```ts
+const text = pickLocale(ctx.locale, "已连接", "connected");
+```
 
 ## 能力驱动的 Ctx
 

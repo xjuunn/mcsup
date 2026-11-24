@@ -79,6 +79,8 @@ pub(crate) struct SessionConfig {
     pub record: PluginRecord,
     pub token: String,
     pub host_version: String,
+    /// 宿主界面语言，随 `welcome` 下发给插件
+    pub locale: String,
     pub limits: WelcomeLimits,
     pub config: ConfigValues,
     pub services: Arc<HostServices>,
@@ -247,6 +249,7 @@ pub(crate) fn handshake(
     let welcome = Welcome {
         session_id: session_id.clone(),
         host_version: cfg.host_version.clone(),
+        locale: cfg.locale.clone(),
         granted: granted.iter().map(ToString::to_string).collect(),
         limits: cfg.limits,
         config: cfg.config.clone(),

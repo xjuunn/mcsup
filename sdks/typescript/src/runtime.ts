@@ -298,6 +298,9 @@ export class Session<C extends readonly Capability[], Cfg extends SchemaLike = S
       sessionId: "",
       limits: { ...DEFAULT_LIMITS },
       scope: { kind: def.scope ?? "machine" },
+      // welcome 之前没有宿主信息：按英文与空版本兜底
+      locale: "en",
+      hostVersion: "",
       events: this.events,
       logLine: (level: string, message: string) => {
         this.log(level, message);
@@ -447,6 +450,8 @@ export class Session<C extends readonly Capability[], Cfg extends SchemaLike = S
       logLinesPerSec: frame.limits.log_lines_per_sec,
     };
     this.ctxEnv.scope = frame.scope;
+    this.ctxEnv.locale = frame.locale;
+    this.ctxEnv.hostVersion = frame.host_version;
     const granted = this.def.capabilities.filter((cap) => frame.granted.includes(cap));
     const ungranted = this.def.capabilities.filter((cap) => !frame.granted.includes(cap));
     this.ctx = createCtx<C, Cfg>(this.ctxEnv, granted as unknown as C, ungranted);

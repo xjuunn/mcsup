@@ -139,6 +139,8 @@ pub struct PluginHost {
     bus: EventBus,
     audit: Arc<dyn AuditSink>,
     host_version: String,
+    /// 下发给插件的界面语言；经锁写入，理由同 [`Self::idle_after`]
+    locale: Mutex<String>,
     sessions: Mutex<HashMap<PluginId, Arc<SessionInner>>>,
     starting: Mutex<HashSet<PluginId>>,
     crashes: Mutex<HashMap<PluginId, Crashes>>,
@@ -207,6 +209,7 @@ impl PluginHost {
             bus,
             audit,
             host_version: host_version.into(),
+            locale: Mutex::new("en".to_owned()),
             sessions: Mutex::new(HashMap::new()),
             starting: Mutex::new(HashSet::new()),
             crashes: Mutex::new(HashMap::new()),
@@ -269,6 +272,30 @@ impl PluginHost {
     #[must_use]
     pub fn heartbeat_for_test(&self) -> Heartbeat {
         self.heartbeat()
+    }
+
+    /// 覆盖下发给插件的界面语言（`zh` / `en`）
+    ///
+    /// 与 [`Self::with_heartbeat`] 同理经锁写入；握手时才读取，之后新建的会话
+    /// 都使用这里的最新值。
+    #[must_use]
+    pub fn with_locale(self: Arc<Self>, locale: impl Into<String>) -> Arc<Self> {
+        {
+            let mut slot = self
+                .locale
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *slot = locale.into();
+        }
+        self
+    }
+
+    /// 当前下发的界面语言
+    fn locale(&self) -> String {
+        self.locale
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// 覆盖空闲停止阈值（测试与 `--idle-timeout` 用）
@@ -618,6 +645,7 @@ impl PluginHost {
             record: record.clone(),
             token,
             host_version: self.host_version.clone(),
+            locale: self.locale(),
             limits: WelcomeLimits::default(),
             config: self.welcome_config(id),
             services: Arc::clone(&self.services),

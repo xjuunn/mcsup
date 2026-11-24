@@ -47,7 +47,7 @@ pub(crate) fn ensure(printer: Printer) -> Result<()> {
     let data_dir = config::platform_data_dir();
     let client = ControlClient::new(&data_dir);
     if !client.is_available() {
-        return spawn(&client);
+        return spawn(&client, printer.lang());
     }
     adopt_current_build(&client, printer)
 }
@@ -83,7 +83,7 @@ fn replace(client: &ControlClient, reason: &str, printer: Printer) -> Result<()>
     printer.print_note(&format!("{reason}，正在重启插件宿主"));
     client.shutdown().context("请求旧插件宿主退出")?;
     wait_until_down(client)?;
-    spawn(client)?;
+    spawn(client, printer.lang())?;
     printer.print_note(&crate::i18n::pick(
         printer.lang(),
         "插件宿主已换成当前构建",
@@ -113,11 +113,13 @@ fn wait_until_down(client: &ControlClient) -> Result<()> {
 }
 
 /// 拉起 `__plugin-host` 并等待可连接
-fn spawn(client: &ControlClient) -> Result<()> {
+fn spawn(client: &ControlClient, lang: crate::locale::Lang) -> Result<()> {
     let exe = std::env::current_exe().context("定位 mcsup 可执行文件")?;
     let mut command = std::process::Command::new(exe);
     command
         .arg("__plugin-host")
+        .arg("--lang")
+        .arg(lang.tag())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());

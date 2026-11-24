@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { action, definePlugin, z } from "../src/index.js";
+import { action, definePlugin, pickLocale, z } from "../src/index.js";
 import { createMockHost } from "../src/testing.js";
 
 const runtime = {
@@ -341,6 +341,106 @@ describe("能力客户端按宿主线上形状解码", () => {
       expect(result.error.code).toBe("internal");
       expect(result.error.message).toMatch(/server:read\.list/);
     }
+    await host.shutdown();
+  });
+
+  it("ctx.locale / hostVersion 来自 welcome，storage 门面包装 KV", async () => {
+    const store = new Map<string, string>();
+    const handle = ({
+      capability,
+      method,
+      input,
+    }: {
+      capability: string;
+      method: string;
+      input: unknown;
+    }): unknown => {
+      if (capability !== "storage:kv") {
+        throw new Error(`unexpected ${capability}.${method}`);
+      }
+      const args = input as { key: string; value?: string };
+      switch (method) {
+        case "get":
+          return { value: store.get(args.key) ?? null };
+        case "set":
+          store.set(args.key, args.value ?? "");
+          return { ok: true };
+        case "delete":
+          return { deleted: store.delete(args.key) };
+        case "list":
+          return { keys: [...store.keys()] };
+        default:
+          throw new Error(`unexpected storage:kv.${method}`);
+      }
+    };
+    const plugin = definePlugin({
+      id: "storage-facade",
+      title: "持久化门面",
+      version: "1.0.0",
+      license: "MIT",
+      capabilities: ["storage:kv"],
+      config: z.object({}),
+      actions: {
+        probe: action("probe")
+          .output(z.unknown())
+          .run(async (_input, ctx) => {
+            const counter = ctx.storage.counter("stats:");
+            const value = await counter.incr("hit");
+            const json = ctx.storage.json<{ a: number }>("j:");
+            await json.set("x", { a: 1 });
+            const text = ctx.storage.text("t:");
+            await text.set("k", "v");
+            return {
+              locale: ctx.locale,
+              hostVersion: ctx.hostVersion,
+              greeting: pickLocale(ctx.locale, "你好", "hello"),
+              counter: value,
+              json: await json.get("x"),
+              text: await text.get("k"),
+            };
+          }),
+      },
+    });
+    const host = createMockHost(plugin, { locale: "zh", handle });
+    await host.start();
+    const result = await host.callOp("probe", {});
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.output).toEqual({
+        locale: "zh",
+        hostVersion: "0.0.0-test",
+        greeting: "你好",
+        counter: 1,
+        json: { a: 1 },
+        text: "v",
+      });
+    }
+    await host.shutdown();
+  });
+
+  it("未声明 storage:kv 时 ctx.storage 不存在", async () => {
+    let hasStorage = true;
+    const plugin = definePlugin({
+      id: "no-storage",
+      title: "无持久化",
+      version: "1.0.0",
+      license: "MIT",
+      capabilities: ["server:read"],
+      config: z.object({}),
+      actions: {
+        probe: action("probe")
+          .output(z.unknown())
+          .run(async (_input, ctx) => {
+            hasStorage = "storage" in ctx;
+            return hasStorage;
+          }),
+      },
+    });
+    const host = createMockHost(plugin, { handle: () => ({ servers: [] }) });
+    await host.start();
+    const result = await host.callOp("probe", {});
+    expect(result.ok).toBe(true);
+    expect(hasStorage).toBe(false);
     await host.shutdown();
   });
 });

@@ -1237,6 +1237,7 @@ panic，只能返回错误。
 | `CLI-UI-006` | 非 TTY | 不输出动画，保留阶段行 |
 | `CLI-UI-007` | Ctrl-C | 取消并退出 130 |
 | `CLI-UI-008` | 错误 | 带可操作提示 |
+| `CLI-UI-009` | 安装向导取消 | 回退记录 / 产物，静默退出 130 |
 
 ## 12.5 Web 投影（`WEB-*`）
 
@@ -1325,6 +1326,8 @@ panic，只能返回错误。
 | `SDK-TS-013` | `createMockHost` | 无 socket |
 | `SDK-TS-014` | 流 | async iterator |
 | `SDK-TS-015` | 打包 | 无 devDependency 进入产物 |
+| `SDK-TS-016` | `ctx.storage` | 仅 `storage:kv` 时存在，读写走同一 KV |
+| `SDK-TS-017` | `ctx.locale` | welcome 下发；缺失回退 `en` |
 | `SDK-PY-001` | `--dump-descriptor` | 与 Rust 逐字节一致 |
 | `SDK-PY-002` | pydantic 配置 | 类型、默认值、`$defs` 内联 |
 | `SDK-PY-003` | op 路由 | 按 id 分发 |

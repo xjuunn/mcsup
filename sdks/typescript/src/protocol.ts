@@ -165,6 +165,8 @@ export function parseFrame(text: string): InboundFrame {
         type: "welcome",
         session_id: requireString(frame, "session_id"),
         host_version: requireString(frame, "host_version"),
+        // 旧宿主不发送 locale：按英文回退，不能因此握手失败
+        locale: typeof frame["locale"] === "string" && frame["locale"] !== "" ? frame["locale"] : "en",
         granted: stringArray(frame, "granted"),
         limits: {
           inflight: requireIntIn(limits, "limits", "inflight", 1),
