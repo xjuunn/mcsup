@@ -32,10 +32,34 @@ function plugin(handler: () => string | Promise<string>) {
     version: "1.0.0",
     license: "MIT",
     capabilities: [],
-    config: z.object({ token: z.string() }),
+    config: z.object({ token: z.string(), base: z.string().optional() }),
     setup: {
-      fields: [{ path: "token", required: true, secret: true, interactive: true }],
+      fields: [
+        { path: "token", required: true, secret: true, interactive: true },
+        { path: "base", secret: true, interactive: true },
+      ],
       interactive: { token: handler },
+    },
+  });
+}
+
+/** 一次登录回填 token 与 base 的插件 */
+function multiPlugin(handler: (fields: readonly string[]) => Readonly<Record<string, string>>) {
+  return definePlugin({
+    id: "setup-multi",
+    title: "安装向导",
+    version: "1.0.0",
+    license: "MIT",
+    capabilities: [],
+    config: z.object({ token: z.string(), base: z.string().optional() }),
+    setup: {
+      fields: [
+        { path: "token", required: true, secret: true, interactive: true },
+        { path: "base", secret: true, interactive: true },
+      ],
+      interactive: {
+        token: (ctx) => handler(ctx.fields),
+      },
     },
   });
 }
@@ -98,5 +122,56 @@ describe("交互式 setup 字段", () => {
 
   it("缺少环境变量时返回协议错误", async () => {
     expect(await runSetupField(plugin(() => "abc"), {})).toBe(ExitCode.Protocol);
+  });
+
+  it("一次登录可回填多个字段并写成 JSON 对象", async () => {
+    const dir = tempDir();
+    const file = path.join(dir, "secret");
+    const code = await runSetupField(
+      multiPlugin((fields) => {
+        expect(fields).toEqual(["token", "base"]);
+        return { token: "tok", base: "https://api.example.com" };
+      }),
+      {
+        MCSUP_SETUP_FIELD: "token",
+        MCSUP_SETUP_SECRET_FILE: file,
+        MCSUP_SETUP_FIELDS: JSON.stringify(["token", "base"]),
+      },
+    );
+    expect(code).toBe(ExitCode.Ok);
+    expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({
+      token: "tok",
+      base: "https://api.example.com",
+    });
+  });
+
+  it("旧宿主没有字段列表时对象降级成当前字段", async () => {
+    const dir = tempDir();
+    const file = path.join(dir, "secret");
+    const code = await runSetupField(
+      multiPlugin(() => ({ token: "tok", base: "https://api.example.com" })),
+      { MCSUP_SETUP_FIELD: "token", MCSUP_SETUP_SECRET_FILE: file },
+    );
+    expect(code).toBe(ExitCode.Ok);
+    expect(readFileSync(file, "utf8")).toBe("tok");
+  });
+
+  it("回填未声明的路径或缺当前字段时失败", async () => {
+    const dir = tempDir();
+    const file = path.join(dir, "secret");
+    expect(
+      await runSetupField(multiPlugin(() => ({ token: "tok", other: "x" })), {
+        MCSUP_SETUP_FIELD: "token",
+        MCSUP_SETUP_SECRET_FILE: file,
+        MCSUP_SETUP_FIELDS: JSON.stringify(["token"]),
+      }),
+    ).toBe(ExitCode.Failure);
+    expect(
+      await runSetupField(multiPlugin(() => ({ base: "x" })), {
+        MCSUP_SETUP_FIELD: "token",
+        MCSUP_SETUP_SECRET_FILE: file,
+        MCSUP_SETUP_FIELDS: JSON.stringify(["token", "base"]),
+      }),
+    ).toBe(ExitCode.Failure);
   });
 });

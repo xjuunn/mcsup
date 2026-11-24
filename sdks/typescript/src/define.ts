@@ -177,12 +177,25 @@ export interface SetupFieldSpec {
 export interface SetupInteractiveContext {
   /** 配置路径，与 descriptor 中声明的字段 `path` 相同 */
   readonly field: string;
+  /**
+   * 本次允许回填的交互式字段路径（宿主经 `MCSUP_SETUP_FIELDS` 告知）。
+   *
+   * 一次平台登录可能同时产出多个配置项（如 token 与服务端基址）。处理函数
+   * 可以返回这些路径的映射；不在其中的键会被 SDK 拒绝。旧宿主不设置这个
+   * 变量时为只含 `field` 的单元素数组。
+   */
+  readonly fields: readonly string[];
 }
 
-/** 交互式 setup 字段的处理函数：返回要写入配置的密钥 */
+/**
+ * 交互式 setup 字段的处理函数
+ *
+ * 返回单个字符串表示只填当前字段；返回对象表示一次登录回填多个配置项，
+ * 键必须是 `ctx.fields` 中的路径，且必须包含 `ctx.field`。
+ */
 export type SetupInteractiveHandler = (
   ctx: SetupInteractiveContext,
-) => string | Promise<string>;
+) => string | Readonly<Record<string, string>> | Promise<string | Readonly<Record<string, string>>>;
 
 /** setup 字段的提问条件 */
 export interface SetupWhenSpec {

@@ -61,6 +61,12 @@
   `DESCRIPTOR_SCHEMA_VERSION` 随之升到 4（仍接受 1 / 2 / 3 的旧产物）。
   TypeScript SDK 同步支持 `SetupFieldSpec.when`，在构建期校验 `path` 非空、
   `includes` / `equals` 只能声明其一。
+- 安装向导的交互式 setup 字段支持一次登录回填多个配置项：宿主经
+  `MCSUP_SETUP_FIELDS` 列出允许路径，插件以 JSON 对象写入密钥文件；二维码等
+  界面经 `MCSUP_SETUP_UI_FILE` 事件交给宿主居中渲染，插件不必处理终端宽度与
+  深色主题。未设置这些变量的旧宿主保持单字符串协议。
+  TypeScript SDK 的 `SetupInteractiveContext` 增加 `fields`，处理函数可返回
+  `string` 或路径 → 值的对象。
 - TypeScript 插件 SDK（`sdks/typescript`，包名 `mcsup-plugin`）：握手、op 调用、
   流式返回、事件订阅、配置与密钥、`ctx.contract.call` 与严格帧解码层，附
   conformance 用例与宿主实现互校。
