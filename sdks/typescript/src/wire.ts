@@ -11,7 +11,9 @@ import { PluginError } from "./errors.js";
 import type {
   ConsoleLineEntry,
   ConsolePage,
+  ContentIdentity,
   ContentItem,
+  ContentKind,
   FileEntry,
   JavaRuntime,
   NetResponse,
@@ -364,8 +366,30 @@ export function decodeContentList(value: unknown): readonly ContentItem[] {
       size: asNumber(field(entry, "size", where), `${where}.size`),
     };
     const identity = field(entry, "identity", where);
-    return identity === undefined ? decoded : { ...decoded, identity };
+    return identity === undefined ? decoded : { ...decoded, identity: decodeContentIdentity(identity, `${where}.identity`) };
   });
+}
+
+const CONTENT_KINDS: readonly ContentKind[] = ["mod", "plugin", "resourcepack", "datapack", "shader", "modpack"];
+
+/** `content.list[].identity`：宿主按哈希反查的结果，字段缺失以 null 表示 */
+function decodeContentIdentity(value: unknown, what: string): ContentIdentity {
+  const record = asObject(value, what);
+  const kind = asNullableString(field(record, "kind", what), `${what}.kind`);
+  if (kind !== null && !(CONTENT_KINDS as readonly string[]).includes(kind)) {
+    invalid(what, `.kind is not a known content kind: ${kind}`);
+  }
+  return {
+    hash: asString(field(record, "hash", what), `${what}.hash`),
+    project_id: asString(field(record, "project_id", what), `${what}.project_id`),
+    slug: asNullableString(field(record, "slug", what), `${what}.slug`),
+    title: asNullableString(field(record, "title", what), `${what}.title`),
+    version_id: asString(field(record, "version_id", what), `${what}.version_id`),
+    version_number: asString(field(record, "version_number", what), `${what}.version_number`),
+    channel: asString(field(record, "channel", what), `${what}.channel`),
+    date_published: asString(field(record, "date_published", what), `${what}.date_published`),
+    kind: kind as ContentKind | null,
+  };
 }
 
 /** `content.install` → `{file,size,project,version}` */

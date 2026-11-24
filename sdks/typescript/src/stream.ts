@@ -10,10 +10,10 @@ import { z } from "./zod.js";
 
 import { type FrameChannel } from "./connection.js";
 import { PluginError, toPluginError } from "./errors.js";
-import { MAX_FRAME_BYTES, frameBytes, wireFrameBytes, type OutboundFrame } from "./protocol.js";
+import { MAX_FRAME_BYTES, MAX_STREAM_BYTES, frameBytes, wireFrameBytes, type OutboundFrame } from "./protocol.js";
 
-/** 流式总字节上限（plugins.md §5.4） */
-export const MAX_STREAM_BYTES = 16 * 1024 * 1024;
+/** 流式总字节上限（plugins.md §5.4）；数值取自生成契约 */
+export { MAX_STREAM_BYTES };
 
 /** 流式空闲超时（plugins.md §5.4：60 s 无新分块即终止） */
 export const STREAM_IDLE_TIMEOUT_MS = 60_000;

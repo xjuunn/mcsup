@@ -55,6 +55,7 @@ export type {
   ConsoleReadClient,
   ConsoleWriteClient,
   ContentClient,
+  ContentIdentity,
   ContentInstallResult,
   ContentItem,
   ContentKind,

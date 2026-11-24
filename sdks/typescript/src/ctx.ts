@@ -233,7 +233,26 @@ export type ContentKind = "mod" | "plugin" | "resourcepack" | "datapack" | "shad
 export interface ContentItem {
   readonly file: string;
   readonly size: number;
-  readonly identity?: unknown;
+  /** 请求了 `identify` 且宿主识别成功时存在 */
+  readonly identity?: ContentIdentity;
+}
+
+/** `content.list` 的按哈希反查结果；缺失字段由宿主置 `null`，不得据空值推断结论 */
+export interface ContentIdentity {
+  /** 反查时使用的文件哈希 */
+  readonly hash: string;
+  readonly project_id: string;
+  /** 上游未返回时为 null */
+  readonly slug: string | null;
+  readonly title: string | null;
+  readonly version_id: string;
+  readonly version_number: string;
+  /** 发布通道：`release` / `beta` / `alpha` */
+  readonly channel: string;
+  /** ISO-8601 发布时间 */
+  readonly date_published: string;
+  /** 上游类型认不出时为 null */
+  readonly kind: ContentKind | null;
 }
 
 export interface ContentInstallResult {

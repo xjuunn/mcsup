@@ -251,18 +251,54 @@ describe("backup", () => {
 });
 
 describe("content", () => {
-  it("list 透传可选 identity", () => {
+  it("list 解码可选 identity", () => {
+    const identity = {
+      hash: "sha1",
+      project_id: "jei",
+      slug: null,
+      title: "JEI",
+      version_id: "v1",
+      version_number: "1.0",
+      channel: "release",
+      date_published: "2024-01-01T00:00:00Z",
+      kind: "mod",
+    };
     expect(
       decodeContentList({
         items: [
           { file: "a.jar", size: 1 },
-          { file: "b.jar", size: 2, identity: { project: "p" } },
+          { file: "b.jar", size: 2, identity },
         ],
       }),
     ).toEqual([
       { file: "a.jar", size: 1 },
-      { file: "b.jar", size: 2, identity: { project: "p" } },
+      { file: "b.jar", size: 2, identity },
     ]);
+  });
+
+  it("list 的 identity 字段缺失或未知 kind 视为违约", () => {
+    const identity = {
+      hash: "sha1",
+      project_id: "jei",
+      slug: null,
+      title: null,
+      version_id: "v1",
+      version_number: "1.0",
+      channel: "release",
+      date_published: "2024-01-01T00:00:00Z",
+      kind: null,
+    };
+    expect(
+      decodeContentList({ items: [{ file: "b.jar", size: 2, identity }] }),
+    ).toEqual([{ file: "b.jar", size: 2, identity }]);
+    expectInternal(
+      () => decodeContentList({ items: [{ file: "b.jar", size: 2, identity: { ...identity, version_id: undefined } }] }),
+      /version_id/,
+    );
+    expectInternal(
+      () => decodeContentList({ items: [{ file: "b.jar", size: 2, identity: { ...identity, kind: "unknown" } }] }),
+      /kind/,
+    );
   });
 
   it("install 的 version 可空", () => {
