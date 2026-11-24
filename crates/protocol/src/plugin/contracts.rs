@@ -502,6 +502,11 @@ fn render_constants(out: &mut String) {
             i64::try_from(crate::plugin::MAX_FRAME_BYTES).unwrap_or(i64::MAX),
         ),
         (
+            "MAX_STREAM_BYTES",
+            "单个流式 op 的总字节上限",
+            i64::try_from(port::plugin::MAX_STREAM_BYTES).unwrap_or(i64::MAX),
+        ),
+        (
             "MAX_JSON_DEPTH",
             "JSON 嵌套深度上限",
             i64::try_from(crate::plugin::MAX_JSON_DEPTH).unwrap_or(i64::MAX),
