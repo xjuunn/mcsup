@@ -8,6 +8,8 @@
 import type { OpenCapabilityName } from "./contracts/v1.js";
 import { PluginError } from "./errors.js";
 import type { InferSchema, SchemaLike } from "./schema.js";
+import { kvCounter, kvCursor, kvJson, kvText, kvTtlCache } from "./utils/state.js";
+import type { KvCounter, KvCursor, KvJson, KvText, KvTtlCache } from "./utils/state.js";
 import {
   decodeBackupCreate,
   decodeBackupList,
@@ -339,6 +341,45 @@ export interface ScopeView {
 }
 
 /**
+ * 宿主界面语言标签（BCP 47 主标签，当前为 `zh` / `en`）。
+ *
+ * 用字符串而不是联合：宿主新增语言时旧 SDK 不应编译失败。判断请用
+ * `pickLocale` / `isZhLocale`，不要直接比较。
+ */
+export type Locale = string;
+
+/** 是否中文界面；空值与无法识别的标签按非中文处理。 */
+export function isZhLocale(locale: string): boolean {
+  return locale.trim().toLowerCase().startsWith("zh");
+}
+
+/** 按宿主语言二选一。 */
+export function pickLocale(locale: string, zh: string, en: string): string {
+  return isZhLocale(locale) ? zh : en;
+}
+
+/** `ctx.storage` 门面；仅在声明 `storage:kv` 时存在 */
+export interface StorageFacade {
+  /** 原始 client，需要未封装的读写时用 */
+  readonly kv: KvClient;
+  /** JSON 值（UTF-8 编码） */
+  json<T>(prefix?: string): KvJson<T>;
+  /** 纯文本值 */
+  text(prefix?: string): KvText;
+  /** 原子计数 */
+  counter(prefix?: string): KvCounter;
+  /** 单调前进的游标 */
+  cursor(key: string, initial?: number): KvCursor;
+  /** 带 TTL 的持久缓存 */
+  cache(prefix?: string): KvTtlCache;
+}
+
+/** 声明 `storage:kv` 时才出现的 `storage` 成员 */
+type StorageMember<C extends readonly Capability[]> = "storage:kv" extends C[number]
+  ? { readonly storage: StorageFacade }
+  : unknown;
+
+/**
  * 能力驱动的上下文（`CtxFor<capabilities, config>`）。
  *
  * 未声明的能力对应字段在类型上不存在；`log` 恒可用。`config` 的类型由
@@ -346,7 +387,7 @@ export interface ScopeView {
  */
 export type CtxFor<C extends readonly Capability[], Cfg extends SchemaLike = SchemaLike> = {
   [K in keyof CtxMembers as K extends C[number] ? K : never]: CtxMembers[K];
-} & {
+} & StorageMember<C> & {
   readonly log: LogClient;
   /** 插件间契约调用；声明 `consumes` 后由宿主路由 */
   readonly contract: ContractClient;
@@ -354,6 +395,10 @@ export type CtxFor<C extends readonly Capability[], Cfg extends SchemaLike = Sch
   readonly sessionId: string;
   readonly limits: LimitsView;
   readonly scope: ScopeView;
+  /** 宿主界面语言（`zh` / `en`），供插件做多语言文案 */
+  readonly locale: Locale;
+  /** 宿主版本 */
+  readonly hostVersion: string;
 };
 
 /** 运行期构造上下文所需的环境（welcome 后会被改写） */
@@ -365,6 +410,9 @@ export interface CtxEnvironment {
   sessionId: string;
   limits: LimitsView;
   scope: ScopeView;
+  locale: Locale;
+  /** 宿主版本；welcome 之前为空 */
+  hostVersion: string;
   readonly events: EventBus;
   readonly logLine: (level: string, message: string) => void;
 }
@@ -464,6 +512,14 @@ export function createCtx<C extends readonly Capability[], Cfg extends SchemaLik
       list: async (prefix = "") => decodeKvList(await call("storage:kv", "list", { prefix })),
     };
     members["storage:kv"] = kv;
+    members["storage"] = {
+      kv,
+      json: <T,>(prefix = "") => kvJson<T>(kv, prefix),
+      text: (prefix = "") => kvText(kv, prefix),
+      counter: (prefix = "") => kvCounter(kv, prefix),
+      cursor: (key, initial = 0) => kvCursor(kv, key, initial),
+      cache: (prefix = "cache:") => kvTtlCache(kv, prefix),
+    } satisfies StorageFacade;
   }
   if (has("secret:rw")) {
     const secrets: SecretClient = {
@@ -619,6 +675,8 @@ export function createCtx<C extends readonly Capability[], Cfg extends SchemaLik
     sessionId: env.sessionId,
     limits: env.limits,
     scope: env.scope,
+    locale: env.locale,
+    hostVersion: env.hostVersion,
   };
   // 声明过但未授予的能力：访问即 denied，而不是静默 undefined（§8.4 不降级）
   for (const capability of ungranted) {
@@ -629,6 +687,16 @@ export function createCtx<C extends readonly Capability[], Cfg extends SchemaLik
         throw new PluginError("denied", `${capability} capability was not granted`);
       },
     });
+    // `storage` 是 `storage:kv` 的便利门面，未授予时同样 denied
+    if (capability === "storage:kv") {
+      Object.defineProperty(ctx, "storage", {
+        enumerable: false,
+        configurable: true,
+        get() {
+          throw new PluginError("denied", "storage:kv capability was not granted");
+        },
+      });
+    }
   }
   return ctx as CtxFor<C, Cfg>;
 }

@@ -1442,6 +1442,66 @@ impl PluginService {
         Ok(record)
     }
 
+    /// 安装向导被取消：把记录与运行状态恢复到安装前
+    ///
+    /// 全新安装按卸载处理：产物、记录、向导里刚写的密钥一并清掉，已保存的
+    /// 键值与日志保留。升级恢复 `previous` 快照并重启原本在跑的进程；新下载
+    /// 的版本目录不删——`--to` 的目标版本可能安装前就已经在盘上。
+    ///
+    /// # Errors
+    ///
+    /// 记录读取、停机、写回或卸载失败时返回 [`PluginError`]
+    pub fn revert_install(
+        &self,
+        id: &PluginId,
+        previous: Option<&PluginRecord>,
+        was_running: bool,
+    ) -> Result<(), PluginError> {
+        let Some(previous) = previous else {
+            if self.is_running(id) {
+                let _ = self.stop(id, Duration::from_secs(10));
+            }
+            // 全新安装可能在授权通过后就已经 enabled；卸载要求先停用
+            if let Ok(mut record) = self.record(id)
+                && record.enabled
+            {
+                record.enabled = false;
+                record.last_state = PluginState::Disabled;
+                record.updated_at = now_secs();
+                self.store.put(&record)?;
+            }
+            return self.remove_with(id, RemoveData::Keep { secrets: false });
+        };
+        let _lock = self.plugin_lock(id)?;
+        if self.is_running(id) {
+            let _ = self.stop(id, Duration::from_secs(10));
+        }
+        let mut restored = previous.clone();
+        restored.last_state = state_after_install(restored.enabled, false);
+        restored.last_error = None;
+        restored.updated_at = now_secs();
+        self.store.put(&restored)?;
+        if was_running
+            && restored.enabled
+            && let Err(err) = self.start(id)
+        {
+            tracing::warn!(
+                plugin = %id,
+                error = %err,
+                "previous version failed to restart after a cancelled install"
+            );
+        }
+        self.audit.record(&AuditEvent {
+            at: now_secs(),
+            plugin: id.to_string(),
+            action: "install:cancelled".to_owned(),
+            capability: None,
+            result: AuditResult::Allowed,
+            detail: Some(format!("restored version {}", restored.version)),
+        });
+        Ok(())
+    }
+
     /// 卸载：要求已停用且进程退出
     ///
     /// 默认连 `plugin-data/<id>/` 与日志一起删：卸载的语义是「这台机器上不再
@@ -3738,6 +3798,73 @@ mod tests {
                 "{label}: log"
             );
         }
+    }
+
+    /// 取消全新安装：记录与产物一起消失，等价于「没装过」
+    #[test]
+    fn revert_fresh_install_removes_record_and_artifact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plugins_root = dir.path().join("plugins");
+        let id = PluginId::parse("demo").expect("id");
+        // 授权通过的全新安装可能已 enabled；取消仍必须能清干净
+        let mut demo = record("demo", true, &[]);
+        demo.last_state = PluginState::Stopped;
+        demo.artifact_dir = plugins_root.join("demo");
+        std::fs::create_dir_all(&demo.artifact_dir).expect("artifact");
+        std::fs::write(demo.artifact_dir.join("plugin"), b"binary").expect("entry");
+        let store = Arc::new(MemoryStore::default());
+        store.put(&demo).expect("put");
+        let service = PluginService::new(
+            store,
+            Arc::new(MemoryConfigStore::default()),
+            None,
+            None,
+            None,
+            Arc::new(port::plugin::NoopAuditSink),
+            plugins_root.clone(),
+            dir.path().join("plugin-data"),
+            dir.path().join("logs"),
+        );
+
+        service
+            .revert_install(&id, None, false)
+            .expect("revert fresh install");
+
+        assert!(service.record(&id).is_err(), "record must be gone");
+        assert!(!plugins_root.join("demo").exists(), "artifact must be gone");
+    }
+
+    /// 取消升级：记录回到安装前快照，授权也随之恢复
+    #[test]
+    fn revert_update_restores_previous_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = PluginId::parse("demo").expect("id");
+        let previous = record("demo", false, &[Capability::Events]);
+        let store = Arc::new(MemoryStore::default());
+        let mut current = record("demo", false, &[]);
+        current.version = "0.2.0".to_owned();
+        current.previous_version = Some("0.1.0".to_owned());
+        store.put(&current).expect("put");
+        let service = PluginService::new(
+            store,
+            Arc::new(MemoryConfigStore::default()),
+            None,
+            None,
+            None,
+            Arc::new(port::plugin::NoopAuditSink),
+            dir.path().join("plugins"),
+            dir.path().join("plugin-data"),
+            dir.path().join("logs"),
+        );
+
+        service
+            .revert_install(&id, Some(&previous), false)
+            .expect("revert update");
+
+        let restored = service.record(&id).expect("record");
+        assert_eq!(restored.version, "0.1.0");
+        assert_eq!(restored.approved, previous.approved);
+        assert_eq!(restored.previous_version, None);
     }
 
     fn all_capabilities() -> [Capability; 4] {

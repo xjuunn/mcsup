@@ -208,7 +208,7 @@ export default chatBridgePreset({
 - 纯函数：文本 / 时间 / 切片 / 截断、重试与并发、Minecraft 颜色码与命令转义
 - 需要状态的封装（KV 计数、游标、TTL 缓存）**显式接能力 client**
   （`kvCounter(ctx["storage:kv"])`），不接 `ctx`、不做隐式注册，能力未授予时
-  在取 client 处直接 `denied`
+  在取 client 处直接 `denied`；`ctx.storage` 只是这些工具的便捷门面
 - 命名不用 `useX`（Hooks 专用，§7）；工具不得包含第三方平台客户端或业务判定，
   边界同 `plugins.md` §14.2 的禁止项
 
@@ -232,8 +232,13 @@ export default chatBridgePreset({
 `Ctx` 的形状由 `capabilities` 字面量数组推导：未声明 `console:read` 时
 `ctx["console:read"]` 不存在（编译期报错），声明了 `storage:kv` 时
 `ctx["storage:kv"]` 才出现（属性名就是能力名，见 `plugins.md` 附录 D）。
+同一声明还带出便捷门面 `ctx.storage`（`json` / `text` / `counter` / `cursor`
+/ `cache`），底层仍是同一个 `KvClient`：作者不必为常用持久化手写编码。
 越权调用在编译期失败，而不是等宿主拒绝。第三方 Hook 的 `ctx` 参数同样受此
 约束，非官方 hook 无法要求未声明的能力。
+
+`ctx.locale` / `ctx.hostVersion` 来自 `welcome`，不随能力声明变化；多语言文案
+用 `pickLocale(ctx.locale, zh, en)` 二选一，避免插件各自实现语言判断。
 
 `ctx.config` 同理：类型来自 `definePlugin` 的 `config` schema（DSL 或 zod），
 `run` 里不需要任何标注。Builder 片段在定义处拿不到 `definePlugin` 的参数，

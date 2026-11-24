@@ -39,6 +39,8 @@ export type { PluginErrorCategory, PluginErrorCode } from "./errors.js";
 export { run } from "./runtime.js";
 export type { RunOptions } from "./runtime.js";
 
+export { isZhLocale, pickLocale } from "./ctx.js";
+
 // 字段 DSL（plugins.md §11.5 子集）：归约为 zod，作者不必直接写 zod
 export { s, isField, toZod } from "./schema.js";
 export type { Field, InferSchema, SchemaLike } from "./schema.js";
@@ -68,6 +70,7 @@ export type {
   KvClient,
   LifecycleClient,
   LimitsView,
+  Locale,
   LogClient,
   NetClient,
   NetRequest,
@@ -79,6 +82,7 @@ export type {
   ServerSummary,
   SnapshotView,
   StopOutcome,
+  StorageFacade,
 } from "./ctx.js";
 
 // 展示格式与标准 JSON Schema 格式的单表来源
@@ -120,6 +124,7 @@ export {
   kvCounter,
   kvCursor,
   kvJson,
+  kvText,
   kvTtlCache,
   legacyColorCodes,
   mapLimit,
@@ -133,4 +138,4 @@ export {
   unique,
   withRetry,
 } from "./utils/index.js";
-export type { KvCounter, KvCursor, KvJson, KvTtlCache, WithRetryOptions } from "./utils/index.js";
+export type { KvCounter, KvCursor, KvJson, KvText, KvTtlCache, WithRetryOptions } from "./utils/index.js";

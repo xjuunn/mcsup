@@ -241,6 +241,7 @@ export interface WelcomeFrame {
   readonly granted: readonly string[];
   readonly host_version: string;
   readonly limits: WelcomeLimits;
+  readonly locale: string;
   readonly scope: WelcomeScope;
   readonly session_id: string;
 }

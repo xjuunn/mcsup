@@ -76,6 +76,9 @@ pub struct Welcome {
     pub session_id: String,
     /// 宿主版本
     pub host_version: String,
+    /// 宿主界面语言（`zh` / `en`）；旧宿主缺失时按 `en`
+    #[serde(default = "default_locale")]
+    pub locale: String,
     /// 实际授予的能力
     pub granted: Vec<String>,
     /// 限额
@@ -84,6 +87,11 @@ pub struct Welcome {
     pub config: ConfigValues,
     /// 作用域
     pub scope: WelcomeScope,
+}
+
+/// 旧宿主不发送 `locale` 时的回退值
+fn default_locale() -> String {
+    "en".to_owned()
 }
 
 /// `welcome.limits`
@@ -924,6 +932,20 @@ mod tests {
         write_frame(&mut buf, &frame).expect("write");
         let mut cursor = Cursor::new(buf);
         read_frame(&mut cursor).expect("read")
+    }
+
+    #[test]
+    fn welcome_locale_defaults_to_english_for_old_hosts() {
+        let welcome: Welcome = serde_json::from_value(serde_json::json!({
+            "session_id": "s",
+            "host_version": "0.1.0",
+            "granted": [],
+            "limits": WelcomeLimits::default(),
+            "config": ConfigValues::default(),
+            "scope": { "kind": "machine" }
+        }))
+        .expect("welcome");
+        assert_eq!(welcome.locale, "en");
     }
 
     #[test]

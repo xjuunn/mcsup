@@ -75,6 +75,12 @@
   可映射到测试的用例编号。
 - TypeScript SDK 的 `Builder.config(schema)`：把 config schema 绑到 op 片段上，
   `run` 里的 `ctx.config` 才有推导类型（`docs/sdk-design.md` §6.1）。
+- 插件可读取宿主界面语言：`welcome` 新增 `locale`（`zh` / `en`，旧宿主缺失时
+  按 `en`），TypeScript SDK 以 `ctx.locale` / `ctx.hostVersion` 暴露，并提供
+  `pickLocale(ctx.locale, zh, en)`。
+- TypeScript SDK 的 `ctx.storage` 便捷门面（声明 `storage:kv` 时出现）：
+  `json` / `text` / `counter` / `cursor` / `cache` 直接落在统一 KV 上，底层仍
+  是 `ctx["storage:kv"]`；工具集补 `kvText`。
 
 ### 变更
 
@@ -147,6 +153,10 @@
 - 插件下载的阻塞 HTTP 客户端没装 rustls crypto provider：`rustls-no-provider`
   下 reqwest 会在内部线程直接 panic（`No rustls crypto provider is configured`）。
   `--url` 与 GitHub 归档两条路都走这段代码，现在统一在构造客户端前装一次。
+- `plugin install` / `plugin update` 的向导被用户取消后仍留下禁用记录：取消现
+  等价于没有安装。全新安装删记录与产物、保留 `plugin-data`（不含密钥）与日
+  志；升级恢复安装前记录并重启原本在跑的旧版本。取消静默退出（130），不再
+  打印 `读取输入: Operation was canceled`。
 
 - 插件宿主跟随当前构建：`ensure()` 连上宿主后先做一次 `identity` 控制握手，把
   宿主启动时记下的构建标识（版本 / 可执行文件路径 / 大小 / mtime）与当前可执行

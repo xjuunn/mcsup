@@ -47,6 +47,30 @@ export function kvJson<T>(kv: KvClient, prefix = ""): KvJson<T> {
   };
 }
 
+/** 文本存取视图：KV 的字节按 UTF-8 编解码，不存在返回 `null` */
+export interface KvText {
+  get(key: string): Promise<string | null>;
+  set(key: string, value: string): Promise<void>;
+  delete(key: string): Promise<boolean>;
+}
+
+/** 文本存取视图工厂。 */
+export function kvText(kv: KvClient, prefix = ""): KvText {
+  const full = (key: string): string => prefix + key;
+  return {
+    async get(key: string): Promise<string | null> {
+      const raw = await kv.get(full(key));
+      return raw === null ? null : textDecoder.decode(raw);
+    },
+    async set(key: string, value: string): Promise<void> {
+      await kv.set(full(key), textEncoder.encode(value));
+    },
+    delete(key: string): Promise<boolean> {
+      return kv.delete(full(key));
+    },
+  };
+}
+
 /** 原子性说明：KV 无事务，「读-改-写」在单插件内串行调用时安全；并发场景用 `pLimit(1)` 收敛。 */
 export interface KvCounter {
   /** 当前值（不存在为 0） */

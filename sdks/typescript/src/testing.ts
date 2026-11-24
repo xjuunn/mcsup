@@ -42,6 +42,8 @@ export interface MockHostOptions {
   readonly configRevision?: number;
   readonly sessionId?: string;
   readonly scope?: ScopeView;
+  /** 宿主界面语言；默认 `en` */
+  readonly locale?: string;
   /** 握手下发的限额；未给出的字段用默认值 */
   readonly limits?: MockLimits;
   /** 握手直接拒绝 */
@@ -122,6 +124,7 @@ export class MockHost<C extends readonly Capability[], Cfg extends SchemaLike = 
       type: "welcome",
       session_id: this.options.sessionId ?? "s-test",
       host_version: "0.0.0-test",
+      locale: this.options.locale ?? "en",
       granted: this.options.granted ?? this.def.capabilities,
       limits: { ...DEFAULT_LIMITS, ...this.options.limits },
       config: { revision: this.options.configRevision ?? 1, values: this.options.config ?? {} },

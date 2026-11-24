@@ -90,11 +90,16 @@ pub(crate) fn run(action: PluginAction, printer: Printer) -> Result<()> {
 }
 
 /// 隐藏入口：运行宿主直到收到 `shutdown`
-pub(crate) fn run_host(data_dir: Option<PathBuf>, idle_timeout: u64) -> Result<()> {
+pub(crate) fn run_host(
+    data_dir: Option<PathBuf>,
+    idle_timeout: u64,
+    lang: crate::locale::Lang,
+) -> Result<()> {
     let data_dir = data_dir.unwrap_or_else(config::platform_data_dir);
     let mcsup = Arc::new(bootstrap::open_mcsup().context("装配插件宿主")?);
     let host = mcsup
         .plugin_host(&data_dir)
+        .with_locale(lang.tag())
         .with_idle_after(Duration::from_secs(idle_timeout.max(10)));
     let server = mcsup::plugin::ControlServer::bind(&data_dir).map_err(|err| match err {
         mcsup::plugin::control::ControlError::AlreadyRunning => {
@@ -1387,16 +1392,29 @@ fn install(
         crate::i18n::pick(printer.lang(), "正在安装插件…", "installing plugin…"),
         printer.is_human(),
     );
+    // 取消时要能回到安装前：安装前 id 未知，先缓存整份记录列表，装完按 id 取。
+    let before = service.list().map_err(anyhow::Error::from)?;
     let outcome = service
         .install(&origin, expected.as_ref(), false)
         .map_err(anyhow::Error::from);
     spinner.finish();
     let outcome = outcome?;
+    let previous = before.into_iter().find(|item| item.id == outcome.record.id);
     let record = outcome.record;
     let pending = outcome.pending.iter().copied().collect::<Vec<_>>();
 
-    let (granted, remaining, report) =
-        approve_and_configure(&service, &record.id, &pending, setup, true, printer)?;
+    let configured = approve_and_configure(&service, &record.id, &pending, setup, true, printer);
+    let (granted, remaining, report) = match configured {
+        Ok(value) => value,
+        Err(err) => {
+            // 向导被 Esc / Ctrl+C 取消等价于「没安装」：回退记录与产物后再静默退出。
+            if crate::prompts::is_cancelled(&err) {
+                service.revert_install(&record.id, previous.as_ref(), false)?;
+                return Err(AppDiagnostic::cancelled().into());
+            }
+            return Err(err);
+        }
+    };
     // 安装向导默认启动；`--no-setup` 时 report.start 为 false，保持旧的
     // 「装完不启动」行为。必填配置仍缺失时也不启动，避免带着坏配置反复崩溃。
     let started = if should_start(&report, &remaining) {
@@ -1540,6 +1558,7 @@ fn absolute_local(path: PathBuf) -> Result<PathBuf> {
     Ok(cwd.join(path))
 }
 
+#[allow(clippy::too_many_lines)] // 确认、切换、向导取消回退与重启共享同一段流程
 fn update(
     id: &str,
     to: Option<String>,
@@ -1587,6 +1606,9 @@ fn update(
         crate::i18n::pick(printer.lang(), spinner_text, "updating plugin…"),
         printer.is_human(),
     );
+    // 向导被取消时回到这个快照：记录、授权与运行状态都恢复成切换前。
+    let previous = service.record(&id)?;
+    let was_running = service.is_running(&id);
     let result = if let Some(to) = to {
         // 目标版本已安装：直接切换 active version
         let to = to.trim().to_owned();
@@ -1601,8 +1623,17 @@ fn update(
     let (updated_id, version) = result?;
     let record = service.record(&updated_id)?;
     let pending = pending_of(&record);
-    let (granted, remaining, report) =
-        approve_and_configure(&service, &updated_id, &pending, setup, false, printer)?;
+    let configured = approve_and_configure(&service, &updated_id, &pending, setup, false, printer);
+    let (granted, remaining, report) = match configured {
+        Ok(value) => value,
+        Err(err) => {
+            if crate::prompts::is_cancelled(&err) {
+                service.revert_install(&updated_id, Some(&previous), was_running)?;
+                return Err(AppDiagnostic::cancelled().into());
+            }
+            return Err(err);
+        }
+    };
 
     // 升级沿用原有的启用状态：用户主动停用的插件不会被升级顺手拉起。
     // 必填配置仍缺失时同样跳过重启，先让用户补齐再手动启动。
@@ -1677,8 +1708,13 @@ fn setup(id: &str, printer: Printer) -> Result<()> {
         .status(&id)
         .is_ok_and(|status| status.session.is_some());
     let pending = pending_of(&record);
-    let (granted, remaining, report) =
-        approve_and_configure(&service, &id, &pending, true, true, printer)?;
+    let configured = approve_and_configure(&service, &id, &pending, true, true, printer);
+    let (granted, remaining, report) = match configured {
+        Ok(value) => value,
+        // 取消向导只是放弃这次配置修改，不视为命令失败
+        Err(err) if crate::prompts::is_cancelled(&err) => return Ok(()),
+        Err(err) => return Err(err),
+    };
     // 配置改完后才判定：绑定服务器都停着时收掉残留进程并跳过重启，避免
     // 用户在向导里改配置的这段时间桥还在空转。
     let gate = bound.enforce_gate(&id, printer);
