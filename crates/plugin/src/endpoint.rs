@@ -88,7 +88,19 @@ impl Endpoint {
         }
         // 上次异常退出可能留下同名文件；只有确认无人监听时才删除。
         if path.exists() {
-            let _ = std::fs::remove_file(&path);
+            // 探活：还能连上说明有实例仍在监听，删除会把它的现有客户端
+            // 静默指向新 socket。连接失败（不存在 / 拒绝 / 超时）才当成陈旧文件。
+            match std::os::unix::net::UnixStream::connect(&path) {
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        format!("endpoint {} is still in use", path.display()),
+                    ));
+                }
+                Err(_) => {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
         }
         let listener = UnixListener::bind(&path)?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;

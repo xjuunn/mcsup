@@ -222,7 +222,7 @@ function build(options: BuildOptions): void {
     fail("typescript compile failed");
   }
 
-  const compiledEntry = path.join(options.outDir, "dist", relJs(options.entry));
+  const compiledEntry = path.join(options.outDir, "dist", relJs(options.entry, options.cwd));
   if (!fs.existsSync(compiledEntry)) {
     fail(`compiled entry not found: ${compiledEntry}`);
   }
@@ -320,17 +320,23 @@ export function publishCommitMessage(
 /**
  * 分支名是否可安全交给 `git push <commit>:refs/heads/<branch>`。
  *
- * 只做保守的字符集与形态检查：拒绝空格、`..`、结尾的 `/`、`.lock` 与以 `-`
- * 开头的形态，避免把引用名交给 git 自己报一堆难懂的错。
+ * 按 `git check-ref-format` 的规则做保守检查：拒绝空格、`..`、空段、以 `.`
+ * 开头的段、以 `.` 或 `.lock` 结尾的段、`@{` 与 `@` 本身，避免把引用名交给
+ * git 自己报一堆难懂的错。
  */
 export function isValidBranchName(branch: string): boolean {
-  return (
-    /^[A-Za-z0-9_][A-Za-z0-9._/-]*$/u.test(branch) &&
-    !branch.includes("..") &&
-    !branch.includes("//") &&
-    !branch.endsWith("/") &&
-    !branch.endsWith(".lock")
-  );
+  if (!/^[A-Za-z0-9_][A-Za-z0-9._/-]*$/u.test(branch)) {
+    return false;
+  }
+  if (branch === "@" || branch.includes("..") || branch.includes("//") || branch.includes("@{")) {
+    return false;
+  }
+  return branch.split("/").every((part) => {
+    if (part === "" || part.startsWith(".") || part.endsWith(".")) {
+      return false;
+    }
+    return !part.endsWith(".lock");
+  });
 }
 
 /**
@@ -513,13 +519,14 @@ const SDK_PACKAGE = "mcsup-plugin";
  *
  * 不用 `fs.cpSync({dereference:true})`：Node 24 上它对文件符号链接不生效
  * （实测仍拷成链接），而宿主的产物校验会拒绝符号链接（`docs/plugins.md`
- * §10.3）。目录按真实路径去重，避免符号链接成环时无限递归。
+ * §10.3）。去重只针对当前递归路径上的祖先，避免符号链接成环时无限递归；
+ * 指向已拷过的兄弟目录的链接必须再拷一份，否则产物里缺少那个路径。
  *
  * 包内的 `node_modules` 一律跳过：那是这个包装过的依赖，由队列按
  * `package.json` 重新解析并铺到顶层——照抄会把整棵开发依赖
  * （typescript / vitest）塞进产物，`file:` 装的 SDK 尤其明显。
  */
-function copyTree(source: string, target: string, seen: Set<string> = new Set()): void {
+function copyTree(source: string, target: string, ancestors: Set<string> = new Set()): void {
   const info = fs.statSync(source);
   if (!info.isDirectory()) {
     fs.mkdirSync(path.dirname(target), { recursive: true });
@@ -527,16 +534,21 @@ function copyTree(source: string, target: string, seen: Set<string> = new Set())
     return;
   }
   const real = fs.realpathSync(source);
-  if (seen.has(real)) {
+  if (ancestors.has(real)) {
+    // 符号链接指回当前路径上的祖先目录：拷贝下去必然无限递归
     return;
   }
-  seen.add(real);
-  fs.mkdirSync(target, { recursive: true });
-  for (const entry of fs.readdirSync(source)) {
-    if (entry === "node_modules") {
-      continue;
+  ancestors.add(real);
+  try {
+    fs.mkdirSync(target, { recursive: true });
+    for (const entry of fs.readdirSync(source)) {
+      if (entry === "node_modules") {
+        continue;
+      }
+      copyTree(path.join(source, entry), path.join(target, entry), ancestors);
     }
-    copyTree(path.join(source, entry), path.join(target, entry), seen);
+  } finally {
+    ancestors.delete(real);
   }
 }
 
@@ -590,7 +602,7 @@ function writeEntryWrapper(options: BuildOptions): string {
   const binDir = path.join(options.outDir, "bin");
   fs.mkdirSync(binDir, { recursive: true });
   const wrapper = path.join(binDir, ENTRY_WRAPPER);
-  const target = `../dist/${relJs(options.entry).split(path.sep).join("/")}`;
+  const target = `../dist/${relJs(options.entry, options.cwd).split(path.sep).join("/")}`;
   fs.writeFileSync(wrapper, entryWrapperSource(target), "utf8");
   return wrapper;
 }
@@ -657,12 +669,20 @@ function findTsconfig(cwd: string): string {
   fail("no tsconfig.json found in " + cwd);
 }
 
-/** `src/index.ts` → `index.js`（tsconfig 以 src 为 rootDir） */
-function relJs(entry: string): string {
-  const normalized = entry.split(path.sep).join("/");
-  const marker = normalized.lastIndexOf("/src/");
-  const rel = marker >= 0 ? normalized.slice(marker + 5) : path.basename(normalized);
-  return rel.replace(/\.tsx?$/, ".js");
+/**
+ * `src/index.ts` → `index.js`（tsconfig 以 `src` 为 rootDir）。
+ *
+ * 入口必须落在 `<cwd>/src` 下：产物路径是相对 rootDir 的位置，用
+ * 「最后一个 `/src/`」猜会在 `src/nested/src/index.ts` 上算错。
+ */
+function relJs(entry: string, cwd: string): string {
+  const srcRoot = path.resolve(cwd, "src");
+  const absolute = path.resolve(cwd, entry);
+  const rel = path.relative(srcRoot, absolute);
+  if (rel === "" || rel.startsWith(`..${path.sep}`) || rel === ".." || path.isAbsolute(rel)) {
+    fail(`entry ${entry} must be inside ${srcRoot}`);
+  }
+  return rel.split(path.sep).join("/").replace(/\.tsx?$/, ".js");
 }
 
 interface ProcessEntry {

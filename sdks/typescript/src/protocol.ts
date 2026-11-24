@@ -124,7 +124,8 @@ function stringArray(frame: LooseFrame, key: string): string[] {
  * @throws {ProtocolError} 非法 JSON、版本不匹配或已知类型缺字段
  */
 export function parseFrame(text: string): InboundFrame {
-  if (text.length > MAX_FRAME_BYTES) {
+  // 上限是字节数：`text.length` 是 UTF-16 码元，非 ASCII 内容会低估 2–3 倍
+  if (utf8Bytes(text) > MAX_FRAME_BYTES) {
     throw new ProtocolError("frame exceeds the size limit");
   }
   let value: unknown;
@@ -264,10 +265,26 @@ export function encodeFrame(frame: OutboundFrame): string {
  * 估算一帧 JSON 的字节数。
  *
  * 用于限额检查，不含版本前缀与换行；与实际编码长度的差值固定，不影响
- * 与宿主约定的上限判定。
+ * 与宿主约定的上限判定。判断「这一行是否超过宿主限额」请用
+ * {@link wireFrameBytes}。
  */
 export function frameBytes(value: unknown): number {
-  return Buffer.byteLength(JSON.stringify(value) ?? "", "utf8");
+  return utf8Bytes(JSON.stringify(value) ?? "");
+}
+
+/**
+ * 一帧在线上占用的字节数：含 `v` 字段与末尾换行。
+ *
+ * 宿主按整行字节数判定 `MAX_FRAME_BYTES`，用 {@link frameBytes} 会少算
+ * 版本前缀与换行，边界值上会被宿主判超限。出站帧的限额检查必须用本函数。
+ */
+export function wireFrameBytes(frame: OutboundFrame): number {
+  return utf8Bytes(JSON.stringify({ v: PROTOCOL_VERSION, ...frame })) + 1;
+}
+
+/** UTF-8 字节数；`Buffer` 在 Node 与 SDK 的构建目标中恒可用 */
+function utf8Bytes(text: string): number {
+  return Buffer.byteLength(text, "utf8");
 }
 
 /** 构造线上错误对象；分类与可重试性来自生成的契约表 */

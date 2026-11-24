@@ -340,7 +340,8 @@ fn kv(
         }
         "list" => {
             let prefix = input.get("prefix").and_then(Value::as_str).unwrap_or("");
-            Ok(json!({ "keys": service.list(plugin, prefix)? }))
+            let after = input.get("after").and_then(Value::as_str);
+            Ok(json!({ "keys": service.list(plugin, prefix, after)? }))
         }
         other => Err(unknown_method("storage:kv", other)),
     }
@@ -1835,7 +1836,12 @@ mod tests {
             fn delete(&self, _plugin: &PluginId, _key: &str) -> Result<bool, HostError> {
                 Ok(false)
             }
-            fn list(&self, _plugin: &PluginId, _prefix: &str) -> Result<Vec<String>, HostError> {
+            fn list(
+                &self,
+                _plugin: &PluginId,
+                _prefix: &str,
+                _after: Option<&str>,
+            ) -> Result<Vec<String>, HostError> {
                 Ok(Vec::new())
             }
         }

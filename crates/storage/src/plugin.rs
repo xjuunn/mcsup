@@ -489,7 +489,12 @@ impl KvStore for KvFileStore {
         }
     }
 
-    fn list(&self, plugin: &PluginId, prefix: &str) -> Result<Vec<String>, HostError> {
+    fn list(
+        &self,
+        plugin: &PluginId,
+        prefix: &str,
+        after: Option<&str>,
+    ) -> Result<Vec<String>, HostError> {
         if prefix.len() > MAX_KV_KEY_BYTES {
             return Err(HostError::invalid_input("kv prefix is too long"));
         }
@@ -503,7 +508,9 @@ impl KvStore for KvFileStore {
                 let Ok(value) = serde_json::from_slice::<KvValue>(&bytes) else {
                     continue;
                 };
-                if value.key.starts_with(prefix) {
+                if value.key.starts_with(prefix)
+                    && after.is_none_or(|after| value.key.as_str() > after)
+                {
                     keys.push(value.key);
                 }
             }
@@ -541,7 +548,8 @@ const SECRETS_VERSION: u8 = 1;
 
 /// 加密后的密钥文件：`v` / `nonce` / `data` 三个字段都是密文信封的一部分
 ///
-/// 有 `v` 字段即视为密文；没有则按旧版明文映射读取（加密上线前写下的文件）。
+/// 信封与旧版明文映射共用 JSON 对象形态，因此按三个字段的类型判定，
+/// 不能只看键名（明文里可能有合法的 `v` 密钥）。
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SealedSecrets {
@@ -550,6 +558,15 @@ struct SealedSecrets {
     nonce: String,
     /// base64(密文 + tag)
     data: String,
+}
+
+impl SealedSecrets {
+    /// `value` 是否是密文信封
+    fn matches(value: &serde_json::Value) -> bool {
+        value.get("v").is_some_and(serde_json::Value::is_u64)
+            && value.get("nonce").is_some_and(serde_json::Value::is_string)
+            && value.get("data").is_some_and(serde_json::Value::is_string)
+    }
 }
 
 /// 机器密钥来源
@@ -662,7 +679,9 @@ impl SecretFileStore {
         };
         let value: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|err| HostError::internal(format!("corrupt secrets file: {err}")))?;
-        if value.get("v").is_some() {
+        // 信封按结构判定，不能只看有没有 `v`：明文文件本身就是一个键值映射，
+        // 插件合法使用名为 `v` 的密钥时会被误当成加密信封整份读不出来。
+        if SealedSecrets::matches(&value) {
             return self.open_sealed(plugin, value);
         }
         serde_json::from_value(value)
@@ -1163,8 +1182,13 @@ mod tests {
         );
         store.set(&plugin, "k2", b"other").expect("set");
         assert_eq!(
-            store.list(&plugin, "k").expect("list"),
+            store.list(&plugin, "k", None).expect("list"),
             ["k".to_owned(), "k2".to_owned()]
+        );
+        // `after` 是上一页最后一个键（不含），用于续页
+        assert_eq!(
+            store.list(&plugin, "k", Some("k")).expect("list after"),
+            ["k2".to_owned()]
         );
         assert!(store.delete(&plugin, "k").expect("delete"));
         assert!(!store.delete(&plugin, "k").expect("delete"));
@@ -1200,6 +1224,28 @@ mod tests {
         }
         assert!(store.delete(&plugin, "token").expect("delete"));
         assert_eq!(store.protection(), SecretProtection::FilePermissions);
+    }
+
+    #[test]
+    fn plaintext_secret_named_v_is_not_mistaken_for_an_envelope() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SecretFileStore::new(dir.path().to_path_buf());
+        let plugin = PluginId::parse("demo").expect("id");
+        for (key, value) in [("v", "plain"), ("nonce", "n"), ("data", "d")] {
+            store
+                .set(&plugin, key, &SecretValue::from_text(value))
+                .expect("set");
+        }
+        for (key, value) in [("v", "plain"), ("nonce", "n"), ("data", "d")] {
+            assert_eq!(
+                store
+                    .get(&plugin, key)
+                    .expect("get")
+                    .expect("value")
+                    .expose(),
+                value.as_bytes()
+            );
+        }
     }
 
     #[test]

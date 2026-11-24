@@ -68,7 +68,11 @@ describe("发布到 GitHub（§15.1 / 附录 E）", () => {
       "dist.lock",
       "a b",
       "refs/heads/x;rm",
-      ".hidden",
+      "a/.b",
+      "a/b.",
+      "a./b",
+      "a.lock/b",
+      "@",
     ]) {
       expect(isValidBranchName(bad), bad).toBe(false);
     }
