@@ -39,7 +39,13 @@ export function kvJson<T>(kv: KvClient, prefix = ""): KvJson<T> {
       }
     },
     async set(key: string, value: T): Promise<void> {
-      await kv.set(full(key), textEncoder.encode(JSON.stringify(value)));
+      const encoded = JSON.stringify(value);
+      // `JSON.stringify` 对 undefined / 函数 / symbol 返回 undefined，
+      // 交给 TextEncoder 会写成字符串 "undefined"，读回时解析失败被当成未写入
+      if (encoded === undefined) {
+        throw new TypeError(`kvJson cannot store a value that JSON cannot represent (key ${key})`);
+      }
+      await kv.set(full(key), textEncoder.encode(encoded));
     },
     delete(key: string): Promise<boolean> {
       return kv.delete(full(key));
@@ -90,11 +96,19 @@ export function kvCounter(kv: KvClient, prefix = ""): KvCounter {
     if (raw === null) {
       return 0;
     }
-    const n = Number.parseInt(textDecoder.decode(raw), 10);
+    // 用 `Number` 而不是 `parseInt`：`"1.5"` 被 parseInt 静默截成 1，
+    // 之后每次 get/add 的结果会比写入值小，且没有报错。
+    const n = Number(textDecoder.decode(raw));
     return Number.isSafeInteger(n) ? n : 0;
   };
   const add = async (key: string, delta = 1): Promise<number> => {
+    if (!Number.isInteger(delta)) {
+      throw new TypeError(`counter delta must be an integer, got ${delta}`);
+    }
     const next = decode(await kv.get(full(key))) + delta;
+    if (!Number.isSafeInteger(next)) {
+      throw new RangeError(`counter ${key} is out of the safe integer range: ${next}`);
+    }
     await kv.set(full(key), String(next));
     return next;
   };
@@ -179,7 +193,13 @@ export function kvTtlCache(kv: KvClient, cachePrefix = "cache:"): KvTtlCache {
   const expired = (entry: CacheEntry): boolean =>
     entry.expiresAt !== null && entry.expiresAt !== undefined && entry.expiresAt <= Date.now();
 
-  const get = async <T>(key: string): Promise<T | null> => {
+  /**
+   * 读条目；过期条目惰性删除后按未命中处理。
+   *
+   * `null` 只表示「键不存在」或「已过期」，与「缓存值本身是 null」区分开：
+   * 缓存的 `value` 可以是 `null`，不能和未命中混为一谈。
+   */
+  const readEntry = async (key: string): Promise<CacheEntry | null> => {
     const entry = await json.get(key);
     if (entry === null) {
       return null;
@@ -188,7 +208,12 @@ export function kvTtlCache(kv: KvClient, cachePrefix = "cache:"): KvTtlCache {
       await json.delete(key);
       return null;
     }
-    return entry.value as T;
+    return entry;
+  };
+
+  const get = async <T>(key: string): Promise<T | null> => {
+    const entry = await readEntry(key);
+    return entry === null ? null : (entry.value as T);
   };
 
   const set = async <T>(key: string, value: T, ttlMs?: number | null): Promise<void> => {
@@ -206,9 +231,9 @@ export function kvTtlCache(kv: KvClient, cachePrefix = "cache:"): KvTtlCache {
     get,
     set,
     async getOrLoad<T>(key: string, ttlMs: number | null | undefined, loader: () => Promise<T>): Promise<T> {
-      const cached = await get<T>(key);
-      if (cached !== null) {
-        return cached;
+      const entry = await readEntry(key);
+      if (entry !== null) {
+        return entry.value as T;
       }
       const value = await loader();
       await set(key, value, ttlMs);
@@ -218,16 +243,30 @@ export function kvTtlCache(kv: KvClient, cachePrefix = "cache:"): KvTtlCache {
       return json.delete(key);
     },
     async purge(prefix = "") {
-      const keys = await kv.list(cachePrefix + prefix);
       let removed = 0;
-      for (const full of keys) {
-        const key = full.slice(cachePrefix.length);
-        const entry = await json.get(key);
-        if (entry !== null && expired(entry) && (await json.delete(key))) {
-          removed += 1;
+      // `kv.list` 单次至多 1000 条：用上一页的最后一个键作为 `after` 续页，
+      // 只查一次会漏掉排在后面的过期键。
+      const base = cachePrefix + prefix;
+      let after: string | undefined;
+      for (;;) {
+        const keys = await kv.list(base, after);
+        if (keys.length === 0) {
+          return removed;
         }
+        for (const full of keys) {
+          const key = full.slice(cachePrefix.length);
+          const entry = await json.get(key);
+          if (entry !== null && expired(entry) && (await json.delete(key))) {
+            removed += 1;
+          }
+        }
+        const last = keys[keys.length - 1];
+        // 旧宿主不认识 `after`，会原样返回第一页；不前进就停下，避免死循环
+        if (last === after) {
+          return removed;
+        }
+        after = last;
       }
-      return removed;
     },
   };
 }

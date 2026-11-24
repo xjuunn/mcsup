@@ -33,7 +33,7 @@ use interprocess::local_socket::ListenerNonblockingMode;
 #[cfg(windows)]
 use interprocess::local_socket::prelude::*;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -51,6 +51,12 @@ pub const TOKEN_FILE: &str = "control-token";
 
 /// 控制连接的读写超时
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 同时保持的控制连接上限
+///
+/// 每条连接一个线程；不设上限时，本机任意进程反复连接就能把宿主拖进线程
+/// 耗尽。正常 CLI 一次调用只开一条连接，32 条足够并发控制命令。
+const MAX_CONTROL_CONNECTIONS: usize = 32;
 
 /// `logs` 单次返回的行数上限
 ///
@@ -254,6 +260,7 @@ impl ControlServer {
     #[allow(clippy::needless_pass_by_value)]
     pub fn serve(self, handler: Arc<dyn ControlHandler>) -> io::Result<()> {
         let shutdown = Arc::clone(&self.shutdown);
+        let active = Arc::new(AtomicUsize::new(0));
         // 监听器非阻塞：`[禁止]` 靠「再连一次」唤醒阻塞的 accept 才能退出。
         // 25 ms 的轮询只发生在空闲的宿主进程里，代价可以接受。
         self.set_nonblocking(true)?;
@@ -269,17 +276,25 @@ impl ControlServer {
                 }
                 Err(err) => return Err(err),
             };
+            if active.fetch_add(1, Ordering::SeqCst) >= MAX_CONTROL_CONNECTIONS {
+                active.fetch_sub(1, Ordering::SeqCst);
+                tracing::warn!("control connection rejected: too many open connections");
+                drop(conn);
+                continue;
+            }
             // 读 / 写超时只在阻塞模式下有意义
             conn.set_nonblocking(false)?;
             let handler = Arc::clone(&handler);
             let token = self.token.clone();
             let connection_shutdown = Arc::clone(&shutdown);
+            let active = Arc::clone(&active);
             std::thread::spawn(move || {
                 if let Err(err) =
                     serve_connection(conn, token.as_deref(), handler, &connection_shutdown)
                 {
                     tracing::debug!(error = %err, "control connection closed");
                 }
+                active.fetch_sub(1, Ordering::SeqCst);
             });
         }
     }

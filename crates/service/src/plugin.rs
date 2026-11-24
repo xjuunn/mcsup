@@ -130,6 +130,8 @@ pub struct InstallOutcome {
     pub record: PluginRecord,
     /// 安装后需要用户确认的能力
     pub pending: BTreeSet<Capability>,
+    /// 安装前旧版本是否在运行；升级失败 / 向导取消时据此恢复运行状态
+    pub was_running: bool,
 }
 
 /// 启停后的状态
@@ -1123,7 +1125,11 @@ impl PluginService {
                 format!("version {version}")
             }),
         });
-        Ok(InstallOutcome { record, pending })
+        Ok(InstallOutcome {
+            record,
+            pending,
+            was_running,
+        })
     }
 
     /// 停机之后、新版本接管之前失败：删掉半成品目录，把旧版本重新拉起来
@@ -1524,6 +1530,10 @@ impl PluginService {
     ///
     /// 仍启用或进程仍在运行时返回 [`PluginError::Conflict`]
     pub fn remove_with(&self, id: &PluginId, data: RemoveData) -> Result<(), PluginError> {
+        // 卸载在删 `plugins/<id>/` 与记录，必须和 install / update / start 串行。
+        // 锁必须在状态判定之前取：先判定后加锁的间隙里，start 会把刚通过检查的
+        // 插件拉起来，随后的删除就发生在运行中的会话下面。
+        let _lock = self.plugin_lock(id)?;
         let record = self.record(id)?;
         if self.is_running(id) {
             return Err(PluginError::Conflict(format!(
@@ -1535,8 +1545,6 @@ impl PluginService {
                 "plugin {id} is enabled; run `mcsup plugin disable {id}` first"
             )));
         }
-        // 卸载在删 `plugins/<id>/` 与记录，必须和 install / update 串行。
-        let _lock = self.plugin_lock(id)?;
         // 先删产物 / 数据 / 密钥，最后删记录。反过来一旦删除失败，记录已经
         // 没了而产物还在盘上：再装同版本永远 `AlreadyExists`、再 `remove` 又是
         // `NotFound`，只能手工删目录；密钥残留还会让重装的同名插件继承上一份

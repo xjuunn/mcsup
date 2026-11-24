@@ -68,7 +68,8 @@ export interface ConnectionHandlers {
 export class Connection {
   private readonly socket: net.Socket;
   private readonly handlers: ConnectionHandlers;
-  private buffer: Buffer = Buffer.alloc(0);
+  private chunks: Buffer[] = [];
+  private buffered = 0;
   private closedReason: string | undefined;
   private readonly pending = new Map<number, PendingCall>();
   private nextCallId = 1;
@@ -192,7 +193,23 @@ export class Connection {
         reject(new PluginError("timeout", `${label} timed out after ${timeoutMs} ms`));
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
-      void this.send({ ...frame, id });
+      let sending: Promise<void>;
+      try {
+        // `encodeFrame` 会同步抛错（BigInt、循环引用），必须在这里收口：否则
+        // pending 与 15 s 计时器会一直留着，调用方还要等到超时才失败。
+        sending = this.send({ ...frame, id });
+      } catch (err) {
+        this.pending.delete(id);
+        clearTimeout(timer);
+        reject(new PluginError("invalid_input", `cannot encode frame: ${String(err)}`));
+        return;
+      }
+      // 写失败已在 `send` 内转成 fail；这里只把等待中的调用立即结束
+      void sending.catch((err: unknown) => {
+        this.pending.delete(id);
+        clearTimeout(timer);
+        reject(err instanceof PluginError ? err : new PluginError("unavailable", String(err)));
+      });
     });
   }
 
@@ -214,11 +231,14 @@ export class Connection {
   }
 
   private consume(chunk: Buffer): void {
-    this.buffer = this.buffer.length === 0 ? chunk : Buffer.concat([this.buffer, chunk]);
+    if (chunk.length > 0) {
+      this.chunks.push(chunk);
+      this.buffered += chunk.length;
+    }
     for (;;) {
-      const index = this.buffer.indexOf(NEWLINE);
+      const index = this.findNewline();
       if (index < 0) {
-        if (this.buffer.length > MAX_FRAME_BYTES) {
+        if (this.buffered > MAX_FRAME_BYTES) {
           this.fail("inbound frame exceeds the size limit");
         }
         return;
@@ -227,8 +247,7 @@ export class Connection {
         this.fail("inbound frame exceeds the size limit");
         return;
       }
-      const line = this.buffer.subarray(0, index).toString("utf8").replace(/\r$/, "");
-      this.buffer = this.buffer.subarray(index + 1);
+      const line = this.take(index).toString("utf8").replace(/\r$/, "");
       if (line.length === 0) {
         continue;
       }
@@ -251,6 +270,50 @@ export class Connection {
         return;
       }
     }
+  }
+
+  /** 已缓冲字节中第一个换行的绝对偏移；没有换行返回 -1 */
+  private findNewline(): number {
+    let offset = 0;
+    for (const chunk of this.chunks) {
+      const index = chunk.indexOf(NEWLINE);
+      if (index >= 0) {
+        return offset + index;
+      }
+      offset += chunk.length;
+    }
+    return -1;
+  }
+
+  /**
+   * 取出前 `length` 字节并跳过其后的换行。
+   *
+   * 按分块切片而不是每收到一个 chunk 就 `Buffer.concat` 全量：24 MiB 帧按
+   * 64 KiB 到达时会退化成 O(n²) 复制。
+   */
+  private take(length: number): Buffer {
+    const parts: Buffer[] = [];
+    let remaining = length;
+    while (remaining > 0) {
+      const head = this.chunks[0]!;
+      if (head.length <= remaining) {
+        parts.push(head);
+        this.chunks.shift();
+        remaining -= head.length;
+      } else {
+        parts.push(head.subarray(0, remaining));
+        this.chunks[0] = head.subarray(remaining);
+        remaining = 0;
+      }
+    }
+    const separator = this.chunks[0]!;
+    if (separator.length === 1) {
+      this.chunks.shift();
+    } else {
+      this.chunks[0] = separator.subarray(1);
+    }
+    this.buffered -= length + 1;
+    return parts.length === 1 ? parts[0]! : Buffer.concat(parts, length);
   }
 
   private settle(frame: Extract<InboundFrame, { type: "result" }>): void {

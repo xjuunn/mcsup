@@ -126,7 +126,7 @@ await withRetry(() => ctx["net:outbound"].request({ url }), { attempts: 3 });
 
 ```ts
 const json = ctx.storage.json<{ last: string }>("state:"); // JSON
-const hits = ctx.storage.counter("stats:");                // 原子计数
+const hits = ctx.storage.counter("stats:");                // 计数（串行）
 const cursor = ctx.storage.cursor("shop:seq");             // 只前进
 const cache = ctx.storage.cache("remote:");                // TTL + 读穿
 ```

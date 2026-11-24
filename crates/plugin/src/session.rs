@@ -760,7 +760,9 @@ impl SessionInner {
                 "plugin rejected the config change",
             )),
             Err(RecvTimeoutError::Timeout) => {
-                self.remove_pending(id);
+                // 插件可能仍在应用旧 revision；不撤销的话它会继续按旧值
+                // 落盘，而宿主已经回滚文件，两边状态永久分叉。
+                self.cancel(id, "timeout");
                 Err(HostError::new(
                     port::plugin::ErrorCode::Timeout,
                     format!(

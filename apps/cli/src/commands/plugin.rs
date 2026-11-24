@@ -1399,6 +1399,7 @@ fn install(
         .map_err(anyhow::Error::from);
     spinner.finish();
     let outcome = outcome?;
+    let was_running = outcome.was_running;
     let previous = before.into_iter().find(|item| item.id == outcome.record.id);
     let record = outcome.record;
     let pending = outcome.pending.iter().copied().collect::<Vec<_>>();
@@ -1409,7 +1410,7 @@ fn install(
         Err(err) => {
             // 向导被 Esc / Ctrl+C 取消等价于「没安装」：回退记录与产物后再静默退出。
             if crate::prompts::is_cancelled(&err) {
-                service.revert_install(&record.id, previous.as_ref(), false)?;
+                service.revert_install(&record.id, previous.as_ref(), was_running)?;
                 return Err(AppDiagnostic::cancelled().into());
             }
             return Err(err);
@@ -2652,17 +2653,37 @@ fn grant(id: &str, capability: &str, printer: Printer) -> Result<()> {
     let id = parse_id(id, printer.lang())?;
     let capability = parse_capability(capability, printer.lang())?;
     let service = open()?;
+    let running = service.is_running(&id);
     let record = service.grant(&id, capability)?;
+    // 授予只写记录：已建立会话的能力视图来自握手时的 welcome，运行中进程
+    // 不会因此拿到新能力，必须重启会话重新握手（docs/plugins.md §8.5）。
     printer.print_outcome(
         &crate::i18n::pick(
             printer.lang(),
-            format!("已授予 {} {capability}", record.id),
-            format!("granted {capability} to {}", record.id),
+            format!(
+                "已授予 {} {capability}{}",
+                record.id,
+                if running {
+                    "；重启插件后生效"
+                } else {
+                    ""
+                }
+            ),
+            format!(
+                "granted {capability} to {}{}",
+                record.id,
+                if running {
+                    "; restart the plugin to apply"
+                } else {
+                    ""
+                }
+            ),
         ),
         &json!({
             "id": record.id.to_string(),
             "capability": capability.to_string(),
             "approved": record.approved.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "restart_required": running,
         }),
     )
 }

@@ -443,4 +443,33 @@ describe("能力客户端按宿主线上形状解码", () => {
     expect(hasStorage).toBe(false);
     await host.shutdown();
   });
+
+  it("未授予的能力：has 返回 false，访问成员抛 denied", async () => {
+    let granted: readonly string[] = [];
+    let denied = false;
+    const plugin = definePlugin({
+      id: "partial-grant",
+      title: "部分授权",
+      version: "1.0.0",
+      license: "MIT",
+      capabilities: ["events", "storage:kv", "console:write"],
+      config: z.object({}),
+      async onStart(ctx) {
+        granted = ctx.granted;
+        expect(ctx.has("events")).toBe(true);
+        expect(ctx.has("console:write")).toBe(false);
+        expect(ctx.has("backup")).toBe(false);
+        try {
+          void ctx["console:write"];
+        } catch (err) {
+          denied = (err as { code?: string }).code === "denied";
+        }
+      },
+    });
+    const host = createMockHost(plugin, { granted: ["events"] });
+    await host.start();
+    expect(granted).toEqual(["events"]);
+    expect(denied).toBe(true);
+    await host.shutdown();
+  });
 });

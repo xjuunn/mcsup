@@ -205,7 +205,7 @@ export function array<S extends SchemaLike>(items: S, options: ArrayOptions = {}
   return fieldOf<InferSchema<S>[]>(withMeta(schema, options));
 }
 
-/** 对象；键顺序即界面顺序 */
+/** 对象；descriptor 生成时键按字典序排序，不能靠定义顺序控制界面排列 */
 export function object<S extends Record<string, SchemaLike>>(
   shape: S,
   options: FieldOptions = {},

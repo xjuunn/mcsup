@@ -10,7 +10,7 @@ import { z } from "./zod.js";
 
 import { type FrameChannel } from "./connection.js";
 import { PluginError, toPluginError } from "./errors.js";
-import { MAX_FRAME_BYTES, frameBytes, type OutboundFrame } from "./protocol.js";
+import { MAX_FRAME_BYTES, frameBytes, wireFrameBytes, type OutboundFrame } from "./protocol.js";
 
 /** 流式总字节上限（plugins.md §5.4） */
 export const MAX_STREAM_BYTES = 16 * 1024 * 1024;
@@ -80,7 +80,7 @@ export async function pumpStream(
   /** 发送一个分块帧；帧超限时返回 false（调用方负责回错误） */
   const emit = async (chunk: unknown, done: boolean): Promise<boolean> => {
     const frame: OutboundFrame = { type: "stream", id: callId, seq, chunk, done };
-    if (frameBytes(frame) > frameLimit || total > MAX_STREAM_BYTES) {
+    if (wireFrameBytes(frame) > frameLimit || total > MAX_STREAM_BYTES) {
       return false;
     }
     // 等写背压，避免生产者把大流堆进内存

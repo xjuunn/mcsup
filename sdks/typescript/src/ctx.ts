@@ -128,7 +128,7 @@ export interface KvClient {
   set(key: string, value: Uint8Array | string): Promise<void>;
   delete(key: string): Promise<boolean>;
   /** 按前缀列键，单次 ≤ 1000，需分页 */
-  list(prefix?: string): Promise<readonly string[]>;
+  list(prefix?: string, after?: string): Promise<readonly string[]>;
 }
 
 // ---------------------------------------------------------------------------
@@ -366,7 +366,7 @@ export interface StorageFacade {
   json<T>(prefix?: string): KvJson<T>;
   /** 纯文本值 */
   text(prefix?: string): KvText;
-  /** 原子计数 */
+  /** 计数（非原子：单插件内串行调用时安全，并发请用 `pLimit(1)` 收敛） */
   counter(prefix?: string): KvCounter;
   /** 单调前进的游标 */
   cursor(key: string, initial?: number): KvCursor;
@@ -399,6 +399,15 @@ export type CtxFor<C extends readonly Capability[], Cfg extends SchemaLike = Sch
   readonly locale: Locale;
   /** 宿主版本 */
   readonly hostVersion: string;
+  /** 已授予的能力（`welcome.granted` 与声明的交集） */
+  readonly granted: readonly Capability[];
+  /**
+   * 该能力当前是否已授予。
+   *
+   * 未授予的成员访问会抛 `denied`，需要「缺能力就降级」的分支必须先问它，
+   * 不能靠 `ctx["x"] === undefined` 判断。
+   */
+  has(capability: Capability): boolean;
 };
 
 /** 运行期构造上下文所需的环境（welcome 后会被改写） */
@@ -434,9 +443,15 @@ export class EventBus {
     };
   }
 
-  /** 投递一个事件；返回是否有人处理 */
+  /**
+   * 投递一个事件；返回是否有人处理。
+   *
+   * 单个 handler 抛错不影响其余 handler 与 `*` 兜底：错误收集后由调用方记录。
+   * 串行扇出的一个副作用是首个失败会吞掉后续订阅者，这里必须隔离。
+   */
   public async dispatch(kind: string, data: unknown, meta: EventMeta): Promise<boolean> {
     let handled = false;
+    const failures: unknown[] = [];
     for (const target of [kind, "*"]) {
       const set = this.handlers.get(target);
       if (set === undefined) {
@@ -444,8 +459,18 @@ export class EventBus {
       }
       for (const handler of [...set]) {
         handled = true;
-        await handler(data, meta);
+        try {
+          await handler(data, meta);
+        } catch (err) {
+          failures.push(err);
+        }
       }
+    }
+    if (failures.length === 1) {
+      throw failures[0];
+    }
+    if (failures.length > 1) {
+      throw new AggregateError(failures, `${failures.length} event handlers failed for ${kind}`);
     }
     return handled;
   }
@@ -509,7 +534,8 @@ export function createCtx<C extends readonly Capability[], Cfg extends SchemaLik
         );
       },
       delete: async (key) => decodeDeleted(await call("storage:kv", "delete", { key }), "storage:kv.delete"),
-      list: async (prefix = "") => decodeKvList(await call("storage:kv", "list", { prefix })),
+      list: async (prefix = "", after) =>
+        decodeKvList(await call("storage:kv", "list", { prefix, after })),
     };
     members["storage:kv"] = kv;
     members["storage"] = {
@@ -677,6 +703,8 @@ export function createCtx<C extends readonly Capability[], Cfg extends SchemaLik
     scope: env.scope,
     locale: env.locale,
     hostVersion: env.hostVersion,
+    granted: Object.freeze([...(capabilities as readonly Capability[])]),
+    has,
   };
   // 声明过但未授予的能力：访问即 denied，而不是静默 undefined（§8.4 不降级）
   for (const capability of ungranted) {

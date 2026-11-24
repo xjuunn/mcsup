@@ -574,10 +574,18 @@ pub trait KvStore: Send + Sync {
 
     /// 按前缀列举，按键升序，最多 [`MAX_KV_LIST`] 个
     ///
+    /// `after` 是上一页的最后一个键（不含）：键严格大于它才进入本页，调用方
+    /// 用本页最后一个键续页。省略表示从该前缀的第一个键开始。
+    ///
     /// # Errors
     ///
     /// 前缀非法返回 `invalid_input`
-    fn list(&self, plugin: &PluginId, prefix: &str) -> Result<Vec<String>, HostError>;
+    fn list(
+        &self,
+        plugin: &PluginId,
+        prefix: &str,
+        after: Option<&str>,
+    ) -> Result<Vec<String>, HostError>;
 }
 
 /// 密钥值

@@ -250,8 +250,10 @@ function memKv(): KvClient & { dump(): Map<string, string> } {
     async delete(key) {
       return store.delete(key);
     },
-    async list(prefix = "") {
-      return [...store.keys()].filter((k) => k.startsWith(prefix)).sort();
+    async list(prefix = "", after?: string) {
+      return [...store.keys()]
+        .filter((k) => k.startsWith(prefix) && (after === undefined || k > after))
+        .sort();
     },
     dump() {
       return new Map([...store.entries()].map(([k, v]) => [k, dec(v)]));
@@ -270,6 +272,13 @@ describe("state", () => {
     await kv.set("j:bad", "not json");
     expect(await json.get("bad")).toBeNull();
     expect(await json.delete("x")).toBe(true);
+  });
+
+  it("kvJson 拒绝 JSON 无法表示的值", async () => {
+    const kv = memKv();
+    const json = kvJson<undefined>(kv, "j:");
+    await expect(json.set("x", undefined)).rejects.toThrow(TypeError);
+    expect(kv.dump().has("j:x")).toBe(false);
   });
 
   it("kvCounter 累加与重置", async () => {
@@ -351,6 +360,56 @@ describe("state", () => {
       expect(await cache.get("lazy")).toBe("loaded");
       // 不过期条目不该被 purge 清掉
       expect(await cache.purge()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("kvCounter 拒绝非整数与溢出", async () => {
+    const counter = kvCounter(memKv(), "c:");
+    await expect(counter.add("hits", 1.5)).rejects.toThrow(TypeError);
+    await expect(counter.add("hits", Number.NaN)).rejects.toThrow(TypeError);
+    // 写入超过安全整数范围的值后再加会溢出
+    const kv = memKv();
+    await kv.set("c:big", String(Number.MAX_SAFE_INTEGER));
+    await expect(kvCounter(kv, "c:").incr("big")).rejects.toThrow(RangeError);
+  });
+
+  it("kvTtlCache 缓存的 null 值不会被当成未命中", async () => {
+    const kv = memKv();
+    const cache = kvTtlCache(kv);
+    await cache.set("n", null, 1000);
+    let loads = 0;
+    const loaded = await cache.getOrLoad("n", 1000, async () => {
+      loads += 1;
+      return "loaded";
+    });
+    expect(loaded).toBeNull();
+    expect(loads).toBe(0);
+  });
+
+  it("kvTtlCache.purge 用 after 分页清理全部过期键", async () => {
+    vi.useFakeTimers();
+    try {
+      const base = memKv();
+      // 宿主 list 单次上限：这里把每页压到 1 条，验证 purge 会续页
+      const paged: KvClient = {
+        ...base,
+        async list(prefix = "", after) {
+          return (await base.list(prefix, after)).slice(0, 1);
+        },
+      };
+      const cache = kvTtlCache(paged);
+      await cache.set("a", 1, 500);
+      await cache.set("b", 2, 500);
+      await cache.set("c", 3, 500);
+      await cache.set("keep", 4, 5000);
+      vi.advanceTimersByTime(1000);
+      expect(await cache.purge()).toBe(3);
+      expect(base.dump().has("cache:a")).toBe(false);
+      expect(base.dump().has("cache:b")).toBe(false);
+      expect(base.dump().has("cache:c")).toBe(false);
+      expect(await cache.get("keep")).toBe(4);
     } finally {
       vi.useRealTimers();
     }

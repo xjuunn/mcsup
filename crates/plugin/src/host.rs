@@ -51,6 +51,9 @@ const BACKOFF_SECS: [u64; 5] = [1, 2, 4, 8, 16];
 /// 崩溃统计窗口
 const CRASH_WINDOW: Duration = Duration::from_secs(600);
 
+/// 崩溃统计窗口的秒数（与会话 `started_at` 的时间戳比较用）
+const CRASH_WINDOW_SECS: i64 = 600;
+
 /// 窗口内第几次崩溃后停止自动重启
 const MAX_CRASHES: usize = 5;
 
@@ -678,12 +681,6 @@ impl PluginHost {
                     map.insert(id.clone(), Arc::clone(&session));
                 }
                 self.subscribe(&session);
-                if let Ok(mut crashes) = self.crashes.lock() {
-                    crashes
-                        .entry(id.clone())
-                        .or_insert(Crashes { at: Vec::new() })
-                        .clear();
-                }
                 record_state(self.store.as_ref(), id, PluginState::Running, None);
                 self.audit.record(&AuditEvent {
                     at: now_secs(),
@@ -794,10 +791,15 @@ impl PluginHost {
         // 「restarting」，排查需要翻插件日志
         let exit = close_reason.unwrap_or_else(|| "connection closed".to_owned());
         let attempts = match self.crashes.lock() {
-            Ok(mut map) => map
-                .entry(id.clone())
-                .or_insert(Crashes { at: Vec::new() })
-                .record(),
+            Ok(mut map) => {
+                let entry = map.entry(id.clone()).or_insert(Crashes { at: Vec::new() });
+                // 会话稳定运行超过崩溃窗口后再退出，历史崩溃不代表循环：从本次
+                // 重新计数。否则「修复后手动启动、很快又崩一次」会直接命中上限。
+                if session.info.started_at + CRASH_WINDOW_SECS <= now_secs() {
+                    entry.clear();
+                }
+                entry.record()
+            }
             Err(_) => MAX_CRASHES,
         };
         let Ok(record) = self.record(id) else {

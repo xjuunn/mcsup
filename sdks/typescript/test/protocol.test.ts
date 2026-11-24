@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { MAX_FRAME_BYTES, MAX_JSON_DEPTH, PROTOCOL_VERSION, ProtocolError, encodeFrame, parseFrame, wireError } from "../src/protocol.js";
+import { MAX_FRAME_BYTES, MAX_JSON_DEPTH, PROTOCOL_VERSION, ProtocolError, encodeFrame, parseFrame, wireError, wireFrameBytes } from "../src/protocol.js";
 
 describe("协议信封", () => {
   it("编码带版本与换行", () => {
@@ -22,6 +22,19 @@ describe("协议信封", () => {
   it("超过 MAX_FRAME_BYTES 拒绝", () => {
     const huge = `{"v":1,"type":"ping","n":1,"pad":"${"x".repeat(MAX_FRAME_BYTES)}"}`;
     expect(() => parseFrame(huge)).toThrow(/size limit/);
+  });
+
+  it("上限按字节而不是 UTF-16 码元计算", () => {
+    // 每个汉字 3 字节：码元数不到上限，字节数已超过
+    const filler = "中".repeat(Math.ceil(MAX_FRAME_BYTES / 3) + 1);
+    const line = `{"v":1,"type":"ping","n":1,"pad":"${filler}"}`;
+    expect(line.length).toBeLessThan(MAX_FRAME_BYTES);
+    expect(() => parseFrame(line)).toThrow(/size limit/);
+  });
+
+  it("wireFrameBytes 与真实编码字节数一致", () => {
+    const frame = { type: "pong" as const, n: 1 };
+    expect(wireFrameBytes(frame)).toBe(Buffer.byteLength(encodeFrame(frame), "utf8"));
   });
 
   it("嵌套超过 32 层拒绝", () => {

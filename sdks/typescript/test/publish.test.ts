@@ -22,11 +22,22 @@ const bin = path.resolve(
   "../bin/mcsup-plugin.js",
 );
 
+/**
+ * 去掉调用方遗留的 `GIT_*`：门禁由 `.githooks/pre-commit` 触发时，git 会把
+ * `GIT_DIR` / `GIT_INDEX_FILE` 等导出到 hook 环境，子进程里的 `git init` 会
+ * 因此不落在临时目录，而是落回宿主仓库（随后 `remote add origin` 撞上已存在
+ * 的 origin）。测试必须自带隔离环境，不依赖调用者是不是 git。
+ */
+const cleanEnv: NodeJS.ProcessEnv = Object.fromEntries(
+  Object.entries(process.env).filter(([key]) => !key.toUpperCase().startsWith("GIT_")),
+);
+
 function git(cwd: string, args: readonly string[]): string {
   return execFileSync("git", [...args], {
     cwd,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
+    env: cleanEnv,
   });
 }
 
@@ -80,7 +91,7 @@ function publish(dir: Fixture, args: readonly string[]): string {
   const result = execFileSync(
     process.execPath,
     [bin, "publish", "--no-build", "--out", "build", ...args],
-    { cwd: dir.repo, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    { cwd: dir.repo, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: cleanEnv },
   );
   return result;
 }

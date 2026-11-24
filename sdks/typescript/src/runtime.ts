@@ -41,7 +41,7 @@ import {
   ExitCode,
   MAX_FRAME_BYTES,
   PLUGIN_API_VERSION,
-  frameBytes,
+  wireFrameBytes,
   type CallFrame,
   type ExitCodeValue,
   type InboundFrame,
@@ -529,6 +529,10 @@ export class Session<C extends readonly Capability[], Cfg extends SchemaLike = S
     if (this.eventQueue.length >= limit) {
       this.eventQueue.shift();
       this.droppedEvents += 1;
+      // 首次丢弃立即告警：队列长期排不空时，等到排空再报会让用户看不到问题
+      if (this.droppedEvents === 1) {
+        this.log("warn", `event queue is full (limit ${limit}), dropping oldest events`);
+      }
     }
     this.eventQueue.push(frame);
     void this.drainEvents();
@@ -549,11 +553,12 @@ export class Session<C extends readonly Capability[], Cfg extends SchemaLike = S
       }
     } finally {
       this.drainingEvents = false;
-      if (this.droppedEvents > 0) {
-        const dropped = this.droppedEvents;
-        this.droppedEvents = 0;
-        this.log("warn", `dropped ${dropped} event(s) because the event queue is full`);
+      // 首次丢弃已在入队处告警，这里只补汇总
+      if (this.droppedEvents > 1) {
+        const dropped = this.droppedEvents - 1;
+        this.log("warn", `dropped ${dropped} more event(s) because the event queue is full`);
       }
+      this.droppedEvents = 0;
     }
   }
 
@@ -768,6 +773,12 @@ export class Session<C extends readonly Capability[], Cfg extends SchemaLike = S
       this.replyError(frame.id, new PluginError("conflict", "call before welcome"));
       return;
     }
+    // 重复 id 会覆盖第一个调用的 AbortController，任一结束都会把同一个键删掉，
+    // 使 inflight 提前归零（shutdown 提前关通道，另一个调用的 result 被丢弃）。
+    if (this.inflight.has(frame.id)) {
+      this.replyError(frame.id, new PluginError("conflict", `duplicate call id ${frame.id}`));
+      return;
+    }
     if (frame.op === undefined) {
       this.replyError(frame.id, PluginError.invalidInput("call has no op"));
       return;
@@ -813,7 +824,7 @@ export class Session<C extends readonly Capability[], Cfg extends SchemaLike = S
         return;
       }
       const result: OutboundFrame = { type: "result", id: frame.id, ok: true, output: checked.data };
-      if (frameBytes(result) > this.frameLimit()) {
+      if (wireFrameBytes(result) > this.frameLimit()) {
         this.replyError(
           frame.id,
           new PluginError("limit_exceeded", `op ${op.id} output exceeds ${this.frameLimit()} bytes`),
@@ -862,6 +873,10 @@ export class Session<C extends readonly Capability[], Cfg extends SchemaLike = S
       return;
     }
     const controller = new AbortController();
+    if (this.inflight.has(frame.id)) {
+      this.replyError(frame.id, new PluginError("conflict", `duplicate call id ${frame.id}`));
+      return;
+    }
     this.inflight.set(frame.id, controller);
     try {
       const output = await raceAbort(
@@ -874,7 +889,15 @@ export class Session<C extends readonly Capability[], Cfg extends SchemaLike = S
         ),
         controller.signal,
       );
-      this.channel.send({ type: "result", id: frame.id, ok: true, output: output ?? null });
+      const result: OutboundFrame = { type: "result", id: frame.id, ok: true, output: output ?? null };
+      if (wireFrameBytes(result) > this.frameLimit()) {
+        this.replyError(
+          frame.id,
+          new PluginError("limit_exceeded", `contract ${contract} output exceeds ${this.frameLimit()} bytes`),
+        );
+        return;
+      }
+      this.channel.send(result);
     } catch (err) {
       this.replyError(frame.id, toPluginError(err));
     } finally {
