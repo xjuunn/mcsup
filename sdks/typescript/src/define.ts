@@ -178,11 +178,12 @@ export interface SetupInteractiveContext {
   /** 配置路径，与 descriptor 中声明的字段 `path` 相同 */
   readonly field: string;
   /**
-   * 本次允许回填的交互式字段路径（宿主经 `MCSUP_SETUP_FIELDS` 告知）。
+   * 本次允许回填的路径（宿主经 `MCSUP_SETUP_FIELDS` 告知）。
    *
-   * 一次平台登录可能同时产出多个配置项（如 token 与服务端基址）。处理函数
-   * 可以返回这些路径的映射；不在其中的键会被 SDK 拒绝。旧宿主不设置这个
-   * 变量时为只含 `field` 的单元素数组。
+   * 范围是交互式字段加上 config schema 里未作为 setup 字段提问的字符串
+   * 叶子：一次平台登录可能同时产出多个配置项（如 token 与服务端基址），
+   * 后者不需要提问。处理函数可以返回这些路径的映射；不在其中的键会被 SDK
+   * 拒绝。旧宿主不设置这个变量时为只含 `field` 的单元素数组。
    */
   readonly fields: readonly string[];
 }

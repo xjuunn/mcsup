@@ -6,7 +6,8 @@
  *
  *   MCSUP_SETUP_FIELD        配置路径（descriptor 里声明的 `path`）
  *   MCSUP_SETUP_SECRET_FILE  宿主准备的临时文件（0600）
- *   MCSUP_SETUP_FIELDS       本次允许回填的全部交互式路径（JSON 数组，可省）
+ *   MCSUP_SETUP_FIELDS       本次允许回填的路径（JSON 数组，可省）：交互式
+ *                            字段 + 未作为 setup 字段提问的 config 字符串叶子
  *   MCSUP_SETUP_UI_FILE      界面事件文件（可省）：按行追加 JSON，宿主实时渲染
  *
  * 插件此时不连接宿主、不建会话，只执行 `setup.interactive[path]`，把返回的
