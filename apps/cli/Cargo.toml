@@ -40,6 +40,8 @@ serde_json.workspace = true
 sha2 = "0.11.0"
 shell-words = "1.1.1"
 sys-locale = "0.3.2"
+# 交互式 setup 字段的临时密钥文件：插件写、宿主读，0600 目录隔离
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 toml.workspace = true
 tracing.workspace = true
@@ -50,5 +52,4 @@ workspace = true
 
 [dev-dependencies]
 insta = { workspace = true, features = ["json"] }
-tempfile.workspace = true
 zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2"] }

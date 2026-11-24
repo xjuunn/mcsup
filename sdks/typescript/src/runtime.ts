@@ -30,6 +30,7 @@ import {
 } from "./define.js";
 import { EventBus, createCtx, type CtxEnvironment, type CtxFor } from "./ctx.js";
 import { PluginError, toPluginError } from "./errors.js";
+import { runSetupField } from "./setup.js";
 import { toZod, type InferSchema, type SchemaLike } from "./schema.js";
 import { pumpStream, raceAbort } from "./stream.js";
 import { DEFAULT_OP_TIMEOUT_MS } from "./validate.js";
@@ -190,6 +191,12 @@ async function runOnce<
       process.stderr.write(`mcsup-plugin: manifest failed: ${String(err)}\n`);
       return ExitCode.Failure;
     }
+  }
+
+  // 安装向导的交互式字段：宿主以子进程重新拉起插件，只跑 setup hook，
+  // 不建会话。放在 endpoint 校验之前，这一模式没有端点也没有令牌。
+  if (env["MCSUP_SETUP_FIELD"] !== undefined) {
+    return await runSetupField(def, env);
   }
 
   const endpoint = args.endpoint ?? env["MCSUP_PLUGIN_ENDPOINT"];

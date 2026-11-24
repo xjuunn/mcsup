@@ -264,7 +264,7 @@ pub const PLUGIN_CONTROL_VERSION: u32 = 1;
 // domain::plugin
 pub const PLUGIN_API_VERSION: u32 = 1;
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
-pub const DESCRIPTOR_SCHEMA_VERSION: u32 = 4;   // 2 起 setup，3 起 bind，4 起 setup.when
+pub const DESCRIPTOR_SCHEMA_VERSION: u32 = 5;   // 2 起 setup，3 起 bind，4 起 setup.when，5 起 setup.fields[].interactive
 ```
 
 `[禁止]` 把插件帧塞进现有的 `Request` / `Response`：那两者是「一连接一请求」
@@ -1477,6 +1477,19 @@ JSON Schema 没有「密钥」「单位」的标准表达，统一用 `x-mcsup-`
 `schema: 4` 起字段可声明 `when` 条件：只有条件成立时才问这一项，用来表达
 「选了哪个平台才问谁的凭据」这类分支，避免问用户用不着的配置。
 
+`schema: 5` 起字段可声明 `interactive`：宿主不直接提问，而是以子进程重新
+拉起插件入口并继承终端，由插件完成扫码、设备授权等平台特定流程。协议：
+
+- 宿主设置 `MCSUP_SETUP_FIELD=<fields[].path>` 与
+  `MCSUP_SETUP_SECRET_FILE=<0600 临时文件>`，工作目录为产物根；
+- 插件不连宿主、不建会话，只执行该字段声明的 setup hook，把密钥写入密钥
+  文件后以 0 退出；密钥不进 argv、不经过 shell、不打印到 stdout；
+- 宿主读回文件、trim 后按字段 schema 复校验，通过则写入配置，临时目录立即
+  删除；
+- hook 失败时宿主提示原因，让用户选择重试 / 手工粘贴 / 跳过；已有值默认
+  保持，用户确认后才重新授权；
+- 非交互（`--json` / 非 TTY）不拉起 hook：字段按普通缺失项处理。
+
 | 字段 | 必填 | 约束 |
 | --- | --- | --- |
 | `setup.start` | 否 | 布尔，默认 `true`；配置写完后是否自动启用并启动 |
@@ -1490,6 +1503,7 @@ JSON Schema 没有「密钥」「单位」的标准表达，统一用 `x-mcsup-`
 | `fields[].choices` | 否 | 数组，≤ 32 项、每项 1–64 字符且不重复；仅用于字符串列表字段，声明后渲染成多选框 |
 | `fields[].choicesFrom` | 否 | `servers`：选项由宿主枚举已注册服务器名。字符串字段渲染成单选，字符串列表渲染成多选；与 `choices` 互斥，不能用于 `secret` 或非字符串字段 |
 | `fields[].when` | 否 | 提问条件（`schema: 4` 起）：`path` + `includes` 或 `equals` 二选一。`path` 必须是**本字段之前**声明过的 setup 字段；`includes` 判字符串列表包含（被依赖字段必须是字符串列表），`equals` 判值相等（值须符合被依赖字段的 schema）。条件不成立时既不提问也不计入 `missing`；依赖值还没收集到时视为不成立 |
+| `fields[].interactive` | 否 | 布尔，默认 `false`（`schema: 5` 起）：交由插件自身的 setup hook 取值。只能用于 `secret: true` 的字符串字段，不能声明 `default` |
 
 宿主行为：
 
@@ -2081,7 +2095,7 @@ GitHub 归档额外多一层 `<repo>-<SHA>/` 顶层目录；128 MiB 的压缩包
 → 校验 manifest → 校验 descriptor（含 setup 解析）→ 计算能力清单
 → 原子移动到 plugins/<id>/<version>/
 → 写安装记录 → 状态 disabled / pending_approval
-→ （交互）列出能力并确认授权 → 逐项填写 setup → enable + start
+→ （交互）列出能力并确认授权 → 逐项填写 setup（交互式字段拉起插件）→ enable + start
 ```
 
 关键约束：
@@ -2121,6 +2135,9 @@ GitHub 归档额外多一层 `<repo>-<SHA>/` 顶层目录；128 MiB 的压缩包
 - 声明了 `when` 条件的字段只在条件成立时提问（`schema: 4` 起）：条件看本次
   已填的答案，不成立的字段既不问也不计入 `missing`。例如平台里没选 `qq`，
   就不会问 `qq.appId` / `qq.clientSecret`。
+- 声明了 `interactive` 的字段（`schema: 5` 起）不弹出输入框：宿主继承终端
+  拉起插件，插件自己显示二维码或走设备授权，密钥经 0600 临时文件回传。
+  失败时可选重试 / 手工粘贴 / 跳过；已有值只在用户确认后才重新授权。
 - 已有值**不预填**到输入框：自由输入字段留空即沿用，界面不另加提示行。
   避免一个回车把旧值当成新输入提交。
 - 每个提问只显示 label 与控件；descriptor 的 `description` 不再渲染成帮助行。
@@ -2819,7 +2836,7 @@ M0 ─→ M1 ─→ M2 ─→ M3 ─→ M4
 | --- | --- | --- |
 | `PLUGIN_API_VERSION` | 1 | `domain::plugin` |
 | `MANIFEST_SCHEMA_VERSION` | 1 | `domain::plugin` |
-| `DESCRIPTOR_SCHEMA_VERSION` | 4（接受更旧的 1 / 2 / 3） | `domain::plugin` |
+| `DESCRIPTOR_SCHEMA_VERSION` | 5（接受更旧的 1 / 2 / 3 / 4） | `domain::plugin` |
 | `PLUGIN_PROTOCOL_VERSION` | 1 | `protocol::plugin` |
 | `PLUGIN_CONTROL_VERSION` | 1 | `protocol::plugin` |
 | 单帧上限 | 24 MiB | `protocol::plugin` |

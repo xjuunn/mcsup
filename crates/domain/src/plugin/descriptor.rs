@@ -362,6 +362,13 @@ pub struct SetupField {
     /// 输入时遮蔽；只能用于 `string` 字段
     #[serde(default)]
     pub secret: bool,
+    /// 交由插件自身的 setup hook 取值（schema 5 起可用）
+    ///
+    /// 宿主不直接提问，而是拉起插件并继承终端：插件负责展示二维码、走设备
+    /// 授权等平台特定流程，把结果写入宿主给的临时密钥文件。只能用于
+    /// `secret` 的字符串字段，不能声明 `default`。
+    #[serde(default)]
+    pub interactive: bool,
     /// 列表字段的可选值；声明后向导渲染成多选框
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub choices: Option<Vec<String>>,
@@ -447,6 +454,8 @@ pub struct ResolvedSetupField {
     pub required: bool,
     /// 是否遮蔽输入
     pub secret: bool,
+    /// 是否由插件的 setup hook 取值
+    pub interactive: bool,
     /// 默认值（声明优先，其次 schema）
     pub default: Option<serde_json::Value>,
     /// 选项由宿主动态提供；`None` 表示用 `kind` 里的静态选项
@@ -812,6 +821,11 @@ impl Descriptor {
                         found: self.schema,
                     });
                 }
+                if self.schema < 5 && setup.fields.iter().any(|field| field.interactive) {
+                    return Err(DescriptorError::SetupInteractiveRequiresSchema {
+                        found: self.schema,
+                    });
+                }
                 let Some(config) = &config else {
                     return Err(DescriptorError::SetupWithoutConfig);
                 };
@@ -1009,6 +1023,36 @@ fn check_choices_source(
     }
 }
 
+/// 校验 `interactive`：只能挂在 secret 字符串字段上，且不能有默认值
+///
+/// 交互式字段由插件自己的 setup hook 产出，宿主只负责把结果落盘到配置。
+/// 允许普通输入或默认值会让两种取值路径并存，结果以谁为准无从判定。
+fn check_interactive(
+    field: &SetupField,
+    path: &str,
+    kind: &SetupKind,
+) -> Result<(), DescriptorError> {
+    if !field.interactive {
+        return Ok(());
+    }
+    let reject = |reason: &str| {
+        Err(DescriptorError::InvalidSetupInteractive {
+            path: path.to_owned(),
+            reason: reason.to_owned(),
+        })
+    };
+    if !field.secret {
+        return reject("interactive fields must also be secret");
+    }
+    if !matches!(kind, SetupKind::Text { .. }) {
+        return reject("interactive fields must be string");
+    }
+    if field.default.is_some() {
+        return reject("interactive fields cannot declare a default");
+    }
+    Ok(())
+}
+
 /// 校验单个 setup 字段，返回可直接展示与提问的解析结果
 fn resolve_setup_field(
     field: &SetupField,
@@ -1054,6 +1098,7 @@ fn resolve_setup_field(
         (kind, None) => kind,
     };
     check_choices_source(field, path, &kind)?;
+    check_interactive(field, path, &kind)?;
     let label = field
         .label
         .clone()
@@ -1099,6 +1144,7 @@ fn resolve_setup_field(
         }),
         required: field.required,
         secret: field.secret,
+        interactive: field.interactive,
         default,
         choices_from: field.choices_from,
         when: field.when.as_ref().map(|when| ResolvedSetupWhen {
@@ -1753,6 +1799,20 @@ pub enum DescriptorError {
         /// 声明值
         found: u32,
     },
+    /// 交互式 setup 字段需要 schema 5
+    #[error("interactive setup fields require descriptor schema 5 or newer, found {found}")]
+    SetupInteractiveRequiresSchema {
+        /// 声明值
+        found: u32,
+    },
+    /// `interactive` 声明非法
+    #[error("invalid interactive flag for setup path {path}: {reason}")]
+    InvalidSetupInteractive {
+        /// 路径
+        path: String,
+        /// 原因
+        reason: String,
+    },
     /// `when` 声明非法
     #[error("invalid condition for setup path {path}: {reason}")]
     InvalidSetupCondition {
@@ -2266,6 +2326,58 @@ mod tests {
         let mut value = with_config(json!({ "server": { "type": "string" } }));
         value["setup"] = json!({ "fields": [{ "path": "server", "choicesFrom": "worlds" }] });
         assert!(parse(value).is_err());
+    }
+
+    #[test]
+    fn setup_interactive_requires_schema5_secret_and_no_default() {
+        // schema 4 还不认识 interactive
+        let mut value = with_config(json!({ "token": { "type": "string" } }));
+        value["schema"] = json!(4);
+        value["setup"] = json!({
+            "fields": [{ "path": "token", "secret": true, "interactive": true }]
+        });
+        assert!(matches!(
+            parse(value),
+            Err(DescriptorError::SetupInteractiveRequiresSchema { found: 4 })
+        ));
+
+        // schema 5 起可用；解析结果保留标记
+        let mut value = with_config(json!({ "token": { "type": "string" } }));
+        value["schema"] = json!(5);
+        value["setup"] = json!({
+            "fields": [
+                { "path": "token", "secret": true, "interactive": true },
+                { "path": "token2" }
+            ]
+        });
+        value["config"]["properties"]["token2"] = json!({ "type": "string" });
+        let setup = parse(value)
+            .expect("valid interactive setup")
+            .setup
+            .expect("setup");
+        assert!(setup.fields[0].interactive);
+        assert!(setup.fields[0].secret);
+        assert!(!setup.fields[1].interactive);
+
+        // 必须是 secret 字符串字段
+        let mut value = with_config(json!({ "token": { "type": "string" } }));
+        value["schema"] = json!(5);
+        value["setup"] = json!({ "fields": [{ "path": "token", "interactive": true }] });
+        assert!(matches!(
+            parse(value),
+            Err(DescriptorError::InvalidSetupInteractive { .. })
+        ));
+
+        // 不能同时声明默认值：取值路径只能有一条
+        let mut value = with_config(json!({ "token": { "type": "string" } }));
+        value["schema"] = json!(5);
+        value["setup"] = json!({
+            "fields": [{ "path": "token", "secret": true, "interactive": true, "default": "x" }]
+        });
+        assert!(matches!(
+            parse(value),
+            Err(DescriptorError::InvalidSetupInteractive { .. })
+        ));
     }
 
     #[test]

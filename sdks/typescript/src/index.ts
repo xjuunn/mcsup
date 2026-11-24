@@ -21,6 +21,8 @@ export type {
   PluginDefinition,
   PluginContext,
   SetupFieldSpec,
+  SetupInteractiveContext,
+  SetupInteractiveHandler,
   SetupSpec,
   StreamChunks,
   Subscription,

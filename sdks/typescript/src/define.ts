@@ -162,7 +162,27 @@ export interface SetupFieldSpec {
    * 两者只能声明其一。宿主没收集到依赖值时视为不成立，字段会被跳过。
    */
   readonly when?: SetupWhenSpec;
+  /**
+   * 由插件自身的 setup hook 取值（schema 5 起可用）。
+   *
+   * 宿主不直接提问，而是以子进程拉起插件入口，继承终端执行
+   * `setup.interactive[path]`，把返回的密钥经 0600 临时文件回传。只能用于
+   * `secret` 的字符串字段，不能声明 `default`：二维码、设备授权这类平台
+   * 特定流程留在插件里，宿主只负责落盘。
+   */
+  readonly interactive?: boolean;
 }
+
+/** 交互式 setup 字段的执行上下文 */
+export interface SetupInteractiveContext {
+  /** 配置路径，与 descriptor 中声明的字段 `path` 相同 */
+  readonly field: string;
+}
+
+/** 交互式 setup 字段的处理函数：返回要写入配置的密钥 */
+export type SetupInteractiveHandler = (
+  ctx: SetupInteractiveContext,
+) => string | Promise<string>;
 
 /** setup 字段的提问条件 */
 export interface SetupWhenSpec {
@@ -180,6 +200,14 @@ export interface SetupSpec {
   readonly start?: boolean;
   /** 按顺序提示的字段 */
   readonly fields: readonly SetupFieldSpec[];
+  /**
+   * 交互式字段的处理函数，键必须是声明 `interactive` 的字段 `path`。
+   *
+   * 宿主执行时设置 `MCSUP_SETUP_FIELD` 与 `MCSUP_SETUP_SECRET_FILE`；SDK 调
+   * 对应函数并把返回值写入密钥文件。键不存在时该字段取值失败，宿主让用户
+   * 重试或手工输入。
+   */
+  readonly interactive?: Readonly<Record<string, SetupInteractiveHandler>>;
 }
 
 /**

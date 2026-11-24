@@ -332,6 +332,7 @@ fn approve_pending(
 ///
 /// `fresh` 为真（全新安装）时询问全部字段：已有值作为输入默认值，密钥留空
 /// 表示保持原值；升级只补仍为空的字段，避免每次升级重问一遍。
+#[allow(clippy::too_many_lines)] // 条件、交互式与普通输入共享同一段提问序列
 fn run_setup(
     service: &PluginService,
     id: &PluginId,
@@ -344,6 +345,7 @@ fn run_setup(
     let Some(setup) = descriptor.setup.as_ref() else {
         return Ok(SetupReport::default());
     };
+    let record = service.record(id)?;
     let current = service.config_get(id)?;
     let values = current.get("values").cloned().unwrap_or_else(|| json!({}));
     let interactive = printer.is_interactive();
@@ -384,6 +386,23 @@ fn run_setup(
         let kept = existing
             .as_ref()
             .is_some_and(|value| !value_is_empty(value));
+        // 交互式字段由插件自己的 setup hook 取值：宿主继承终端拉起插件，
+        // 插件负责扫码 / 设备授权，结果经 0600 临时文件回传。
+        if field.interactive {
+            let Some(secret) =
+                prompt_interactive_field(&record, field, printer, existing.as_ref())?
+            else {
+                if field.required && missing {
+                    report.missing.push(field.path.clone());
+                }
+                continue;
+            };
+            let value = Value::String(secret);
+            set_value_path(&mut answered, &field.path, value.clone());
+            set_path(&mut patch, &field.path, value);
+            report.configured.push(field.path.clone());
+            continue;
+        }
         let value = loop {
             let Some(value) = prompt_setup_field(field, printer, existing.as_ref(), &servers)?
             else {
@@ -439,6 +458,133 @@ fn run_setup(
         service.config_merge(id, &Value::Object(patch))?;
     }
     Ok(report)
+}
+
+/// 交互式 setup 字段：拉起插件自身的 setup hook（schema 5）
+///
+/// 宿主只负责开临时文件、继承终端与回读结果，平台流程（二维码、设备授权）
+/// 全在插件里。已有值默认保持，用户主动确认后才重新授权；hook 失败时让用户
+/// 选择重试、手工粘贴或跳过，不把一次扫码失败变成安装失败。
+fn prompt_interactive_field(
+    record: &PluginRecord,
+    field: &ResolvedSetupField,
+    printer: Printer,
+    existing: Option<&Value>,
+) -> Result<Option<String>> {
+    let lang = printer.lang();
+    let keeps = existing.is_some_and(|value| !value_is_empty(value));
+    if keeps {
+        let again = crate::prompts::confirm_or_yes(
+            printer,
+            &crate::i18n::pick(
+                lang,
+                format!("{} 已设置，要重新授权吗？", field.label),
+                format!("{} is already set; authorize again?", field.label),
+            ),
+            false,
+        )?;
+        if !again {
+            return Ok(None);
+        }
+    }
+    let mut manual = false;
+    loop {
+        let attempt = if manual {
+            let text = crate::prompts::input_secret(lang, &field.label, "")?;
+            let text = text.trim().to_owned();
+            if text.is_empty() {
+                printer.print_section(&crate::i18n::pick(
+                    lang,
+                    "不能为空，请重新输入",
+                    "cannot be blank; please try again",
+                ));
+                continue;
+            }
+            Ok(text)
+        } else {
+            printer.print_section(&crate::i18n::pick(
+                lang,
+                format!("正在启动插件完成 {} 登录…", field.label),
+                format!("starting the plugin to complete {} login…", field.label),
+            ));
+            run_setup_hook(record, field)
+        };
+        match attempt {
+            Ok(secret) => match mcsup::domain::plugin::schema::validate_instance(
+                &field.schema,
+                &Value::String(secret.clone()),
+                &field.path,
+            ) {
+                Ok(()) => return Ok(Some(secret)),
+                Err(err) => printer.print_section(&crate::i18n::pick(
+                    lang,
+                    format!("{} 无效：{err}", field.label),
+                    format!("{} is invalid: {err}", field.label),
+                )),
+            },
+            Err(err) => printer.print_section(&crate::i18n::pick(
+                lang,
+                format!("登录失败：{err}"),
+                format!("login failed: {err}"),
+            )),
+        }
+        let options = vec![
+            crate::i18n::pick(lang, "重试", "retry"),
+            crate::i18n::pick(lang, "手工粘贴", "paste manually"),
+            crate::i18n::pick(lang, "跳过", "skip"),
+        ];
+        let picked = crate::prompts::select_choice(
+            lang,
+            &crate::i18n::pick(lang, "接下来怎么做？", "what next?"),
+            &options,
+            None,
+            "",
+        )?;
+        if picked == options[0] {
+            manual = false;
+        } else if picked == options[1] {
+            manual = true;
+        } else {
+            return Ok(None);
+        }
+    }
+}
+
+/// 执行插件的 setup hook：继承终端，密钥经 0600 临时文件回传
+///
+/// 临时目录与密钥文件用完即删；插件只拿到路径，密钥不进 argv、不经过 shell。
+fn run_setup_hook(record: &PluginRecord, field: &ResolvedSetupField) -> Result<String> {
+    let dir = tempfile::Builder::new()
+        .prefix("mcsup-setup-")
+        .tempdir()
+        .context("create setup temp dir")?;
+    let secret_file = dir.path().join("secret");
+    let (program, args) =
+        mcsup::plugin::process::entry_command(&record.artifact_dir, &record.manifest.entry, &[])
+            .map_err(|err| anyhow!("{err}"))?;
+    let status = std::process::Command::new(&program)
+        .args(&args)
+        .current_dir(&record.artifact_dir)
+        .env("MCSUP_SETUP_FIELD", &field.path)
+        .env("MCSUP_SETUP_SECRET_FILE", &secret_file)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .with_context(|| format!("run plugin setup hook {}", program.display()))?;
+    if !status.success() {
+        let code = status
+            .code()
+            .map_or_else(|| status.to_string(), |code| code.to_string());
+        return Err(anyhow!("plugin setup hook exited with {code}"));
+    }
+    let text = std::fs::read_to_string(&secret_file)
+        .with_context(|| format!("read {}", secret_file.display()))?;
+    let secret = text.trim().to_owned();
+    if secret.is_empty() {
+        return Err(anyhow!("plugin setup hook returned an empty value"));
+    }
+    Ok(secret)
 }
 
 /// 该字段这次要不要问：条件成立（未声明条件视为成立），且全新安装或仍为空
@@ -2531,6 +2677,7 @@ mod tests {
             description: None,
             required: true,
             secret: false,
+            interactive: false,
             default: None,
             choices_from: Some(ChoicesSource::Servers),
             when: None,
@@ -2582,6 +2729,7 @@ mod tests {
             description: None,
             required: true,
             secret: false,
+            interactive: false,
             default: None,
             choices_from: None,
             when,
