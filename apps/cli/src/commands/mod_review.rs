@@ -154,12 +154,15 @@ pub(crate) async fn review_local(
 
 /// 把阻断项分成两个处置阶段
 ///
-/// 返回 `(可停用, 缺依赖)`：缺依赖靠补装解决、不靠停用，因此不进停用表。
-/// `可停用` 是「仅客户端」或「与服务端不匹配」，只能停用或换版本。
+/// 返回 `(可停用, 需补装)`：缺依赖与缺加载器桥都靠补装解决、不靠停用，因此
+/// 不进停用表。可停用的是「仅客户端」或「与服务端不匹配」，只能停用或换版本。
 fn partition(blocked: &[ModBlocked]) -> (Vec<&ModBlocked>, Vec<&ModBlocked>) {
-    blocked
-        .iter()
-        .partition(|entry| !matches!(&entry.blocker, ModBlocker::MissingDeps { .. }))
+    blocked.iter().partition(|entry| {
+        !matches!(
+            &entry.blocker,
+            ModBlocker::MissingDeps { .. } | ModBlocker::MissingBridge { .. }
+        )
+    })
 }
 
 /// 停用之后自动补装缺失依赖：先计划（零写入）再落盘，不询问
@@ -297,6 +300,17 @@ fn remote_reason_text(entry: &RemoteModBlocked, lang: Lang) -> String {
                 entry.detail.first().unwrap_or(&entry.kind)
             ),
         ),
+        "missing_bridge" => pick(
+            lang,
+            format!(
+                "缺少 Sinytra Connector 桥，{} 个 Fabric 专用 mod 无法装载（可 mod fix 补装）",
+                entry.detail.len()
+            ),
+            format!(
+                "missing Sinytra Connector bridge; {} Fabric-only mod(s) cannot load (mod fix can install it)",
+                entry.detail.len()
+            ),
+        ),
         _ => entry.kind.clone(),
     }
 }
@@ -329,6 +343,17 @@ fn reason_text(blocker: &ModBlocker, lang: Lang) -> String {
             lang,
             format!("{detail}（可停用或换适配版本）"),
             format!("{detail} (disable it or switch version)"),
+        ),
+        ModBlocker::MissingBridge { files, .. } => pick(
+            lang,
+            format!(
+                "缺少 Sinytra Connector 桥，{} 个 Fabric 专用 mod 无法装载（可 mod fix 补装）",
+                files.len()
+            ),
+            format!(
+                "missing Sinytra Connector bridge; {} Fabric-only mod(s) cannot load (mod fix can install it)",
+                files.len()
+            ),
         ),
     }
 }
@@ -506,19 +531,56 @@ mod tests {
                     mods: vec!["other".to_owned()],
                 },
             },
+            ModBlocked {
+                file: "mods".to_owned(),
+                blocker: ModBlocker::MissingBridge {
+                    loader: "fabric".to_owned(),
+                    files: vec!["mods/e.jar".to_owned(), "mods/f.jar".to_owned()],
+                },
+            },
         ];
         let (disableable, missing) = partition(&blocked);
+        // 缺依赖与缺桥都靠补装解决，只有真的不匹配才进停用表
         assert_eq!(disableable.len(), 2);
-        assert_eq!(missing.len(), 2);
+        assert_eq!(missing.len(), 3);
         assert!(
             disableable
                 .iter()
                 .all(|e| !matches!(&e.blocker, ModBlocker::MissingDeps { .. }))
         );
         assert!(
-            missing
+            disableable
                 .iter()
-                .all(|e| matches!(&e.blocker, ModBlocker::MissingDeps { .. }))
+                .all(|e| { !matches!(&e.blocker, ModBlocker::MissingBridge { .. }) })
         );
+        assert!(missing.iter().all(|e| matches!(
+            &e.blocker,
+            ModBlocker::MissingDeps { .. } | ModBlocker::MissingBridge { .. }
+        )));
+    }
+
+    /// 缺桥聚合行的文案要说明「补桥」而不是「停用」
+    #[test]
+    fn missing_bridge_reason_mentions_installing_the_bridge() {
+        let blocker = ModBlocker::MissingBridge {
+            loader: "fabric".to_owned(),
+            files: vec!["mods/a.jar".to_owned(), "mods/b.jar".to_owned()],
+        };
+        let reason = reason_text(&blocker, Lang::Zh);
+        assert!(reason.contains('2'), "{reason}");
+        assert!(reason.contains("Sinytra Connector"), "{reason}");
+        assert!(reason.contains("mod fix"), "{reason}");
+    }
+
+    /// 不匹配的文案不再暗示「版本区间不符」：加载器维度也会走到这里
+    #[test]
+    fn mismatch_reason_offers_disable_or_switch_version() {
+        let blocker = ModBlocker::Mismatch {
+            detail: "只支持 fabric，服务端是 forge".to_owned(),
+        };
+        let reason = reason_text(&blocker, Lang::Zh);
+        assert!(reason.contains("只支持 fabric"), "{reason}");
+        assert!(reason.contains("停用"), "{reason}");
+        assert!(!reason.contains("版本区间"), "{reason}");
     }
 }

@@ -366,16 +366,23 @@ pub struct ModDisabled {
 /// 修复计划的一项：补装缺失依赖
 #[derive(Debug, Clone)]
 pub struct FixInstall {
-    /// 依赖它的文件（展示用）
+    /// 依赖它的文件（展示用；补桥时是受影响的文件清单）
     pub needed_by: String,
-    /// 缺失的依赖 modid
+    /// 缺失的依赖 modid；补桥时是桥出的加载器名（`fabric`）
     pub missing: String,
+    /// 来源标识（项目 ID 只在来源内唯一）
+    pub source: String,
     /// 上游项目 ID（按 modid 检索命中）
     pub project_id: String,
     /// 项目标题
     pub title: String,
     /// 上游项目自身是否标注仅客户端
     pub client_only: bool,
+    /// 这条补装是为了补加载器桥，而不是某个具名 modid
+    ///
+    /// 桥没有可校验的 modid（Sinytra Connector 不带模组元数据），安装时不能
+    /// 按 `expect_modid` 校验；展示措辞也不同——用户要知道补的是「桥」。
+    pub bridge: bool,
     /// 精确版本 ID
     ///
     /// 整合包清单里记着这个文件的确切版本（从下载地址解析），补装时照它
@@ -452,6 +459,10 @@ pub struct FixRefused {
 /// 一个可补装的候选（内部用，避免与对外 DTO 混淆）
 #[derive(Debug, Clone)]
 struct FixCandidate {
+    /// 来源标识（`modrinth` / `curseforge`）
+    ///
+    /// 项目 ID 只在同一来源内唯一，补装时必须回到检索命中的那个来源解析。
+    source: String,
     /// 上游项目 ID
     project_id: String,
     /// 展示名（整合包清单里取文件名，检索命中取项目标题）
@@ -474,6 +485,8 @@ enum FixTarget {
 /// 待补装的一项（内部工作队列元素）
 #[derive(Debug, Clone)]
 struct PendingFix {
+    /// 来源标识（项目 ID 只在来源内唯一）
+    source: String,
     /// 项目 ID
     project_id: String,
     /// 这次安装要补的 modid（安装时校验 jar 是否真的提供它）
@@ -901,6 +914,7 @@ impl ModService {
     async fn plan_dependency_install(
         &self,
         name: &str,
+        source: &str,
         project: &str,
         kind: ContentKind,
         expect_modid: Option<&str>,
@@ -914,7 +928,7 @@ impl ModService {
                 kind,
                 InstallSpec {
                     version: version_id,
-                    source: None,
+                    source: Some(source),
                     allow_prerelease: false,
                 },
             )
@@ -927,7 +941,7 @@ impl ModService {
                     kind,
                     InstallSpec {
                         version: None,
-                        source: None,
+                        source: Some(source),
                         allow_prerelease: false,
                     },
                 )
@@ -940,7 +954,7 @@ impl ModService {
                         kind,
                         InstallSpec {
                             version: None,
-                            source: None,
+                            source: Some(source),
                             allow_prerelease: true,
                         },
                     )
@@ -1157,6 +1171,7 @@ impl ModService {
     ///
     /// 服务器不存在、位于远端、正在运行、目录无法遍历或上游异常时返回
     /// [`ModError`]
+    #[allow(clippy::too_many_lines)] // 审计、补桥、补依赖、移除四类处置顺序固定，拆开只是把同一份计划分到多处
     pub async fn plan_fix(&self, name: &str, kind: ContentKind) -> Result<ModFixPlan, ModError> {
         let server = self.local_server(name)?;
         self.ensure_stopped(&server)?;
@@ -1166,6 +1181,9 @@ impl ModService {
         let dir = mods_dir(&server, kind);
         let jars = jars_in(&dir)?;
         let audit = self.inspect(&jars, &[], &server).await?;
+        // 桥在审计里被扫描出来（已装时 `bridged_loaders` 非空），并进目标后
+        // 「要不要补桥」与「fit 判定」用的是同一份条件
+        let target = server_target(&server).with_bridged_loaders(audit.bridged_loaders.clone());
 
         let mut installs: Vec<FixInstall> = Vec::new();
         let mut unresolved: Vec<String> = Vec::new();
@@ -1196,9 +1214,11 @@ impl ModService {
                             installs.push(FixInstall {
                                 needed_by: needed_by.clone(),
                                 missing: missing.clone(),
+                                source: item.source,
                                 project_id: item.project_id,
                                 title: item.title,
                                 client_only: item.client_only,
+                                bridge: false,
                                 version_id: item.version_id,
                             });
                         }
@@ -1214,8 +1234,44 @@ impl ModService {
                 .await;
         }
 
+        // 缺加载器桥：这批 Fabric mod 唯一的问题是目标 Forge / NeoForge 服务端
+        // 没有 Sinytra Connector。补桥而不是逐个移除——移除会把能跑的内容删光。
+        let bridge_files: Vec<String> = audit
+            .mods
+            .iter()
+            .filter(|report| report.capability.needs_bridge(&target))
+            .map(|report| file_name_of(&report.capability.path))
+            .collect();
+        if !bridge_files.is_empty() {
+            // 桥自身没有 modid（无模组元数据），不能走按 modid 检索；
+            // 按项目名 `connector` 检索，只收 slug 精确等于它的那一个
+            let connector = self
+                .find_provider("connector", &server)
+                .await?
+                .into_iter()
+                .find(|hit| hit.slug.as_deref() == Some("connector"));
+            match connector {
+                Some(hit) => installs.push(FixInstall {
+                    needed_by: bridge_files.join("、"),
+                    missing: ModLoader::Fabric.as_str().to_owned(),
+                    source: hit.source.to_owned(),
+                    project_id: hit.id,
+                    title: hit.title,
+                    client_only: hit.client_only,
+                    bridge: true,
+                    version_id: None,
+                }),
+                None => unresolved.push("sinytra-connector".to_owned()),
+            }
+        }
+
         let mut removals: Vec<FixRemove> = Vec::new();
         for report in &audit.mods {
+            // 缺桥的条目由上面的补装项处置，不能进移除表：加载器这一维确实
+            // 不匹配，但补桥后就能装（`needs_bridge` 已排除 MC / Java 不符）
+            if report.capability.needs_bridge(&target) {
+                continue;
+            }
             // 缺依赖的文件默认由补装项处置；补不上的、且文件本身只是客户端
             // 功能时，移除才是能让服务端起得来的处置——这种情况多见于整合
             // 包把客户端界面 mod（要客户端音乐库）一起摊到服务端上
@@ -1437,6 +1493,8 @@ impl ModService {
             && let Some(project_id) = hit.project_id.clone()
         {
             return Ok(FixTarget::Installs(vec![FixCandidate {
+                // 快照记录的是生成本快照的整合包来源（当前只有 Modrinth）
+                source: snapshot.map_or_else(String::new, |snapshot| snapshot.source.clone()),
                 project_id,
                 title: file_name_of(&hit.path),
                 client_only: hit.server.as_deref() == Some("unsupported"),
@@ -1452,6 +1510,7 @@ impl ModService {
         Ok(FixTarget::Installs(
             hits.into_iter()
                 .map(|hit| FixCandidate {
+                    source: hit.source.to_owned(),
                     project_id: hit.id,
                     title: hit.title,
                     client_only: hit.client_only,
@@ -1534,10 +1593,33 @@ impl ModService {
                 &query,
             );
             relaxed.server_usable_only = false;
-            let found = self.content.search(None, &relaxed).await?;
-            let candidates = rank_provider_hits(found.hits, &term);
+            // 逐个来源检索而不是只用默认来源：只上架 CurseForge 的依赖
+            // （实测 `the-twilight-forest`）在 Modrinth 上根本不存在。
+            // 一个来源不可用不该让别的来源的结论消失。
+            let mut candidates: Vec<ContentProject> = Vec::new();
+            let mut searched_ok = false;
+            let mut first_error: Option<ModError> = None;
+            for source in self.content.source_names() {
+                match self.content.search(Some(source), &relaxed).await {
+                    Ok(found) => {
+                        searched_ok = true;
+                        candidates.extend(rank_provider_hits(found.hits, &term));
+                    }
+                    Err(err) => {
+                        if first_error.is_none() {
+                            first_error = Some(err.into());
+                        }
+                    }
+                }
+            }
             if !candidates.is_empty() {
-                return Ok(candidates);
+                // 各来源分别排过序，合并后按同一口径再排一次，避免下载量
+                // 量级差异掩盖相关度
+                return Ok(rank_provider_hits(candidates, &term));
+            }
+            // 全部来源都失败：这不是「没有提供方」，是上游真的不可用
+            if !searched_ok && let Some(err) = first_error {
+                return Err(err);
             }
         }
         Ok(Vec::new())
@@ -1602,6 +1684,7 @@ impl ModService {
     /// 缺 melody，melody 又缺 unified-api）。装被拒不等于修不了——把被拒时
     /// 暴露的缺失依赖排到队尾继续解析，本项的重试排在依赖之后。单项失败只
     /// 记一笔，不中断其余项。
+    #[allow(clippy::too_many_lines)] // 队列推进、拒装回填、依赖展开是同一段循环，拆开只会多传状态
     async fn install_fix_batch(
         &self,
         name: &str,
@@ -1616,25 +1699,37 @@ impl ModService {
             .installs
             .iter()
             .map(|item| PendingFix {
+                source: item.source.clone(),
                 project_id: item.project_id.clone(),
-                missing: Some(item.missing.clone()),
+                missing: if item.bridge {
+                    // 桥没有可校验的 modid
+                    None
+                } else {
+                    Some(item.missing.clone())
+                },
                 version_id: item.version_id.clone(),
                 retried: false,
             })
             .collect();
         let mut state = FixState::default();
         for item in &plan.installs {
-            state.plan_candidate(&item.missing);
+            if !item.bridge {
+                state.plan_candidate(&item.missing);
+            }
         }
         let mut expansions = 0usize;
 
         while let Some(pending) = queue.pop_front() {
-            if state.visited.contains(&pending.project_id) {
+            if state
+                .visited
+                .contains(&fix_key(&pending.source, &pending.project_id))
+            {
                 continue;
             }
             let install_plan = match self
                 .plan_dependency_install(
                     name,
+                    &pending.source,
                     &pending.project_id,
                     kind,
                     pending.missing.as_deref(),
@@ -1646,7 +1741,9 @@ impl ModService {
                 // 逐项汇总：某一项在上游没有匹配版本（或上游本身出错）不该
                 // 让整批停下——其余待修项仍然可以装好
                 Err(err) => {
-                    state.visited.insert(pending.project_id.clone());
+                    state
+                        .visited
+                        .insert(fix_key(&pending.source, &pending.project_id));
                     if let Some(missing) = pending.missing.as_deref() {
                         state.candidate_rejected(missing);
                     }
@@ -1670,7 +1767,9 @@ impl ModService {
                 .await
             {
                 Ok(installed_mod) => {
-                    state.visited.insert(pending.project_id.clone());
+                    state
+                        .visited
+                        .insert(fix_key(&pending.source, &pending.project_id));
                     installed.push(installed_mod);
                 }
                 // 缺依赖被拒：先补它自己的依赖，再回头重试本项
@@ -1688,7 +1787,9 @@ impl ModService {
                     .await?;
                 }
                 Err(ModError::Refused { risk, evidence, .. }) => {
-                    state.visited.insert(pending.project_id.clone());
+                    state
+                        .visited
+                        .insert(fix_key(&pending.source, &pending.project_id));
                     if let Some(missing) = pending.missing.as_deref() {
                         state.candidate_rejected(missing);
                     }
@@ -1706,7 +1807,9 @@ impl ModService {
                     });
                 }
                 Err(err) => {
-                    state.visited.insert(pending.project_id.clone());
+                    state
+                        .visited
+                        .insert(fix_key(&pending.source, &pending.project_id));
                     record_install_failure(&pending, &err, &mut state);
                 }
             }
@@ -1732,6 +1835,7 @@ impl ModService {
             .await?;
         if planned {
             queue.push_back(PendingFix {
+                source: pending.source.clone(),
                 project_id: pending.project_id.clone(),
                 missing: pending.missing.clone(),
                 version_id: pending.version_id.clone(),
@@ -1775,9 +1879,13 @@ impl ModService {
                 .and_then(|snapshot| snapshot.provider_for(missing))
                 && let Some(project_id) = hit.project_id.clone()
             {
-                if !state.visited.contains(&project_id) {
+                let source = snapshot
+                    .as_ref()
+                    .map_or_else(String::new, |snapshot| snapshot.source.clone());
+                if !state.visited.contains(&fix_key(&source, &project_id)) {
                     state.plan_candidate(missing);
                     queue.push_back(PendingFix {
+                        source,
                         project_id,
                         missing: Some(missing.clone()),
                         version_id: hit.version_id.clone(),
@@ -1791,7 +1899,7 @@ impl ModService {
                 .find_provider(missing, server)
                 .await?
                 .into_iter()
-                .filter(|hit| !state.visited.contains(&hit.id))
+                .filter(|hit| !state.visited.contains(&fix_key(hit.source, &hit.id)))
                 .collect::<Vec<_>>();
             if fresh.is_empty() {
                 state.no_provider(missing);
@@ -1800,6 +1908,7 @@ impl ModService {
             for hit in fresh {
                 state.plan_candidate(missing);
                 queue.push_back(PendingFix {
+                    source: hit.source.to_owned(),
                     project_id: hit.id,
                     missing: Some(missing.clone()),
                     // 检索命中没有精确版本，按服务端条件挑
@@ -2204,6 +2313,14 @@ fn verdict_of(audit: ModAudit, file: &str) -> Result<StagedVerdict, ModError> {
     })
 }
 
+/// 补装去重键：项目 ID 只在来源内唯一
+///
+/// `Modrinth` 的 ID 与 `CurseForge` 的数值 ID 可能撞在同一串上；只按项目 ID
+/// 去重会把两个来源的不同项目当成同一个，后一个再也装不上。
+fn fix_key(source: &str, project_id: &str) -> String {
+    format!("{source}:{project_id}")
+}
+
 /// 该不该为这一项继续往下展开依赖
 ///
 /// 只在「确实缺依赖、还没为它展开过、且没到深度上限」时展开：成环的数据
@@ -2301,13 +2418,27 @@ fn provider_search_terms(modid: &str) -> Vec<String> {
 /// - `2`：其余包含，最后才考虑
 fn provider_hit_rank(hit: &ContentProject, term: &str) -> Option<u8> {
     let term = term.to_ascii_lowercase();
+    // 检索词与项目名的分隔符习惯不同：modid 常写成 `twilightforest`，项目
+    // slug 是 `the-twilight-forest`、标题是 `The Twilight Forest`。只按原串
+    // 做包含会把这些本体全部漏掉——实测 Modrinth 无此项目时只能靠 CurseForge
+    // 命中，而那一轮正是被这条规则筛空的。因此再比一遍去分隔符后的紧凑形式。
+    let compact_term: String = term.chars().filter(char::is_ascii_alphanumeric).collect();
     let equals = |text: &str| text.to_ascii_lowercase() == term;
     let prefixed = |text: &str| {
         text.to_ascii_lowercase()
             .strip_prefix(&term)
             .is_some_and(|rest| rest.starts_with('-'))
     };
-    let contains = |text: &str| text.to_ascii_lowercase().contains(&term);
+    let compact = |text: &str| {
+        text.chars()
+            .filter(char::is_ascii_alphanumeric)
+            .map(|c| c.to_ascii_lowercase())
+            .collect::<String>()
+    };
+    let contains = |text: &str| {
+        text.to_ascii_lowercase().contains(&term)
+            || (!compact_term.is_empty() && compact(text).contains(&compact_term))
+    };
     let slug = hit.slug.as_deref();
     if equals(&hit.id) || slug.is_some_and(equals) {
         Some(0)
@@ -2531,6 +2662,7 @@ mod tests {
     #[test]
     fn provider_hit_requires_name_relevance() {
         let hit = |id: &str, title: &str| ContentProject {
+            source: "modrinth",
             id: id.to_owned(),
             slug: Some(id.to_owned()),
             title: title.to_owned(),
@@ -2571,6 +2703,41 @@ mod tests {
         );
     }
 
+    /// 分隔符不影响相关度：modid 连写、项目名带连字符或空格时仍算本体
+    ///
+    /// 现场：`delightful` 依赖 `twilightforest`。`Modrinth` 没有该项目，
+    /// `CurseForge` 上的 slug 是 `the-twilight-forest`、标题是
+    /// `The Twilight Forest`。只按原串包含时全部落空，依赖被误报成
+    /// 「上游找不到提供方」。
+    #[test]
+    fn provider_hit_matches_across_separators() {
+        let hit = |id: &str, slug: &str, title: &str| ContentProject {
+            source: "curseforge",
+            id: id.to_owned(),
+            slug: Some(slug.to_owned()),
+            title: title.to_owned(),
+            description: String::new(),
+            kind: ContentKind::Mod,
+            also_kinds: Vec::new(),
+            loaders: Vec::new(),
+            game_versions: Vec::new(),
+            author: None,
+            downloads: 0,
+            icon_url: None,
+            client_only: false,
+        };
+        let project = hit("227639", "the-twilight-forest", "The Twilight Forest");
+        assert_eq!(provider_hit_rank(&project, "twilightforest"), Some(2));
+        // 反方向同样成立：检索词带分隔符、项目名连写
+        assert_eq!(
+            provider_hit_rank(
+                &hit("x", "twilightforest", "TwilightForest"),
+                "twilight-forest"
+            ),
+            Some(2)
+        );
+    }
+
     /// 相等命中优先于「服务端可用」：melody 现场
     ///
     /// 本体被上游标成仅客户端，名字里含该词的近似项目反而标着服务端可用。
@@ -2578,6 +2745,7 @@ mod tests {
     #[test]
     fn provider_pick_prefers_exact_slug_over_server_usable() {
         let hit = |id: &str, client_only: bool| ContentProject {
+            source: "modrinth",
             id: id.to_owned(),
             slug: Some(id.to_owned()),
             title: id.to_owned(),
@@ -2606,6 +2774,7 @@ mod tests {
     #[test]
     fn provider_rank_keeps_every_candidate() {
         let hit = |id: &str, client_only: bool, downloads: u64| ContentProject {
+            source: "modrinth",
             id: id.to_owned(),
             slug: Some(id.to_owned()),
             title: id.to_owned(),

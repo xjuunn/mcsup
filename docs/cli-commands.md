@@ -242,7 +242,7 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | `update` | `mcsup server mod update [<name>] [<mod>] [--kind <k>] [--source <s>] [--force] [--dry-run]` | 识别 → 逐项查候选 → `decide_update` → 展示清单 → 确认后逐个安装。不给 `<mod>` 时处理全部可更新项。换名更新会把旧文件删掉，避免两份同 modid 的 jar |
 | `outdated` | `mcsup server mod outdated [<name>] [--kind <k>] [--source <s>]` | 只读版 `update`：只列可更新项，不下载 |
 | `disable` | `mcsup server mod disable [<name>] <文件>…` | 把文件移进 `<server>/mods/disabled/`：加载器不扫描子目录，原名不变，随时能搬回来。与 `remove` 的区别是语义——移除表达「不要了」，停用表达「暂时不用」 |
-| `fix` | `mcsup server mod fix [<name>] [--kind <k>] [--from-log] [--yes]` | 按本地审计算出修复计划（补装缺失依赖 / 移出无法装载的文件）→ 展示 → 确认 → 执行。**移除是移进 `<server>/.mcsup-trash/`，不是删除**：判定是工具的推断，判错时用户能原样取回。`--from-log` 换掉计划来源：读 `console.log` 末尾 500 行，把崩溃栈里非平台包的帧归因到 `mods/` 下的具体文件并规划移除，同时展示缺失类与原始栈帧；归因不到的类进 `unattributed`，不猜文件。两条来源不合并——元数据判定答「装之前能不能装」，崩溃归因答「装完了为什么起不来」 |
+| `fix` | `mcsup server mod fix [<name>] [--kind <k>] [--from-log] [--yes]` | 按本地审计算出修复计划（补装缺失依赖 / 补加载器桥 / 移出无法装载的文件）→ 展示 → 确认 → 执行。**移除是移进 `<server>/.mcsup-trash/`，不是删除**：判定是工具的推断，判错时用户能原样取回。`--from-log` 换掉计划来源：读 `console.log` 末尾 500 行，把崩溃栈里非平台包的帧归因到 `mods/` 下的具体文件并规划移除，同时展示缺失类与原始栈帧；归因不到的类进 `unattributed`，不猜文件。两条来源不合并——元数据判定答「装之前能不能装」，崩溃归因答「装完了为什么起不来」 |
 
 `--kind` 只接受 `mod` 与 `plugin`（默认 `mod`）：这两个类别由服务端从顶层目录
 直接装载，改动的就是 `mods/` 与 `plugins/`。其余类别落点不在这里——数据包在
@@ -275,6 +275,12 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
   整条依赖被误报成「上游找不到提供方」——而提供方就在结果里。现在同一
   modid 的全部候选都排进计划，安装时按 modid 逐个校验，第一个不提供就换
   下一个；只有候选全部试完才记进 `unresolved`。
+- **依赖检索按来源顺序逐个查**：默认 Modrinth 优先，未命中时查 CurseForge。
+  只上架 CurseForge 的依赖（实测 `the-twilight-forest`，Modrinth 无此项目）
+  因此能补上，而不是报成「上游找不到提供方」。CurseForge 默认走社区镜像
+  （官方 API 不提供匿名访问）；设置 `CURSEFORGE_API_KEY` 后走官方
+  `api.curseforge.com`，key 只作为请求头发送。命中项在计划里带 `source`，
+  补装回到同一来源解析项目与版本——项目 ID 只在来源内唯一，跨来源会 404。
 - **能从整合包清单读到的，一律不搜索**：装整合包时把清单留在
   `<server>/.mcsup-modpack/manifest.json`（详见
   [整合包清单快照](#整合包清单快照)）。清单里的每个文件都带**项目 ID 与版本
@@ -520,6 +526,12 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 被误判成「仅客户端」，目录里的 Fabric mod 也不再被算作「只支持 fabric，服务端是
 forge」——桥把 Fabric 并入了目标服务端可装载的加载器集合，因此这些 mod 会保留而
 不是默认停用。
+
+**没装桥时聚合成一条**：同一目录里所有「只差桥」的 Fabric 专用 mod 合并为一条
+`mods: 有 N 个 fabric 专用 mod，当前服务端缺少 Sinytra Connector 桥`，而不是每个
+文件刷一遍同样的「只支持 fabric」。`mcsup server mod fix` 识别这一情况后**补装
+Sinytra Connector，而不是移除这些 mod**；补桥只解决加载器一维，MC 版本或 Java
+也对不上的文件仍按不匹配处置。
 
 清单里 `server: unsupported` 的文件不会装到服务端；`optional` 视为需要安装。
 `.mrpack` 由内置 zip 解析直接解开，不调用系统 `unzip`，归档内的 UTF-8

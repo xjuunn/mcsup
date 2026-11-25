@@ -112,6 +112,12 @@ impl ContentQuery {
 /// 用途），差异化口径由实现层决定后在这里落地。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContentProject {
+    /// 来源标识（[`ContentSourceInfo::name`]，如 `modrinth` / `curseforge`）
+    ///
+    /// 项目 ID 只在**同一个来源内**唯一：`Modrinth` 的 base62 id 与 `CurseForge`
+    /// 的数值 id 互不相通。检索结果必须带上来源，安装时才能回到同一处解析，
+    /// 否则会拿 `CurseForge` 的项目 ID 去问 `Modrinth`（404）。
+    pub source: &'static str,
     /// 来源内的项目 ID（稳定，可作为长期标识）
     pub id: String,
     /// 来源内的可读标识（slug / 项目名；可缺失）
@@ -399,6 +405,7 @@ mod tests {
     #[test]
     fn content_project_kinds_puts_primary_first() {
         let project = ContentProject {
+            source: "stub",
             id: "P".to_owned(),
             slug: None,
             title: "t".to_owned(),

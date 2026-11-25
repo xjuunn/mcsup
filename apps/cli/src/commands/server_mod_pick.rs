@@ -572,6 +572,7 @@ mod tests {
     #[test]
     fn detail_rows_skip_missing_optional_fields() {
         let project = ContentProject {
+            source: "modrinth",
             id: "AABBCC".to_owned(),
             slug: None,
             title: "Some Mod".to_owned(),

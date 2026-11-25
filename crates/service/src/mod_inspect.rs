@@ -87,6 +87,16 @@ pub enum ModBlocker {
     },
     /// 文件本身只能在客户端装载
     ClientOnly,
+    /// Forge / `NeoForge` 服务端缺加载器桥（Sinytra Connector）
+    ///
+    /// 一组 Fabric 专用 mod 的唯一问题是目标服务端没有桥：装桥即可，移除
+    /// 文件反而是错的处置。按目录聚合成一条，避免每个文件刷一遍同样的说明。
+    MissingBridge {
+        /// 桥出的加载器（目前恒为 `fabric`）
+        loader: String,
+        /// 受影响文件的相对路径
+        files: Vec<String>,
+    },
     /// 与目标服务端不匹配（加载器 / MC 版本 / Java 维度）
     Mismatch {
         /// 维度说明（`[加载器] 只支持 fabric，服务端是 forge` 之类）
@@ -145,6 +155,12 @@ pub struct ModAudit {
     /// `None` 表示分属多个加载器、无法确定：此时依赖闭包只校验与加载器无关
     /// 的依赖，不拿单个加载器的清单去吓人（见 `ModDependency::applies`）。
     pub target_loader: Option<ModLoader>,
+    /// 本批文件里检测到的加载器桥（Sinytra Connector 之类）
+    ///
+    /// 装载桥之后 Forge 服务端也能吃 Fabric mod。判定「要不要补桥」必须先
+    /// 排除「桥已经装了」：只看目标变体（`forge`）会把已装桥的服务端继续判成
+    /// 缺桥，反复规划补装。调用方把这里的值并进 `ServerTarget` 即可。
+    pub bridged_loaders: Vec<ModLoader>,
 }
 
 impl ModAudit {
@@ -394,6 +410,7 @@ impl ModInspectService {
         // 加载器并入目标。否则 Forge 服务端上的 Fabric mod 会被判成「只支持
         // fabric，服务端是 forge」而误删。
         bridged.extend(audit.mods.iter().filter_map(|r| r.capability.bridges_to));
+        audit.bridged_loaders.clone_from(&bridged);
         let effective_target = target.map(|t| t.clone().with_bridged_loaders(bridged));
         for report in &mut audit.mods {
             report.missing_deps = report.capability.missing_mandatory_deps(&present, loader);
@@ -463,13 +480,37 @@ impl ModInspectService {
                 continue;
             }
             let audit = self.inspect_paths_for_sync(&jars, Some(target));
+            let effective = target
+                .clone()
+                .with_bridged_loaders(audit.bridged_loaders.clone());
+            let mut bridged_files: Vec<String> = Vec::new();
             for report in &audit.mods {
+                // 缺桥的 Fabric mod：按目录聚合成一条，不逐个刷同样的说明。
+                // 桥只解决加载器一维，`needs_bridge` 已排除 MC / Java 不符。
+                let needs_bridge = report.capability.needs_bridge(&effective);
+                if needs_bridge {
+                    bridged_files.push(relative(server_dir, &report.capability.path));
+                }
                 let Some(blocker) = report.blocker() else {
                     continue;
                 };
+                // 加载器不匹配由缺桥汇总统一表达；其余成因（缺依赖 / 仅客户端）
+                // 仍按文件报——它们各自需要不同的处置
+                if needs_bridge && matches!(blocker, ModBlocker::Mismatch { .. }) {
+                    continue;
+                }
                 out.push(ModBlocked {
                     file: relative(server_dir, &report.capability.path),
                     blocker,
+                });
+            }
+            if !bridged_files.is_empty() {
+                out.push(ModBlocked {
+                    file: relative(server_dir, sub),
+                    blocker: ModBlocker::MissingBridge {
+                        loader: ModLoader::Fabric.as_str().to_owned(),
+                        files: bridged_files,
+                    },
                 });
             }
         }
@@ -937,5 +978,113 @@ mod tests {
             .await
             .expect("audit");
         assert!(!audit.queried_upstream);
+    }
+
+    /// 真目录里的 jar 由 `collect_jars` 扫出来，缺桥按目录聚合成一条
+    ///
+    /// 启动预检走的就是 `blockers_in_dir`：每个 Fabric 专用 mod 各刷一遍
+    /// 「只支持 fabric」会把控制台刷满，而它们的处置是同一条——补 Sinytra
+    /// Connector。
+    #[tokio::test]
+    async fn blockers_in_dir_aggregates_missing_bridge() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("mods");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let files: Vec<PathBuf> = ["numismatic.jar", "owo.jar", "connector-extras.jar"]
+            .iter()
+            .map(|name| dir.join(name))
+            .collect();
+        for file in &files {
+            std::fs::write(file, b"x").expect("write");
+        }
+        let caps = files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| {
+                cap(
+                    &file.to_string_lossy(),
+                    &format!("m{index}"),
+                    SideSupport::Required,
+                )
+            })
+            .collect();
+        let svc = ModInspectService::local(Arc::new(FakeInspector(caps)));
+        let target = ServerTarget {
+            loader: Some(ModLoader::Forge),
+            mc_version: Some("1.20.1".to_owned()),
+            java_major: Some(17),
+            bridged_loaders: Vec::new(),
+        };
+        let blocked = svc.blockers_in_dir(tmp.path(), &target).expect("blockers");
+        assert_eq!(blocked.len(), 1, "{blocked:?}");
+        assert_eq!(blocked[0].file, "mods");
+        match &blocked[0].blocker {
+            ModBlocker::MissingBridge { loader, files } => {
+                assert_eq!(loader, "fabric");
+                assert_eq!(files.len(), 3, "{files:?}");
+            }
+            other => panic!("expected missing bridge, got {other:?}"),
+        }
+    }
+
+    /// 目录里已有桥时不再报缺桥：否则每次启动都提示补一次
+    #[tokio::test]
+    async fn blockers_in_dir_skips_bridge_when_installed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("mods");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let fabric = dir.join("numismatic.jar");
+        let connector = dir.join("connector.jar");
+        std::fs::write(&fabric, b"x").expect("write");
+        std::fs::write(&connector, b"x").expect("write");
+        let mut bridge = cap(
+            &connector.to_string_lossy(),
+            "connector",
+            SideSupport::Required,
+        );
+        bridge.loaders = Vec::new();
+        bridge.bridges_to = Some(ModLoader::Fabric);
+        let caps = vec![
+            cap(
+                &fabric.to_string_lossy(),
+                "numismatic",
+                SideSupport::Required,
+            ),
+            bridge,
+        ];
+        let svc = ModInspectService::local(Arc::new(FakeInspector(caps)));
+        let target = ServerTarget {
+            loader: Some(ModLoader::Forge),
+            mc_version: Some("1.20.1".to_owned()),
+            java_major: Some(17),
+            bridged_loaders: Vec::new(),
+        };
+        let blocked = svc.blockers_in_dir(tmp.path(), &target).expect("blockers");
+        assert!(blocked.is_empty(), "{blocked:?}");
+    }
+
+    /// 加载器真的不对（不是缺桥）时仍按文件报不匹配
+    #[tokio::test]
+    async fn blockers_in_dir_keeps_non_bridge_mismatch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("mods");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let file = dir.join("forge-only.jar");
+        std::fs::write(&file, b"x").expect("write");
+        let mut forge_only = cap(&file.to_string_lossy(), "forge-only", SideSupport::Required);
+        forge_only.loaders = vec![ModLoader::Forge];
+        let svc = ModInspectService::local(Arc::new(FakeInspector(vec![forge_only])));
+        let target = ServerTarget {
+            loader: Some(ModLoader::Fabric),
+            mc_version: Some("1.20.1".to_owned()),
+            java_major: Some(17),
+            bridged_loaders: Vec::new(),
+        };
+        let blocked = svc.blockers_in_dir(tmp.path(), &target).expect("blockers");
+        assert_eq!(blocked.len(), 1, "{blocked:?}");
+        assert!(
+            matches!(blocked[0].blocker, ModBlocker::Mismatch { .. }),
+            "{blocked:?}"
+        );
     }
 }

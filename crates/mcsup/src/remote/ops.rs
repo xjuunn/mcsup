@@ -1185,6 +1185,7 @@ fn wire_mod_blocked(entry: &ModBlocked) -> WireModBlocked {
     let (kind, detail) = match &entry.blocker {
         ModBlocker::MissingDeps { mods } => ("missing_deps", mods.clone()),
         ModBlocker::ClientOnly => ("client_only", Vec::new()),
+        ModBlocker::MissingBridge { files, .. } => ("missing_bridge", files.clone()),
         ModBlocker::Mismatch { detail } => ("mismatch", vec![detail.clone()]),
     };
     WireModBlocked {

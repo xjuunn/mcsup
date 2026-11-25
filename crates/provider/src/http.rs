@@ -302,8 +302,28 @@ pub(crate) async fn get_json<T>(
 where
     T: DeserializeOwned,
 {
+    get_json_with(client, url, not_found_id, None).await
+}
+
+/// 带一个可选请求头的 [`get_json`]
+///
+/// 只用于需要鉴权的来源（CurseForge 的 `x-api-key`）。头值是密钥，日志与错误
+/// 里**不得**出现：这里除拼接请求外不记录任何内容。
+pub(crate) async fn get_json_with<T>(
+    client: &Client,
+    url: &str,
+    not_found_id: Option<VersionId>,
+    api_key: Option<&str>,
+) -> Result<T, SourceError>
+where
+    T: DeserializeOwned,
+{
     parse_http_url(url)?;
-    let response = send_with_retry(|| client.get(url), url).await?;
+    let build = || match api_key {
+        Some(key) => client.get(url).header("x-api-key", key),
+        None => client.get(url),
+    };
+    let response = send_with_retry(build, url).await?;
     let status = response.status();
     if !status.is_success() {
         let code = status.as_u16();
