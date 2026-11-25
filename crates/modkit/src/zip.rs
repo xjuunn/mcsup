@@ -66,11 +66,20 @@ impl ModInspector for ZipModInspector {
         parse_metadata(&mut zip, &mut cap);
 
         // 字节码：Java 版本取所有 class 的最大值；客户端类引用只在元数据
-        // 完全没给 side 结论时才采信
-        let (max_java, any_client_ref) = scan_classes(&mut zip, &names);
+        // 完全没给 side 结论时才采信；「窗口 + halt」单独成信号
+        let scan = scan_classes(&mut zip, &names);
         // class major → Java 大版本（65 对用户没意义，用户要的是「Java 21」）
-        cap.java_compiled = max_java.and_then(domain::mod_::java_version_from_class_major);
-        if any_client_ref {
+        cap.java_compiled = scan
+            .max_java
+            .and_then(domain::mod_::java_version_from_class_major);
+        cap.gui_window_halt = scan.gui_window_halt;
+        if scan.gui_window_halt {
+            cap.side.evidence.push(Evidence::new(
+                EvidenceSource::Bytecode,
+                "同一个 class 里既有顶层窗口容器（JFrame / JDialog / awt.Window 等），又调用 Runtime.halt：启动时会开窗口并终止 JVM",
+            ));
+        }
+        if scan.any_client_ref {
             apply_client_bytecode(&mut cap);
         }
 
@@ -326,10 +335,23 @@ fn read_entry<R: Read + std::io::Seek>(zip: &mut ZipArchive<R>, name: &str) -> O
 /// 单个元数据文件最多读多少字节
 const METADATA_LIMIT: u64 = 4 * 1024 * 1024;
 
-/// 扫描所有 class：返回（最大 Java 大版本, 是否有客户端类引用）
-fn scan_classes(zip: &mut ZipArchive<std::fs::File>, names: &[String]) -> (Option<u32>, bool) {
-    let mut max_java = None;
-    let mut any_client = false;
+/// 字节码扫描结论
+///
+/// 三个信号同一次遍历收集：三者都要读每个 class 的字节，分开扫会把整包
+/// 解压两遍。
+#[derive(Debug, Clone, Copy, Default)]
+struct ClassScan {
+    /// 所有 class 里最大的 class major
+    max_java: Option<u32>,
+    /// 是否有 class 引用客户端专属类
+    any_client_ref: bool,
+    /// 是否有 class 同时具备「顶层窗口容器」与 `Runtime.halt`
+    gui_window_halt: bool,
+}
+
+/// 扫描所有 class：收集 Java 版本、客户端类引用、窗口 + halt 信号
+fn scan_classes(zip: &mut ZipArchive<std::fs::File>, names: &[String]) -> ClassScan {
+    let mut scan = ClassScan::default();
     let mut budget = CLASS_SCAN_BUDGET;
     for name in names {
         if !has_ext(name, "class") || budget == 0 {
@@ -351,13 +373,16 @@ fn scan_classes(zip: &mut ZipArchive<std::fs::File>, names: &[String]) -> (Optio
         }
         budget -= 1;
         if let Some(major) = bytecode::java_major(&buf) {
-            max_java = Some(max_java.map_or(major, |m: u32| m.max(major)));
+            scan.max_java = Some(scan.max_java.map_or(major, |m: u32| m.max(major)));
         }
         if bytecode::references_client_classes(&buf) {
-            any_client = true;
+            scan.any_client_ref = true;
+        }
+        if bytecode::halts_after_window(&buf) {
+            scan.gui_window_halt = true;
         }
     }
-    (max_java, any_client)
+    scan
 }
 
 /// 字节码发现客户端类引用后的 side 处置
@@ -1441,5 +1466,87 @@ mod tests {
         assert!(cap.mc_range_for(Some(ModLoader::NeoForge)).contains("1.21"));
         // Forge 侧没写 minecraft 约束 = 不设限
         assert!(cap.mc_range_for(Some(ModLoader::Forge)).is_any());
+    }
+
+    /// 端到端：字节码里的「窗口 + halt」要能落进 `ModCapability`
+    ///
+    /// 现场形态取自 `missingmodschecker` 的 `MissingModsWindow`：引用
+    /// `javax/swing/JFrame`，窗口关闭后 `Runtime.getRuntime().halt(0)`。
+    #[test]
+    fn gui_window_halt_survives_the_scan() {
+        let cap = inspect_bytes(&archive_with_classes(&[
+            (
+                "toni/checker/Window.class",
+                &pool_class(&["javax/swing/JFrame", "java/lang/Runtime", "halt"]),
+            ),
+            (
+                "toni/checker/Plain.class",
+                &pool_class(&["java/lang/Object"]),
+            ),
+        ]));
+        assert!(cap.gui_window_halt);
+    }
+
+    /// 只有窗口 API 的 jar 不落该信号
+    ///
+    /// 实测 `blue_skies`（`JFrame`）与 `midnightlib`（`JFileChooser`）在
+    /// dedicated server 上正常装载。
+    #[test]
+    fn window_only_jar_has_no_gui_signal() {
+        let cap = inspect_bytes(&archive_with_classes(&[
+            (
+                "moonlight/BlueSkies.class",
+                &pool_class(&["javax/swing/JFrame", "java/lang/Object"]),
+            ),
+            (
+                "midnightlib/Config.class",
+                &pool_class(&["javax/swing/JFileChooser", "java/lang/Runtime"]),
+            ),
+        ]));
+        assert!(!cap.gui_window_halt);
+    }
+
+    /// 只有 halt 的 jar 不落该信号
+    ///
+    /// `Runtime.halt` 在关闭钩子、watchdog 里都会用，与服务端能否启动无关。
+    #[test]
+    fn halt_only_jar_has_no_gui_signal() {
+        let cap = inspect_bytes(&archive_with_classes(&[(
+            "spark/Watchdog.class",
+            &pool_class(&["java/lang/Runtime", "halt"]),
+        )]));
+        assert!(!cap.gui_window_halt);
+    }
+
+    /// 构造一个只含 class 头 + 给定量常量池字符串的字节序列
+    fn pool_class(strings: &[&str]) -> Vec<u8> {
+        let mut bytes = vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x00, 0x00, 0x3D];
+        for text in strings {
+            let len = u16::try_from(text.len()).expect("short test strings");
+            bytes.extend_from_slice(&len.to_be_bytes());
+            bytes.extend_from_slice(text.as_bytes());
+        }
+        bytes
+    }
+
+    /// 构造最小 jar：每个条目一段给定字节
+    fn archive_with_classes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        for (name, bytes) in entries {
+            writer.start_file(*name, options).expect("start");
+            writer.write_all(bytes).expect("write");
+        }
+        writer.finish().expect("finish").into_inner()
+    }
+
+    /// 从内存归档跑一遍 `inspect` 的完整链路
+    fn inspect_bytes(bytes: &[u8]) -> ModCapability {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fixture.jar");
+        std::fs::write(&path, bytes).expect("write jar");
+        ZipModInspector::new().inspect(&path).expect("inspect")
     }
 }

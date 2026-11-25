@@ -102,6 +102,17 @@ pub enum ModBlocker {
         /// 维度说明（`[加载器] 只支持 fabric，服务端是 forge` 之类）
         detail: String,
     },
+    /// 启动时会自己打开图形窗口，关闭窗口即终止 JVM
+    ///
+    /// 专用服务端没有可操作的桌面：窗口要么建不起来（`HeadlessException`），
+    /// 要么建起来后一直等一个不会到来的关闭请求，就绪标记 `Done (` 永远不
+    /// 出现，服务端实际卡死。实测 `missingmodschecker` 属于这一类，它没有
+    /// 元数据可判（`mods.toml` 只有 `minecraft` 与 `txnilib`，`side` 全是
+    /// `BOTH`），只能靠 [`ModCapability::needs_gui_session`] 的字节码结论。
+    ///
+    /// 处置只有停用：这类文件的服务端行为由它自己的 UI 逻辑决定，没有可
+    /// 补装的提供方，也不是换版本就能好。
+    GuiWindow,
 }
 
 /// 一条会阻断启动的条目
@@ -118,8 +129,13 @@ impl ModReport {
     ///
     /// 判定顺序即处置顺序：缺依赖可以补装，仅客户端只能排除，不匹配只能
     /// 换版本。先报先能修的那一类，用户不会在「换个版本」上白费力气。
+    /// 唯一的例外是 [`ModBlocker::GuiWindow`]：它排在最前——这类文件装什么
+    /// 依赖都起不来，先让用户看到唯一有效的处置（停用）比先补一轮依赖有用。
     #[must_use]
     pub fn blocker(&self) -> Option<ModBlocker> {
+        if self.capability.needs_gui_session() {
+            return Some(ModBlocker::GuiWindow);
+        }
         if !self.missing_deps.is_empty() {
             return Some(ModBlocker::MissingDeps {
                 mods: self.missing_deps.clone(),
@@ -1086,5 +1102,87 @@ mod tests {
             matches!(blocked[0].blocker, ModBlocker::Mismatch { .. }),
             "{blocked:?}"
         );
+    }
+
+    /// 会弹窗再终止 JVM 的 mod 被单独报出来，其余维度都正常也要拦
+    ///
+    /// 现场形态：`missingmodschecker` 的元数据只声明 `minecraft` 与 `txnilib`
+    /// （`side = BOTH`），客/服维度给不出任何结论，加载器与 MC 版本也都对得
+    /// 上。唯一的问题在字节码里，因此这条不能落到 `Mismatch`（那会建议用户
+    /// 「换个版本」），必须单独成类并给出停用建议。
+    #[tokio::test]
+    async fn blockers_in_dir_reports_gui_window_mods() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("mods");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let file = dir.join("missingmodschecker-forge-1.0.2-1.20.1.jar");
+        std::fs::write(&file, b"x").expect("write");
+        let mut checker = cap(
+            &file.to_string_lossy(),
+            "missingmodschecker",
+            SideSupport::Required,
+        );
+        checker.loaders = vec![ModLoader::Forge];
+        checker.gui_window_halt = true;
+        let svc = ModInspectService::local(Arc::new(FakeInspector(vec![checker])));
+        let target = ServerTarget {
+            loader: Some(ModLoader::Forge),
+            mc_version: Some("1.20.1".to_owned()),
+            java_major: Some(17),
+            bridged_loaders: Vec::new(),
+        };
+        let blocked = svc.blockers_in_dir(tmp.path(), &target).expect("blockers");
+        assert_eq!(blocked.len(), 1, "{blocked:?}");
+        assert_eq!(
+            blocked[0].file,
+            "mods/missingmodschecker-forge-1.0.2-1.20.1.jar"
+        );
+        assert_eq!(blocked[0].blocker, ModBlocker::GuiWindow);
+    }
+
+    /// 只引用窗口 API、不终止 JVM 的 mod 不报
+    ///
+    /// 实测 `blue_skies`（`JFrame`）、`midnightlib`（`JFileChooser`）在
+    /// dedicated server 上正常装载。把它们报成阻断就是纯误报，用户会照着
+    /// 提示停用一个能用的 mod。
+    #[tokio::test]
+    async fn blockers_in_dir_ignores_window_api_without_halt() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("mods");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let blue = dir.join("blue_skies-1.20.1-1.3.31.jar");
+        let midnight = dir.join("midnightlib-forge-1.9.2+1.20.1.jar");
+        std::fs::write(&blue, b"x").expect("write");
+        std::fs::write(&midnight, b"x").expect("write");
+        let mut skies = cap(&blue.to_string_lossy(), "blue_skies", SideSupport::Required);
+        skies.loaders = vec![ModLoader::Forge];
+        let mut lib = cap(
+            &midnight.to_string_lossy(),
+            "midnightlib",
+            SideSupport::Required,
+        );
+        lib.loaders = vec![ModLoader::Forge];
+        let svc = ModInspectService::local(Arc::new(FakeInspector(vec![skies, lib])));
+        let target = ServerTarget {
+            loader: Some(ModLoader::Forge),
+            mc_version: Some("1.20.1".to_owned()),
+            java_major: Some(17),
+            bridged_loaders: Vec::new(),
+        };
+        let blocked = svc.blockers_in_dir(tmp.path(), &target).expect("blockers");
+        assert!(blocked.is_empty(), "{blocked:?}");
+    }
+
+    /// 弹窗信号优先于缺依赖：这类文件补什么依赖都起不来
+    #[tokio::test]
+    async fn gui_window_takes_precedence_over_missing_deps() {
+        let mut checker = cap("/a.jar", "checker", SideSupport::Required);
+        checker.gui_window_halt = true;
+        let audit = ModInspectService::local(Arc::new(FakeInspector(vec![checker])))
+            .inspect_paths(&[PathBuf::from("/a.jar")], false)
+            .await
+            .expect("audit");
+        let blocker = audit.mods[0].blocker().expect("blocker");
+        assert_eq!(blocker, ModBlocker::GuiWindow);
     }
 }

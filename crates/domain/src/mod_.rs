@@ -697,6 +697,21 @@ pub struct ModCapability {
     /// 据此把它当作服务端基础设施，并把 `bridges_to` 并入目标服务端可装载的
     /// 加载器集合（见 [`ServerTarget::bridged_loaders`]）。
     pub bridges_to: Option<ModLoader>,
+    /// 同一个 class 里既有顶层窗口容器、又调用 `Runtime.halt`
+    ///
+    /// 只记**事实**：某个 class 引用了 `JFrame` / `JDialog` / `JWindow` /
+    /// `awt.Frame` / `awt.Window` 之一，且常量池里有 `Runtime` 与 `halt`。
+    /// 是否算「服务端缺图形会话就起不来」由 [`Self::needs_gui_session`] 判定。
+    ///
+    /// 为什么要单独记：专用服务端没有可操作的桌面，这类 mod 打开窗口后要么
+    /// 永远等一个不会到来的关闭请求（就绪标记 `Done (` 永远不出现），要么
+    /// 窗口一关就把 JVM 一起带走。实测 `missingmodschecker`：
+    /// `MissingModsWindow` 里 `setVisible(true)` 之后 `Runtime.halt(0)`，
+    /// 服务端卡在启动阶段。
+    ///
+    /// 只引用窗口 API 不算：实测 `blue_skies`（`JFrame`）、`midnightlib`
+    /// （`JFileChooser`）都在 dedicated server 上正常装载。
+    pub gui_window_halt: bool,
 }
 
 /// 「不施加版本限制」的共享区间
@@ -730,6 +745,7 @@ impl ModCapability {
             provides: Vec::new(),
             is_library: false,
             bridges_to: None,
+            gui_window_halt: false,
         }
     }
 
@@ -803,7 +819,18 @@ impl ModCapability {
         if self.bridges_to.is_some() {
             return Risk::Ok;
         }
+        // 打开图形窗口后终止 JVM：专用服务端没有可操作的桌面，这类文件
+        // 起不来。判定依据是字节码里的「顶层窗口 + Runtime.halt」组合，
+        // 属于启发式（能证明代码里有这条路，不能证明每次启动都走它），
+        // 因此把下限抬到「待确认」而不是直接判死；确定的阻断由启动预检按
+        // [`Self::needs_gui_session`] 单独给出。已经有更重的结论（明确
+        // 仅客户端）时保持原判。
         let base = Risk::of(&self.side);
+        let base = if self.gui_window_halt {
+            base.max(Risk::Review)
+        } else {
+            base
+        };
         // 没有任何模组加载器元数据：可能是资源包 / 数据包 / 损坏文件，
         // 也可能只是我们认不出。判不出就降级为待确认，而不是放行。
         if self.loaders.is_empty() && base == Risk::Ok {
@@ -1208,6 +1235,25 @@ impl ModCapability {
         }
         let fit = self.fit_for(target);
         fit.loader == Fit::Mismatch && fit.mc_version != Fit::Mismatch && fit.java != Fit::Mismatch
+    }
+
+    /// 装到专用服务端上会因为「要图形窗口」而起不来
+    ///
+    /// 事实由 [`Self::gui_window_halt`] 记录，这里的判定只回答一个问题：
+    /// **这个目标服务端有没有可用的图形会话**。专用服务端永远没有——JVM 在
+    /// 无桌面会话里 `setVisible(true)` 抛 `HeadlessException`，或者窗口建起来
+    /// 等一个永远不会到来的关闭请求，随后的 `halt` 把整个服务端带走。
+    ///
+    /// 判定放在领域层而不是扫描层：`gui_window_halt` 是「代码里有什么」，
+    /// 「这台服务端缺不缺图形会话」是部署形态的判断。以后若有桌面环境的
+    /// 服务端形态（本地单人「开服并进游戏」一类），只需在这里补一个条件，
+    /// 不用改扫描与入口。
+    ///
+    /// 桥单独放行：Sinytra Connector 内嵌 Fabric 客户端 API，字节码里窗口
+    /// 相关引用是它自身的库成分，不是「会弹窗」的证据。
+    #[must_use]
+    pub fn needs_gui_session(&self) -> bool {
+        self.gui_window_halt && self.bridges_to.is_none()
     }
 
     /// 加载器维度：目标服务端能否载入本文件声明的加载器之一
@@ -1972,6 +2018,58 @@ mod tests {
         cap.bridges_to = Some(ModLoader::Fabric);
         // 刻意不给 loaders / side，模拟「裸 jar + 客户端类引用」的最坏情形
         assert_eq!(cap.risk(), Risk::Ok);
+    }
+
+    /// 打开窗口后终止 JVM 的 mod 停在「待确认」，并且判定为缺图形会话
+    ///
+    /// 风险只到 `Review` 而不是 `Blocking`：字节码只证明「代码里有这条路」，
+    /// 不证明每次启动都走它。启动预检另按 [`ModCapability::needs_gui_session`]
+    /// 给出确定的阻断说明——那里知道目标服务端是专用服务端。
+    #[test]
+    fn gui_window_halt_is_review_and_needs_gui_session() {
+        let mut cap = ModCapability::empty("checker.jar");
+        cap.loaders = vec![ModLoader::Forge];
+        cap.side = SideVerdict::declared(SideSupport::Required, SideSupport::Required);
+        cap.gui_window_halt = true;
+        assert_eq!(cap.risk(), Risk::Review);
+        assert!(cap.needs_gui_session());
+        // 「待确认」不等于拦死：安装判定只提示，不拒绝
+        assert_eq!(
+            InstallVerdict::of(cap.risk(), false),
+            InstallVerdict::Review
+        );
+    }
+
+    /// 没有该信号的普通 mod 不受影响
+    ///
+    /// 显式给客/服结论：`cap` 辅助函数只填加载器与 MC 区间，客/服维度是
+    /// `Unknown`，风险本就该是 `Review`——与本条要验证的信号无关。
+    #[test]
+    fn mod_without_gui_signal_needs_no_gui_session() {
+        let mut mod_ = cap(&[ModLoader::Forge], "1.20.1", Some(17));
+        mod_.side = SideVerdict::declared(SideSupport::Required, SideSupport::Required);
+        assert!(!mod_.needs_gui_session());
+        assert_eq!(mod_.risk(), Risk::Ok);
+    }
+
+    /// 客/服判不出时，没有窗口信号也不改变原有口径
+    ///
+    /// 风险仍由 `Unknown` 决定（`Review`），窗口信号不存在时不多加任何影响。
+    #[test]
+    fn unknown_side_without_gui_signal_keeps_review() {
+        let mod_ = cap(&[ModLoader::Forge], "1.20.1", Some(17));
+        assert!(!mod_.needs_gui_session());
+        assert_eq!(mod_.risk(), Risk::Review);
+    }
+
+    /// 桥自身的窗口类引用不算「要图形会话」
+    #[test]
+    fn bridge_with_window_halt_is_not_gui_blocking() {
+        let mut bridge = ModCapability::empty("connector.jar");
+        bridge.bridges_to = Some(ModLoader::Fabric);
+        bridge.gui_window_halt = true;
+        assert!(!bridge.needs_gui_session());
+        assert_eq!(bridge.risk(), Risk::Ok);
     }
 
     #[test]

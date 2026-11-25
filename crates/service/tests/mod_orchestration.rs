@@ -253,6 +253,8 @@ struct Verdict {
     id: Option<String>,
     /// 声明的必需依赖（modid + 生效侧，缺了就算缺失依赖）
     depends: Vec<(String, domain::mod_::DepSide)>,
+    /// 字节码里「顶层窗口 + Runtime.halt」信号
+    gui_window_halt: bool,
 }
 
 /// 假检查器：按**文件名**给结论（暂存路径每次不同，不能按全路径匹配）
@@ -273,6 +275,7 @@ impl FakeInspector {
                         side: *side,
                         id: None,
                         depends: Vec::new(),
+                        gui_window_halt: false,
                     })
                     .collect(),
             ),
@@ -305,6 +308,14 @@ impl FakeInspector {
         self.declare_dep_with_side(file, dep, domain::mod_::DepSide::Both);
     }
 
+    /// 同 [`Self::declare_dep`]，但标记该文件的字节码里有「窗口 + halt」
+    fn declare_gui_window(&self, file: &str) {
+        let mut verdicts = self.verdicts.lock().expect("verdicts");
+        if let Some(verdict) = verdicts.iter_mut().find(|verdict| verdict.file == file) {
+            verdict.gui_window_halt = true;
+        }
+    }
+
     /// 同上，但指定这条依赖在哪一侧生效
     fn declare_dep_with_side(&self, file: &str, dep: &str, side: domain::mod_::DepSide) {
         let mut verdicts = self.verdicts.lock().expect("verdicts");
@@ -332,6 +343,7 @@ impl ModInspector for FakeInspector {
         capability.version = Some("1.0.0".to_owned());
         capability.loaders.push(ModLoader::Fabric);
         capability.side = SideVerdict::declared(SideSupport::Required, verdict.side);
+        capability.gui_window_halt = verdict.gui_window_halt;
         for (dep, dep_side) in &verdict.depends {
             capability.depends.push(domain::mod_::ModDependency {
                 id: dep.clone(),
@@ -876,6 +888,47 @@ async fn plan_fix_installs_connector_bridge_instead_of_removing_fabric_mods() {
     // 桥出的加载器，而不是某个 modid
     assert_eq!(bridge.missing, "fabric");
     assert!(bridge.needed_by.contains("numismatic.jar"), "{plan:?}");
+}
+
+/// 要图形窗口的 mod 进移除表，且不为它补依赖
+///
+/// 现场：`missingmodschecker` 的元数据只有 `minecraft` 与 `txnilib` 两条
+/// 依赖，客/服维度全 `BOTH`，任何静态元数据都判不出问题。它的实际行为是
+/// `MissingModsWindow` 里 `setVisible(true)` 后 `Runtime.halt(0)`——服务端
+/// 卡在窗口上，就绪标记 `Done (` 永远不出现。处置只有停用；给它补依赖是
+/// 白装，装完照样起不来。
+#[tokio::test]
+async fn plan_fix_removes_gui_window_mods_and_skips_their_deps() {
+    // 用 Fabric 替身：本用例只关心「窗口 + halt」的处置，与加载器变体无关
+    // （假检查器把所有文件都报成 Fabric，Forge 变体会先走缺桥分支）
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[("missingmodschecker.jar", SideSupport::Required)],
+        b"jar-bytes",
+    );
+    harness
+        .inspector
+        .declare_gui_window("missingmodschecker.jar");
+    harness
+        .inspector
+        .declare_dep("missingmodschecker.jar", "txnilib");
+    harness.write("mods/missingmodschecker.jar", b"m");
+    harness.set_resolved_for("txnilib", &[("v1", "txnilib.jar")]);
+
+    let plan = harness
+        .mods
+        .plan_fix("alpha", ContentKind::Mod)
+        .await
+        .expect("plan_fix");
+    // 不给它补依赖：补了也没用
+    assert!(plan.installs.is_empty(), "{plan:?}");
+    assert_eq!(plan.removals.len(), 1, "{plan:?}");
+    assert!(plan.removals[0].file.ends_with("missingmodschecker.jar"));
+    assert!(
+        plan.removals[0].reason.contains("图形窗口"),
+        "{}",
+        plan.removals[0].reason
+    );
 }
 
 /// 提供方被上游标成仅客户端时仍要能补上：库类 mod 的标注经常有误

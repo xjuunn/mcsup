@@ -1192,6 +1192,11 @@ impl ModService {
         // 名字猜，会挑错项目（`satin` 搜出来首位是 `satin-free-wakes`）
         let mut snapshot = self.modpack_snapshot(&server).await;
         for report in &audit.mods {
+            // 要图形窗口的 mod 已判为必须停用（见下方移除表）：给它补依赖是
+            // 白装，装完这个文件也起不来
+            if report.capability.needs_gui_session() {
+                continue;
+            }
             if report.missing_deps.is_empty() {
                 continue;
             }
@@ -1270,6 +1275,16 @@ impl ModService {
             // 缺桥的条目由上面的补装项处置，不能进移除表：加载器这一维确实
             // 不匹配，但补桥后就能装（`needs_bridge` 已排除 MC / Java 不符）
             if report.capability.needs_bridge(&target) {
+                continue;
+            }
+            // 要图形窗口的 mod：专用服务端没有可操作的桌面，唯一有效的处置
+            // 是停用。补装什么都解决不了，换版本也未必——先把原因说清。
+            if report.capability.needs_gui_session() {
+                removals.push(FixRemove {
+                    file: PathBuf::from(&report.capability.path),
+                    reason: "启动时会打开图形窗口并在窗口关闭后终止 JVM，专用服务端无法运行"
+                        .to_owned(),
+                });
                 continue;
             }
             // 缺依赖的文件默认由补装项处置；补不上的、且文件本身只是客户端

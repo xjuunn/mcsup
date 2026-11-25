@@ -81,6 +81,7 @@ pub struct RemoteModBlocked {
     /// 相对服务端目录的路径
     pub file: String,
     /// 原因类别：`missing_deps` / `client_only` / `missing_bridge` / `mismatch`
+    /// / `gui_window`
     pub kind: String,
     /// 类别相关的细节
     pub detail: Vec<String>,
