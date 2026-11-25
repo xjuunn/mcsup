@@ -2122,6 +2122,11 @@ peer）整棵 vendor 进 `<out>/node_modules`（`sdks/typescript` 的
 解包必须防 Zip Slip：拒绝绝对路径、`..`、符号链接、硬链接、设备文件。
 Windows 还需拒绝保留名（`CON`、`NUL` 等）与尾随点 / 空格。
 
+解包时按归档记录的 Unix 模式位恢复文件权限（只取低 9 位，忽略文件类型与
+setuid / setgid / sticky）。产物入口脚本（`bin/run.sh`）靠这步保留可执行位，
+否则入口校验会报 `entry ... is not executable`；本地目录安装走 `fs::copy`，
+权限位随源文件一起复制。
+
 GitHub 归档额外多一层 `<repo>-<SHA>/` 顶层目录；128 MiB 的压缩包上限也适用，
 产物里塞了大体积资源时请改用 `--from` / `--url` 分发。
 

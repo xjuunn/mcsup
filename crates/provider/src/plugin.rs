@@ -486,7 +486,35 @@ fn extract_archive(archive: &Path, dest: &Path) -> Result<(), HostError> {
             .map_err(|err| HostError::internal(format!("create {}: {err}", target.display())))?;
         std::io::copy(&mut entry, &mut output)
             .map_err(|err| HostError::internal(format!("extract {name}: {err}")))?;
+        restore_mode(&target, entry.unix_mode())?;
     }
+    Ok(())
+}
+
+/// 恢复归档记录的文件权限位
+///
+/// `File::create` 按当前 umask 建房，会把 zip 里的 Unix 模式位一起丢掉：
+/// 产物中的 `bin/run.sh` 解包后变成 `0o644`，入口校验随即报
+/// `is not executable`。这里只取低 9 位，文件类型、setuid / setgid /
+/// sticky 一律忽略。
+fn restore_mode(path: &Path, unix_mode: Option<u32>) -> Result<(), HostError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let Some(mode) = unix_mode else {
+            return Ok(());
+        };
+        // 由 Windows 工具生成的归档可能只带 DOS 属性，低 9 位可能全为 0；
+        // 此时不覆盖新建文件的默认权限。
+        if mode.trailing_zeros() >= 9 {
+            return Ok(());
+        }
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o777))
+            .map_err(|err| HostError::internal(format!("set mode {}: {err}", path.display())))?;
+    }
+    #[cfg(not(unix))]
+    let _ = (path, unix_mode);
     Ok(())
 }
 
@@ -580,6 +608,47 @@ mod tests {
             .fetch(&ArtifactOrigin::Local(archive), dest.path())
             .expect_err("zip slip");
         assert_eq!(err.code, port::plugin::ErrorCode::Denied);
+    }
+
+    /// zip 里的 Unix 模式位必须在解包后保留
+    ///
+    /// 产物入口通常是 `bin/run.sh`，宿主按 `0o111` 校验可执行；`File::create`
+    /// 建房会丢掉归档里的模式位，导致安装时报 `is not executable`。
+    #[cfg(unix)]
+    #[test]
+    fn archive_preserves_executable_bit() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tmp");
+        let archive = dir.path().join("plugin.zip");
+        {
+            let file = std::fs::File::create(&archive).expect("create");
+            let mut zip = zip::ZipWriter::new(file);
+            let plain = zip::write::SimpleFileOptions::default();
+            for (name, body) in [
+                ("manifest.json", manifest_json("demo")),
+                ("descriptor.json", descriptor_json("demo")),
+            ] {
+                zip.start_file(name, plain).expect("entry");
+                zip.write_all(body.as_bytes()).expect("write");
+            }
+            zip.start_file("bin/run.sh", plain.unix_permissions(0o755))
+                .expect("entry");
+            zip.write_all(b"#!/bin/sh\nexec node entry.mjs\n")
+                .expect("write");
+            zip.finish().expect("finish");
+        }
+        let dest = tempfile::tempdir().expect("dest");
+        let artifact = PluginArtifactSource::new()
+            .fetch(&ArtifactOrigin::Local(archive), dest.path())
+            .expect("fetch");
+        let entry = artifact.root.join("bin/run.sh");
+        let mode = std::fs::metadata(&entry)
+            .expect("stat entry")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o111, 0o111, "entry mode {mode:o}");
     }
 
     #[test]
