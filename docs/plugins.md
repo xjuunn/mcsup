@@ -264,7 +264,7 @@ pub const PLUGIN_CONTROL_VERSION: u32 = 1;
 // domain::plugin
 pub const PLUGIN_API_VERSION: u32 = 1;
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
-pub const DESCRIPTOR_SCHEMA_VERSION: u32 = 6;   // 2 起 setup，3 起 bind，4 起 setup.when，5 起 interactive，6 起 setup.help
+pub const DESCRIPTOR_SCHEMA_VERSION: u32 = 6;   // 2 起 setup，3 起 bind，4 起 setup.when，5 起 interactive，6 起结构化 setup 描述
 ```
 
 `[禁止]` 把插件帧塞进现有的 `Request` / `Response`：那两者是「一连接一请求」
@@ -1518,20 +1518,25 @@ JSON Schema 没有「密钥」「单位」的标准表达，统一用 `x-mcsup-`
 | `fields[].required` | 否 | 布尔，默认 `false`；必填项留空会重问 |
 | `fields[].secret` | 否 | 布尔，默认 `false`；输入遮蔽，字段类型必须是 `string` |
 | `fields[].label` | 否 | ≤ 64 字符；省略时取 schema 的 `x-mcsup-label`，再退到 `path` |
-| `fields[].description` | 否 | ≤ 512 字符；没有 `help` 时按行打印的简单帮助；省略时取 schema 的 `description` |
-| `fields[].help` | 否 | 结构化帮助（`schema: 6` 起）：`style` 为 `lines` / `steps` / `inline`，配 `title`、`text` 或 `steps`、`links`。优先于 `description`；详见下方「帮助文本」 |
+| `fields[].description` | 否 | 提问前展示的描述。字符串按行输出（`schema: 2` 起，≤ 512 字符）；对象形式（`schema: 6` 起）配 `style`、`title`、`text` 或 `steps`、`links`。省略时取 schema 的 `description`；详见下方「描述」 |
 | `fields[].default` | 否 | 提示默认值，必须符合该字段 schema；省略时取 schema 的 `default` |
 | `fields[].choices` | 否 | 数组，≤ 32 项、每项 1–64 字符且不重复；仅用于字符串列表字段，声明后渲染成多选框 |
 | `fields[].choicesFrom` | 否 | `servers`：选项由宿主枚举已注册服务器名。字符串字段渲染成单选，字符串列表渲染成多选；与 `choices` 互斥，不能用于 `secret` 或非字符串字段 |
 | `fields[].when` | 否 | 提问条件（`schema: 4` 起）：`path` + `includes` 或 `equals` 二选一。`path` 必须是**本字段之前**声明过的 setup 字段；`includes` 判字符串列表包含（被依赖字段必须是字符串列表），`equals` 判值相等（值须符合被依赖字段的 schema）。条件不成立时既不提问也不计入 `missing`；依赖值还没收集到时视为不成立 |
 | `fields[].interactive` | 否 | 布尔，默认 `false`（`schema: 5` 起）：交由插件自身的 setup hook 取值。只能用于 `secret: true` 的字符串字段，不能声明 `default` |
 
-### 帮助文本
+### 描述
 
-需要用户去第三方平台注册的凭据字段，用帮助文本说明去哪里申请、怎么操作、
+需要用户去第三方平台注册的凭据字段，用描述说明去哪里申请、怎么操作、
 文档在哪。内容全部由插件写，宿主不内置任何平台知识；没写就不显示。
 
-`help.style` 决定显示方式：
+字符串形式按行输出，适合一小段说明：
+
+```json
+{ "description": "去「开发设置」复制 AppID\n没有 AppID 时先创建机器人" }
+```
+
+对象形式（`schema: 6` 起）用 `style` 选择显示方式：
 
 | style | 声明什么 | 宿主渲染 |
 | --- | --- | --- |
@@ -1543,7 +1548,7 @@ JSON Schema 没有「密钥」「单位」的标准表达，统一用 `x-mcsup-`
 
 ```json
 {
-  "help": {
+  "description": {
     "style": "steps",
     "title": "获取 QQ AppID",
     "steps": ["打开 https://q.qq.com/ 登录", "进入「开发设置」复制 AppID"],
@@ -1555,8 +1560,8 @@ JSON Schema 没有「密钥」「单位」的标准表达，统一用 `x-mcsup-`
 约束：`text` ≤ 512 字符；`steps` ≤ 16 条、每条 ≤ 200 字符；`links` ≤ 8 条，
 `label` 1–64 字符，`url` 必须以 `http://` 或 `https://` 开头且不含空白。
 `steps` 样式不能写 `text`，`lines` / `inline` 不能写 `steps`：形状冲突时
-解析直接失败，不静默取其一。`help` 优先于 `description`，两者都省略时
-向导不输出提示。
+解析直接失败，不静默取其一。对象形式要求 `schema: 6`；字符串形式不抬高
+版本。两者都不写时退到 schema 的 `description`，仍然没有就什么都不显示。
 
 宿主行为：
 
@@ -1569,9 +1574,9 @@ JSON Schema 没有「密钥」「单位」的标准表达，统一用 `x-mcsup-`
   也不会把「缺 QQ 凭据」算进 `missing`；
 - 已有值**不预填**到输入框（避免把旧值当成新输入一把回车提交）：留空即沿用，
   字符串列表会预勾选当前值；
-- 帮助文本只在真正要填值时渲染：字段已有值、留空即可沿用时跳过（含
+- 描述只在真正要填值时渲染：字段已有值、留空即可沿用时跳过（含
   `inline`），避免 `plugin setup` 重跑时重复刷教程；`--json` / 非 TTY 不
-  提问也就没有帮助行；交互式字段没有输入框，`inline` 退回单行打印；
+  提问也就没有描述行；交互式字段没有输入框，`inline` 退回单行打印；
 - 字符串列表声明了 `choices` 时渲染成多选框：`■` / `□` 表示勾选状态，
   空格切换、回车确认；当前值不在 `choices` 里时会作为额外选项追加，不会被
   静默丢弃；
@@ -2204,10 +2209,10 @@ GitHub 归档额外多一层 `<repo>-<SHA>/` 顶层目录；128 MiB 的压缩包
   已有值只在用户确认后才重新授权。
 - 已有值**不预填**到输入框：自由输入字段留空即沿用，界面不另加「已设置」
   提示行。避免一个回车把旧值当成新输入提交。
-- 字段帮助（`schema: 6` 起 `fields[].help`，否则退回 `description`）在提问
-  前渲染：`lines` 按行输出、`steps` 由宿主编号、`inline` 贴在输入框旁，
-  可带标题与官方链接。教程由插件提供，宿主不内置平台知识；没写就不显示，
-  已有值沿用时也不重复打印。
+- 字段描述（`fields[].description`；字符串形式自 `schema: 2`、对象形式自
+  `schema: 6` 起）在提问前渲染：`lines` 按行输出、`steps` 由宿主编号、
+  `inline` 贴在输入框旁，可带标题与官方链接。教程由插件提供，宿主不内置
+  平台知识；没写就不显示，已有值沿用时也不重复打印。
 - 字符串列表声明了 `choices` 时渲染成多选框：`■` / `□` 表示勾选状态，
   空格切换、回车确认，并预勾选当前值。
 - 声明 `choicesFrom: "servers"` 的字段从已注册服务器中选（字符串 → 单选，

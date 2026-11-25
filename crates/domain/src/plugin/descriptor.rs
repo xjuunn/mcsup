@@ -61,26 +61,23 @@ pub const MAX_SETUP_LABEL_CHARS: usize = 64;
 /// setup 描述长度上限（字符）
 pub const MAX_SETUP_DESCRIPTION_CHARS: usize = 512;
 
-/// setup 帮助标题长度上限（字符）
-pub const MAX_SETUP_HELP_TITLE_CHARS: usize = 64;
+/// setup 描述标题长度上限（字符）
+pub const MAX_SETUP_DESCRIPTION_TITLE_CHARS: usize = 64;
 
-/// setup 帮助正文长度上限（字符）
-pub const MAX_SETUP_HELP_TEXT_CHARS: usize = MAX_SETUP_DESCRIPTION_CHARS;
+/// setup 描述的步骤数上限（条）
+pub const MAX_SETUP_DESCRIPTION_STEPS: usize = 16;
 
-/// setup 帮助的步骤数上限（条）
-pub const MAX_SETUP_HELP_STEPS: usize = 16;
+/// setup 描述单条步骤的长度上限（字符）
+pub const MAX_SETUP_DESCRIPTION_STEP_CHARS: usize = 200;
 
-/// setup 帮助单条步骤的长度上限（字符）
-pub const MAX_SETUP_HELP_STEP_CHARS: usize = 200;
+/// setup 描述的链接数上限（条）
+pub const MAX_SETUP_DESCRIPTION_LINKS: usize = 8;
 
-/// setup 帮助的链接数上限（条）
-pub const MAX_SETUP_HELP_LINKS: usize = 8;
+/// setup 描述链接文字的长度上限（字符）
+pub const MAX_SETUP_DESCRIPTION_LINK_LABEL_CHARS: usize = 64;
 
-/// setup 帮助链接文字的长度上限（字符）
-pub const MAX_SETUP_HELP_LINK_LABEL_CHARS: usize = 64;
-
-/// setup 帮助链接地址的长度上限（字符）
-pub const MAX_SETUP_HELP_LINK_URL_CHARS: usize = 512;
+/// setup 描述链接地址的长度上限（字符）
+pub const MAX_SETUP_DESCRIPTION_LINK_URL_CHARS: usize = 512;
 
 /// setup 列表字段的可选值上限（项）
 pub const MAX_SETUP_CHOICES: usize = 32;
@@ -403,15 +400,12 @@ pub struct SetupField {
     /// 覆盖 schema 的 `x-mcsup-label`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    /// 简化的帮助文本：没有 `help` 时按行打印；省略时取 schema 的 `description`
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    /// 结构化的帮助文本（schema 6 起可用）
+    /// 提问前展示给用户的描述（schema 6 起可写成对象）
     ///
-    /// 优先于 `description`：声明后向导按 `style` 渲染标题、步骤与链接；
-    /// 两者都没写时向导不显示任何提示。
+    /// 字符串按行输出；对象按 `style` 渲染标题、步骤与链接。省略时取 schema
+    /// 的 `description`。插件不写就不显示任何提示。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub help: Option<SetupHelp>,
+    pub description: Option<SetupDescription>,
     /// 提示默认值；省略时取 schema 的 `default`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<serde_json::Value>,
@@ -420,17 +414,27 @@ pub struct SetupField {
     pub when: Option<SetupWhen>,
 }
 
-/// setup 字段的帮助文本（schema 6 起可用）
+/// setup 字段的描述（schema 6 起可写成对象）
 ///
-/// 教程内容完全由插件提供，宿主不内置任何平台知识：要不要写、写哪些步骤、
-/// 指向哪个官方地址，都由插件在这里声明。宿主只负责排版，因此同一份
+/// 字符串形式按行输出，兼容旧插件的简写；对象形式按 `style` 渲染。描述内容
+/// 完全由插件提供，宿主不内置任何平台知识。宿主只负责排版，因此同一份
 /// descriptor 在终端、Web 与其它客户端上得到一致的展示。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SetupDescription {
+    /// 简化写法：按行输出的一小段文字
+    Text(String),
+    /// 结构化的多显示方式描述（schema 6 起可用）
+    Block(SetupDescriptionBlock),
+}
+
+/// 结构化的 setup 描述
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct SetupHelp {
+pub struct SetupDescriptionBlock {
     /// 显示方式；默认 `lines`
     #[serde(default)]
-    pub style: SetupHelpStyle,
+    pub style: SetupDescriptionStyle,
     /// 标题行；省略则不打印标题
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -442,26 +446,26 @@ pub struct SetupHelp {
     pub steps: Option<Vec<String>>,
     /// 官方链接；宿主按 `文字: 地址` 输出
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub links: Option<Vec<SetupHelpLink>>,
+    pub links: Option<Vec<SetupDescriptionLink>>,
 }
 
-/// 帮助文本的显示方式
+/// 描述的显示方式
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum SetupHelpStyle {
+pub enum SetupDescriptionStyle {
     /// 按行输出，保留插件写的缩进（适合一小段说明）
     #[default]
     Lines,
     /// 宿主按 `1.`、`2.` 自动编号（适合注册步骤）
     Steps,
-    /// 作为输入框旁的单行帮助，不单独占行（适合一句话提醒）
+    /// 作为输入框旁的单行说明，不单独占行（适合一句话提醒）
     Inline,
 }
 
-/// 帮助文本里的一个链接
+/// 描述里的一个链接
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SetupHelpLink {
+pub struct SetupDescriptionLink {
     /// 链接文字
     pub label: String,
     /// 地址；只接受 `http(s)://`
@@ -523,8 +527,8 @@ pub struct ResolvedSetupField {
     pub path: String,
     /// 展示标签
     pub label: String,
-    /// 帮助文本；`None` 表示插件没写，向导不显示任何提示
-    pub help: Option<ResolvedSetupHelp>,
+    /// 展示给用户的描述；`None` 表示插件没写，向导不显示任何提示
+    pub description: Option<ResolvedSetupDescription>,
     /// 是否必填
     pub required: bool,
     /// 是否遮蔽输入
@@ -543,26 +547,26 @@ pub struct ResolvedSetupField {
     pub schema: serde_json::Value,
 }
 
-/// 校验通过的帮助文本
+/// 校验通过的描述
 ///
 /// `entries` 已按显示方式归一化：`lines` 是按行拆好的正文（去掉行尾空白、
 /// 跳过空行），`steps` 是去掉首尾空白的步骤原文（编号由宿主添加），`inline`
 /// 只有一项，换行已折成空格。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedSetupHelp {
+pub struct ResolvedSetupDescription {
     /// 显示方式
-    pub style: SetupHelpStyle,
+    pub style: SetupDescriptionStyle,
     /// 标题行
     pub title: Option<String>,
     /// 正文行或步骤
     pub entries: Vec<String>,
     /// 官方链接
-    pub links: Vec<ResolvedSetupHelpLink>,
+    pub links: Vec<ResolvedSetupDescriptionLink>,
 }
 
-/// 校验通过的帮助链接
+/// 校验通过的描述链接
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedSetupHelpLink {
+pub struct ResolvedSetupDescriptionLink {
     /// 链接文字
     pub label: String,
     /// 地址
@@ -927,8 +931,15 @@ impl Descriptor {
                         found: self.schema,
                     });
                 }
-                if self.schema < 6 && setup.fields.iter().any(|field| field.help.is_some()) {
-                    return Err(DescriptorError::SetupHelpRequiresSchema { found: self.schema });
+                if self.schema < 6
+                    && setup
+                        .fields
+                        .iter()
+                        .any(|field| matches!(field.description, Some(SetupDescription::Block(_))))
+                {
+                    return Err(DescriptorError::SetupDescriptionRequiresSchema {
+                        found: self.schema,
+                    });
                 }
                 let Some(config) = &config else {
                     return Err(DescriptorError::SetupWithoutConfig);
@@ -1218,7 +1229,7 @@ fn resolve_setup_field(
             path: path.to_owned(),
         });
     }
-    let help = resolve_setup_help(field, path, schema)?;
+    let description = resolve_setup_description(field, path, schema)?;
     let default = field
         .default
         .clone()
@@ -1234,7 +1245,7 @@ fn resolve_setup_field(
     Ok(ResolvedSetupField {
         path: path.to_owned(),
         label,
-        help,
+        description,
         required: field.required,
         secret: field.secret,
         interactive: field.interactive,
@@ -1250,41 +1261,52 @@ fn resolve_setup_field(
     })
 }
 
-/// 解析 setup 字段的帮助文本
+/// 解析 setup 字段的描述
 ///
-/// 优先级：`help`（结构化，多显示方式）→ `description`（按行输出）→ schema
-/// 的 `description`（同上）。都没有时返回 `None`，向导不显示任何提示：是否
-/// 解释某个字段由插件决定，宿主不替它生成说明。
-fn resolve_setup_help(
+/// 声明优先，字符串与对象都从 `description` 读；省略时取 schema 的
+/// `description`。都没有时返回 `None`，向导不显示任何提示：是否解释某个
+/// 字段由插件决定，宿主不替它生成说明。
+fn resolve_setup_description(
     field: &SetupField,
     path: &str,
     schema: &serde_json::Value,
-) -> Result<Option<ResolvedSetupHelp>, DescriptorError> {
-    if let Some(help) = &field.help {
-        return resolve_setup_help_block(help, path).map(Some);
+) -> Result<Option<ResolvedSetupDescription>, DescriptorError> {
+    match &field.description {
+        Some(SetupDescription::Block(block)) => {
+            return resolve_setup_description_block(block, path).map(Some);
+        }
+        Some(SetupDescription::Text(text)) => {
+            return resolve_description_text(text, path).map(Some);
+        }
+        None => {}
     }
-    let Some(text) = field.description.as_deref().or_else(|| {
-        schema
-            .get("description")
-            .and_then(serde_json::Value::as_str)
-    }) else {
+    let Some(text) = schema
+        .get("description")
+        .and_then(serde_json::Value::as_str)
+    else {
         return Ok(None);
     };
-    if text.chars().count() > MAX_SETUP_DESCRIPTION_CHARS {
-        return Err(DescriptorError::InvalidSetupDescription {
-            path: path.to_owned(),
-        });
-    }
-    Ok(Some(ResolvedSetupHelp {
-        style: SetupHelpStyle::Lines,
-        title: None,
-        entries: split_help_lines(text),
-        links: Vec::new(),
-    }))
+    resolve_description_text(text, path).map(Some)
 }
 
-/// 按行拆帮助文本：去掉行尾空白、跳过空行，保留插件写的缩进
-fn split_help_lines(text: &str) -> Vec<String> {
+/// 字符串描述：按行输出，长度受 [`MAX_SETUP_DESCRIPTION_CHARS`] 约束
+fn resolve_description_text(
+    text: &str,
+    path: &str,
+) -> Result<ResolvedSetupDescription, DescriptorError> {
+    if text.chars().count() > MAX_SETUP_DESCRIPTION_CHARS {
+        return Err(invalid_description(path, "description is too long"));
+    }
+    Ok(ResolvedSetupDescription {
+        style: SetupDescriptionStyle::Lines,
+        title: None,
+        entries: split_description_lines(text),
+        links: Vec::new(),
+    })
+}
+
+/// 按行拆描述：去掉行尾空白、跳过空行，保留插件写的缩进
+fn split_description_lines(text: &str) -> Vec<String> {
     text.lines()
         .map(str::trim_end)
         .filter(|line| !line.trim().is_empty())
@@ -1292,107 +1314,128 @@ fn split_help_lines(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// 帮助文本声明非法的统一错误
-fn invalid_help(path: &str, reason: &str) -> DescriptorError {
-    DescriptorError::InvalidSetupHelp {
+/// 描述声明非法的统一错误
+fn invalid_description(path: &str, reason: &str) -> DescriptorError {
+    DescriptorError::InvalidSetupDescription {
         path: path.to_owned(),
         reason: reason.to_owned(),
     }
 }
 
-/// 校验结构化的帮助文本
+/// 校验结构化的描述
 ///
 /// 形状由 `style` 决定：`steps` 只接受 `steps`，`lines` / `inline` 只接受
 /// `text`。两种都声明会让宿主不知道该渲染哪一份，直接拒绝比静默取其一好。
-fn resolve_setup_help_block(
-    help: &SetupHelp,
+fn resolve_setup_description_block(
+    block: &SetupDescriptionBlock,
     path: &str,
-) -> Result<ResolvedSetupHelp, DescriptorError> {
-    Ok(ResolvedSetupHelp {
-        style: help.style,
-        title: resolve_help_title(help, path)?,
-        entries: resolve_help_entries(help, path)?,
-        links: resolve_help_links(help, path)?,
+) -> Result<ResolvedSetupDescription, DescriptorError> {
+    Ok(ResolvedSetupDescription {
+        style: block.style,
+        title: resolve_description_title(block, path)?,
+        entries: resolve_description_entries(block, path)?,
+        links: resolve_description_links(block, path)?,
     })
 }
 
-/// 校验帮助标题：去掉首尾空白后不能为空，长度受上限约束
-fn resolve_help_title(help: &SetupHelp, path: &str) -> Result<Option<String>, DescriptorError> {
-    let Some(title) = help.title.as_deref() else {
+/// 校验描述标题：去掉首尾空白后不能为空，长度受上限约束
+fn resolve_description_title(
+    block: &SetupDescriptionBlock,
+    path: &str,
+) -> Result<Option<String>, DescriptorError> {
+    let Some(title) = block.title.as_deref() else {
         return Ok(None);
     };
     let title = title.trim();
     if title.is_empty() {
-        return Err(invalid_help(path, "help.title must not be blank"));
+        return Err(invalid_description(
+            path,
+            "description.title must not be blank",
+        ));
     }
-    if title.chars().count() > MAX_SETUP_HELP_TITLE_CHARS {
-        return Err(invalid_help(path, "help.title is too long"));
+    if title.chars().count() > MAX_SETUP_DESCRIPTION_TITLE_CHARS {
+        return Err(invalid_description(path, "description.title is too long"));
     }
     Ok(Some(title.to_owned()))
 }
 
-/// 校验帮助正文：`steps` 用步骤数组，`lines` / `inline` 用多行文本
-fn resolve_help_entries(help: &SetupHelp, path: &str) -> Result<Vec<String>, DescriptorError> {
-    match help.style {
-        SetupHelpStyle::Steps => {
-            if help.text.is_some() {
-                return Err(invalid_help(
+/// 校验描述正文：`steps` 用步骤数组，`lines` / `inline` 用多行文本
+fn resolve_description_entries(
+    block: &SetupDescriptionBlock,
+    path: &str,
+) -> Result<Vec<String>, DescriptorError> {
+    match block.style {
+        SetupDescriptionStyle::Steps => {
+            if block.text.is_some() {
+                return Err(invalid_description(
                     path,
-                    "help.text is for style lines / inline; declare help.steps",
+                    "description.text is for style lines / inline; declare description.steps",
                 ));
             }
-            let Some(steps) = help.steps.as_ref() else {
-                return Err(invalid_help(path, "help.steps is required for style steps"));
+            let Some(steps) = block.steps.as_ref() else {
+                return Err(invalid_description(
+                    path,
+                    "description.steps is required for style steps",
+                ));
             };
             if steps.is_empty() {
-                return Err(invalid_help(path, "help.steps must not be empty"));
+                return Err(invalid_description(
+                    path,
+                    "description.steps must not be empty",
+                ));
             }
-            if steps.len() > MAX_SETUP_HELP_STEPS {
-                return Err(invalid_help(path, "too many help.steps"));
+            if steps.len() > MAX_SETUP_DESCRIPTION_STEPS {
+                return Err(invalid_description(path, "too many description.steps"));
             }
             steps
                 .iter()
                 .map(|step| {
                     let step = step.trim();
                     if step.is_empty() {
-                        return Err(invalid_help(
+                        return Err(invalid_description(
                             path,
-                            "help.steps must not contain blank items",
+                            "description.steps must not contain blank items",
                         ));
                     }
-                    if step.chars().count() > MAX_SETUP_HELP_STEP_CHARS {
-                        return Err(invalid_help(path, "help step is too long"));
+                    if step.chars().count() > MAX_SETUP_DESCRIPTION_STEP_CHARS {
+                        return Err(invalid_description(path, "description step is too long"));
                     }
                     Ok(step.to_owned())
                 })
                 .collect()
         }
-        SetupHelpStyle::Lines | SetupHelpStyle::Inline => {
-            if help.steps.is_some() {
-                return Err(invalid_help(
+        SetupDescriptionStyle::Lines | SetupDescriptionStyle::Inline => {
+            if block.steps.is_some() {
+                return Err(invalid_description(
                     path,
-                    "help.steps is for style steps; declare help.text",
+                    "description.steps is for style steps; declare description.text",
                 ));
             }
-            let Some(text) = help.text.as_deref() else {
-                return Err(invalid_help(
+            let Some(text) = block.text.as_deref() else {
+                return Err(invalid_description(
                     path,
-                    "help.text is required for style lines / inline",
+                    "description.text is required for style lines / inline",
                 ));
             };
             if text.trim().is_empty() {
-                return Err(invalid_help(path, "help.text must not be blank"));
+                return Err(invalid_description(
+                    path,
+                    "description.text must not be blank",
+                ));
             }
             // 按原文校验长度：`inline` 折成一行后会变短，但作者不该以为写多长都行
-            if text.chars().count() > MAX_SETUP_HELP_TEXT_CHARS {
-                return Err(invalid_help(path, "help.text is too long"));
+            if text.chars().count() > MAX_SETUP_DESCRIPTION_CHARS {
+                return Err(invalid_description(path, "description.text is too long"));
             }
-            if help.style == SetupHelpStyle::Inline {
+            if block.style == SetupDescriptionStyle::Inline {
                 Ok(vec![text.split_whitespace().collect::<Vec<_>>().join(" ")])
             } else {
-                let entries = split_help_lines(text);
+                let entries = split_description_lines(text);
                 if entries.is_empty() {
-                    return Err(invalid_help(path, "help.text must not be blank"));
+                    return Err(invalid_description(
+                        path,
+                        "description.text must not be blank",
+                    ));
                 }
                 Ok(entries)
             }
@@ -1400,49 +1443,49 @@ fn resolve_help_entries(help: &SetupHelp, path: &str) -> Result<Vec<String>, Des
     }
 }
 
-/// 校验帮助链接：文字与地址都不能为空，地址只收单行 http(s)
-fn resolve_help_links(
-    help: &SetupHelp,
+/// 校验描述链接：文字与地址都不能为空，地址只收单行 http(s)
+fn resolve_description_links(
+    block: &SetupDescriptionBlock,
     path: &str,
-) -> Result<Vec<ResolvedSetupHelpLink>, DescriptorError> {
-    let Some(links) = help.links.as_deref() else {
+) -> Result<Vec<ResolvedSetupDescriptionLink>, DescriptorError> {
+    let Some(links) = block.links.as_deref() else {
         return Ok(Vec::new());
     };
     if links.is_empty() {
-        return Err(invalid_help(
+        return Err(invalid_description(
             path,
-            "help.links must not be empty when declared",
+            "description.links must not be empty when declared",
         ));
     }
-    if links.len() > MAX_SETUP_HELP_LINKS {
-        return Err(invalid_help(path, "too many help.links"));
+    if links.len() > MAX_SETUP_DESCRIPTION_LINKS {
+        return Err(invalid_description(path, "too many description.links"));
     }
     links
         .iter()
         .map(|link| {
             let label = link.label.trim();
-            if label.is_empty() || label.chars().count() > MAX_SETUP_HELP_LINK_LABEL_CHARS {
-                return Err(invalid_help(
+            if label.is_empty() || label.chars().count() > MAX_SETUP_DESCRIPTION_LINK_LABEL_CHARS {
+                return Err(invalid_description(
                     path,
-                    "help link label must be 1..=64 characters",
+                    "description link label must be 1..=64 characters",
                 ));
             }
             let url = link.url.trim();
             if !(url.starts_with("https://") || url.starts_with("http://")) {
-                return Err(invalid_help(
+                return Err(invalid_description(
                     path,
-                    "help link url must start with http:// or https://",
+                    "description link url must start with http:// or https://",
                 ));
             }
-            if url.chars().count() > MAX_SETUP_HELP_LINK_URL_CHARS
+            if url.chars().count() > MAX_SETUP_DESCRIPTION_LINK_URL_CHARS
                 || url.chars().any(char::is_whitespace)
             {
-                return Err(invalid_help(
+                return Err(invalid_description(
                     path,
-                    "help link url must be a single-line http(s) url",
+                    "description link url must be a single-line http(s) url",
                 ));
             }
-            Ok(ResolvedSetupHelpLink {
+            Ok(ResolvedSetupDescriptionLink {
                 label: label.to_owned(),
                 url: url.to_owned(),
             })
@@ -2106,19 +2149,11 @@ pub enum DescriptorError {
         /// 原因
         reason: String,
     },
-    /// 帮助文本需要 schema 6
-    #[error("setup field help requires descriptor schema 6 or newer, found {found}")]
-    SetupHelpRequiresSchema {
+    /// 结构化描述需要 schema 6
+    #[error("structured setup description requires descriptor schema 6 or newer, found {found}")]
+    SetupDescriptionRequiresSchema {
         /// 声明值
         found: u32,
-    },
-    /// `help` 声明非法
-    #[error("invalid help for setup path {path}: {reason}")]
-    InvalidSetupHelp {
-        /// 路径
-        path: String,
-        /// 原因
-        reason: String,
     },
     /// `when` 声明非法
     #[error("invalid condition for setup path {path}: {reason}")]
@@ -2225,11 +2260,13 @@ pub enum DescriptorError {
         /// 路径
         path: String,
     },
-    /// setup 描述过长
-    #[error("setup description too long for {path}")]
+    /// setup 描述非法
+    #[error("invalid description for setup path {path}: {reason}")]
     InvalidSetupDescription {
         /// 路径
         path: String,
+        /// 原因
+        reason: String,
     },
     /// setup 默认值不符合字段 schema
     #[error("invalid default for setup path {path}: {reason}")]
@@ -2687,19 +2724,33 @@ mod tests {
         ));
     }
 
-    /// 帮助文本：三种显示方式、schema 6 门限、与 description 的优先级
+    /// 描述：三种显示方式、字符串写法与 schema 6 门限
     #[test]
-    fn setup_help_supports_styles_and_requires_schema6() {
-        // schema 5 还不认识 help，解析阶段就该拒绝，不能等到渲染
+    fn setup_description_supports_styles_and_requires_schema6() {
+        // 结构化描述要求 schema 6，解析阶段就该拒绝，不能等到渲染
         let mut value = with_config(json!({ "token": { "type": "string" } }));
         value["schema"] = json!(5);
         value["setup"] = json!({
-            "fields": [{ "path": "token", "help": { "style": "inline", "text": "去后台复制" } }]
+            "fields": [{ "path": "token", "description": { "style": "inline", "text": "去后台复制" } }]
         });
         assert!(matches!(
             parse(value),
-            Err(DescriptorError::SetupHelpRequiresSchema { found: 5 })
+            Err(DescriptorError::SetupDescriptionRequiresSchema { found: 5 })
         ));
+
+        // 字符串写法从 schema 2 起可用，按行输出
+        let mut value = with_config(json!({ "token": { "type": "string" } }));
+        value["setup"] = json!({
+            "fields": [{ "path": "token", "description": "第一行  \n\n  缩进的第二行\n" }]
+        });
+        let setup = parse(value)
+            .expect("valid text description")
+            .setup
+            .expect("setup");
+        let description = setup.fields[0].description.as_ref().expect("description");
+        assert_eq!(description.style, SetupDescriptionStyle::Lines);
+        assert!(description.title.is_none());
+        assert_eq!(description.entries, vec!["第一行", "  缩进的第二行"]);
 
         // steps：标题、步骤原文与链接都原样保留，编号由宿主添加
         let mut value = with_config(json!({ "appId": { "type": "string" } }));
@@ -2707,7 +2758,7 @@ mod tests {
         value["setup"] = json!({
             "fields": [{
                 "path": "appId",
-                "help": {
+                "description": {
                     "style": "steps",
                     "title": "获取 AppID",
                     "steps": ["打开 https://q.qq.com/ 登录", " 复制 AppID  "],
@@ -2716,118 +2767,85 @@ mod tests {
             }]
         });
         let setup = parse(value)
-            .expect("valid steps help")
+            .expect("valid steps description")
             .setup
             .expect("setup");
-        let help = setup.fields[0].help.as_ref().expect("help");
-        assert_eq!(help.style, SetupHelpStyle::Steps);
-        assert_eq!(help.title.as_deref(), Some("获取 AppID"));
+        let description = setup.fields[0].description.as_ref().expect("description");
+        assert_eq!(description.style, SetupDescriptionStyle::Steps);
+        assert_eq!(description.title.as_deref(), Some("获取 AppID"));
         assert_eq!(
-            help.entries,
+            description.entries,
             vec!["打开 https://q.qq.com/ 登录", "复制 AppID"]
         );
-        assert_eq!(help.links[0].label, "机器人文档");
-        assert_eq!(help.links[0].url, "https://bot.q.qq.com/wiki/");
+        assert_eq!(description.links[0].label, "机器人文档");
+        assert_eq!(description.links[0].url, "https://bot.q.qq.com/wiki/");
 
-        // lines：保留缩进、去掉行尾空白与空行
+        // inline：折成一行，交给输入框旁的提示位
         let mut value = with_config(json!({ "token": { "type": "string" } }));
         value["schema"] = json!(6);
         value["setup"] = json!({
             "fields": [{
                 "path": "token",
-                "help": { "text": "第一行  \n\n  缩进的第二行\n" }
+                "description": { "style": "inline", "text": "只用于换 token，\n不会写进日志" }
             }]
         });
         let setup = parse(value)
-            .expect("valid lines help")
+            .expect("valid inline description")
             .setup
             .expect("setup");
-        let help = setup.fields[0].help.as_ref().expect("help");
-        assert_eq!(help.style, SetupHelpStyle::Lines);
-        assert!(help.title.is_none());
-        assert_eq!(help.entries, vec!["第一行", "  缩进的第二行"]);
+        let description = setup.fields[0].description.as_ref().expect("description");
+        assert_eq!(description.style, SetupDescriptionStyle::Inline);
+        assert_eq!(description.entries, vec!["只用于换 token， 不会写进日志"]);
 
-        // inline：折成一行，交给输入框旁的帮助位
-        let mut value = with_config(json!({ "token": { "type": "string" } }));
-        value["schema"] = json!(6);
-        value["setup"] = json!({
-            "fields": [{
-                "path": "token",
-                "help": { "style": "inline", "text": "只用于换 token，\n不会写进日志" }
-            }]
-        });
-        let setup = parse(value)
-            .expect("valid inline help")
-            .setup
-            .expect("setup");
-        let help = setup.fields[0].help.as_ref().expect("help");
-        assert_eq!(help.style, SetupHelpStyle::Inline);
-        assert_eq!(help.entries, vec!["只用于换 token， 不会写进日志"]);
-
-        // 没写 help / description：不产生帮助，向导不显示提示
+        // 没写 description：不产生描述，向导不显示提示
         let mut value = with_config(json!({ "token": { "type": "string" } }));
         value["setup"] = json!({ "fields": [{ "path": "token" }] });
         let setup = parse(value)
             .expect("valid bare setup")
             .setup
             .expect("setup");
-        assert!(setup.fields[0].help.is_none());
-
-        // description 与 help 同时声明时 help 优先，description 不再参与渲染
-        let mut value = with_config(json!({ "token": { "type": "string" } }));
-        value["schema"] = json!(6);
-        value["setup"] = json!({
-            "fields": [{
-                "path": "token",
-                "description": "旧式说明",
-                "help": { "style": "inline", "text": "新式说明" }
-            }]
-        });
-        let setup = parse(value).expect("help wins").setup.expect("setup");
-        let help = setup.fields[0].help.as_ref().expect("help");
-        assert_eq!(help.style, SetupHelpStyle::Inline);
-        assert_eq!(help.entries, vec!["新式说明"]);
+        assert!(setup.fields[0].description.is_none());
     }
 
-    /// 帮助文本的非法形状必须解析阶段失败，并指出路径
+    /// 结构化描述的非法形状必须解析阶段失败，并指出路径
     #[test]
-    fn invalid_setup_help_is_rejected() {
-        let help = |help: serde_json::Value| {
+    fn invalid_setup_description_is_rejected() {
+        let description = |description: serde_json::Value| {
             let mut value = with_config(json!({ "token": { "type": "string" } }));
             value["schema"] = json!(6);
-            value["setup"] = json!({ "fields": [{ "path": "token", "help": help }] });
+            value["setup"] = json!({ "fields": [{ "path": "token", "description": description }] });
             parse(value)
         };
         // 用 steps 样式却只写 text，反之亦然
         assert!(matches!(
-            help(json!({ "style": "steps", "text": "x" })),
-            Err(DescriptorError::InvalidSetupHelp { .. })
+            description(json!({ "style": "steps", "text": "x" })),
+            Err(DescriptorError::InvalidSetupDescription { .. })
         ));
         assert!(matches!(
-            help(json!({ "steps": ["x"] })),
-            Err(DescriptorError::InvalidSetupHelp { .. })
+            description(json!({ "steps": ["x"] })),
+            Err(DescriptorError::InvalidSetupDescription { .. })
         ));
         // 空标题、空正文
         assert!(matches!(
-            help(json!({ "title": "  ", "text": "x" })),
-            Err(DescriptorError::InvalidSetupHelp { .. })
+            description(json!({ "title": "  ", "text": "x" })),
+            Err(DescriptorError::InvalidSetupDescription { .. })
         ));
         assert!(matches!(
-            help(json!({ "text": " \n " })),
-            Err(DescriptorError::InvalidSetupHelp { .. })
+            description(json!({ "text": " \n " })),
+            Err(DescriptorError::InvalidSetupDescription { .. })
         ));
         // 链接只收 http(s)，且不能带空白
         assert!(matches!(
-            help(json!({ "text": "x", "links": [{ "label": "a", "url": "file:///etc" }] })),
-            Err(DescriptorError::InvalidSetupHelp { .. })
+            description(json!({ "text": "x", "links": [{ "label": "a", "url": "file:///etc" }] })),
+            Err(DescriptorError::InvalidSetupDescription { .. })
         ));
         assert!(matches!(
-            help(json!({ "text": "x", "links": [{ "label": "a", "url": "https://a b" }] })),
-            Err(DescriptorError::InvalidSetupHelp { .. })
+            description(json!({ "text": "x", "links": [{ "label": "a", "url": "https://a b" }] })),
+            Err(DescriptorError::InvalidSetupDescription { .. })
         ));
         // 未声明的键不能被静默忽略
         assert!(matches!(
-            help(json!({ "text": "x", "colour": "red" })),
+            description(json!({ "text": "x", "colour": "red" })),
             Err(DescriptorError::Json(_))
         ));
     }

@@ -9,13 +9,13 @@
 import { z } from "./zod.js";
 
 import {
-  MAX_SETUP_HELP_LINKS,
-  MAX_SETUP_HELP_LINK_LABEL_CHARS,
-  MAX_SETUP_HELP_LINK_URL_CHARS,
-  MAX_SETUP_HELP_STEPS,
-  MAX_SETUP_HELP_STEP_CHARS,
-  MAX_SETUP_HELP_TEXT_CHARS,
-  MAX_SETUP_HELP_TITLE_CHARS,
+  MAX_SETUP_DESCRIPTION_CHARS,
+  MAX_SETUP_DESCRIPTION_LINKS,
+  MAX_SETUP_DESCRIPTION_LINK_LABEL_CHARS,
+  MAX_SETUP_DESCRIPTION_LINK_URL_CHARS,
+  MAX_SETUP_DESCRIPTION_STEPS,
+  MAX_SETUP_DESCRIPTION_STEP_CHARS,
+  MAX_SETUP_DESCRIPTION_TITLE_CHARS,
   PLUGIN_API_VERSION,
 } from "./protocol.js";
 import {
@@ -27,7 +27,7 @@ import {
   type OpSpecLike,
   type PluginDefinition,
   type ResolvedOp,
-  type SetupHelpSpec,
+  type SetupDescriptionSpec,
   type SetupSpec,
   type SetupWhenSpec,
 } from "./define.js";
@@ -467,70 +467,70 @@ function opKinds(resolved: readonly ResolvedOp[]): Map<string, OpKind> {
 const charCount = (text: string): number => [...text].length;
 
 /**
- * 帮助文本归一化（descriptor schema 6）
+ * 结构化描述归一化（descriptor schema 6）
  *
  * 形状由 `style` 决定：`steps` 只接受 `steps`，`lines` / `inline` 只接受
  * `text`。两种都写会让宿主不知道该渲染哪一份，构建期直接拒绝，比运行时
  * 静默取其一好。`style` 即使省略也写进产物，宿主不必再推断默认值。
  */
-function buildSetupHelp(path: string, help: SetupHelpSpec): JsonValue {
-  const style = help.style ?? "lines";
+function buildSetupDescription(path: string, description: SetupDescriptionSpec): JsonValue {
+  const style = description.style ?? "lines";
   if (style !== "lines" && style !== "steps" && style !== "inline") {
     throw new DescriptorError(`${path}.style`, "must be lines / steps / inline");
   }
   const entry: Record<string, JsonValue> = { style };
-  if (help.title !== undefined) {
-    const title = help.title.trim();
-    if (title === "" || charCount(help.title) > MAX_SETUP_HELP_TITLE_CHARS) {
+  if (description.title !== undefined) {
+    const title = description.title.trim();
+    if (title === "" || charCount(description.title) > MAX_SETUP_DESCRIPTION_TITLE_CHARS) {
       throw new DescriptorError(`${path}.title`, "must be 1..=64 characters");
     }
     entry["title"] = title;
   }
   if (style === "steps") {
-    if (help.text !== undefined) {
+    if (description.text !== undefined) {
       throw new DescriptorError(`${path}.text`, "is for style lines / inline; declare steps");
     }
-    if (help.steps === undefined || help.steps.length === 0) {
+    if (description.steps === undefined || description.steps.length === 0) {
       throw new DescriptorError(`${path}.steps`, "is required for style steps");
     }
-    if (help.steps.length > MAX_SETUP_HELP_STEPS) {
-      throw new DescriptorError(`${path}.steps`, `has more than ${MAX_SETUP_HELP_STEPS} items`);
+    if (description.steps.length > MAX_SETUP_DESCRIPTION_STEPS) {
+      throw new DescriptorError(`${path}.steps`, `has more than ${MAX_SETUP_DESCRIPTION_STEPS} items`);
     }
-    for (const step of help.steps) {
-      if (step.trim() === "" || charCount(step) > MAX_SETUP_HELP_STEP_CHARS) {
+    for (const step of description.steps) {
+      if (step.trim() === "" || charCount(step) > MAX_SETUP_DESCRIPTION_STEP_CHARS) {
         throw new DescriptorError(`${path}.steps`, "items must be 1..=200 characters");
       }
     }
-    entry["steps"] = help.steps.map((step) => step.trim());
+    entry["steps"] = description.steps.map((step) => step.trim());
   } else {
-    if (help.steps !== undefined) {
+    if (description.steps !== undefined) {
       throw new DescriptorError(`${path}.steps`, "is for style steps; declare text");
     }
-    if (help.text === undefined || help.text.trim() === "") {
+    if (description.text === undefined || description.text.trim() === "") {
       throw new DescriptorError(`${path}.text`, "is required for style lines / inline");
     }
-    if (charCount(help.text) > MAX_SETUP_HELP_TEXT_CHARS) {
+    if (charCount(description.text) > MAX_SETUP_DESCRIPTION_CHARS) {
       throw new DescriptorError(`${path}.text`, "is longer than 512 characters");
     }
-    entry["text"] = help.text;
+    entry["text"] = description.text;
   }
-  if (help.links !== undefined) {
-    if (help.links.length === 0) {
+  if (description.links !== undefined) {
+    if (description.links.length === 0) {
       throw new DescriptorError(`${path}.links`, "must not be empty when declared");
     }
-    if (help.links.length > MAX_SETUP_HELP_LINKS) {
-      throw new DescriptorError(`${path}.links`, `has more than ${MAX_SETUP_HELP_LINKS} items`);
+    if (description.links.length > MAX_SETUP_DESCRIPTION_LINKS) {
+      throw new DescriptorError(`${path}.links`, `has more than ${MAX_SETUP_DESCRIPTION_LINKS} items`);
     }
-    entry["links"] = help.links.map((link) => {
+    entry["links"] = description.links.map((link) => {
       const label = link.label.trim();
       const url = link.url.trim();
-      if (label === "" || charCount(label) > MAX_SETUP_HELP_LINK_LABEL_CHARS) {
+      if (label === "" || charCount(label) > MAX_SETUP_DESCRIPTION_LINK_LABEL_CHARS) {
         throw new DescriptorError(`${path}.links`, "label must be 1..=64 characters");
       }
       if (!url.startsWith("https://") && !url.startsWith("http://")) {
         throw new DescriptorError(`${path}.links`, "url must start with http:// or https://");
       }
-      if (charCount(url) > MAX_SETUP_HELP_LINK_URL_CHARS || /\s/u.test(url)) {
+      if (charCount(url) > MAX_SETUP_DESCRIPTION_LINK_URL_CHARS || /\s/u.test(url)) {
         throw new DescriptorError(`${path}.links`, "url must be a single-line http(s) url");
       }
       return { label, url };
@@ -553,10 +553,10 @@ function buildSetup(setup: SetupSpec): JsonValue {
       entry["label"] = field.label;
     }
     if (field.description !== undefined) {
-      entry["description"] = field.description;
-    }
-    if (field.help !== undefined) {
-      entry["help"] = buildSetupHelp(`setup.fields.${field.path}.help`, field.help);
+      entry["description"] =
+        typeof field.description === "string"
+          ? field.description
+          : buildSetupDescription(`setup.fields.${field.path}.description`, field.description);
     }
     if (field.default !== undefined) {
       entry["default"] = field.default as JsonValue;
@@ -741,7 +741,7 @@ export function buildDescriptor<
   }
   // 版本号只升不降：帮助文本要求 6，交互式字段 5，字段条件 4，bind 3，setup 2，其余 1
   const fields = def.setup?.fields ?? [];
-  const schema: 1 | 2 | 3 | 4 | 5 | 6 = fields.some((field) => field.help !== undefined)
+  const schema: 1 | 2 | 3 | 4 | 5 | 6 = fields.some((field) => typeof field.description === "object")
     ? 6
     : fields.some((field) => field.interactive === true)
       ? 5
