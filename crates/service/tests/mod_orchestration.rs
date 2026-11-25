@@ -60,6 +60,8 @@ struct SourceConfig {
     hashed: Vec<String>,
     /// 全部可搜索的项目（替身按 `server_usable_only` 模拟上游过滤）
     search_pool: Vec<ContentProject>,
+    /// 按关键词返回不同结果（模拟上游全文检索的分词行为）
+    by_keyword: Vec<(String, Vec<ContentProject>)>,
 }
 
 /// 「这个哈希属于某项目的某个版本」
@@ -92,6 +94,7 @@ impl FakeSource {
                 seen: Vec::new(),
                 hashed: Vec::new(),
                 search_pool: Vec::new(),
+                by_keyword: Vec::new(),
             }),
         }
     }
@@ -116,9 +119,20 @@ impl ContentSource for FakeSource {
 
     async fn search(&self, query: &ContentQuery) -> Result<ContentSearch, SourceError> {
         let config = self.config.lock().expect("source config");
+        // 模拟上游全文检索：命中关键词时返回该词的专项结果，否则回落整池
+        let pool = query
+            .keyword
+            .as_deref()
+            .and_then(|keyword| {
+                config
+                    .by_keyword
+                    .iter()
+                    .find(|(term, _)| term == keyword)
+                    .map(|(_, hits)| hits)
+            })
+            .unwrap_or(&config.search_pool);
         // 模拟上游 facet 行为：`server_usable_only` 时只返回非仅客户端项目
-        let hits: Vec<ContentProject> = config
-            .search_pool
+        let hits: Vec<ContentProject> = pool
             .iter()
             .filter(|hit| !query.server_usable_only || !hit.client_only)
             .cloned()
@@ -804,6 +818,50 @@ async fn plan_fix_strips_trailing_digits_when_searching_provider() {
     assert_eq!(plan.installs.len(), 1, "{plan:?}");
     assert_eq!(plan.installs[0].missing, "geckolib3");
     assert_eq!(plan.installs[0].project_id, "geckolib");
+}
+
+/// 连写依赖 `twilightforest`：原词只命中附加组件（它们的 modid 不是它），
+/// 本体 `The Twilight Forest` 只在切词检索里；必须累计候选并排序，
+/// 不能因为首个检索词有结果就停
+#[tokio::test]
+async fn plan_fix_searches_compound_dependency_with_split_terms() {
+    let harness = Harness::new(
+        CommandLog::stopped(),
+        &[("TwilightCaveFix.jar", SideSupport::Required)],
+        b"jar-bytes",
+    );
+    harness
+        .inspector
+        .declare_dep("TwilightCaveFix.jar", "twilightforest");
+    harness.write("mods/TwilightCaveFix.jar", b"cave");
+    let mut addon = search_hit_named(
+        "modrinth",
+        "1430534",
+        "fork-twilightforest-thread-safety-addon-for-forge",
+        "[FORK] Twilight Forest Thread Safety Addon",
+    );
+    addon.downloads = 3_195_784;
+    let mut real = search_hit_named(
+        "modrinth",
+        "227639",
+        "the-twilight-forest",
+        "The Twilight Forest",
+    );
+    real.downloads = 213_748_131;
+    harness.source.configure(|config| {
+        config.by_keyword = vec![
+            ("twilightforest".to_owned(), vec![addon]),
+            ("twilight forest".to_owned(), vec![real]),
+        ];
+    });
+
+    let plan = harness
+        .mods
+        .plan_fix("alpha", ContentKind::Mod)
+        .await
+        .expect("plan_fix");
+    assert!(plan.unresolved.is_empty(), "{plan:?}");
+    assert_eq!(plan.installs[0].project_id, "227639", "{plan:?}");
 }
 
 /// 主来源没有该项目时回退到第二来源，并按命中来源解析

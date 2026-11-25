@@ -117,33 +117,16 @@ pub struct ModSearch {
     pub page_size: u32,
 }
 
-/// 切词尝试的上限：连写 modid 可能很长，逐个位置切开打十几个请求不值得
-const SPLIT_ATTEMPTS: usize = 6;
-/// 切出来的两段各自至少多长
-const SPLIT_MIN_LEN: usize = 3;
 /// 上游分页上限
 pub(super) const PAGE_SIZE_MAX: u32 = 50;
 
 /// 把一个连写关键词的候选切法列出来
 ///
-/// 只对 ASCII 生效：非 ASCII 无法按字节安全切分，直接返回空表。切分位置从右侧
-/// 开始（`twilightforest` 的实际词界在 `twilight|forest`，靠近中间偏右），
-/// 命中一个就够，调用方按顺序试。
+/// 实现在 [`port::content::split_compound_terms`]：补装依赖时服务层也要用同一
+/// 口径切词，规则只能有一份。这里保留旧名以免调用点散落。
 #[must_use]
 pub fn split_terms(keyword: &str) -> Vec<String> {
-    if !keyword.is_ascii() || keyword.contains([' ', '-', '_']) {
-        return Vec::new();
-    }
-    let len = keyword.len();
-    let mut out = Vec::new();
-    // 从右侧往左：位置 i 表示「前 i 个字符 + 空格 + 剩余」
-    for i in (SPLIT_MIN_LEN..=len - SPLIT_MIN_LEN).rev() {
-        if out.len() >= SPLIT_ATTEMPTS {
-            break;
-        }
-        out.push(format!("{} {}", &keyword[..i], &keyword[i..]));
-    }
-    out
+    port::content::split_compound_terms(keyword)
 }
 
 /// [`CurseForgeSource`] 的构造器
@@ -446,7 +429,7 @@ mod tests {
     #[test]
     fn split_attempts_are_bounded() {
         let terms = split_terms("averylongconcatenatedmodid");
-        assert!(terms.len() <= SPLIT_ATTEMPTS, "{terms:?}");
+        assert!(terms.len() <= 6, "{terms:?}");
     }
 
     #[test]
