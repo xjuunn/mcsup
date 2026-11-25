@@ -4,16 +4,16 @@
 //! 编码与排版。二维码从行首开始排版，也不依赖插件进程的 stdout 编码设置；
 //! 插件只把事件写进 UI 文件，见 `commands::plugin`。
 //!
-//! # 为什么用背景色块而不是半块字符
+//! # 为什么默认用半块字符
 //!
-//! 上下半块（`▀` / `▄`）能把两行模块压进一行文本，宽度只有色块排版的一半，
-//! 但字形不一定填满字符格：macOS Terminal 里相邻行的半块之间留有细缝，缝把
-//! 二维码切成一条条横线，手机定位不到三个定位图案，扫不出来。
+//! 半块字符把上下两个模块压进一个字符格：终端字符格约 1 列宽、2 行高，模块
+//! 在两个方向上都占一个格，仍然是正方形。它只占色块排版的四分之一面积（宽高
+//! 各减半），一屏就能完整容下，用户不用滚动就能扫。
 //!
-//! 色块排版让每个模块占 2×1 个字符格（终端字符格约 1×2，模块因此是正方形），
-//! 深浅完全由背景色表达，不经过字形，所以没有缝。代价是宽度翻倍：终端放不下
-//! 时先把静默区从 2 模块收到 1 模块，仍放不下才退回半块排版（宽度只有一半，
-//! 字形能无缝拼接的终端仍可扫）。
+//! 色块排版（每模块 2 字符格宽、1 行高）深浅完全由背景色表达，不经过字形，
+//! 任何字体都无缝。代价是面积是半块排版的四倍，二维码常常高过一屏。只有已知
+//! 半块字形之间有细缝的终端（macOS Terminal，缝会把二维码切成横条，手机定位
+//! 不到三个定位图案）才退回色块排版。
 //!
 //! 纠错等级取 L：屏幕上没有污损与折叠，模块数最少，整幅也最小。
 
@@ -21,7 +21,7 @@ use qrcode::{Color, EcLevel, QrCode};
 
 /// 左右静默区宽度（模块数）：优先 2，终端放不下时退到 1
 const QUIET: usize = 2;
-/// 上下静默区高度（模块数，色块排版下一行文本就是一个模块）
+/// 上下静默区高度（模块数，半块排版下两行模块合成一行文本）
 const QUIET_ROWS: usize = 2;
 /// 深色模块的字符格背景
 const DARK_BG: &str = "\x1b[40m";
@@ -50,18 +50,40 @@ fn columns_from_size((_rows, columns): (u16, u16)) -> usize {
 /// 排版。返回 `None` 表示内容超出 QR 规范上限，或终端窄到任何排版都会折行。
 #[must_use]
 pub(crate) fn render(content: &str, columns: Option<usize>) -> Option<String> {
+    render_with(content, columns, terminal_has_glyph_seams())
+}
+
+/// 已知半块字形有细缝的终端：退回色块排版，宁可尺寸大也要能扫
+fn terminal_has_glyph_seams() -> bool {
+    use std::ffi::OsStr;
+    std::env::var_os("TERM_PROGRAM").as_deref() == Some(OsStr::new("Apple_Terminal"))
+}
+
+/// 按字形是否无缝选择排版，便于测试
+///
+/// 半块排版最省地方，始终优先。只有 `seamed` 为真时才用色块排版；此时如果
+/// 色块排版也放不下，就没有更窄的选择。
+fn render_with(content: &str, columns: Option<usize>, seamed: bool) -> Option<String> {
     let code = QrCode::with_error_correction_level(content.as_bytes(), EcLevel::L).ok()?;
     let size = code.width();
     let colors = code.to_colors();
-    // 色块排版：每模块 2 个字符格宽
+    if !seamed {
+        for quiet in [QUIET, 1] {
+            if fits(columns, half_blocks_width(size, quiet)) {
+                return Some(render_half_blocks(&colors, size, quiet));
+            }
+        }
+        tracing::debug!(
+            size,
+            ?columns,
+            "QR does not fit the terminal; falling back to the link"
+        );
+        return None;
+    }
     for quiet in [QUIET, 1] {
-        if fits(columns, (size + quiet * 2) * 2) {
+        if fits(columns, cells_width(size, quiet)) {
             return Some(render_cells(&colors, size, quiet));
         }
-    }
-    // 半块排版只占一半宽度；字形能无缝拼接的终端仍可扫
-    if fits(columns, size + QUIET * 2) {
-        return Some(render_half_blocks(&colors, size, QUIET));
     }
     tracing::debug!(
         size,
@@ -76,11 +98,21 @@ fn fits(columns: Option<usize>, width: usize) -> bool {
     columns.is_none_or(|limit| width <= limit)
 }
 
+/// 色块排版宽度：每模块 2 个字符格
+fn cells_width(size: usize, quiet: usize) -> usize {
+    (size + quiet * 2) * 2
+}
+
+/// 半块排版宽度：每模块 1 个字符格
+fn half_blocks_width(size: usize, quiet: usize) -> usize {
+    size + quiet * 2
+}
+
 /// 色块排版：每模块 2 个字符格宽、1 行高，深浅由背景色填满字符格
 ///
 /// `quiet` 只收窄左右静默区；上下固定 [`QUIET_ROWS`] 行，不占宽度。
 fn render_cells(colors: &[Color], size: usize, quiet: usize) -> String {
-    let line_width = (size + quiet * 2) * 2;
+    let line_width = cells_width(size, quiet);
     let quiet_row = format!("\x1b[47m{}\x1b[0m\n", " ".repeat(line_width));
     let pad = " ".repeat(quiet * 2);
     let mut out = String::new();
@@ -105,9 +137,9 @@ fn render_cells(colors: &[Color], size: usize, quiet: usize) -> String {
     out
 }
 
-/// 半块排版：两行模块合成一行文本，宽度是色块排版的一半
+/// 半块排版：两行模块合成一行文本，宽高都只有色块排版的一半
 fn render_half_blocks(colors: &[Color], size: usize, quiet: usize) -> String {
-    let line_width = size + quiet * 2;
+    let line_width = half_blocks_width(size, quiet);
     let pad = " ".repeat(quiet);
     let quiet_row = format!("\x1b[30;47m{}\x1b[0m\n", " ".repeat(line_width));
     let quiet_lines = QUIET_ROWS.div_ceil(2);
@@ -139,7 +171,7 @@ fn render_half_blocks(colors: &[Color], size: usize, quiet: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{QUIET_ROWS, render};
+    use super::{QUIET_ROWS, render_with};
     use qrcode::{EcLevel, QrCode};
 
     /// 去掉 CSI 颜色序列，只留终端里实际占位的字符
@@ -166,21 +198,43 @@ mod tests {
             .width()
     }
 
+    fn weixin_link() -> &'static str {
+        "https://liteapp.weixin.qq.com/q/7GiQu1?qrcode=4ffab43bb683afbf4818b1c3365685ff&bot_type=3"
+    }
+
     /// 每行都从行首开始（以 CSI 序列开头），不插入居中缩进
     #[test]
     fn starts_every_line_at_the_left_margin() {
-        let rendered = render("https://example.com/weixin", Some(200)).expect("render");
+        let rendered = render_with("https://example.com/weixin", Some(200), false).expect("render");
         for line in rendered.lines() {
             assert!(line.starts_with('\x1b'), "应从行首的样式序列开始：{line:?}");
         }
     }
 
-    /// 宽终端用色块排版：每行两个静默行 + 模块行，宽度是模块数的两倍
+    /// 默认用半块排版：宽度只有模块数，高度只有模块数的一半
     #[test]
-    fn wide_terminal_uses_solid_cells() {
-        let content = "https://liteapp.weixin.qq.com/q/7GiQu1?qrcode=4ffab43bb683afbf4818b1c3365685ff&bot_type=3";
+    fn default_layout_is_half_blocks() {
+        let content = weixin_link();
         let size = code_size(content);
-        let rendered = render(content, Some(200)).expect("render");
+        let rendered = render_with(content, Some(200), false).expect("render");
+        let lines = rendered.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), size.div_ceil(2) + QUIET_ROWS);
+        for line in lines {
+            let text = visible(line);
+            assert_eq!(text.chars().count(), size + 4, "宽度等于模块数加静默区");
+            assert!(
+                text.chars().all(|ch| " █▀▄".contains(ch)),
+                "只应出现静默区与半块字符：{text:?}"
+            );
+        }
+    }
+
+    /// 已知字形有缝的终端退回色块排版：每行两个静默行 + 模块行
+    #[test]
+    fn seamed_terminal_uses_solid_cells() {
+        let content = weixin_link();
+        let size = code_size(content);
+        let rendered = render_with(content, Some(200), true).expect("render");
         let lines = rendered.lines().collect::<Vec<_>>();
         assert_eq!(lines.len(), size + QUIET_ROWS * 2);
         for line in lines {
@@ -194,47 +248,42 @@ mod tests {
         }
     }
 
-    /// 80 列终端放不下 2 模块静默区时收到 1 模块，仍然用色块排版
+    /// 半块排版放不下时先收窄静默区到 1 模块
     #[test]
     fn narrow_terminal_shrinks_the_quiet_zone() {
-        let content = "https://liteapp.weixin.qq.com/q/7GiQu1?qrcode=4ffab43bb683afbf4818b1c3365685ff&bot_type=3";
+        let content = weixin_link();
         let size = code_size(content);
-        // 一行能放 1 模块静默区但放不下 2 模块
-        let columns = (size + 2) * 2;
-        let rendered = render(content, Some(columns)).expect("render");
+        let columns = size + 2;
+        let rendered = render_with(content, Some(columns), false).expect("render");
         for line in rendered.lines() {
             assert_eq!(visible(line).chars().count(), columns, "正好铺满一行");
         }
-        assert!(rendered.contains('\x1b'), "仍是色块排版");
     }
 
-    /// 连 1 模块静默区都放不下时退回半块排版，宽度减半
+    /// 色块排版同样在放不下时收窄静默区
     #[test]
-    fn very_narrow_terminal_falls_back_to_half_blocks() {
-        let content = "https://liteapp.weixin.qq.com/q/7GiQu1?qrcode=4ffab43bb683afbf4818b1c3365685ff&bot_type=3";
+    fn seamed_terminal_shrinks_the_quiet_zone() {
+        let content = weixin_link();
         let size = code_size(content);
-        let columns = size + 4;
-        let rendered = render(content, Some(columns)).expect("render");
-        let lines = rendered.lines().collect::<Vec<_>>();
-        assert_eq!(lines.len(), size.div_ceil(2) + QUIET_ROWS);
-        for line in lines {
-            let text = visible(line);
-            assert_eq!(text.chars().count(), columns, "半块排版宽度减半");
-            assert!(
-                text.chars().all(|ch| " █▀▄".contains(ch)),
-                "只应出现静默区与半块字符：{text:?}"
-            );
+        let columns = (size + 2) * 2;
+        let rendered = render_with(content, Some(columns), true).expect("render");
+        for line in rendered.lines() {
+            assert_eq!(visible(line).chars().count(), columns, "正好铺满一行");
         }
     }
 
-    /// 比半块排版还窄：返回 None，由调用方给出链接
+    /// 比最窄排版还窄：返回 None，由调用方给出链接
     #[test]
     fn terminal_too_narrow_yields_none() {
         let content = "https://example.com/weixin";
         let size = code_size(content);
-        assert!(render(content, Some(size + 3)).is_none());
+        // 半块排版最窄时每模块 1 列、静默区 1 模块
+        assert!(render_with(content, Some(size + 1), false).is_none());
+        // 色块排版最窄时每模块 2 列、静默区 1 模块
+        assert!(render_with(content, Some((size + 2) * 2 - 1), true).is_none());
         // 未知宽度按够用处理
-        assert!(render(content, None).is_some());
+        assert!(render_with(content, None, false).is_some());
+        assert!(render_with(content, None, true).is_some());
     }
 
     /// `console` 的尺寸元组是 `(行, 列)`：80×24 的终端一行 80 列

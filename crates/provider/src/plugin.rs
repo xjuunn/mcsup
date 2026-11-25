@@ -497,6 +497,10 @@ fn extract_archive(archive: &Path, dest: &Path) -> Result<(), HostError> {
 /// 产物中的 `bin/run.sh` 解包后变成 `0o644`，入口校验随即报
 /// `is not executable`。这里只取低 9 位，文件类型、setuid / setgid /
 /// sticky 一律忽略。
+///
+/// 非 Unix 平台没有权限位可设，函数体只剩 `Ok(())`，clippy 会把返回值判成
+/// 多余；调用方仍按统一签名用 `?` 处理，因此只在非 Unix 下放行该 lint。
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn restore_mode(path: &Path, unix_mode: Option<u32>) -> Result<(), HostError> {
     #[cfg(unix)]
     {
