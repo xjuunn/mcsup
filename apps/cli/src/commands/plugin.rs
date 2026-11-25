@@ -17,7 +17,9 @@ use comfy_table::Table;
 use mcsup::domain::plugin::PluginId;
 use mcsup::domain::plugin::capability::Capability;
 use mcsup::domain::plugin::descriptor::Descriptor;
-use mcsup::domain::plugin::descriptor::{ChoicesSource, ResolvedSetupField, SetupKind};
+use mcsup::domain::plugin::descriptor::{
+    ChoicesSource, ResolvedSetupField, ResolvedSetupHelp, SetupHelpStyle, SetupKind,
+};
 use mcsup::domain::plugin::manifest::Manifest;
 use mcsup::domain::plugin::revocation::RevocationList;
 use mcsup::domain::plugin::source::PluginSource;
@@ -420,8 +422,19 @@ fn run_setup(
             }
             continue;
         }
+        // 帮助只在真正要填值时显示：已有值可沿用时，重跑向导不必再念一遍教程
+        if !kept {
+            print_field_help(printer, field, false);
+        }
+        // `inline` 样式贴在输入框旁，不单独占行；已有值沿用时一并省略
+        let inline = if kept {
+            ""
+        } else {
+            help_inline(field.help.as_ref())
+        };
         let value = loop {
-            let Some(value) = prompt_setup_field(field, printer, existing.as_ref(), &servers)?
+            let Some(value) =
+                prompt_setup_field(field, printer, existing.as_ref(), &servers, inline)?
             else {
                 // 必填项没有现有值可沿用：留空就是没填，必须重问，不能记一笔
                 // `missing` 就滑过去（那等于回车跳过必填）。
@@ -510,6 +523,9 @@ fn prompt_interactive_field(
             return Ok(None);
         }
     }
+    // 拉起插件前先说明这一步要做什么、去哪里授权：交互式字段没有输入框，
+    // `inline` 样式也在这里单行打印，用户看到二维码才知道该用哪个账号扫
+    print_field_help(printer, field, true);
     // 告诉插件本次可以回填哪些路径；旧插件忽略这个变量
     let interactive_paths = fillable_paths(fillable);
     let mut manual = false;
@@ -877,23 +893,79 @@ fn should_ask(
     active && (fresh || value_missing(values, &field.path))
 }
 
+/// 帮助正文的展示行（不含标题与链接）
+///
+/// `steps` 由宿主编号：插件只写步骤内容，不自己拼 `1.`，这样换客户端时
+/// 编号方式仍然一致。`inline` 没有独立正文，交给 [`help_inline`]。
+fn help_body_lines(help: &ResolvedSetupHelp) -> Vec<String> {
+    match help.style {
+        SetupHelpStyle::Steps => help
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, step)| format!("{}. {step}", index + 1))
+            .collect(),
+        SetupHelpStyle::Lines => help.entries.clone(),
+        SetupHelpStyle::Inline => Vec::new(),
+    }
+}
+
+/// 单行帮助：只有 `inline` 有内容，交给输入框的帮助位
+///
+/// 没有声明帮助、或声明了别的样式时返回空串：输入框不会渲染空帮助。
+fn help_inline(help: Option<&ResolvedSetupHelp>) -> &str {
+    help.filter(|help| help.style == SetupHelpStyle::Inline)
+        .and_then(|help| help.entries.first())
+        .map_or("", String::as_str)
+}
+
+/// 打印字段帮助：标题加粗，正文与链接按普通行输出
+///
+/// `inline` 默认贴在输入框旁，不在这里打印；交互式字段没有输入框，调用方
+/// 传 `include_inline` 时改为单行输出。没有帮助文本就什么都不打印——教程
+/// 由插件决定写不写，宿主不生成默认文案。
+fn print_field_help(printer: Printer, field: &ResolvedSetupField, include_inline: bool) {
+    let Some(help) = field.help.as_ref() else {
+        return;
+    };
+    if help.style == SetupHelpStyle::Inline {
+        if include_inline {
+            for entry in &help.entries {
+                printer.print_note(entry);
+            }
+        }
+        return;
+    }
+    if let Some(title) = &help.title {
+        printer.print_section(title);
+    }
+    for line in help_body_lines(help) {
+        printer.print_note(&line);
+    }
+    for link in &help.links {
+        printer.print_note(&format!("{}: {}", link.label, link.url));
+    }
+}
+
 /// 询问单个字段；返回 `None` 表示留空跳过或沿用已有值
 ///
 /// 已有值不预填成输入默认值：否则一个回车就把旧值当成新输入提交，用户
-/// 也分不清「默认值」与「上次填的值」。改为在帮助行标注「已设置，留空保持
-/// 不变」。声明了 `choicesFrom` 的字段由宿主枚举候选（如已注册服务器），
-/// 渲染成单选 / 多选，当前值即使不在候选里也会追加，保证看得见。
+/// 也分不清「默认值」与「上次填的值」，留空即沿用。字段帮助由调用方打印，
+/// 这里只把 `inline` 样式交给控件的帮助位。声明了 `choicesFrom` 的字段由
+/// 宿主枚举候选（如已注册服务器），渲染成单选 / 多选，当前值即使不在候选
+/// 里也会追加，保证看得见。
 fn prompt_setup_field(
     field: &ResolvedSetupField,
     printer: Printer,
     existing: Option<&Value>,
     servers: &[String],
+    help: &str,
 ) -> Result<Option<Value>> {
     let lang = printer.lang();
     let offered = setup_options(field, servers);
     let select = !offered.is_empty();
     let keeps = existing.is_some_and(|value| !value_is_empty(value));
-    // 提问下面不再渲染任何提示行：字段含义由 label 表达，向导保持一行一问。
+    // 已有值时连默认值都不提示：留空就是沿用，避免看起来像「要重新填一遍」。
     let default_text = if keeps {
         String::new()
     } else {
@@ -909,13 +981,13 @@ fn prompt_setup_field(
                 lang,
                 &field.label,
                 default,
-                ""
+                help
             )?)))
         }
-        SetupKind::Text { .. } if select => select_one(field, lang, existing, offered, ""),
-        SetupKind::Text { .. } => prompt_text(field, lang, &default_text, ""),
+        SetupKind::Text { .. } if select => select_one(field, lang, existing, offered, help),
+        SetupKind::Text { .. } => prompt_text(field, lang, &default_text, help),
         SetupKind::Integer => {
-            let input = crate::prompts::input_text(lang, &field.label, &default_text, "")?;
+            let input = crate::prompts::input_text(lang, &field.label, &default_text, help)?;
             if input.trim().is_empty() {
                 return Ok(None);
             }
@@ -926,7 +998,7 @@ fn prompt_setup_field(
             }))
         }
         SetupKind::Number => {
-            let input = crate::prompts::input_text(lang, &field.label, &default_text, "")?;
+            let input = crate::prompts::input_text(lang, &field.label, &default_text, help)?;
             if input.trim().is_empty() {
                 return Ok(None);
             }
@@ -935,8 +1007,8 @@ fn prompt_setup_field(
                 Err(_) => json!(input.trim()),
             }))
         }
-        SetupKind::StringList { .. } if select => select_list(field, lang, existing, offered, ""),
-        SetupKind::StringList { .. } => prompt_list(field, lang, &default_text, ""),
+        SetupKind::StringList { .. } if select => select_list(field, lang, existing, offered, help),
+        SetupKind::StringList { .. } => prompt_list(field, lang, &default_text, help),
     }
 }
 
@@ -2982,8 +3054,49 @@ fn artifact_root(record: &PluginRecord) -> &Path {
 mod tests {
     use super::*;
     use mcsup::domain::plugin::descriptor::ResolvedSetup;
+    use mcsup::domain::plugin::descriptor::ResolvedSetupHelpLink;
     use mcsup::domain::plugin::descriptor::ResolvedSetupWhen;
     use serde_json::json;
+
+    /// steps 由宿主编号、lines 原样保留、inline 交给输入框
+    #[test]
+    fn help_renders_by_style() {
+        let steps = ResolvedSetupHelp {
+            style: SetupHelpStyle::Steps,
+            title: Some("获取 AppID".to_owned()),
+            entries: vec!["打开 https://q.qq.com/".to_owned(), "复制 AppID".to_owned()],
+            links: vec![ResolvedSetupHelpLink {
+                label: "机器人文档".to_owned(),
+                url: "https://bot.q.qq.com/wiki/".to_owned(),
+            }],
+        };
+        assert_eq!(
+            help_body_lines(&steps),
+            vec!["1. 打开 https://q.qq.com/", "2. 复制 AppID"]
+        );
+        assert_eq!(help_inline(Some(&steps)), "");
+
+        // lines 保留插件写的缩进，宿主不改写排版
+        let lines = ResolvedSetupHelp {
+            style: SetupHelpStyle::Lines,
+            title: None,
+            entries: vec!["  缩进保留".to_owned()],
+            links: Vec::new(),
+        };
+        assert_eq!(help_body_lines(&lines), vec!["  缩进保留"]);
+
+        // inline 不占独立行，只作为输入框的帮助文本
+        let inline = ResolvedSetupHelp {
+            style: SetupHelpStyle::Inline,
+            title: None,
+            entries: vec!["只用于换取 token".to_owned()],
+            links: Vec::new(),
+        };
+        assert_eq!(help_inline(Some(&inline)), "只用于换取 token");
+        assert!(help_body_lines(&inline).is_empty());
+        // 插件没写帮助：不打印，控件也不显示帮助
+        assert_eq!(help_inline(None), "");
+    }
 
     /// 多选框不能吞掉配置里已有、但插件没声明的值
     #[test]
@@ -3004,7 +3117,7 @@ mod tests {
         let field = ResolvedSetupField {
             path: "qq.server".to_owned(),
             label: "入站服务器".to_owned(),
-            description: None,
+            help: None,
             required: true,
             secret: false,
             interactive: false,
@@ -3056,7 +3169,7 @@ mod tests {
         let field = |path: &str, when: Option<ResolvedSetupWhen>| ResolvedSetupField {
             path: path.to_owned(),
             label: path.to_owned(),
-            description: None,
+            help: None,
             required: true,
             secret: false,
             interactive: false,
@@ -3153,7 +3266,7 @@ mod tests {
         ResolvedSetupField {
             path: path.to_owned(),
             label: path.to_owned(),
-            description: None,
+            help: None,
             required: false,
             secret: false,
             interactive: false,
