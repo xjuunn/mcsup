@@ -28,6 +28,22 @@ const DARK_BG: &str = "\x1b[40m";
 /// 浅色模块的字符格背景
 const LIGHT_BG: &str = "\x1b[47m";
 
+/// 终端一行的可用列数
+///
+/// `console::Term::size_checked()` 返回的是 `(行, 列)`，顺序容易写反：取错成
+/// 行数会让二维码被判成放不下，整幅都不显示。
+#[must_use]
+pub(crate) fn terminal_columns() -> Option<usize> {
+    console::Term::stdout()
+        .size_checked()
+        .map(columns_from_size)
+}
+
+/// `console` 的尺寸元组是 `(行, 列)`，列数在第二位
+fn columns_from_size((_rows, columns): (u16, u16)) -> usize {
+    usize::from(columns)
+}
+
 /// 渲染二维码，从行首开始
 ///
 /// `columns` 是终端一行的可用字符数（未知时传 `None`），用于挑选不会折行的
@@ -47,6 +63,11 @@ pub(crate) fn render(content: &str, columns: Option<usize>) -> Option<String> {
     if fits(columns, size + QUIET * 2) {
         return Some(render_half_blocks(&colors, size, QUIET));
     }
+    tracing::debug!(
+        size,
+        ?columns,
+        "QR does not fit the terminal; falling back to the link"
+    );
     None
 }
 
@@ -214,5 +235,12 @@ mod tests {
         assert!(render(content, Some(size + 3)).is_none());
         // 未知宽度按够用处理
         assert!(render(content, None).is_some());
+    }
+
+    /// `console` 的尺寸元组是 `(行, 列)`：80×24 的终端一行 80 列
+    #[test]
+    fn terminal_size_tuple_is_rows_then_columns() {
+        assert_eq!(super::columns_from_size((24, 80)), 80);
+        assert_eq!(super::columns_from_size((40, 132)), 132);
     }
 }
