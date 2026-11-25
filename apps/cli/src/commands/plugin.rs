@@ -773,7 +773,7 @@ fn run_setup_hook(
 
 /// 交互式 setup 的界面事件读取器
 ///
-/// 插件按行追加 JSON：`{"type":"qr","content":"…"}` 由宿主编码并居中渲染，
+/// 插件按行追加 JSON：`{"type":"qr","content":"…"}` 由宿主编码并渲染，
 /// `{"type":"status","text":"…"}` 原样作为进度行。未知事件与坏行忽略，
 /// 不能因为一行排版内容让登录失败。
 struct SetupUi<'a> {
@@ -843,12 +843,9 @@ impl<'a> SetupUi<'a> {
                     str::to_owned,
                 );
                 self.printer.print_section(&label);
-                let rendered = std::io::stdout().is_terminal().then(|| {
-                    crate::qr::render_centered(
-                        content,
-                        crossterm::terminal::size().map_or(80, |(width, _)| usize::from(width)),
-                    )
-                });
+                let rendered = std::io::stdout()
+                    .is_terminal()
+                    .then(|| crate::qr::render(content));
                 match rendered.flatten() {
                     Some(qr) => {
                         print!("{qr}");
