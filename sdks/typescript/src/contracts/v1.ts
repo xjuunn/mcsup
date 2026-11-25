@@ -66,26 +66,26 @@ export const MAX_OP_TITLE_CHARS = 64;
 /** op 描述字符上限 */
 export const MAX_OP_DESCRIPTION_CHARS = 512;
 
-/** setup 帮助标题字符上限 */
-export const MAX_SETUP_HELP_TITLE_CHARS = 64;
+/** setup 描述字符上限 */
+export const MAX_SETUP_DESCRIPTION_CHARS = 512;
 
-/** setup 帮助正文字符上限 */
-export const MAX_SETUP_HELP_TEXT_CHARS = 512;
+/** setup 描述标题字符上限 */
+export const MAX_SETUP_DESCRIPTION_TITLE_CHARS = 64;
 
-/** setup 帮助步骤数上限 */
-export const MAX_SETUP_HELP_STEPS = 16;
+/** setup 描述步骤数上限 */
+export const MAX_SETUP_DESCRIPTION_STEPS = 16;
 
-/** setup 帮助单条步骤字符上限 */
-export const MAX_SETUP_HELP_STEP_CHARS = 200;
+/** setup 描述单条步骤字符上限 */
+export const MAX_SETUP_DESCRIPTION_STEP_CHARS = 200;
 
-/** setup 帮助链接数上限 */
-export const MAX_SETUP_HELP_LINKS = 8;
+/** setup 描述链接数上限 */
+export const MAX_SETUP_DESCRIPTION_LINKS = 8;
 
-/** setup 帮助链接文字字符上限 */
-export const MAX_SETUP_HELP_LINK_LABEL_CHARS = 64;
+/** setup 描述链接文字字符上限 */
+export const MAX_SETUP_DESCRIPTION_LINK_LABEL_CHARS = 64;
 
-/** setup 帮助链接地址字符上限 */
-export const MAX_SETUP_HELP_LINK_URL_CHARS = 512;
+/** setup 描述链接地址字符上限 */
+export const MAX_SETUP_DESCRIPTION_LINK_URL_CHARS = 512;
 
 // ---------------------------------------------------------------------------
 // 退出码（plugins.md §6.7）

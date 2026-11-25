@@ -137,14 +137,14 @@ describe("descriptor", () => {
     });
   });
 
-  it("帮助文本生成 schema 6 并按 style 归一化", () => {
+  it("对象描述生成 schema 6 并按 style 归一化", () => {
     const def = {
       ...chatBridge.definition,
       setup: {
         fields: [
           {
             path: "qq.appId",
-            help: {
+            description: {
               style: "steps",
               title: " 获取 AppID ",
               steps: [" 打开 https://q.qq.com/ ", "复制 AppID"],
@@ -160,7 +160,7 @@ describe("descriptor", () => {
       fields: [
         {
           path: "qq.appId",
-          help: {
+          description: {
             style: "steps",
             title: "获取 AppID",
             steps: ["打开 https://q.qq.com/", "复制 AppID"],
@@ -171,18 +171,36 @@ describe("descriptor", () => {
     });
   });
 
-  it("帮助文本拒绝错的形状与非 http 链接", () => {
-    const withHelp = (help: unknown) =>
+  it("字符串描述按原样输出，不抬高 schema 版本", () => {
+    const def = {
+      ...chatBridge.definition,
+      setup: {
+        fields: [{ path: "qq.appId", description: "第一行\n第二行" }],
+      },
+    } as typeof chatBridge.definition;
+    const d = buildDescriptor(def);
+    expect(d.schema).toBe(2);
+    expect(d.setup).toEqual({
+      fields: [{ path: "qq.appId", description: "第一行\n第二行" }],
+    });
+  });
+
+  it("对象描述拒绝错的形状与非 http 链接", () => {
+    const withDescription = (description: unknown) =>
       ({
         ...chatBridge.definition,
-        setup: { fields: [{ path: "token", help }] },
+        setup: { fields: [{ path: "token", description }] },
       }) as typeof chatBridge.definition;
-    expect(() => buildDescriptor(withHelp({ style: "steps", text: "x" }))).toThrow(/declare steps/);
-    expect(() => buildDescriptor(withHelp({ steps: ["x"] }))).toThrow(/is for style steps/);
     expect(() =>
-      buildDescriptor(withHelp({ text: "x", links: [{ label: "a", url: "ftp://x" }] })),
+      buildDescriptor(withDescription({ style: "steps", text: "x" })),
+    ).toThrow(/declare steps/);
+    expect(() => buildDescriptor(withDescription({ steps: ["x"] }))).toThrow(
+      /is for style steps/,
+    );
+    expect(() =>
+      buildDescriptor(withDescription({ text: "x", links: [{ label: "a", url: "ftp://x" }] })),
     ).toThrow(/http/);
-    expect(() => buildDescriptor(withHelp({ title: " ", text: "x" }))).toThrow(/1\.\.=64/);
+    expect(() => buildDescriptor(withDescription({ title: " ", text: "x" }))).toThrow(/1\.\.=64/);
   });
 
   it("交互式字段必须与 handler 一一对应", () => {

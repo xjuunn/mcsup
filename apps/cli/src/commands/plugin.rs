@@ -18,7 +18,7 @@ use mcsup::domain::plugin::PluginId;
 use mcsup::domain::plugin::capability::Capability;
 use mcsup::domain::plugin::descriptor::Descriptor;
 use mcsup::domain::plugin::descriptor::{
-    ChoicesSource, ResolvedSetupField, ResolvedSetupHelp, SetupHelpStyle, SetupKind,
+    ChoicesSource, ResolvedSetupDescription, ResolvedSetupField, SetupDescriptionStyle, SetupKind,
 };
 use mcsup::domain::plugin::manifest::Manifest;
 use mcsup::domain::plugin::revocation::RevocationList;
@@ -422,15 +422,15 @@ fn run_setup(
             }
             continue;
         }
-        // 帮助只在真正要填值时显示：已有值可沿用时，重跑向导不必再念一遍教程
+        // 描述只在真正要填值时显示：已有值可沿用时，重跑向导不必再念一遍教程
         if !kept {
-            print_field_help(printer, field, false);
+            print_field_description(printer, field, false);
         }
         // `inline` 样式贴在输入框旁，不单独占行；已有值沿用时一并省略
         let inline = if kept {
             ""
         } else {
-            help_inline(field.help.as_ref())
+            description_inline(field.description.as_ref())
         };
         let value = loop {
             let Some(value) =
@@ -525,7 +525,7 @@ fn prompt_interactive_field(
     }
     // 拉起插件前先说明这一步要做什么、去哪里授权：交互式字段没有输入框，
     // `inline` 样式也在这里单行打印，用户看到二维码才知道该用哪个账号扫
-    print_field_help(printer, field, true);
+    print_field_description(printer, field, true);
     // 告诉插件本次可以回填哪些路径；旧插件忽略这个变量
     let interactive_paths = fillable_paths(fillable);
     let mut manual = false;
@@ -890,56 +890,57 @@ fn should_ask(
     active && (fresh || value_missing(values, &field.path))
 }
 
-/// 帮助正文的展示行（不含标题与链接）
+/// 描述的展示行（不含标题与链接）
 ///
 /// `steps` 由宿主编号：插件只写步骤内容，不自己拼 `1.`，这样换客户端时
-/// 编号方式仍然一致。`inline` 没有独立正文，交给 [`help_inline`]。
-fn help_body_lines(help: &ResolvedSetupHelp) -> Vec<String> {
-    match help.style {
-        SetupHelpStyle::Steps => help
+/// 编号方式仍然一致。`inline` 没有独立正文，交给 [`description_inline`]。
+fn description_body_lines(description: &ResolvedSetupDescription) -> Vec<String> {
+    match description.style {
+        SetupDescriptionStyle::Steps => description
             .entries
             .iter()
             .enumerate()
             .map(|(index, step)| format!("{}. {step}", index + 1))
             .collect(),
-        SetupHelpStyle::Lines => help.entries.clone(),
-        SetupHelpStyle::Inline => Vec::new(),
+        SetupDescriptionStyle::Lines => description.entries.clone(),
+        SetupDescriptionStyle::Inline => Vec::new(),
     }
 }
 
-/// 单行帮助：只有 `inline` 有内容，交给输入框的帮助位
+/// 单行描述：只有 `inline` 有内容，交给输入框的提示位
 ///
-/// 没有声明帮助、或声明了别的样式时返回空串：输入框不会渲染空帮助。
-fn help_inline(help: Option<&ResolvedSetupHelp>) -> &str {
-    help.filter(|help| help.style == SetupHelpStyle::Inline)
-        .and_then(|help| help.entries.first())
+/// 没有声明描述、或声明了别的样式时返回空串：输入框不会渲染空提示。
+fn description_inline(description: Option<&ResolvedSetupDescription>) -> &str {
+    description
+        .filter(|description| description.style == SetupDescriptionStyle::Inline)
+        .and_then(|description| description.entries.first())
         .map_or("", String::as_str)
 }
 
-/// 打印字段帮助：标题加粗，正文与链接按普通行输出
+/// 打印字段描述：标题加粗，正文与链接按普通行输出
 ///
 /// `inline` 默认贴在输入框旁，不在这里打印；交互式字段没有输入框，调用方
-/// 传 `include_inline` 时改为单行输出。没有帮助文本就什么都不打印——教程
+/// 传 `include_inline` 时改为单行输出。没有描述就什么都不打印——教程
 /// 由插件决定写不写，宿主不生成默认文案。
-fn print_field_help(printer: Printer, field: &ResolvedSetupField, include_inline: bool) {
-    let Some(help) = field.help.as_ref() else {
+fn print_field_description(printer: Printer, field: &ResolvedSetupField, include_inline: bool) {
+    let Some(description) = field.description.as_ref() else {
         return;
     };
-    if help.style == SetupHelpStyle::Inline {
+    if description.style == SetupDescriptionStyle::Inline {
         if include_inline {
-            for entry in &help.entries {
+            for entry in &description.entries {
                 printer.print_note(entry);
             }
         }
         return;
     }
-    if let Some(title) = &help.title {
+    if let Some(title) = &description.title {
         printer.print_section(title);
     }
-    for line in help_body_lines(help) {
+    for line in description_body_lines(description) {
         printer.print_note(&line);
     }
-    for link in &help.links {
+    for link in &description.links {
         printer.print_note(&format!("{}: {}", link.label, link.url));
     }
 }
@@ -3051,48 +3052,48 @@ fn artifact_root(record: &PluginRecord) -> &Path {
 mod tests {
     use super::*;
     use mcsup::domain::plugin::descriptor::ResolvedSetup;
-    use mcsup::domain::plugin::descriptor::ResolvedSetupHelpLink;
+    use mcsup::domain::plugin::descriptor::ResolvedSetupDescriptionLink;
     use mcsup::domain::plugin::descriptor::ResolvedSetupWhen;
     use serde_json::json;
 
     /// steps 由宿主编号、lines 原样保留、inline 交给输入框
     #[test]
-    fn help_renders_by_style() {
-        let steps = ResolvedSetupHelp {
-            style: SetupHelpStyle::Steps,
+    fn description_renders_by_style() {
+        let steps = ResolvedSetupDescription {
+            style: SetupDescriptionStyle::Steps,
             title: Some("获取 AppID".to_owned()),
             entries: vec!["打开 https://q.qq.com/".to_owned(), "复制 AppID".to_owned()],
-            links: vec![ResolvedSetupHelpLink {
+            links: vec![ResolvedSetupDescriptionLink {
                 label: "机器人文档".to_owned(),
                 url: "https://bot.q.qq.com/wiki/".to_owned(),
             }],
         };
         assert_eq!(
-            help_body_lines(&steps),
+            description_body_lines(&steps),
             vec!["1. 打开 https://q.qq.com/", "2. 复制 AppID"]
         );
-        assert_eq!(help_inline(Some(&steps)), "");
+        assert_eq!(description_inline(Some(&steps)), "");
 
         // lines 保留插件写的缩进，宿主不改写排版
-        let lines = ResolvedSetupHelp {
-            style: SetupHelpStyle::Lines,
+        let lines = ResolvedSetupDescription {
+            style: SetupDescriptionStyle::Lines,
             title: None,
             entries: vec!["  缩进保留".to_owned()],
             links: Vec::new(),
         };
-        assert_eq!(help_body_lines(&lines), vec!["  缩进保留"]);
+        assert_eq!(description_body_lines(&lines), vec!["  缩进保留"]);
 
-        // inline 不占独立行，只作为输入框的帮助文本
-        let inline = ResolvedSetupHelp {
-            style: SetupHelpStyle::Inline,
+        // inline 不占独立行，只作为输入框的提示文本
+        let inline = ResolvedSetupDescription {
+            style: SetupDescriptionStyle::Inline,
             title: None,
             entries: vec!["只用于换取 token".to_owned()],
             links: Vec::new(),
         };
-        assert_eq!(help_inline(Some(&inline)), "只用于换取 token");
-        assert!(help_body_lines(&inline).is_empty());
-        // 插件没写帮助：不打印，控件也不显示帮助
-        assert_eq!(help_inline(None), "");
+        assert_eq!(description_inline(Some(&inline)), "只用于换取 token");
+        assert!(description_body_lines(&inline).is_empty());
+        // 插件没写描述：不打印，控件也不显示提示
+        assert_eq!(description_inline(None), "");
     }
 
     /// 多选框不能吞掉配置里已有、但插件没声明的值
@@ -3114,7 +3115,7 @@ mod tests {
         let field = ResolvedSetupField {
             path: "qq.server".to_owned(),
             label: "入站服务器".to_owned(),
-            help: None,
+            description: None,
             required: true,
             secret: false,
             interactive: false,
@@ -3166,7 +3167,7 @@ mod tests {
         let field = |path: &str, when: Option<ResolvedSetupWhen>| ResolvedSetupField {
             path: path.to_owned(),
             label: path.to_owned(),
-            help: None,
+            description: None,
             required: true,
             secret: false,
             interactive: false,
@@ -3263,7 +3264,7 @@ mod tests {
         ResolvedSetupField {
             path: path.to_owned(),
             label: path.to_owned(),
-            help: None,
+            description: None,
             required: false,
             secret: false,
             interactive: false,
