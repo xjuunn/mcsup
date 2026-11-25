@@ -851,14 +851,13 @@ impl<'a> SetupUi<'a> {
                             .map(|(width, _)| usize::from(width)),
                     )
                 });
-                match rendered.flatten() {
-                    Some(qr) => {
-                        print!("{qr}");
-                        let _ = std::io::Write::flush(&mut std::io::stdout());
-                    }
-                    // 画不出来（终端太窄或内容超出 QR 上限）时兜底给可点开的链接
-                    None => self.printer.print_note(&format!("  {content}")),
+                // 二维码与链接一起给：终端画不出来、字缝或窗口太窄扫不动时，
+                // 用户可以直接打开链接；也能核对自己扫的是哪个账号。
+                if let Some(qr) = rendered.flatten() {
+                    print!("{qr}");
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
                 }
+                self.printer.print_note(&format!("  {content}"));
             }
             Some("status") => {
                 if let Some(text) = event.get("text").and_then(Value::as_str)
