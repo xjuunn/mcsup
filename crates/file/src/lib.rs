@@ -456,9 +456,17 @@ impl FileDownloader {
             return Err(DownloadError::Cancelled);
         }
         if let Some(err) = failure {
+            // 3 类状态码说明「问题不在数据本身，而在传输方式」：
+            // - `200`：上游忽略了 Range，整段回传
+            // - `416`：大小探测与实际不符，区间越界
+            // - `404`：入口主机只对不带 Range 的请求重定向/放行，带 Range 一律
+            //   拒绝（实测 `edge.forgecdn.net`）。上游 `HttpByteSource` 会先尝试
+            //   改发落点；落点也不支持时单流同样能取到完整内容，退化为单流即可。
             if matches!(
                 err,
-                DownloadError::Source(SourceError::Status { status: 200 | 416 })
+                DownloadError::Source(SourceError::Status {
+                    status: 200 | 404 | 416
+                })
             ) {
                 return self
                     .transfer_single(temp_path, request, Some(stat.size), progress, cancel)
@@ -1145,6 +1153,8 @@ mod tests {
         fail_opens: AtomicU32,
         short_reads: AtomicU32,
         range_ignored: bool,
+        /// 非空时任何区间请求都返回该状态码
+        reject_status: Option<u16>,
         cancel: Option<CancellationToken>,
     }
 
@@ -1172,6 +1182,9 @@ mod tests {
             }
             if self.range_ignored || !self.supports_range {
                 return Err(SourceError::Status { status: 200 });
+            }
+            if let Some(status) = self.reject_status {
+                return Err(SourceError::Status { status });
             }
             let start = usize::try_from(*range.start()).expect("range start fits usize");
             let end = usize::try_from(*range.end()).expect("range end fits usize");
@@ -1227,6 +1240,7 @@ mod tests {
             fail_opens: AtomicU32::new(0),
             short_reads: AtomicU32::new(0),
             range_ignored: false,
+            reject_status: None,
             cancel: None,
         })
     }
@@ -1760,6 +1774,7 @@ mod tests {
             fail_opens: AtomicU32::new(0),
             short_reads: AtomicU32::new(0),
             range_ignored: true,
+            reject_status: None,
             cancel: None,
         });
 
@@ -1770,6 +1785,40 @@ mod tests {
             &payload,
             Some(Checksum::new(ChecksumAlgorithm::Sha1, sha1_hex(&payload))),
         );
+
+        let done = downloader
+            .download(&request, None, &CancellationToken::new())
+            .await?;
+
+        assert_eq!(done.size, payload.len() as u64);
+        assert_eq!(std::fs::read(&destination)?, payload);
+        assert!(range.open_calls.load(Ordering::Relaxed) >= 1);
+        assert_eq!(std::fs::read_dir(dir.path())?.count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_single_stream_when_range_rejected_404() -> Result<(), Box<dyn Error>> {
+        // 入口主机对带 Range 的请求回 404、对普通请求放行：分段全部失败后
+        // 必须退化为单流，而不是把整次下载判死。
+        let dir = tempdir()?;
+        let destination = dir.path().join("server.jar");
+        let payload = big_payload();
+        let range = Arc::new(FakeRangeSource {
+            data: Arc::new(payload.clone()),
+            supports_range: true,
+            stat_calls: AtomicU32::new(0),
+            open_calls: AtomicU32::new(0),
+            fail_opens: AtomicU32::new(0),
+            short_reads: AtomicU32::new(0),
+            range_ignored: false,
+            reject_status: Some(404),
+            cancel: None,
+        });
+
+        let downloader =
+            FileDownloader::new(fake_source(&[&payload])).with_range_source(range.clone());
+        let request = request_for(&destination, &payload, None);
 
         let done = downloader
             .download(&request, None, &CancellationToken::new())
@@ -1847,6 +1896,7 @@ mod tests {
             fail_opens: AtomicU32::new(0),
             short_reads: AtomicU32::new(0),
             range_ignored: false,
+            reject_status: None,
             cancel: Some(cancel.clone()),
         });
 

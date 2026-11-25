@@ -21,6 +21,39 @@ use url::Url;
 
 use crate::SourceError;
 
+/// 切词尝试的上限：连写 modid 可能很长，逐个位置切开打十几个请求不值得
+const SPLIT_ATTEMPTS: usize = 6;
+/// 切出来的两段各自至少多长
+const SPLIT_MIN_LEN: usize = 3;
+
+/// 把连写的检索词按可能的词界切成「前段 空格 后段」
+///
+/// modid 常写成 `twilightforest`，而项目名按词分开（`The Twilight Forest`）。
+/// 上游全文检索把检索词当整词条，连写词只能命中名字里恰好含这串字母的附加
+/// 组件，本体反而搜不到。从右侧往左试有限个位置（实际词界多在中偏右）。
+///
+/// 只对纯 ASCII 且不含空格 / `-` / `_` 的词生效：其他形态无法按字节安全切分，
+/// 也不需要再切。
+#[must_use]
+pub fn split_compound_terms(keyword: &str) -> Vec<String> {
+    if !keyword.is_ascii() || keyword.contains([' ', '-', '_']) {
+        return Vec::new();
+    }
+    let len = keyword.len();
+    if len < SPLIT_MIN_LEN * 2 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    // 从右侧往左：位置 i 表示「前 i 个字符 + 空格 + 剩余」
+    for i in (SPLIT_MIN_LEN..=len - SPLIT_MIN_LEN).rev() {
+        if out.len() >= SPLIT_ATTEMPTS {
+            break;
+        }
+        out.push(format!("{} {}", &keyword[..i], &keyword[i..]));
+    }
+    out
+}
+
 /// 内容搜索条件
 ///
 /// 与 [`domain::server::content::ContentRequest`] 的区别：那个是「给服务端挑

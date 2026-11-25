@@ -40,7 +40,9 @@ use domain::server::content::{
 };
 use domain::server::layout::console_log_path;
 use domain::server::version::ServerVariant;
-use port::content::{ContentProject, ContentQuery, ContentSearch, safe_filename};
+use port::content::{
+    ContentProject, ContentQuery, ContentSearch, safe_filename, split_compound_terms,
+};
 use port::mod_::ModInspector;
 use port::{Backend, CancellationToken, ErrorCategory, ProgressSink};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1599,6 +1601,14 @@ impl ModService {
         // 是 `wakes`），真正的 `satin-api` 排第二；只取首位会被
         // `expect_modid` 拒掉，然后整条依赖被判成「上游找不到提供方」，
         // 明明提供方就在结果里。
+        // 逐个检索词累计候选，而不是「第一个有结果的词就用」：连写 modid
+        // 的首个检索词只能命中名字里恰好含这串字母的附加组件（实测
+        // `twilightforest` → `[FORK] ... Addon`），本体在切词后的检索里。
+        // 早退会把本体挡在候选之外，补装必然报「上游找不到提供方」。
+        let mut candidates: Vec<(u8, ContentProject)> = Vec::new();
+        let mut slots: HashMap<(&'static str, String), usize> = HashMap::new();
+        let mut searched_ok = false;
+        let mut first_error: Option<ModError> = None;
         for term in provider_search_terms(modid) {
             let query = ContentQuery::new().keyword(&term).page(0, 5);
             let mut relaxed = server_query(
@@ -1611,14 +1621,25 @@ impl ModService {
             // 逐个来源检索而不是只用默认来源：只上架 CurseForge 的依赖
             // （实测 `the-twilight-forest`）在 Modrinth 上根本不存在。
             // 一个来源不可用不该让别的来源的结论消失。
-            let mut candidates: Vec<ContentProject> = Vec::new();
-            let mut searched_ok = false;
-            let mut first_error: Option<ModError> = None;
             for source in self.content.source_names() {
                 match self.content.search(Some(source), &relaxed).await {
                     Ok(found) => {
                         searched_ok = true;
-                        candidates.extend(rank_provider_hits(found.hits, &term));
+                        for hit in found.hits {
+                            let Some(rank) = provider_hit_rank(&hit, &term) else {
+                                continue;
+                            };
+                            let key = (hit.source, hit.id.clone());
+                            if let Some(&at) = slots.get(&key) {
+                                // 同一项目可能被多个检索词命中，取最相关的那次
+                                if rank < candidates[at].0 {
+                                    candidates[at].0 = rank;
+                                }
+                            } else {
+                                slots.insert(key, candidates.len());
+                                candidates.push((rank, hit));
+                            }
+                        }
                     }
                     Err(err) => {
                         if first_error.is_none() {
@@ -1627,15 +1648,19 @@ impl ModService {
                     }
                 }
             }
-            if !candidates.is_empty() {
-                // 各来源分别排过序，合并后按同一口径再排一次，避免下载量
-                // 量级差异掩盖相关度
-                return Ok(rank_provider_hits(candidates, &term));
+            // 同名或 `<modid>-` 前缀命中已经能确定本体，后续切词只会增加
+            // 请求；其余情况要继续找，`twilightforest` 的本体正是切词才出现。
+            if candidates.iter().any(|(rank, _)| *rank <= 1) {
+                break;
             }
-            // 全部来源都失败：这不是「没有提供方」，是上游真的不可用
-            if !searched_ok && let Some(err) = first_error {
-                return Err(err);
-            }
+        }
+        if !candidates.is_empty() {
+            sort_ranked_hits(&mut candidates);
+            return Ok(candidates.into_iter().map(|(_, hit)| hit).collect());
+        }
+        // 全部来源都失败：这不是「没有提供方」，是上游真的不可用
+        if !searched_ok && let Some(err) = first_error {
+            return Err(err);
         }
         Ok(Vec::new())
     }
@@ -2407,8 +2432,19 @@ fn file_name_of(path: &str) -> String {
 fn provider_search_terms(modid: &str) -> Vec<String> {
     let mut terms = vec![modid.to_owned()];
     let trimmed = modid.trim_end_matches(|c: char| c.is_ascii_digit());
-    if trimmed.len() != modid.len() && !trimmed.is_empty() {
+    let base = if trimmed.len() != modid.len() && !trimmed.is_empty() {
         terms.push(trimmed.to_owned());
+        trimmed
+    } else {
+        modid
+    };
+    // 连写 modid 在上游全文检索里只能命中名字恰好含这串字母的附加组件；
+    // 本体项目名按词分开（`twilightforest` → `The Twilight Forest`），
+    // 必须再补切词检索词，否则本体永远进不了候选。
+    for split in split_compound_terms(base) {
+        if !terms.iter().any(|seen| seen == &split) {
+            terms.push(split);
+        }
     }
     terms
 }
@@ -2474,18 +2510,28 @@ fn provider_hit_rank(hit: &ContentProject, term: &str) -> Option<u8> {
 /// 的本体，它的侧别由安装检查判，不由检索判。
 ///
 /// 并列时按下载量降序：同档候选里更主流的那个更可能是本体。
+#[cfg(test)]
 fn rank_provider_hits(hits: Vec<ContentProject>, term: &str) -> Vec<ContentProject> {
     let mut ranked: Vec<(u8, ContentProject)> = hits
         .into_iter()
         .filter_map(|hit| provider_hit_rank(&hit, term).map(|rank| (rank, hit)))
         .collect();
+    sort_ranked_hits(&mut ranked);
+    ranked.into_iter().map(|(_, hit)| hit).collect()
+}
+
+/// 按相关度、侧别、下载量给候选排序
+///
+/// 抽出来供跨检索词累计的候选与测试里的单次排序共用：同一批候选可能来自
+/// 不同检索词，每个候选带的是它在最相关那次检索里的档位，排序口径必须只有
+/// 一份。
+fn sort_ranked_hits(ranked: &mut [(u8, ContentProject)]) {
     ranked.sort_by(|(left_rank, left), (right_rank, right)| {
         left_rank
             .cmp(right_rank)
             .then_with(|| left.client_only.cmp(&right.client_only))
             .then_with(|| right.downloads.cmp(&left.downloads))
     });
-    ranked.into_iter().map(|(_, hit)| hit).collect()
 }
 
 /// 换名更新后删掉旧文件
@@ -2662,7 +2708,13 @@ mod tests {
     fn provider_terms_strip_trailing_version_digits() {
         assert_eq!(
             provider_search_terms("geckolib3"),
-            vec!["geckolib3".to_owned(), "geckolib".to_owned()]
+            vec![
+                "geckolib3".to_owned(),
+                "geckolib".to_owned(),
+                "gecko lib".to_owned(),
+                "geck olib".to_owned(),
+                "gec kolib".to_owned(),
+            ]
         );
         // 正常命名不受影响
         assert_eq!(
@@ -2671,6 +2723,13 @@ mod tests {
         );
         // 全是数字的 modid 不剥（剥完就空了）
         assert_eq!(provider_search_terms("42"), vec!["42".to_owned()]);
+    }
+
+    /// 连写 modid 要补切词检索词：`twilightforest` 的本体项目名是
+    /// `The Twilight Forest`，原词只能命中名字含这串字母的附加组件
+    #[test]
+    fn provider_terms_include_compound_split() {
+        assert!(provider_search_terms("twilightforest").contains(&"twilight forest".to_owned()));
     }
 
     /// 命中项目必须与检索词相关：slug/id/标题都不含词的照单不收
