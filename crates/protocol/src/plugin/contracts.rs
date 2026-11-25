@@ -23,7 +23,9 @@ use domain::plugin::capability::Capability;
 use domain::plugin::descriptor::{
     DEFAULT_OP_TIMEOUT_MS, MAX_DESCRIPTOR_BYTES, MAX_ENUM_VALUES, MAX_OP_DESCRIPTION_CHARS,
     MAX_OP_TIMEOUT_MS, MAX_OP_TITLE_CHARS, MAX_SCHEMA_BYTES, MAX_SCHEMA_DEPTH, MAX_SCHEMA_NODES,
-    MAX_SCHEMA_PROPERTIES, MAX_STRING_LENGTH, MIN_OP_TIMEOUT_MS,
+    MAX_SCHEMA_PROPERTIES, MAX_SETUP_HELP_LINK_LABEL_CHARS, MAX_SETUP_HELP_LINK_URL_CHARS,
+    MAX_SETUP_HELP_LINKS, MAX_SETUP_HELP_STEP_CHARS, MAX_SETUP_HELP_STEPS,
+    MAX_SETUP_HELP_TEXT_CHARS, MAX_SETUP_HELP_TITLE_CHARS, MAX_STRING_LENGTH, MIN_OP_TIMEOUT_MS,
 };
 use domain::plugin::error::PluginErrorCode;
 use domain::plugin::event::Subscription;
@@ -536,10 +538,10 @@ fn render_constants(out: &mut String) {
     }
 }
 
-/// descriptor / schema 限值（`plugins.md` §11.2 / §11.5）
+/// descriptor / schema 限值（`plugins.md` §11.2 / §11.5 / §11.8）
 ///
 /// 这是构建期校验的唯一来源：SDK 侧不再手抄同一组数字。
-fn descriptor_constants() -> [(&'static str, &'static str, u64); 12] {
+fn descriptor_constants() -> [(&'static str, &'static str, u64); 19] {
     [
         (
             "MAX_SCHEMA_DEPTH",
@@ -596,6 +598,41 @@ fn descriptor_constants() -> [(&'static str, &'static str, u64); 12] {
             "MAX_OP_DESCRIPTION_CHARS",
             "op 描述字符上限",
             MAX_OP_DESCRIPTION_CHARS as u64,
+        ),
+        (
+            "MAX_SETUP_HELP_TITLE_CHARS",
+            "setup 帮助标题字符上限",
+            MAX_SETUP_HELP_TITLE_CHARS as u64,
+        ),
+        (
+            "MAX_SETUP_HELP_TEXT_CHARS",
+            "setup 帮助正文字符上限",
+            MAX_SETUP_HELP_TEXT_CHARS as u64,
+        ),
+        (
+            "MAX_SETUP_HELP_STEPS",
+            "setup 帮助步骤数上限",
+            MAX_SETUP_HELP_STEPS as u64,
+        ),
+        (
+            "MAX_SETUP_HELP_STEP_CHARS",
+            "setup 帮助单条步骤字符上限",
+            MAX_SETUP_HELP_STEP_CHARS as u64,
+        ),
+        (
+            "MAX_SETUP_HELP_LINKS",
+            "setup 帮助链接数上限",
+            MAX_SETUP_HELP_LINKS as u64,
+        ),
+        (
+            "MAX_SETUP_HELP_LINK_LABEL_CHARS",
+            "setup 帮助链接文字字符上限",
+            MAX_SETUP_HELP_LINK_LABEL_CHARS as u64,
+        ),
+        (
+            "MAX_SETUP_HELP_LINK_URL_CHARS",
+            "setup 帮助链接地址字符上限",
+            MAX_SETUP_HELP_LINK_URL_CHARS as u64,
         ),
     ]
 }

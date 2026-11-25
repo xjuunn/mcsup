@@ -133,6 +133,44 @@ export type Subscription<
   Cfg extends SchemaLike = z.ZodType,
 > = string | readonly string[] | { readonly kind: string; readonly handler: EventHandler<C, Cfg> };
 
+/** 安装向导帮助文本的显示方式 */
+export type SetupHelpStyle =
+  /** 按行输出，保留写的缩进（一小段说明） */
+  | "lines"
+  /** 宿主按 `1.`、`2.` 自动编号（注册步骤） */
+  | "steps"
+  /** 贴在输入框旁的单行帮助，不单独占行（一句话提醒） */
+  | "inline";
+
+/** 安装向导帮助里的一个链接；宿主按 `文字: 地址` 输出 */
+export interface SetupHelpLink {
+  /** 链接文字 */
+  readonly label: string;
+  /** 地址；只接受 http(s) */
+  readonly url: string;
+}
+
+/**
+ * 安装向导字段的帮助文本（descriptor schema 6 起可用）。
+ *
+ * 教程内容完全由插件提供，宿主不内置平台知识：要不要写、写哪些步骤、指向
+ * 哪个官方地址都在这里决定。`style` 选显示方式：`lines` 用 `text`，
+ * `steps` 用 `steps`，`inline` 用 `text`。`help` 优先于 `description`；
+ * 两者都没写时向导不显示任何提示。
+ */
+export interface SetupHelpSpec {
+  /** 显示方式；默认 `lines` */
+  readonly style?: SetupHelpStyle;
+  /** 标题行；省略则不打印标题 */
+  readonly title?: string;
+  /** 正文；`lines` / `inline` 用，按字符数 ≤ 512 */
+  readonly text?: string;
+  /** 步骤；`steps` 用，≤ 16 条、每条 ≤ 200 字符 */
+  readonly steps?: readonly string[];
+  /** 官方链接；≤ 8 条 */
+  readonly links?: readonly SetupHelpLink[];
+}
+
 /** 安装向导字段：宿主在授权后逐项询问，写入配置 */
 export interface SetupFieldSpec {
   /** 配置路径，点号分隔（如 `qq.appId`） */
@@ -143,8 +181,10 @@ export interface SetupFieldSpec {
   readonly secret?: boolean;
   /** 覆盖 schema 的 `x-mcsup-label` */
   readonly label?: string;
-  /** 覆盖 schema 的 description */
+  /** 覆盖 schema 的 description；没有 `help` 时按行打印 */
   readonly description?: string;
+  /** 结构化的帮助文本（schema 6 起）；优先于 `description` */
+  readonly help?: SetupHelpSpec;
   /** 提示默认值；省略时取 schema 的 default */
   readonly default?: unknown;
   /** 列表字段的可选值；声明后向导渲染成多选框（仅数组字符串字段） */

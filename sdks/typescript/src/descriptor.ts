@@ -8,7 +8,16 @@
 
 import { z } from "./zod.js";
 
-import { PLUGIN_API_VERSION } from "./protocol.js";
+import {
+  MAX_SETUP_HELP_LINKS,
+  MAX_SETUP_HELP_LINK_LABEL_CHARS,
+  MAX_SETUP_HELP_LINK_URL_CHARS,
+  MAX_SETUP_HELP_STEPS,
+  MAX_SETUP_HELP_STEP_CHARS,
+  MAX_SETUP_HELP_TEXT_CHARS,
+  MAX_SETUP_HELP_TITLE_CHARS,
+  PLUGIN_API_VERSION,
+} from "./protocol.js";
 import {
   subscriptionKinds,
   type BindSpec,
@@ -18,6 +27,7 @@ import {
   type OpSpecLike,
   type PluginDefinition,
   type ResolvedOp,
+  type SetupHelpSpec,
   type SetupSpec,
   type SetupWhenSpec,
 } from "./define.js";
@@ -382,7 +392,7 @@ export function jsonSchemaOf(schema: z.ZodType, onOutput: boolean, path = "schem
 
 /** descriptor 结构（plugins.md §11.1） */
 export interface Descriptor {
-  readonly schema: 1 | 2 | 3 | 4 | 5;
+  readonly schema: 1 | 2 | 3 | 4 | 5 | 6;
   readonly plugin_id: string;
   readonly api: number;
   readonly config: JsonValue;
@@ -453,6 +463,82 @@ function opKinds(resolved: readonly ResolvedOp[]): Map<string, OpKind> {
   return kinds;
 }
 
+/** 字符数：按 Unicode 码点计，与宿主一致（`length` 按 UTF-16 单元） */
+const charCount = (text: string): number => [...text].length;
+
+/**
+ * 帮助文本归一化（descriptor schema 6）
+ *
+ * 形状由 `style` 决定：`steps` 只接受 `steps`，`lines` / `inline` 只接受
+ * `text`。两种都写会让宿主不知道该渲染哪一份，构建期直接拒绝，比运行时
+ * 静默取其一好。`style` 即使省略也写进产物，宿主不必再推断默认值。
+ */
+function buildSetupHelp(path: string, help: SetupHelpSpec): JsonValue {
+  const style = help.style ?? "lines";
+  if (style !== "lines" && style !== "steps" && style !== "inline") {
+    throw new DescriptorError(`${path}.style`, "must be lines / steps / inline");
+  }
+  const entry: Record<string, JsonValue> = { style };
+  if (help.title !== undefined) {
+    const title = help.title.trim();
+    if (title === "" || charCount(help.title) > MAX_SETUP_HELP_TITLE_CHARS) {
+      throw new DescriptorError(`${path}.title`, "must be 1..=64 characters");
+    }
+    entry["title"] = title;
+  }
+  if (style === "steps") {
+    if (help.text !== undefined) {
+      throw new DescriptorError(`${path}.text`, "is for style lines / inline; declare steps");
+    }
+    if (help.steps === undefined || help.steps.length === 0) {
+      throw new DescriptorError(`${path}.steps`, "is required for style steps");
+    }
+    if (help.steps.length > MAX_SETUP_HELP_STEPS) {
+      throw new DescriptorError(`${path}.steps`, `has more than ${MAX_SETUP_HELP_STEPS} items`);
+    }
+    for (const step of help.steps) {
+      if (step.trim() === "" || charCount(step) > MAX_SETUP_HELP_STEP_CHARS) {
+        throw new DescriptorError(`${path}.steps`, "items must be 1..=200 characters");
+      }
+    }
+    entry["steps"] = help.steps.map((step) => step.trim());
+  } else {
+    if (help.steps !== undefined) {
+      throw new DescriptorError(`${path}.steps`, "is for style steps; declare text");
+    }
+    if (help.text === undefined || help.text.trim() === "") {
+      throw new DescriptorError(`${path}.text`, "is required for style lines / inline");
+    }
+    if (charCount(help.text) > MAX_SETUP_HELP_TEXT_CHARS) {
+      throw new DescriptorError(`${path}.text`, "is longer than 512 characters");
+    }
+    entry["text"] = help.text;
+  }
+  if (help.links !== undefined) {
+    if (help.links.length === 0) {
+      throw new DescriptorError(`${path}.links`, "must not be empty when declared");
+    }
+    if (help.links.length > MAX_SETUP_HELP_LINKS) {
+      throw new DescriptorError(`${path}.links`, `has more than ${MAX_SETUP_HELP_LINKS} items`);
+    }
+    entry["links"] = help.links.map((link) => {
+      const label = link.label.trim();
+      const url = link.url.trim();
+      if (label === "" || charCount(label) > MAX_SETUP_HELP_LINK_LABEL_CHARS) {
+        throw new DescriptorError(`${path}.links`, "label must be 1..=64 characters");
+      }
+      if (!url.startsWith("https://") && !url.startsWith("http://")) {
+        throw new DescriptorError(`${path}.links`, "url must start with http:// or https://");
+      }
+      if (charCount(url) > MAX_SETUP_HELP_LINK_URL_CHARS || /\s/u.test(url)) {
+        throw new DescriptorError(`${path}.links`, "url must be a single-line http(s) url");
+      }
+      return { label, url };
+    });
+  }
+  return sortKeys(entry);
+}
+
 /** 安装向导归一化：只保留声明过的键，字段顺序保持声明顺序 */
 function buildSetup(setup: SetupSpec): JsonValue {
   const fields = setup.fields.map((field) => {
@@ -468,6 +554,9 @@ function buildSetup(setup: SetupSpec): JsonValue {
     }
     if (field.description !== undefined) {
       entry["description"] = field.description;
+    }
+    if (field.help !== undefined) {
+      entry["help"] = buildSetupHelp(`setup.fields.${field.path}.help`, field.help);
     }
     if (field.default !== undefined) {
       entry["default"] = field.default as JsonValue;
@@ -650,20 +739,19 @@ export function buildDescriptor<
   if (ops.length > 64) {
     throw new DescriptorError("ops", `${ops.length} ops declared, limit is 64`);
   }
-  // 版本号只升不降：交互式字段要求 5，setup 字段条件要求 4，bind 是 3，setup 是 2，其余仍是 1
-  const hasSetupWhen =
-    def.setup !== undefined && def.setup.fields.some((field) => field.when !== undefined);
-  const hasInteractive =
-    def.setup !== undefined && def.setup.fields.some((field) => field.interactive === true);
-  const schema: 1 | 2 | 3 | 4 | 5 = hasInteractive
-    ? 5
-    : hasSetupWhen
-      ? 4
-      : bind !== undefined
-        ? 3
-        : setup === undefined
-          ? 1
-          : 2;
+  // 版本号只升不降：帮助文本要求 6，交互式字段 5，字段条件 4，bind 3，setup 2，其余 1
+  const fields = def.setup?.fields ?? [];
+  const schema: 1 | 2 | 3 | 4 | 5 | 6 = fields.some((field) => field.help !== undefined)
+    ? 6
+    : fields.some((field) => field.interactive === true)
+      ? 5
+      : fields.some((field) => field.when !== undefined)
+        ? 4
+        : bind !== undefined
+          ? 3
+          : setup === undefined
+            ? 1
+            : 2;
   const descriptor: Descriptor = {
     schema,
     plugin_id: def.id,

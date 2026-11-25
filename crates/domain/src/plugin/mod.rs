@@ -34,8 +34,9 @@ pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 /// descriptor schema 版本
 ///
 /// 2 起支持 `setup` 安装向导，3 起支持 `bind` 服务器绑定，4 起支持 setup
-/// 字段条件（`setup.fields[].when`）；校验同时接受更旧的 1 / 2 / 3（旧产物）。
-pub const DESCRIPTOR_SCHEMA_VERSION: u32 = 5;
+/// 字段条件（`setup.fields[].when`），5 起支持交互式字段，6 起支持 setup
+/// 字段帮助文本（`setup.fields[].help`）；校验同时接受更旧的 1–5（旧产物）。
+pub const DESCRIPTOR_SCHEMA_VERSION: u32 = 6;
 
 /// 当前平台标识：`darwin-arm64` / `linux-x64` / `win32-x64`
 ///
