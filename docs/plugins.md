@@ -419,12 +419,15 @@ mcsup __plugin-host --data-dir <path> --idle-timeout 300
 plugin-<hash>.sock
 ```
 
-哈希输入是 `(data_dir, plugin_id, scope, server)` 的拼接，避免不同实例撞名。
+哈希输入是 `(run_dir, plugin_id, scope, server)` 的拼接，`run_dir` 即端点目录
+`{data_dir}/mcsup/run`，不同实例不会因为同 id 撞名，回退到系统临时目录时也不
+必额外区分。
 
 macOS 的 Unix socket 路径上限约 104 字节。端点解析必须：
 
 1. 计算完整路径长度；
-2. 超过 100 字节时改用 `$TMPDIR/mcsup-<uid>/pl-<hash>.sock`；
+2. 超过 100 字节时改用 `$TMPDIR/mcsup-<pid>/pl-<hash>.sock`（`<pid>` 是宿主
+   进程号，回退目录按进程隔离，同一用户下多个实例不会互相顶掉）；
 3. 仍超限则回退回环 TCP。
 
 回环 TCP 必须绑定 `127.0.0.1`，端口由内核分配，端点串形如
@@ -1494,6 +1497,9 @@ JSON Schema 没有「密钥」「单位」的标准表达，统一用 `x-mcsup-`
   由宿主编码成二维码并按终端宽度居中（纠错等级 L、2 模块静默区，尽量小），
   `{"type":"status","text":"<文本>"}` 作为进度行原样显示；终端画不出来时退回
   显示可点开的链接。未设置该变量时插件自行绘制二维码，保持旧宿主可用；
+- hook 进程继承终端，插件直接写 stdout 也是可见的，因此宿主不再额外打印等待
+  动画：光标寻址的重绘会盖掉插件刚打印的行。等用户扫码、走设备授权这类没有
+  输出的间隙，插件应自己追加 `status` 事件说明在等什么；
 - 插件不连宿主、不建会话，只执行该字段声明的 setup hook，把密钥写入密钥
   文件后以 0 退出；密钥不进 argv、不经过 shell、不打印到 stdout；
 - 宿主读回文件、trim 后逐项按 config schema 复校验（路径必须是字符串叶子，

@@ -729,6 +729,8 @@ fn run_setup_hook(
         .stderr(std::process::Stdio::inherit())
         .spawn()
         .with_context(|| format!("run plugin setup hook {}", program.display()))?;
+    // 子进程继承终端，插件自己往 stdout 写提示、靠 UI 文件回显进度。这里不能
+    // 再叠一条 spinner：光标寻址的重绘会盖掉插件刚打印的行。
     let mut ui = SetupUi::new(&ui_file, printer);
     let status = loop {
         ui.drain();
@@ -776,6 +778,9 @@ impl<'a> SetupUi<'a> {
     }
 
     /// 读取并渲染尚未处理的事件；文件还没创建时静默跳过
+    ///
+    /// 不在这里重绘任何进度条：hook 子进程继承终端，会自己往 stdout 写提示，
+    /// 光标寻址的重绘会把那些行盖掉。
     fn drain(&mut self) {
         let Ok(bytes) = std::fs::read(self.path) else {
             return;
