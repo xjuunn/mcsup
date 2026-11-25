@@ -905,8 +905,13 @@ fn blocking_issue(entry: &ModBlocked) -> String {
         ModBlocker::ClientOnly => {
             format!("{file}: 清单或上游判定仅客户端，服务端无法装载（可停用该文件）")
         }
+        ModBlocker::MissingBridge { loader, files } => format!(
+            "{file}: 有 {} 个 {loader} 专用 mod，当前服务端缺少 Sinytra Connector 桥（可执行 mcsup server mod fix 自动补装）：{}",
+            files.len(),
+            files.join("、")
+        ),
         ModBlocker::Mismatch { detail } => {
-            format!("{file}: {detail}（与目标服务端的版本区间不符，可停用或更换适配版本）")
+            format!("{file}: {detail}（可停用或更换适配版本）")
         }
     }
 }

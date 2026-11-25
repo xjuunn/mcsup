@@ -197,6 +197,7 @@ fn belongs_to(version: &Version, id_or_slug: &str) -> bool {
 fn project_from_hit(hit: &SearchHit) -> ContentProject {
     let kind = kind_of(&hit.project_type, &hit.all_project_types);
     ContentProject {
+        source: "modrinth",
         id: hit.project_id.clone(),
         slug: hit.slug.clone(),
         title: hit.title.clone(),
@@ -219,6 +220,7 @@ fn project_from_hit(hit: &SearchHit) -> ContentProject {
 fn project_from_detail(project: &Project) -> ContentProject {
     let kind = kind_of(&project.project_type, &[]);
     ContentProject {
+        source: "modrinth",
         id: project.id.clone(),
         slug: project.slug.clone(),
         title: project.title.clone(),

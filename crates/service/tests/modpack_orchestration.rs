@@ -792,7 +792,9 @@ async fn reports_mods_that_cannot_load_on_a_server() {
 /// 加载器对不上要报出来——这是 forge 整合包里混进 fabric jar 的现场
 ///
 /// 这类文件在 `mods/` 里加载器根本不会尝试装载，但会以「找不到入口点」的
-/// 形式让整次启动失败，报错里只有类名。
+/// 形式让整次启动失败，报错里只有类名。Forge 系服务端上的 Fabric 专用 jar
+/// 差的是一个 Sinytra Connector 桥，因此按目录聚合成一条「缺桥」，补桥即可
+/// 跑起来；只有真的无法靠桥解决时（MC 版本不符等）才落到 `Mismatch`。
 #[tokio::test]
 async fn reports_mods_from_another_loader() {
     let index = ModpackIndex::new(
@@ -832,13 +834,18 @@ async fn reports_mods_from_another_loader() {
         .await
         .expect("apply");
 
+    // Fabric 专用 mod 落在 Forge 整合包里：补 Sinytra Connector 就能跑，因此
+    // 按目录聚合成一条「缺桥」，而不是逐个文件报不匹配（逐个报会把控制台刷满
+    // 同一句说明，处置却是同一条）
     assert_eq!(applied.blocked.len(), 1, "{:?}", applied.blocked);
-    assert_eq!(applied.blocked[0].file, "mods/fabric-mod.jar");
-    assert!(
-        matches!(applied.blocked[0].blocker, ModBlocker::Mismatch { .. }),
-        "原因要落在加载器维度上: {:?}",
-        applied.blocked[0].blocker
-    );
+    assert_eq!(applied.blocked[0].file, "mods");
+    match &applied.blocked[0].blocker {
+        ModBlocker::MissingBridge { loader, files } => {
+            assert_eq!(loader, "fabric");
+            assert_eq!(files, &["mods/fabric-mod.jar".to_owned()]);
+        }
+        other => panic!("原因要落在缺桥维度上: {other:?}"),
+    }
     std::fs::remove_dir_all(&dir).ok();
 }
 

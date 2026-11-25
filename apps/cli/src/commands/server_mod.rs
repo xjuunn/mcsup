@@ -748,6 +748,23 @@ fn report_fix_plan(plan: &ModFixPlan, printer: Printer, actionable: bool) -> Res
         let title = &item.title;
         let needed_by = &item.needed_by;
         let missing = &item.missing;
+        if item.bridge {
+            printer.print_outcome(
+                &pick(
+                    lang,
+                    format!(
+                        "补装加载器桥 {title}（来自 {}）：{missing} 专用 mod 需要它才能被当前服务端装载；受影响：{needed_by}",
+                        item.source
+                    ),
+                    format!(
+                        "install loader bridge {title} (from {}): {missing}-only mods need it on this server; affected: {needed_by}",
+                        item.source
+                    ),
+                ),
+                &(),
+            )?;
+            continue;
+        }
         let note = if item.client_only {
             text(lang, "（上游标注仅客户端）", "(upstream marks client-only)")
         } else {
@@ -756,8 +773,14 @@ fn report_fix_plan(plan: &ModFixPlan, printer: Printer, actionable: bool) -> Res
         printer.print_outcome(
             &pick(
                 lang,
-                format!("补装 {title}{note}：{needed_by} 缺少必需依赖 {missing}"),
-                format!("install {title}{note}: {needed_by} misses dependency {missing}"),
+                format!(
+                    "补装 {title}（来自 {}）{note}：{needed_by} 缺少必需依赖 {missing}",
+                    item.source
+                ),
+                format!(
+                    "install {title} (from {}){note}: {needed_by} misses dependency {missing}",
+                    item.source
+                ),
             ),
             &(),
         )?;
@@ -819,8 +842,10 @@ struct FixSuspectJson<'a> {
 struct FixInstallJson<'a> {
     needed_by: &'a str,
     missing: &'a str,
+    source: &'a str,
     project_id: &'a str,
     title: &'a str,
+    bridge: bool,
 }
 
 #[derive(Serialize)]
@@ -838,8 +863,10 @@ fn fix_plan_json(plan: &ModFixPlan) -> FixPlanJson<'_> {
             .map(|item| FixInstallJson {
                 needed_by: &item.needed_by,
                 missing: &item.missing,
+                source: &item.source,
                 project_id: &item.project_id,
                 title: &item.title,
+                bridge: item.bridge,
             })
             .collect(),
         removals: plan

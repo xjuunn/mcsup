@@ -1183,6 +1183,33 @@ impl ModCapability {
         }
     }
 
+    /// 目标服务端是否只差一个加载器桥就能装载本文件
+    ///
+    /// 用于「Forge / `NeoForge` 服务端缺 Sinytra Connector」这一种情况：文件本身
+    /// 是服务端可用的，MC 版本与 Java 也都对得上，唯一不满足的是加载器——
+    /// 此时补桥能解决，移除文件反而会把能跑的内容删掉。
+    ///
+    /// 判定口径与 [`Self::fit_for`] 一致，只是把「加载器不匹配」单独拎出来：
+    /// 桥只桥加载器这一维，MC 或 Java 不符时补桥仍然起不来，不能算「只差
+    /// 一个桥」。已经装桥（`target.bridged_loaders` 含 Fabric）时也不成立。
+    #[must_use]
+    pub fn needs_bridge(&self, target: &ServerTarget) -> bool {
+        let Some(want) = target.loader else {
+            return false;
+        };
+        if !matches!(want, ModLoader::Forge | ModLoader::NeoForge) {
+            return false;
+        }
+        if target.bridged_loaders.contains(&ModLoader::Fabric) {
+            return false;
+        }
+        if self.loaders.is_empty() || !self.loaders.iter().all(|l| *l == ModLoader::Fabric) {
+            return false;
+        }
+        let fit = self.fit_for(target);
+        fit.loader == Fit::Mismatch && fit.mc_version != Fit::Mismatch && fit.java != Fit::Mismatch
+    }
+
     /// 加载器维度：目标服务端能否载入本文件声明的加载器之一
     ///
     /// 「能装」「缺 MC 版本待确认」「确实不匹配」三种结论必须分开：第二种若
@@ -1826,6 +1853,39 @@ mod tests {
                 .loader,
             Fit::Mismatch
         );
+    }
+
+    /// 只差加载器一维时，补桥是可行的处置
+    #[test]
+    fn fabric_mod_on_forge_without_bridge_needs_bridge() {
+        let fabric_mod = cap(&[ModLoader::Fabric], "1.20.1", Some(17));
+        assert!(fabric_mod.needs_bridge(&target(ModLoader::Forge, "1.20.1", Some(17))));
+        assert!(fabric_mod.needs_bridge(&target(ModLoader::NeoForge, "1.20.1", Some(17))));
+    }
+
+    /// 装了桥就不再需要（否则会重复规划补装）
+    #[test]
+    fn bridged_target_no_longer_needs_bridge() {
+        let fabric_mod = cap(&[ModLoader::Fabric], "", None);
+        assert!(!fabric_mod.needs_bridge(&target_bridged(ModLoader::Forge, &[ModLoader::Fabric])));
+    }
+
+    /// 桥只解决加载器：MC 版本也对不上时不算「缺桥」
+    #[test]
+    fn mc_mismatch_is_not_a_missing_bridge() {
+        let fabric_mod = cap(&[ModLoader::Fabric], "1.21.1", None);
+        assert!(!fabric_mod.needs_bridge(&target(ModLoader::Forge, "1.20.1", None)));
+    }
+
+    /// 非 Fabric 专用、目标不是 Forge 系、或根本没声明加载器时都不成立
+    #[test]
+    fn needs_bridge_only_for_fabric_mods_on_forge_family() {
+        let forge_mod = cap(&[ModLoader::Forge], "", None);
+        assert!(!forge_mod.needs_bridge(&target(ModLoader::Fabric, "", None)));
+        let fabric_mod = cap(&[ModLoader::Fabric], "", None);
+        assert!(!fabric_mod.needs_bridge(&target(ModLoader::Fabric, "", None)));
+        let unknown = ModCapability::empty("x.jar");
+        assert!(!unknown.needs_bridge(&target(ModLoader::Forge, "", None)));
     }
 
     /// Fabric 专用 mod 在 Forge 上没桥时，原因点明需要 Sinytra Connector

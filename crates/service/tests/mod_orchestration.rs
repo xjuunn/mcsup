@@ -72,12 +72,19 @@ struct IdentityPreset {
 
 /// 假来源：候选、解析结果与反查结论都由用例给定
 struct FakeSource {
+    /// 来源标识：默认冒充 Modrinth，多来源用例里可另建一个 `curseforge`
+    name: &'static str,
     config: Mutex<SourceConfig>,
 }
 
 impl FakeSource {
     fn new() -> Self {
+        Self::named("modrinth")
+    }
+
+    fn named(name: &'static str) -> Self {
         Self {
+            name,
             config: Mutex::new(SourceConfig {
                 candidates: Vec::new(),
                 resolved: Vec::new(),
@@ -96,7 +103,8 @@ impl FakeSource {
 
 impl ContentSourceInfo for FakeSource {
     fn name(&self) -> &'static str {
-        "fake"
+        // 检索命中与快照都按来源名回查注册表，名字必须与注册名对得上
+        self.name
     }
 }
 
@@ -124,6 +132,7 @@ impl ContentSource for FakeSource {
 
     async fn project(&self, id: &str) -> Result<ContentProject, SourceError> {
         Ok(ContentProject {
+            source: self.name,
             id: id.to_owned(),
             slug: Some(id.to_owned()),
             title: id.to_owned(),
@@ -382,15 +391,45 @@ struct Harness {
     mods: ModService,
     downloader: Arc<FakeDownloader>,
     source: Arc<FakeSource>,
+    /// 第二个注册来源（多来源回退用例用），默认没有
+    extra: Option<Arc<FakeSource>>,
     inspector: Arc<FakeInspector>,
 }
 
 impl Harness {
     fn new(log: CommandLog, verdicts: &[(&str, SideSupport)], bytes: &[u8]) -> Self {
+        Self::new_with_variant(log, verdicts, bytes, ServerVariant::Fabric, None)
+    }
+
+    /// Forge 服务端：用于验证缺 Sinytra Connector 时的桥补装
+    fn new_forge(log: CommandLog, verdicts: &[(&str, SideSupport)], bytes: &[u8]) -> Self {
+        Self::new_with_variant(log, verdicts, bytes, ServerVariant::Forge, None)
+    }
+
+    /// 两个来源：主来源（`modrinth`）+ 命名的第二来源，用于验证检索回退
+    ///
+    /// 用 Fabric 服务端：Forge 会让同目录的 Fabric mod 进入「缺桥」分支，
+    /// 干扰对补装来源的断言；回退逻辑本身与变体无关。
+    fn new_with_source(
+        log: CommandLog,
+        verdicts: &[(&str, SideSupport)],
+        bytes: &[u8],
+        extra: &'static str,
+    ) -> Self {
+        Self::new_with_variant(log, verdicts, bytes, ServerVariant::Fabric, Some(extra))
+    }
+
+    fn new_with_variant(
+        log: CommandLog,
+        verdicts: &[(&str, SideSupport)],
+        bytes: &[u8],
+        variant: ServerVariant,
+        extra: Option<&'static str>,
+    ) -> Self {
         let fixture = ServiceFixture::new();
         let repo = Arc::new(MemServerRepo::new());
         let mut meta = testkit::server_meta("alpha", fixture.workspace().id.as_str());
-        meta.variant = ServerVariant::Fabric;
+        meta.variant = variant;
         repo.insert(meta);
         let dir = fixture.root().join("servers").join("alpha");
         std::fs::create_dir_all(&dir).expect("mkdir server");
@@ -405,10 +444,14 @@ impl Harness {
             config.candidates = vec![candidate("v2")];
             config.resolved = vec![resolved("v2", "cool-mod.jar", bytes.len() as u64)];
         });
+        let mut sources: Vec<Arc<dyn ContentSource>> =
+            vec![Arc::clone(&source) as Arc<dyn ContentSource>];
+        let extra_source = extra.map(FakeSource::named).map(Arc::new);
+        if let Some(extra_source) = &extra_source {
+            sources.push(Arc::clone(extra_source) as Arc<dyn ContentSource>);
+        }
         let content = ContentService::new(
-            Arc::new(ContentSourceRegistry::new(vec![
-                Arc::clone(&source) as Arc<dyn ContentSource>
-            ])),
+            Arc::new(ContentSourceRegistry::new(sources)),
             Arc::clone(&downloader) as Arc<dyn ArtifactDownloader>,
         );
         let inspector = Arc::new(FakeInspector::new(verdicts));
@@ -425,6 +468,7 @@ impl Harness {
             mods,
             downloader,
             source,
+            extra: extra_source,
             inspector,
         }
     }
@@ -586,6 +630,7 @@ fn pack_file(path: &str, project: &str, version: &str, server: &str) -> service:
 
 fn search_hit(id: &str, client_only: bool) -> ContentProject {
     ContentProject {
+        source: "modrinth",
         id: id.to_owned(),
         slug: Some(id.to_owned()),
         title: id.to_owned(),
@@ -598,6 +643,25 @@ fn search_hit(id: &str, client_only: bool) -> ContentProject {
         downloads: 0,
         icon_url: None,
         client_only,
+    }
+}
+
+/// 来源、slug、标题都可控的检索命中（多来源 / 分隔符用例）
+fn search_hit_named(source: &'static str, id: &str, slug: &str, title: &str) -> ContentProject {
+    ContentProject {
+        source,
+        id: id.to_owned(),
+        slug: Some(slug.to_owned()),
+        title: title.to_owned(),
+        description: String::new(),
+        kind: ContentKind::Mod,
+        also_kinds: Vec::new(),
+        loaders: vec!["fabric".to_owned()],
+        game_versions: vec!["1.21.1".to_owned()],
+        author: None,
+        downloads: 0,
+        icon_url: None,
+        client_only: false,
     }
 }
 
@@ -728,6 +792,90 @@ async fn plan_fix_strips_trailing_digits_when_searching_provider() {
     assert_eq!(plan.installs.len(), 1, "{plan:?}");
     assert_eq!(plan.installs[0].missing, "geckolib3");
     assert_eq!(plan.installs[0].project_id, "geckolib");
+}
+
+/// 主来源没有该项目时回退到第二来源，并按命中来源解析
+///
+/// 现场：`delightful` 声明依赖 `twilightforest`。`Modrinth` 没有这个项目，
+/// 只有 `CurseForge` 有（slug `the-twilight-forest`，项目 ID `227639`）。
+/// 只在默认来源检索会把它判成「上游找不到提供方」；命中来源还必须一路带到
+/// 补装，否则会拿 `CurseForge` 的数值 ID 去 `Modrinth` 解析，装到错的东西或直接
+/// 404。
+#[tokio::test]
+async fn plan_fix_falls_back_to_second_source() {
+    let harness = Harness::new_with_source(
+        CommandLog::stopped(),
+        &[("delightful.jar", SideSupport::Required)],
+        b"jar-bytes",
+        "curseforge",
+    );
+    harness
+        .inspector
+        .declare_dep("delightful.jar", "twilightforest");
+    harness.write("mods/delightful.jar", b"d");
+    // 主来源（modrinth）搜不到本体
+    harness
+        .source
+        .configure(|config| config.search_pool = Vec::new());
+    let extra = harness.extra.as_ref().expect("second source");
+    extra.configure(|config| {
+        config.search_pool = vec![search_hit_named(
+            "curseforge",
+            "227639",
+            "the-twilight-forest",
+            "The Twilight Forest",
+        )];
+        config.candidates = vec![candidate("v1")];
+        config.resolved = vec![resolved_for("227639", "v1", "twilightforest-1.20.1.jar", 4)];
+    });
+
+    let plan = harness
+        .mods
+        .plan_fix("alpha", ContentKind::Mod)
+        .await
+        .expect("plan_fix");
+    assert_eq!(plan.installs.len(), 1, "{plan:?}");
+    assert_eq!(plan.installs[0].missing, "twilightforest");
+    assert_eq!(plan.installs[0].source, "curseforge");
+    assert_eq!(plan.installs[0].project_id, "227639");
+}
+
+/// Forge 服务端缺 Sinytra Connector 时：补桥，不把 Fabric mod 规划成移除
+///
+/// 现场：Better MC 的 `mods/` 里只有 Fabric 专用 mod 与 `ConnectorExtras` /
+/// Fabric API，没有 Connector 本体。旧逻辑会按 `FitVerdict::Rejected` 把
+/// 6 个 Fabric mod 全部移走——能跑的内容被删光，桥却没补上。
+#[tokio::test]
+async fn plan_fix_installs_connector_bridge_instead_of_removing_fabric_mods() {
+    let harness = Harness::new_forge(
+        CommandLog::stopped(),
+        &[
+            ("numismatic.jar", SideSupport::Required),
+            ("owo.jar", SideSupport::Required),
+        ],
+        b"jar-bytes",
+    );
+    harness.write("mods/numismatic.jar", b"m");
+    harness.write("mods/owo.jar", b"m");
+    harness.source.configure(|config| {
+        config.search_pool = vec![search_hit("connector", false)];
+    });
+    harness.set_resolved_for("connector", &[("v1", "Connector-1.0.0.jar")]);
+
+    let plan = harness
+        .mods
+        .plan_fix("alpha", ContentKind::Mod)
+        .await
+        .expect("plan_fix");
+    assert!(plan.removals.is_empty(), "{plan:?}");
+    assert_eq!(plan.installs.len(), 1, "{plan:?}");
+    let bridge = &plan.installs[0];
+    assert!(bridge.bridge);
+    assert_eq!(bridge.project_id, "connector");
+    assert_eq!(bridge.source, "modrinth");
+    // 桥出的加载器，而不是某个 modid
+    assert_eq!(bridge.missing, "fabric");
+    assert!(bridge.needed_by.contains("numismatic.jar"), "{plan:?}");
 }
 
 /// 提供方被上游标成仅客户端时仍要能补上：库类 mod 的标注经常有误

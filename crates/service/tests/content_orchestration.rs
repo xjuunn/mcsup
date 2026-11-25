@@ -83,6 +83,7 @@ impl ContentSource for FakeSource {
 
     async fn project(&self, id: &str) -> Result<ContentProject, SourceError> {
         Ok(ContentProject {
+            source: "stub",
             id: id.to_owned(),
             slug: None,
             title: id.to_owned(),

@@ -41,9 +41,9 @@ pub fn corrupt(
 pub struct WireModBlocked {
     /// 相对服务端目录的路径（`mods/x.jar`）
     pub file: String,
-    /// 原因类别：`missing_deps` / `client_only` / `mismatch`
+    /// 原因类别：`missing_deps` / `client_only` / `missing_bridge` / `mismatch`
     pub kind: String,
-    /// 类别相关的细节：缺的 modid 列表，或不匹配的维度说明
+    /// 类别相关的细节：缺的 modid 列表、受影响的文件，或不匹配的维度说明
     #[serde(default)]
     pub detail: Vec<String>,
 }

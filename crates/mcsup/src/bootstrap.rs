@@ -14,6 +14,7 @@ use java::HostJavaScanner;
 use port::ServerJarSource;
 use port::content::{ContentSource, ContentSourceRegistry};
 use port::modpack::{ModpackExtractor, ModpackSource, ModpackSourceRegistry};
+use provider::curseforge::CurseForgeSource;
 use provider::fabric::FabricSource;
 use provider::forge::ForgeSource;
 use provider::http::HttpByteSource;
@@ -784,17 +785,44 @@ impl McsupBuilder {
     }
 }
 
-/// 默认的内容来源集合：Modrinth 官方
+/// 默认的内容来源集合：`Modrinth` 官方 + `CurseForge`
 ///
 /// 只准备 HTTP 客户端，不打网络。换源由 [`McsupBuilder::content_sources`]
 /// 覆盖；自建 / 镜像用 `ModrinthSource::builder().base_url(..)` 构造。
+///
+/// # 顺序
+///
+/// `Modrinth` 排第一，因此 `--source` 缺省时仍然在 `Modrinth` 检索与安装——
+/// 项目 ID 只在同一来源内唯一，默认来源不能随注册数量漂移。`CurseForge` 只在
+/// 前面没有命中时补位（`mod fix` 补装依赖时按注册顺序逐个来源查）。
+///
+/// # `CurseForge` 鉴权
+///
+/// 没有配置 `CURSEFORGE_API_KEY` 时走社区镜像（匿名可用，与官方 v1 同构）；
+/// 配了就走官方地址，避免把 key 交给第三方。镜像的可用性由镜像自己负责，
+/// 不在这里预探（探测失败会让整个平台起不来）。
 ///
 /// # Errors
 ///
 /// 来源构造失败时返回 [`BootstrapError::Source`]
 pub fn default_content_sources() -> Result<Vec<Arc<dyn ContentSource>>, BootstrapError> {
-    let source = ModrinthSource::new().map_err(|err| BootstrapError::Source(Box::new(err)))?;
-    Ok(vec![Arc::new(source) as Arc<dyn ContentSource>])
+    let modrinth = ModrinthSource::new()
+        .map(|source| Arc::new(source) as Arc<dyn ContentSource>)
+        .map_err(|err| BootstrapError::Source(Box::new(err)))?;
+    let mut curseforge = CurseForgeSource::builder();
+    if let Some(key) = std::env::var("CURSEFORGE_API_KEY")
+        .ok()
+        .filter(|key| !key.trim().is_empty())
+    {
+        curseforge = curseforge
+            .base_url(provider::curseforge::OFFICIAL_API)
+            .api_key(key);
+    }
+    let curseforge = curseforge
+        .build()
+        .map(|source| Arc::new(source) as Arc<dyn ContentSource>)
+        .map_err(|err| BootstrapError::Source(Box::new(err)))?;
+    Ok(vec![modrinth, curseforge])
 }
 
 /// 默认的整合包来源集合：Modrinth 官方

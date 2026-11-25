@@ -365,6 +365,7 @@ fn resolved_content(
 
 fn project(id: &str) -> ContentProject {
     ContentProject {
+        source: "modrinth",
         id: id.to_owned(),
         slug: Some(id.to_owned()),
         title: id.to_owned(),
