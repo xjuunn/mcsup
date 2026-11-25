@@ -334,6 +334,7 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 | 目标 MC 区间 | Fabric `depends.minecraft`、Forge `versionRange`，**按加载器分开记** | 高 |
 | 客/服（入口点推断） | 只有 `client` 入口、无 `main`/`server` | 中（有双端库反例） |
 | 客/服（字节码） | 常量池引用 `net/minecraft/client/`、`blaze3d` | 中，仅非 Fabric 生态采信 |
+| 专用服务端可用性（字节码） | 同一个 class 里既有顶层窗口容器（`JFrame` / `JDialog` / `JWindow` / `awt.Frame` / `awt.Window`），又调用 `Runtime.halt` | 中，结论落在 `gui_window` 字段（见下） |
 
 **依赖按加载器校验**：一个 jar 可以同时带多份清单（实测 `lukis-*` 同时有
 `fabric.mod.json` 与 `quilt.mod.json`），把不同加载器的依赖合并会造出假缺失
@@ -369,6 +370,40 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 前者是 `~1.20`、后者是 `[1.19.2]`）。判定与展示都按**目标加载器**那一份取值，
 合成一格会必然错一半。
 
+### 会弹窗的 mod（`gui_window`）
+
+专用服务端没有可操作的桌面。有一类 mod 在启动阶段自己开一个 AWT / Swing
+窗口，用户关掉窗口后调用 `Runtime.halt` 直接把 JVM 带走——脚本上看就是「一直
+不出现 `Done (`」，等到超时或人工介入。实测 `missingmodschecker`（Better MC
+BMC4 整合包带的一个依赖检查器）就是这个形状：`MissingModsWindow` 里
+`setVisible(true)` 之后 `Runtime.getRuntime().halt(0)`。
+
+这类文件没法用元数据识别：它的 `mods.toml` 只声明 `minecraft` 与 `txnilib`，
+`side` 全是 `BOTH`，客/服维度一条信息都没有。唯一的信号在字节码里，因此
+`ZipModInspector` 扫每个 class 的常量池，要求**同一个 class** 同时具备：
+
+- 一个能自成顶层窗口的容器：`javax/swing/JFrame`、`JDialog`、`JWindow`、
+  `java/awt/Frame`、`awt.Window`
+- `Runtime` 类与**完整的**常量池项 `halt`（带长度前缀比对，`halted` /
+  `asphalt` 这类更长的词不算）
+
+只引用窗口类名不算：实测 `blue_skies` 引用 `JFrame`、`midnightlib` 引用
+`JFileChooser`，两者在 dedicated server 上都正常装载。只查 `halt` 更不行——
+关闭钩子、watchdog 都用它。因此判定要求两者同处一个 class，且刻意不收
+`System.exit`（`exit` 这个字符串在任何 mod 里都可能出现）。
+
+结论按「能证明代码里有这条路，不能证明每次启动都走它」定位：
+
+| 位置 | 结论 |
+| --- | --- |
+| `mod inspect` / `server mod list` | 风险 `review`，并与 `gui_window` 字段、字节码证据一起列出；建议是停用而不是「启动一次确认」 |
+| `server start` 预检 | 阻断，原因 `gui_window`：专用服务端会卡在窗口上 |
+| `server mod fix` | 进移除表（移进 `.mcsup-trash/`），且**不为它补依赖**——补了也起不来 |
+| `mod inspect` 复核表 | 进停用表（与「仅客户端」「不匹配」同一阶段） |
+
+Sinytra Connector 这类加载器桥单独放行：它内嵌 Fabric 客户端 API，字节码里的
+窗口相关引用是自身的库成分，不是「会弹窗」的证据。
+
 ### 目标服务端匹配
 
 风险等级回答「这个 jar 本身是不是服务端的东西」，与装到哪台服务端无关。
@@ -394,6 +429,8 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
   `unclear`
 - `server mod list` 的「适配」列与 `mod inspect` 的 `fit` 字段是同一份形状，
   脚本不必按命令名分两套解析
+- 「会弹窗」是独立的一列事实：`mod inspect` 的 JSON 带布尔字段 `gui_window`，
+  风险列同时给出 `review`。脚本据此决定停用哪些文件，不必解析自然语言证据
 - 已知限制：原版服务端没有 mod 加载器，加载器维度因此不参与判定（它本来也
   不读 `mods/`）。这类服务端上只看 MC 版本与 Java 两个维度
 
@@ -401,6 +438,9 @@ CLI 是 Thin Entry Point，不承载业务逻辑；退出码、stdout/stderr、J
 
 只报告，不改开服流程：不删文件、不改清单、不阻断安装。是否排除某个 mod
 由用户决定。
+
+`gui_window` 是唯一「报告里就写着必须停用」的结论：这类文件装什么依赖都起不
+来，`server mod fix` 会把它排进移除表（仍走 `.mcsup-trash/`）。
 
 ## mcsup workspace（工作目录）
 
@@ -532,6 +572,12 @@ forge」——桥把 Fabric 并入了目标服务端可装载的加载器集合�
 文件刷一遍同样的「只支持 fabric」。`mcsup server mod fix` 识别这一情况后**补装
 Sinytra Connector，而不是移除这些 mod**；补桥只解决加载器一维，MC 版本或 Java
 也对不上的文件仍按不匹配处置。
+
+**会弹窗的 mod 单独一行，原因是 `gui_window`**：它与「仅客户端」「不匹配」同属
+停用阶段，但处置文案不同——不是「换适配版本」，而是「专用服务端无法运行，需
+停用」。安装复核走到这里时文件已经在 `mods/` 里，`mcsup server mod fix` 会把它
+排进移除表（仍走 `.mcsup-trash/`），不会为它补依赖。识别口径见 `mcsup mod`
+一节的「会弹窗的 mod」。
 
 清单里 `server: unsupported` 的文件不会装到服务端；`optional` 视为需要安装。
 `.mrpack` 由内置 zip 解析直接解开，不调用系统 `unzip`，归档内的 UTF-8

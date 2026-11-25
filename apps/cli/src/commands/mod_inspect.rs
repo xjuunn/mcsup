@@ -39,6 +39,11 @@ struct ModJson {
     server: String,
     confidence: String,
     risk: String,
+    /// 启动时会打开图形窗口并在关闭后终止 JVM
+    ///
+    /// 独立成字段而不是只写在 `evidence` 里：脚本要能直接按它决定停用哪些
+    /// 文件，不必解析自然语言证据。
+    gui_window: bool,
     missing_deps: Vec<String>,
     /// 依赖校验使用的目标加载器；`null` 表示未确定
     target_loader: Option<String>,
@@ -536,10 +541,19 @@ fn print_reason_detail(report: &ModReport, printer: Printer) {
         );
         printer.print_section(&deps);
     }
+    // 要图形窗口是「装到专用服务端必然起不来」，处置唯一（停用），
+    // 不能与「判不出」的建议混在一起
+    if cap.needs_gui_session() {
+        printer.print_section(text(
+            lang,
+            "  ↳ 建议：专用服务端不要启用该文件（mcsup server mod disable）",
+            "  ↳ suggestion: disable it on a dedicated server (mcsup server mod disable)",
+        ));
+    }
     for ev in &cap.side.evidence {
         printer.print_section(&format!("  ↳ [{}] {}", ev.source, ev.detail));
     }
-    if cap.side.server == SideSupport::Unknown {
+    if cap.side.server == SideSupport::Unknown && !cap.needs_gui_session() {
         printer.print_section(text(
             lang,
             "  ↳ 建议：装入 mods/ 后启动一次服务端确认",
@@ -631,6 +645,7 @@ fn to_json(report: &ModReport, target_loader: Option<ModLoader>, target: &Server
         server: cap.side.server.as_str().to_owned(),
         confidence: confidence_name(cap.side.confidence),
         risk: report.risk.as_str().to_owned(),
+        gui_window: cap.gui_window_halt,
         missing_deps: report.missing_deps.clone(),
         // 目标加载器是整批共享的口径，单条记录也带上，JSON 消费方不必另取
         target_loader: target_loader.map(|loader| loader.as_str().to_owned()),

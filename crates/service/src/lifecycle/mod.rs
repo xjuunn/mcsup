@@ -913,6 +913,9 @@ fn blocking_issue(entry: &ModBlocked) -> String {
         ModBlocker::Mismatch { detail } => {
             format!("{file}: {detail}（可停用或更换适配版本）")
         }
+        ModBlocker::GuiWindow => format!(
+            "{file}: 启动时会打开图形窗口并在关闭窗口后终止 JVM，专用服务端会卡住或直接退出（可停用该文件）"
+        ),
     }
 }
 

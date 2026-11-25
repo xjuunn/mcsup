@@ -311,6 +311,11 @@ fn remote_reason_text(entry: &RemoteModBlocked, lang: Lang) -> String {
                 entry.detail.len()
             ),
         ),
+        "gui_window" => pick(
+            lang,
+            "启动时会打开图形窗口并在关闭后终止 JVM，专用服务端无法运行（需停用）".to_owned(),
+            "opens a GUI window at startup and halts the JVM when it closes; cannot run on a dedicated server (disable it)".to_owned(),
+        ),
         _ => entry.kind.clone(),
     }
 }
@@ -354,6 +359,11 @@ fn reason_text(blocker: &ModBlocker, lang: Lang) -> String {
                 "missing Sinytra Connector bridge; {} Fabric-only mod(s) cannot load (mod fix can install it)",
                 files.len()
             ),
+        ),
+        ModBlocker::GuiWindow => pick(
+            lang,
+            "启动时会打开图形窗口，关闭后终止 JVM（专用服务端无法运行，需停用）".to_owned(),
+            "opens a GUI window at startup and halts the JVM when it closes (cannot run on a dedicated server; disable it)".to_owned(),
         ),
     }
 }
@@ -582,5 +592,41 @@ mod tests {
         assert!(reason.contains("只支持 fabric"), "{reason}");
         assert!(reason.contains("停用"), "{reason}");
         assert!(!reason.contains("版本区间"), "{reason}");
+    }
+
+    /// 图形窗口阻断进停用表：补装与换版本都解决不了
+    #[test]
+    fn gui_window_blocker_is_disableable() {
+        let blocked = vec![ModBlocked {
+            file: "mods/missingmodschecker.jar".to_owned(),
+            blocker: ModBlocker::GuiWindow,
+        }];
+        let (disableable, missing) = partition(&blocked);
+        assert_eq!(disableable.len(), 1);
+        assert!(missing.is_empty());
+    }
+
+    /// 图形窗口的文案要说清「打开窗口」与「终止 JVM」，处置是停用
+    #[test]
+    fn gui_window_reason_mentions_window_and_disable() {
+        let reason = reason_text(&ModBlocker::GuiWindow, Lang::Zh);
+        assert!(reason.contains("图形窗口"), "{reason}");
+        assert!(reason.contains("JVM"), "{reason}");
+        assert!(reason.contains("停用"), "{reason}");
+        // 不能暗示「补装」：这类文件补什么依赖都起不来
+        assert!(!reason.contains("mod fix"), "{reason}");
+    }
+
+    /// 线格式的 `gui_window` 与本地渲染同义
+    #[test]
+    fn remote_gui_window_kind_renders_like_local() {
+        let entry = RemoteModBlocked {
+            file: "mods/missingmodschecker.jar".to_owned(),
+            kind: "gui_window".to_owned(),
+            detail: Vec::new(),
+        };
+        let reason = remote_reason_text(&entry, Lang::Zh);
+        assert!(reason.contains("图形窗口"), "{reason}");
+        assert!(reason.contains("停用"), "{reason}");
     }
 }

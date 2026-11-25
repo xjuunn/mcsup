@@ -1187,6 +1187,7 @@ fn wire_mod_blocked(entry: &ModBlocked) -> WireModBlocked {
         ModBlocker::ClientOnly => ("client_only", Vec::new()),
         ModBlocker::MissingBridge { files, .. } => ("missing_bridge", files.clone()),
         ModBlocker::Mismatch { detail } => ("mismatch", vec![detail.clone()]),
+        ModBlocker::GuiWindow => ("gui_window", Vec::new()),
     };
     WireModBlocked {
         file: entry.file.clone(),
