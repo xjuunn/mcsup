@@ -843,9 +843,14 @@ impl<'a> SetupUi<'a> {
                     str::to_owned,
                 );
                 self.printer.print_section(&label);
-                let rendered = std::io::stdout()
-                    .is_terminal()
-                    .then(|| crate::qr::render(content));
+                let rendered = std::io::stdout().is_terminal().then(|| {
+                    crate::qr::render(
+                        content,
+                        console::Term::stdout()
+                            .size_checked()
+                            .map(|(width, _)| usize::from(width)),
+                    )
+                });
                 match rendered.flatten() {
                     Some(qr) => {
                         print!("{qr}");
