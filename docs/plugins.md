@@ -2046,28 +2046,39 @@ SDK 主版本 == plugin API 主版本
 | --- | --- | --- |
 | 本地产物 | `--from ./x.zip` | 直接读文件 |
 | URL | `--url https://.../x.zip` | 下载；`--sha256` 或同名 `.sha256` |
-| GitHub 仓库 | `install https://github.com/<owner>/<repo>` | 解析引用到 commit，再下载该 commit 的仓库归档 |
+| GitHub 仓库 | `install https://github.com/<owner>/<repo>` | 裸链接取最新 Release 的 zip 资产；带 `/tree/<ref>` 时下载该引用的仓库归档 |
 
-GitHub 归档解析步骤（不执行任何代码）：
+GitHub 来源定位（不执行任何代码）：
 
-1. 把 `<owner>/<repo>` 与可选引用（`--ref`，或链接里的 `/tree/<ref>`）解析成
-   一个不可变的 commit SHA。引用本身就是完整 SHA 时跳过这一步。
-2. 下载 `https://codeload.github.com/<owner>/<repo>/zip/<SHA>`。
-3. 解包（归档顶层是 `<repo>-<SHA>/`，安装器会自动下钻一层）。
-4. 校验 `manifest.json` / `descriptor.json`，登记。
+1. 裸链接（不带 `/tree/<ref>`、也不带 `--ref`）：问
+   `api.github.com/repos/<owner>/<repo>/releases/latest`，从 `assets` 里挑 zip
+   资产。只看 `.zip`（`.zip.sha256` 是校验文件）；只有一个就用它，有多个时
+   优先名字以 `<repo>` 开头的那一个，仍不唯一就当作没有可用资产。
+2. 最新 Release 没有可用资产、查询失败（含未发布 Release）或资产有歧义时，
+   回退仓库归档：把默认分支解析成不可变的 commit SHA，下载
+   `https://codeload.github.com/<owner>/<repo>/zip/<SHA>`。引用本身就是完整
+   SHA 时跳过解析。
+3. 带引用（`--ref <ref>` 或链接里的 `/tree/<ref>`）时直接走第 2 步，不查
+   Release。
+4. 解包（GitHub 归档顶层是 `<repo>-<SHA>/`，安装器会自动下钻一层），校验
+   `manifest.json` / `descriptor.json`，登记。
 
-安装**不构建**：仓库内容必须是成品产物，`manifest.json` 必须在仓库根或唯一一层
-子目录里。作者把产物提交进默认分支时，用户装裸链接；把产物提交进独立的
-`dist` 分支时，用户装 `https://github.com/<owner>/<repo>/tree/dist`。
+安装**不构建**：来源内容必须是成品产物，`manifest.json` 必须在产物根或唯一
+一层子目录里。作者有三种发布姿势：
 
-解析引用优先问 `api.github.com`（未鉴权 60 次/小时）；不可达或被限流时回退到
-`github.com/<owner>/<repo>/commits/<ref>.atom`（同主机、无速率限制）。两条都
-失败才报 `unavailable`。私有仓库两条路都拿不到内容，请改用 `--from` 安装本地
-构建。
+- 把产物提交进默认分支：装裸链接（存在 Release 时优先装 Release，行为一致）；
+- 把产物提交进 `dist` 分支：装 `https://github.com/<owner>/<repo>/tree/dist`；
+- 用 Release 挂 zip 资产：装裸链接，自动取最新版本。
+
+`api.github.com` 未鉴权限 60 次/小时；不可达或被限流时，Release 查询直接回退
+仓库归档，引用解析再退到 `github.com/<owner>/<repo>/commits/<ref>.atom`（同
+主机、无速率限制）。都失败才报 `unavailable`。私有仓库拿不到内容，请改用
+`--from` 安装本地构建。
 
 `--ref` 只配 GitHub 链接：`[禁止]` 与 `--url` / `--from` 一起用。引用可以是
-分支、tag 或 commit；缺省即默认分支。想钉死版本请显式 `--ref <tag|sha>`，
-因为 `update` 会按记录的引用重新解析最新提交。
+分支、tag 或 commit；缺省是「最新 Release」（无可用资产时回退默认分支）。
+想钉死版本请显式 `--ref <tag|sha>`，因为 `update` 会按记录的引用重新解析：
+裸链接跟到最新 Release，`/tree/dist` 跟到 `dist` 分支最新提交。
 
 `--sha256` 比对的是**归档字节**的摘要，而 GitHub 重新打包同一 commit 时字节
 可能变化（压缩实现、时间戳），所以它主要用于 `--url`。要固定内容请改用
@@ -2474,8 +2485,9 @@ mcsup __plugin-host --data-dir <path> [--idle-timeout <secs>]   # 隐藏
 - `plugin update` 不带 `--to` 时按记录里的来源重新拉取，产物 id 必须仍是同一个；
   本地来源在安装时已规范成绝对路径，`update` 不依赖当前工作目录。GitHub 来源
   记录的是**引用**（分支 / tag / commit）而不是解析出来的 commit，所以裸链接
-  装上的插件 `update` 会跟到默认分支的最新提交，`.../tree/dist` 装上的会跟到
-  `dist` 分支最新提交；想钉死版本用 `--ref <tag|sha>`。
+  装上的插件 `update` 会跟到最新 Release（无可用资产时跟到默认分支最新提交），
+  `.../tree/dist` 装上的会跟到 `dist` 分支最新提交；想钉死版本用
+  `--ref <tag|sha>`。
 - 非交互缺必填参数：退出码 2，stderr 说明缺什么；配置必填项缺失时以
   `missing` 字段返回并在下一轮 `config set` 后补上。
 - `config set` / `config get` 的 `<key>` 支持点号路径（`qq.appId`）：写入
@@ -3094,14 +3106,20 @@ GitHub 来源**不需要**任何索引文件。仓库内容就是产物：
 └── node_modules/          # Node / TS 插件：运行时依赖，必须自备
 ```
 
-两种发布姿势：
+三种发布姿势：
 
 | 姿势 | 作者 | 用户命令 |
 | --- | --- | --- |
-| 默认分支携带产物 | 把 `mcsup-plugin build --out .` 的产物提交进默认分支 | `install https://github.com/<owner>/<repo>` |
+| Release 资产 | tag 上构建 zip 并挂到 Release | `install https://github.com/<owner>/<repo>`（装最新 Release） |
+| 默认分支携带产物 | 把 `mcsup-plugin build --out .` 的产物提交进默认分支 | `install https://github.com/<owner>/<repo>`（没有可用 Release 时生效） |
 | 独立 `dist` 分支 | 产物提交进 `dist` 分支，代码留在默认分支 | `install https://github.com/<owner>/<repo>/tree/dist` |
 
-`mcsup-plugin publish` 封装第二种：构建后把产物写成一次提交推到 `dist` 分支，
+裸链接优先装最新 Release：资产里只能有一个 zip（`.zip.sha256` 不算），有多个时
+优先 `<repo>-*` 命名，否则回退仓库归档。Release 姿势不需要把产物提交进任何
+分支，`update` 会跟随最新 Release；要固定版本请用 `--url` 指向具体资产的
+`releases/download/<tag>/<asset>` 地址。
+
+`mcsup-plugin publish` 封装第三种：构建后把产物写成一次提交推到 `dist` 分支，
 不碰工作区，也不需要用户手工切分支。
 
 规则：

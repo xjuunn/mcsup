@@ -1,16 +1,26 @@
-//! GitHub 仓库归档：`<owner>/<repo>[@<ref>]` → commit → 归档 zip
+//! GitHub 来源定位：仓库 / Release 资产 → 可直接下载的 zip
 //!
-//! 只做两件事，都不执行仓库里的代码：
+//! 只做定位，不执行仓库里的代码：
 //!
-//! 1. 把分支 / tag / commit 解析成一个不可变的 commit id；
-//! 2. 拼出 `codeload.github.com` 的归档地址交给调用方下载、解包与校验。
+//! - 带引用（`/tree/<ref>`、`--ref`）时，把分支 / tag / commit 解析成不可变的
+//!   commit id，拼出 `codeload.github.com` 的归档地址；
+//! - 裸链接（`https://github.com/<owner>/<repo>`）表示**最新 Release**：取
+//!   `releases/latest` 里的 zip 资产，仓库用 Release 分发成品时用户不用记
+//!   版本号与资产名；
+//! - 最新 Release 没有可用资产（或接口不可达）时回退到默认分支归档，保持
+//!   「把产物提交进仓库」这条路可用。
+//!
+//! # 资产选择
+//!
+//! 只看 `.zip` 资产（`.zip.sha256` 不算）。恰好一个就直接用；有多个时优先
+//! 名字以 `<repo>` 开头的那一个；仍不唯一就当作没有可用资产而回退——猜错会
+//! 装进别的产物，宁可落到仓库归档让作者补一个命名明确的资产。
 //!
 //! # 为什么不再走 `git`
 //!
 //! 旧实现要求本机装 git、作者在仓库根维护 `mcsup-plugin.json` 并在 Release
-//! 里挂平台产物。三步里任何一步没做好，用户就装不上。现在仓库本身就是产物：
-//! 用户粘贴裸链接即可，作者只要把 `manifest.json` 提交进仓库（或提交进一个
-//! `dist` 分支），发布就是 `git push`。
+//! 里挂平台产物。现在用户粘贴裸链接即可，作者可以选「把 `manifest.json` 提交
+//! 进仓库（或 `dist` 分支）」或「在 Release 里挂 zip」任一种。
 //!
 //! # 解析 commit 的两条路
 //!
@@ -31,16 +41,28 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// User-Agent：`api.github.com` 会拒绝没有 UA 的请求
 const USER_AGENT: &str = concat!("mcsup/", env!("CARGO_PKG_VERSION"));
 
-/// 解析到的归档定位
+/// 解析到的定位
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GithubArchive {
-    /// 解析到的 commit（小写 hex）
-    pub commit: String,
+    /// 定位标识：走仓库归档时是 commit id（小写 hex），走 Release 资产时是 tag
+    pub resolved: String,
     /// 归档 zip 的下载地址
     pub url: String,
 }
 
-/// 解析分支 / tag / commit，返回不可变的归档地址
+/// 最新 Release 里的插件压缩包
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReleaseAsset {
+    /// Release 的 tag
+    tag: String,
+    /// 资产的下载地址
+    url: String,
+}
+
+/// 定位下载地址
+///
+/// `rev` 为 `None`（裸链接）时先取最新 Release 的 zip 资产，取不到可用资产
+/// 再回退默认分支归档。
 ///
 /// # Errors
 ///
@@ -50,6 +72,34 @@ pub(crate) fn resolve(
     repo: &str,
     rev: Option<&str>,
 ) -> Result<GithubArchive, HostError> {
+    if rev.is_none() {
+        match latest_release_asset(owner, repo) {
+            Ok(Some(asset)) => {
+                tracing::info!(
+                    owner,
+                    repo,
+                    tag = %asset.tag,
+                    url = %asset.url,
+                    "resolved GitHub release asset"
+                );
+                return Ok(GithubArchive {
+                    resolved: asset.tag,
+                    url: asset.url,
+                });
+            }
+            Ok(None) => tracing::info!(
+                owner,
+                repo,
+                "latest GitHub release has no plugin archive; using the default branch archive"
+            ),
+            Err(reason) => tracing::warn!(
+                owner,
+                repo,
+                %reason,
+                "cannot use the latest GitHub release; using the default branch archive"
+            ),
+        }
+    }
     let rev = rev.unwrap_or("HEAD");
     let commit = if is_full_commit(rev) {
         rev.to_ascii_lowercase()
@@ -65,8 +115,85 @@ pub(crate) fn resolve(
     );
     Ok(GithubArchive {
         url: archive_url(owner, repo, &commit),
-        commit,
+        resolved: commit,
     })
+}
+
+/// 取最新 Release 里的插件压缩包
+///
+/// `Ok(None)` 表示没有可用资产（未发布 Release 也算），由调用方回退默认分支；
+/// `Err` 表示查询失败或资产有歧义，同样回退但记一条 warn。
+fn latest_release_asset(owner: &str, repo: &str) -> Result<Option<ReleaseAsset>, String> {
+    let url = format!("https://api.github.com/repos/{owner}/{repo}/releases/latest");
+    let Some(body) = http_get_optional(&url)? else {
+        return Ok(None);
+    };
+    pick_release_asset(&body, repo)
+}
+
+/// 从 `releases/latest` 的 JSON 里挑出插件压缩包
+///
+/// # Errors
+///
+/// 响应不是合法 JSON，或存在多个同样合用的 zip 资产时返回原因。
+fn pick_release_asset(body: &str, repo: &str) -> Result<Option<ReleaseAsset>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|err| format!("invalid release payload: {err}"))?;
+    let tag = value
+        .get("tag_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("latest")
+        .to_owned();
+    let Some(assets) = value.get("assets").and_then(serde_json::Value::as_array) else {
+        return Ok(None);
+    };
+    let candidates = assets
+        .iter()
+        .filter_map(|asset| {
+            let name = asset.get("name")?.as_str()?;
+            let url = asset.get("browser_download_url")?.as_str()?;
+            is_plugin_archive(name).then(|| (name.to_owned(), url.to_owned()))
+        })
+        .collect::<Vec<_>>();
+    let picked = match candidates.len() {
+        0 => return Ok(None),
+        1 => candidates.into_iter().next().map(|(_, url)| url),
+        // 多个 zip：优先 `<repo>-<version>.zip` 这种以仓库名开头的资产
+        _ => {
+            let prefix = format!("{repo}-").to_ascii_lowercase();
+            let exact = format!("{repo}.zip").to_ascii_lowercase();
+            let preferred = candidates
+                .iter()
+                .filter(|(name, _)| {
+                    let lower = name.to_ascii_lowercase();
+                    lower.starts_with(&prefix) || lower == exact
+                })
+                .map(|(_, url)| url.clone())
+                .collect::<Vec<_>>();
+            if let [url] = preferred.as_slice() {
+                Some(url.clone())
+            } else {
+                let names = candidates
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(format!(
+                    "release {tag} has multiple zip assets ({names}); \
+                     install one of them with --url"
+                ));
+            }
+        }
+    };
+    let Some(url) = picked else {
+        return Ok(None);
+    };
+    Ok(Some(ReleaseAsset { tag, url }))
+}
+
+/// 是否为可安装的压缩包资产：只看 `.zip`，`.zip.sha256` 是校验文件
+fn is_plugin_archive(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(".zip")
 }
 
 fn resolve_commit(owner: &str, repo: &str, rev: &str) -> Result<String, HostError> {
@@ -104,6 +231,29 @@ fn atom_commit(owner: &str, repo: &str, rev: &str) -> Result<String, String> {
 }
 
 fn http_get(url: &str) -> Result<String, String> {
+    let (status, body) = http_get_raw(url)?;
+    if !status.is_success() {
+        return Err(format!("HTTP {status}"));
+    }
+    Ok(body)
+}
+
+/// 同 [`http_get`]，但把 404 当成「没有」而不是失败
+///
+/// 仓库没有 Release 时 `releases/latest` 返回 404，这是常态，不该按错误处理。
+fn http_get_optional(url: &str) -> Result<Option<String>, String> {
+    let (status, body) = http_get_raw(url)?;
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        return Err(format!("HTTP {status}"));
+    }
+    Ok(Some(body))
+}
+
+/// 发 GET，返回状态码与正文
+fn http_get_raw(url: &str) -> Result<(reqwest::StatusCode, String), String> {
     // `rustls-no-provider` 下必须先装 crypto provider，否则 reqwest 内部线程 panic
     crate::http::install_crypto_provider();
     let client = reqwest::blocking::Client::builder()
@@ -117,10 +267,8 @@ fn http_get(url: &str) -> Result<String, String> {
         .send()
         .map_err(|err| format!("{err}"))?;
     let status = response.status();
-    if !status.is_success() {
-        return Err(format!("HTTP {status}"));
-    }
-    response.text().map_err(|err| format!("read body: {err}"))
+    let body = response.text().map_err(|err| format!("read body: {err}"))?;
+    Ok((status, body))
 }
 
 /// `codeload` 归档地址
@@ -170,7 +318,7 @@ mod tests {
     #[test]
     fn full_commit_skips_resolution() {
         let archive = resolve("octocat", "Hello-World", Some(SHA)).expect("resolve");
-        assert_eq!(archive.commit, SHA);
+        assert_eq!(archive.resolved, SHA);
         assert_eq!(
             archive.url,
             format!("https://codeload.github.com/octocat/Hello-World/zip/{SHA}")
@@ -181,7 +329,7 @@ mod tests {
     fn full_commit_is_lowercased() {
         let upper = SHA.to_ascii_uppercase();
         let archive = resolve("o", "r", Some(&upper)).expect("resolve");
-        assert_eq!(archive.commit, SHA);
+        assert_eq!(archive.resolved, SHA);
     }
 
     #[test]
@@ -222,5 +370,109 @@ mod tests {
         assert!(is_full_commit(&"a".repeat(64)));
         assert!(!is_full_commit("7fd1a60"));
         assert!(!is_full_commit(&"z".repeat(40)));
+    }
+
+    /// 构造 `releases/latest` 响应：`assets` 是 `(名字, 地址)` 列表
+    fn release_json(tag: &str, assets: &[(&str, &str)]) -> String {
+        let assets = assets
+            .iter()
+            .map(|(name, url)| {
+                serde_json::json!({
+                    "name": name,
+                    "browser_download_url": url,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({ "tag_name": tag, "assets": assets }).to_string()
+    }
+
+    #[test]
+    fn release_asset_is_the_only_zip() {
+        let body = release_json(
+            "v0.1.0",
+            &[
+                (
+                    "plugin-0.1.0.zip",
+                    "https://github.com/o/r/releases/download/v0.1.0/plugin-0.1.0.zip",
+                ),
+                (
+                    "plugin-0.1.0.zip.sha256",
+                    "https://github.com/o/r/releases/download/v0.1.0/plugin-0.1.0.zip.sha256",
+                ),
+            ],
+        );
+        let asset = pick_release_asset(&body, "plugin")
+            .expect("pick")
+            .expect("asset");
+        assert_eq!(asset.tag, "v0.1.0");
+        assert_eq!(
+            asset.url,
+            "https://github.com/o/r/releases/download/v0.1.0/plugin-0.1.0.zip"
+        );
+    }
+
+    #[test]
+    fn release_without_a_zip_has_no_usable_asset() {
+        let body = release_json(
+            "v1",
+            &[("plugin.tar.gz", "https://example.test/plugin.tar.gz")],
+        );
+        assert!(
+            pick_release_asset(&body, "plugin")
+                .expect("parse")
+                .is_none()
+        );
+        // 没有 assets 字段（预发布已删除全部资产）同样视为没有
+        assert!(
+            pick_release_asset(r#"{"tag_name":"v1"}"#, "plugin")
+                .expect("parse")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn multiple_zips_prefer_the_repo_prefixed_one() {
+        let body = release_json(
+            "v1",
+            &[
+                ("docs.zip", "https://example.test/docs.zip"),
+                ("plugin-1.0.0.zip", "https://example.test/plugin-1.0.0.zip"),
+            ],
+        );
+        let asset = pick_release_asset(&body, "plugin")
+            .expect("pick")
+            .expect("asset");
+        assert_eq!(asset.url, "https://example.test/plugin-1.0.0.zip");
+        // 仓库名恰好就是压缩包名也算明确
+        let body = release_json(
+            "v1",
+            &[
+                ("plugin.zip", "https://example.test/plugin.zip"),
+                ("extra.zip", "https://example.test/extra.zip"),
+            ],
+        );
+        let asset = pick_release_asset(&body, "plugin")
+            .expect("pick")
+            .expect("asset");
+        assert_eq!(asset.url, "https://example.test/plugin.zip");
+    }
+
+    #[test]
+    fn ambiguous_zips_are_rejected() {
+        let body = release_json(
+            "v1",
+            &[
+                ("a.zip", "https://example.test/a.zip"),
+                ("b.zip", "https://example.test/b.zip"),
+            ],
+        );
+        let err = pick_release_asset(&body, "plugin").expect_err("ambiguous");
+        assert!(err.contains("a.zip"), "{err}");
+        assert!(err.contains("--url"), "{err}");
+    }
+
+    #[test]
+    fn invalid_release_payload_is_rejected() {
+        assert!(pick_release_asset("not json", "plugin").is_err());
     }
 }

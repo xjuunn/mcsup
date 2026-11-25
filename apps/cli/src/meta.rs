@@ -1252,8 +1252,8 @@ pub(crate) fn plugin_json_arg() -> &'static str {
 #[must_use]
 pub(crate) fn plugin_source_arg() -> &'static str {
     t(
-        "本地路径、压缩包 URL 或 GitHub 仓库链接（省略时由 --from / --url 指定）",
-        "local path, archive URL or GitHub repository link (omit when using --from / --url)",
+        "本地路径、压缩包 URL 或 GitHub 仓库链接（裸链接装最新 Release，省略时由 --from / --url 指定）",
+        "local path, archive URL or GitHub repository link (a bare link installs the latest release; omit when using --from / --url)",
     )
 }
 
@@ -1270,8 +1270,8 @@ pub(crate) fn plugin_url_arg() -> &'static str {
 #[must_use]
 pub(crate) fn plugin_ref_arg() -> &'static str {
     t(
-        "GitHub 仓库的分支 / tag / commit（缺省为默认分支）",
-        "branch / tag / commit of the GitHub repository (default: the default branch)",
+        "GitHub 仓库的分支 / tag / commit（缺省为最新 Release，无可用资产时回退默认分支）",
+        "branch / tag / commit of the GitHub repository (default: the latest release, falling back to the default branch)",
     )
 }
 

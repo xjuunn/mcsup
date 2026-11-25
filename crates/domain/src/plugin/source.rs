@@ -4,7 +4,8 @@
 //!
 //! - **用户输入**（`mcsup plugin install <source>`）：本地路径、远程压缩包直链，
 //!   或一个裸的 GitHub 仓库链接（`https://github.com/<owner>/<repo>`，可带
-//!   `/tree/<ref>` 后缀）；
+//!   `/tree/<ref>` 后缀）。裸链接表示**最新 Release**：安装器优先取该仓库
+//!   `releases/latest` 里的 zip 资产，没有可用资产时回退默认分支归档；
 //! - **安装记录**（`PluginRecord::source`）：`local:<path>` / `url:<url>` /
 //!   `github:<owner>/<repo>[@<ref>]`。`plugin update` 直接把它喂回本模块，
 //!   所以写入（[`PluginSource`] 的 `Display`）与读取（[`PluginSource::parse_record`]）
@@ -13,11 +14,11 @@
 //!
 //! # 记录里存「引用」而不是「提交」
 //!
-//! GitHub 来源记录的是用户请求的引用（分支 / tag，缺省即默认分支），不是解析
-//! 出来的 commit。写成 commit 会丢掉分支名：作者把产物放在 `dist` 分支、用户装
-//! `.../tree/dist` 时，记录只留下一个 sha，`update` 就再也跟不动 `dist` 了。
-//! 想钉死版本的用户可以显式 `--ref <tag>` 或 `--ref <sha>`，那时记录里本来
-//! 就是不可移动的引用。
+//! GitHub 来源记录的是用户请求的引用（分支 / tag，缺省即「最新 Release」），
+//! 不是解析出来的 commit。写成 commit 会丢掉分支名：作者把产物放在 `dist`
+//! 分支、用户装 `.../tree/dist` 时，记录只留下一个 sha，`update` 就再也跟不动
+//! `dist` 了。想钉死版本的用户可以显式 `--ref <tag>` 或 `--ref <sha>`，那时
+//! 记录里本来就是不可移动的引用。
 //!
 //! # 为什么不接受任意 git 地址
 //!
@@ -53,7 +54,8 @@ pub enum PluginSource {
     Url(String),
     /// GitHub 仓库归档
     ///
-    /// `rev` 是分支 / tag / commit；`None` 表示仓库的默认分支。
+    /// `rev` 是分支 / tag / commit；`None` 表示**最新 Release**（仓库未发布
+    /// 可用资产时回退默认分支归档）。
     Github {
         /// 仓库所有者
         owner: String,
@@ -122,7 +124,7 @@ impl PluginSource {
         Err(InvalidSource::new(raw, SourceReject::UnknownPrefix))
     }
 
-    /// 请求的引用（分支 / tag / commit）；`None` 表示默认分支
+    /// 请求的引用（分支 / tag / commit）；`None` 表示最新 Release
     #[must_use]
     pub fn rev(&self) -> Option<&str> {
         match self {
