@@ -843,14 +843,9 @@ impl<'a> SetupUi<'a> {
                     str::to_owned,
                 );
                 self.printer.print_section(&label);
-                let rendered = std::io::stdout().is_terminal().then(|| {
-                    crate::qr::render(
-                        content,
-                        console::Term::stdout()
-                            .size_checked()
-                            .map(|(width, _)| usize::from(width)),
-                    )
-                });
+                let rendered = std::io::stdout()
+                    .is_terminal()
+                    .then(|| crate::qr::render(content, crate::qr::terminal_columns()));
                 // 二维码与链接一起给：终端画不出来、字缝或窗口太窄扫不动时，
                 // 用户可以直接打开链接；也能核对自己扫的是哪个账号。
                 if let Some(qr) = rendered.flatten() {
