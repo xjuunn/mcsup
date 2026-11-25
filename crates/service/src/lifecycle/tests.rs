@@ -519,10 +519,23 @@ struct Fixture {
     server_dir: PathBuf,
     name: String,
     id: domain::server::meta::ServerId,
-    _tmp: tempfile::TempDir,
+    /// 测试期间的临时根目录；JVM home 也建在它下面，必须活到用例结束
+    tmp: tempfile::TempDir,
 }
 
 impl Fixture {
+    /// 建一个真实存在的 JVM home（`bin/java` 落地）
+    ///
+    /// 登记筛选要求可执行文件存在：`server start` 会先过滤掉路径已失效的
+    /// 登记，夹具必须是能跑的形状，否则用例会被自己的过滤挡掉。
+    fn java_home(&self, major: i64) -> PathBuf {
+        let home = self.tmp.path().join(format!("jdk{major}"));
+        let bin = home.join("bin");
+        crate::fs::create_dir_all(&bin).expect("mkdir");
+        crate::fs::write(bin.join(domain::java::java_exe_name()), b"stub").expect("stub");
+        home
+    }
+
     fn new(with_jar: bool) -> Self {
         let tmp = tempfile::tempdir().expect("tmp");
         let ws = ws_fixture(tmp.path());
@@ -565,7 +578,7 @@ impl Fixture {
             server_dir: server.dir,
             name,
             id,
-            _tmp: tmp,
+            tmp,
         }
     }
 }
@@ -720,10 +733,9 @@ fn start_without_accept_eula_fails_and_leaves_file_untouched() {
 #[test]
 fn start_with_accept_eula_writes_true_and_picks_highest_java() {
     let fixture = Fixture::new(true);
-    let runtimes = vec![
-        runtime(Path::new("/opt/java17"), 17),
-        runtime(Path::new("/opt/java21"), 21),
-    ];
+    let j17 = fixture.java_home(17);
+    let j21 = fixture.java_home(21);
+    let runtimes = vec![runtime(&j17, 17), runtime(&j21, 21)];
     let supervisor = Arc::new(FakeSupervisor::default());
     let svc = service(
         &fixture,
@@ -746,7 +758,7 @@ fn start_with_accept_eula_writes_true_and_picks_highest_java() {
         mcsup_launch_jar("server.jar"),
         "默认启动方式为相对服务器目录的 server.jar"
     );
-    assert_eq!(request.java_bin, java_bin_under(Path::new("/opt/java21")));
+    assert_eq!(request.java_bin, java_bin_under(&j21));
     assert_eq!(request.ram_mib, Some(DEFAULT_RAM_MIB));
     assert_eq!(
         request.supervisor_exe,
@@ -758,10 +770,9 @@ fn start_with_accept_eula_writes_true_and_picks_highest_java() {
 #[test]
 fn start_honors_bound_java_major() {
     let fixture = Fixture::new(true);
-    let runtimes = vec![
-        runtime(Path::new("/opt/java17"), 17),
-        runtime(Path::new("/opt/java21"), 21),
-    ];
+    let j17 = fixture.java_home(17);
+    let j21 = fixture.java_home(21);
+    let runtimes = vec![runtime(&j17, 17), runtime(&j21, 21)];
     fixture
         .registry
         .update_settings(
@@ -784,10 +795,7 @@ fn start_honors_bound_java_major() {
     start(&svc, &fixture.name, true).expect("start");
 
     let requests = supervisor.starts();
-    assert_eq!(
-        requests[0].java_bin,
-        java_bin_under(Path::new("/opt/java17"))
-    );
+    assert_eq!(requests[0].java_bin, java_bin_under(&j17));
 }
 
 /// 记录缺少 Java 要求时按 MC 版本补：`Fabric` / `Quilt` / `NeoForge` 的旧记录
@@ -813,10 +821,9 @@ fn meta_java_major_falls_back_to_mc_version() {
 #[test]
 fn start_honors_version_required_java_major() {
     let fixture = Fixture::new(true);
-    let runtimes = vec![
-        runtime(Path::new("/opt/java17"), 17),
-        runtime(Path::new("/opt/java21"), 21),
-    ];
+    let j17 = fixture.java_home(17);
+    let j21 = fixture.java_home(21);
+    let runtimes = vec![runtime(&j17, 17), runtime(&j21, 21)];
     fixture
         .registry
         .update_core(
@@ -844,7 +851,7 @@ fn start_honors_version_required_java_major() {
     let requests = supervisor.starts();
     assert_eq!(
         requests[0].java_bin,
-        java_bin_under(Path::new("/opt/java21")),
+        java_bin_under(&j21),
         "版本要求的 Java 大版本必须被采纳"
     );
 }
@@ -873,7 +880,7 @@ fn start_reports_unknown_when_version_required_major_missing() {
     let svc = service(
         &fixture,
         java_service(
-            MemJavaRepo::new(vec![runtime(Path::new("/opt/java17"), 17)], true),
+            MemJavaRepo::new(vec![runtime(&fixture.java_home(17), 17)], true),
             vec![],
         ),
         Arc::clone(&supervisor),
@@ -907,7 +914,7 @@ fn start_reports_unknown_java_major_when_bound_runtime_missing() {
     let svc = service(
         &fixture,
         java_service(
-            MemJavaRepo::new(vec![runtime(Path::new("/opt/java21"), 21)], true),
+            MemJavaRepo::new(vec![runtime(&fixture.java_home(21), 21)], true),
             vec![],
         ),
         Arc::clone(&supervisor),
@@ -941,7 +948,7 @@ fn start_honors_ram_setting_and_opts_override_it() {
     let svc = service(
         &fixture,
         java_service(
-            MemJavaRepo::new(vec![runtime(Path::new("/opt/java21"), 21)], true),
+            MemJavaRepo::new(vec![runtime(&fixture.java_home(21), 21)], true),
             vec![],
         ),
         Arc::clone(&supervisor),
@@ -963,7 +970,7 @@ fn start_honors_ram_setting_and_opts_override_it() {
     let explicit_svc = service(
         &fixture,
         java_service(
-            MemJavaRepo::new(vec![runtime(Path::new("/opt/java21"), 21)], true),
+            MemJavaRepo::new(vec![runtime(&fixture.java_home(21), 21)], true),
             vec![],
         ),
         Arc::clone(&explicit_supervisor),
@@ -990,6 +997,10 @@ fn start_without_java_reports_no_java() {
 fn start_scans_when_never_scanned_and_uses_found_runtime() {
     let fixture = Fixture::new(true);
     let home = fixture.server_dir.join("fake-jvm");
+    // 扫描到的 home 也必须是可用形状：否则会被登记筛选过滤成「没有 Java」
+    let bin = home.join("bin");
+    crate::fs::create_dir_all(&bin).expect("mkdir");
+    crate::fs::write(bin.join(domain::java::java_exe_name()), b"stub").expect("stub");
     let svc = service(
         &fixture,
         java_service(MemJavaRepo::new(vec![], false), vec![home.clone()]),
@@ -1016,7 +1027,7 @@ fn start_maps_port_already_running() {
     let svc = service(
         &fixture,
         java_service(
-            MemJavaRepo::new(vec![runtime(Path::new("/opt/java21"), 21)], true),
+            MemJavaRepo::new(vec![runtime(&fixture.java_home(21), 21)], true),
             vec![],
         ),
         Arc::clone(&supervisor),
@@ -1130,7 +1141,7 @@ fn restart_stops_then_starts() {
     let svc = service(
         &fixture,
         java_service(
-            MemJavaRepo::new(vec![runtime(Path::new("/opt/java21"), 21)], true),
+            MemJavaRepo::new(vec![runtime(&fixture.java_home(21), 21)], true),
             vec![],
         ),
         Arc::clone(&supervisor),
@@ -1159,7 +1170,7 @@ fn restart_aborts_on_stop_timeout_without_start() {
     let svc = service(
         &fixture,
         java_service(
-            MemJavaRepo::new(vec![runtime(Path::new("/opt/java21"), 21)], true),
+            MemJavaRepo::new(vec![runtime(&fixture.java_home(21), 21)], true),
             vec![],
         ),
         Arc::clone(&supervisor),
@@ -1679,16 +1690,14 @@ fn fabric_fixture(with_jar: bool) -> Fixture {
         server_dir: server.dir,
         name: server.meta.name.as_str().to_owned(),
         id: server.meta.id.clone(),
-        _tmp: tmp,
+        tmp,
     }
 }
 
-fn fabric_java() -> JavaService {
+fn fabric_java(fixture: &Fixture) -> JavaService {
+    let home = fixture.java_home(21);
     JavaService::new(
-        Arc::new(MemJavaRepo::new(
-            vec![runtime(Path::new("/opt/java21"), 21)],
-            true,
-        )),
+        Arc::new(MemJavaRepo::new(vec![runtime(&home, 21)], true)),
         Arc::new(FixedScanner { homes: vec![] }),
         Arc::new(NoopJavaRegistry),
         Arc::new(NoopDownloader),
@@ -1700,7 +1709,7 @@ fn fabric_java() -> JavaService {
 fn with_preflight(fixture: &Fixture, supervisor: Arc<FakeSupervisor>) -> ServerLifecycleService {
     ServerLifecycleService::new(
         Arc::clone(&fixture.registry),
-        fabric_java(),
+        fabric_java(fixture),
         Arc::new(SupBackend {
             supervisor: supervisor as Arc<dyn SupervisorPort>,
         }),

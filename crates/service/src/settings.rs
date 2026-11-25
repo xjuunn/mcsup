@@ -505,7 +505,17 @@ mod tests {
 
     #[test]
     fn set_java_version_requires_registered_major() {
-        let (svc, _tmp) = fixture(vec![runtime(Path::new("/opt/java21"), 21)]);
+        // 登记必须是可用形状（`bin/java` 落地）：失效路径会被筛选掉，
+        // 那就变成「从未登记」而不是「已登记」
+        let home_dir = tempfile::tempdir().expect("tmp");
+        let home = home_dir.path().join("jdk21");
+        std::fs::create_dir_all(home.join("bin")).expect("mkdir");
+        std::fs::write(
+            home.join("bin").join(domain::java::java_exe_name()),
+            b"stub",
+        )
+        .expect("stub");
+        let (svc, _tmp) = fixture(vec![runtime(&home, 21)]);
         let change = set(&svc, SettingKey::JavaVersion, "21").expect("bound");
         assert_eq!(
             change.settings.java_major,

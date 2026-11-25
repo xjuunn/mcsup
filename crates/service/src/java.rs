@@ -247,7 +247,33 @@ impl JavaService {
             on_first_scan();
             self.scan(false, on_found)?;
         }
-        Ok(self.repo.list_sourced()?)
+        self.live_sourced()
+    }
+
+    /// 只保留本机仍然存在的运行时（远端条目原样保留）
+    ///
+    /// 注册表是扫描那一刻的快照：用户随时可能删掉 `.jdks`、换盘符或清缓存。
+    /// 不过滤就会选中一条已经不存在的路径，`Command::spawn` 以 OS 错误失败
+    /// （Windows 上是「系统找不到指定的路径」），用户看不出真正原因是登记过期。
+    /// 存在性判据与扫描、安装后定位共用同一个形状（[`domain::java::java_bin_under`]）。
+    ///
+    /// 只过滤、不删记录：盘符暂时卸载或网络盘掉线时记录应原样保留，重新出现后
+    /// 无需再扫描即可使用。远端条目的路径属于对端，本机无从探测，一律保留。
+    fn live_sourced(&self) -> Result<Vec<Sourced<JavaRuntime>>, JavaError> {
+        let mut alive: Vec<Sourced<JavaRuntime>> = Vec::new();
+        for entry in self.repo.list_sourced()? {
+            let present = !entry.origin.is_local()
+                || domain::java::java_bin_under(&entry.value.path).is_file();
+            if present {
+                alive.push(entry);
+            } else {
+                tracing::warn!(
+                    path = %entry.value.path.display(),
+                    "registered java runtime is gone; skipping it"
+                );
+            }
+        }
+        Ok(alive)
     }
 
     /// 列出全部已注册运行时；未扫描过则先扫描并逐个回调
@@ -268,7 +294,11 @@ impl JavaService {
             on_first_scan();
             self.scan(false, on_found)?;
         }
-        Ok(self.repo.list()?)
+        Ok(self
+            .live_sourced()?
+            .into_iter()
+            .map(|entry| entry.value)
+            .collect())
     }
 
     /// 从远端安装到 `{java_root}/{id}` 并注册
@@ -449,9 +479,9 @@ impl JavaService {
     /// 注册表失败时返回 [`JavaError::Repo`]
     pub fn find_by_major(&self, major: JavaMajor) -> Result<Vec<JavaRuntime>, JavaError> {
         Ok(self
-            .repo
-            .list()?
+            .live_sourced()?
             .into_iter()
+            .map(|entry| entry.value)
             .filter(|rt| rt.major == major)
             .collect())
     }
@@ -1063,8 +1093,17 @@ mod tests {
         registry: Arc<dyn JavaSourceRegistryPort>,
     ) -> (JavaService, Arc<MemRepo>) {
         let repo = Arc::new(MemRepo::new());
+        // 夹具里的 JDK 必须是真实形状（`bin/java` 存在）：登记筛选按这个判据
+        // 过滤，否则「列出一个运行时」的用例会被自己的过滤掉
+        let fake_home = tmp.join("jdk21");
+        crate::fs::create_dir_all(fake_home.join("bin")).expect("mkdir");
+        crate::fs::write(
+            fake_home.join("bin").join(domain::java::java_exe_name()),
+            b"stub",
+        )
+        .expect("stub");
         let scanner = Arc::new(FakeScanner {
-            homes: vec![tmp.join("jdk21")],
+            homes: vec![fake_home],
         });
         let extractor = Arc::new(FakeExtractor);
         let java_root = tmp.join("java");
@@ -1135,6 +1174,118 @@ mod tests {
         let list = service.list().expect("list");
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].major.as_i64(), 21);
+    }
+
+    /// 登记一处路径的运行时（是否可用由目录内容决定）
+    fn runtime_at(path: &Path, major: i64) -> JavaRuntime {
+        JavaRuntime {
+            id: format!("id-{major}"),
+            path: path.to_path_buf(),
+            major: JavaMajor::parse(major).expect("major"),
+            version: format!("{major}.0.0"),
+            vendor: JavaVendor::Temurin,
+            managed: false,
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    /// 登记的 JDK 目录被删掉后不能再参与挑选
+    ///
+    /// 回归：注册表是扫描那一刻的快照，删掉的 `.jdks` 仍会被 `pick_runtime`
+    /// 选中，`server start` / 安装器 `spawn` 只报「系统找不到指定的路径」，
+    /// 用户看不出真正原因是登记过期。
+    #[test]
+    fn list_skips_runtime_whose_java_is_gone() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (service, repo) = svc(tmp.path());
+        service.scan(false, &mut |_| {}).expect("scan");
+        let ghost = runtime_at(&tmp.path().join("deleted-jdk"), 17);
+        repo.upsert(&ghost).expect("upsert");
+
+        let list = service.list().expect("list");
+        assert_eq!(list.len(), 1, "{list:?}");
+        assert_eq!(list[0].major.as_i64(), 21);
+        assert!(
+            service
+                .find_by_major(JavaMajor::parse(17).expect("17"))
+                .expect("find")
+                .is_empty(),
+            "按大版本查找也不能返回已失效的登记"
+        );
+        // 只过滤不删记录：盘符暂时不在时，重新出现即可用
+        assert!(repo.get_by_path(&ghost.path).is_ok(), "record must stay");
+    }
+
+    /// 远端条目的路径属于对端，本机探测不到也不能当成失效过滤掉
+    #[test]
+    fn list_keeps_remote_runtime_with_unreachable_path() {
+        /// 本地 + 一条远端条目的组合仓库
+        struct RemoteMemo {
+            local: MemRepo,
+            remote: JavaRuntime,
+        }
+
+        impl JavaRuntimeRepository for RemoteMemo {
+            fn upsert(&self, runtime: &JavaRuntime) -> Result<(), RepositoryError> {
+                self.local.upsert(runtime)
+            }
+
+            fn list(&self) -> Result<Vec<JavaRuntime>, RepositoryError> {
+                let mut items = self.local.list()?;
+                items.push(self.remote.clone());
+                Ok(items)
+            }
+
+            fn get_by_path(&self, path: &Path) -> Result<JavaRuntime, RepositoryError> {
+                self.local.get_by_path(path)
+            }
+
+            fn remove(&self, path: &Path) -> Result<(), RepositoryError> {
+                self.local.remove(path)
+            }
+
+            fn scan_state(&self) -> Result<Option<i64>, RepositoryError> {
+                self.local.scan_state()
+            }
+
+            fn mark_scanned(&self, at: i64) -> Result<(), RepositoryError> {
+                self.local.mark_scanned(at)
+            }
+
+            fn list_sourced(&self) -> Result<Vec<Sourced<JavaRuntime>>, RepositoryError> {
+                let mut out = self.local.list_sourced()?;
+                out.push(Sourced {
+                    origin: port::Origin::Remote(
+                        port::RemoteName::parse("box").expect("remote name"),
+                    ),
+                    value: self.remote.clone(),
+                    offline: false,
+                });
+                Ok(out)
+            }
+        }
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let remote_only = runtime_at(Path::new("/remote-only/jdk21"), 21);
+        let service = JavaService::new(
+            Arc::new(RemoteMemo {
+                local: MemRepo::new(),
+                remote: remote_only.clone(),
+            }),
+            Arc::new(FakeScanner { homes: Vec::new() }),
+            Arc::new(FakeRegistry),
+            Arc::new(NoopDownloader),
+            Arc::new(FakeExtractor),
+            tmp.path().join("java"),
+        );
+
+        let sourced = service
+            .list_sourced(&mut || {}, &mut |_| {})
+            .expect("sourced");
+        assert_eq!(sourced.len(), 1, "{sourced:?}");
+        assert_eq!(sourced[0].value.path, remote_only.path);
+        assert!(!sourced[0].origin.is_local());
     }
 
     #[test]

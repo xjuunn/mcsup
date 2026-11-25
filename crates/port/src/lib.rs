@@ -501,8 +501,18 @@ pub struct ExtractError(pub String);
 #[non_exhaustive]
 pub enum InstallerError {
     /// 无法启动 java（路径不存在、权限不足）
-    #[error("failed to launch installer: {0}")]
-    Spawn(#[source] std::io::Error),
+    ///
+    /// 带上要启动的 `java`：只说「系统找不到指定的路径」时用户不知道缺的是
+    /// Java 还是服务器目录，也无法区分「没装 Java」与「登记的路径已失效」。
+    /// 启动原因由 source 链给出，这里不重复拼进消息，避免 `{err:#}` 打印两遍。
+    #[error("failed to launch installer: {java}")]
+    Spawn {
+        /// 尝试启动的 `java` 可执行文件
+        java: PathBuf,
+        /// 启动失败原因
+        #[source]
+        source: std::io::Error,
+    },
     /// 安装器非零退出（附带上游输出的尾部）
     #[error("installer exited with {code}: {tail}")]
     Failed {
@@ -537,7 +547,7 @@ impl InstallerError {
     pub fn category(&self) -> ErrorCategory {
         match self {
             Self::Cancelled => ErrorCategory::Cancelled,
-            Self::Spawn(_)
+            Self::Spawn { .. }
             | Self::Failed { .. }
             | Self::NoOutput { .. }
             | Self::TimedOut { .. } => ErrorCategory::Backend,

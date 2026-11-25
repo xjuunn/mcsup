@@ -238,6 +238,20 @@ impl JavaScanner for OneJavaScanner {
     }
 }
 
+/// 一个真实存在的 JVM home（`bin/java` 落地）与持有它的临时目录
+///
+/// 登记筛选要求路径上仍有可执行文件：报告一个不存在的 home 会被过滤成
+/// 「没有 Java」，起服用例就会在 `create` / `start` 处失败。返回的
+/// `TempDir` 必须活到用例结束，否则目录先被删，效果与「失效登记」相同。
+fn jdk_home() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path().join("jdk-21");
+    let bin = home.join("bin");
+    std::fs::create_dir_all(&bin).expect("mkdir");
+    std::fs::write(bin.join(java_exe_name()), b"stub").expect("stub");
+    (dir, home)
+}
+
 /// 假内容来源：候选、解析目标与哈希反查都由用例给定
 struct FakeContentSource {
     candidates: Vec<ContentCandidate>,
@@ -706,7 +720,7 @@ async fn unknown_variant_leaves_nothing_behind() {
 #[tokio::test]
 async fn create_uses_config_defaults_for_start_and_eula() {
     let supervisor = Arc::new(SwitchableSupervisor::default());
-    let home = PathBuf::from("/nonexistent/jdk-21");
+    let (_jdk, home) = jdk_home();
     let fixture = harness(jar_bytes(), |builder| {
         builder
             .jar_sources(vec![Arc::new(FixedSource::vanilla())])
@@ -806,7 +820,7 @@ fn start_requires_supervisor_exe_for_default_supervisor() {
 #[tokio::test]
 async fn start_status_restart_and_stop_share_one_supervisor() {
     let supervisor = Arc::new(SwitchableSupervisor::default());
-    let home = PathBuf::from("/nonexistent/jdk-21");
+    let (_jdk, home) = jdk_home();
     let fixture = harness(jar_bytes(), |builder| {
         builder
             .jar_sources(vec![Arc::new(FixedSource::vanilla())])
@@ -1555,7 +1569,7 @@ async fn creating_the_same_name_twice_is_a_conflict() {
 #[tokio::test]
 async fn accessors_share_the_same_config() {
     let supervisor = Arc::new(SwitchableSupervisor::default());
-    let home = PathBuf::from("/nonexistent/jdk-21");
+    let (_jdk, home) = jdk_home();
     let fixture = harness(jar_bytes(), |builder| {
         builder
             .jar_sources(vec![Arc::new(FixedSource::vanilla())])

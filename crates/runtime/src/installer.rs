@@ -200,7 +200,13 @@ fn run_and_capture(
 ) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), InstallerError> {
     // 调用方可以不设管道；不设就没有输出可收集，这里兜底成 piped
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(InstallerError::Spawn)?;
+    // 启动失败的错误要指名失败的 java：只有 OS 原文时，用户无法判断是
+    // 「没装 Java」还是「登记的路径已失效」
+    let program = PathBuf::from(command.get_program());
+    let mut child = command.spawn().map_err(|source| InstallerError::Spawn {
+        java: program.clone(),
+        source,
+    })?;
 
     // 两个管道各起一个读线程：输出可能很多，不读会写满管道导致子进程阻塞
     // （死锁），而主线程要留在轮询里响应取消
@@ -228,7 +234,10 @@ fn run_and_capture(
                 // 查询状态本身失败：别把子进程留在后台
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(InstallerError::Spawn(err));
+                return Err(InstallerError::Spawn {
+                    java: program,
+                    source: err,
+                });
             }
         }
 
@@ -647,6 +656,33 @@ mod tests {
             )
             .expect_err("must be cancelled");
         assert!(matches!(err, InstallerError::Cancelled), "{err:?}");
+    }
+
+    /// 启动失败必须点名要启动的 java
+    ///
+    /// 回归：只说 OS 原文「系统找不到指定的路径」时，用户无法判断缺的是
+    /// Java、安装目录还是登记路径已失效。
+    #[test]
+    fn spawn_failure_names_the_java_binary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = LocalInstallerRunner::new()
+            .run_installer(
+                &port::InstallerInvocation {
+                    java_bin: Path::new("definitely-not-a-java"),
+                    installer: Path::new("installer.jar"),
+                    dir: dir.path(),
+                    kind: port::InstallKind::Installer,
+                    extra_args: &[],
+                },
+                None,
+                &CancellationToken::new(),
+            )
+            .expect_err("must fail to spawn");
+        assert!(matches!(err, InstallerError::Spawn { .. }), "{err:?}");
+        let text = err.to_string();
+        assert!(text.contains("definitely-not-a-java"), "{text}");
+        // OS 原因仍在 source 链上，不与路径重复拼进消息
+        assert!(std::error::Error::source(&err).is_some(), "{err:?}");
     }
 
     /// 命令按 `java -jar <installer> --installServer <dir>` 组装，cwd 为安装目录
