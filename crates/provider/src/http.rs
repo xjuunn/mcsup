@@ -3,8 +3,9 @@ use domain::server::version::VersionId;
 use port::{ByteReader, ByteSource, RangeSource, RemoteStat, SourceError};
 use reqwest::Client;
 use serde::de::DeserializeOwned;
+use std::collections::HashMap;
 use std::ops::RangeInclusive;
-use std::sync::Once;
+use std::sync::{Mutex, Once};
 use std::time::Duration;
 use url::Url;
 
@@ -205,10 +206,23 @@ async fn read_text_prefix(mut response: reqwest::Response, limit: usize) -> Stri
     String::from_utf8_lossy(&body).into_owned()
 }
 
+/// 已记住的重定向落点上限
+///
+/// 分区下载的入口地址是稳定的，几百条足以覆盖一次批量安装；写满后不再缓存，
+/// 只让后续请求多走一次探测，不影响正确性。
+const RESOLVED_CACHE_MAX: usize = 512;
+
 /// 基于 HTTP 的字节来源
 #[derive(Debug)]
 pub struct HttpByteSource {
     http: Client,
+    /// 入口地址到重定向落点的映射
+    ///
+    /// CDN 的常见形态：入口主机（如 `edge.forgecdn.net`）对**带 Range** 的
+    /// 请求直接回 `404`，只有不带 Range 的请求才回 `302`。分段下载按入口地址
+    /// 发 Range 就永远拿不到数据，而单流跟随重定向即可成功。这里记住入口地址
+    /// 解析出的真实落点，让分段请求改发到落点。
+    resolved: Mutex<HashMap<String, Url>>,
 }
 
 impl HttpByteSource {
@@ -220,7 +234,92 @@ impl HttpByteSource {
     pub fn new() -> Result<Self, SourceError> {
         Ok(Self {
             http: build_stream_client()?,
+            resolved: Mutex::new(HashMap::new()),
         })
+    }
+
+    fn lock_resolved(&self) -> std::sync::MutexGuard<'_, HashMap<String, Url>> {
+        // 缓存只做加速，持锁期间不执行任何可能 panic 的操作；即使上一次持锁
+        // 线程中途 panic，污染的数据结构本身仍可用，直接取回即可。
+        self.resolved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// 记住入口地址到落点的映射；落点与入口相同则无需记录
+    fn remember_redirect(&self, requested: &Url, resolved: &Url) {
+        if requested == resolved {
+            return;
+        }
+        let mut cache = self.lock_resolved();
+        if cache.len() < RESOLVED_CACHE_MAX {
+            cache.insert(requested.as_str().to_owned(), resolved.clone());
+        }
+    }
+
+    fn cached_redirect(&self, requested: &Url) -> Option<Url> {
+        self.lock_resolved().get(requested.as_str()).cloned()
+    }
+
+    /// 用不带 Range 的 HEAD 探测入口地址被重定向到哪里
+    ///
+    /// 只有分段请求已经失败时才调用。HEAD 跟随重定向成功且落点与入口不同
+    /// 才返回落点，否则返回 `None` 让调用方保留原始错误。
+    async fn redirect_target(&self, location: &Url) -> Option<Url> {
+        let response = self.http.head(location.clone()).send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let resolved = response.url().clone();
+        (resolved != *location).then_some(resolved)
+    }
+
+    /// 向给定地址发一次带 Range 的 GET，要求上游以 `206` 返回区间
+    async fn request_range(
+        &self,
+        location: &Url,
+        range: &RangeInclusive<u64>,
+    ) -> Result<reqwest::Response, SourceError> {
+        let response = self
+            .http
+            .get(location.clone())
+            .header(
+                reqwest::header::RANGE,
+                format!("bytes={}-{}", range.start(), range.end()),
+            )
+            .send()
+            .await
+            .map_err(map_transport)?;
+        let status = response.status();
+        if status != reqwest::StatusCode::PARTIAL_CONTENT {
+            return Err(SourceError::Status {
+                status: status.as_u16(),
+            });
+        }
+        Ok(response)
+    }
+
+    /// 校验区间响应的 `Content-Range` 并交出响应体
+    fn finish_range(
+        response: reqwest::Response,
+        range: &RangeInclusive<u64>,
+    ) -> Result<Box<dyn ByteReader>, SourceError> {
+        let expected_prefix = format!("bytes {}-{}/", range.start(), range.end());
+        let content_range = response
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| {
+                SourceError::Decode(Box::new(std::io::Error::other("missing content-range")))
+            })?;
+        if !content_range.starts_with(&expected_prefix) {
+            return Err(SourceError::Decode(Box::new(std::io::Error::other(
+                format!(
+                    "content-range mismatch: expected `{expected_prefix}*`, got `{content_range}`"
+                ),
+            ))));
+        }
+        Ok(Box::new(HttpBody { response }))
     }
 }
 
@@ -444,6 +543,9 @@ impl RangeSource for HttpByteSource {
                 status: status.as_u16(),
             });
         }
+        // HEAD 已跟随重定向：这里拿到的是真实落点。记住它，分段请求才不会
+        // 在只认普通请求的入口主机上被 Range 挡掉。
+        self.remember_redirect(location, response.url());
         let supports_range = response
             .headers()
             .get(reqwest::header::ACCEPT_RANGES)
@@ -469,38 +571,26 @@ impl RangeSource for HttpByteSource {
         range: RangeInclusive<u64>,
     ) -> Result<Box<dyn ByteReader>, SourceError> {
         ensure_http_url(location)?;
-        let response = self
-            .http
-            .get(location.clone())
-            .header(
-                reqwest::header::RANGE,
-                format!("bytes={}-{}", range.start(), range.end()),
-            )
-            .send()
-            .await
-            .map_err(map_transport)?;
-        let status = response.status();
-        if status != reqwest::StatusCode::PARTIAL_CONTENT {
-            return Err(SourceError::Status {
-                status: status.as_u16(),
-            });
+        // `stat` 通常刚探测过同一地址，落点已在缓存里：直接对落点发 Range，
+        // 不必每次分段都先撞一次入口主机的 404。
+        if let Some(target) = self.cached_redirect(location) {
+            let response = self.request_range(&target, &range).await?;
+            return Self::finish_range(response, &range);
         }
-        let expected_prefix = format!("bytes {}-{}/", range.start(), range.end());
-        let content_range = response
-            .headers()
-            .get(reqwest::header::CONTENT_RANGE)
-            .and_then(|value| value.to_str().ok())
-            .ok_or_else(|| {
-                SourceError::Decode(Box::new(std::io::Error::other("missing content-range")))
-            })?;
-        if !content_range.starts_with(&expected_prefix) {
-            return Err(SourceError::Decode(Box::new(std::io::Error::other(
-                format!(
-                    "content-range mismatch: expected `{expected_prefix}*`, got `{content_range}`"
-                ),
-            ))));
+        match self.request_range(location, &range).await {
+            Ok(response) => Self::finish_range(response, &range),
+            // 入口主机对带 Range 的请求回 404、对普通请求回 302 是 CDN 的常见
+            // 形态。未经过 `stat` 记录落点时，用 HEAD 探一次落点再重试。
+            Err(SourceError::Status { status: 404 }) => {
+                let Some(target) = self.redirect_target(location).await else {
+                    return Err(SourceError::Status { status: 404 });
+                };
+                self.remember_redirect(location, &target);
+                let response = self.request_range(&target, &range).await?;
+                Self::finish_range(response, &range)
+            }
+            Err(err) => Err(err),
         }
-        Ok(Box::new(HttpBody { response }))
     }
 }
 
@@ -556,6 +646,177 @@ mod tests {
             .expect("重试后应当成功");
         assert_eq!(text, "ok");
         server.await.expect("server");
+    }
+
+    /// 读请求行（`GET /x HTTP/1.1`）；读到空行或 EOF 为止
+    async fn request_line(stream: &mut TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        while let Ok(read) = stream.read(&mut chunk).await {
+            if read == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..read]);
+            if buf.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&buf)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    async fn send_text(stream: &mut TcpStream, response: &str) {
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.flush().await;
+    }
+
+    /// 入口主机：HEAD 回 302 指向 `target`，带 Range 的请求一律 404
+    async fn serve_entry(stream: &mut TcpStream, target: &str) {
+        let line = request_line(stream).await;
+        if line.starts_with("HEAD ") {
+            send_text(
+                stream,
+                &format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                ),
+            )
+            .await;
+        } else {
+            send_text(
+                stream,
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await;
+        }
+    }
+
+    /// 落点主机：HEAD 声明长度与范围支持，GET 按给定区间回 206
+    async fn serve_target(stream: &mut TcpStream, payload: &[u8], range: (u64, u64)) {
+        let line = request_line(stream).await;
+        if line.starts_with("HEAD ") {
+            send_text(
+                stream,
+                &format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                ),
+            )
+            .await;
+            return;
+        }
+        let (start, end) = range;
+        let start = usize::try_from(start).expect("range start fits usize");
+        let end = usize::try_from(end).expect("range end fits usize");
+        let body = &payload[start..=end];
+        let mut response = format!(
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            payload.len(),
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        let _ = stream.write_all(&response).await;
+        let _ = stream.flush().await;
+    }
+
+    /// HEAD 跟随重定向拿到的落点被记住后，分段请求直接发往落点，
+    /// 不再撞入口主机的 Range 404
+    #[tokio::test]
+    async fn stat_records_redirect_so_range_skips_entry() {
+        let payload = b"redirected-range-payload";
+        let end = payload.len() as u64 - 1;
+
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind target");
+        let target_addr = target_listener.local_addr().expect("target addr");
+        let target = format!("http://{target_addr}/file");
+        let target_task = tokio::spawn({
+            let payload = payload.to_vec();
+            async move {
+                for _ in 0..2 {
+                    let (mut stream, _) = target_listener.accept().await.expect("target accept");
+                    serve_target(&mut stream, &payload, (0, end)).await;
+                }
+            }
+        });
+
+        let entry_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind entry");
+        let entry_addr = entry_listener.local_addr().expect("entry addr");
+        let entry_task = tokio::spawn({
+            let target = target.clone();
+            async move {
+                let (mut stream, _) = entry_listener.accept().await.expect("entry accept");
+                serve_entry(&mut stream, &target).await;
+                // 只接一个连接：stat 之后再发往入口会直接建连失败
+            }
+        });
+
+        let source = HttpByteSource::new().expect("source");
+        let location = Url::parse(&format!("http://{entry_addr}/file")).expect("url");
+        let stat = source.stat(&location).await.expect("stat");
+        assert_eq!(stat.size, payload.len() as u64);
+        assert!(stat.supports_range);
+        // 等入口监听关闭：此后分段请求若仍走入口必然失败
+        entry_task.await.expect("entry");
+
+        let mut reader = source
+            .open_range(&location, 0..=end)
+            .await
+            .expect("落点应能返回区间");
+        let mut body = Vec::new();
+        while let Some(chunk) = reader.next_chunk().await.expect("chunk") {
+            body.extend_from_slice(&chunk);
+        }
+        assert_eq!(body, payload);
+        target_task.await.expect("target");
+    }
+
+    /// 没经过 `stat` 时，区间 404 应通过 HEAD 探出落点并重试一次
+    #[tokio::test]
+    async fn open_range_resolves_redirect_when_stat_skipped() {
+        let payload = b"self-healing-range-payload";
+        let end = payload.len() as u64 - 1;
+
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind target");
+        let target_addr = target_listener.local_addr().expect("target addr");
+        let target = format!("http://{target_addr}/file");
+        let target_task = tokio::spawn({
+            let payload = payload.to_vec();
+            async move {
+                // HEAD（跟随 302）与随后的区间 GET 会各占一条连接
+                while let Ok((mut stream, _)) = target_listener.accept().await {
+                    serve_target(&mut stream, &payload, (0, end)).await;
+                }
+            }
+        });
+
+        let entry_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind entry");
+        let entry_addr = entry_listener.local_addr().expect("entry addr");
+        let entry_task = tokio::spawn({
+            let target = target.clone();
+            async move {
+                // 先收到带 Range 的 GET（404），再收到探测用的 HEAD（302）
+                while let Ok((mut stream, _)) = entry_listener.accept().await {
+                    serve_entry(&mut stream, &target).await;
+                }
+            }
+        });
+
+        let source = HttpByteSource::new().expect("source");
+        let location = Url::parse(&format!("http://{entry_addr}/file")).expect("url");
+        let mut reader = source
+            .open_range(&location, 0..=end)
+            .await
+            .expect("应探测落点后成功");
+        let mut body = Vec::new();
+        while let Some(chunk) = reader.next_chunk().await.expect("chunk") {
+            body.extend_from_slice(&chunk);
+        }
+        assert_eq!(body, payload);
+        entry_task.abort();
+        target_task.abort();
     }
 
     /// 声明超大的响应体在读取前就被拒绝，不按 Content-Length 预分配内存
