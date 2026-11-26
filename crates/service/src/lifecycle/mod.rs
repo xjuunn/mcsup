@@ -903,7 +903,7 @@ fn blocking_issue(entry: &ModBlocked) -> String {
             mods.join("、")
         ),
         ModBlocker::ClientOnly => {
-            format!("{file}: 清单或上游判定仅客户端，服务端无法装载（可停用该文件）")
+            format!("{file}: 清单、上游或入口类初始化判定仅客户端，服务端无法装载（可停用该文件）")
         }
         ModBlocker::MissingBridge { loader, files } => format!(
             "{file}: 有 {} 个 {loader} 专用 mod，当前服务端缺少 Sinytra Connector 桥（可执行 mcsup server mod fix 自动补装）：{}",
