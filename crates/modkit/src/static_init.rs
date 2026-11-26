@@ -81,7 +81,7 @@ pub(crate) fn find(classes: &[ClassFile]) -> Option<InitClientAccess> {
         .collect();
     let mut entries = classes
         .iter()
-        .filter(|class| class.mod_entry)
+        .filter(|class| class.mod_entry && !class.mod_client_only)
         .collect::<Vec<_>>();
     entries.sort_by(|left, right| left.name.cmp(&right.name));
     entries.into_iter().find_map(|entry| walk(entry, &index))
@@ -233,6 +233,17 @@ mod tests {
         ClassFile {
             name: name.to_owned(),
             mod_entry,
+            mod_client_only: false,
+            methods,
+        }
+    }
+
+    /// 构造一个 `@Mod(dist = CLIENT)` 入口：专用服务端不装载，不能当追踪根
+    fn client_only_class(name: &str, methods: Vec<Method>) -> ClassFile {
+        ClassFile {
+            name: name.to_owned(),
+            mod_entry: true,
+            mod_client_only: true,
             methods,
         }
     }
@@ -328,6 +339,22 @@ mod tests {
                 &[("com/example/Entry", "isDedicatedServer", "()Z")],
             )],
         )];
+        assert!(find(&classes).is_none());
+    }
+
+    /// `@Mod(dist = CLIENT)` 的入口不参与追踪
+    ///
+    /// 实测 `create-1.21.1`：`CreateClient` 带 `dist = CLIENT`，其
+    /// `<clinit>` 引用 `Minecraft`；若把它当入口，整个 Create 会被误判仅客户端。
+    #[test]
+    fn client_dist_restricted_entry_is_skipped() {
+        let classes = vec![
+            class("com/example/Create", true, vec![method("create", &[], &[])]),
+            client_only_class(
+                "com/example/CreateClient",
+                vec![method("<clinit>", &["net/minecraft/client/Minecraft"], &[])],
+            ),
+        ];
         assert!(find(&classes).is_none());
     }
 

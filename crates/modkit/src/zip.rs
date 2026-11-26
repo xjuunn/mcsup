@@ -226,6 +226,17 @@ fn detect_loaders(names: &[String]) -> Vec<ModLoader> {
     if has("mcmod.info") {
         loaders.push(ModLoader::LegacyForge);
     }
+    // 1.12.x 的 Forge jar 常不带 `mcmod.info`：作者用旧 Gradle 打包、或依赖
+    // `ContainedDeps` 的壳 jar（实测 `drpmedieval` / `drpcore` 只有这条缓存）。
+    // FML 在 `mcmod.info` 缺位时会退回扫描 `@Mod` 注解并写这份缓存，因此它
+    // 出现即说明是 Forge mod。不认它就会把这些 jar 当成「无加载器裸 jar」，
+    // 只用字节码引用客户端类的弱信号定罪——实测会把双端 mod 判成仅客户端。
+    //
+    // 只在**完全认不出加载器**时兜底：1.19+ / `NeoForge` 语料里从不出现该
+    // 文件，就算出现也不该盖掉更明确的 `mods.toml` 归属。
+    if loaders.is_empty() && has("META-INF/fml_cache_class_versions.json") {
+        loaders.push(ModLoader::LegacyForge);
+    }
     if has("litemod.json") {
         loaders.push(ModLoader::LiteLoader);
     }
@@ -450,6 +461,10 @@ fn parse_classes(
 ///
 /// 实测 `ReplayMod-1.0.8.jar` 正是后者：`mods.toml` 不写 side，61 个 Forge
 /// mod（60 个 `@Mod` 入口）里唯一命中的就是它，其余入口零误报。
+///
+/// 判定靠「链上没有任何客 / 服判断」这层保护才成立，因此 `is_guard_call`
+/// 必须同样认得包装形式。语料里靠包装逃过误杀的真实案例详见
+/// [`crate::bytecode::is_guard_call`]。
 fn apply_init_client_access(cap: &mut ModCapability, access: &static_init::InitClientAccess) {
     // 桥内嵌 Fabric 客户端 API，入口链穿过这些类是桥自身的库成分
     if cap.bridges_to.is_some() {
@@ -1456,6 +1471,31 @@ mod tests {
         apply_init_client_access(&mut cap, &init_access());
         assert!(!cap.init_client_access);
         assert_eq!(cap.side.server, SideSupport::Unknown);
+    }
+
+    /// 1.12.2 的 Forge jar 可能只带 FML 注解缓存、没有 `mcmod.info`
+    ///
+    /// 实测 `drpmedieval-1.12.2-0.3.6.jar`：有 `@Mod` 与 Client/Server Proxy，
+    /// 却只有 `META-INF/fml_cache_class_versions.json`。认不出加载器会让它
+    /// 落入「裸 jar」分支，被字节码弱信号判成仅客户端——真误杀。
+    #[test]
+    fn legacy_forge_detected_by_fml_annotation_cache() {
+        let names = vec![
+            "META-INF/fml_cache_annotation.json".to_owned(),
+            "META-INF/fml_cache_class_versions.json".to_owned(),
+        ];
+        assert_eq!(detect_loaders(&names), vec![ModLoader::LegacyForge]);
+    }
+
+    /// 该缓存不参与新版本加载器判定
+    #[test]
+    fn fml_cache_does_not_mark_modern_jars_as_legacy() {
+        let names = vec![
+            "META-INF/mods.toml".to_owned(),
+            "META-INF/fml_cache_class_versions.json".to_owned(),
+        ];
+        // mods.toml 已定 Forge；缓存不应再叠加一次 LegacyForge
+        assert_eq!(detect_loaders(&names), vec![ModLoader::Forge]);
     }
 
     /// 桥（Sinytra Connector）的识别：transformation service + 内嵌 Fabric Loader

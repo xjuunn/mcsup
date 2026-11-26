@@ -38,6 +38,12 @@ pub(crate) struct ClassFile {
     pub(crate) name: String,
     /// 类上是否带 `@Mod`（Forge / `NeoForge` / 旧 FML）
     pub(crate) mod_entry: bool,
+    /// `@Mod` 的 dist 限制是否只允许客户端
+    ///
+    /// `NeoForge` 的 `@Mod(dist = Dist.CLIENT)` 入口在专用服务端不被装载；
+    /// 判定入口链时必须跳过它，否则会把「只在客户端存在的入口」误算成
+    /// 「服务端会执行」。
+    pub(crate) mod_client_only: bool,
     pub(crate) methods: Vec<Method>,
 }
 
@@ -97,12 +103,20 @@ pub(crate) fn parse(bytes: &[u8]) -> Option<ClassFile> {
     let methods = parse_methods(&mut reader, &cp)?;
     let annotations = parse_class_annotations(&mut reader, &cp);
     let mod_entry = annotations
+        .types
         .iter()
         .any(|annotation| MOD_ANNOTATIONS.contains(&annotation.as_str()));
+    // `@Mod(dist = Dist.CLIENT)` 的入口在专用服务端上不会被装载，它的静态
+    // 初始化自然不会执行。实测 `create-1.21.1`：主入口 `Create` 无 dist 限制，
+    // 而 `CreateClient` 标注 `dist = CLIENT`，两者都带 `@Mod`；把后者当入口
+    // 会把它引用的 `Minecraft` 判成「服务端必崩」，误杀整个 Create。
+    let mod_client_only = !annotations.mod_dists.is_empty()
+        && annotations.mod_dists.iter().all(|dist| dist == "CLIENT");
 
     Some(ClassFile {
         name,
         mod_entry,
+        mod_client_only,
         methods,
     })
 }
@@ -404,9 +418,18 @@ fn simple_instruction_len(op: u8) -> Option<usize> {
     })
 }
 
-/// 类级注解的类型描述符
-fn parse_class_annotations(reader: &mut Reader<'_>, cp: &[Option<Cp>]) -> Vec<String> {
-    let mut out = Vec::new();
+/// 类级注解解析结果
+#[derive(Debug, Default)]
+struct ClassAnnotations {
+    /// 注解类型描述符
+    types: Vec<String>,
+    /// `@Mod` 上的 `dist` 元素取值（`Dist` 枚举常量名，如 `CLIENT`）
+    mod_dists: Vec<String>,
+}
+
+/// 类级注解的类型描述符与 `@Mod` 的 dist 限制
+fn parse_class_annotations(reader: &mut Reader<'_>, cp: &[Option<Cp>]) -> ClassAnnotations {
+    let mut out = ClassAnnotations::default();
     let Some(count) = reader.u2() else {
         return out;
     };
@@ -430,7 +453,7 @@ fn parse_class_annotations(reader: &mut Reader<'_>, cp: &[Option<Cp>]) -> Vec<St
     out
 }
 
-fn collect_annotation_types(body: &[u8], cp: &[Option<Cp>], out: &mut Vec<String>) {
+fn collect_annotation_types(body: &[u8], cp: &[Option<Cp>], out: &mut ClassAnnotations) {
     let mut reader = Reader::new(body);
     let Some(count) = reader.u2() else {
         return;
@@ -439,18 +462,62 @@ fn collect_annotation_types(body: &[u8], cp: &[Option<Cp>], out: &mut Vec<String
         let Some(type_index) = reader.u2() else {
             return;
         };
-        if let Some(text) = utf8(cp, type_index) {
-            out.push(text.to_owned());
+        let annotation_type = utf8(cp, type_index).map(ToOwned::to_owned);
+        if let Some(text) = &annotation_type {
+            out.types.push(text.clone());
         }
         let Some(pairs) = reader.u2() else {
             return;
         };
         for _ in 0..pairs {
-            if reader.u2().is_none() || skip_element_value(&mut reader, 0).is_none() {
+            let Some(element_name) = reader.u2() else {
                 return;
+            };
+            let is_mod = annotation_type
+                .as_deref()
+                .is_some_and(|text| MOD_ANNOTATIONS.contains(&text));
+            let name_is_dist = utf8(cp, element_name) == Some("dist");
+            if !(is_mod && name_is_dist) {
+                if skip_element_value(&mut reader, 0).is_none() {
+                    return;
+                }
+                continue;
+            }
+            match read_dist_element(&mut reader, cp) {
+                Some(dists) => out.mod_dists.extend(dists),
+                None => return,
             }
         }
     }
+}
+
+/// 读 `@Mod(dist = ...)` 的元素值
+///
+/// `dist` 是数组：`dist = {Dist.CLIENT, Dist.DEDICATED_SERVER}`，每个元素是
+/// 枚举常量（tag `e`，两个索引分别指向类型描述符与常量名）。
+fn read_dist_element(reader: &mut Reader<'_>, cp: &[Option<Cp>]) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    match reader.u1()? {
+        b'e' => {
+            reader.u2()?; // 枚举类型描述符
+            let name = utf8(cp, reader.u2()?)?;
+            out.push(name.to_owned());
+        }
+        b'[' => {
+            let count = reader.u2()?;
+            for _ in 0..count {
+                let tag = reader.u1()?;
+                if tag != b'e' {
+                    return None;
+                }
+                reader.u2()?;
+                let name = utf8(cp, reader.u2()?)?;
+                out.push(name.to_owned());
+            }
+        }
+        _ => return None,
+    }
+    Some(out)
 }
 
 /// 跳过注解元素值
@@ -459,7 +526,8 @@ fn skip_element_value(reader: &mut Reader<'_>, depth: usize) -> Option<()> {
         return None;
     }
     match reader.u1()? {
-        b'B' | b'C' | b'D' | b'F' | b'I' | b'J' | b'S' | b'Z' | b'c' => reader.skip(2),
+        // `s` 是 String 常量索引；`c` 是 class 常量索引
+        b'B' | b'C' | b'D' | b'F' | b'I' | b'J' | b'S' | b'Z' | b'c' | b's' => reader.skip(2),
         b'e' => reader.skip(4),
         b'@' => skip_annotation(reader, depth + 1),
         b'[' => {
@@ -573,6 +641,20 @@ mod tests {
         }
 
         fn build(self, class_name: &str, annotations: &[&str], methods: &[Method]) -> Vec<u8> {
+            self.build_with_dist(class_name, annotations, None, methods)
+        }
+
+        /// 构造带 `@Mod(dist = {…})` 的 class
+        ///
+        /// `dist` 只写到第一个注解上；测试只需要覆盖「入口被 dist 限制」这条
+        /// 路径，不必模拟多个注解各带元素值。
+        fn build_with_dist(
+            self,
+            class_name: &str,
+            annotations: &[&str],
+            dist: Option<&[&str]>,
+            methods: &[Method],
+        ) -> Vec<u8> {
             let mut pool = self;
             let this = pool.class(class_name);
             // 属性名与注解描述符必须在写常量池计数之前全部登记好：
@@ -583,88 +665,91 @@ mod tests {
                 .iter()
                 .map(|annotation| pool.utf8(annotation))
                 .collect::<Vec<_>>();
+            let dist_indices = pool.dist_indices(dist);
 
             let mut out = vec![0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x00, 0x00, 0x3D];
             let count = u16::try_from(pool.pool.len()).expect("测试 class 的常量池不会超限");
             out.extend_from_slice(&count.to_be_bytes());
             for entry in pool.pool.iter().skip(1) {
-                match entry {
-                    Pool::Utf8(text) => {
-                        out.push(1);
-                        let len = u16::try_from(text.len()).expect("测试 class 的常量池不会超限");
-                        out.extend_from_slice(&len.to_be_bytes());
-                        out.extend_from_slice(text.as_bytes());
-                    }
-                    Pool::Class(name) => {
-                        out.push(7);
-                        out.extend_from_slice(&name.to_be_bytes());
-                    }
-                    Pool::NameType(name, descriptor) => {
-                        out.push(12);
-                        out.extend_from_slice(&name.to_be_bytes());
-                        out.extend_from_slice(&descriptor.to_be_bytes());
-                    }
-                    Pool::Member(class, name_type) => {
-                        out.push(10);
-                        out.extend_from_slice(&class.to_be_bytes());
-                        out.extend_from_slice(&name_type.to_be_bytes());
-                    }
-                }
+                write_pool_entry(&mut out, entry);
             }
-            out.extend_from_slice(&0x0021u16.to_be_bytes()); // public
-            out.extend_from_slice(&this.to_be_bytes());
-            out.extend_from_slice(&0x0000u16.to_be_bytes()); // super
-            out.extend_from_slice(&0x0000u16.to_be_bytes()); // interfaces
-            out.extend_from_slice(&0x0000u16.to_be_bytes()); // fields
-
-            out.extend_from_slice(
-                &u16::try_from(methods.len())
-                    .expect("测试 class 的方法数不会超限")
-                    .to_be_bytes(),
+            write_class_header(&mut out, this, methods, code_attr);
+            write_annotations(
+                &mut out,
+                &annotation_types,
+                annotations_attr,
+                dist_indices.as_ref(),
             );
-            for method in methods {
-                out.extend_from_slice(&0x0009u16.to_be_bytes()); // static
-                out.extend_from_slice(&method.name.to_be_bytes());
-                out.extend_from_slice(&method.descriptor.to_be_bytes());
-                let has_code = !method.code.is_empty();
-                let attributes = u16::from(has_code);
-                out.extend_from_slice(&attributes.to_be_bytes());
-                if has_code {
-                    out.extend_from_slice(&code_attr.to_be_bytes());
-                    let mut body = Vec::new();
-                    body.extend_from_slice(&0u16.to_be_bytes());
-                    body.extend_from_slice(&0u16.to_be_bytes());
-                    body.extend_from_slice(
-                        &u32::try_from(method.code.len())
-                            .expect("测试 class 的方法体不会超限")
-                            .to_be_bytes(),
-                    );
-                    body.extend_from_slice(&method.code);
-                    body.extend_from_slice(&0u16.to_be_bytes()); // exception table
-                    body.extend_from_slice(&0u16.to_be_bytes()); // attributes
-                    out.extend_from_slice(
-                        &u32::try_from(body.len())
-                            .expect("测试 class 的属性不会超限")
-                            .to_be_bytes(),
-                    );
-                    out.extend_from_slice(&body);
-                }
-            }
+            out
+        }
 
-            let has_annotations = !annotation_types.is_empty();
-            out.extend_from_slice(&u16::from(has_annotations).to_be_bytes());
-            if has_annotations {
-                out.extend_from_slice(&annotations_attr.to_be_bytes());
+        /// `dist` 元素需要的常量池项：元素名、枚举类型、各常量名
+        fn dist_indices(&mut self, dist: Option<&[&str]>) -> Option<(u16, u16, Vec<u16>)> {
+            let dists = dist?;
+            let element = self.utf8("dist");
+            let enum_type = self.utf8("Lnet/neoforged/api/distmarker/Dist;");
+            let names = dists.iter().map(|name| self.utf8(name)).collect();
+            Some((element, enum_type, names))
+        }
+    }
+
+    /// 写一个常量池项（测试池不含 long / double，无跳号）
+    fn write_pool_entry(out: &mut Vec<u8>, entry: &Pool) {
+        match entry {
+            Pool::Utf8(text) => {
+                out.push(1);
+                let len = u16::try_from(text.len()).expect("测试 class 的常量池不会超限");
+                out.extend_from_slice(&len.to_be_bytes());
+                out.extend_from_slice(text.as_bytes());
+            }
+            Pool::Class(name) => {
+                out.push(7);
+                out.extend_from_slice(&name.to_be_bytes());
+            }
+            Pool::NameType(name, descriptor) => {
+                out.push(12);
+                out.extend_from_slice(&name.to_be_bytes());
+                out.extend_from_slice(&descriptor.to_be_bytes());
+            }
+            Pool::Member(class, name_type) => {
+                out.push(10);
+                out.extend_from_slice(&class.to_be_bytes());
+                out.extend_from_slice(&name_type.to_be_bytes());
+            }
+        }
+    }
+
+    /// 写类头、字段表与方法表
+    fn write_class_header(out: &mut Vec<u8>, this: u16, methods: &[Method], code_attr: u16) {
+        out.extend_from_slice(&0x0021u16.to_be_bytes()); // public
+        out.extend_from_slice(&this.to_be_bytes());
+        out.extend_from_slice(&0x0000u16.to_be_bytes()); // super
+        out.extend_from_slice(&0x0000u16.to_be_bytes()); // interfaces
+        out.extend_from_slice(&0x0000u16.to_be_bytes()); // fields
+        out.extend_from_slice(
+            &u16::try_from(methods.len())
+                .expect("测试 class 的方法数不会超限")
+                .to_be_bytes(),
+        );
+        for method in methods {
+            out.extend_from_slice(&0x0009u16.to_be_bytes()); // static
+            out.extend_from_slice(&method.name.to_be_bytes());
+            out.extend_from_slice(&method.descriptor.to_be_bytes());
+            let has_code = !method.code.is_empty();
+            out.extend_from_slice(&u16::from(has_code).to_be_bytes());
+            if has_code {
+                out.extend_from_slice(&code_attr.to_be_bytes());
                 let mut body = Vec::new();
+                body.extend_from_slice(&0u16.to_be_bytes()); // max_stack
+                body.extend_from_slice(&0u16.to_be_bytes()); // max_locals
                 body.extend_from_slice(
-                    &u16::try_from(annotation_types.len())
-                        .expect("测试 class 的注解数不会超限")
+                    &u32::try_from(method.code.len())
+                        .expect("测试 class 的方法体不会超限")
                         .to_be_bytes(),
                 );
-                for annotation in annotation_types {
-                    body.extend_from_slice(&annotation.to_be_bytes());
-                    body.extend_from_slice(&0u16.to_be_bytes());
-                }
+                body.extend_from_slice(&method.code);
+                body.extend_from_slice(&0u16.to_be_bytes()); // exception table
+                body.extend_from_slice(&0u16.to_be_bytes()); // attributes
                 out.extend_from_slice(
                     &u32::try_from(body.len())
                         .expect("测试 class 的属性不会超限")
@@ -672,8 +757,55 @@ mod tests {
                 );
                 out.extend_from_slice(&body);
             }
-            out
         }
+    }
+
+    /// 写类级注解属性；`dist` 只挂在第一个注解上
+    fn write_annotations(
+        out: &mut Vec<u8>,
+        annotation_types: &[u16],
+        annotations_attr: u16,
+        dist: Option<&(u16, u16, Vec<u16>)>,
+    ) {
+        let has_annotations = !annotation_types.is_empty();
+        out.extend_from_slice(&u16::from(has_annotations).to_be_bytes());
+        if !has_annotations {
+            return;
+        }
+        out.extend_from_slice(&annotations_attr.to_be_bytes());
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            &u16::try_from(annotation_types.len())
+                .expect("测试 class 的注解数不会超限")
+                .to_be_bytes(),
+        );
+        for (position, annotation) in annotation_types.iter().enumerate() {
+            body.extend_from_slice(&annotation.to_be_bytes());
+            match dist.filter(|_| position == 0) {
+                Some((element, enum_type, names)) => {
+                    body.extend_from_slice(&1u16.to_be_bytes());
+                    body.extend_from_slice(&element.to_be_bytes());
+                    body.push(b'[');
+                    body.extend_from_slice(
+                        &u16::try_from(names.len())
+                            .expect("测试 class 的 dist 元素数不会超限")
+                            .to_be_bytes(),
+                    );
+                    for name in names {
+                        body.push(b'e');
+                        body.extend_from_slice(&enum_type.to_be_bytes());
+                        body.extend_from_slice(&name.to_be_bytes());
+                    }
+                }
+                None => body.extend_from_slice(&0u16.to_be_bytes()),
+            }
+        }
+        out.extend_from_slice(
+            &u32::try_from(body.len())
+                .expect("测试 class 的属性不会超限")
+                .to_be_bytes(),
+        );
+        out.extend_from_slice(&body);
     }
 
     /// 测试方法：常量池里先建好 name / descriptor，再填指令
@@ -719,6 +851,51 @@ mod tests {
         let method = Method::new(&mut builder, "run", "()V", vec![0xb1]);
         let bytes = builder.build("com/example/Helper", &[], &[method]);
         assert!(!parse(&bytes).expect("合法 class").mod_entry);
+    }
+
+    /// `@Mod(dist = Dist.CLIENT)`：入口只在客户端装载，必须标记出来
+    #[test]
+    fn reads_mod_client_dist() {
+        let mut builder = Builder::new();
+        let method = Method::new(&mut builder, "run", "()V", vec![0xb1]);
+        let bytes = builder.build_with_dist(
+            "com/example/CreateClient",
+            &["Lnet/neoforged/fml/common/Mod;"],
+            Some(&["CLIENT"]),
+            &[method],
+        );
+        let class = parse(&bytes).expect("合法 class");
+        assert!(class.mod_entry);
+        assert!(class.mod_client_only);
+    }
+
+    /// 双端 dist（`CLIENT` + `DEDICATED_SERVER`）不算仅客户端
+    #[test]
+    fn dual_dist_is_not_client_only() {
+        let mut builder = Builder::new();
+        let method = Method::new(&mut builder, "run", "()V", vec![0xb1]);
+        let bytes = builder.build_with_dist(
+            "com/example/Entry",
+            &["Lnet/neoforged/fml/common/Mod;"],
+            Some(&["CLIENT", "DEDICATED_SERVER"]),
+            &[method],
+        );
+        let class = parse(&bytes).expect("合法 class");
+        assert!(class.mod_entry);
+        assert!(!class.mod_client_only);
+    }
+
+    /// 没有 dist 元素就是无限制
+    #[test]
+    fn entry_without_dist_is_not_client_only() {
+        let mut builder = Builder::new();
+        let method = Method::new(&mut builder, "run", "()V", vec![0xb1]);
+        let bytes = builder.build(
+            "com/example/Entry",
+            &["Lnet/minecraftforge/fml/common/Mod;"],
+            &[method],
+        );
+        assert!(!parse(&bytes).expect("合法 class").mod_client_only);
     }
 
     /// 返回类型里的客户端类也要收：`ReplayMod` 的崩溃就藏在返回类型
