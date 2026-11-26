@@ -14,6 +14,7 @@
 //! | `[[dependencies.x]] side = "CLIENT"` | 该依赖在服务端不参与校验 | — |
 //! | 只有 `client` 入口，无 `main`/`server` | 仅客户端 | High |
 //! | 字节码引用客户端类（仅无加载器元数据的裸 jar） | 仅客户端迹象 | Medium |
+//! | `@Mod` 入口初始化链无条件引用客户端类 | 仅客户端，服务端装载阶段必崩 | Certain |
 //! | mixin 有 `client` 段 | 仅记证据，不下结论 | — |
 
 use domain::mod_::{
@@ -26,7 +27,9 @@ use std::path::Path;
 use zip::ZipArchive;
 
 use crate::bytecode;
+use crate::classfile;
 use crate::json;
+use crate::static_init;
 
 /// 基于 zip 归档的本地检测器
 #[derive(Debug, Clone, Copy, Default)]
@@ -79,7 +82,11 @@ impl ModInspector for ZipModInspector {
                 "同一个 class 里既有顶层窗口容器（JFrame / JDialog / awt.Window 等），又调用 Runtime.halt：启动时会开窗口并终止 JVM",
             ));
         }
-        if scan.any_client_ref {
+        // 入口初始化链命中是强信号，直接压过「裸 jar 才升级」的弱规则；
+        // 否则只留弱证据，交给 domain 的 Risk::of 判成「需确认」
+        if let Some(access) = &scan.init_client_access {
+            apply_init_client_access(&mut cap, access);
+        } else if scan.any_client_ref {
             apply_client_bytecode(&mut cap);
         }
 
@@ -219,6 +226,17 @@ fn detect_loaders(names: &[String]) -> Vec<ModLoader> {
     if has("mcmod.info") {
         loaders.push(ModLoader::LegacyForge);
     }
+    // 1.12.x 的 Forge jar 常不带 `mcmod.info`：作者用旧 Gradle 打包、或依赖
+    // `ContainedDeps` 的壳 jar（实测 `drpmedieval` / `drpcore` 只有这条缓存）。
+    // FML 在 `mcmod.info` 缺位时会退回扫描 `@Mod` 注解并写这份缓存，因此它
+    // 出现即说明是 Forge mod。不认它就会把这些 jar 当成「无加载器裸 jar」，
+    // 只用字节码引用客户端类的弱信号定罪——实测会把双端 mod 判成仅客户端。
+    //
+    // 只在**完全认不出加载器**时兜底：1.19+ / `NeoForge` 语料里从不出现该
+    // 文件，就算出现也不该盖掉更明确的 `mods.toml` 归属。
+    if loaders.is_empty() && has("META-INF/fml_cache_class_versions.json") {
+        loaders.push(ModLoader::LegacyForge);
+    }
     if has("litemod.json") {
         loaders.push(ModLoader::LiteLoader);
     }
@@ -337,9 +355,9 @@ const METADATA_LIMIT: u64 = 4 * 1024 * 1024;
 
 /// 字节码扫描结论
 ///
-/// 三个信号同一次遍历收集：三者都要读每个 class 的字节，分开扫会把整包
-/// 解压两遍。
-#[derive(Debug, Clone, Copy, Default)]
+/// 三个基础信号同一次遍历收集：三者都要读每个 class 的字节，分开扫会把整包
+/// 解压两遍。入口初始化链只在「有客户端类引用」时再单独跑一遍解析。
+#[derive(Debug, Clone, Default)]
 struct ClassScan {
     /// 所有 class 里最大的 class major
     max_java: Option<u32>,
@@ -347,10 +365,22 @@ struct ClassScan {
     any_client_ref: bool,
     /// 是否有 class 同时具备「顶层窗口容器」与 `Runtime.halt`
     gui_window_halt: bool,
+    /// 入口初始化链无条件引用客户端类的现场
+    init_client_access: Option<static_init::InitClientAccess>,
 }
 
 /// 扫描所有 class：收集 Java 版本、客户端类引用、窗口 + halt 信号
 fn scan_classes(zip: &mut ZipArchive<std::fs::File>, names: &[String]) -> ClassScan {
+    let mut scan = scan_raw_classes(zip, names);
+    // 没有客户端类引用就不可能有入口链命中，省掉第二遍全量解析
+    if scan.any_client_ref {
+        scan.init_client_access = static_init::find(&parse_classes(zip, names));
+    }
+    scan
+}
+
+/// 第一遍：只按原始字节取三个基础信号
+fn scan_raw_classes(zip: &mut ZipArchive<std::fs::File>, names: &[String]) -> ClassScan {
     let mut scan = ClassScan::default();
     let mut budget = CLASS_SCAN_BUDGET;
     for name in names {
@@ -383,6 +413,88 @@ fn scan_classes(zip: &mut ZipArchive<std::fs::File>, names: &[String]) -> ClassS
         }
     }
     scan
+}
+
+/// 第二遍：解析 class 结构，供入口初始化链追踪
+///
+/// 只在第一遍发现客户端类引用时执行。超过读取上限的 class 会被截断、
+/// 解析失败即跳过——这类 class 本来也超出单个 class 的合理大小。
+fn parse_classes(
+    zip: &mut ZipArchive<std::fs::File>,
+    names: &[String],
+) -> Vec<classfile::ClassFile> {
+    let mut classes = Vec::new();
+    let mut budget = CLASS_SCAN_BUDGET;
+    for name in names {
+        if !has_ext(name, "class") || budget == 0 {
+            continue;
+        }
+        let Ok(mut entry) = zip.by_name(name) else {
+            continue;
+        };
+        let mut buf = Vec::new();
+        if entry
+            .by_ref()
+            .take(CLASS_READ_LIMIT)
+            .read_to_end(&mut buf)
+            .is_err()
+        {
+            continue;
+        }
+        budget -= 1;
+        if let Some(class) = classfile::parse(&buf) {
+            classes.push(class);
+        }
+    }
+    classes
+}
+
+/// 入口初始化链无条件引用客户端类：专用服务端必然在装载阶段崩溃
+///
+/// 与 [`apply_client_bytecode`] 的区别在证据强度：
+///
+/// - 弱信号只知道「jar 里有客户端类引用」，Forge 服务端 mod 引用客户端类是
+///   常态（`DistExecutor`、懒加载渲染分支），只能提示人工确认
+/// - 强信号证明「`@Mod` 入口的构造 / 静态初始化链必然走到它」，且链上没有
+///   任何 dist 判断。这类引用在专用服务端上一定被 `RuntimeDistCleaner`
+///   拒绝，服务端连启动都完成不了，应当直接判为不可用
+///
+/// 实测 `ReplayMod-1.0.8.jar` 正是后者：`mods.toml` 不写 side，61 个 Forge
+/// mod（60 个 `@Mod` 入口）里唯一命中的就是它，其余入口零误报。
+///
+/// 判定靠「链上没有任何客 / 服判断」这层保护才成立，因此 `is_guard_call`
+/// 必须同样认得包装形式。语料里靠包装逃过误杀的真实案例详见
+/// [`crate::bytecode::is_guard_call`]。
+fn apply_init_client_access(cap: &mut ModCapability, access: &static_init::InitClientAccess) {
+    // 桥内嵌 Fabric 客户端 API，入口链穿过这些类是桥自身的库成分
+    if cap.bridges_to.is_some() {
+        return;
+    }
+    cap.init_client_access = true;
+    let detail = format!(
+        "入口类 {} 的初始化调用链无条件引用客户端专属类 {}（{}）",
+        access.entry,
+        access.client_type,
+        access.chain_text()
+    );
+    // 元数据已明确声明服务端可装载：尊重作者声明，不拿启发式推翻它。
+    // 只记事实，避免把我们没识别出的运行时分支误判成「仅客户端」而误杀。
+    if matches!(
+        cap.side.server,
+        SideSupport::Required | SideSupport::Optional
+    ) {
+        cap.side.evidence.push(Evidence::new(
+            EvidenceSource::Bytecode,
+            format!("{detail}，但元数据声明服务端可用；未升级结论，建议实机确认"),
+        ));
+        return;
+    }
+    cap.side = SideVerdict::declared(SideSupport::Required, SideSupport::Unsupported);
+    cap.side.confidence = Confidence::Certain;
+    cap.side.evidence.push(Evidence::new(
+        EvidenceSource::Bytecode,
+        format!("{detail}；Forge 的 RuntimeDistCleaner 会在专用服务端拒绝加载，服务端停在装载阶段"),
+    ));
 }
 
 /// 字节码发现客户端类引用后的 side 处置
@@ -1301,6 +1413,89 @@ mod tests {
         apply_client_bytecode(&mut cap);
         assert_eq!(cap.side.server, SideSupport::Unsupported);
         assert_eq!(cap.side.client, SideSupport::Required);
+    }
+
+    fn init_access() -> static_init::InitClientAccess {
+        static_init::InitClientAccess {
+            entry: "com/example/Entry".to_owned(),
+            chain: vec![
+                "com/example/Entry.<init>".to_owned(),
+                "com/example/MCVer.getMinecraft".to_owned(),
+            ],
+            client_type: "net/minecraft/client/Minecraft".to_owned(),
+        }
+    }
+
+    /// 入口初始化链命中：直接判为仅客户端、Blocking 级，并记下完整证据
+    #[test]
+    fn init_client_access_condemns_silent_mod() {
+        let mut cap = ModCapability::empty("replay.jar");
+        cap.loaders.push(ModLoader::Forge);
+        // 元数据没给 side：两侧都 Unknown
+        apply_init_client_access(&mut cap, &init_access());
+        assert!(cap.init_client_access);
+        assert_eq!(cap.side.server, SideSupport::Unsupported);
+        assert_eq!(cap.side.client, SideSupport::Required);
+        assert_eq!(cap.side.confidence, Confidence::Certain);
+        assert_eq!(cap.risk(), domain::mod_::Risk::Blocking);
+        assert!(cap.side.evidence.iter().any(
+            |e| e.source == EvidenceSource::Bytecode && e.detail.contains("com/example/Entry")
+        ));
+    }
+
+    /// 元数据已声明服务端可用：不拿启发式推翻，只记证据（避免误杀）
+    #[test]
+    fn init_client_access_respects_declared_server_support() {
+        let mut cap = ModCapability::empty("dual.jar");
+        cap.loaders.push(ModLoader::Forge);
+        cap.side = SideVerdict::declared(SideSupport::Required, SideSupport::Required);
+        apply_init_client_access(&mut cap, &init_access());
+        assert!(cap.init_client_access);
+        // 结论不被改写
+        assert_eq!(cap.side.server, SideSupport::Required);
+        assert_eq!(cap.risk(), domain::mod_::Risk::Ok);
+        // 事实仍记下，供实机确认
+        assert!(
+            cap.side
+                .evidence
+                .iter()
+                .any(|e| e.source == EvidenceSource::Bytecode)
+        );
+    }
+
+    /// 桥 jar 不做入口链定罪
+    #[test]
+    fn init_client_access_is_skipped_for_bridge() {
+        let mut cap = ModCapability::empty("connector.jar");
+        cap.bridges_to = Some(ModLoader::Fabric);
+        apply_init_client_access(&mut cap, &init_access());
+        assert!(!cap.init_client_access);
+        assert_eq!(cap.side.server, SideSupport::Unknown);
+    }
+
+    /// 1.12.2 的 Forge jar 可能只带 FML 注解缓存、没有 `mcmod.info`
+    ///
+    /// 实测 `drpmedieval-1.12.2-0.3.6.jar`：有 `@Mod` 与 Client/Server Proxy，
+    /// 却只有 `META-INF/fml_cache_class_versions.json`。认不出加载器会让它
+    /// 落入「裸 jar」分支，被字节码弱信号判成仅客户端——真误杀。
+    #[test]
+    fn legacy_forge_detected_by_fml_annotation_cache() {
+        let names = vec![
+            "META-INF/fml_cache_annotation.json".to_owned(),
+            "META-INF/fml_cache_class_versions.json".to_owned(),
+        ];
+        assert_eq!(detect_loaders(&names), vec![ModLoader::LegacyForge]);
+    }
+
+    /// 该缓存不参与新版本加载器判定
+    #[test]
+    fn fml_cache_does_not_mark_modern_jars_as_legacy() {
+        let names = vec![
+            "META-INF/mods.toml".to_owned(),
+            "META-INF/fml_cache_class_versions.json".to_owned(),
+        ];
+        // mods.toml 已定 Forge；缓存不应再叠加一次 LegacyForge
+        assert_eq!(detect_loaders(&names), vec![ModLoader::Forge]);
     }
 
     /// 桥（Sinytra Connector）的识别：transformation service + 内嵌 Fabric Loader

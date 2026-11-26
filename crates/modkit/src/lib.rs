@@ -5,6 +5,8 @@
 //! - [`ZipModInspector`]：读归档、认加载器、抽元数据
 //! - `json`：容错 JSON 解析（真实 jar 里存在非法 JSON）
 //! - `bytecode`：class 文件头取 Java 版本、常量池扫客户端类引用
+//! - `classfile`：解析常量池与方法字节码里的类型引用
+//! - `static_init`：从 `@Mod` 入口追踪初始化链，找无条件引用客户端类的现场
 //!
 //! # 为什么需要容错 JSON
 //!
@@ -14,7 +16,9 @@
 //! 若不修补，14% 的真实 mod 会被判成「格式未知」。
 
 mod bytecode;
+mod classfile;
 mod json;
+mod static_init;
 mod zip;
 
 pub use zip::ZipModInspector;

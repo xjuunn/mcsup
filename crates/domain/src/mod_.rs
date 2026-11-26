@@ -712,6 +712,22 @@ pub struct ModCapability {
     /// 只引用窗口 API 不算：实测 `blue_skies`（`JFrame`）、`midnightlib`
     /// （`JFileChooser`）都在 dedicated server 上正常装载。
     pub gui_window_halt: bool,
+    /// 入口类的构造 / 静态初始化链无条件引用客户端专属类
+    ///
+    /// 只记**事实**：从 `@Mod` 入口类的 `<init>` / `<clinit>` 出发，沿同 jar
+    /// 内调用追踪，某一跳直接引用 `net/minecraft/client/` 等客户端专属类，
+    /// 且整条路径上没有 dist 判断（`FMLEnvironment` / `DistExecutor` / `Dist`）。
+    ///
+    /// 为什么单独成字段：专用服务端上这类引用会在类加载时被 Forge 的
+    /// `RuntimeDistCleaner` 拒绝，抛 `ExceptionInInitializerError`，服务端连
+    /// 就绪标记 `Done (` 都到不了。实测 `ReplayMod-1.0.8.jar`：
+    /// `ReplayMod.<clinit>` 调 `MCVer.getMinecraft()`，后者
+    /// `invokestatic Minecraft.m_91087_()`，`mods.toml` 不写任何 side。
+    ///
+    /// 与 [`Self::gui_window_halt`] 的区别：那个是「能起来但卡住 / 被杀」，
+    /// 这个是「根本起不来」。必须是入口初始化链，客户端专用类自己的
+    /// `<clinit>` 不算——专用服务端从不加载它们。
+    pub init_client_access: bool,
 }
 
 /// 「不施加版本限制」的共享区间
@@ -746,6 +762,7 @@ impl ModCapability {
             is_library: false,
             bridges_to: None,
             gui_window_halt: false,
+            init_client_access: false,
         }
     }
 

@@ -28,6 +28,31 @@ const CLIENT_PACKAGES: [&[u8]; 4] = [
     b"net/minecraft/src/",      // MCP 旧名
 ];
 
+/// 客户端专属包前缀（结构化匹配用，内部名以 `/` 分隔）
+const CLIENT_PREFIXES: [&str; 3] = [
+    "net/minecraft/client/",
+    "com/mojang/blaze3d/",
+    "net/minecraft/src/",
+];
+
+/// 不在客户端包下、但同样只在客户端存在的类
+const CLIENT_CLASSES: [&str; 1] = [
+    "net/minecraft/class_310", // intermediary 下的 MinecraftClient
+];
+
+/// dist 判断相关的类型
+///
+/// 调用链上出现这些类型，说明作者写了客/服分支，客户端类引用可能只在
+/// 客户端一侧执行。判定据此放弃升级：宁可判不出，也不能误杀。
+const GUARD_TYPES: [&str; 6] = [
+    "net/minecraftforge/fml/loading/FMLEnvironment",
+    "net/minecraftforge/fml/DistExecutor",
+    "net/minecraftforge/api/distmarker/Dist",
+    "net/neoforged/fml/loading/FMLEnvironment",
+    "net/neoforged/fml/DistExecutor",
+    "net/neoforged/api/distmarker/Dist",
+];
+
 /// 能自己成为**顶层窗口**的 AWT / Swing 容器
 ///
 /// 只收这类：`JOptionPane` / `JFileChooser` 需要父组件才有意义，单看常量池
@@ -81,6 +106,64 @@ pub(crate) fn references_client_classes(bytes: &[u8]) -> bool {
     CLIENT_PACKAGES
         .iter()
         .any(|needle| contains_bytes(bytes, needle))
+}
+
+/// 内部名是否属于客户端专属类型
+///
+/// 结构化匹配（非原始字节扫描）：只认完整名前缀，避免把 `net/minecraft/
+/// clientish` 之类误算进来。
+#[must_use]
+pub(crate) fn is_client_class_name(name: &str) -> bool {
+    CLIENT_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+        || CLIENT_CLASSES.contains(&name)
+}
+
+/// 类型是否属于 dist 判断
+///
+/// `Dist` 的嵌套类型（`Dist$Side`）同样命中：只要调用链上出现过 dist 判断，
+/// 就不能把客户端类引用当成无条件执行。
+#[must_use]
+pub(crate) fn is_guard_type(name: &str) -> bool {
+    GUARD_TYPES.iter().any(|guard| name.starts_with(guard))
+}
+
+/// 一次成员访问是否构成「客 / 服判断」
+///
+/// 光认 Forge 自己的 dist 类型不够：大量 mod 把判断包在自己的平台工具类或
+/// 静态字段里，类型名千变万化。实测两类真实误报：
+///
+/// - Kiwi 的 `Kiwi.<init>` 里 `Platform.isPhysicalClient()` 为真才写
+///   `RenderType`，属主 `snownee/kiwi/loader/Platform` 不在白名单
+/// - `NBTac` 的 `NBTacForge.<init>` 读静态字段 `isDedicatedServer`，为真直接
+///   `return`，客户端调用被这层布尔挡住
+///
+/// 因此按**成员名**兜底识别这些包装。客户端类自己的方法（`Minecraft.
+/// isClientSide`）不算 guard：那本身就是客户端类引用，正是要检出的证据，
+/// 不能被当成「作者写了分支」而放过。
+#[must_use]
+pub(crate) fn is_guard_call(owner: &str, name: &str) -> bool {
+    if is_guard_type(owner) {
+        return true;
+    }
+    if is_client_class_name(owner) {
+        return false;
+    }
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "isphysicalclient"
+            | "isdedicatedserver"
+            | "isclientside"
+            | "isclient"
+            | "isserver"
+            | "isserverside"
+            | "isclientenvironment"
+            | "getdist"
+            | "getphysicalside"
+            | "getlogicalside"
+    )
 }
 
 /// 该 class 是否会在打开图形窗口后终止 JVM
@@ -285,6 +368,51 @@ mod tests {
         pool.extend_from_slice(&pool_utf8("halt"));
         pool.extend_from_slice(&pool_utf8("java/lang/Runtime"));
         assert!(!halts_after_window(&class_with_pool(&pool)));
+    }
+
+    /// 中间名不是客户端类：结构匹配只认完整前缀
+    #[test]
+    fn client_prefix_match_is_structural() {
+        assert!(is_client_class_name("net/minecraft/client/Minecraft"));
+        assert!(is_client_class_name("net/minecraft/client/gui/Font"));
+        assert!(is_client_class_name("com/mojang/blaze3d/vertex/PoseStack"));
+        assert!(!is_client_class_name(
+            "net/minecraft/server/MinecraftServer"
+        ));
+        assert!(!is_client_class_name("net/minecraft/clientish/Foo"));
+    }
+
+    /// dist 判断的嵌套类型也算
+    #[test]
+    fn guard_types_include_nested_dist() {
+        assert!(is_guard_type(
+            "net/minecraftforge/fml/loading/FMLEnvironment"
+        ));
+        assert!(is_guard_type("net/minecraftforge/api/distmarker/Dist$Side"));
+        assert!(is_guard_type("net/neoforged/fml/DistExecutor"));
+        assert!(!is_guard_type("net/minecraft/client/Minecraft"));
+    }
+
+    /// 包装在平台工具类 / 静态字段里的 dist 判断也要认
+    #[test]
+    fn wrapped_side_checks_are_guards() {
+        // Kiwi：Platform.isPhysicalClient()
+        assert!(is_guard_call(
+            "snownee/kiwi/loader/Platform",
+            "isPhysicalClient"
+        ));
+        // NBTac：静态字段 isDedicatedServer
+        assert!(is_guard_call(
+            "com/mt1006/nbt_ac/NBTacForge",
+            "isDedicatedServer"
+        ));
+        // 客户端类自己的方法不是 guard：那本身就是要检出的证据
+        assert!(!is_guard_call(
+            "net/minecraft/client/Minecraft",
+            "isClientSide"
+        ));
+        // 无关方法名不当 guard
+        assert!(!is_guard_call("com/example/Util", "loadConfig"));
     }
 
     /// 非 class 字节不给结论
