@@ -836,22 +836,22 @@ pub(crate) fn report_remote_applied(
     Ok(())
 }
 
-/// 「跳过仅客户端模组」的提示后缀；没跳过时为空串
+/// 「跳过服务端不需要的文件」的提示后缀；没跳过时为空串
 ///
-/// 上游元数据判定与清单不一致时，文件数会比清单声明的少。不解释一句，
-/// 用户会以为安装漏了文件。
+/// 上游元数据或清单声明与清单装法不一致时，文件数会比清单声明的少。
+/// 不解释一句，用户会以为安装漏了文件。
 fn skipped_note(lang: crate::locale::Lang, skipped: usize) -> String {
     if skipped == 0 {
         return String::new();
     }
     crate::i18n::pick(
         lang,
-        format!("，跳过 {skipped} 个仅客户端模组"),
-        format!(", skipped {skipped} client-only mods"),
+        format!("，跳过 {skipped} 个服务端不需要的文件"),
+        format!(", skipped {skipped} file(s) the server does not need"),
     )
 }
 
-/// human 模式下列出被跳过的仅客户端模组；JSON 模式数据已在 payload 里
+/// human 模式下列出被跳过的文件；JSON 模式数据已在 payload 里
 ///
 /// 数量只说「跳过了」，用户没法知道跳过的是不是非删不可的。逐行列文件名，
 /// 与 `server mod list` 的「文件」列同口径（去 `mods/` 前缀）。
@@ -862,8 +862,8 @@ fn print_skipped_files(printer: Printer, files: &[String]) {
     }
     crate::output::print_line(&crate::i18n::pick(
         printer.lang(),
-        "已跳过的仅客户端模组：",
-        "skipped client-only mods:",
+        "服务端不需要的文件：",
+        "files the server does not need:",
     ));
     for path in files {
         crate::output::print_line(&format!("  - {}", file_name(path)));
@@ -917,7 +917,7 @@ struct ModpackInstallJson<'a> {
     files: usize,
     downloaded_bytes: u64,
     reused: usize,
-    /// 按上游元数据判定为仅客户端、已跳过的模组数
+    /// 按上游元数据或清单声明判定服务端不需要、已跳过的文件数
     skipped_client_only: usize,
     /// 被跳过文件的清单路径（与 `skipped_client_only` 数量一一对应）
     skipped_client_only_files: &'a [String],
@@ -1103,12 +1103,12 @@ mod tests {
         assert_eq!(skipped_note(Lang::En, 0), "");
         assert_eq!(
             skipped_note(Lang::Zh, 3),
-            "，跳过 3 个仅客户端模组",
+            "，跳过 3 个服务端不需要的文件",
             "中文提示要带上数量"
         );
         assert_eq!(
             skipped_note(Lang::En, 3),
-            ", skipped 3 client-only mods",
+            ", skipped 3 file(s) the server does not need",
             "英文提示要带上数量"
         );
     }

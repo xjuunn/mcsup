@@ -39,7 +39,9 @@ struct FakeModpackSource {
     resolved: ResolvedModpack,
     /// 上游判定为仅客户端的文件哈希
     client_only: Vec<String>,
-    /// 被整合包内其他成员依赖的文件哈希
+    /// 成员依赖关系：`(文件哈希, 项目 ID, 必需依赖的项目 ID)`
+    members: Vec<(String, String, Vec<String>)>,
+    /// 会加入合成依赖关系、由「持有者成员」硬依赖的哈希
     depended_on: Vec<String>,
     /// 模拟上游元数据查询失败
     metadata_fails: bool,
@@ -56,6 +58,7 @@ impl FakeModpackSource {
         Self {
             resolved: resolved(),
             client_only: Vec::new(),
+            members: Vec::new(),
             depended_on: Vec::new(),
             metadata_fails: false,
             queried: Arc::new(Mutex::new(Vec::new())),
@@ -82,7 +85,20 @@ impl FakeModpackSource {
         self
     }
 
-    /// 指定被整合包内其他成员依赖的哈希
+    /// 声明成员归属：`(文件哈希, 项目 ID, 它必需依赖的项目 ID)`
+    fn member(mut self, hash: &str, project: &str, requires: &[&str]) -> Self {
+        self.members.push((
+            hash.to_owned(),
+            project.to_owned(),
+            requires.iter().map(|id| (*id).to_owned()).collect(),
+        ));
+        self
+    }
+
+    /// 指定「被整合包内其他会装成员硬依赖」的哈希
+    ///
+    /// 只关心「有没有人需要它」，因此合成一个必需的持有者成员即可，不必
+    /// 写出完整的项目图。
     fn depended_on(mut self, hashes: &[&str]) -> Self {
         self.depended_on = hashes.iter().map(|hash| (*hash).to_owned()).collect();
         self
@@ -153,18 +169,37 @@ impl ModpackSource for FakeModpackSource {
         if self.metadata_fails {
             return Err(SourceError::Status { status: 503 });
         }
-        Ok(PackMemberVerdicts {
-            client_only: hashes
-                .iter()
-                .filter(|hash| self.client_only.contains(hash))
-                .cloned()
-                .collect(),
-            depended_on: hashes
-                .iter()
-                .filter(|hash| self.depended_on.contains(hash))
-                .cloned()
-                .collect(),
-        })
+        let wanted: HashSet<&str> = hashes.iter().map(String::as_str).collect();
+        let mut graph = domain::server::modpack::PackMemberGraph::default();
+        for hash in hashes {
+            if self.client_only.contains(hash) {
+                graph.client_only.insert(hash.clone());
+            }
+        }
+        // 请求里没有的哈希不参与：真实来源只返回能反查到的那些
+        for (hash, project, requires) in &self.members {
+            if !wanted.contains(hash.as_str()) {
+                continue;
+            }
+            graph.project_of.insert(hash.clone(), project.clone());
+            graph.requires.insert(hash.clone(), requires.clone());
+        }
+        // 「有人依赖」用合成的持有者成员表达：持有者不在清单里，但它的
+        // 必需依赖会被不动点看到
+        for hash in &self.depended_on {
+            if !wanted.contains(hash.as_str()) {
+                continue;
+            }
+            let holder = format!("holder-of-{hash}");
+            graph.project_of.insert(holder.clone(), holder.clone());
+            graph.requires.insert(holder.clone(), vec![hash.clone()]);
+            // 被依赖者必须能提供对应项目，否则不动点无法把哈希与项目对上
+            graph
+                .project_of
+                .entry(hash.clone())
+                .or_insert_with(|| hash.clone());
+        }
+        Ok(PackMemberVerdicts { graph })
     }
 
     async fn authoritative_hashes(
@@ -1241,8 +1276,11 @@ async fn removes_previously_installed_client_only_mod() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// 只有 `mods/` 下的 `.jar` 才需要查上游：配置、资源包、清单已排除的
-/// `server: unsupported` 文件、以及由 overrides 提供的文件都不该占用请求预算
+/// 只有 `mods/` 下的 `.jar` 才需要查上游：配置、资源包、以及由 overrides
+/// 提供的文件都不该占用请求预算
+///
+/// 清单声明 `server: unsupported` 的 jar **仍要反查**：它可能就是别人硬依赖
+/// 的库，跳过它之前得先知道依赖关系。反查回来没人依赖，才真的跳过。
 #[tokio::test]
 async fn only_mod_jars_are_queried() {
     // 没有下载地址：内容由 overrides/ 提供，不该反查也不能下载
@@ -1259,7 +1297,7 @@ async fn only_mod_jars_are_queried() {
             file_with_sha1("mods/sub/b.JAR", 4, EnvTag::None, &sha1(11)),
             file_with_sha1("config/x.toml", 2, EnvTag::None, &sha1(12)),
             file_with_sha1("resourcepacks/rp.zip", 2, EnvTag::None, &sha1(13)),
-            // 清单已判定服务端不支持，不必再问上游
+            // 清单判定服务端不支持，但它可能被别的成员硬依赖：要反查
             file_with_sha1("mods/client-env.jar", 4, EnvTag::Unsupported, &sha1(14)),
             // 清单没给 sha1：无法反查，仍按清单安装
             file("mods/no-hash.jar", 4, EnvTag::Required),
@@ -1289,15 +1327,86 @@ async fn only_mod_jars_are_queried() {
     assert_eq!(batches.len(), 1, "{batches:?}");
     assert_eq!(
         batches[0].iter().cloned().collect::<HashSet<_>>(),
-        HashSet::from([sha1(10), sha1(11)]),
-        "只应反查 mods/ 下的 jar（扩展名大小写不敏感）: {batches:?}"
+        HashSet::from([sha1(10), sha1(11), sha1(14)]),
+        "只应反查 mods/ 下的 jar（扩展名大小写不敏感），含 env 丢弃项: {batches:?}"
     );
     assert!(dir.join("mods/no-hash.jar").is_file(), "没有 sha1 也要装");
     assert!(
         !dir.join("mods/from-override.jar").exists(),
         "没有下载地址的文件只由 overrides 提供，apply 不该下载它"
     );
-    assert_eq!(applied.skipped_client_only, 0, "{applied:?}");
+    assert!(
+        !dir.join("mods/client-env.jar").exists(),
+        "没人依赖的 env 丢弃项仍然跳过"
+    );
+    assert_eq!(
+        applied.skipped_client_only, 1,
+        "跳过的要报出来: {applied:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 清单把库标成 `server: unsupported`、而成员硬依赖它时，库要装回来
+///
+/// 现场：cobbleverse 的 `athena` / `fusion` 在 `modrinth.index.json` 里是
+/// `env.server: unsupported`，而 `CobbleFurnies` / `rechiseled` 的
+/// `fabric.mod.json` 硬依赖它们。只按 env 过滤会让服务端以
+/// `HARD_DEP_NO_CANDIDATE` 起不来。
+#[tokio::test]
+async fn keeps_env_unsupported_member_that_pack_members_depend_on() {
+    let athena = sha1(31);
+    let index = ModpackIndex::new(
+        1,
+        "minecraft",
+        "1.0.0",
+        "Pack",
+        deps(&[("minecraft", "1.21.1"), ("fabric-loader", "0.16.0")]),
+        vec![
+            file_with_sha1("mods/cobblefurnies.jar", 4, EnvTag::Required, &sha1(30)),
+            // env 声明服务端不支持，但 cobblefurnies 硬依赖它
+            file_with_sha1("mods/athena.jar", 4, EnvTag::Unsupported, &athena),
+            // 同样被 env 丢掉、没人依赖的纯客户端优化 mod
+            file_with_sha1("mods/sodium-extra.jar", 4, EnvTag::Unsupported, &sha1(32)),
+        ],
+    )
+    .expect("index");
+    let source = Arc::new(
+        FakeModpackSource::new()
+            .member(&sha1(30), "cobblefurnies", &["athena"])
+            .member(&athena, "athena", &[])
+            .member(&sha1(32), "sodium-extra", &[]),
+    );
+    let service = service_with_source(index, Vec::new(), FakeDownloader::ok(), source);
+    let dir = scratch("env-dep-keep");
+
+    let prepared = service
+        .prepare(
+            "P",
+            ModpackInstallOptions::new(&dir),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("prepare");
+    let applied = service
+        .apply(&prepared, &dir, None, &CancellationToken::new())
+        .await
+        .expect("apply");
+
+    assert!(
+        dir.join("mods/athena.jar").is_file(),
+        "被硬依赖的库必须装回来，否则服务端起不来: {}",
+        dir.display()
+    );
+    assert!(
+        !dir.join("mods/sodium-extra.jar").exists(),
+        "没人依赖的 env 丢弃项仍然跳过"
+    );
+    assert_eq!(
+        applied.skipped_client_only_files,
+        vec!["mods/sodium-extra.jar".to_owned()],
+        "只报真正跳过的那一个"
+    );
+    assert_eq!(applied.file_count, 2, "{applied:?}");
     std::fs::remove_dir_all(&dir).ok();
 }
 

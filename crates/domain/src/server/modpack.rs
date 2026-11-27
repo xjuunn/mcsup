@@ -369,20 +369,37 @@ pub struct PackMemberGraph {
     pub requires: BTreeMap<String, Vec<String>>,
     /// 上游把整个项目标成仅客户端的文件哈希
     pub client_only: BTreeSet<String>,
+    /// 清单把文件的 `env.server` 声明为 `unsupported` 的哈希
+    ///
+    /// 与 [`Self::client_only`] 是两条独立来源：前者来自整合包清单，后者来自
+    /// 上游项目元数据。两者都可能丢掉别的成员硬依赖的库——实测整合包把
+    /// `athena` / `fusion` 标成 `server: unsupported`，而 `CobbleFurnies` /
+    /// `rechiseled` 的 `fabric.mod.json` 硬依赖它们，服务端会以
+    /// `HARD_DEP_NO_CANDIDATE` 起不来。因此 env 丢弃同样要参与不动点。
+    pub env_unsupported: BTreeSet<String>,
 }
 
 impl PackMemberGraph {
+    /// 该成员是否被自身事实丢弃（不看依赖能否把它拉回来）
+    ///
+    /// 两条来源：上游把项目标成仅客户端、清单声明 `env.server: unsupported`。
+    #[must_use]
+    pub fn dropped(&self, hash: &str) -> bool {
+        self.client_only.contains(hash) || self.env_unsupported.contains(hash)
+    }
+
     /// 服务端真正会安装的成员（文件哈希）
     ///
-    /// 起点是「自己不是仅客户端」的成员——它们无论如何都要装；然后反复
-    /// 把「被已装成员必需依赖、且自己能提供该项目」的仅客户端成员并进来，
-    /// 直到集合不再变大。两者都装之后，其余仅客户端成员才是真的该跳过。
+    /// 起点是「没被任何事实丢弃」的成员——它们无论如何都要装；然后反复把
+    /// 「被已装成员必需依赖、且自己能提供该项目」的成员并进来，直到集合不再
+    /// 变大。被自身事实丢弃、但被别人需要的成员由这一步回捞；回捞不到的就是
+    /// 真的该跳过。
     #[must_use]
     pub fn retained(&self) -> BTreeSet<String> {
         let mut kept: BTreeSet<String> = self
             .project_of
             .keys()
-            .filter(|hash| !self.client_only.contains(*hash))
+            .filter(|hash| !self.dropped(hash))
             .cloned()
             .collect();
         loop {
@@ -394,14 +411,13 @@ impl PackMemberGraph {
                 }
             }
             let mut grew = false;
-            for hash in &self.client_only {
-                if kept.contains(hash) {
+            for hash in self.project_of.keys() {
+                if kept.contains(hash) || !self.dropped(hash) {
                     continue;
                 }
-                let Some(project) = self.project_of.get(hash) else {
-                    continue;
-                };
-                if needed.contains(project.as_str()) {
+                if let Some(project) = self.project_of.get(hash)
+                    && needed.contains(project.as_str())
+                {
                     kept.insert(hash.clone());
                     grew = true;
                 }
@@ -413,16 +429,69 @@ impl PackMemberGraph {
         kept
     }
 
-    /// 仅客户端、但被留下的成员需要、因此不能跳过的文件哈希
+    /// 被自身事实丢弃、但被会装成员的必需依赖拉回的文件哈希
     ///
-    /// 判定口径与 [`Self::retained`] 一致：`retained` 里那些上游标成仅客户端的
-    /// 条目。
+    /// 判定口径与 [`Self::retained`] 一致：`retained` 里那些本会被跳过的
+    /// 条目。用于区分「无条件要装」与「靠依赖保住」。
     #[must_use]
     pub fn depended_on(&self) -> BTreeSet<String> {
         self.retained()
             .into_iter()
-            .filter(|hash| self.client_only.contains(hash))
+            .filter(|hash| self.dropped(hash))
             .collect()
+    }
+
+    /// 某个清单成员是否要装到服务端
+    ///
+    /// `retained` 先由 [`Self::retained`] 算好传进来，避免逐文件重算不动点。
+    /// `env_allows` 是该文件自己的 `env.server` 声明结果。
+    ///
+    /// 前置条件：清单的 env 事实必须先用 [`Self::absorb_manifest_env`] 并进
+    /// 这张图。两条丢弃事实（上游仅客户端、清单 env 不支持）都只能被
+    /// 「会装成员的必需依赖」救回来；图里查不到的哈希（上游没收录、清单没给
+    /// sha1）无法参与依赖判定，按清单声明处置——判不出来宁可多装，不能删掉
+    /// 真正的服务端 mod。
+    #[must_use]
+    pub fn installs(
+        &self,
+        retained: &BTreeSet<String>,
+        hash: Option<&str>,
+        env_allows: bool,
+    ) -> bool {
+        let Some(hash) = hash else {
+            return env_allows;
+        };
+        if self.dropped(hash) {
+            return retained.contains(hash);
+        }
+        if self.project_of.contains_key(hash) {
+            return true;
+        }
+        env_allows
+    }
+
+    /// 把清单声明的 `env.server: unsupported` 并进丢弃事实
+    ///
+    /// 上游 API 不知道整合包作者把哪个文件声明成服务端不支持，这条事实只能
+    /// 从清单来。它必须和上游的 `server_side` 进同一张图：两者都会丢掉别的
+    /// 成员硬依赖的库，都要由依赖不动点决定能不能救回来。
+    ///
+    /// 同一个 sha1 可能对应多个清单路径（同一个 jar 在两个目录各放一份）。
+    /// 只有**全部**路径都声明不支持才算丢弃——任意一处声明服务端可用，这份
+    /// 字节就得装，不能因为另一处声明被连带删掉。
+    pub fn absorb_manifest_env(&mut self, index: &ModpackIndex) {
+        let mut any_allowed: BTreeMap<&str, bool> = BTreeMap::new();
+        for file in &index.files {
+            let Some(hash) = file.hashes.sha1.as_deref() else {
+                continue;
+            };
+            *any_allowed.entry(hash).or_insert(false) |= file.installs_on_server();
+        }
+        for (hash, allowed) in any_allowed {
+            if !allowed {
+                self.env_unsupported.insert(hash.to_owned());
+            }
+        }
     }
 }
 
@@ -794,6 +863,18 @@ mod tests {
         out
     }
 
+    /// 同上，但把条目标成「清单 env 声明服务端不支持」而非「上游仅客户端」
+    fn env_graph(members: &[(&str, &str, &[&str], bool)]) -> PackMemberGraph {
+        let mut out = graph(members);
+        for (hash, _project, _requires, env_dropped) in members {
+            if *env_dropped {
+                out.client_only.remove(*hash);
+                out.env_unsupported.insert((*hash).to_owned());
+            }
+        }
+        out
+    }
+
     fn names<'a>(set: impl IntoIterator<Item = &'a String>) -> Vec<&'a str> {
         set.into_iter().map(String::as_str).collect()
     }
@@ -843,6 +924,102 @@ mod tests {
         ]);
         assert_eq!(names(&g.retained()), vec!["h-a", "h-b", "h-c"]);
         assert_eq!(names(&g.depended_on()), vec!["h-b", "h-c"]);
+    }
+
+    /// 清单 env 丢弃的库同样要被依赖救回来
+    ///
+    /// 现场：cobbleverse 的 `athena` / `fusion` 在清单里是
+    /// `env.server: unsupported`，而 `CobbleFurnies` / `rechiseled` 硬依赖
+    /// 它们。env 这一层不看依赖图，只按声明过滤就会拆掉服务端的必需件。
+    #[test]
+    fn library_dropped_by_env_is_kept_by_dependents() {
+        let g = env_graph(&[
+            ("h-furnies", "cobblefurnies", &["athena"], false),
+            ("h-athena", "athena", &[], true),
+            ("h-sodium-extra", "sodium-extra", &[], true),
+        ]);
+        assert_eq!(names(&g.depended_on()), vec!["h-athena"]);
+        assert_eq!(names(&g.retained()), vec!["h-athena", "h-furnies"]);
+    }
+
+    /// env 丢弃与上游仅客户端两条事实可以叠在同一个成员上，判定口径一致
+    #[test]
+    fn env_and_upstream_drops_share_one_closure() {
+        let mut g = env_graph(&[
+            ("h-mod", "mod", &["lib"], false),
+            ("h-lib", "lib", &[], true),
+            ("h-pure", "pure", &[], true),
+        ]);
+        g.client_only.insert("h-lib".to_owned());
+        assert_eq!(names(&g.retained()), vec!["h-lib", "h-mod"]);
+        assert_eq!(names(&g.depended_on()), vec!["h-lib"]);
+    }
+
+    /// 逐文件判定：装着装、跳过该跳过，图里查不到时按清单声明
+    #[test]
+    fn installs_combines_env_declaration_with_the_graph() {
+        let g = env_graph(&[
+            ("h-mod", "mod", &["lib"], false),
+            ("h-lib", "lib", &[], true),
+            ("h-pure", "pure", &[], true),
+        ]);
+        let retained = g.retained();
+        // 服务端可用成员：装
+        assert!(g.installs(&retained, Some("h-mod"), true));
+        // 被依赖救回来的库：装
+        assert!(g.installs(&retained, Some("h-lib"), false));
+        // 没人依赖、清单说服务端不支持：跳过
+        assert!(!g.installs(&retained, Some("h-pure"), false));
+        // 图里没有（上游查不到 / 清单没给哈希）：按清单声明
+        assert!(g.installs(&retained, Some("h-unknown"), true));
+        assert!(!g.installs(&retained, Some("h-unknown"), false));
+        assert!(g.installs(&retained, None, true));
+    }
+
+    /// 清单 env 声明并入丢弃事实：同哈希多路径时全不支持才算丢弃
+    #[test]
+    fn absorb_manifest_env_only_drops_hashes_with_no_server_side_path() {
+        let server_unsupported = FileEnv {
+            client: EnvSupport::Required,
+            server: EnvSupport::Unsupported,
+        };
+        let required = FileEnv {
+            client: EnvSupport::Required,
+            server: EnvSupport::Required,
+        };
+        let hashed = |path: &str, sha1: &str, env: FileEnv| {
+            ModpackFile::new(
+                path.to_owned(),
+                vec![format!("https://x/{path}")],
+                1,
+                ModpackHashes {
+                    sha1: Some(sha1.to_owned()),
+                    sha512: None,
+                },
+                Some(env),
+            )
+        };
+        let index = index(
+            vec![
+                // 同一个 jar 两个路径：一处声明不支持、一处声明可用 → 不丢弃
+                hashed("mods/dup.jar", "aaa", server_unsupported),
+                hashed("mods/dup-copy.jar", "aaa", required),
+                hashed("mods/client.jar", "bbb", server_unsupported),
+                // 没有 sha1：无法并入图，由逐文件 `env_allows` 决定
+                file("mods/no-hash.jar", &[], Some(server_unsupported)),
+            ],
+            deps(&[("minecraft", "1.21.1")]),
+        );
+
+        let mut g = PackMemberGraph::default();
+        g.absorb_manifest_env(&index);
+        assert_eq!(names(&g.env_unsupported), vec!["bbb"]);
+
+        let retained = g.retained();
+        assert!(g.installs(&retained, Some("aaa"), true), "另一处路径可用");
+        assert!(!g.installs(&retained, Some("bbb"), false));
+        assert!(g.installs(&retained, None, true));
+        assert!(!g.installs(&retained, None, false));
     }
 
     #[test]

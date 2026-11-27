@@ -25,7 +25,7 @@ use crate::lifecycle::LifecycleError;
 use crate::mod_inspect::ModBlocked;
 use crate::modpack_manifest::ModpackManifestSnapshot;
 use domain::mod_::{ModLoader, ServerTarget};
-use domain::server::modpack::{ModpackFile, ModpackIndex};
+use domain::server::modpack::{ModpackFile, ModpackIndex, PackMemberGraph};
 use domain::server::version::ServerVariant;
 use port::mod_::ModInspector;
 use port::modpack::{
@@ -33,6 +33,7 @@ use port::modpack::{
     PackMemberVerdicts, ResolvedModpack,
 };
 use port::{ArtifactDownloader, CancellationToken, DownloadRequest, ProgressSink, SourceError};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
@@ -405,30 +406,46 @@ impl ModpackService {
         //    Embeddium 之类仅客户端模组标成 `server: required`，按清单装进
         //    服务端会在启动时加载客户端类并崩溃。能查到权威元数据时以它为准。
         //
-        //    但不能只看「上游说它仅客户端」：库类项目（`satin` / `melody`
-        //    一类提供 API 的）常被标成 `unsupported`，实际是别的 mod 起不来的
-        //    硬前提。判定因而收敛到 `PackMemberVerdicts::skips`——仅客户端
-        //    **且** 无成员依赖才跳过。
+        //    反向同样会出错：清单把某个库标成 `server: unsupported`，而别的
+        //    成员硬依赖它（实测 cobbleverse 的 `athena` / `fusion`），跳过之后
+        //    服务端直接 `HARD_DEP_NO_CANDIDATE`。因此两条来源——上游的
+        //    `server_side` 与清单的 `env.server`——要一起参与同一次依赖不动点：
+        //    任何一条丢弃的成员，只要被会装的成员必需依赖，就得装回来。
         let source = self.select_source(Some(prepared.source))?;
+        // 反查范围用「清单里的 mod jar」，不按 env 预筛：被 env 丢掉的那几个
+        // 正是要参与不动点的对象，先筛掉就看不到依赖关系了。
         let mod_hashes: Vec<String> = prepared
             .index
-            .downloadable_server_files()
-            .into_iter()
+            .files
+            .iter()
+            .filter(|file| file.has_download())
             .filter(|file| file.path.starts_with("mods/"))
             .filter(|file| file.is_plugin_jar())
             .filter_map(|file| file.hashes.sha1.clone())
             .collect();
         // 纯配置 / 资源包整合包没有可反查的 jar，直接省掉一次上游请求
-        let verdicts = if mod_hashes.is_empty() {
+        let mut verdicts = if mod_hashes.is_empty() {
             PackMemberVerdicts::default()
         } else {
             source.pack_member_verdicts(&mod_hashes).await?
         };
+        // 清单声明 `server: unsupported` 的文件哈希并入图，与上游仅客户端
+        // 标记同等对待：都会被跳过，也都可能被依赖拉回来。判定收敛在领域层
+        // （`PackMemberGraph::absorb_manifest_env`），这里不做第二次合并。
+        verdicts.graph.absorb_manifest_env(&prepared.index);
+        // 不动点只算一次，逐文件判定共用同一个结果
+        let retained = verdicts.graph.retained();
 
-        // 3. 清单文件：只装服务端需要的（server: unsupported 已由领域层过滤），
-        //    并行下载，进度收敛为整包口径（见 [`Self::download_files`]）
-        let (jobs, skipped_client_only) =
-            self.classify_files(prepared, server_dir, &verdicts).await?;
+        // 3. 清单文件：逐个按 [`PackMemberGraph::installs`] 判定后并行下载，
+        //    进度收敛为整包口径（见 [`Self::download_files`]）
+        let (jobs, skipped_client_only) = self
+            .classify_files(prepared, server_dir, &verdicts.graph, &retained)
+            .await?;
+        let installed = prepared
+            .index
+            .files
+            .len()
+            .saturating_sub(skipped_client_only.len());
         let mut applied = self
             .download_files(prepared, source.as_ref(), &jobs, progress, cancel)
             .await?;
@@ -442,11 +459,7 @@ impl ModpackService {
         //    只有把整批文件摆在一起才判得出来。这一步与 `server start` 的
         //    预检共用同一个扫描，因此这里报空就等于启动不会被 mod 拦住。
         applied.blocked = self.audit_mods(prepared, server_dir).await;
-        applied.file_count = prepared
-            .index
-            .server_files()
-            .len()
-            .saturating_sub(skipped_client_only.len());
+        applied.file_count = installed;
         applied.skipped_client_only = skipped_client_only.len();
         applied.skipped_client_only_files = skipped_client_only;
 
@@ -527,34 +540,47 @@ impl ModpackService {
         }
     }
 
-    /// 把清单文件分类：要下载的、仅客户端剔除的
+    /// 把清单文件分类：要下载的、服务端不装的
     ///
-    /// 仅客户端文件顺手清掉旧落盘——重装时留着只会让服务端起不来。
+    /// 判定统一走 [`PackMemberGraph::installs`]，一条规则决定三种处置：装并下载、
+    /// 装但由 overrides 提供、跳过。跳过时顺手清掉旧落盘——重装时留着只会让
+    /// 服务端起不来。
+    ///
+    /// 范围是**清单全部文件**，不是领域层预先按 env 过滤过的子集：被 env 声明
+    /// `server: unsupported` 的文件若被会装成员必需依赖，`retained` 会把它拉
+    /// 回来，此时它必须出现在待装集合里。先按 env 筛掉就再没机会回捞。
+    ///
     /// 返回被剔除文件的清单路径，供入口回显「跳过的是哪几个」，而不是只报数量。
     async fn classify_files<'a>(
         &self,
         prepared: &'a ModpackPrepared,
         server_dir: &Path,
-        verdicts: &PackMemberVerdicts,
+        graph: &PackMemberGraph,
+        retained: &BTreeSet<String>,
     ) -> Result<(Vec<(&'a ModpackFile, PathBuf)>, Vec<String>), ModpackError> {
         let mut skipped_client_only: Vec<String> = Vec::new();
         let mut jobs: Vec<(&'a ModpackFile, PathBuf)> = Vec::new();
-        for file in prepared.index.downloadable_server_files() {
+        for file in &prepared.index.files {
             let target = safe_target(server_dir, &file.path)?;
-            if file
-                .hashes
-                .sha1
-                .as_deref()
-                .is_some_and(|hash| verdicts.skips(hash))
-            {
+            let installs = graph.installs(
+                retained,
+                file.hashes.sha1.as_deref(),
+                file.installs_on_server(),
+            );
+            if !installs {
                 // 上一次安装可能已经把它落盘；重装时顺手清掉，避免旧文件
-                // 继续让服务端起不来
+                // 继续让服务端起不来。overrides 铺进来的同一个文件也在这条
+                // 路径上处理——它已经落在 server_dir 里了。
                 if tokio::fs::try_exists(&target).await.unwrap_or(false) {
                     tokio::fs::remove_file(&target)
                         .await
                         .map_err(|err| ModpackError::io(&target, err))?;
                 }
                 skipped_client_only.push(file.path.clone());
+                continue;
+            }
+            // 没有下载地址：内容由 overrides 提供，已随归档铺好
+            if !file.has_download() {
                 continue;
             }
             jobs.push((file, target));
@@ -698,7 +724,7 @@ impl ModpackService {
         info!(
             project = %prepared.resolved.project_id,
             version = %prepared.resolved.version_id,
-            files = prepared.index.server_files().len(),
+            files = jobs.len(),
             downloaded_bytes,
             reused,
             stale_hashes = stale_hashes.len(),
@@ -1007,7 +1033,7 @@ pub struct ModpackApplied {
     pub downloaded_bytes: u64,
     /// 已存在而跳过的文件数
     pub reused: usize,
-    /// 按上游元数据判定为仅客户端、已跳过的文件数
+    /// 按上游元数据或清单声明判定服务端不需要、已跳过的文件数
     pub skipped_client_only: usize,
     /// 被跳过文件的清单路径（如 `mods/sodium.jar`），与 [`Self::skipped_client_only`]
     /// 数量一一对应，供入口回显列出「跳过的是哪几个」

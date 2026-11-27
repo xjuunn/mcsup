@@ -227,17 +227,23 @@ impl ModpackSource for ModrinthModpackSource {
     }
 
     async fn client_only_hashes(&self, hashes: &[String]) -> Result<HashSet<String>, SourceError> {
-        Ok(self.pack_member_verdicts(hashes).await?.client_only)
+        Ok(self
+            .pack_member_verdicts(hashes)
+            .await?
+            .graph
+            .client_only
+            .into_iter()
+            .collect())
     }
 
     async fn pack_member_verdicts(
         &self,
         hashes: &[String],
     ) -> Result<PackMemberVerdicts, SourceError> {
-        if hashes.is_empty() {
-            return Ok(PackMemberVerdicts::default());
-        }
         let mut verdicts = PackMemberVerdicts::default();
+        if hashes.is_empty() {
+            return Ok(verdicts);
+        }
         // 整包一次性看：依赖关系是包内成员之间的，分批就看不到跨批的依赖
         let mut all_versions: HashMap<String, Version> = HashMap::new();
         for chunk in hashes.chunks(HASH_QUERY_BATCH) {
@@ -258,11 +264,14 @@ impl ModpackSource for ModrinthModpackSource {
             .into_iter()
             .collect();
         let projects = self.inner.projects(&project_ids).await?;
-        verdicts.client_only = client_only_from(&all_versions, &projects);
-        // 「谁被依赖」不能一次统计：被跳过的成员不该为别人提供保护。判定
-        // 需要迭代到不动点，放在领域层，这里只把上游事实摊成依赖图。
-        let graph = member_graph(&all_versions, &verdicts.client_only);
-        verdicts.depended_on = graph.depended_on().into_iter().collect();
+        let client_only = client_only_from(&all_versions, &projects);
+        // 「谁留下」不能一次统计：被跳过的成员不该为别人提供保护。判定需要
+        // 迭代到不动点，收敛在领域层；这里只把上游事实摊成依赖图。
+        //
+        // 清单 env 那条事实由调用方补：上游 API 不知道整合包作者把哪个文件
+        // 声明成 `server: unsupported`。两条来源参与同一个不动点，才能既
+        // 丢掉纯客户端 mod，又保住被服务端成员硬依赖的库。
+        verdicts.graph = member_graph(&all_versions, &client_only);
         Ok(verdicts)
     }
 

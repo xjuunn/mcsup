@@ -524,12 +524,19 @@ Sinytra Connector 这类加载器桥单独放行：它内嵌 Fabric 客户端 AP
 中止安装（避免装出一个启动必崩的服务端），来源不支持这项能力时退回「按清单
 装」。JSON 输出里的 `skipped_client_only` 与人类可读输出都会报告跳过数量。
 
+**清单声明 `env.server: unsupported` 同样不等于可以丢掉**。上游 API 不知道
+作者把哪个文件声明成服务端不支持，这条事实从清单来；它与上游的
+`server_side` 后果相同，都进同一张成员依赖图。实测 cobbleverse 的 `athena` /
+`fusion` 在清单里是 `server: unsupported`，而 `CobbleFurnies` / `rechiseled`
+硬依赖它们，只按 env 直滤会让服务端以 `HARD_DEP_NO_CANDIDATE` 起不来。因此
+反查上游时**不按 env 预筛**：被 env 丢掉的 jar 也要查，才看得到依赖关系。
+
 **「谁被依赖」要迭代到不动点**。被跳过的成员不该为别人提供保护：`sodium`
 被 `indium` / `iris` / `reeses` 依赖，而这三个自己都是仅客户端、都会被跳过，
 一次统计会把 `sodium` 判成「有人依赖」而留下，服务端照样起不来。判定因此从
-「服务端可用」的成员出发，沿必需依赖反复扩张到不再有新成员（详见
-`PackMemberGraph::retained`）。反过来，留下的成员需要的库即使自己被标成仅
-客户端也必须装，同一条规则两向都成立。
+没被任何事实丢弃的成员出发，沿必需依赖反复扩张到不再有新成员（详见
+`PackMemberGraph::retained`）。反过来，留下的成员需要的库即使自己被上游标成
+仅客户端、或清单声明服务端不支持，也必须装回来，同一条规则两向都成立。
 
 **装完再按文件本身复核一次**。前面两步信的都是声明：清单的 `env`、上游项目的
 `server_side`。声明与实际不符时只有读 jar 才能发现（Fabric 的

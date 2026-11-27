@@ -653,7 +653,7 @@ pub enum Response {
         downloaded_bytes: u64,
         /// 已存在而复用的文件数
         reused: usize,
-        /// 按上游元数据判定为仅客户端、已跳过的文件数
+        /// 按上游元数据或清单声明判定服务端不需要、已跳过的文件数
         skipped_client_only: usize,
         /// 被跳过文件的清单路径（与 `skipped_client_only` 数量一一对应）
         ///

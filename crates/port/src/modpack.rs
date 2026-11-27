@@ -19,8 +19,8 @@
 //! facet，还要按响应体里的逐条字段再筛一次。
 
 use async_trait::async_trait;
-use domain::server::modpack::ModpackIndex;
-use std::collections::HashSet;
+use domain::server::modpack::{ModpackIndex, PackMemberGraph};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
 use crate::SourceError;
@@ -191,35 +191,17 @@ pub struct ExtractedModpack {
 
 /// 整合包内各成员的上游判定
 ///
-/// 两个集合都以**文件 sha1** 为键，Service 据此决定某个清单文件要不要装到
-/// 服务端。见 [`ModpackSource::pack_member_verdicts`]。
+/// Service 据此决定某个清单文件要不要装到服务端。见
+/// [`ModpackSource::pack_member_verdicts`]。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PackMemberVerdicts {
-    /// 上游标注仅客户端（`server_side: unsupported`）的文件
-    pub client_only: HashSet<String>,
-    /// 被整合包内其他成员的**必需依赖**指向的文件
+    /// 上游事实摊成的成员依赖图
     ///
-    /// 这类文件即使自己被标成仅客户端也不能跳过：上游的项目级标注描述的是
-    /// 「这个项目自己需不需要服务端」，而库类项目（`satin` / `melody` 一类
-    /// 提供 API 的）常常标 `unsupported`，却是别的 mod 跑起来的硬前提。
-    /// 服务端加载器不加载它们，但依赖声明要求它们**存在于 `mods/`**。
-    ///
-    /// 注意只有**会装**的成员的依赖才算数：被跳过的成员不该为别人提供保护。
-    /// 这是不动点问题，不能一次统计——算法在
-    /// [`domain::server::modpack::PackMemberGraph::depended_on`]，来源只需把上游
-    /// 事实摆成图。
-    pub depended_on: HashSet<String>,
-}
-
-impl PackMemberVerdicts {
-    /// 某个文件是否应当跳过（不装到服务端）
-    ///
-    /// 仅客户端 **且** 无人依赖才跳过。判定收敛在这里，Service 与各入口
-    /// 都调用它，不各写一份。
-    #[must_use]
-    pub fn skips(&self, sha1: &str) -> bool {
-        self.client_only.contains(sha1) && !self.depended_on.contains(sha1)
-    }
+    /// 「谁仅客户端」「谁被谁必需依赖」都在这张图里。Why 不直接给两组哈希：
+    /// 依赖保护是不动点判定（被跳过的成员不该为别人提供保护），一次统计会
+    /// 把 `sodium` 这类只被其它客户端 mod 依赖的项目留下。算法收敛在
+    /// [`PackMemberGraph::retained`]，来源只负责把事实摆好。
+    pub graph: PackMemberGraph,
 }
 
 /// 整合包来源
@@ -300,8 +282,12 @@ pub trait ModpackSource: ContentSourceInfo + Send + Sync {
     ) -> Result<PackMemberVerdicts, SourceError> {
         let client_only = self.client_only_hashes(hashes).await?;
         Ok(PackMemberVerdicts {
-            client_only,
-            depended_on: HashSet::new(),
+            graph: PackMemberGraph {
+                project_of: BTreeMap::new(),
+                requires: BTreeMap::new(),
+                client_only: client_only.into_iter().collect(),
+                env_unsupported: BTreeSet::new(),
+            },
         })
     }
 

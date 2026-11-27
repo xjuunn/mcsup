@@ -395,15 +395,22 @@ Modrinth 同一版本可以同时提供客户端与服务端文件，服务端�
 客户端包。客户端包常把仅客户端模组标成 `server: required`，直接装到服务端
 会在启动阶段崩溃。
 
-清单的 `env` 字段同样不可全信。`apply` 会把 `mods/` 下 jar 的 sha1 交给
+清单的 `env` 字段同样不可全信。`apply` 会把**清单里全部** `mods/` 下 jar
+的 sha1（含 `env.server: unsupported` 的条目）交给
 `port::ModpackSource::pack_member_verdicts`（默认实现退化为
-`client_only_hashes`），由来源给出两份事实：哪些文件被上游标注
-`server_side = unsupported`、哪些文件被包内其他成员必需依赖。
+`client_only_hashes`），由来源给出成员依赖图：谁被上游标注
+`server_side = unsupported`、谁被包内其他成员必需依赖。清单声明的
+`env.server: unsupported` 由 `PackMemberGraph::absorb_manifest_env` 并进同一
+张图——上游 API 不知道作者把哪个文件声明成服务端不支持，但这条事实与上游标注
+后果相同，都要参与同一次判定。
 
 「谁该留下」由领域层算：`domain::server::modpack::PackMemberGraph::retained`
-从服务端可用的成员出发，沿必需依赖迭代到不动点。一次统计是错的——被跳过的
-成员不该为别人提供保护（`sodium` 被同为仅客户端的 `indium` / `iris` 依赖，
-一次统计会把它误留下来）。查询失败即中止安装，不带着未知状态落盘。
+从没被任何事实丢弃的成员出发，沿必需依赖迭代到不动点。一次统计是错的——被
+跳过的成员不该为别人提供保护（`sodium` 被同为仅客户端的 `indium` / `iris`
+依赖，一次统计会把它误留下来）。两条丢弃来源共用这个不动点：被
+`env.server: unsupported` 丢掉、却被会装成员硬依赖的库会被拉回来（实测
+cobbleverse 的 `athena` / `fusion` 就是这样，按 env 直滤会让服务端以
+`HARD_DEP_NO_CANDIDATE` 起不来）。查询失败即中止安装，不带着未知状态落盘。
 
 装完还有一道按**文件本身**的复核（`ModpackService::audit_mods`）：对整台服务端
 的 `mods/` 与 `plugins/` 跑一次本地检测，列出会让服务端起不来的条目——缺必需
