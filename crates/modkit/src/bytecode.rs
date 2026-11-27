@@ -150,6 +150,15 @@ pub(crate) fn is_guard_call(owner: &str, name: &str) -> bool {
     if is_client_class_name(owner) {
         return false;
     }
+    is_side_predicate_name(name)
+}
+
+/// 成员名本身是否在表达「当前是哪一侧」
+///
+/// 与 [`is_guard_call`] 的区别：不看属主。用于判断某个静态字段的赋值来源
+/// 是不是客 / 服判断（`IS_CLIENT = Platform.isPhysicalClient()`）。
+#[must_use]
+pub(crate) fn is_side_predicate_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     matches!(
         lower.as_str(),
@@ -164,6 +173,17 @@ pub(crate) fn is_guard_call(owner: &str, name: &str) -> bool {
             | "getphysicalside"
             | "getlogicalside"
     )
+}
+
+/// 类型是否是 `Dist` 枚举本身
+///
+/// 比 [`is_guard_type`] 更窄：只认 `Dist`，不认 `FMLEnvironment`。用于判断
+/// 「写入这个字段的值是不是由 dist 比较得来」——`FMLEnvironment.production`
+/// 是开发环境标志，不是客 / 服判断，认进来会把 `IN_DEV` 一类字段误当 guard。
+#[must_use]
+pub(crate) fn is_dist_type(name: &str) -> bool {
+    name.starts_with("net/minecraftforge/api/distmarker/Dist")
+        || name.starts_with("net/neoforged/api/distmarker/Dist")
 }
 
 /// 该 class 是否会在打开图形窗口后终止 JVM

@@ -26,7 +26,7 @@
 //! 没有任何运行时分支绕开。因此证据写清完整调用链，供人工核对。
 
 use crate::bytecode;
-use crate::classfile::{ClassFile, Method};
+use crate::classfile::{Call, ClassFile, Method};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -79,17 +79,68 @@ pub(crate) fn find(classes: &[ClassFile]) -> Option<InitClientAccess> {
         .iter()
         .map(|class| (class.name.as_str(), class))
         .collect();
+    let side_fields = side_fields(classes, &index);
     let mut entries = classes
         .iter()
         .filter(|class| class.mod_entry && !class.mod_client_only)
         .collect::<Vec<_>>();
     entries.sort_by(|left, right| left.name.cmp(&right.name));
-    entries.into_iter().find_map(|entry| walk(entry, &index))
+    entries
+        .into_iter()
+        .find_map(|entry| walk(entry, &index, &side_fields))
+}
+
+/// 本 jar 内「值来自客 / 服判断」的静态布尔字段
+///
+/// 现场：Cupboard 的 `<clinit>` 写
+/// `IS_CLIENT_OR_INTEGRATED = FMLEnvironment.dist == Dist.CLIENT`，配置加载里
+/// 读它来跳过客户端兼容层（`if (IS_CLIENT_OR_INTEGRATED) ClientConfigCompat...`）。
+/// 读点只看到一个布尔字段，认不出是 dist 判断，于是把后面的 `Minecraft`
+/// 引用当成无条件执行，误判仅客户端。
+///
+/// 所以把「写点由 dist 比较得来」的字段收集起来，读它等同于 dist 判断。
+/// 只收布尔字段、只认 `Dist` 本身或方向谓词名，避免把 `FMLEnvironment.
+/// production` 派生的 `IN_DEV` 一类开发标志也算进来。
+fn side_fields<'a>(
+    classes: &'a [ClassFile],
+    index: &HashMap<&'a str, &'a ClassFile>,
+) -> HashSet<(String, String)> {
+    let mut fields = HashSet::new();
+    for class in classes {
+        for method in &class.methods {
+            if !writes_side_predicate(index, method) {
+                continue;
+            }
+            for write in &method.field_writes {
+                if write.descriptor == "Z" {
+                    fields.insert((write.owner.clone(), write.name.clone()));
+                }
+            }
+        }
+    }
+    fields
+}
+
+/// 该方法写入的值是否由客 / 服判断得来
+fn writes_side_predicate(index: &HashMap<&str, &ClassFile>, method: &Method) -> bool {
+    method
+        .class_refs
+        .iter()
+        .any(|name| bytecode::is_dist_type(name))
+        || method
+            .calls
+            .iter()
+            .any(|call| bytecode::is_side_predicate_name(&call.name))
+        || method
+            .calls
+            .iter()
+            .any(|call| calls_side_predicate(index, call))
 }
 
 fn walk<'a>(
     entry: &'a ClassFile,
     index: &HashMap<&'a str, &'a ClassFile>,
+    side_fields: &HashSet<(String, String)>,
 ) -> Option<InitClientAccess> {
     let mut queue: VecDeque<Key<'a>> = VecDeque::new();
     let mut parent: HashMap<Key<'a>, Option<Key<'a>>> = HashMap::new();
@@ -120,7 +171,7 @@ fn walk<'a>(
             .class_refs
             .iter()
             .find(|name| bytecode::is_client_class_name(name))
-            && !path_guarded(index, &parent, key)
+            && !path_guarded(index, side_fields, &parent, key)
         {
             return Some(InitClientAccess {
                 entry: entry.name.clone(),
@@ -162,10 +213,33 @@ fn method_at<'a>(index: &HashMap<&'a str, &'a ClassFile>, key: Key<'a>) -> Optio
 
 /// 方法里是否出现客 / 服判断
 ///
-/// 两条都查：`class_refs` 覆盖直接读的 dist 类型，`calls` 覆盖包装在平台
-/// 工具类 / 静态字段里的判断（`Platform.isPhysicalClient()`、
-/// `isDedicatedServer` 这类）。
-fn method_guarded(method: &Method) -> bool {
+/// 四条都查：
+///
+/// 1. `class_refs` 覆盖直接读的 dist 类型（`Dist` / `FMLEnvironment`）
+/// 2. `calls` 覆盖包装在平台工具类里的判断（`Platform.isPhysicalClient()`、
+///    `isDedicatedServer` 这类）
+/// 3. 调用一个**本 jar 内返回 boolean、且自身含 dist 判断**的方法
+/// 4. 读一个**本 jar 内由 dist 比较赋值**的静态布尔字段
+///
+/// 第 3 条是实测补的：Jade 的 `CommonProxy.<init>` 写的是
+/// `if (isPhysicallyClient()) { ClientProxy.init(); }`，而 `isPhysicallyClient`
+/// 是它自己定义的 `FMLEnvironment.dist.isClient()` 包装。按名字白名单只能
+/// 命中拼写相同的 `isPhysicalClient`（Kiwi），拼写差一个字符就漏——实测
+/// `isPhysicallyClient` 让 Jade 被误判成仅客户端。按「是不是一个 dist 判断
+/// 谓词」识别，不再依赖拼写。
+///
+/// 第 4 条同理，只是把判断存进了字段：Cupboard 的
+/// `IS_CLIENT_OR_INTEGRATED` 在 `<clinit>` 里由 `dist == Dist.CLIENT` 赋值，
+/// 配置加载读它来跳过客户端兼容层。
+///
+/// 要求返回 `boolean`，是因为只有谓词才可能作为分支条件决定后续代码走不走；
+/// 一个 void 方法内部有 dist 判断，说明不了调用方紧接着的客户端调用是否受它
+/// 保护。
+fn method_guarded<'a>(
+    index: &HashMap<&'a str, &'a ClassFile>,
+    side_fields: &HashSet<(String, String)>,
+    method: &Method,
+) -> bool {
     method
         .class_refs
         .iter()
@@ -174,18 +248,57 @@ fn method_guarded(method: &Method) -> bool {
             .calls
             .iter()
             .any(|call| bytecode::is_guard_call(&call.owner, &call.name))
+        || method
+            .calls
+            .iter()
+            .any(|call| calls_side_predicate(index, call))
+        || method
+            .calls
+            .iter()
+            .any(|call| reads_side_field(side_fields, call))
+}
+
+/// 该成员访问是不是「读一个由 dist 比较赋值的静态布尔字段」
+fn reads_side_field(side_fields: &HashSet<(String, String)>, call: &Call) -> bool {
+    call.descriptor == "Z" && side_fields.contains(&(call.owner.clone(), call.name.clone()))
+}
+
+/// 调用目标是否「本 jar 内返回 boolean 的客 / 服判断谓词」
+fn calls_side_predicate<'a>(index: &HashMap<&'a str, &'a ClassFile>, call: &Call) -> bool {
+    if !call.descriptor.ends_with(")Z") {
+        return false;
+    }
+    let Some(owner) = index.get(call.owner.as_str()).copied() else {
+        return false;
+    };
+    let Some(target) = owner
+        .methods
+        .iter()
+        .find(|method| method.name == call.name && method.descriptor == call.descriptor)
+    else {
+        return false;
+    };
+    target
+        .class_refs
+        .iter()
+        .any(|name| bytecode::is_guard_type(name))
+        || target
+            .calls
+            .iter()
+            .any(|inner| bytecode::is_guard_call(&inner.owner, &inner.name))
 }
 
 /// 从入口到引用点的整条路径上是否出现过 dist 判断
 fn path_guarded<'a>(
     index: &HashMap<&'a str, &'a ClassFile>,
+    side_fields: &HashSet<(String, String)>,
     parent: &HashMap<Key<'a>, Option<Key<'a>>>,
     key: Key<'a>,
 ) -> bool {
     let mut current = Some(key);
     while let Some(node) = current {
         if let Some(method) = method_at(index, node)
-            && method_guarded(method)
+            && method_guarded(index, side_fields, method)
         {
             return true;
         }
@@ -226,7 +339,22 @@ mod tests {
                     descriptor: (*descriptor).to_owned(),
                 })
                 .collect(),
+            field_writes: Vec::new(),
         }
+    }
+
+    /// 带静态字段写入的方法：`putstatic owner.name:Z`
+    fn writer(name: &str, refs: &[&str], writes: &[(&str, &str)]) -> Method {
+        let mut method = method(name, refs, &[]);
+        method.field_writes = writes
+            .iter()
+            .map(|(owner, field)| Call {
+                owner: (*owner).to_owned(),
+                name: (*field).to_owned(),
+                descriptor: "Z".to_owned(),
+            })
+            .collect();
+        method
     }
 
     fn class(name: &str, mod_entry: bool, methods: Vec<Method>) -> ClassFile {
@@ -325,6 +453,157 @@ mod tests {
             )],
         )];
         assert!(find(&classes).is_none());
+    }
+
+    /// 本 jar 内自造的 dist 谓词：Jade 的 `isPhysicallyClient()` 拼写与白名单
+    /// 里的 `isPhysicalClient` 差一个字符，只能按「是不是 dist 谓词」识别
+    ///
+    /// 现场：`CommonProxy.<init>` 是
+    /// `if (isPhysicallyClient()) { ClientProxy.init(bus); }`，
+    /// `isPhysicallyClient` 的方法体是 `FMLEnvironment.dist.isClient()`。
+    #[test]
+    fn local_side_predicate_prevents_flagging() {
+        let mut predicate = method(
+            "isPhysicallyClient",
+            &[
+                "net/neoforged/fml/loading/FMLEnvironment",
+                "net/neoforged/api/distmarker/Dist",
+            ],
+            &[("net/neoforged/api/distmarker/Dist", "isClient", "()Z")],
+        );
+        predicate.descriptor = "()Z".to_owned();
+        let classes = vec![
+            class(
+                "com/example/CommonProxy",
+                true,
+                vec![
+                    method(
+                        "<init>",
+                        &[],
+                        &[
+                            ("com/example/CommonProxy", "isPhysicallyClient", "()Z"),
+                            ("com/example/ClientProxy", "init", "()V"),
+                        ],
+                    ),
+                    predicate,
+                ],
+            ),
+            class(
+                "com/example/ClientProxy",
+                false,
+                vec![method(
+                    "init",
+                    &["com/mojang/blaze3d/platform/InputConstants"],
+                    &[],
+                )],
+            ),
+        ];
+        assert!(find(&classes).is_none());
+    }
+
+    /// 谓词不返回 boolean：说明不了调用方后续的客户端调用受它保护，仍要报
+    #[test]
+    fn void_helper_with_dist_check_does_not_suppress() {
+        let classes = vec![
+            class(
+                "com/example/Entry",
+                true,
+                vec![
+                    method(
+                        "<init>",
+                        &[],
+                        &[
+                            ("com/example/Entry", "logSide", "()V"),
+                            ("com/example/ClientProxy", "init", "()V"),
+                        ],
+                    ),
+                    // void 方法内部有 dist 判断，但调用它不代表后续调用被分支保护
+                    method(
+                        "logSide",
+                        &["net/minecraftforge/fml/loading/FMLEnvironment"],
+                        &[],
+                    ),
+                ],
+            ),
+            class(
+                "com/example/ClientProxy",
+                false,
+                vec![method("init", &["net/minecraft/client/Minecraft"], &[])],
+            ),
+        ];
+        let found = find(&classes).expect("应仍然报出");
+        assert_eq!(found.client_type, "net/minecraft/client/Minecraft");
+    }
+
+    /// 由 dist 比较赋值的静态布尔字段：Cupboard 的 `IS_CLIENT_OR_INTEGRATED`
+    ///
+    /// 现场：`Cupboard.<clinit>` 写 `IS_CLIENT_OR_INTEGRATED = dist == Dist.CLIENT`，
+    /// `CupboardConfig.load` 读它再决定要不要走客户端兼容层。读点只有一个布尔
+    /// 字段，认不出是 dist 判断，会把后面的 `Minecraft` 引用当成无条件执行。
+    #[test]
+    fn dist_derived_static_field_prevents_flagging() {
+        let mut load = method(
+            "load",
+            &[],
+            &[
+                ("com/example/Entry", "IS_CLIENT_OR_INTEGRATED", "Z"),
+                ("com/example/ClientCompat", "onLoad", "()V"),
+            ],
+        );
+        load.descriptor = "(Z)V".to_owned();
+        let classes = vec![
+            class(
+                "com/example/Entry",
+                true,
+                vec![
+                    method("<init>", &[], &[("com/example/Entry", "load", "(Z)V")]),
+                    load,
+                    writer(
+                        "<clinit>",
+                        &["net/neoforged/api/distmarker/Dist"],
+                        &[("com/example/Entry", "IS_CLIENT_OR_INTEGRATED")],
+                    ),
+                ],
+            ),
+            class(
+                "com/example/ClientCompat",
+                false,
+                vec![method("onLoad", &["net/minecraft/client/Minecraft"], &[])],
+            ),
+        ];
+        assert!(find(&classes).is_none());
+    }
+
+    /// 开发环境标志不是客 / 服判断：`IN_DEV = !FMLEnvironment.production`
+    ///
+    /// 认成 guard 会把「只在 dev 环境才碰客户端类」的 mod 放过，漏报真正的
+    /// 服务端崩溃。
+    #[test]
+    fn dev_flag_field_is_not_a_side_guard() {
+        let classes = vec![
+            class(
+                "com/example/Entry",
+                true,
+                vec![
+                    method("<init>", &[], &[("com/example/Compat", "init", "()V")]),
+                    writer(
+                        "<clinit>",
+                        &["net/neoforged/fml/loading/FMLEnvironment"],
+                        &[("com/example/Entry", "IN_DEV")],
+                    ),
+                ],
+            ),
+            class(
+                "com/example/Compat",
+                false,
+                vec![method(
+                    "init",
+                    &["net/minecraft/client/Minecraft"],
+                    &[("com/example/Entry", "IN_DEV", "Z")],
+                )],
+            ),
+        ];
+        assert!(find(&classes).is_some());
     }
 
     /// 静态布尔字段当 guard：NBTac 读 `isDedicatedServer`，为真直接返回

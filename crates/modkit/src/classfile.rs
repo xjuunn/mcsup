@@ -60,7 +60,17 @@ pub(crate) struct Method {
     /// Minecraft;` 光看属主是 `MCVer`，客户端类型只写在返回类型里。
     pub(crate) class_refs: Vec<String>,
     /// 方法体发起的调用（属主 / 方法名 / 描述符）
+    ///
+    /// 字段读写也收在这里：JVM 的字段与方法是同一种成员引用常量，判定只看
+    /// 名字对得上就够了。
     pub(crate) calls: Vec<Call>,
+    /// 方法体写入的静态字段（`putstatic`）
+    ///
+    /// 单独记录是为了识别「静态布尔字段就是客 / 服判断」这种写法：实测
+    /// Cupboard 的 `<clinit>` 把 `IS_CLIENT_OR_INTEGRATED` 赋成
+    /// `FMLEnvironment.dist == Dist.CLIENT`，配置加载里读这个字段来跳过客户端
+    /// 兼容层。只看读点分不清它是不是 dist 判断，得看写点。
+    pub(crate) field_writes: Vec<Call>,
 }
 
 /// 一条方法调用
@@ -248,6 +258,7 @@ fn parse_methods(reader: &mut Reader<'_>, cp: &[Option<Cp>]) -> Option<Vec<Metho
             descriptor,
             class_refs: Vec::new(),
             calls: Vec::new(),
+            field_writes: Vec::new(),
         };
         if let Some(body) = code {
             scan_code_attribute(body, cp, &mut method);
@@ -281,7 +292,7 @@ fn scan_code(code: &[u8], cp: &[Option<Cp>], method: &mut Method) {
             break;
         };
         if let Some(index) = constant_operand(code, pos, len) {
-            record_constant(cp, index, method);
+            record_constant(cp, index, code[pos], method);
         }
         pos += len;
     }
@@ -304,7 +315,7 @@ fn constant_operand(code: &[u8], pos: usize, len: usize) -> Option<u16> {
     }
 }
 
-fn record_constant(cp: &[Option<Cp>], index: u16, method: &mut Method) {
+fn record_constant(cp: &[Option<Cp>], index: u16, opcode: u8, method: &mut Method) {
     match cp.get(usize::from(index)).and_then(Option::as_ref) {
         Some(Cp::Class(_)) => {
             if let Some(name) = class_name(cp, index) {
@@ -313,13 +324,17 @@ fn record_constant(cp: &[Option<Cp>], index: u16, method: &mut Method) {
         }
         Some(Cp::Member { .. }) => {
             if let Some((owner, name, descriptor)) = member(cp, index) {
-                method.class_refs.push(owner.to_owned());
-                push_descriptor_types(descriptor, &mut method.class_refs);
-                method.calls.push(Call {
+                let reference = Call {
                     owner: owner.to_owned(),
                     name: name.to_owned(),
                     descriptor: descriptor.to_owned(),
-                });
+                };
+                method.class_refs.push(owner.to_owned());
+                push_descriptor_types(descriptor, &mut method.class_refs);
+                if opcode == 0xb3 {
+                    method.field_writes.push(reference.clone());
+                }
+                method.calls.push(reference);
             }
         }
         _ => {}
